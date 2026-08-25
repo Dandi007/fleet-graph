@@ -1,0 +1,24 @@
+# systemd *user* unit skeleton — wired up for real in P6.
+#
+# KillMode=process is deliberate: executor processes (agent-run / agent-session)
+# must survive a daemon restart so the P1 re-adopt primitive can reclaim them,
+# the same property loop-engine's jobd relied on.
+[Unit]
+Description=fleet-graph orchestration daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/apps/fleet-graph/current
+ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph serve
+Restart=always
+RestartSec=5
+KillMode=process
+TimeoutStopSec=30
+# Credentials are env-only; never commit a token into this unit.
+Environment=FLEET_GRAPH_GATEWAY_BASE_URL=http://127.0.0.1:15722
+EnvironmentFile=%h/.config/fleet-graph/env
+
+[Install]
+WantedBy=default.target
