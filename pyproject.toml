@@ -32,6 +32,9 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+# Docs and comments quote the plan verbatim, and the plan is written in Chinese.
+# CJK punctuation is intended here, not a confusable typo for the ASCII form.
+allowed-confusables = ["，", "：", "；", "（", "）", "、", "「", "」", "％", "－"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
