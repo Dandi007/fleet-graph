@@ -147,6 +147,22 @@ class TestDispatchingAnLlmStage:
         written = json.loads(Path(spec.input_path).read_text(encoding="utf-8"))
         jsonschema.validate(written, json.loads(schema_path.read_text(encoding="utf-8")))
 
+    def test_a_stage_model_override_names_its_runtime_too(self, tmp_path: Path) -> None:
+        """`--model` resolves through a chain and agent-run wants the runtime
+        named alongside it."""
+        launcher = RecordingLauncher()
+        actor = make_actor(tmp_path, launcher)
+        actor.models = {"continuous_review": "deepseek-v4-pro"}
+
+        actor.act(REVIEW, dispatch_for(REVIEW))
+        actor.act(IMPLEMENT, dispatch_for(IMPLEMENT))
+
+        review_spec, implement_spec = (spec for spec, _ in launcher.launched)
+        assert review_spec.model == "deepseek-v4-pro"
+        assert review_spec.runtime == "opencode"
+        assert implement_spec.model is None, "no override means the role's own selector"
+        assert implement_spec.runtime is None
+
     def test_write_is_asked_for_only_where_the_product_changes(self, tmp_path: Path) -> None:
         """A role's `write` is a ceiling, not a grant. Asking for it where the
         role forbids it is refused outright, and reviewers forbid it -- a

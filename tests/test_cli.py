@@ -54,6 +54,34 @@ class TestTheDdSubcommand:
         assert build_parser().parse_args(base).publish_merge is False
         assert build_parser().parse_args([*base, "--publish-merge"]).publish_merge is True
 
+    def test_stage_model_overrides_accumulate(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "dd",
+                "run",
+                "--development",
+                "d",
+                "--workspace",
+                "/tmp/w",
+                "--plugin-binding",
+                "/tmp/b.json",
+                "--remote-url",
+                "u",
+                "--remote-ref",
+                "refs/heads/main",
+                "--root-digest",
+                "sha256:" + "a" * 64,
+                "--stage-model",
+                "continuous_review=deepseek-v4-pro",
+                "--stage-model",
+                "final_review=claude-opus-5",
+            ]
+        )
+        assert dict(p.split("=", 1) for p in args.stage_model) == {
+            "continuous_review": "deepseek-v4-pro",
+            "final_review": "claude-opus-5",
+        }
+
     def test_acceptance_commands_accumulate(self) -> None:
         args = build_parser().parse_args(
             [
