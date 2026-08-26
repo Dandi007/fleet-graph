@@ -16,12 +16,21 @@ So this is a seat -> probe mapping, not a global check. Two faces exist today:
   because the subscription channel only accepts streaming requests. A
   non-streaming probe there fails for the wrong reason.
 
+A face is an endpoint *and* a credential. Gateway tokens are scoped to channel
+groups, so the OpenAI-lane token cannot reach the subscription channels at all:
+probing /v1/responses with it returns 503 "No available channel for model
+gpt-5.6-sol under group anthropic" while the seat is perfectly healthy. That is
+a false negative produced by the probe itself -- measured, not hypothesised --
+which is why ProbeSpec carries the env var naming its lane. The babysitter
+encodes the same thing as two separate curl header files.
+
 Adding a seat means adding its probe. A seat with no registered probe is
 refused ignition rather than silently defaulting to someone else's face.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -31,10 +40,13 @@ PROBE_TIMEOUT_SECONDS = 30.0
 
 @dataclass(frozen=True)
 class ProbeSpec:
-    """One probe: where to post, what to send, and what proves it is alive."""
+    """One probe: the lane, where to post, what to send, and what proves life."""
 
     path: str
     body: dict[str, Any]
+    # Env var holding the token for this lane. Tokens are scoped to channel
+    # groups; the wrong one reports a healthy seat as dead.
+    token_env: str
     # The response is healthy if any of these appear in it. Substring markers
     # rather than parsed JSON because the responses face answers with SSE.
     healthy_markers: tuple[str, ...]
@@ -43,16 +55,20 @@ class ProbeSpec:
         return any(marker in raw for marker in self.healthy_markers)
 
 
-def openai_probe(model: str) -> ProbeSpec:
+def openai_probe(model: str, token_env: str = "FLEET_GRAPH_GATEWAY_TOKEN") -> ProbeSpec:
     return ProbeSpec(
+        token_env=token_env,
         path="/v1/chat/completions",
         body={"model": model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 16},
         healthy_markers=('"choices"',),
     )
 
 
-def responses_probe(model: str) -> ProbeSpec:
+def responses_probe(
+    model: str, token_env: str = "FLEET_GRAPH_GATEWAY_TOKEN_RESPONSES"
+) -> ProbeSpec:
     return ProbeSpec(
+        token_env=token_env,
         path="/v1/responses",
         body={
             "model": model,
@@ -93,7 +109,11 @@ def probe_for(seat: str) -> ProbeSpec:
 
 
 class ProbeTransport(Protocol):
-    def post(self, url: str, body: dict[str, Any]) -> tuple[int, str]: ...
+    def post(self, url: str, body: dict[str, Any], token: str) -> tuple[int, str]: ...
+
+
+class MissingProbeCredential(RuntimeError):
+    """The lane's env var is unset. Refuse rather than probe unauthenticated."""
 
 
 class GatewayProber:
@@ -102,15 +122,23 @@ class GatewayProber:
         transport: ProbeTransport,
         *,
         base_url: str = DEFAULT_GATEWAY_URL,
+        env: dict[str, str] | None = None,
     ) -> None:
         self.transport = transport
         self.base_url = base_url.rstrip("/")
+        self.env = env if env is not None else dict(os.environ)
 
     def check(self, seat: str) -> bool:
         """True when the seat's own dependency face answers healthily."""
         spec = probe_for(seat)
+        token = self.env.get(spec.token_env)
+        if not token:
+            raise MissingProbeCredential(
+                f"seat {seat!r} probes the {spec.token_env} lane, but that variable is unset; "
+                "probing with another lane's token reports healthy seats as dead"
+            )
         try:
-            status, raw = self.transport.post(f"{self.base_url}{spec.path}", spec.body)
+            status, raw = self.transport.post(f"{self.base_url}{spec.path}", spec.body, token)
         except Exception:
             # Unreachable gateway is red, not an exception to propagate: the
             # caller's job is to decide about ignition, not to crash.
@@ -123,6 +151,7 @@ class GatewayProber:
 __all__ = [
     "SEAT_PROBES",
     "GatewayProber",
+    "MissingProbeCredential",
     "ProbeSpec",
     "UnknownSeat",
     "openai_probe",
