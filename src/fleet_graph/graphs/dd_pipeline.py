@@ -18,14 +18,13 @@ it::
 - **actor** is an agent run for an `llm` stage and an in-process callable for a
   `script` stage. Which one is decided by the contract's `actor` field, not by
   a registry that could disagree with it.
-- **materialize** is where the authoritative commit comes from, and the state's
-  `head_commit` is set from it rather than from anything the actor said. The
-  contract's `commit_binding` then compares the receipt's `output_commit`
-  against the commit the next stage will actually start from. In dd both are
-  meant to come from the deterministic sealer, so agreement is the expected
-  case -- which is exactly why a disagreement is worth stopping on: one of the
-  two is not what it claims to be, and the alternative is handing the next
-  stage a phantom commit.
+- **materialize** is where the authoritative commit comes from, and it returns
+  a receipt as well. **An actor reports; a sealer attests.** The sealer's
+  receipt supersedes the actor's claim, so an actor that invents an
+  `output_commit` changes nothing downstream -- the chain is built from what
+  was actually written. What the contract's `commit_binding` still catches is
+  a sealer whose attestation disagrees with the commit it produced, which is
+  the difference between a broken chain and a phantom one handed onward.
 - **output_verify** refuses a stage that reported success without producing
   what it declared.
 
@@ -43,7 +42,8 @@ vote by resuming it -- which is the same reason `bus/board.py` has no
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -56,6 +56,7 @@ from fleet_graph.dd.lifecycle import (
     LifecycleError,
     Stage,
 )
+from fleet_graph.state.run_artifacts import iso
 
 # The event an actor reports when nothing was steered -- the spine edge.
 SPINE_EVENT = "success"
@@ -125,14 +126,24 @@ class Actor(Protocol):
     def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome: ...
 
 
-class Materializer(Protocol):
-    """Produces the authoritative commit for a stage's output.
+@dataclass(frozen=True)
+class Sealed:
+    """What the materializer produced: the authoritative commit, and the receipt.
 
-    Independent of the actor on purpose: it is the second opinion the
-    contract's `commit_binding` compares the receipt against.
+    The receipt matters as much as the commit. It is the sealer's own account
+    of what it wrote, and it -- not the actor's claim -- is what the contract's
+    bindings are checked against downstream. An actor reports; a sealer
+    attests.
     """
 
-    def materialize(self, stage: Stage, dispatch: Dispatch, outcome: StageOutcome) -> str: ...
+    commit: str
+    receipt: dict[str, Any] | None = None
+
+
+class Materializer(Protocol):
+    """Produces the authoritative commit for a stage's output."""
+
+    def materialize(self, stage: Stage, dispatch: Dispatch, outcome: StageOutcome) -> Sealed: ...
 
 
 @dataclass(frozen=True)
@@ -150,6 +161,7 @@ class PipelineState(TypedDict, total=False):
     mode: str
     generation: int
     attempt: int
+    attempt_started_at: str
     head_commit: str
     artifacts: dict[str, str]
     steps: int
@@ -175,6 +187,13 @@ class PipelineDeps:
     capability: CapabilityLock | None = None
     bounds: PipelineBounds = field(default_factory=PipelineBounds)
     observe: Any = None
+    # Stamped once per attempt, never per step. The sealer puts this in the
+    # commit it writes, so a retry that re-stamped would produce a different
+    # commit for the same work -- and the forward chain would stop matching.
+    clock: Any = None
+
+    def stamp(self) -> str:
+        return iso(self.clock() if self.clock is not None else time.time())
 
     def actor_for(self, stage: Stage) -> Actor:
         """The contract's `actor` field decides, not a registry that could differ."""
@@ -233,7 +252,9 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             "mode": state.get("mode", MODE_INITIAL),
             "generation": state.get("generation", 1),
             "attempt": state.get("attempt", 1),
+            "attempt_started_at": state.get("attempt_started_at", ""),
             "input_commit": state.get("head_commit", ""),
+            "parent_receipt": dict(state.get("last_receipt") or {}),
             "required_artifacts": list(stage.required_artifacts),
             "produced_artifacts": list(stage.produced_artifacts),
             "contract_version": lifecycle.contract_version,
@@ -316,7 +337,12 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                         fault=True,
                     )
                 try:
-                    head_commit = deps.materializer.materialize(stage, dispatch, outcome)
+                    sealed = deps.materializer.materialize(stage, dispatch, outcome)
+                    head_commit = sealed.commit
+                    if sealed.receipt is not None:
+                        # The sealer attested; its account supersedes the
+                        # actor's claim for every downstream binding.
+                        outcome = replace(outcome, receipt=sealed.receipt)
                 except StageRefused as refused:
                     # The sealer, not the actor, can end a stage too: a
                     # non-applied receipt is a legitimate "I will not apply
@@ -423,6 +449,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             "stage": transition.target,
             "mode": transition.next_mode,
             "attempt": state.get("attempt", 1) + 1,
+            "attempt_started_at": deps.stamp(),
             "rework_count": rework,
         }
 
@@ -448,6 +475,7 @@ def initial_state(
     head_commit: str,
     artifacts: dict[str, str],
     generation: int = 1,
+    attempt_started_at: str = "",
 ) -> PipelineState:
     """The pipeline's entry state. `artifacts` seeds the root inputs (the spec)."""
     return {
@@ -456,6 +484,7 @@ def initial_state(
         "mode": MODE_INITIAL,
         "generation": generation,
         "attempt": 1,
+        "attempt_started_at": attempt_started_at or iso(time.time()),
         "head_commit": head_commit,
         "artifacts": dict(artifacts),
         "steps": 0,
@@ -484,6 +513,7 @@ __all__ = [
     "PipelineDeps",
     "PipelineFault",
     "PipelineState",
+    "Sealed",
     "StageOutcome",
     "StageRefused",
     "build_dd_pipeline_graph",
