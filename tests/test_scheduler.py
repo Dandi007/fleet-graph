@@ -130,15 +130,21 @@ class TestSeatAwareProbes:
             assert spec.healthy_markers, seat
 
 
+ENV = {
+    "FLEET_GRAPH_GATEWAY_TOKEN": "openai-lane-token",
+    "FLEET_GRAPH_GATEWAY_TOKEN_RESPONSES": "responses-lane-token",
+}
+
+
 class FakeTransport:
     def __init__(self, status_code: int = 200, raw: str = "", raises: Exception | None = None):
         self.status_code = status_code
         self.raw = raw
         self.raises = raises
-        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.calls: list[tuple[str, dict[str, Any], str]] = []
 
-    def post(self, url: str, body: dict[str, Any]) -> tuple[int, str]:
-        self.calls.append((url, body))
+    def post(self, url: str, body: dict[str, Any], token: str) -> tuple[int, str]:
+        self.calls.append((url, body, token))
         if self.raises is not None:
             raise self.raises
         return self.status_code, self.raw
@@ -146,32 +152,32 @@ class FakeTransport:
 
 class TestProberBehaviour:
     def test_healthy_openai_response(self) -> None:
-        prober = GatewayProber(FakeTransport(200, '{"choices": [{"text": "pong"}]}'))
+        prober = GatewayProber(FakeTransport(200, '{"choices": [{"text": "pong"}]}'), env=ENV)
         assert prober.check("opencode-dsv4pro") is True
 
     def test_healthy_streaming_responses_frame(self) -> None:
-        prober = GatewayProber(FakeTransport(200, 'data: {"status": "completed"}\n\n'))
+        prober = GatewayProber(FakeTransport(200, 'data: {"status": "completed"}\n\n'), env=ENV)
         assert prober.check("opencode-gpt-terra") is True
 
     def test_wrong_shaped_body_is_red(self) -> None:
-        prober = GatewayProber(FakeTransport(200, '{"error": "no channel available"}'))
+        prober = GatewayProber(FakeTransport(200, '{"error": "no channel available"}'), env=ENV)
         assert prober.check("opencode-gpt-terra") is False
 
     def test_non_2xx_is_red(self) -> None:
-        prober = GatewayProber(FakeTransport(502, "bad gateway"))
+        prober = GatewayProber(FakeTransport(502, "bad gateway"), env=ENV)
         assert prober.check("opencode-dsv4pro") is False
 
     def test_unreachable_gateway_is_red_not_an_exception(self) -> None:
-        prober = GatewayProber(FakeTransport(raises=OSError("connection refused")))
+        prober = GatewayProber(FakeTransport(raises=OSError("connection refused")), env=ENV)
         assert prober.check("opencode-dsv4pro") is False
 
     def test_probe_targets_the_loopback_gateway(self) -> None:
         transport = FakeTransport(200, '{"choices": []}')
-        GatewayProber(transport).check("opencode-dsv4pro")
+        GatewayProber(transport, env=ENV).check("opencode-dsv4pro")
         assert transport.calls[0][0].startswith("http://127.0.0.1:15722")
 
     def test_unknown_seat_propagates(self) -> None:
-        prober = GatewayProber(FakeTransport(200, ""))
+        prober = GatewayProber(FakeTransport(200, ""), env=ENV)
         with pytest.raises(UnknownSeat):
             prober.check("opencode-mystery")
 
@@ -185,3 +191,39 @@ class TestProbeSpecHelpers:
         spec = responses_probe("m")
         assert spec.is_healthy('{"status": "completed"}') is True
         assert spec.is_healthy('{"status":"completed"}') is True
+
+
+class TestCredentialLanes:
+    """A face is an endpoint *and* a credential.
+
+    Measured on the live gateway: probing /v1/responses with the OpenAI-lane
+    token returns 503 'No available channel for model gpt-5.6-sol under group
+    anthropic' while the seat is perfectly healthy. Tokens are scoped to
+    channel groups, so the wrong one manufactures a false negative -- the exact
+    defect class seat-aware probing exists to prevent.
+    """
+
+    def test_each_face_names_its_own_lane(self) -> None:
+        assert probe_for("opencode-dsv4pro").token_env == "FLEET_GRAPH_GATEWAY_TOKEN"
+        for seat in ("opencode-gpt-terra", "opencode-gpt-sol"):
+            assert probe_for(seat).token_env == "FLEET_GRAPH_GATEWAY_TOKEN_RESPONSES"
+
+    def test_the_lane_token_is_the_one_sent(self) -> None:
+        transport = FakeTransport(200, 'data: {"status": "completed"}')
+        GatewayProber(transport, env=ENV).check("opencode-gpt-terra")
+        assert transport.calls[0][2] == "responses-lane-token"
+
+    def test_openai_seat_sends_the_openai_token(self) -> None:
+        transport = FakeTransport(200, '{"choices": []}')
+        GatewayProber(transport, env=ENV).check("opencode-dsv4pro")
+        assert transport.calls[0][2] == "openai-lane-token"
+
+    def test_a_missing_lane_credential_raises_rather_than_probing(self) -> None:
+        """Silently falling back to another lane is how the false negative happens."""
+        from fleet_graph.scheduler.probe import MissingProbeCredential
+
+        transport = FakeTransport(200, "")
+        prober = GatewayProber(transport, env={"FLEET_GRAPH_GATEWAY_TOKEN": "x"})
+        with pytest.raises(MissingProbeCredential, match="reports healthy seats as dead"):
+            prober.check("opencode-gpt-sol")
+        assert transport.calls == []
