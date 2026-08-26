@@ -223,4 +223,22 @@ __all__ = [
     "RunArtifacts",
     "iso",
     "signal_terminal_name",
+    "write_json_durable",
 ]
+
+
+def write_json_durable(path: str | Path, obj: Any) -> Path:
+    """Write JSON and make it durable before returning.
+
+    The flush-then-fsync is the whole point: without it the data sits in the
+    page cache, and a machine that loses power after the caller acked its
+    inbox deliveries comes back with the messages gone from both sides. This
+    is what `Inbox.drain_then_ack` requires of its persist callback.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8") as handle:
+        json.dump(obj, handle, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return target
