@@ -70,10 +70,86 @@ class TestCommand:
         assert "--setenv=AGENT_RUNTIME_ROOT=/data/x" in spec.argv()
 
     def test_logs_append_rather_than_truncate(self, spec: LaunchSpec) -> None:
-        """A restart must not erase the previous generation's log."""
-        joined = " ".join(spec.argv())
-        assert "StandardOutput=append:" in joined
-        assert "StandardError=append:" in joined
+        """A restart must not erase the previous generation's log.
+
+        Checked per argv element, not on a joined string. The first version
+        joined argv with spaces and asserted a substring -- which passes for
+        `["-p StandardOutput=append:x"]` just as happily as for
+        `["--property=StandardOutput=append:x"]`. Joining argv back together
+        destroys exactly the information that was wrong.
+        """
+        argv = spec.argv()
+        assert f"--property=StandardOutput=append:{spec.log_file}" in argv
+        assert f"--property=StandardError=append:{spec.log_file}" in argv
+
+    def test_no_argument_smuggles_a_flag_and_its_value_into_one_token(
+        self, spec: LaunchSpec
+    ) -> None:
+        """There is no shell between us and systemd-run.
+
+        `"-p StandardOutput=append:/x"` is one execve argument whose value
+        starts with a space; systemd-run reports `Unknown assignment:` and
+        looks for all the world like a misspelled property name. This is the
+        general form of that bug, so it also catches the next one.
+        """
+        for arg in spec.argv():
+            if arg.startswith("-"):
+                assert " " not in arg, arg
+
+
+class TestSystemdRunActuallyAcceptsIt:
+    """Three deploy-only defects in a row said string tests are not enough.
+
+    A unit that names a subcommand that does not exist, a key spelled so
+    systemd drops it, a property packed into one token -- all three passed
+    every test in this repo and all three only failed on the real machine.
+    So this one hands the real argv to the real systemd-run.
+    """
+
+    def test_the_real_binary_accepts_the_properties(self, tmp_path: Path) -> None:
+        import shutil
+        import subprocess
+
+        if shutil.which("systemd-run") is None:
+            pytest.skip("systemd-run not available")
+        spec = LaunchSpec(
+            folder_id="selftest",
+            seat="s",
+            run_root=tmp_path / "runs",
+            log_path=tmp_path / "logs" / "selftest.log",
+            unit_prefix="fleet-graph-launcher-selftest",
+            working_directory=str(tmp_path),
+            executable="/bin/true",
+        )
+        # Everything up to and including the executable: the flags are what
+        # systemd-run parses, and /bin/true needs none of the line arguments.
+        full = spec.argv()
+        argv = full[: full.index(spec.executable) + 1]
+        (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+        done = subprocess.run(argv, capture_output=True, text=True, check=False)
+        subprocess.run(
+            ["systemctl", "--user", "stop", spec.unit_name],
+            capture_output=True,
+            check=False,
+        )
+        assert "Unknown assignment" not in done.stderr, done.stderr
+        assert "Invalid" not in done.stderr, done.stderr
+        assert done.returncode == 0, done.stderr
+
+
+class TestTheLogDirectoryExists:
+    def test_launch_creates_it(self, tmp_path: Path) -> None:
+        """`append:` does not create the directory -- systemd fails the unit
+        and the line never starts. /data/fleet-graph/logs did not exist on the
+        first real launch, waiting directly behind the property bug."""
+        spec = LaunchSpec(
+            folder_id="wf-1",
+            seat="s",
+            log_path=tmp_path / "deep" / "nested" / "wf-1.log",
+            executable="/bin/false",
+        )
+        TransientLauncher().launch(spec)
+        assert (tmp_path / "deep" / "nested").is_dir()
 
 
 class TestDryRun:
