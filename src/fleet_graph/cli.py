@@ -94,6 +94,11 @@ def _dd_run(args: argparse.Namespace) -> int:
     from fleet_graph.dd.vendor.plugin_adapter import load_plugin_binding
     from fleet_graph.graphs.dd_runner import DevelopmentConfig, run_pipeline
 
+    if args.resume and not args.checkpoint:
+        # An in-memory checkpointer has no thread to resume. Silently starting
+        # over would re-dispatch stages that are already sealed.
+        raise SystemExit("--resume needs the --checkpoint the run was started with")
+
     workspace = pathlib.Path(args.workspace).resolve()
     binding = load_plugin_binding(plugin_binding_config(pathlib.Path(args.plugin_binding)))
 
