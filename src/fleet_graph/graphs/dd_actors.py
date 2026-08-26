@@ -55,6 +55,17 @@ DEFAULT_ROLES = {
     "final_review": "final_reviewer",
 }
 
+# agent-runtime's `attempt-context.v1.json` has its own stage vocabulary, and
+# it is not the contract's: `review` where dd says `continuous_review`, and
+# `final-review` -- hyphen -- where dd says `final_review`. Two vocabularies
+# for the same three stages, so the translation has to be written down. Its
+# values are pinned against that schema's enum by test.
+ROLE_STAGE = {
+    "implement": "implement",
+    "continuous_review": "review",
+    "final_review": "final-review",
+}
+
 # Which stage owns which protocol artifact, per the contract. Defined here so
 # the materializer and the dispatcher agree by construction.
 IMPLEMENT_HANDOFF_ARTIFACT = "attempt_context_implement_handoff"
@@ -124,7 +135,7 @@ class AgentRunStageActor:
             ),
             "development_id": self.development_id,
             "spec_commit": dispatch["input_commit"],
-            "stage": stage.id,
+            "stage": ROLE_STAGE.get(stage.id, stage.id),
             "worktree_path": str(self.worktree_path),
             "run_id": run_id,
         }
@@ -313,6 +324,7 @@ class BoardGate:
 __all__ = [
     "DEFAULT_ROLES",
     "GATE_APPROVE",
+    "ROLE_STAGE",
     "AgentRunStageActor",
     "BoardGate",
     "implement_stage",
