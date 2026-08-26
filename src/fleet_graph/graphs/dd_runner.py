@@ -152,6 +152,9 @@ def build_pipeline(
         ),
         stage_producing(lifecycle, ACCEPTANCE_RESULT): AcceptanceStage(
             repo=config.workspace_path,
+            # The same declaration configure writes down. Acceptance runs this,
+            # not whatever the worktree ended up containing.
+            declared=[list(c) for c in (config.run_config.get("acceptance_commands") or [])],
             timeout_seconds=config.acceptance_timeout_seconds,
         ),
         stage_producing(lifecycle, MERGE_RESULT): MergeStage(

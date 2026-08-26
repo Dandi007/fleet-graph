@@ -20,6 +20,7 @@ from fleet_graph.graphs.dd_scripts import (
     ConfigureStage,
     MergeStage,
     WorkspaceSealer,
+    write_json,
 )
 
 LIFECYCLE = Lifecycle.load()
@@ -58,9 +59,14 @@ class TestAcceptance:
             CONFIGURE, dispatch()
         )
 
+    def _acceptance(self, repo: Path, commands: list[list[str]]) -> AcceptanceStage:
+        """How build_pipeline wires it: one declaration, written down by
+        configure and handed to acceptance."""
+        return AcceptanceStage(repo=repo, declared=commands)
+
     def test_a_passing_run_records_what_it_ran(self, repo: Path) -> None:
         self._configure(repo, [["true"], ["echo", "hello"]])
-        outcome = AcceptanceStage(repo=repo).act(ACCEPTANCE, dispatch())
+        outcome = self._acceptance(repo, [["true"], ["echo", "hello"]]).act(ACCEPTANCE, dispatch())
 
         written = json.loads((repo / ACCEPTANCE_PATH).read_text(encoding="utf-8"))
         assert written["passed"] is True
@@ -75,7 +81,7 @@ class TestAcceptance:
         """The run happened and the answer was no. That is a refusal, not a fault."""
         self._configure(repo, [["false"]])
         with pytest.raises(StageRefused, match="acceptance failed"):
-            AcceptanceStage(repo=repo).act(ACCEPTANCE, dispatch())
+            self._acceptance(repo, [["false"]]).act(ACCEPTANCE, dispatch())
 
         written = json.loads((repo / ACCEPTANCE_PATH).read_text(encoding="utf-8"))
         assert written["passed"] is False
@@ -85,11 +91,34 @@ class TestAcceptance:
         with pytest.raises(StageRefused, match="configure did not run"):
             AcceptanceStage(repo=repo).act(ACCEPTANCE, dispatch())
 
+    def test_the_graded_cannot_edit_the_exam(self, repo: Path) -> None:
+        """Measured before it was written: the same repo with a failing test
+        went from refused to `passed: true` once the acceptance command in the
+        worktree was replaced with `true`. The implementer's role grants
+        `write: [worktree_path]`, so it can do exactly that."""
+        self._configure(repo, [["false"]])
+        write_json(repo, RUN_CONFIG_PATH, {"acceptance_commands": [["true"]]})
+
+        with pytest.raises(StageRefused, match="nobody declared"):
+            self._acceptance(repo, [["false"]]).act(ACCEPTANCE, dispatch())
+
+        assert not (repo / ACCEPTANCE_PATH).exists(), "a refused acceptance records no verdict"
+
+    def test_commands_appearing_from_nowhere_are_refused(self, repo: Path) -> None:
+        """The empty declaration is not a wildcard: a run configured with no
+        acceptance commands must not execute ones the worktree supplies."""
+        write_json(repo, RUN_CONFIG_PATH, {"acceptance_commands": [["touch", "pwned"]]})
+
+        with pytest.raises(StageRefused, match="nobody declared"):
+            self._acceptance(repo, []).act(ACCEPTANCE, dispatch())
+
+        assert not (repo / "pwned").exists()
+
     def test_no_declared_commands_passes_vacuously(self, repo: Path) -> None:
         """Declaring nothing to check is the caller's business, not a failure --
         but the record says plainly that nothing ran."""
         self._configure(repo, [])
-        AcceptanceStage(repo=repo).act(ACCEPTANCE, dispatch())
+        self._acceptance(repo, []).act(ACCEPTANCE, dispatch())
         written = json.loads((repo / ACCEPTANCE_PATH).read_text(encoding="utf-8"))
         assert written["results"] == []
         assert written["passed"] is True
