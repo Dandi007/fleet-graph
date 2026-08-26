@@ -33,17 +33,18 @@ PLACEHOLDER = re.compile(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)(\?)?\}\}")
 IMPLEMENT_PERSONA = "implement/personas/implementer.md"
 IMPLEMENT_TEMPLATE = "implement/templates/implement.md"
 
-# How to hand the result back. The bundle's persona is written for
-# loop-engine's harness, which collects the result over its own dependency
-# channel, so it says nothing about envelopes. fleet-graph dispatches through
-# `agent-run`, and how the answer travels is therefore fleet-graph's to state.
-# Leaving it unsaid is what an earlier run did, and the agent did the work and
-# then returned nothing a machine could read.
+# A restatement of how the result travels, not a missing instruction: both
+# personas already say to put the object in `Envelope.result`. It is here
+# because three real runs returned it once. The bundle's persona spreads the
+# required fields across two bullet groups and describes them in prose; this
+# lists them concretely at the end, where the last thing read is the thing
+# asked for. Cheap, and it costs nothing if the persona was already enough.
 RESULT_TRANSPORT = """\
-## Returning your result (fleet-graph dispatch)
+## Result checklist (fleet-graph dispatch)
 
-Put one JSON object in `Envelope.result` -- not in prose, not in a fenced block
-in your commentary. It must carry exactly:
+To restate the reporting rule above concretely: put one JSON object in
+`Envelope.result` -- not in prose, not in a fenced block in your commentary.
+It must carry exactly:
 
 - `actor_job_id`: the `actor_job_id` given above, echoed back verbatim
 - `input_commit`: the `input_commit` given above, echoed back verbatim
