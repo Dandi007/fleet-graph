@@ -281,8 +281,29 @@ class Scheduler:
         it, so re-reading the same file on every 60s tick does not inflate the
         streak.
         """
-        state = self.stall_state(folder_id)
         record = self.terminal_record(folder_id)
+        if not self._stall_path(folder_id).exists():
+            # No bookkeeping yet: whatever terminal is lying there was not
+            # written by a run this file witnessed. Adopt it as the baseline
+            # instead of counting it.
+            #
+            # This is what makes the documented escape hatch true. The runbook
+            # says "delete the counter file to retry now"; without this, the
+            # very next tick re-reads the same old terminal -- already counted
+            # once, before the delete -- and the streak comes back as 1 rather
+            # than 0. Observed after clearing the canary's backoff by hand.
+            #
+            # It is also the honest reading in general: one terminal is not a
+            # streak, and a failure from before we were watching is not ours
+            # to count.
+            if record is not None and record.get("run_id") is not None:
+                self._write_stall_state(
+                    folder_id,
+                    {"streak": 0, "accounted_run_id": record["run_id"], "last_start_at": None},
+                )
+            return 0
+
+        state = self.stall_state(folder_id)
         if record is None:
             return int(state["streak"])
         run_id = record.get("run_id")

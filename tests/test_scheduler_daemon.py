@@ -224,8 +224,17 @@ def write_terminal_record(
 
 
 class TestTheStallStreak:
+    """These seed the bookkeeping with `record_start` before writing a
+    terminal, because that is the real sequence: the scheduler writes the
+    state file when it launches, so by the time a terminal from that launch
+    appears the file always exists. Writing a terminal with no bookkeeping at
+    all means something else produced it -- see
+    `test_a_terminal_from_before_we_watched_is_not_our_streak`.
+    """
+
     def test_a_fruitless_run_counts(self, tmp_path: Path) -> None:
         scheduler = make(tmp_path)
+        scheduler.record_start("wf-1", 1000.0)
         write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1")
         assert scheduler.account_last_run("wf-1") == 1
 
@@ -233,11 +242,13 @@ class TestTheStallStreak:
         """The scheduler re-reads this file every 60s. Counting per read would
         put a line into a six-hour backoff within minutes of one bad run."""
         scheduler = make(tmp_path)
+        scheduler.record_start("wf-1", 1000.0)
         write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1")
         assert [scheduler.account_last_run("wf-1") for _ in range(5)] == [1, 1, 1, 1, 1]
 
     def test_consecutive_fruitless_runs_accumulate(self, tmp_path: Path) -> None:
         scheduler = make(tmp_path)
+        scheduler.record_start("wf-1", 1000.0)
         for n in (1, 2, 3):
             write_terminal_record(tmp_path, "wf-1", "blocked", 0, f"run-{n}")
             assert scheduler.account_last_run("wf-1") == n
@@ -246,6 +257,7 @@ class TestTheStallStreak:
         """Progress is progress even if the line then blocked. The guard is
         about lines going nowhere, not about lines ending unhappily."""
         scheduler = make(tmp_path)
+        scheduler.record_start("wf-1", 1000.0)
         write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1")
         scheduler.account_last_run("wf-1")
         write_terminal_record(tmp_path, "wf-1", "blocked", 2, "run-2")
@@ -253,6 +265,7 @@ class TestTheStallStreak:
 
     def test_finishing_clears_the_streak(self, tmp_path: Path) -> None:
         scheduler = make(tmp_path)
+        scheduler.record_start("wf-1", 1000.0)
         write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1")
         scheduler.account_last_run("wf-1")
         write_terminal_record(tmp_path, "wf-1", "done", 0, "run-2")
@@ -262,10 +275,44 @@ class TestTheStallStreak:
         """The daemon restarts on every release. A counter that reset on deploy
         would send a stuck line back to full speed exactly when we ship --
         which is when nobody is watching that line."""
+        make(tmp_path).record_start("wf-1", 1000.0)
         write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1")
         make(tmp_path).account_last_run("wf-1")
         write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-2")
         assert make(tmp_path).account_last_run("wf-1") == 2, "streak was kept in memory"
+
+    def test_deleting_the_counter_file_really_resets(self, tmp_path: Path) -> None:
+        """The runbook's escape hatch has to mean what it says.
+
+        `docs/operating.md` tells an operator to delete the counter file to
+        make a backed-off line retry now. Without a baseline step the very
+        next tick re-reads the same terminal -- already counted once, before
+        the delete -- and the streak comes back as 1 instead of 0. Observed
+        for real after clearing the canary's backoff by hand.
+        """
+        scheduler = make(tmp_path)
+        scheduler.record_start("wf-1", 1000.0)
+        for n in (1, 2, 3):
+            write_terminal_record(tmp_path, "wf-1", "blocked", 0, f"run-{n}")
+            scheduler.account_last_run("wf-1")
+        scheduler._stall_path("wf-1").unlink()
+        assert scheduler.account_last_run("wf-1") == 0
+        # And it stays 0: the adopted terminal must not be counted later either.
+        assert scheduler.account_last_run("wf-1") == 0
+
+    def test_a_terminal_from_before_we_watched_is_not_our_streak(self, tmp_path: Path) -> None:
+        """One terminal is not a streak. A line whose last run failed long
+        before this scheduler existed starts at zero, not at one."""
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "ancient")
+        assert make(tmp_path).account_last_run("wf-1") == 0
+
+    def test_the_baseline_does_not_swallow_the_next_failure(self, tmp_path: Path) -> None:
+        """Adopting a terminal must not make the guard blind afterwards."""
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "ancient")
+        scheduler = make(tmp_path)
+        scheduler.account_last_run("wf-1")
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "next")
+        assert scheduler.account_last_run("wf-1") == 1
 
     def test_no_terminal_yet_is_not_a_stall(self, tmp_path: Path) -> None:
         assert make(tmp_path).account_last_run("wf-1") == 0
@@ -274,10 +321,10 @@ class TestTheStallStreak:
         """A counter nothing consults is a counter that looks like a working
         guard right up until the line it should have held restarts anyway."""
         scheduler = make(tmp_path, now=1000.0)
+        scheduler.record_start("wf-1", 1000.0 - 400)
         for n in (1, 2, 3):
             write_terminal_record(tmp_path, "wf-1", "blocked", 0, f"run-{n}")
             scheduler.account_last_run("wf-1")
-        scheduler.last_start_at["wf-1"] = 1000.0 - 400
         assert scheduler.tick()[0].decision.refusal is Refusal.NO_PROGRESS
 
 
