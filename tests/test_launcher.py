@@ -136,6 +136,40 @@ class TestSystemdRunActuallyAcceptsIt:
         assert "Invalid" not in done.stderr, done.stderr
         assert done.returncode == 0, done.stderr
 
+    def test_the_binary_would_actually_notice(self, tmp_path: Path) -> None:
+        """Premise test: prove the check above can fail.
+
+        systemd-run connects to the bus *before* it parses properties, so with
+        no user session bus both the right spelling and the wrong one produce
+        the same connection error -- and a test that only asserted on stderr
+        content would call that a pass. This feeds it the old broken form and
+        requires the complaint. If this fails, the check above proves nothing
+        about how we spell properties.
+        """
+        import shutil
+        import subprocess
+
+        if shutil.which("systemd-run") is None:
+            pytest.skip("systemd-run not available")
+        done = subprocess.run(
+            [
+                "systemd-run",
+                "--user",
+                "--collect",
+                "--unit",
+                "fleet-graph-launcher-premise",
+                "-p StandardOutput=append:" + str(tmp_path / "x.log"),
+                "/bin/true",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert "Unknown assignment" in done.stderr, (
+            "systemd-run accepted a flag and value packed into one token; it is probably "
+            f"failing before it parses anything. stderr={done.stderr!r}"
+        )
+
 
 class TestTheLogDirectoryExists:
     def test_launch_creates_it(self, tmp_path: Path) -> None:

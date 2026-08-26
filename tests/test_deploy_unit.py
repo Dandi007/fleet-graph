@@ -89,6 +89,35 @@ class TestTheUnitCannotFailForUnreadableReasons:
         noise = done.stderr + done.stdout
         assert "Unknown key" not in noise, noise
 
+    def test_the_verifier_would_actually_notice(self, tmp_path: Path) -> None:
+        """Premise test: prove the check above can fail.
+
+        `systemd-analyze verify` exits 0 when it cannot reach a user manager
+        at all, printing "Failed to initialize manager" and parsing nothing --
+        so the assertion above passes without having looked. That is worse
+        than a hard failure: it is a green light from a check that never ran.
+        This feeds it a unit with a deliberately misspelled key and requires
+        the complaint. If this test fails, the one above proves nothing.
+        """
+        analyze = shutil.which("systemd-analyze")
+        if analyze is None:
+            pytest.skip("systemd-analyze not available")
+        broken = tmp_path / "broken.service"
+        broken.write_text(
+            "[Service]\nType=simple\nExecStart=/bin/true\n-EnvironmentFile=/tmp/nope\n",
+            encoding="utf-8",
+        )
+        done = subprocess.run(
+            [analyze, "--user", "verify", str(broken)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert "Unknown key" in done.stderr + done.stdout, (
+            "systemd-analyze did not flag a key it should not recognise; it is probably "
+            "running without a user manager and parsing nothing"
+        )
+
     def test_no_credential_is_baked_into_the_unit(self) -> None:
         """Credentials are env-only (golden rule 3). A token in a unit file is
         a token in git."""
