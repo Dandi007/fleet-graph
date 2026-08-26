@@ -23,8 +23,21 @@ CONFIG = Path(__file__).resolve().parent.parent / "config" / "ronin-lines.json"
 # merger-plugin. dev-dispatch was only the vehicle, and fleet-graph is now
 # that vehicle. Classifying by title instead of by goal is the same
 # "name match is not semantics" trap this repo keeps hitting.
-# P7 §5-D2：爆炸半径最小（只改告警配置面），且产物人眼可验。
+# P7 §5-D2：金丝雀爆炸半径最小（只改告警配置面），且产物人眼可验。
 CANARY = "wf-40fa8d"
+
+# 第二批：可观测 / 额度类，改面板与配置，不动核心服务。金丝雀已实证引擎
+# 全链（25 轮无重复推进 → dd 四阶段封存 → 真实产品 diff → 在授权边界正确
+# 停住），四处迁移等价缺口已补齐（执行器指向不可变 release、线的 PATH、
+# 启动间隔、退避）。放量由 agent 依用户 2026-08-27 02:0x 全权委托代行。
+BATCH_TWO = {
+    CANARY,
+    "wf-7bc4d1",  # llm-usage-dashboard
+    "wf-6475fd",  # observability-onboarding
+    "wf-386b2f",  # agent-work-cost-observability
+    "wf-5664e5",  # quota-api 指标内建
+    "wf-9b5931",  # agent-runtime-model-switch
+}
 
 MIGRATED = {
     "wf-287e81",
@@ -76,16 +89,32 @@ class TestTheShippedConfigLoads:
         for line in SchedulerConfig.from_json(CONFIG).lines:
             assert line.max_rounds == 9999, line.folder_id
 
-    def test_exactly_the_canary_is_switched_on(self) -> None:
+    def test_exactly_the_current_batch_is_switched_on(self) -> None:
         """P7 放量的当前批次，写在这里而不是写在某人的记忆里。
 
-        用户 2026-08-26 裁决（board msg_01M0Z2QW0XWPMBWNF7ZFY9SCNX）：金丝雀
-        wf-40fa8d 单线跑 24h，再放 5 条，再全量。放量下一批 = 改这个断言，
-        改不动就说明有人在没改测试的情况下动了配置。"""
+        放量下一批 = 改这个断言。改不动就说明有人在没改测试的情况下动了
+        配置——那正是要拦的事。
+        """
         enabled = {
             line.folder_id for line in SchedulerConfig.from_json(CONFIG).lines if line.enabled
         }
-        assert enabled == {CANARY}
+        assert enabled == BATCH_TWO
+
+    def test_the_canary_stays_on_through_later_batches(self) -> None:
+        """放量是叠加不是替换。把金丝雀关掉换新线，会丢掉唯一一条已经有
+        真机证据的线。"""
+        enabled = {
+            line.folder_id for line in SchedulerConfig.from_json(CONFIG).lines if line.enabled
+        }
+        assert CANARY in enabled
+
+    def test_the_archived_lines_stay_out(self) -> None:
+        """wf-d726aa / wf-8c8ae3 已归档（题目对象随 loop-engine 退役，或诉求
+        已被 fleet-graph 的不变量兑现）。它们本就不在名册里，这条断言防的是
+        「批量打开」时把它们顺手带进来。"""
+        folders = {line.folder_id for line in SchedulerConfig.from_json(CONFIG).lines}
+        assert "wf-d726aa" not in folders
+        assert "wf-8c8ae3" not in folders
 
     def test_every_line_states_its_rollout_position(self) -> None:
         """`enabled` 默认是 False，所以漏写等于不跑——不会误起线，但会静默
