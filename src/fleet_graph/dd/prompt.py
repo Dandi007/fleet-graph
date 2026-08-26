@@ -192,6 +192,18 @@ def bundle_resources(loaded: Any) -> dict[str, str]:
 REVIEW_PROMPT = """\
 You are the {phase} Reviewer for one `dev-dispatch.attempt-context/v1` attempt.
 
+## The commit under review
+
+- `input_commit`: `{subject_commit}`
+- `subject_commit`: `{subject_commit}`
+- `implementation_subject_commit`: `{implementation_subject_commit}`
+
+Your persona asks you to check those three agree before reviewing. They are
+listed here because they are supplied to you, not discovered: if they do not
+agree, say so as a `blocker` finding with `REJECT` rather than stopping
+silently -- a review that stops without a verdict is indistinguishable from
+one that never ran.
+
 Review the product changes at `{subject_commit}` against the approved spec at
 `{spec_path}`, in the worktree `{worktree_path}`. Read the committed feedback
 index at `{index_path}` and every review artifact it references; that index is

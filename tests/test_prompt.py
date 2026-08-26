@@ -287,6 +287,23 @@ class TestTheReviewPrompt:
         assert "continuous" in self._rendered("continuous")
         assert "final" in self._rendered("final")
 
+    def test_it_supplies_the_three_commits_the_persona_checks(self) -> None:
+        """The persona asks the reviewer to verify `input_commit`,
+        `subject_commit` and `implementation_subject_commit` agree before
+        reviewing. A prompt that never names `input_commit` leaves it checking
+        a value it was not given."""
+        rendered = self._rendered()
+        for name in ("input_commit", "subject_commit", "implementation_subject_commit"):
+            assert f"`{name}`" in rendered, name
+
+    def test_a_failed_precondition_must_still_produce_a_verdict(self) -> None:
+        """A review that stops without a verdict is indistinguishable from one
+        that never ran -- the same silent-stop shape that cost four implement
+        runs."""
+        rendered = self._rendered()
+        assert "rather than stopping" in rendered
+        assert "blocker" in rendered
+
     def test_it_says_a_reviewer_must_not_write(self) -> None:
         """A reviewer that writes to the subject workspace has its verdict
         discarded -- REVIEWER_GIT_MUTATION in the contract's own taxonomy."""
