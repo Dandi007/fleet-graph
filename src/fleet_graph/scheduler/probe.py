@@ -112,6 +112,32 @@ class ProbeTransport(Protocol):
     def post(self, url: str, body: dict[str, Any], token: str) -> tuple[int, str]: ...
 
 
+class HttpxProbeTransport:
+    """The real transport. Short timeout on purpose.
+
+    A probe is asking "is the upstream answering right now"; waiting a long
+    time for that answer is itself the answer, and a scheduler blocked on a
+    hung gateway stops scheduling everything else.
+
+    `trust_env=False` for the same reason every other loopback client in this
+    repo sets it: this host exports a SOCKS proxy, and 127.0.0.1 would go
+    through it and fail to connect at all.
+    """
+
+    def __init__(self, timeout: float = 20.0) -> None:
+        import httpx
+
+        self._client = httpx.Client(timeout=timeout, trust_env=False)
+
+    def post(self, url: str, body: dict[str, Any], token: str) -> tuple[int, str]:
+        response = self._client.post(
+            url,
+            json=body,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        return response.status_code, response.text
+
+
 class MissingProbeCredential(RuntimeError):
     """The lane's env var is unset. Refuse rather than probe unauthenticated."""
 
@@ -151,6 +177,7 @@ class GatewayProber:
 __all__ = [
     "SEAT_PROBES",
     "GatewayProber",
+    "HttpxProbeTransport",
     "MissingProbeCredential",
     "ProbeSpec",
     "UnknownSeat",

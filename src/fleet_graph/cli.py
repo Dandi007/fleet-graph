@@ -1,6 +1,6 @@
 """Thin CLI entrypoint.
 
-`version`, `hello`, `line run`, and `dd run`. The scheduler daemon lands in P6.
+`version`, `hello`, `line run`, `dd run`, and `scheduler run`.
 """
 
 from __future__ import annotations
@@ -139,6 +139,29 @@ def _dd_run(args: argparse.Namespace) -> int:
     return 0 if result.get("terminal") == "complete" else 1
 
 
+def _scheduler_run(args: argparse.Namespace) -> int:
+    """Run the resident scheduler: look at each line, ask, start or record why not."""
+    import pathlib
+
+    from fleet_graph.scheduler.daemon import Scheduler, SchedulerConfig
+    from fleet_graph.scheduler.launcher import TransientLauncher
+    from fleet_graph.scheduler.probe import GatewayProber, HttpxProbeTransport
+
+    config = SchedulerConfig.from_json(pathlib.Path(args.config))
+    scheduler = Scheduler(
+        config,
+        prober=None if args.no_probe else GatewayProber(HttpxProbeTransport()),
+        launcher=TransientLauncher(dry_run=args.dry_run),
+        observe=lambda result: print(json.dumps(result.as_dict(), ensure_ascii=False), flush=True),
+    )
+
+    if args.once:
+        scheduler.tick()
+        return 0
+    scheduler.run_forever()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fleet-graph")
     parser.add_argument("--version", action="version", version=__version__)
@@ -201,6 +224,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="push the durable ref. Off by default: it is the one step here that cannot be undone",
     )
     dd_run.set_defaults(func=_dd_run)
+
+    scheduler = subparsers.add_parser("scheduler", help="the resident line scheduler")
+    scheduler_sub = scheduler.add_subparsers()
+    sched_run = scheduler_sub.add_parser("run", help="tick until stopped")
+    sched_run.add_argument("--config", required=True, help="JSON config: lines, roots, caps")
+    sched_run.add_argument("--once", action="store_true", help="one tick, then exit")
+    sched_run.add_argument(
+        "--dry-run", action="store_true", help="decide and log, but launch nothing"
+    )
+    sched_run.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="run without a gateway probe. Every line then refuses on no_probe, "
+        "which is the honest reading of not being able to ask",
+    )
+    sched_run.set_defaults(func=_scheduler_run)
     return parser
 
 
