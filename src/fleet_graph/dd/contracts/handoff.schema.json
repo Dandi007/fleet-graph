@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-engine.dev-dispatch/contracts/handoff.schema.json",
+  "title": "Handoff Envelope",
+  "type": "object",
+  "required": [
+    "contract_version",
+    "handoff_id",
+    "development_id",
+    "stage",
+    "generation",
+    "attempt",
+    "repository",
+    "worktree",
+    "commit",
+    "mr",
+    "artifacts",
+    "plugin",
+    "parent_handoff_digest",
+    "attestation_ref",
+    "attestation_digest",
+    "verified_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {"const": 1},
+    "handoff_id": {"type": "string", "minLength": 1},
+    "development_id": {"type": "string", "minLength": 1},
+    "stage": {
+      "enum": [
+        "admission",
+        "configure",
+        "implement",
+        "continuous_review",
+        "final_review",
+        "acceptance",
+        "human_gate",
+        "merger"
+      ]
+    },
+    "generation": {"type": "integer", "minimum": 1},
+    "attempt": {"type": "integer", "minimum": 1},
+    "repository": {
+      "type": "object",
+      "required": ["provider", "remote_url", "target_branch"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": {"const": "github"},
+        "remote_url": {"type": "string", "minLength": 1},
+        "target_branch": {"type": "string", "minLength": 1}
+      }
+    },
+    "worktree": {
+      "type": "object",
+      "required": ["host_id", "path", "branch"],
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1},
+        "branch": {"type": "string", "minLength": 1}
+      }
+    },
+    "commit": {
+      "type": "object",
+      "required": ["sha", "tree_sha", "parent_sha"],
+      "additionalProperties": false,
+      "properties": {
+        "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "tree_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "parent_sha": {
+          "anyOf": [
+            {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "mr": {
+      "type": "object",
+      "required": ["url", "number", "state", "head_branch", "base_branch", "head_sha"],
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "type": "string",
+          "pattern": "^https://[A-Za-z0-9.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+$"
+        },
+        "number": {"type": "integer", "minimum": 1},
+        "state": {"enum": ["OPEN", "MERGED", "CLOSED"]},
+        "head_branch": {"type": "string", "minLength": 1},
+        "base_branch": {"type": "string", "minLength": 1},
+        "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "path", "blob_sha"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": {"type": "string", "minLength": 1},
+          "path": {"type": "string", "minLength": 1},
+          "blob_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+        }
+      }
+    },
+    "plugin": {
+      "type": "object",
+      "required": ["commit", "bundle_digest", "workflow_digest"],
+      "additionalProperties": false,
+      "properties": {
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "bundle_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "workflow_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "parent_handoff_digest": {
+      "anyOf": [
+        {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        {"type": "null"}
+      ]
+    },
+    "attestation_ref": {"type": "string", "minLength": 1},
+    "attestation_digest": {
+      "anyOf": [
+        {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        {"const": ""}
+      ]
+    },
+    "verified_at": {"type": "string", "minLength": 1}
+  }
+}

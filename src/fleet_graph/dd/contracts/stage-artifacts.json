@@ -1,0 +1,169 @@
+{
+  "contract_version": 2,
+  "artifact_kinds": {
+    "spec": {
+      "description": "Development root Spec artifact; caller-chosen normalized relative path inside the worktree."
+    },
+    "product_code": {
+      "description": "Product code, tests and other actor-produced non-evidence files; any normalized relative path inside the worktree."
+    },
+    "run_config": {
+      "path_pattern": ".dev-dispatch/run-config.json"
+    },
+    "implementation_evidence": {
+      "path_pattern": ".dev-dispatch/evidence/implement-g{generation}-a{attempt}.json"
+    },
+    "continuous_verdict": {
+      "path_pattern": ".dev-dispatch/reviews/continuous/g{generation}-a{attempt}.json",
+      "required_fields": {
+        "verdict": ["APPROVE", "REJECT"],
+        "feedback": "non-empty-string"
+      }
+    },
+    "final_verdict": {
+      "path_pattern": ".dev-dispatch/reviews/final/g{generation}-a{attempt}.json",
+      "required_fields": {
+        "verdict": ["APPROVE", "REJECT"],
+        "feedback": "non-empty-string"
+      }
+    },
+    "feedback": {
+      "path_pattern": ".dev-dispatch/reviews/feedback/g{generation}-a{attempt}.json",
+      "required_fields": {
+        "feedback": "non-empty-string"
+      }
+    },
+    "acceptance_result": {
+      "path_pattern": ".dd-evidence/acceptance.json"
+    },
+    "gate_decision": {
+      "path_pattern": ".dev-dispatch/gates/merge-g{generation}.json",
+      "required_fields": {
+        "decision": ["APPROVE", "REJECT"],
+        "operator_identity": "non-empty-string",
+        "decided_at": "non-empty-string"
+      }
+    },
+    "merge_result": {
+      "path_pattern": ".dev-dispatch/merge/result-g{generation}.json",
+      "required_fields": {
+        "result": ["MERGED", "PREPARED"]
+      }
+    },
+    "attempt_context_development": {
+      "description": "dev-dispatch.attempt-context/v1 development identity artifact; written only by the deterministic bootstrap primitive.",
+      "path_pattern": ".dev-dispatch/development.json"
+    },
+    "attempt_context_spec": {
+      "description": "dev-dispatch.attempt-context/v1 immutable approved spec bytes; written only by the deterministic bootstrap primitive.",
+      "path_pattern": ".dev-dispatch/spec/approved.md"
+    },
+    "attempt_context_spec_manifest": {
+      "description": "dev-dispatch.attempt-context/v1 spec manifest binding the approved spec path and digest.",
+      "path_pattern": ".dev-dispatch/spec/manifest.json"
+    },
+    "attempt_context_feedback_index": {
+      "description": "dev-dispatch.attempt-context/v1 committed feedback index; the only feedback source of truth together with the committed review artifacts it references.",
+      "path_pattern": ".dev-dispatch/feedback/index.json"
+    },
+    "attempt_context_implement_handoff": {
+      "description": "dev-dispatch.attempt-context/v1 Implement handoff artifact sealed into I<n> by the deterministic Implement sealer.",
+      "path_pattern": ".dev-dispatch/handoffs/{attempt_id}/implement.json"
+    },
+    "attempt_context_review": {
+      "description": "dev-dispatch.attempt-context/v1 committed Review verdict/findings artifact materialized into RC<n>/RF<n> by the deterministic Review materializer.",
+      "path_pattern": ".dev-dispatch/reviews/{review_id}/review.json"
+    }
+  },
+  "transition_receipts": {
+    "implement": {
+      "materialized": true,
+      "schema": "contracts/implement-handoff-receipt.schema.json",
+      "output_commit_field": "output_commit"
+    },
+    "continuous_review": {
+      "materialized": true,
+      "schema": "contracts/review-handoff-receipt.schema.json",
+      "review_phase": "continuous",
+      "output_commit_field": "output_commit"
+    },
+    "final_review": {
+      "materialized": true,
+      "schema": "contracts/review-handoff-receipt.schema.json",
+      "review_phase": "final",
+      "output_commit_field": "output_commit"
+    }
+  },
+  "transport_records": {
+    "review_stage_failure": {
+      "owner_node": "deterministic_seal",
+      "route": "stage_output",
+      "schema": "contracts/failed-record.schema.json",
+      "status": "failed",
+      "terminal": true,
+      "stages": ["continuous_review", "final_review", "implement"]
+    }
+  },
+  "stages": {
+    "configure": {"required": ["spec"], "produced": ["run_config"]},
+    "implement": {
+      "required": ["spec", "run_config"],
+      "produced": ["implementation_evidence", "product_code"],
+      "protocol_artifacts": {
+        "dev-dispatch.attempt-context/v1": {
+          "required": [
+            "attempt_context_development",
+            "attempt_context_spec",
+            "attempt_context_spec_manifest",
+            "attempt_context_feedback_index"
+          ],
+          "produced": ["attempt_context_implement_handoff"]
+        }
+      }
+    },
+    "continuous_review": {
+      "required": ["spec", "implementation_evidence"],
+      "produced": ["continuous_verdict", "feedback"],
+      "failure_outputs": ["review_stage_failure"],
+      "protocol_artifacts": {
+        "dev-dispatch.attempt-context/v1": {
+          "required": [
+            "attempt_context_development",
+            "attempt_context_spec",
+            "attempt_context_spec_manifest",
+            "attempt_context_feedback_index",
+            "attempt_context_implement_handoff"
+          ],
+          "produced": [
+            "attempt_context_review",
+            "attempt_context_feedback_index"
+          ]
+        }
+      }
+    },
+    "final_review": {
+      "required": ["spec", "continuous_verdict"],
+      "produced": ["final_verdict"],
+      "failure_outputs": ["review_stage_failure"],
+      "protocol_artifacts": {
+        "dev-dispatch.attempt-context/v1": {
+          "required": [
+            "attempt_context_development",
+            "attempt_context_spec",
+            "attempt_context_spec_manifest",
+            "attempt_context_feedback_index",
+            "attempt_context_implement_handoff",
+            "attempt_context_review"
+          ],
+          "produced": [
+            "attempt_context_review",
+            "attempt_context_feedback_index"
+          ]
+        }
+      }
+    },
+    "acceptance": {"required": ["spec"], "produced": ["acceptance_result"]},
+    "human_gate": {"required": ["acceptance_result"], "produced": ["gate_decision"]},
+    "merger": {"required": ["gate_decision"], "produced": ["merge_result"]}
+  }
+}

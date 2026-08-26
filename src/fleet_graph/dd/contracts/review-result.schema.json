@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-engine.dev-dispatch/contracts/review-result.schema.json",
+  "title": "dev-dispatch.attempt-context/v1 ReviewResult",
+  "description": "Read-only Reviewer actor output. It cannot advance lifecycle state by itself and can never contain its own containing Git commit OID; that OID lives only in the controller ReviewHandoffReceipt as output_commit.",
+  "type": "object",
+  "required": [
+    "contract_version",
+    "review_id",
+    "attempt_id",
+    "review_phase",
+    "subject_commit",
+    "implementation_subject_commit",
+    "verdict",
+    "findings",
+    "spec_digest",
+    "reviewer_job_id",
+    "reviewer_model"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {"$ref": "attempt-context.schema.json#/$defs/contract_version"},
+    "review_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+    "attempt_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+    "review_phase": {"$ref": "attempt-context.schema.json#/$defs/review_phase"},
+    "subject_commit": {"$ref": "attempt-context.schema.json#/$defs/full_commit"},
+    "implementation_subject_commit": {"$ref": "attempt-context.schema.json#/$defs/full_commit"},
+    "verdict": {"$ref": "attempt-context.schema.json#/$defs/verdict"},
+    "findings": {
+      "type": "array",
+      "items": {"$ref": "attempt-context.schema.json#/$defs/finding"}
+    },
+    "spec_digest": {"$ref": "attempt-context.schema.json#/$defs/sha256_digest"},
+    "reviewer_job_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+    "reviewer_model": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"}
+  }
+}

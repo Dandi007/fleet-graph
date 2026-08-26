@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-engine.dev-dispatch/contracts/feedback-index.schema.json",
+  "title": "dev-dispatch.attempt-context/v1 FeedbackIndex",
+  "description": "Committed feedback index at .dev-dispatch/feedback/index.json: the only feedback source of truth together with the committed Review artifacts it references. Contains every committed RC/RF entry in stable attempt/phase order. The bootstrap H0 index is this object with entries: [].",
+  "type": "object",
+  "required": ["contract_version", "development_id", "entries"],
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {"$ref": "attempt-context.schema.json#/$defs/contract_version"},
+    "development_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "attempt",
+          "attempt_id",
+          "review_id",
+          "review_phase",
+          "subject_commit",
+          "implementation_subject_commit",
+          "verdict",
+          "artifact_path",
+          "artifact_blob_oid",
+          "artifact_digest"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {"type": "integer", "minimum": 1},
+          "attempt_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+          "review_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+          "review_phase": {"$ref": "attempt-context.schema.json#/$defs/review_phase"},
+          "subject_commit": {"$ref": "attempt-context.schema.json#/$defs/full_commit"},
+          "implementation_subject_commit": {"$ref": "attempt-context.schema.json#/$defs/full_commit"},
+          "verdict": {"$ref": "attempt-context.schema.json#/$defs/verdict"},
+          "artifact_path": {"$ref": "attempt-context.schema.json#/$defs/review_artifact_path"},
+          "artifact_blob_oid": {"$ref": "attempt-context.schema.json#/$defs/git_blob_oid"},
+          "artifact_digest": {"$ref": "attempt-context.schema.json#/$defs/sha256_digest"}
+        }
+      }
+    }
+  }
+}

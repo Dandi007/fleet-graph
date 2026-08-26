@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-engine.dev-dispatch/contracts/stage-dispatch.schema.json",
+  "title": "dev-dispatch.attempt-context/v1 StageDispatch",
+  "description": "Exact-commit stage dispatch consumed by an actor controller. The consuming controller must prove local HEAD == input_commit == persisted handoff head == remote durable ref head before the actor runs.",
+  "type": "object",
+  "required": [
+    "contract_version",
+    "development_id",
+    "attempt_id",
+    "stage",
+    "mode",
+    "target_base_commit",
+    "input_commit",
+    "expected_remote_head",
+    "parent_handoff_receipt_digest",
+    "spec_ref",
+    "feedback_ref",
+    "materialization_intent_id"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {"$ref": "attempt-context.schema.json#/$defs/contract_version"},
+    "development_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+    "attempt_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+    "stage": {
+      "enum": ["implement", "continuous_review", "final_review", "acceptance"]
+    },
+    "mode": {"enum": ["initial", "rework"]},
+    "target_base_commit": {"$ref": "attempt-context.schema.json#/$defs/full_commit"},
+    "input_commit": {"$ref": "attempt-context.schema.json#/$defs/full_commit"},
+    "expected_remote_head": {"$ref": "attempt-context.schema.json#/$defs/full_commit"},
+    "parent_handoff_receipt_digest": {"$ref": "attempt-context.schema.json#/$defs/sha256_digest"},
+    "spec_ref": {"$ref": "attempt-context.schema.json#/$defs/spec_ref"},
+    "feedback_ref": {"$ref": "attempt-context.schema.json#/$defs/feedback_index_ref"},
+    "materialization_intent_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"}
+  }
+}

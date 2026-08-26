@@ -1,0 +1,261 @@
+{
+  "contract_version": 2,
+  "capabilities": {
+    "attempt_context": {
+      "protocol": "dev-dispatch.attempt-context/v1",
+      "schemas": [
+        "contracts/attempt-context.schema.json",
+        "contracts/stage-dispatch.schema.json",
+        "contracts/implement-handoff-receipt.schema.json",
+        "contracts/implement-non-applied-receipt.schema.json",
+        "contracts/review-result.schema.json",
+        "contracts/review-handoff-receipt.schema.json",
+        "contracts/feedback-index.schema.json",
+        "contracts/failed-record.schema.json"
+      ]
+    }
+  },
+  "wrapper": ["input_verify", "actor", "materialize", "output_verify"],
+  "failure_outputs": {
+    "review_stage_failure": {
+      "owner_node": "deterministic_seal",
+      "route": "stage_output",
+      "schema": "contracts/failed-record.schema.json",
+      "status": "failed",
+      "terminal": true,
+      "stages": ["continuous_review", "final_review", "implement"]
+    }
+  },
+  "stages": [
+    {
+      "id": "configure",
+      "actor": "script",
+      "wrapper": true,
+      "required_artifacts": ["spec"],
+      "produced_artifacts": ["run_config"]
+    },
+    {
+      "id": "implement",
+      "actor": "llm",
+      "wrapper": true,
+      "required_artifacts": ["spec", "run_config"],
+      "produced_artifacts": ["implementation_evidence", "product_code"],
+      "protocol_artifacts": {
+        "dev-dispatch.attempt-context/v1": {
+          "required_artifacts": [
+            "attempt_context_development",
+            "attempt_context_spec",
+            "attempt_context_spec_manifest",
+            "attempt_context_feedback_index"
+          ],
+          "produced_artifacts": ["attempt_context_implement_handoff"]
+        }
+      }
+    },
+    {
+      "id": "continuous_review",
+      "actor": "llm",
+      "wrapper": true,
+      "required_artifacts": ["spec", "implementation_evidence"],
+      "produced_artifacts": ["continuous_verdict", "feedback"],
+      "failure_outputs": ["review_stage_failure"],
+      "protocol_artifacts": {
+        "dev-dispatch.attempt-context/v1": {
+          "required_artifacts": [
+            "attempt_context_development",
+            "attempt_context_spec",
+            "attempt_context_spec_manifest",
+            "attempt_context_feedback_index",
+            "attempt_context_implement_handoff"
+          ],
+          "produced_artifacts": [
+            "attempt_context_review",
+            "attempt_context_feedback_index"
+          ]
+        }
+      }
+    },
+    {
+      "id": "final_review",
+      "actor": "llm",
+      "wrapper": true,
+      "required_artifacts": ["spec", "continuous_verdict"],
+      "produced_artifacts": ["final_verdict"],
+      "failure_outputs": ["review_stage_failure"],
+      "protocol_artifacts": {
+        "dev-dispatch.attempt-context/v1": {
+          "required_artifacts": [
+            "attempt_context_development",
+            "attempt_context_spec",
+            "attempt_context_spec_manifest",
+            "attempt_context_feedback_index",
+            "attempt_context_implement_handoff",
+            "attempt_context_review"
+          ],
+          "produced_artifacts": [
+            "attempt_context_review",
+            "attempt_context_feedback_index"
+          ]
+        }
+      }
+    },
+    {
+      "id": "acceptance",
+      "actor": "script",
+      "wrapper": true,
+      "required_artifacts": ["spec"],
+      "produced_artifacts": ["acceptance_result"]
+    },
+    {
+      "id": "human_gate",
+      "actor": "script",
+      "wrapper": true,
+      "required_artifacts": ["acceptance_result"],
+      "produced_artifacts": ["gate_decision"]
+    },
+    {
+      "id": "merger",
+      "actor": "script",
+      "wrapper": true,
+      "required_artifacts": ["gate_decision"],
+      "produced_artifacts": ["merge_result"]
+    }
+  ],
+  "transitions": [
+    {
+      "from": "implement",
+      "on": "success",
+      "to": "continuous_review",
+      "next_mode": "inherit",
+      "required_receipt": "implement",
+      "commit_binding": {
+        "source": "required_receipt.output_commit",
+        "target": "next_dispatch.input_commit",
+        "operator": "equal"
+      }
+    },
+    {
+      "from": "continuous_review",
+      "on": "REJECT",
+      "to": "implement",
+      "next_mode": "rework",
+      "required_receipt": "continuous_review",
+      "event_binding": {
+        "source": "required_receipt.verdict",
+        "target": "transition.on",
+        "operator": "equal"
+      },
+      "commit_binding": {
+        "source": "required_receipt.output_commit",
+        "target": "next_dispatch.input_commit",
+        "operator": "equal"
+      }
+    },
+    {
+      "from": "continuous_review",
+      "on": "APPROVE",
+      "to": "final_review",
+      "next_mode": "inherit",
+      "required_receipt": "continuous_review",
+      "event_binding": {
+        "source": "required_receipt.verdict",
+        "target": "transition.on",
+        "operator": "equal"
+      },
+      "commit_binding": {
+        "source": "required_receipt.output_commit",
+        "target": "next_dispatch.input_commit",
+        "operator": "equal"
+      }
+    },
+    {
+      "from": "final_review",
+      "on": "REJECT",
+      "to": "implement",
+      "next_mode": "rework",
+      "required_receipt": "final_review",
+      "event_binding": {
+        "source": "required_receipt.verdict",
+        "target": "transition.on",
+        "operator": "equal"
+      },
+      "commit_binding": {
+        "source": "required_receipt.output_commit",
+        "target": "next_dispatch.input_commit",
+        "operator": "equal"
+      }
+    },
+    {
+      "from": "final_review",
+      "on": "APPROVE",
+      "to": "acceptance",
+      "next_mode": "inherit",
+      "required_receipt": "final_review",
+      "event_binding": {
+        "source": "required_receipt.verdict",
+        "target": "transition.on",
+        "operator": "equal"
+      },
+      "commit_binding": {
+        "source": "required_receipt.output_commit",
+        "target": "next_dispatch.input_commit",
+        "operator": "equal"
+      }
+    }
+  ],
+  "failure_transitions": [
+    {
+      "from": "implement",
+      "on": "failed",
+      "required_transport_record": "review_stage_failure",
+      "terminal": true,
+      "materialize": false,
+      "receipt": false
+    },
+    {
+      "from": "continuous_review",
+      "on": "failed",
+      "required_transport_record": "review_stage_failure",
+      "terminal": true,
+      "materialize": false,
+      "receipt": false
+    },
+    {
+      "from": "final_review",
+      "on": "failed",
+      "required_transport_record": "review_stage_failure",
+      "terminal": true,
+      "materialize": false,
+      "receipt": false
+    }
+  ],
+  "failure_taxonomy": {
+    "INVALID_HANDOFF_SCHEMA": {"retryable": false, "meaning": "Required field, type or contract version error"},
+    "INVALID_WORKTREE": {"retryable": false, "meaning": "Path is not the target git worktree or repository mismatch"},
+    "DIRTY_WORKTREE": {"retryable": false, "meaning": "Worktree is not clean at a stage boundary"},
+    "LOCAL_COMMIT_MISMATCH": {"retryable": false, "meaning": "HEAD does not equal the handoff commit"},
+    "INVALID_ARTIFACT_PATH": {"retryable": false, "meaning": "Path escapes the worktree, is untracked or kind mismatch"},
+    "ARTIFACT_BLOB_MISMATCH": {"retryable": false, "meaning": "Worktree bytes, commit blob or recorded blob SHA disagree"},
+    "REMOTE_HEAD_CONFLICT": {"retryable": false, "meaning": "Remote branch does not equal the expected commit"},
+    "MR_NOT_FOUND": {"retryable": true, "bounded": true, "meaning": "MR does not exist; bounded retry only for provider availability"},
+    "MR_AMBIGUOUS": {"retryable": false, "meaning": "Multiple candidate MRs found"},
+    "MR_STATE_INVALID": {"retryable": false, "meaning": "MR closed, merged or state not matching the stage"},
+    "MR_IDENTITY_MISMATCH": {"retryable": false, "meaning": "Repository, head branch or base branch mismatch"},
+    "MR_COMMIT_MISMATCH": {"retryable": false, "meaning": "MR head SHA does not equal the handoff commit"},
+    "HANDOFF_CHAIN_MISMATCH": {"retryable": false, "meaning": "Parent digest, stage or commit chain mismatch"},
+    "PLUGIN_CONTRACT_MISMATCH": {"retryable": false, "meaning": "Schema, bundle or workflow identity mismatch"},
+    "MATERIALIZATION_FAILED": {"retryable": true, "bounded": true, "meaning": "Commit, push or receipt write failed"},
+    "PROVIDER_UNAVAILABLE": {"retryable": true, "bounded": true, "meaning": "Git remote or GitHub temporarily unavailable"},
+    "ATTESTATION_WRITE_FAILED": {"retryable": true, "bounded": true, "meaning": "Canonical attestation could not be atomically written"},
+    "SECRET_SENTINEL_DETECTED": {"retryable": false, "meaning": "Plugin extension: secret sentinel found in handoff, artifact or attestation"},
+    "ATTESTATION_MISMATCH": {"retryable": false, "meaning": "Plugin extension: attestation ref, digest or content mismatch"},
+    "UNDECLARED_ARTIFACT": {"retryable": false, "meaning": "Plugin extension: worktree carries changes outside the declared artifact set"},
+    "ARTIFACT_CONTENT_MISMATCH": {"retryable": false, "meaning": "Plugin extension: artifact content violates the stage-artifacts required_fields contract"},
+    "REVIEWER_GIT_MUTATION": {"retryable": false, "meaning": "Reviewer wrote to the immutable subject workspace; tracked, untracked, or ignored mutation detected, verdict is discarded"},
+    "INVALID_REVIEW_LOCATION": {"retryable": false, "meaning": "Reviewer location is malformed, ambiguous or contains forbidden control bytes"},
+    "INVALID_REQUIREMENT_MAPPER_ENVELOPE": {"retryable": false, "meaning": "Requirement mapper output is not a valid structured envelope"},
+    "INVALID_VERDICT_AUDITOR_ENVELOPE": {"retryable": false, "meaning": "Verdict auditor output is not a valid structured envelope"},
+    "EXTERNAL_REVIEW_RESULT_SCHEMA_MISMATCH": {"retryable": false, "meaning": "External ReviewResult does not match the canonical schema"},
+    "UNVERIFIED_TEST_CLAIM": {"retryable": false, "meaning": "Implement seal re-executed verification commands and their real exit codes differ from the claimed ones"}
+  }
+}

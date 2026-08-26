@@ -1,0 +1,341 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-engine.dev-dispatch/contracts/development-lifecycle.schema.json",
+  "title": "Development Lifecycle Manifest",
+  "type": "object",
+  "required": ["contract_version", "capabilities", "wrapper", "failure_outputs", "stages", "transitions", "failure_transitions", "failure_taxonomy"],
+  "additionalProperties": false,
+  "$defs": {
+    "artifact_kind": {
+      "enum": [
+        "spec",
+        "product_code",
+        "run_config",
+        "implementation_evidence",
+        "continuous_verdict",
+        "final_verdict",
+        "feedback",
+        "acceptance_result",
+        "gate_decision",
+        "merge_result",
+        "attempt_context_development",
+        "attempt_context_spec",
+        "attempt_context_spec_manifest",
+        "attempt_context_feedback_index",
+        "attempt_context_implement_handoff",
+        "attempt_context_review"
+      ]
+    },
+    "protocol_artifacts": {
+      "type": "object",
+      "required": ["dev-dispatch.attempt-context/v1"],
+      "additionalProperties": false,
+      "properties": {
+        "dev-dispatch.attempt-context/v1": {
+          "type": "object",
+          "required": ["required_artifacts", "produced_artifacts"],
+          "additionalProperties": false,
+          "properties": {
+            "required_artifacts": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "enum": [
+                  "attempt_context_development",
+                  "attempt_context_spec",
+                  "attempt_context_spec_manifest",
+                  "attempt_context_feedback_index",
+                  "attempt_context_implement_handoff",
+                  "attempt_context_review"
+                ]
+              },
+              "uniqueItems": true
+            },
+            "produced_artifacts": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "enum": [
+                  "attempt_context_development",
+                  "attempt_context_spec",
+                  "attempt_context_spec_manifest",
+                  "attempt_context_feedback_index",
+                  "attempt_context_implement_handoff",
+                  "attempt_context_review"
+                ]
+              },
+              "uniqueItems": true
+            }
+          }
+        }
+      }
+    }
+  },
+  "properties": {
+    "contract_version": {"const": 2},
+    "capabilities": {
+      "type": "object",
+      "required": ["attempt_context"],
+      "additionalProperties": false,
+      "properties": {
+        "attempt_context": {
+          "type": "object",
+          "required": ["protocol", "schemas"],
+          "additionalProperties": false,
+          "properties": {
+            "protocol": {"const": "dev-dispatch.attempt-context/v1"},
+            "schemas": {
+              "type": "array",
+              "minItems": 1,
+              "items": {"type": "string", "minLength": 1},
+              "uniqueItems": true
+            }
+          }
+        }
+      }
+    },
+    "wrapper": {
+      "type": "array",
+      "prefixItems": [
+        {"const": "input_verify"},
+        {"const": "actor"},
+        {"const": "materialize"},
+        {"const": "output_verify"}
+      ],
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "failure_outputs": {
+      "type": "object",
+      "required": ["review_stage_failure"],
+      "additionalProperties": false,
+      "properties": {
+        "review_stage_failure": {
+          "type": "object",
+          "required": [
+            "owner_node",
+            "route",
+            "schema",
+            "status",
+            "terminal",
+            "stages"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "owner_node": {"const": "deterministic_seal"},
+            "route": {"const": "stage_output"},
+            "schema": {"const": "contracts/failed-record.schema.json"},
+            "status": {"const": "failed"},
+            "terminal": {"const": true},
+            "stages": {
+              "type": "array",
+              "minItems": 3,
+              "maxItems": 3,
+              "items": {
+                "enum": ["continuous_review", "final_review", "implement"]
+              },
+              "uniqueItems": true
+            }
+          }
+        }
+      }
+    },
+    "stages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "actor", "wrapper"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "enum": [
+              "configure",
+              "implement",
+              "continuous_review",
+              "final_review",
+              "acceptance",
+              "human_gate",
+              "merger"
+            ]
+          },
+          "actor": {"enum": ["script", "llm"]},
+          "wrapper": {"const": true},
+          "required_artifacts": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/artifact_kind"},
+            "uniqueItems": true
+          },
+          "produced_artifacts": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/artifact_kind"},
+            "uniqueItems": true
+          },
+          "failure_outputs": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "enum": ["review_stage_failure"]
+            },
+            "uniqueItems": true
+          },
+          "protocol_artifacts": {"$ref": "#/$defs/protocol_artifacts"}
+        }
+      }
+    },
+    "transitions": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {
+        "oneOf": [
+          {
+            "const": {
+              "from": "implement",
+              "on": "success",
+              "to": "continuous_review",
+              "next_mode": "inherit",
+              "required_receipt": "implement",
+              "commit_binding": {
+                "source": "required_receipt.output_commit",
+                "target": "next_dispatch.input_commit",
+                "operator": "equal"
+              }
+            }
+          },
+          {
+            "const": {
+              "from": "continuous_review",
+              "on": "REJECT",
+              "to": "implement",
+              "next_mode": "rework",
+              "required_receipt": "continuous_review",
+              "event_binding": {
+                "source": "required_receipt.verdict",
+                "target": "transition.on",
+                "operator": "equal"
+              },
+              "commit_binding": {
+                "source": "required_receipt.output_commit",
+                "target": "next_dispatch.input_commit",
+                "operator": "equal"
+              }
+            }
+          },
+          {
+            "const": {
+              "from": "continuous_review",
+              "on": "APPROVE",
+              "to": "final_review",
+              "next_mode": "inherit",
+              "required_receipt": "continuous_review",
+              "event_binding": {
+                "source": "required_receipt.verdict",
+                "target": "transition.on",
+                "operator": "equal"
+              },
+              "commit_binding": {
+                "source": "required_receipt.output_commit",
+                "target": "next_dispatch.input_commit",
+                "operator": "equal"
+              }
+            }
+          },
+          {
+            "const": {
+              "from": "final_review",
+              "on": "REJECT",
+              "to": "implement",
+              "next_mode": "rework",
+              "required_receipt": "final_review",
+              "event_binding": {
+                "source": "required_receipt.verdict",
+                "target": "transition.on",
+                "operator": "equal"
+              },
+              "commit_binding": {
+                "source": "required_receipt.output_commit",
+                "target": "next_dispatch.input_commit",
+                "operator": "equal"
+              }
+            }
+          },
+          {
+            "const": {
+              "from": "final_review",
+              "on": "APPROVE",
+              "to": "acceptance",
+              "next_mode": "inherit",
+              "required_receipt": "final_review",
+              "event_binding": {
+                "source": "required_receipt.verdict",
+                "target": "transition.on",
+                "operator": "equal"
+              },
+              "commit_binding": {
+                "source": "required_receipt.output_commit",
+                "target": "next_dispatch.input_commit",
+                "operator": "equal"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "failure_transitions": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {
+        "oneOf": [
+          {
+            "const": {
+              "from": "implement",
+              "on": "failed",
+              "required_transport_record": "review_stage_failure",
+              "terminal": true,
+              "materialize": false,
+              "receipt": false
+            }
+          },
+          {
+            "const": {
+              "from": "continuous_review",
+              "on": "failed",
+              "required_transport_record": "review_stage_failure",
+              "terminal": true,
+              "materialize": false,
+              "receipt": false
+            }
+          },
+          {
+            "const": {
+              "from": "final_review",
+              "on": "failed",
+              "required_transport_record": "review_stage_failure",
+              "terminal": true,
+              "materialize": false,
+              "receipt": false
+            }
+          }
+        ]
+      }
+    },
+    "failure_taxonomy": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["retryable", "meaning"],
+        "additionalProperties": false,
+        "properties": {
+          "retryable": {"type": "boolean"},
+          "bounded": {"type": "boolean"},
+          "meaning": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

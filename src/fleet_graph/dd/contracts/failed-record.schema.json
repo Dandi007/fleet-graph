@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-engine.dev-dispatch/contracts/failed-stage-record-v1.schema.json",
+  "title": "dev-dispatch.failed-stage-record/v1",
+  "description": "Deterministic seal stage-output failed record. Enqueued exactly once per failure; never accompanies a produced ReviewResult.",
+  "type": "object",
+  "required": ["id", "status", "failure"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^stage-output-[0-9a-f]{64}$"
+    },
+    "status": {
+      "const": "failed"
+    },
+    "failure": {
+      "type": "object",
+      "required": [
+        "contract_version",
+        "development_id",
+        "attempt_id",
+        "stage",
+        "source_node",
+        "item_index",
+        "failure_code",
+        "failure_detail"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": {
+          "const": "dev-dispatch.failed-stage-record/v1"
+        },
+        "development_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attempt_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stage": {
+          "enum": ["continuous_review", "final_review", "implement"]
+        },
+        "review_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "review_phase": {
+          "enum": ["continuous", "final"]
+        },
+        "subject_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "implementation_subject_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "spec_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "reviewer_job_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviewer_model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_node": {
+          "enum": ["requirement_mapper", "verdict_auditor", "deterministic_seal"]
+        },
+        "item_index": {
+          "anyOf": [
+            {"type": "null"},
+            {"type": "integer", "minimum": 0}
+          ]
+        },
+        "failure_code": {
+          "enum": [
+            "INVALID_REVIEW_LOCATION",
+            "INVALID_REQUIREMENT_MAPPER_ENVELOPE",
+            "INVALID_VERDICT_AUDITOR_ENVELOPE",
+            "EXTERNAL_REVIEW_RESULT_SCHEMA_MISMATCH",
+            "UNVERIFIED_TEST_CLAIM"
+          ]
+        },
+        "failure_detail": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "^[^\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]*$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "stage": {"not": {"const": "implement"}}
+            }
+          },
+          "then": {
+            "required": [
+              "review_id",
+              "review_phase",
+              "subject_commit",
+              "implementation_subject_commit",
+              "spec_digest",
+              "reviewer_job_id",
+              "reviewer_model"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "stage": {"const": "implement"}
+            }
+          },
+          "then": {
+            "required": ["subject_commit", "implementation_subject_commit", "spec_digest"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "review_id": {
+                "pattern": "^rc-"
+              }
+            },
+            "required": ["review_id"]
+          },
+          "then": {
+            "properties": {
+              "review_phase": {"const": "continuous"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "review_id": {
+                "pattern": "^rf-"
+              }
+            },
+            "required": ["review_id"]
+          },
+          "then": {
+            "properties": {
+              "review_phase": {"const": "final"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "failure_code": {"const": "INVALID_REVIEW_LOCATION"}
+            }
+          },
+          "then": {
+            "properties": {
+              "source_node": {
+                "enum": ["requirement_mapper", "verdict_auditor"]
+              },
+              "item_index": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "failure_code": {"const": "INVALID_REQUIREMENT_MAPPER_ENVELOPE"}
+            }
+          },
+          "then": {
+            "properties": {
+              "source_node": {"const": "requirement_mapper"},
+              "item_index": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "failure_code": {"const": "INVALID_VERDICT_AUDITOR_ENVELOPE"}
+            }
+          },
+          "then": {
+            "properties": {
+              "source_node": {"const": "verdict_auditor"},
+              "item_index": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "failure_code": {"const": "EXTERNAL_REVIEW_RESULT_SCHEMA_MISMATCH"}
+            }
+          },
+          "then": {
+            "properties": {
+              "source_node": {"const": "deterministic_seal"},
+              "item_index": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "failure_code": {"const": "UNVERIFIED_TEST_CLAIM"}
+            }
+          },
+          "then": {
+            "properties": {
+              "source_node": {"const": "deterministic_seal"},
+              "item_index": {"type": "null"}
+            }
+          }
+        }
+      ]
+    }
+  }
+}

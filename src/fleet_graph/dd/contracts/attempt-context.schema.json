@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-engine.dev-dispatch/contracts/attempt-context.schema.json",
+  "title": "dev-dispatch.attempt-context/v1 shared definitions",
+  "description": "Shared strict definitions for every dev-dispatch.attempt-context/v1 protocol object. Commit fields are full lowercase 40-hex Git object IDs only; branch names, abbreviated SHAs, HEAD and ambiguous commit aliases are invalid.",
+  "$defs": {
+    "contract_version": {
+      "const": "dev-dispatch.attempt-context/v1"
+    },
+    "full_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "git_blob_oid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "nonempty_string": {
+      "type": "string",
+      "minLength": 1
+    },
+    "review_phase": {
+      "enum": ["continuous", "final"]
+    },
+    "verdict": {
+      "enum": ["APPROVE", "REJECT"]
+    },
+    "implement_outcome": {
+      "enum": ["APPLIED", "DISPUTED", "BLOCKED"]
+    },
+    "reserved_path": {
+      "type": "string",
+      "pattern": "^(?!.*\\.\\.)\\.dev-dispatch/[A-Za-z0-9._/-]+$"
+    },
+    "artifact_ref": {
+      "type": "object",
+      "required": ["path", "blob_oid", "digest"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {"$ref": "#/$defs/reserved_path"},
+        "blob_oid": {"$ref": "#/$defs/git_blob_oid"},
+        "digest": {"$ref": "#/$defs/sha256_digest"}
+      }
+    },
+    "spec_ref": {
+      "type": "object",
+      "required": ["path", "blob_oid", "digest"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {"const": ".dev-dispatch/spec/approved.md"},
+        "blob_oid": {"$ref": "#/$defs/git_blob_oid"},
+        "digest": {"$ref": "#/$defs/sha256_digest"}
+      }
+    },
+    "feedback_index_ref": {
+      "type": "object",
+      "required": ["path", "blob_oid", "digest", "entry_count"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {"const": ".dev-dispatch/feedback/index.json"},
+        "blob_oid": {"$ref": "#/$defs/git_blob_oid"},
+        "digest": {"$ref": "#/$defs/sha256_digest"},
+        "entry_count": {"type": "integer", "minimum": 0}
+      }
+    },
+    "review_feedback_index_ref": {
+      "type": "object",
+      "required": ["path", "blob_oid", "digest", "entry_count"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {"const": ".dev-dispatch/feedback/index.json"},
+        "blob_oid": {"$ref": "#/$defs/git_blob_oid"},
+        "digest": {"$ref": "#/$defs/sha256_digest"},
+        "entry_count": {"type": "integer", "minimum": 1}
+      }
+    },
+    "implement_handoff_artifact_ref": {
+      "type": "object",
+      "required": ["path", "blob_oid", "digest"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^(?!.*\\.\\.)\\.dev-dispatch/handoffs/(?!\\./)[A-Za-z0-9._-]+/implement\\.json$"
+        },
+        "blob_oid": {"$ref": "#/$defs/git_blob_oid"},
+        "digest": {"$ref": "#/$defs/sha256_digest"}
+      }
+    },
+    "review_artifact_path": {
+      "type": "string",
+      "pattern": "^(?!.*\\.\\.)\\.dev-dispatch/reviews/(?!\\./)[A-Za-z0-9._-]+/review\\.json$"
+    },
+    "review_artifact_ref": {
+      "type": "object",
+      "required": ["path", "blob_oid", "digest"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {"$ref": "#/$defs/review_artifact_path"},
+        "blob_oid": {"$ref": "#/$defs/git_blob_oid"},
+        "digest": {"$ref": "#/$defs/sha256_digest"}
+      }
+    },
+    "finding": {
+      "type": "object",
+      "required": ["severity", "summary"],
+      "additionalProperties": false,
+      "properties": {
+        "severity": {"enum": ["blocker", "major", "minor", "note"]},
+        "summary": {"$ref": "#/$defs/nonempty_string"},
+        "location": {"$ref": "#/$defs/nonempty_string"}
+      }
+    }
+  }
+}
