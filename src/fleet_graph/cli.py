@@ -90,7 +90,7 @@ def _dd_run(args: argparse.Namespace) -> int:
     """Run one development through the dd pipeline to termination."""
     import pathlib
 
-    from fleet_graph.dd.bootstrap import committed_target_base
+    from fleet_graph.dd.bootstrap import IdentityChanged, committed_target_base
     from fleet_graph.dd.git import run_git
     from fleet_graph.dd.vendor.plugin_adapter import load_plugin_binding
     from fleet_graph.graphs.dd_runner import DevelopmentConfig, run_pipeline
@@ -107,6 +107,15 @@ def _dd_run(args: argparse.Namespace) -> int:
     if not head:
         head = run_git(workspace, "rev-parse", "HEAD", check=True).stdout.strip()
 
+    if args.target_base:
+        target_base = args.target_base
+    else:
+        try:
+            target_base = committed_target_base(workspace) or head
+        except IdentityChanged as changed:
+            # A refusal, not a crash: the operator has a legible next step.
+            raise SystemExit(str(changed)) from changed
+
     run_root = pathlib.Path(args.run_root or f"/data/fleet-graph/dd/{args.development}")
     config = DevelopmentConfig(
         development_id=args.development,
@@ -117,7 +126,7 @@ def _dd_run(args: argparse.Namespace) -> int:
         remote_ref=args.remote_ref,
         # The identity the development committed wins over HEAD: by now HEAD
         # has moved past the base the spec was approved against.
-        target_base_commit=args.target_base or committed_target_base(workspace) or head,
+        target_base_commit=target_base,
         root_handoff_digest=args.root_digest,
         plugin_binding=binding,
         head_commit=head,
