@@ -24,8 +24,23 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
+
+from fleet_graph.dd.upstream_constants import ReviewPhase
+
+# The contract's own review_phase vocabulary, keyed by dd stage id.
+REVIEW_PHASE = {
+    "continuous_review": str(ReviewPhase.CONTINUOUS),
+    "final_review": str(ReviewPhase.FINAL),
+}
+# The artifact the implement stage produces; its sealed commit is the one a
+# review names as its subject, which stops being the review's own input commit
+# as soon as a second review runs after the first.
+IMPLEMENT_EVIDENCE = "implementation_evidence"
+
+REVIEW_ID_NAMESPACE = uuid.UUID("4a9d0e17-8b52-5c63-a7f8-1d3e5b9c2a44")
 
 PLACEHOLDER = re.compile(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)(\?)?\}\}")
 
@@ -174,6 +189,90 @@ def bundle_resources(loaded: Any) -> dict[str, str]:
     return {resource.relative_path: resource.content.decode("utf-8") for resource in loaded}
 
 
+REVIEW_PROMPT = """\
+You are the {phase} Reviewer for one `dev-dispatch.attempt-context/v1` attempt.
+
+Review the product changes at `{subject_commit}` against the approved spec at
+`{spec_path}`, in the worktree `{worktree_path}`. Read the committed feedback
+index at `{index_path}` and every review artifact it references; that index is
+the only feedback history. Do not modify anything: this is a read-only review,
+and a reviewer that writes to the subject workspace has its verdict discarded.
+
+## Your verdict
+
+`APPROVE` only if the change satisfies the spec. `REJECT` otherwise, with at
+least one finding saying why. Reporting a spec as satisfied when it is not is
+a contract violation, and so is inventing a finding to look thorough.
+
+## Result envelope (fleet-graph dispatch)
+
+Put one JSON object at the top level of `Envelope.result` -- no outer `result`
+key, no outer `effects` key. Echo these back verbatim:
+
+```json
+{{
+  "contract_version": "{contract_version}",
+  "review_id": "{review_id}",
+  "attempt_id": "{attempt_id}",
+  "review_phase": "{phase}",
+  "subject_commit": "{subject_commit}",
+  "implementation_subject_commit": "{implementation_subject_commit}",
+  "spec_digest": "{spec_digest}",
+  "reviewer_job_id": "{reviewer_job_id}"
+}}
+```
+
+and add these three, which are yours to determine:
+
+- `verdict`: `APPROVE` or `REJECT`
+- `findings`: an array, possibly empty, of
+  `{{"severity": "blocker"|"major"|"minor"|"note", "summary": "...", "location": "..."}}`
+  -- `location` is optional; `severity` and `summary` are not
+- `reviewer_model`: the model you are running as
+
+All eleven keys must be present, and nothing else.\
+"""
+
+
+def derive_review_id(attempt_id: str, phase: str) -> str:
+    """Derived, like every other id here: a retry names the same review."""
+    return str(uuid.uuid5(REVIEW_ID_NAMESPACE, f"{attempt_id}\x1f{phase}"))
+
+
+def render_review_prompt(
+    stage_dispatch: dict[str, Any],
+    *,
+    phase: str,
+    worktree_path: str,
+    reviewer_job_id: str,
+    implementation_subject_commit: str,
+    spec_path: str,
+    index_path: str,
+) -> str:
+    """Our own review prompt, not the bundle's workflow.
+
+    The bundle runs review as several nodes with their own templates, and
+    rebuilding that here would be rebuilding its workflow engine. What this
+    does is narrower and sufficient: state the task, and state the result
+    contract -- because seven of `review.result.v2`'s eleven fields are values
+    we already hold and the reviewer only has to echo. Four are its own:
+    verdict, findings, reviewer_job_id, reviewer_model.
+    """
+    return REVIEW_PROMPT.format(
+        phase=phase,
+        subject_commit=stage_dispatch["input_commit"],
+        spec_path=spec_path,
+        index_path=index_path,
+        worktree_path=worktree_path,
+        contract_version=stage_dispatch["contract_version"],
+        review_id=derive_review_id(stage_dispatch["attempt_id"], phase),
+        attempt_id=stage_dispatch["attempt_id"],
+        implementation_subject_commit=implementation_subject_commit,
+        spec_digest=stage_dispatch["spec_ref"]["digest"],
+        reviewer_job_id=reviewer_job_id,
+    )
+
+
 @dataclass
 class PluginPromptSource:
     """The implement prompt, read from the bundle the capability check admitted.
@@ -204,14 +303,34 @@ class PluginPromptSource:
             )
         return self._cache
 
+    def review_phase_of(self, stage_id: str) -> str | None:
+        """`continuous` / `final` -- a third vocabulary, from the contract's own
+        `review_phase` enum. dd's stage ids and the role input's stage values
+        are the other two."""
+        return REVIEW_PHASE.get(stage_id)
+
     def for_stage(
         self, stage_id: str, dispatch: dict[str, Any], *, run_id: str, actor_job_id: str
     ) -> str | None:
-        if stage_id != "implement":
+        phase = self.review_phase_of(stage_id)
+        if phase is None and stage_id != "implement":
             return None
         stage_dispatch = self.builder.build(
             dispatch, parent_receipt=dispatch.get("parent_receipt") or None
         )
+        if phase is not None:
+            return render_review_prompt(
+                stage_dispatch,
+                phase=phase,
+                worktree_path=self.worktree_path,
+                reviewer_job_id=actor_job_id,
+                implementation_subject_commit=(
+                    (dispatch.get("artifact_commits") or {}).get(IMPLEMENT_EVIDENCE)
+                    or stage_dispatch["input_commit"]
+                ),
+                spec_path=self.builder.spec_path,
+                index_path=self.builder.index_path,
+            )
         return render_stage_prompt(
             self.resources(),
             IMPLEMENT_PERSONA,
@@ -227,14 +346,19 @@ class PluginPromptSource:
 
 
 __all__ = [
+    "IMPLEMENT_EVIDENCE",
     "IMPLEMENT_PERSONA",
     "IMPLEMENT_TEMPLATE",
     "RESULT_TRANSPORT",
+    "REVIEW_PHASE",
+    "REVIEW_PROMPT",
     "PluginPromptSource",
     "PromptError",
     "as_value",
     "bundle_resources",
+    "derive_review_id",
     "render_commands",
+    "render_review_prompt",
     "render_stage_prompt",
     "render_template",
     "stage_values",

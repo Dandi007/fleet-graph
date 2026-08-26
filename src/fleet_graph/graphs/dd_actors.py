@@ -55,6 +55,11 @@ DEFAULT_ROLES = {
     "final_review": "final_reviewer",
 }
 
+# The artifact whose producer is, by definition, the stage that changes the
+# product. Asking the contract which stage that is beats writing the name down,
+# and it is the only stage that may be dispatched with write.
+PRODUCT_ARTIFACT = "product_code"
+
 # agent-runtime's `attempt-context.v1.json` has its own stage vocabulary, and
 # it is not the contract's: `review` where dd says `continuous_review`, and
 # `final-review` -- hyphen -- where dd says `final_review`. Two vocabularies
@@ -114,8 +119,19 @@ class AgentRunStageActor:
     timeouts: dict[str, int] = field(default_factory=dict)
     default_timeout_seconds: int = 3600
     poll_interval: float = 2.0
-    write: bool = True
     extra_labels: dict[str, str] = field(default_factory=dict)
+
+    def writes(self, stage: Stage) -> bool:
+        """Only the stage the contract says produces product code.
+
+        A role's own `write` declaration is a ceiling, not a grant: agent-run
+        gives write only when the caller asks for it *and* the role allows it,
+        and asking for it where the role forbids it is refused outright
+        ("write tightening"). Reviewers declare write false, and a reviewer
+        that writes to the subject workspace has its verdict discarded -- so
+        asking on their behalf was never going to work, and should not.
+        """
+        return PRODUCT_ARTIFACT in stage.produced_artifacts
 
     def _timeout(self, stage: Stage) -> int:
         return self.timeouts.get(stage.id, self.default_timeout_seconds)
@@ -179,7 +195,7 @@ class AgentRunStageActor:
             input_path=str(input_path),
             prompt_file=str(prompt_path),
             structured=True,
-            write=self.write,
+            write=self.writes(stage),
             timeout_seconds=self._timeout(stage),
             labels=labels,
         )
@@ -324,6 +340,7 @@ class BoardGate:
 __all__ = [
     "DEFAULT_ROLES",
     "GATE_APPROVE",
+    "PRODUCT_ARTIFACT",
     "ROLE_STAGE",
     "AgentRunStageActor",
     "BoardGate",

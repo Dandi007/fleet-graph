@@ -147,6 +147,41 @@ class TestDispatchingAnLlmStage:
         written = json.loads(Path(spec.input_path).read_text(encoding="utf-8"))
         jsonschema.validate(written, json.loads(schema_path.read_text(encoding="utf-8")))
 
+    def test_write_is_asked_for_only_where_the_product_changes(self, tmp_path: Path) -> None:
+        """A role's `write` is a ceiling, not a grant. Asking for it where the
+        role forbids it is refused outright, and reviewers forbid it -- a
+        reviewer that writes to the subject workspace has its verdict
+        discarded."""
+        launcher = RecordingLauncher()
+        actor = make_actor(tmp_path, launcher)
+        for stage_id in ("implement", "continuous_review", "final_review"):
+            actor.act(LIFECYCLE.stages[stage_id], dispatch_for(LIFECYCLE.stages[stage_id]))
+
+        asked = {spec.labels["stage"]: spec.write for spec, _ in launcher.launched}
+        assert asked == {
+            "implement": True,
+            "continuous_review": False,
+            "final_review": False,
+        }
+
+    def test_the_roles_own_declarations_agree(self) -> None:
+        """If a role ever stops allowing write, this is where we find out."""
+        if not SCHEMAS.parent.is_dir():
+            pytest.skip("agent-runtime is not on this machine")
+        declared = {}
+        for stage_id in ("implement", "continuous_review", "final_review"):
+            role = SCHEMAS.parent / f"{stage_role(LIFECYCLE.stages[stage_id], {})}.yaml"
+            text = role.read_text(encoding="utf-8")
+            declared[stage_id] = "write: true" in text
+
+        actor = AgentRunStageActor(
+            launcher=None,  # type: ignore[arg-type]
+            development_id="d",
+            run_root=Path("/tmp"),
+        )
+        for stage_id, allows in declared.items():
+            assert actor.writes(LIFECYCLE.stages[stage_id]) == allows, stage_id
+
     def test_the_stage_vocabulary_is_translated_not_assumed(self) -> None:
         """`review` where dd says `continuous_review`, `final-review` -- hyphen
         -- where dd says `final_review`. Two vocabularies, one translation."""

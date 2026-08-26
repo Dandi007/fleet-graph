@@ -223,16 +223,98 @@ class TestTheEnvelopeMismatchThatCostFourRuns:
         assert "top level" in RESULT_TRANSPORT
 
 
-class TestReviewsAreLeftAlone:
-    def test_the_prompt_source_declines_stages_it_should_not_reproduce(self) -> None:
-        """The review stages are a multi-node workflow in the bundle. Rebuilding
-        that inside the orchestration shell is the opposite of the point."""
+class TestTheReviewPrompt:
+    """Ours, not the bundle's. The bundle runs review as several nodes with
+    their own templates; rebuilding that here would be rebuilding its workflow
+    engine. This is narrower and sufficient: state the task, state the result
+    contract."""
+
+    def _dispatch(self) -> dict[str, Any]:
+        return {
+            "attempt_id": "att-1",
+            "contract_version": "dev-dispatch.attempt-context/v1",
+            "development_id": "dev-1",
+            "input_commit": "a" * 40,
+            "spec_ref": {"path": ".dev-dispatch/spec/approved.md", "digest": "sha256:" + "b" * 64},
+        }
+
+    def _rendered(self, phase: str = "continuous") -> str:
+        from fleet_graph.dd.prompt import render_review_prompt
+
+        return render_review_prompt(
+            self._dispatch(),
+            phase=phase,
+            worktree_path="/w",
+            reviewer_job_id="job-1",
+            implementation_subject_commit="c" * 40,
+            spec_path=".dev-dispatch/spec/approved.md",
+            index_path=".dev-dispatch/feedback/index.json",
+        )
+
+    def test_it_names_every_field_the_result_schema_requires(self) -> None:
+        """Seven are values we already hold and the reviewer echoes; four are
+        its own."""
+        schema = json.loads(
+            (
+                Path(__file__).parents[1] / "src/fleet_graph/dd/contracts/review-result.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        rendered = self._rendered()
+        for field in schema["required"]:
+            assert field in rendered, field
+
+    def test_it_hands_over_the_values_that_are_not_the_reviewers_to_invent(self) -> None:
+        rendered = self._rendered()
+        assert "a" * 40 in rendered, "the subject commit"
+        assert "c" * 40 in rendered, "the implement commit under review"
+        assert "sha256:" + "b" * 64 in rendered, "the spec digest"
+        assert "job-1" in rendered
+
+    def test_the_phase_is_the_contracts_own_vocabulary(self) -> None:
+        """A third vocabulary: dd's stage ids and the role input's stage values
+        are the other two."""
+        defs = json.loads(
+            (
+                Path(__file__).parents[1]
+                / "src/fleet_graph/dd/contracts/attempt-context.schema.json"
+            ).read_text(encoding="utf-8")
+        )["$defs"]
+        allowed = set(defs["review_phase"]["enum"])
+
+        from fleet_graph.dd.prompt import REVIEW_PHASE
+
+        assert set(REVIEW_PHASE.values()) == allowed
+        assert "continuous" in self._rendered("continuous")
+        assert "final" in self._rendered("final")
+
+    def test_it_says_a_reviewer_must_not_write(self) -> None:
+        """A reviewer that writes to the subject workspace has its verdict
+        discarded -- REVIEWER_GIT_MUTATION in the contract's own taxonomy."""
+        assert "read-only" in self._rendered()
+        assert "discarded" in self._rendered()
+
+    def test_it_forbids_both_directions_of_dishonesty(self) -> None:
+        rendered = self._rendered()
+        assert "contract violation" in rendered
+        assert "inventing a finding" in rendered
+
+    def test_the_review_id_is_derived_not_random(self) -> None:
+        from fleet_graph.dd.prompt import derive_review_id
+
+        assert derive_review_id("att-1", "continuous") == derive_review_id("att-1", "continuous")
+        assert derive_review_id("att-1", "continuous") != derive_review_id("att-1", "final")
+
+    def test_acceptance_gets_no_prompt_from_here(self) -> None:
+        """It is dispatched in the schema's stage enum but the plugin ships no
+        sealer and no persona for it."""
         from fleet_graph.dd.prompt import PluginPromptSource
 
         source = PluginPromptSource(binding=None, builder=None, worktree_path="/w")
-        for stage in ("continuous_review", "final_review", "acceptance"):
-            assert source.for_stage(stage, {}, run_id="r", actor_job_id="j") is None
+        assert source.for_stage("acceptance", {}, run_id="r", actor_job_id="j") is None
+        assert source.for_stage("merger", {}, run_id="r", actor_job_id="j") is None
 
+
+class TestTheBundleShipsMoreThanWeReproduce:
     def test_the_bundle_really_does_ship_a_multi_node_review(self) -> None:
         if not PINNED_PLUGIN.is_dir():
             pytest.skip("the pinned plugin release is not on this machine")
