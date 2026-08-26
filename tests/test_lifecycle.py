@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from fleet_graph.dd.lifecycle import (
+    AmbiguousSpine,
     BindingViolation,
     Lifecycle,
     UnknownTransition,
@@ -185,3 +186,95 @@ class TestSingleSourceOfTruth:
 
     def test_the_real_contract_still_drives_the_default(self, lifecycle: Lifecycle) -> None:
         assert lifecycle.transition("implement", "success").target == "continuous_review"
+
+
+class TestTheSpineIsDerivedNotWritten:
+    """The five unconditional edges the transitions table does not carry."""
+
+    def test_spine_falls_out_of_the_artifact_graph(self, lifecycle: Lifecycle) -> None:
+        assert lifecycle.spine == {
+            "configure": "implement",
+            "implement": "continuous_review",
+            "continuous_review": "final_review",
+            "acceptance": "human_gate",
+            "human_gate": "merger",
+        }
+
+    def test_the_derived_edges_agree_with_the_declared_ones(self, lifecycle: Lifecycle) -> None:
+        """Where both exist they must say the same thing, or the contract is
+        internally inconsistent and no runner can be trusted to walk it."""
+        for source, target in lifecycle.spine.items():
+            declared = [
+                t.target for t in lifecycle.transitions if t.source == source and not t.is_rework
+            ]
+            if declared:
+                assert target in declared, f"{source}: derived {target}, declared {declared}"
+
+    def test_a_root_input_carries_no_edge(self, lifecycle: Lifecycle) -> None:
+        """`spec` has no producer and five consumers; it must not imply an edge."""
+        assert "spec" not in lifecycle.artifact_producers
+        assert len(lifecycle.artifact_consumers["spec"]) > 1
+
+    def test_an_artifact_nobody_consumes_carries_no_edge(self, lifecycle: Lifecycle) -> None:
+        assert "product_code" not in lifecycle.artifact_consumers
+        assert lifecycle.artifact_producers["product_code"] == ("implement",)
+
+    def test_only_the_last_stage_is_terminal(self, lifecycle: Lifecycle) -> None:
+        terminal = [name for name in lifecycle.stages if lifecycle.is_terminal(name)]
+        assert terminal == ["merger"]
+
+    def test_two_candidate_successors_refuse_rather_than_pick(self, tmp_path: Path) -> None:
+        contract = {
+            "contract_version": 99,
+            "stages": [
+                {"id": "a", "actor": "script", "produced_artifacts": ["x", "y"]},
+                {"id": "b", "actor": "script", "required_artifacts": ["x"]},
+                {"id": "c", "actor": "script", "required_artifacts": ["y"]},
+            ],
+            "transitions": [],
+        }
+        path = tmp_path / "lifecycle.json"
+        path.write_text(json.dumps(contract), encoding="utf-8")
+
+        with pytest.raises(AmbiguousSpine):
+            Lifecycle.load(path).artifact_successor("a")
+
+    def test_two_producers_of_one_artifact_carry_no_edge(self, tmp_path: Path) -> None:
+        """Ambiguity on the producing side is silence, not a guess."""
+        contract = {
+            "contract_version": 99,
+            "stages": [
+                {"id": "a", "actor": "script", "produced_artifacts": ["x"]},
+                {"id": "a2", "actor": "script", "produced_artifacts": ["x"]},
+                {"id": "b", "actor": "script", "required_artifacts": ["x"]},
+            ],
+            "transitions": [],
+        }
+        path = tmp_path / "lifecycle.json"
+        path.write_text(json.dumps(contract), encoding="utf-8")
+
+        assert Lifecycle.load(path).artifact_successor("a") is None
+
+
+class TestFailureExitsAndWrapper:
+    def test_the_three_llm_stages_declare_a_failure_exit(self, lifecycle: Lifecycle) -> None:
+        sources = {f.source for f in lifecycle.failure_transitions}
+        assert sources == {name for name, s in lifecycle.stages.items() if s.is_llm}
+
+    def test_failure_exit_is_terminal_never_materialised(self, lifecycle: Lifecycle) -> None:
+        exit_ = lifecycle.failure_transition("implement", "failed")
+        assert exit_ is not None
+        assert exit_.terminal is True
+        assert exit_.materialize is False
+        assert exit_.receipt is False
+
+    def test_a_script_stage_declares_no_failure_exit(self, lifecycle: Lifecycle) -> None:
+        assert lifecycle.failure_transition("acceptance", "failed") is None
+
+    def test_the_wrapper_order_comes_from_the_contract(self, lifecycle: Lifecycle) -> None:
+        assert lifecycle.wrapper_steps == (
+            "input_verify",
+            "actor",
+            "materialize",
+            "output_verify",
+        )

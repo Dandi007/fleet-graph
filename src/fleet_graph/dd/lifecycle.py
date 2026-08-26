@@ -23,6 +23,20 @@ Two bindings do real work and are enforced here rather than trusted:
   handed work that was never actually produced by the stage before it.
 - `event_binding` ties the transition to the receipt's own verdict, so a
   caller cannot claim APPROVE while holding a receipt that says REJECT.
+
+One thing the `transitions` table does **not** contain is the unconditional
+spine: nothing declares `configure -> implement`, `acceptance -> human_gate`,
+or `human_gate -> merger`. The table only carries the edges a verdict can
+steer, because those are the ones that need receipts and bindings.
+
+Rather than hand-write the missing five edges -- which would put back exactly
+the second, drifting description of the machine this module exists to avoid --
+the spine is *derived* from the artifact declarations the stages already carry.
+`configure` produces `run_config`, `implement` is the only stage that requires
+it, so the edge exists. Every spine edge in this contract falls out that way,
+uniquely. Where an artifact has more than one producer or more than one
+consumer the derivation refuses rather than picking, because at that point the
+contract genuinely does not say what comes next.
 """
 
 from __future__ import annotations
@@ -47,6 +61,10 @@ class UnknownTransition(LifecycleError):
 
 class BindingViolation(LifecycleError):
     """A declared binding did not hold. The chain is broken; stop."""
+
+
+class AmbiguousSpine(LifecycleError):
+    """The artifact graph admits more than one successor. Refuse to choose."""
 
 
 @dataclass(frozen=True)
@@ -76,6 +94,18 @@ class Transition:
     @property
     def is_rework(self) -> bool:
         return self.next_mode == "rework"
+
+
+@dataclass(frozen=True)
+class FailureTransition:
+    """A declared failure exit. Terminal by contract, and never materialised."""
+
+    source: str
+    event: str
+    required_transport_record: str
+    terminal: bool = True
+    materialize: bool = False
+    receipt: bool = False
 
 
 def _dig(obj: Any, dotted: str) -> Any:
@@ -130,6 +160,38 @@ class Lifecycle:
         )
 
     @cached_property
+    def wrapper_steps(self) -> tuple[str, ...]:
+        """The per-stage wrapper, in contract order.
+
+        Every stage runs `input_verify -> actor -> materialize -> output_verify`
+        because the contract says so, not because a runner hardcoded it. A
+        runner that meets a step it does not implement must fault rather than
+        skip it -- a silently skipped `output_verify` is an unverified stage
+        that still reports success.
+        """
+        return tuple(self.contract.get("wrapper", ()))
+
+    @cached_property
+    def failure_transitions(self) -> tuple[FailureTransition, ...]:
+        return tuple(
+            FailureTransition(
+                source=raw["from"],
+                event=raw["on"],
+                required_transport_record=raw["required_transport_record"],
+                terminal=bool(raw.get("terminal", True)),
+                materialize=bool(raw.get("materialize", False)),
+                receipt=bool(raw.get("receipt", False)),
+            )
+            for raw in self.contract.get("failure_transitions", ())
+        )
+
+    def failure_transition(self, stage: str, event: str) -> FailureTransition | None:
+        for candidate in self.failure_transitions:
+            if candidate.source == stage and candidate.event == event:
+                return candidate
+        return None
+
+    @cached_property
     def failure_taxonomy(self) -> dict[str, dict[str, Any]]:
         return dict(self.contract.get("failure_taxonomy", {}))
 
@@ -155,8 +217,75 @@ class Lifecycle:
         return tuple(t.event for t in self.transitions if t.source == stage)
 
     def is_terminal(self, stage: str) -> bool:
-        """A stage with no outgoing transitions ends the pipeline."""
-        return stage in self.stages and not self.events_from(stage)
+        """A stage with neither a declared edge nor a derived successor ends it."""
+        if stage not in self.stages:
+            return False
+        if self.events_from(stage):
+            return False
+        try:
+            return self.artifact_successor(stage) is None
+        except AmbiguousSpine:
+            return False
+
+    # --- the derived spine -----------------------------------------------
+
+    @cached_property
+    def artifact_producers(self) -> dict[str, tuple[str, ...]]:
+        producers: dict[str, list[str]] = {}
+        for stage in self.stages.values():
+            for kind in stage.produced_artifacts:
+                producers.setdefault(kind, []).append(stage.id)
+        return {kind: tuple(ids) for kind, ids in producers.items()}
+
+    @cached_property
+    def artifact_consumers(self) -> dict[str, tuple[str, ...]]:
+        consumers: dict[str, list[str]] = {}
+        for stage in self.stages.values():
+            for kind in stage.required_artifacts:
+                consumers.setdefault(kind, []).append(stage.id)
+        return {kind: tuple(ids) for kind, ids in consumers.items()}
+
+    def artifact_successor(self, stage: str) -> str | None:
+        """The stage that consumes what this one produces, or None.
+
+        Only an artifact with exactly one producer and exactly one consumer
+        carries an edge. `spec` has no producer (it is the root input) and many
+        consumers, so it carries none; `product_code` has no consumer, so it
+        carries none either. Anything genuinely ambiguous raises instead of
+        being resolved by a tiebreak nobody wrote down.
+        """
+        current = self.stages.get(stage)
+        if current is None:
+            return None
+
+        targets: list[str] = []
+        for kind in current.produced_artifacts:
+            if self.artifact_producers.get(kind, ()) != (stage,):
+                continue
+            consumers = tuple(c for c in self.artifact_consumers.get(kind, ()) if c != stage)
+            if len(consumers) != 1:
+                continue
+            if consumers[0] not in targets:
+                targets.append(consumers[0])
+
+        if not targets:
+            return None
+        if len(targets) > 1:
+            raise AmbiguousSpine(
+                f"{stage} produces artifacts consumed by {sorted(targets)}; "
+                "the contract does not say which one comes next"
+            )
+        return targets[0]
+
+    @cached_property
+    def spine(self) -> dict[str, str]:
+        """Every derivable unconditional edge, keyed by source stage."""
+        derived: dict[str, str] = {}
+        for stage in self.stages:
+            successor = self.artifact_successor(stage)
+            if successor is not None:
+                derived[stage] = successor
+        return derived
 
     # --- bindings --------------------------------------------------------
 
@@ -213,7 +342,9 @@ class Lifecycle:
 
 __all__ = [
     "LIFECYCLE_PATH",
+    "AmbiguousSpine",
     "BindingViolation",
+    "FailureTransition",
     "Lifecycle",
     "LifecycleError",
     "Stage",
