@@ -17,6 +17,7 @@ import pytest
 
 from conftest import DEVELOPMENT_ID, git, head
 from fleet_graph.dd.lifecycle import Lifecycle
+from fleet_graph.dd.prompt import IMPLEMENT_PERSONA, IMPLEMENT_TEMPLATE
 from fleet_graph.dd.vendor import plugin_adapter
 from fleet_graph.executors.agent_run import RunStatus, RunTicket
 from fleet_graph.graphs.dd_pipeline import (
@@ -140,6 +141,27 @@ def plugin_seals(repo: Path, monkeypatch: pytest.MonkeyPatch) -> RealCommitSeale
 
     monkeypatch.setattr(plugin_adapter, "invoke_implement_materializer", implement_seal)
     monkeypatch.setattr(plugin_adapter, "invoke_review_materializer", review_seal)
+
+    # The prompt comes from the same bundle, so the stand-in has to cover it
+    # too -- otherwise the test would be asserting against a pipeline that
+    # never rendered one.
+    class Resource:
+        def __init__(self, path: str, text: str) -> None:
+            self.relative_path = path
+            self.content = text.encode("utf-8")
+            self.digest = "sha256:" + "0" * 64
+
+    monkeypatch.setattr(
+        plugin_adapter,
+        "load_implement_stage_resources",
+        lambda binding, **kwargs: (
+            Resource(IMPLEMENT_PERSONA, "You are the Implementer."),
+            Resource(
+                IMPLEMENT_TEMPLATE,
+                "input_commit: {{input_commit}}\nacceptance: {{acceptance_commands}}\n",
+            ),
+        ),
+    )
     return sealer
 
 
