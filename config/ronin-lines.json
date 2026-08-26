@@ -4,13 +4,59 @@
   "run_root": "/data/fleet-graph/runs",
   "maintenance_stop": "/data/ronin/maintenance-stop",
   "lines": [
-    { "folder_id": "wf-5664e5", "seat": "opencode-gpt-terra", "max_rounds": 9999, "alias": "ronin-quota" },
-    { "folder_id": "wf-386b2f", "seat": "opencode-gpt-terra", "max_rounds": 9999, "alias": "ronin-cost-observ" },
-    { "folder_id": "wf-7bc4d1", "seat": "opencode-gpt-terra", "max_rounds": 9999, "alias": "ronin-usage-dash" },
-    { "folder_id": "wf-6475fd", "seat": "opencode-gpt-terra", "max_rounds": 9999, "alias": "ronin-observ" },
-    { "folder_id": "wf-9b5931", "seat": "opencode-gpt-terra", "max_rounds": 9999, "alias": "ronin-model-switch" },
-    { "folder_id": "wf-541832", "seat": "opencode-gpt-terra", "max_rounds": 9999, "alias": "ronin-brainstorm-v4" },
-    { "folder_id": "wf-3f87f3", "seat": "opencode-gpt-terra", "max_rounds": 9999, "alias": "ronin-platform" },
-    { "folder_id": "wf-40fa8d", "seat": "opencode-gpt-terra", "max_rounds": 9999, "alias": "ronin-quotaalert" }
+    {
+      "folder_id": "wf-287e81",
+      "seat": "opencode-gpt-terra",
+      "max_rounds": 9999,
+      "alias": "ronin-g2s"
+    },
+    {
+      "folder_id": "wf-386b2f",
+      "seat": "opencode-gpt-terra",
+      "max_rounds": 9999,
+      "alias": "ronin-cost-observ"
+    },
+    {
+      "folder_id": "wf-3f87f3",
+      "seat": "opencode-gpt-terra",
+      "max_rounds": 9999,
+      "alias": "ronin-platform"
+    },
+    {
+      "folder_id": "wf-40fa8d",
+      "seat": "opencode-gpt-terra",
+      "max_rounds": 9999,
+      "alias": "ronin-quotaalert"
+    },
+    {
+      "folder_id": "wf-541832",
+      "seat": "opencode-gpt-terra",
+      "max_rounds": 9999,
+      "alias": "ronin-brainstorm-v4"
+    },
+    {
+      "folder_id": "wf-5664e5",
+      "seat": "opencode-gpt-terra",
+      "max_rounds": 9999,
+      "alias": "ronin-quota"
+    },
+    {
+      "folder_id": "wf-6475fd",
+      "seat": "opencode-gpt-terra",
+      "max_rounds": 9999,
+      "alias": "ronin-observ"
+    },
+    {
+      "folder_id": "wf-7bc4d1",
+      "seat": "opencode-gpt-terra",
+      "max_rounds": 9999,
+      "alias": "ronin-usage-dash"
+    },
+    {
+      "folder_id": "wf-9b5931",
+      "seat": "opencode-gpt-terra",
+      "max_rounds": 9999,
+      "alias": "ronin-model-switch"
+    }
   ]
 }
