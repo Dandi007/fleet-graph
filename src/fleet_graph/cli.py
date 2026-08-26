@@ -89,9 +89,9 @@ def plugin_binding_config(path: Any) -> dict[str, Any]:
 def _dd_run(args: argparse.Namespace) -> int:
     """Run one development through the dd pipeline to termination."""
     import pathlib
-    import subprocess
 
     from fleet_graph.dd.bootstrap import committed_target_base
+    from fleet_graph.dd.git import run_git
     from fleet_graph.dd.vendor.plugin_adapter import load_plugin_binding
     from fleet_graph.graphs.dd_runner import DevelopmentConfig, run_pipeline
 
@@ -105,12 +105,7 @@ def _dd_run(args: argparse.Namespace) -> int:
 
     head = args.spec_commit
     if not head:
-        head = subprocess.run(
-            ["git", "-C", str(workspace), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
+        head = run_git(workspace, "rev-parse", "HEAD", check=True).stdout.strip()
 
     run_root = pathlib.Path(args.run_root or f"/data/fleet-graph/dd/{args.development}")
     config = DevelopmentConfig(
@@ -160,17 +155,14 @@ def _dd_run(args: argparse.Namespace) -> int:
 def _dd_bootstrap(args: argparse.Namespace) -> int:
     """Write and commit the attempt context a development starts from."""
     import pathlib
-    import subprocess
 
     from fleet_graph.dd.bootstrap import build_attempt_context
+    from fleet_graph.dd.git import run_git
 
     workspace = pathlib.Path(args.workspace).resolve()
 
     def git(*argv: str) -> str:
-        done = subprocess.run(
-            ["git", "-C", str(workspace), *argv], capture_output=True, text=True, check=True
-        )
-        return done.stdout.strip()
+        return run_git(workspace, *argv, check=True).stdout.strip()
 
     base = args.target_base or git("rev-parse", "HEAD")
     context = build_attempt_context(
