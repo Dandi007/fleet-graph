@@ -1,0 +1,271 @@
+"""Assembling a development: every real part, wired together, on a real repo.
+
+The agents and the plugin script are stood in for -- one costs money and the
+other lives in another repository -- but everything between them is the
+shipped code: the contract interpreter, the derived spine, the dispatch
+builder reading real git blobs, the capability lock over the real bundle, and
+the bindings that check the chain.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from conftest import DEVELOPMENT_ID, git, head
+from fleet_graph.dd.lifecycle import Lifecycle
+from fleet_graph.dd.vendor import plugin_adapter
+from fleet_graph.executors.agent_run import RunStatus, RunTicket
+from fleet_graph.graphs.dd_pipeline import (
+    TERMINAL_COMPLETE,
+    TERMINAL_FAULT,
+    Dispatch,
+    Sealed,
+    StageOutcome,
+)
+from fleet_graph.graphs.dd_runner import (
+    DevelopmentConfig,
+    build_pipeline,
+    lifecycle_gate_stage,
+    run_pipeline,
+)
+
+LIFECYCLE = Lifecycle.load()
+
+
+def make_config(repo: Path, tmp_path: Path) -> DevelopmentConfig:
+    return DevelopmentConfig(
+        development_id=DEVELOPMENT_ID,
+        workspace_path=repo,
+        state_root=tmp_path / "state",
+        run_root=tmp_path / "runs",
+        remote_url="https://example.invalid/repo.git",
+        remote_ref="refs/heads/dev-001",
+        target_base_commit="b" * 40,
+        root_handoff_digest="sha256:" + "c" * 64,
+        plugin_binding=object(),
+        head_commit=head(repo),
+    )
+
+
+class AgentRunStub:
+    """Stands in for `agent-run`: answers with what each stage declares."""
+
+    def __init__(self, verdicts: dict[str, list[str]] | None = None) -> None:
+        self.verdicts = {k: list(v) for k, v in (verdicts or {}).items()}
+        self.dispatched: list[str] = []
+
+    def launch(self, spec: Any, run_id: str) -> RunTicket:
+        self.stage = spec.labels["stage"]
+        self.dispatched.append(self.stage)
+        return RunTicket(run_id, "/tmp/x", None)
+
+    def wait(self, ticket: RunTicket, **kwargs: Any) -> RunStatus:
+        stage = LIFECYCLE.stages[self.stage]
+        queue = self.verdicts.get(stage.id)
+        verdict = queue.pop(0) if queue else "success"
+        if stage.id == "implement":
+            receipt: dict[str, Any] = {
+                "actor_job_id": f"job-{stage.id}",
+                "input_commit": "1" * 40,
+                "outcome": "APPLIED",
+                "work_head_commit": "2" * 40,
+                "verification_record": {"checks": []},
+            }
+        else:
+            receipt = {"review_result": {"verdict": verdict, "findings": []}}
+        return RunStatus(
+            "succeeded",
+            {
+                "structured_result": {
+                    "verdict": verdict,
+                    "receipt": receipt,
+                    "produced_artifacts": list(stage.produced_artifacts),
+                }
+            },
+        )
+
+
+class ScriptStub:
+    """A script stage that produces what the contract says it produces."""
+
+    def __init__(self) -> None:
+        self.ran: list[str] = []
+
+    def act(self, stage: Any, dispatch: Dispatch) -> StageOutcome:
+        self.ran.append(stage.id)
+        return StageOutcome(
+            event="success",
+            receipt={"stage": stage.id},
+            produced=tuple(stage.produced_artifacts),
+        )
+
+
+class RealCommitSealer:
+    """Writes an actual commit, so the next stage's dispatch can read it."""
+
+    def __init__(self, repo: Path, *, verdict_from_actor: bool = False) -> None:
+        self.repo = repo
+        self.verdict_from_actor = verdict_from_actor
+        self.commits: list[str] = []
+
+    def seal(self, stage_id: str, outcome: StageOutcome) -> dict[str, Any]:
+        git(self.repo, "commit", "-q", "--allow-empty", "-m", f"seal {stage_id}")
+        commit = head(self.repo)
+        self.commits.append(commit)
+        receipt: dict[str, Any] = {"stage": stage_id, "output_commit": commit}
+        declared = (outcome.receipt or {}).get("review_result")
+        if isinstance(declared, dict) and declared.get("verdict"):
+            receipt["verdict"] = declared["verdict"]
+        return receipt
+
+    def materialize(self, stage: Any, dispatch: Dispatch, outcome: StageOutcome) -> Sealed:
+        receipt = self.seal(stage.id, outcome)
+        return Sealed(commit=receipt["output_commit"], receipt=receipt)
+
+
+@pytest.fixture
+def plugin_seals(repo: Path, monkeypatch: pytest.MonkeyPatch) -> RealCommitSealer:
+    """Stand in for the plugin's materialize-handoff script."""
+    sealer = RealCommitSealer(repo)
+
+    def implement_seal(binding: Any, request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        return sealer.seal("implement", StageOutcome())
+
+    def review_seal(binding: Any, request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        verdict = request["review_result"]["verdict"]
+        return {
+            **sealer.seal(request["dispatch"]["stage"], StageOutcome()),
+            "verdict": verdict,
+        }
+
+    monkeypatch.setattr(plugin_adapter, "invoke_implement_materializer", implement_seal)
+    monkeypatch.setattr(plugin_adapter, "invoke_review_materializer", review_seal)
+    return sealer
+
+
+def run(
+    repo: Path,
+    tmp_path: Path,
+    *,
+    verdicts: dict[str, list[str]] | None = None,
+) -> tuple[dict[str, Any], AgentRunStub, ScriptStub]:
+    launcher = AgentRunStub(verdicts)
+    scripts = ScriptStub()
+    local = RealCommitSealer(repo)
+    # Every stage the plugin does not seal. `acceptance` is among them even
+    # though it appears in the dispatch schema's stage enum.
+    unsealed = {name: local for name, stage in LIFECYCLE.stages.items() if not stage.is_llm}
+    result = run_pipeline(
+        make_config(repo, tmp_path),
+        scripts={name: scripts for name, s in LIFECYCLE.stages.items() if not s.is_llm},
+        materializers=unsealed,
+        launcher=launcher,
+    )
+    return result, launcher, scripts
+
+
+class TestTheWholePipelineComposes:
+    def test_it_walks_from_configure_to_the_last_stage(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        result, _launcher, _scripts = run(
+            repo, tmp_path, verdicts={"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}
+        )
+
+        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        assert [entry["stage"] for entry in result["history"]] == [
+            "configure",
+            "implement",
+            "continuous_review",
+            "final_review",
+            "acceptance",
+            "human_gate",
+            "merger",
+        ]
+
+    def test_only_the_llm_stages_cost_an_agent_run(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        _result, launcher, scripts = run(
+            repo, tmp_path, verdicts={"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}
+        )
+        assert set(launcher.dispatched) == {
+            name for name, stage in LIFECYCLE.stages.items() if stage.is_llm
+        }
+        assert set(scripts.ran) == {
+            name for name, stage in LIFECYCLE.stages.items() if not stage.is_llm
+        }
+
+    def test_every_stage_starts_from_the_commit_the_last_one_sealed(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        result, _launcher, _scripts = run(
+            repo, tmp_path, verdicts={"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}
+        )
+        commits = [entry["output_commit"] for entry in result["history"]]
+        assert len(set(commits)) == len(commits), "each stage sealed its own commit"
+        assert result["head_commit"] == commits[-1] == head(repo)
+
+    def test_a_rejection_reworks_and_still_finishes(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        result, launcher, _scripts = run(
+            repo,
+            tmp_path,
+            verdicts={"continuous_review": ["REJECT", "APPROVE"], "final_review": ["APPROVE"]},
+        )
+        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        assert launcher.dispatched.count("implement") == 2
+
+
+class TestWhatIsNotWiredYetFailsLoudly:
+    def test_a_stage_with_no_script_refuses_by_name(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        """Better than a placeholder that reports a stage as done."""
+        result = run_pipeline(make_config(repo, tmp_path), launcher=AgentRunStub())
+        assert result["terminal"] == TERMINAL_FAULT
+        assert "no registered script" in result["terminal_reason"]
+
+    def test_a_stage_with_no_sealer_refuses_rather_than_carrying_the_commit(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        scripts = ScriptStub()
+        result = run_pipeline(
+            make_config(repo, tmp_path),
+            scripts={name: scripts for name, s in LIFECYCLE.stages.items() if not s.is_llm},
+            launcher=AgentRunStub(),
+        )
+        assert result["terminal"] == TERMINAL_FAULT
+        assert "does not serve stage 'configure'" in result["terminal_reason"]
+
+
+class TestTheWiringReadsTheContract:
+    def test_the_gate_stage_is_found_through_the_artifact_it_produces(self) -> None:
+        assert lifecycle_gate_stage(LIFECYCLE) == "human_gate"
+
+    def test_the_board_is_only_wired_when_one_is_supplied(self, repo: Path, tmp_path: Path) -> None:
+        _graph, deps = build_pipeline(make_config(repo, tmp_path))
+        assert "human_gate" not in deps.scripts
+
+        class FakeBoard:
+            pass
+
+        _graph, deps = build_pipeline(
+            make_config(repo, tmp_path), board=FakeBoard(), gate_card_entity_id="card-1"
+        )
+        assert "human_gate" in deps.scripts
+
+    def test_the_capability_lock_is_on_by_default(self, repo: Path, tmp_path: Path) -> None:
+        _graph, deps = build_pipeline(make_config(repo, tmp_path))
+        assert deps.capability is not None
+        assert deps.capability.require().ok
+
+    def test_the_run_root_is_per_development(self, repo: Path, tmp_path: Path) -> None:
+        config = make_config(repo, tmp_path)
+        assert config.thread_id == f"{DEVELOPMENT_ID}:g1"
+        assert json.dumps(str(config.run_root))

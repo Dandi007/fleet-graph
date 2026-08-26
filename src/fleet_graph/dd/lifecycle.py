@@ -278,6 +278,27 @@ class Lifecycle:
         return targets[0]
 
     @cached_property
+    def protocol_producers(self) -> dict[str, tuple[str, ...]]:
+        """Which stage produces each protocol artifact, per the contract.
+
+        The attempt-context protocol layers extra artifacts onto the stages --
+        the implement handoff, the review record, the feedback index. A caller
+        that needs "whichever stage seals the implement handoff" can ask here
+        instead of writing the stage's name down a second time.
+        """
+        producers: dict[str, list[str]] = {}
+        for raw in self.contract["stages"]:
+            for protocol in (raw.get("protocol_artifacts") or {}).values():
+                for kind in protocol.get("produced_artifacts", ()):
+                    producers.setdefault(kind, []).append(raw["id"])
+        return {kind: tuple(ids) for kind, ids in producers.items()}
+
+    def sole_producer_of(self, protocol_artifact: str) -> str | None:
+        """The one stage that produces it, or None if that is not unique."""
+        producers = self.protocol_producers.get(protocol_artifact, ())
+        return producers[0] if len(producers) == 1 else None
+
+    @cached_property
     def spine(self) -> dict[str, str]:
         """Every derivable unconditional edge, keyed by source stage."""
         derived: dict[str, str] = {}

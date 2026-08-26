@@ -41,11 +41,11 @@ def applied_receipt() -> dict[str, Any]:
     }
 
 
+IMPLEMENT_DIGEST = "sha256:" + "a" * 64
+
+
 def review_receipt() -> dict[str, Any]:
-    return {
-        "review_result": {"verdict": "APPROVE", "findings": []},
-        "implementation_handoff_receipt_digest": "sha256:" + "a" * 64,
-    }
+    return {"review_result": {"verdict": "APPROVE", "findings": []}}
 
 
 def make_materializer(repo: Path) -> PluginMaterializer:
@@ -79,6 +79,7 @@ def dispatch_for(repo: Path, stage_id: str, *, stamp: str = STAMP, attempt: int 
         "attempt_started_at": stamp,
         "input_commit": head(repo),
         "parent_receipt": {},
+        "receipt_digests": {"implement": IMPLEMENT_DIGEST},
     }
 
 
@@ -153,12 +154,24 @@ class TestTheActorResultIsChecked:
         receipt = {**applied_receipt(), "chatty_extra": "ignore me"}
         assert "chatty_extra" not in implement_actor_result(receipt)
 
-    def test_a_review_must_name_the_implement_receipt_it_reviews(self, repo: Path) -> None:
-        receipt = review_receipt()
-        del receipt["implementation_handoff_receipt_digest"]
-        with pytest.raises(MaterializationFailed, match="implement receipt"):
+    def test_the_reviewed_receipt_comes_from_the_chain_not_the_reviewer(self, repo: Path) -> None:
+        """A reviewer handing back the digest of its own subject would be
+        attesting to what it is reviewing."""
+        receipt = {
+            **review_receipt(),
+            "implementation_handoff_receipt_digest": "sha256:" + "f" * 64,
+        }
+        request = make_materializer(repo).request(
+            REVIEW, dispatch_for(repo, "continuous_review"), StageOutcome(receipt=receipt)
+        )
+        assert request["implementation_handoff_receipt_digest"] == IMPLEMENT_DIGEST
+
+    def test_a_review_with_no_sealed_implement_receipt_is_a_chain_hole(self, repo: Path) -> None:
+        dispatch = dispatch_for(repo, "continuous_review")
+        dispatch["receipt_digests"] = {}
+        with pytest.raises(MaterializationFailed, match="chain has a hole"):
             make_materializer(repo).request(
-                REVIEW, dispatch_for(repo, "continuous_review"), StageOutcome(receipt=receipt)
+                REVIEW, dispatch, StageOutcome(receipt=review_receipt())
             )
 
     def test_a_review_must_declare_a_review_result(self, repo: Path) -> None:
@@ -265,6 +278,17 @@ class TestUnservedStagesRefuse:
         assert not materializer.serves(GATE)
         with pytest.raises(UnservedStage):
             materializer.request(GATE, dispatch_for(repo, "human_gate"), StageOutcome())
+
+    def test_a_dispatched_stage_is_not_automatically_a_sealed_one(self, repo: Path) -> None:
+        """`acceptance` is in the dispatch schema's stage enum but the plugin
+        ships no sealer for it. Equating the two sets would have routed it to
+        the review materializer, which rejects it."""
+        materializer = make_materializer(repo)
+        acceptance = LIFECYCLE.stages["acceptance"]
+
+        assert materializer.builder.serves(acceptance.id)
+        assert not materializer.serves(acceptance)
+        assert materializer.sealed_stages == {"implement", "continuous_review", "final_review"}
 
     def test_an_unrouted_stage_refuses_rather_than_passing_the_commit_through(self) -> None:
         """Carrying the previous commit forward would report a stage as sealed
