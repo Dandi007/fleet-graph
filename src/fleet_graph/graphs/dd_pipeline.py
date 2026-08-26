@@ -70,6 +70,9 @@ KNOWN_WRAPPER_STEPS = frozenset(
     {STEP_INPUT_VERIFY, STEP_ACTOR, STEP_MATERIALIZE, STEP_OUTPUT_VERIFY}
 )
 
+MODE_NORMAL = "normal"
+MODE_INHERIT = "inherit"
+
 TERMINAL_COMPLETE = "complete"
 TERMINAL_FAILED = "failed"
 TERMINAL_REFUSED = "refused"
@@ -221,7 +224,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         return {
             "development_id": state.get("development_id", ""),
             "stage": stage.id,
-            "mode": state.get("mode", "normal"),
+            "mode": state.get("mode", MODE_NORMAL),
             "generation": state.get("generation", 1),
             "attempt": state.get("attempt", 1),
             "input_commit": state.get("head_commit", ""),
@@ -384,10 +387,16 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                 return _terminal(TERMINAL_FAULT, str(ambiguous), fault=True)
             if successor is None:
                 return _terminal(TERMINAL_FAULT, str(exc), fault=True)
-            return {"stage": successor, "mode": state.get("mode", "normal")}
+            return {"stage": successor, "mode": state.get("mode", MODE_NORMAL)}
 
         if not transition.is_rework:
-            return {"stage": transition.target, "mode": "normal"}
+            # `inherit` means what it says: an attempt that entered as rework
+            # stays rework for the rest of its pass, so the stages downstream
+            # of a rejection know they are looking at reworked output.
+            mode = state.get("mode", MODE_NORMAL)
+            if transition.next_mode != MODE_INHERIT:
+                mode = transition.next_mode
+            return {"stage": transition.target, "mode": mode}
 
         rework = state.get("rework_count", 0) + 1
         if rework > deps.bounds.max_rework:
@@ -428,7 +437,7 @@ def initial_state(
     return {
         "development_id": development_id,
         "stage": stage,
-        "mode": "normal",
+        "mode": MODE_NORMAL,
         "generation": generation,
         "attempt": 1,
         "head_commit": head_commit,
@@ -442,6 +451,8 @@ def initial_state(
 
 __all__ = [
     "FAILURE_EVENT",
+    "MODE_INHERIT",
+    "MODE_NORMAL",
     "SPINE_EVENT",
     "TERMINAL_BOUNDS",
     "TERMINAL_COMPLETE",

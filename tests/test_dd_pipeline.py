@@ -146,6 +146,25 @@ class TestReworkComesBackAsRework:
         implements = [attempt for stage, attempt in actor.calls if stage == "implement"]
         assert implements == [1, 2], "the rework attempt must not re-enter as attempt 1"
 
+    def test_rework_is_inherited_by_the_stages_downstream(self) -> None:
+        """`next_mode: inherit` means inherit, not reset.
+
+        A stage reviewing reworked output must know that is what it is looking
+        at; resetting to normal on the next hop would hide it.
+        """
+        modes: list[tuple[str, str]] = []
+
+        class Recorder(ContractActor):
+            def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
+                modes.append((stage.id, dispatch["mode"]))
+                return super().act(stage, dispatch)
+
+        actor = Recorder({"continuous_review": ["REJECT", "APPROVE"], "final_review": ["APPROVE"]})
+        run(make_deps(actor=actor))
+
+        after_rejection = modes[modes.index(("implement", "rework")) :]
+        assert all(mode == "rework" for _, mode in after_rejection), after_rejection
+
     def test_an_endless_rework_loop_is_bounded(self) -> None:
         actor = ContractActor({"continuous_review": ["REJECT"] * 20})
         state = run(make_deps(actor=actor, bounds=PipelineBounds(max_rework=3)))
