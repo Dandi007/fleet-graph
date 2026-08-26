@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import git, head
 from fleet_graph.dd.bootstrap import (
     DEVELOPMENT_FIELDS,
     DEVELOPMENT_PATH,
@@ -17,6 +18,7 @@ from fleet_graph.dd.bootstrap import (
     BootstrapError,
     build_attempt_context,
     canonical_bytes,
+    committed_target_base,
     digest_of,
 )
 
@@ -125,3 +127,42 @@ class TestItRefusesRatherThanWriteSomethingUnusable:
     def test_a_base_that_is_not_a_full_lowercase_commit(self, base: str) -> None:
         with pytest.raises(BootstrapError, match="40-hex"):
             build_attempt_context(development_id="d", spec=SPEC, target_base_commit=base)
+
+
+class TestTheBaseIsReadBackFromWhatWasCommitted:
+    """`dd bootstrap` then `dd run` has to compose without an operator
+    remembering to repeat the base by hand."""
+
+    def _bootstrap(self, repo: Path, base: str) -> None:
+        build_attempt_context(
+            development_id="dev-1", spec=b"# spec\n", target_base_commit=base
+        ).write(repo)
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "dev-dispatch: bootstrap dev-1")
+
+    def test_it_reads_the_base_the_identity_named(self, repo: Path) -> None:
+        base = head(repo)
+        self._bootstrap(repo, base)
+
+        # HEAD has moved past the base by exactly the bootstrap commit, which
+        # is the trap: deriving the base from HEAD here would name a commit
+        # the committed identity never claimed.
+        assert head(repo) != base
+        assert committed_target_base(repo) == base
+
+    def test_a_worktree_that_was_never_bootstrapped_has_none(self, repo: Path) -> None:
+        assert committed_target_base(repo) is None
+
+    def test_an_uncommitted_bootstrap_does_not_count(self, repo: Path) -> None:
+        """The sealer reads the committed object, so this reads it too."""
+        build_attempt_context(
+            development_id="dev-1", spec=b"# spec\n", target_base_commit=head(repo)
+        ).write(repo)
+        assert committed_target_base(repo) is None
+
+    def test_unreadable_json_is_no_answer_rather_than_a_crash(self, repo: Path) -> None:
+        (repo / DEVELOPMENT_PATH).parent.mkdir(parents=True, exist_ok=True)
+        (repo / DEVELOPMENT_PATH).write_text("not json", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "broken")
+        assert committed_target_base(repo) is None

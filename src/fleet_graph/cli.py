@@ -91,6 +91,7 @@ def _dd_run(args: argparse.Namespace) -> int:
     import pathlib
     import subprocess
 
+    from fleet_graph.dd.bootstrap import committed_target_base
     from fleet_graph.dd.vendor.plugin_adapter import load_plugin_binding
     from fleet_graph.graphs.dd_runner import DevelopmentConfig, run_pipeline
 
@@ -119,7 +120,9 @@ def _dd_run(args: argparse.Namespace) -> int:
         run_root=run_root,
         remote_url=args.remote_url,
         remote_ref=args.remote_ref,
-        target_base_commit=args.target_base or head,
+        # The identity the development committed wins over HEAD: by now HEAD
+        # has moved past the base the spec was approved against.
+        target_base_commit=args.target_base or committed_target_base(workspace) or head,
         root_handoff_digest=args.root_digest,
         plugin_binding=binding,
         head_commit=head,
@@ -272,7 +275,12 @@ def build_parser() -> argparse.ArgumentParser:
     dd_run.add_argument("--remote-ref", required=True, help="refs/heads/... durable ref")
     dd_run.add_argument("--root-digest", required=True, help="sha256: of the initial handoff")
     dd_run.add_argument("--spec-commit", default=None, help="defaults to the workspace HEAD")
-    dd_run.add_argument("--target-base", default=None, help="defaults to the spec commit")
+    dd_run.add_argument(
+        "--target-base",
+        default=None,
+        help="defaults to the target_base_commit the development committed, "
+        "then to the spec commit",
+    )
     dd_run.add_argument("--generation", type=int, default=1)
     dd_run.add_argument("--run-root", default=None)
     dd_run.add_argument("--state-root", default=None)
