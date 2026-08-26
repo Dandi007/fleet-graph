@@ -24,10 +24,16 @@ KillMode=process
 TimeoutStopSec=30
 # Credentials are env-only; never commit a token into this unit.
 Environment=FLEET_GRAPH_GATEWAY_BASE_URL=http://127.0.0.1:15722
-# Leading `-`: a missing env file must not be an unexplained start failure.
-# The scheduler refuses on its own terms when a credential it needs is absent,
-# and that refusal names the variable.
--EnvironmentFile=%h/.config/fleet-graph/env
+# `EnvironmentFile=-...`: the `-` goes *after* the `=`. Written as
+# `-EnvironmentFile=`, systemd logs "Unknown key" and silently drops the whole
+# line -- the unit still starts, still looks healthy, and the daemon simply
+# never sees its credentials. It shipped that way and every line refused on
+# `no_probe` for it. Verified against systemd itself in tests/test_deploy_unit.py,
+# not against anyone's memory of the grammar.
+# The optional marker itself is deliberate: a missing env file must not be an
+# unexplained start failure -- the scheduler refuses on its own terms when a
+# credential it needs is absent, and that refusal names the variable.
+EnvironmentFile=-%h/.config/fleet-graph/env
 
 [Install]
 WantedBy=default.target

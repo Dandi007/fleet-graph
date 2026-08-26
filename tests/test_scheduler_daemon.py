@@ -250,6 +250,41 @@ class TestConfig:
         assert "ronin" not in str(DEFAULT_MAINTENANCE_STOP)
 
 
+class TestARefusalNamesItsRealCause:
+    """`no_probe` has three causes; the log line has to say which.
+
+    The unit shipped with `-EnvironmentFile=` instead of `EnvironmentFile=-`.
+    systemd calls that an unknown key, drops the line, and starts the service
+    anyway -- so the daemon ran with no credentials and every line refused on
+    `no_probe`. The refusal text said "no probe registered for seat", which is
+    the one cause that was not true. It sent the reader to a registry that was
+    perfectly fine.
+    """
+
+    def test_a_missing_credential_says_so(self, tmp_path: Path) -> None:
+        from fleet_graph.scheduler.probe import MissingProbeCredential
+
+        scheduler = make(tmp_path, prober=FakeProber(MissingProbeCredential("TOKEN_X is unset")))
+        record = scheduler.tick()[0].as_dict()
+        assert record["refusal"] == "no_probe"
+        assert "TOKEN_X is unset" in record["probe_detail"]
+
+    def test_an_unregistered_seat_says_so(self, tmp_path: Path) -> None:
+        from fleet_graph.scheduler.probe import UnknownSeat
+
+        scheduler = make(tmp_path, prober=FakeProber(UnknownSeat("no probe for seat 'wat'")))
+        assert "no probe for seat" in scheduler.tick()[0].as_dict()["probe_detail"]
+
+    def test_having_no_prober_at_all_says_so(self, tmp_path: Path) -> None:
+        record = make(tmp_path, prober=None).tick()[0].as_dict()
+        assert "without a gateway prober" in record["probe_detail"]
+
+    def test_the_generic_refusal_no_longer_claims_a_cause(self, tmp_path: Path) -> None:
+        """`decide` cannot know which of the three it was, so it must not say."""
+        record = make(tmp_path, prober=None).tick()[0].as_dict()
+        assert "registered" not in record["detail"]
+
+
 class TestTheRosterReachesTheDecision:
     """The config field and the refusal have to be the same fact.
 

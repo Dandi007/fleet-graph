@@ -56,6 +56,7 @@ from fleet_graph.scheduler.ignition import (
     DEFAULT_TOTAL_CAP,
     IgnitionDecision,
     LineStatus,
+    Refusal,
     decide,
 )
 from fleet_graph.scheduler.launcher import LaunchResult, LaunchSpec, TransientLauncher
@@ -90,6 +91,7 @@ class TickResult:
     folder_id: str
     decision: IgnitionDecision
     launch: LaunchResult | None = None
+    probe_detail: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -98,6 +100,8 @@ class TickResult:
             "refusal": self.decision.refusal.value if self.decision.refusal else None,
             "detail": self.decision.detail,
         }
+        if self.probe_detail is not None:
+            record["probe_detail"] = self.probe_detail
         if self.launch is not None:
             record["unit"] = self.launch.unit_name
             record["launched"] = self.launch.started
@@ -163,6 +167,10 @@ class Scheduler:
         self.observe = observe
         self.total_started = 0
         self.last_start_at: dict[str, float] = {}
+        #: Why a seat's probe could not answer, keyed by seat. `decide` only
+        #: learns that we could not ask; the reason belongs in the log line an
+        #: operator actually reads.
+        self.probe_reasons: dict[str, str] = {}
 
     # --- observation ------------------------------------------------------
 
@@ -222,14 +230,17 @@ class Scheduler:
         that is how a dead upstream on one face passes for a live one.
         """
         if self.prober is None:
+            self.probe_reasons[seat] = "this scheduler was started without a gateway prober"
             return None
         try:
-            return bool(self.prober.check(seat))
-        except (UnknownSeat, MissingProbeCredential):
+            healthy = bool(self.prober.check(seat))
+        except (UnknownSeat, MissingProbeCredential) as exc:
             # A missing credential is "no answer", not "red": the seat may be
             # perfectly healthy and we simply cannot ask. Either way `decide`
             # refuses, which is the safe reading of not knowing.
+            self.probe_reasons[seat] = str(exc)
             return None
+        return healthy
 
     # --- acting -----------------------------------------------------------
 
@@ -259,6 +270,8 @@ class Scheduler:
                 total_cap=self.config.total_cap,
             )
             result = TickResult(line.folder_id, decision)
+            if decision.refusal is Refusal.NO_PROBE:
+                result.probe_detail = self.probe_reasons.get(line.seat)
             if decision.ignite:
                 result.launch = self.launcher.launch(self.spec_for(line))
                 # Counted on the attempt, not on success. A launch that fails

@@ -116,8 +116,16 @@ def decide(
         )
 
     if gateway_healthy is None:
+        # Deliberately cause-neutral. `None` means "could not ask", and there
+        # are three ways to get there: no prober configured, no probe
+        # registered for the seat, no credential for its lane. The old text
+        # named only the middle one, which sent the reader looking at a
+        # registry that was fine while an unloaded env file went unnoticed.
+        # The caller knows which one it was; see Scheduler.gateway_healthy.
         return IgnitionDecision(
-            False, Refusal.NO_PROBE, f"no probe registered for seat {status.seat!r}"
+            False,
+            Refusal.NO_PROBE,
+            f"gateway health for seat {status.seat!r} could not be determined",
         )
 
     if not gateway_healthy:
