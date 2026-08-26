@@ -1,61 +1,71 @@
 {
   "_comment": "浪人存量线的新引擎配置（P5 配置面迁移）。同一 work folder 继续用，不建新 folder。",
   "_provenance": "取自 /data/ronin/babysitter-20260822.sh v28 的 FOLDERS/seat()/maxrounds()；逐条与该脚本取值核对",
+  "_rollout": "P7 分批放量（用户 2026-08-26 裁决 msg_01M0Z2QW0XWPMBWNF7ZFY9SCNX）：金丝雀 wf-40fa8d 单线跑 24h → 放 5 条 → 全量。enabled 是唯一的放行开关；旧 /data/ronin/maintenance-stop 整套已退役，紧急停机口改为 fleet-graph 自有路径。",
   "run_root": "/data/fleet-graph/runs",
   "lines": [
     {
       "folder_id": "wf-287e81",
       "seat": "opencode-gpt-terra",
       "max_rounds": 9999,
-      "alias": "ronin-g2s"
+      "alias": "ronin-g2s",
+      "enabled": false
     },
     {
       "folder_id": "wf-386b2f",
       "seat": "opencode-gpt-terra",
       "max_rounds": 9999,
-      "alias": "ronin-cost-observ"
+      "alias": "ronin-cost-observ",
+      "enabled": false
     },
     {
       "folder_id": "wf-3f87f3",
       "seat": "opencode-gpt-terra",
       "max_rounds": 9999,
-      "alias": "ronin-platform"
+      "alias": "ronin-platform",
+      "enabled": false
     },
     {
       "folder_id": "wf-40fa8d",
       "seat": "opencode-gpt-terra",
       "max_rounds": 9999,
-      "alias": "ronin-quotaalert"
+      "alias": "ronin-quotaalert",
+      "enabled": true
     },
     {
       "folder_id": "wf-541832",
       "seat": "opencode-gpt-terra",
       "max_rounds": 9999,
-      "alias": "ronin-brainstorm-v4"
+      "alias": "ronin-brainstorm-v4",
+      "enabled": false
     },
     {
       "folder_id": "wf-5664e5",
       "seat": "opencode-gpt-terra",
       "max_rounds": 9999,
-      "alias": "ronin-quota"
+      "alias": "ronin-quota",
+      "enabled": false
     },
     {
       "folder_id": "wf-6475fd",
       "seat": "opencode-gpt-terra",
       "max_rounds": 9999,
-      "alias": "ronin-observ"
+      "alias": "ronin-observ",
+      "enabled": false
     },
     {
       "folder_id": "wf-7bc4d1",
       "seat": "opencode-gpt-terra",
       "max_rounds": 9999,
-      "alias": "ronin-usage-dash"
+      "alias": "ronin-usage-dash",
+      "enabled": false
     },
     {
       "folder_id": "wf-9b5931",
       "seat": "opencode-gpt-terra",
       "max_rounds": 9999,
-      "alias": "ronin-model-switch"
+      "alias": "ronin-model-switch",
+      "enabled": false
     }
   ]
 }

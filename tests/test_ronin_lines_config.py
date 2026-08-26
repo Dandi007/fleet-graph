@@ -23,6 +23,9 @@ CONFIG = Path(__file__).resolve().parent.parent / "config" / "ronin-lines.json"
 # merger-plugin. dev-dispatch was only the vehicle, and fleet-graph is now
 # that vehicle. Classifying by title instead of by goal is the same
 # "name match is not semantics" trap this repo keeps hitting.
+# P7 §5-D2：爆炸半径最小（只改告警配置面），且产物人眼可验。
+CANARY = "wf-40fa8d"
+
 MIGRATED = {
     "wf-287e81",
     "wf-5664e5",
@@ -72,6 +75,24 @@ class TestTheShippedConfigLoads:
         silently tightening a bound would end lines that used to keep going."""
         for line in SchedulerConfig.from_json(CONFIG).lines:
             assert line.max_rounds == 9999, line.folder_id
+
+    def test_exactly_the_canary_is_switched_on(self) -> None:
+        """P7 放量的当前批次，写在这里而不是写在某人的记忆里。
+
+        用户 2026-08-26 裁决（board msg_01M0Z2QW0XWPMBWNF7ZFY9SCNX）：金丝雀
+        wf-40fa8d 单线跑 24h，再放 5 条，再全量。放量下一批 = 改这个断言，
+        改不动就说明有人在没改测试的情况下动了配置。"""
+        enabled = {
+            line.folder_id for line in SchedulerConfig.from_json(CONFIG).lines if line.enabled
+        }
+        assert enabled == {CANARY}
+
+    def test_every_line_states_its_rollout_position(self) -> None:
+        """`enabled` 默认是 False，所以漏写等于不跑——不会误起线，但会静默
+        不跑。逐条写出来，让「这条到底该不该跑」是文件里的事实。"""
+        raw = json.loads(CONFIG.read_text(encoding="utf-8"))
+        for entry in raw["lines"]:
+            assert isinstance(entry.get("enabled"), bool), entry["folder_id"]
 
     def test_folder_ids_are_well_formed(self) -> None:
         raw = json.loads(CONFIG.read_text(encoding="utf-8"))
