@@ -23,6 +23,9 @@ CONFIG = Path(__file__).resolve().parent.parent / "config" / "ronin-lines.json"
 # merger-plugin. dev-dispatch was only the vehicle, and fleet-graph is now
 # that vehicle. Classifying by title instead of by goal is the same
 # "name match is not semantics" trap this repo keeps hitting.
+# P7 §5-D2：爆炸半径最小（只改告警配置面），且产物人眼可验。
+CANARY = "wf-40fa8d"
+
 MIGRATED = {
     "wf-287e81",
     "wf-5664e5",
@@ -46,11 +49,20 @@ class TestTheShippedConfigLoads:
             assert line.seat, line.folder_id
             assert line.alias, line.folder_id
 
-    def test_the_maintenance_gate_is_the_fleet_wide_one(self) -> None:
-        """Not a private flag: the gate that stopped the old fleet must be the
-        same file, or a stop would only stop half the fleet."""
+    def test_it_no_longer_points_at_the_retired_stacks_gate(self) -> None:
+        """The shipped config used to name /data/ronin/maintenance-stop. That
+        whole gate was retired on the 2026-08-26 ruling; the roster below is
+        what holds lines now, and the emergency stop lives at a fleet-graph
+        path. A config still naming the old file would make the new scheduler
+        depend on a retired stack's directory."""
+        raw = json.loads(CONFIG.read_text(encoding="utf-8"))
+        assert "maintenance_stop" not in raw
+        # Not a substring check on the file: `_provenance` legitimately names
+        # /data/ronin/babysitter-20260822.sh as where these values came from,
+        # and a grep would have failed on the one line that should say it.
+        assert not any(str(v).startswith("/data/ronin") for v in raw.values() if isinstance(v, str))
         config = SchedulerConfig.from_json(CONFIG)
-        assert str(config.maintenance_stop_path) == "/data/ronin/maintenance-stop"
+        assert str(config.maintenance_stop_path) == "/data/fleet-graph/maintenance-stop"
 
     def test_no_line_carries_the_retired_mcp(self) -> None:
         """babysitter passed --session-mcp-allow loop-engine-development to
@@ -64,8 +76,58 @@ class TestTheShippedConfigLoads:
         for line in SchedulerConfig.from_json(CONFIG).lines:
             assert line.max_rounds == 9999, line.folder_id
 
+    def test_exactly_the_canary_is_switched_on(self) -> None:
+        """P7 放量的当前批次，写在这里而不是写在某人的记忆里。
+
+        用户 2026-08-26 裁决（board msg_01M0Z2QW0XWPMBWNF7ZFY9SCNX）：金丝雀
+        wf-40fa8d 单线跑 24h，再放 5 条，再全量。放量下一批 = 改这个断言，
+        改不动就说明有人在没改测试的情况下动了配置。"""
+        enabled = {
+            line.folder_id for line in SchedulerConfig.from_json(CONFIG).lines if line.enabled
+        }
+        assert enabled == {CANARY}
+
+    def test_every_line_states_its_rollout_position(self) -> None:
+        """`enabled` 默认是 False，所以漏写等于不跑——不会误起线，但会静默
+        不跑。逐条写出来，让「这条到底该不该跑」是文件里的事实。"""
+        raw = json.loads(CONFIG.read_text(encoding="utf-8"))
+        for entry in raw["lines"]:
+            assert isinstance(entry.get("enabled"), bool), entry["folder_id"]
+
     def test_folder_ids_are_well_formed(self) -> None:
         raw = json.loads(CONFIG.read_text(encoding="utf-8"))
         for entry in raw["lines"]:
             assert entry["folder_id"].startswith("wf-")
             assert len(entry["folder_id"]) == 9
+
+
+class TestTheRunbookMatchesTheCode:
+    """事故里没人会翻 docstring。
+
+    紧急停机口的地址写在 docs/operating.md 上，运维会照抄。抄到一个和代码
+    默认值对不上的路径，命令会安静地什么都不做——而那正是最不该安静的时刻。
+    """
+
+    RUNBOOK = Path(__file__).resolve().parent.parent / "docs" / "operating.md"
+
+    def test_every_copyable_command_names_the_path_the_code_reads(self) -> None:
+        """按代码块查，不按全文查。
+
+        第一版只断言「正确路径在文中出现过」——文档里同时留着一句「路径曾是
+        /data/ronin/...」的历史说明，于是一条 `cat > /data/ronin/...` 的错命令
+        照样通过。出现过不等于抄下来是对的；要查的是可复制的那几行。"""
+        from fleet_graph.scheduler.daemon import DEFAULT_MAINTENANCE_STOP
+
+        current = str(DEFAULT_MAINTENANCE_STOP)
+        in_code, checked = False, 0
+        for line in self.RUNBOOK.read_text(encoding="utf-8").splitlines():
+            if line.startswith("```"):
+                in_code = not in_code
+                continue
+            if in_code and "maintenance-stop" in line:
+                checked += 1
+                assert current in line, line
+        assert checked >= 2, "runbook lost its stop/release commands"
+
+    def test_the_runbook_names_the_canary_currently_switched_on(self) -> None:
+        assert CANARY in self.RUNBOOK.read_text(encoding="utf-8")

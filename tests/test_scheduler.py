@@ -35,6 +35,7 @@ def status(**kwargs: Any) -> LineStatus:
 def call(st: LineStatus, **kwargs: Any) -> IgnitionDecision:
     params: dict[str, Any] = {
         "now": NOW,
+        "enabled": True,
         "maintenance_stop": False,
         "gateway_healthy": True,
         "total_started": 0,
@@ -50,6 +51,44 @@ class TestIgnitionAllowed:
     def test_a_line_past_its_cooldown_ignites(self) -> None:
         st = status(last_start_at=NOW - DEFAULT_COOLDOWN_SECONDS - 1)
         assert call(st).ignite is True
+
+
+class TestTheRoster:
+    """Which lines this scheduler may start at all.
+
+    The gate this replaces was an external file holding a live fleet down. It
+    expired, and an expired flag is inert -- so "nobody renewed it" ignited
+    everything. The roster inverts that: nothing runs unless something says it
+    runs.
+    """
+
+    def test_a_line_that_is_not_enabled_does_not_ignite(self) -> None:
+        decision = call(status(), enabled=False)
+        assert decision.ignite is False
+        assert decision.refusal is Refusal.LINE_DISABLED
+
+    def test_the_roster_is_asked_before_the_fleet_wide_stop(self) -> None:
+        """A line nobody put on the roster is not being held by maintenance;
+        reporting `maintenance_stop` for it would send an operator to clear a
+        flag that was never what stopped it."""
+        decision = call(status(), enabled=False, maintenance_stop=True)
+        assert decision.refusal is Refusal.LINE_DISABLED
+
+    def test_being_off_the_roster_outranks_every_other_refusal(self) -> None:
+        decision = call(
+            status(running=True, terminal="done", last_start_at=NOW),
+            enabled=False,
+            gateway_healthy=False,
+            total_started=DEFAULT_TOTAL_CAP,
+        )
+        assert decision.refusal is Refusal.LINE_DISABLED
+
+    def test_enabling_a_line_is_not_by_itself_permission_to_run(self) -> None:
+        """The roster says "allowed to be considered", not "start it". Every
+        other gate still applies -- otherwise switching a line on during an
+        incident would walk straight past the emergency stop."""
+        decision = call(status(), enabled=True, maintenance_stop=True)
+        assert decision.refusal is Refusal.MAINTENANCE_STOP
 
 
 class TestRefusals:

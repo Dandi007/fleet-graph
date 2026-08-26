@@ -24,6 +24,7 @@ DEFAULT_TOTAL_CAP = 60
 
 
 class Refusal(StrEnum):
+    LINE_DISABLED = "line_disabled"
     MAINTENANCE_STOP = "maintenance_stop"
     ALREADY_RUNNING = "already_running"
     TERMINAL_DONE = "terminal_done"
@@ -59,6 +60,7 @@ def decide(
     status: LineStatus,
     *,
     now: float,
+    enabled: bool,
     maintenance_stop: bool,
     gateway_healthy: bool | None,
     total_started: int,
@@ -72,7 +74,20 @@ def decide(
 
     `gateway_healthy` is None when no probe could be run for this seat. That is
     a refusal, not a pass -- see scheduler/probe.py.
+
+    `enabled` has no default on purpose. Whether a line may run is the one
+    thing no call site should be able to leave unsaid.
     """
+    if not enabled:
+        # A line runs because the config says this one runs, not because the
+        # fleet as a whole is unpaused. Batched rollout is the immediate
+        # reason (one canary, then five, then all), but the durable one is
+        # that a roster which opts each line in has no state where "nobody
+        # decided" means "everybody runs".
+        return IgnitionDecision(
+            False, Refusal.LINE_DISABLED, f"{status.folder_id} is not enabled in the line config"
+        )
+
     if maintenance_stop:
         return IgnitionDecision(False, Refusal.MAINTENANCE_STOP, "maintenance-stop is in effect")
 
