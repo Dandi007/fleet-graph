@@ -82,7 +82,7 @@ flowchart TB
 | `executors/` | 一次 agent 执行的封装。`agent_run` / `agent_session` 是对 L1 二进制的 subprocess 封装；`text_node` 是进程内直连网关，不经 L1 | `AgentRunLauncher` / `AgentSessionSeat` / `TextNode` |
 | `bus/` | agent-bus 客户端与工作看板。**没有发布 `work.decision.v1` 的方法**——裁决只归人（§6.2） | `BusClient` / `Board` / `GateTicket` / `Inbox` |
 | `state/` | durable state（不变量四）。`run_artifacts` 是 fleet-sentinel 直接消费的磁盘契约；`work_folder` 是 katana work-folder MCP 客户端 | `RunArtifacts` / `WorkFolder` |
-| `scheduler/` | 点火门禁、网关探针与常驻调度。探针是 **seat → 面 + 凭证 lane** 的映射，不是单一健康检查（§6.3）；`daemon` 是按 tick 起线的常驻体，只读 terminal.json 的 `terminal` 字段 | `decide` / `GatewayProber` / `ProbeSpec` / `Scheduler` / `LineSpec` |
+| `scheduler/` | 点火门禁、网关探针与常驻调度。探针是 **seat → 面 + 凭证 lane** 的映射，不是单一健康检查（§6.3）；`daemon` 是按 tick 起线的常驻体，只读 terminal.json 的**机械字段**（`terminal` / `rounds` / `run_id`），不读 `reason`（§6.4） | `decide` / `GatewayProber` / `ProbeSpec` / `Scheduler` / `LineSpec` |
 | `dd/` | dev-dispatch 的**契约面**：生命周期、派发、prompt、attempt context、能力锁。契约是 plugin 的，本包只读不改写（§2.2） | `Lifecycle` / `StageDispatchBuilder` / `PluginPromptSource` / `build_attempt_context` / `CapabilityLock` |
 
 ### 2.2 dev-dispatch pipeline 的形状
@@ -208,6 +208,22 @@ LangGraph interrupt → agent-bus 发 question note → 等 work.decision.v1 →
 探错 endpoint 或探错凭证 lane，都会**报出漏报**——明明线依赖的那个面是坏的，探针却说健康。这比不探更糟：它把「我们不知道」变成「我们查过了，没问题」。实测过：用 openai lane 的 token 探 `/v1/responses` 返回 `503 No available channel ... under group anthropic`，而座位本身完全健康。
 
 没有注册探针的座位**直接拒绝点火**，不借用别的座位的面。
+
+### 6.4 两个闸门，以及卡住的线怎么退避
+
+**闸一：名册。** `LineSpec.enabled` 决定哪些线**允许**被起，默认 `false`——一条线跑，是因为一份过了 review 的配置说它跑。
+
+它替换的东西形状是相反的：旧门禁 `/data/ronin/maintenance-stop` 让整支舰队默认在跑，一个外部文件把它们按住；而那个文件带强制 `expires_at` 且到期即失效，于是「**没人续签**」是一条通往全量点火的路径。安全机制不该有「无人值守 = 放行」这条边。分批放量因此成为配置事实，而不是某个文件的存续。
+
+**闸二：紧急停机。** 改名册要 PR + 发布，扑火要几秒钟——两种紧急度需要两个闸。停机文件保留（连同 `expires_at` 到期即失效的语义），只是换到 fleet-graph 自己的路径。判断顺序上名册排在最前：一条没进名册的线不是被维护窗口按住的，报 `maintenance_stop` 会把运维支使去清一张不是元凶的 flag。
+
+**卡住的线退避而不锁死。** 一条线若**结束时一轮都没往前走**（`rounds: 0` 且非 `done`），重试间隔逐次翻倍，上限 6h。
+
+- **判据是计数，不是文字。** 同一个 blocker 被 agent 换个措辞写出来，字符 bigram 相似度实测只有 0.28——任何基于 `reason` 的判重都会把它当成两个不同问题。`rounds` 是本引擎泵数出来的数字，不受被判方支配（这是不变量四在调度面的体现）。
+- **退避不是锁死。** 硬停会把这条守卫必须继续工作的那个情况一起停掉：blocker 自己好了。锁死的线要人去注意并解锁，那正是旧舰队手工冻结 BLOCKED 线的人工簿记。退避不需要任何人。
+- **计数与上次启动时刻都落盘。** daemon 每次发布都重启；只落一半会让退避在发版时归零——而发版正是最没人盯着那条线的时候。相对地，全局熔断 `total_started` **刻意不落盘**：它针对系统性故障，而发新代码正是这类故障的合理补救。
+
+运维口径（日志词、逃生口、怎么手动停/放）见 `docs/operating.md`。
 
 ## 7. 需人拍板的开放问题
 
