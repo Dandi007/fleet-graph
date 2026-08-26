@@ -1,0 +1,148 @@
+"""Real Coordinator and Worker, backed by the agent-runtime CLI.
+
+The graph in goal_line.py talks to two narrow ports. These are the
+implementations that reach actual agents, and they are the only place in the
+line that knows agent-runtime exists -- INV-4/B8 says every agent run goes
+through `agent-run` or `agent-session` and never a directly spawned harness.
+
+Both adapters put their payloads in files rather than argv. `/proc` makes argv
+world-readable, and a coordinator input carries the whole inbox.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from fleet_graph.executors.agent_run import (
+    AgentRunLauncher,
+    AgentRunSpec,
+    RunStatus,
+    derive_run_id,
+)
+from fleet_graph.executors.agent_session import AgentSessionSeat, SeatHandle
+from fleet_graph.state.run_artifacts import write_json_durable
+
+DISPATCHER = "fleet-graph"
+
+
+class CoordinatorFault(RuntimeError):
+    """The coordinator run failed, or answered in a shape we will not guess at."""
+
+
+def parse_envelope(result: dict[str, Any]) -> dict[str, Any]:
+    """Pull the declared result out of an agent-run envelope.
+
+    `structured_result` is the current field; `result` is accepted for older
+    envelopes. A missing one is a fault rather than something to infer from
+    stdout -- inferring is the INV-3 violation this layer exists to avoid.
+    """
+    for key in ("structured_result", "result"):
+        value = result.get(key)
+        if isinstance(value, dict):
+            return value
+
+    stdout = result.get("stdout")
+    if isinstance(stdout, str) and stdout.strip():
+        try:
+            parsed = json.loads(stdout)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            for key in ("structured_result", "result"):
+                if isinstance(parsed.get(key), dict):
+                    return parsed[key]
+            if "verdict" in parsed:
+                return parsed
+
+    raise CoordinatorFault(
+        f"envelope carried no structured_result/result object; keys={sorted(result)}"
+    )
+
+
+@dataclass
+class AgentRunCoordinator:
+    """One coordinator turn per graph round, via `agent-run --role`."""
+
+    launcher: AgentRunLauncher
+    folder_id: str
+    thread_id: str
+    run_root: Path
+    role: str = "goal_coordinator"
+    timeout_seconds: int = 2700
+    poll_interval: float = 2.0
+    extra_labels: dict[str, str] | None = None
+
+    def turn(self, round_no: int, coord_input: dict[str, Any]) -> dict[str, Any]:
+        input_path = write_json_durable(
+            self.run_root / "coord" / f"round-{round_no}-input.json", coord_input
+        )
+
+        labels = {"work_folder": self.folder_id, "dispatcher": DISPATCHER}
+        labels.update(self.extra_labels or {})
+
+        spec = AgentRunSpec(
+            prompt="",
+            role=self.role,
+            input_path=str(input_path),
+            prompt_file=str(input_path),
+            structured=True,
+            timeout_seconds=self.timeout_seconds,
+            labels=labels,
+        )
+        run_id = derive_run_id(self.thread_id, f"coordinator-{round_no}")
+        ticket = self.launcher.launch(spec, run_id)
+        status: RunStatus = self.launcher.wait(
+            ticket,
+            poll_interval=self.poll_interval,
+            deadline_seconds=self.timeout_seconds + 120,
+        )
+
+        if status.result is None:
+            raise CoordinatorFault(f"coordinator run {run_id} produced no result")
+        if not status.ok:
+            raise CoordinatorFault(
+                f"coordinator run {run_id} ended {status.state} "
+                f"(exit_code={status.result.get('exit_code')})"
+            )
+        return parse_envelope(status.result)
+
+
+@dataclass
+class AgentSessionWorker:
+    """The long-lived worker seat. Opened once, re-entered every round."""
+
+    seat: AgentSessionSeat
+    seat_spec: Any
+    seat_key: str
+    turn_timeout_seconds: int = 3000
+    _handle: SeatHandle | None = None
+
+    def open(self) -> SeatHandle:
+        if self._handle is None:
+            self._handle = self.seat.open(self.seat_spec, self.seat_key)
+        return self._handle
+
+    def turn(self, prompt: str, round_no: int) -> str:
+        handle = self.open()
+        envelope = self.seat.send(handle, prompt, timeout_seconds=self.turn_timeout_seconds)
+        text = envelope.get("text")
+        if isinstance(text, str):
+            return text
+        # The seat answered without text. Returning "" here would feed an empty
+        # fact to the next coordinator turn and look like a quiet round rather
+        # than a failed one -- the same silent-stall shape TextNode guards.
+        raise CoordinatorFault(
+            f"worker turn {round_no} returned no text; envelope keys={sorted(envelope)}"
+        )
+
+
+__all__ = [
+    "DISPATCHER",
+    "AgentRunCoordinator",
+    "AgentSessionWorker",
+    "CoordinatorFault",
+    "parse_envelope",
+]

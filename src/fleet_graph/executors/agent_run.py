@@ -102,6 +102,11 @@ class AgentRunSpec:
     timeout_seconds: int = 900
     cwd: str | None = None
     structured: bool = False
+    # Role input (validated against the role's schema) and prompt body, both
+    # as file paths. Keeping them off argv matters for the same reason worker
+    # prompts do: argv is world-readable through /proc.
+    input_path: str | None = None
+    prompt_file: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     mcp_allow: tuple[str, ...] = ()
 
@@ -128,11 +133,16 @@ class AgentRunSpec:
             argv += ["--structured"]
         if self.cwd:
             argv += ["--cwd", self.cwd]
+        if self.input_path:
+            argv += ["--input", self.input_path]
+        if self.prompt_file:
+            argv += ["--prompt-file", self.prompt_file]
         for server in self.mcp_allow:
             argv += ["--mcp-allow", server]
         for key, value in sorted(self.labels.items()):
             argv += ["--label", f"{key}={value}"]
-        argv += ["--", self.prompt]
+        if not self.prompt_file:
+            argv += ["--", self.prompt]
         return argv
 
 
