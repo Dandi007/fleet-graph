@@ -75,6 +75,7 @@ class DevelopmentConfig:
     start_stage: str = "configure"
     roles: dict[str, str] = field(default_factory=dict)
     timeouts: dict[str, int] = field(default_factory=dict)
+    models: dict[str, str] = field(default_factory=dict)
     checkpoint_path: str = ":memory:"
     max_steps: int = 40
     max_rework: int = 6
@@ -120,6 +121,7 @@ def build_pipeline(
         worktree_path=config.workspace_path,
         roles=config.roles,
         timeouts=config.timeouts,
+        models=config.models,
         # The stage's prompt comes from the bundle the capability check
         # admitted, not from the role's own persona. See dd/prompt.py.
         prompts=PluginPromptSource(

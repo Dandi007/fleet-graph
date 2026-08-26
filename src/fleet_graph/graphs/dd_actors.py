@@ -117,6 +117,11 @@ class AgentRunStageActor:
     prompts: Any = None
     roles: dict[str, str] = field(default_factory=dict)
     timeouts: dict[str, int] = field(default_factory=dict)
+    # Per-stage model override. The role's selector is the default and stays
+    # the policy; this is the caller's lever for a stage whose seat is not
+    # working out, without editing config that other consumers share.
+    models: dict[str, str] = field(default_factory=dict)
+    model_runtime: str = "opencode"
     default_timeout_seconds: int = 3600
     poll_interval: float = 2.0
     extra_labels: dict[str, str] = field(default_factory=dict)
@@ -189,9 +194,14 @@ class AgentRunStageActor:
             "stage": stage.id,
             **self.extra_labels,
         }
+        model = self.models.get(stage.id)
         spec = AgentRunSpec(
             prompt="",
             role=stage_role(stage, self.roles),
+            # agent-run resolves `--model` through a chain and wants the
+            # runtime named alongside it.
+            runtime=self.model_runtime if model else None,
+            model=model,
             input_path=str(input_path),
             prompt_file=str(prompt_path),
             structured=True,

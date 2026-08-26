@@ -121,6 +121,7 @@ def _dd_run(args: argparse.Namespace) -> int:
         generation=args.generation,
         checkpoint_path=args.checkpoint or ":memory:",
         run_config={"acceptance_commands": [c.split() for c in args.accept]},
+        models=dict(pair.split("=", 1) for pair in args.stage_model),
         publish_merge=args.publish_merge,
     )
 
@@ -218,6 +219,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="an acceptance command; repeatable",
     )
     dd_run.add_argument("--board-card", default=None, help="card entity id; enables the gate")
+    dd_run.add_argument(
+        "--stage-model",
+        action="append",
+        default=[],
+        metavar="STAGE=MODEL",
+        help="override one stage's model, e.g. continuous_review=deepseek-v4-pro. "
+        "The role's own selector is the default and stays the policy",
+    )
     dd_run.add_argument(
         "--publish-merge",
         action="store_true",
