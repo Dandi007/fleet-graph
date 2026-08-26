@@ -140,6 +140,57 @@ def _dd_run(args: argparse.Namespace) -> int:
     return 0 if result.get("terminal") == "complete" else 1
 
 
+def _dd_bootstrap(args: argparse.Namespace) -> int:
+    """Write and commit the attempt context a development starts from."""
+    import pathlib
+    import subprocess
+
+    from fleet_graph.dd.bootstrap import build_attempt_context
+
+    workspace = pathlib.Path(args.workspace).resolve()
+
+    def git(*argv: str) -> str:
+        done = subprocess.run(
+            ["git", "-C", str(workspace), *argv], capture_output=True, text=True, check=True
+        )
+        return done.stdout.strip()
+
+    base = args.target_base or git("rev-parse", "HEAD")
+    context = build_attempt_context(
+        development_id=args.development,
+        spec=pathlib.Path(args.spec).read_bytes(),
+        target_base_commit=base,
+    )
+    context.write(workspace)
+
+    git("add", "--", ".dev-dispatch")
+    git(
+        "-c",
+        "user.name=Dev Dispatch",
+        "-c",
+        "user.email=dev-dispatch@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        f"dev-dispatch: bootstrap {args.development}",
+    )
+
+    json.dump(
+        {
+            "development_id": args.development,
+            "target_base_commit": base,
+            "spec_digest": context.spec_digest,
+            "commit": git("rev-parse", "HEAD"),
+            "files": sorted(context.files),
+        },
+        sys.stdout,
+        ensure_ascii=False,
+        indent=1,
+    )
+    sys.stdout.write("\n")
+    return 0
+
+
 def _scheduler_run(args: argparse.Namespace) -> int:
     """Run the resident scheduler: look at each line, ask, start or record why not."""
     import pathlib
@@ -233,6 +284,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="push the durable ref. Off by default: it is the one step here that cannot be undone",
     )
     dd_run.set_defaults(func=_dd_run)
+
+    dd_boot = dd_sub.add_parser(
+        "bootstrap", help="write and commit the attempt context a development starts from"
+    )
+    dd_boot.add_argument("--development", required=True)
+    dd_boot.add_argument("--workspace", required=True)
+    dd_boot.add_argument("--spec", required=True, help="the approved spec to freeze")
+    dd_boot.add_argument("--target-base", default=None, help="defaults to the workspace HEAD")
+    dd_boot.set_defaults(func=_dd_bootstrap)
 
     scheduler = subparsers.add_parser("scheduler", help="the resident line scheduler")
     scheduler_sub = scheduler.add_subparsers()
