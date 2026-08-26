@@ -13,6 +13,7 @@ from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.executors.agent_run import RunStatus, RunTicket, RunWaitTimeout
 from fleet_graph.graphs.dd_actors import (
     GATE_APPROVE,
+    ROLE_STAGE,
     AgentRunStageActor,
     BoardGate,
     stage_role,
@@ -31,6 +32,9 @@ IMPLEMENT = LIFECYCLE.stages["implement"]
 REVIEW = LIFECYCLE.stages["continuous_review"]
 GATE = LIFECYCLE.stages["human_gate"]
 COMMIT = "a" * 40
+
+
+SCHEMAS = Path("/data/code/self/agent-runtime/profiles/roles/schemas")
 
 
 def dispatch_for(stage: Stage, *, attempt: int = 1, generation: int = 1) -> Dispatch:
@@ -118,25 +122,42 @@ class TestDispatchingAnLlmStage:
             "run_id",
         }
 
-    def test_the_input_is_what_the_roles_own_schema_asks_for(self, tmp_path: Path) -> None:
-        """Validated against `attempt-context.v1.json` where it is present.
+    @pytest.mark.parametrize(
+        "stage_id", ["implement", "continuous_review", "final_review"], ids=lambda s: s
+    )
+    def test_the_input_is_what_the_roles_own_schema_asks_for(
+        self, tmp_path: Path, stage_id: str
+    ) -> None:
+        """Every dispatched stage, not just the first one.
 
-        Sending the walker's richer dispatch would fail the role's own
-        validation, and would be telling the agent things the contract says it
-        should read from the tree.
+        Checking only `implement` passed for a year of nothing, because
+        `implement` happens to be a legal value in both vocabularies. The two
+        review stages are where they diverge, and a real run is an expensive
+        place to find that out.
         """
-        schema_path = Path(
-            "/data/code/self/agent-runtime/profiles/roles/schemas/attempt-context.v1.json"
-        )
+        schema_path = SCHEMAS / "attempt-context.v1.json"
         if not schema_path.is_file():
             pytest.skip("agent-runtime is not on this machine")
         import jsonschema
 
+        stage = LIFECYCLE.stages[stage_id]
         launcher = RecordingLauncher()
-        make_actor(tmp_path, launcher).act(IMPLEMENT, dispatch_for(IMPLEMENT))
+        make_actor(tmp_path, launcher).act(stage, dispatch_for(stage))
         spec, _ = launcher.launched[0]
         written = json.loads(Path(spec.input_path).read_text(encoding="utf-8"))
         jsonschema.validate(written, json.loads(schema_path.read_text(encoding="utf-8")))
+
+    def test_the_stage_vocabulary_is_translated_not_assumed(self) -> None:
+        """`review` where dd says `continuous_review`, `final-review` -- hyphen
+        -- where dd says `final_review`. Two vocabularies, one translation."""
+        schema_path = SCHEMAS / "attempt-context.v1.json"
+        if not schema_path.is_file():
+            pytest.skip("agent-runtime is not on this machine")
+        enum = set(
+            json.loads(schema_path.read_text(encoding="utf-8"))["properties"]["stage"]["enum"]
+        )
+        assert set(ROLE_STAGE.values()) <= enum, ROLE_STAGE
+        assert set(ROLE_STAGE) == {n for n, s in LIFECYCLE.stages.items() if s.is_llm}
 
     def test_the_run_is_labelled_for_attribution(self, tmp_path: Path) -> None:
         launcher = RecordingLauncher()
