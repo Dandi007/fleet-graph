@@ -147,6 +147,14 @@ class SchedulerConfig:
     backoff_cap_seconds: float = DEFAULT_BACKOFF_CAP_SECONDS
     #: Extra environment handed to every line, on top of the scheduler's PATH.
     extra_line_environment: dict[str, str] = field(default_factory=dict)
+    #: Seconds to wait between two launches in the same tick. The old
+    #: babysitter slept 45s here, walking its roster rather than starting it.
+    #: Nine lines starting in the same second means nine gateway probes, nine
+    #: opencode sessions and nine bun processes arriving together -- a burst
+    #: the fleet never had to survive before, on a gateway shared with
+    #: everything else on this host. Steady-state load is unchanged either
+    #: way; this is only about the shape of the start.
+    launch_stagger_seconds: float = 45.0
 
     @classmethod
     def from_json(cls, path: Path) -> SchedulerConfig:
@@ -173,6 +181,7 @@ class Scheduler:
         units: UnitProbe | None = None,
         clock: Any = None,
         observe: Any = None,
+        sleep: Any = None,
     ) -> None:
         self.config = config
         self.prober = prober
@@ -180,6 +189,7 @@ class Scheduler:
         self.units = units or SystemdUnitProbe()
         self.clock = clock or time.time
         self.observe = observe
+        self.sleep = sleep or time.sleep
         self.total_started = 0
         self.last_start_at: dict[str, float] = {}
         #: Why a seat's probe could not answer, keyed by seat. `decide` only
@@ -411,6 +421,7 @@ class Scheduler:
         now = self.clock()
         stopped = self.maintenance_stop()
         results: list[TickResult] = []
+        launched_this_tick = 0
 
         for line in self.config.lines:
             decision = decide(
@@ -429,6 +440,12 @@ class Scheduler:
             if decision.refusal is Refusal.NO_PROBE:
                 result.probe_detail = self.probe_reasons.get(line.seat)
             if decision.ignite:
+                if launched_this_tick and self.config.launch_stagger_seconds > 0:
+                    # Between launches only -- never before the first, never
+                    # after the last. A tick that starts nothing must not
+                    # sleep at all.
+                    self.sleep(self.config.launch_stagger_seconds)
+                launched_this_tick += 1
                 result.launch = self.launcher.launch(self.spec_for(line))
                 # Counted on the attempt, not on success. A launch that fails
                 # every time would otherwise never reach the cap it exists to

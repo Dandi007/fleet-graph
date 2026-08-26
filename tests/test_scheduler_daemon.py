@@ -62,6 +62,7 @@ def make(
     launcher: FakeLauncher | None = None,
     prober: Any = _DEFAULT,
     now: float = 1000.0,
+    slept: list[float] | None = None,
     **config: Any,
 ) -> Scheduler:
     return Scheduler(
@@ -75,6 +76,7 @@ def make(
         launcher=launcher or FakeLauncher(),
         units=units or FakeUnits(),
         clock=lambda: now,
+        sleep=(slept.append if slept is not None else (lambda _s: None)),
     )
 
 
@@ -379,6 +381,69 @@ class TestARestartDoesNotHandOutAFreeLaunch:
         first.tick()
         assert first.total_started == 1
         assert make(tmp_path).total_started == 0
+
+
+class TestItWalksTheRosterRatherThanStartingIt:
+    """The old babysitter slept 45s between launches. We had nothing.
+
+    Nine lines igniting in the same second means nine gateway probes, nine
+    opencode sessions and nine bun processes arriving together -- a burst the
+    fleet never had to survive, on a gateway shared with everything else here.
+    Steady-state load is identical either way; only the start differs.
+    """
+
+    def _lines(self, n: int) -> list[LineSpec]:
+        return [
+            LineSpec(folder_id=f"wf-{i}", seat="opencode-dsv4pro", enabled=True) for i in range(n)
+        ]
+
+    def test_it_waits_between_launches(self, tmp_path: Path) -> None:
+        slept: list[float] = []
+        make(tmp_path, lines=self._lines(3), slept=slept).tick()
+        assert slept == [45.0, 45.0], "three launches means two gaps"
+
+    def test_it_does_not_wait_before_the_first(self, tmp_path: Path) -> None:
+        slept: list[float] = []
+        make(tmp_path, lines=self._lines(1), slept=slept).tick()
+        assert slept == []
+
+    def test_a_tick_that_starts_nothing_does_not_sleep(self, tmp_path: Path) -> None:
+        """Otherwise a fully disabled roster would burn 45s per line per tick
+        doing nothing at all."""
+        slept: list[float] = []
+        lines = [LineSpec(folder_id="wf-1", seat="s", enabled=False)]
+        make(tmp_path, lines=lines, slept=slept).tick()
+        assert slept == []
+
+    def test_refusals_do_not_count_as_launches(self, tmp_path: Path) -> None:
+        """Only real starts open a gap. A roster of mostly-refusing lines must
+        not accumulate waits for launches that never happened."""
+        slept: list[float] = []
+        lines = [
+            LineSpec(folder_id="wf-off", seat="s", enabled=False),
+            LineSpec(folder_id="wf-on", seat="opencode-dsv4pro", enabled=True),
+        ]
+        make(tmp_path, lines=lines, slept=slept).tick()
+        assert slept == []
+
+    def test_the_gap_is_configurable_and_can_be_switched_off(self, tmp_path: Path) -> None:
+        slept: list[float] = []
+        make(tmp_path, lines=self._lines(3), slept=slept, launch_stagger_seconds=0).tick()
+        assert slept == []
+
+
+class TestTheExecutorIsPinnedToARelease:
+    def test_agent_run_comes_from_the_release_symlink(self) -> None:
+        """`agent-runtime` is a working tree that gets `git pull --ff-only`ed
+        during normal deployment, and one migrated line has agent-runtime as
+        its subject. `-current` points at an immutable snapshot instead. The
+        old babysitter overrode the pump's default to exactly this path."""
+        from fleet_graph.executors.agent_run import DEFAULT_AGENT_RUN_BIN
+        from fleet_graph.executors.agent_session import DEFAULT_AGENT_SESSION_BIN
+
+        for path in (DEFAULT_AGENT_RUN_BIN, DEFAULT_AGENT_SESSION_BIN):
+            assert "/agent-runtime-current/" in path, path
+            assert "/self/agent-runtime/" not in path, path
 
 
 class TestTicking:

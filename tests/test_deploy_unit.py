@@ -141,6 +141,19 @@ class TestTheUnitGivesLinesAWorkingPath:
         assert ".bun/bin" in path_lines[0], path_lines[0]
         assert "/usr/bin" in path_lines[0], "PATH must still carry the system binaries"
 
+    def test_the_path_carries_what_the_old_pump_carried(self) -> None:
+        """Migration equivalence, fifth instance. Every migrated seat is named
+        `opencode-*`, and the `opencode` binary lives in `~/.opencode/bin`
+        (symlinked from `~/.local/bin`) -- neither of which was on our PATH.
+        The canary happened not to need it; that is luck, not equivalence."""
+        path_line = next(
+            line
+            for line in UNIT.read_text(encoding="utf-8").splitlines()
+            if line.startswith("Environment=PATH=")
+        )
+        for wanted in (".bun/bin", ".local/bin", ".opencode/bin", ".cargo/bin"):
+            assert wanted in path_line, f"{wanted} missing from {path_line}"
+
 
 class TestTheRestartPolicyMatchesTheReAdoptDesign:
     def test_kill_mode_lets_executors_outlive_the_daemon(self) -> None:
