@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.dd.git import run_git
 from fleet_graph.dd.vendor import git_ops
 from fleet_graph.graphs.dd_pipeline import (
     Dispatch,
@@ -105,12 +106,9 @@ class WorkspaceSealer:
         return Sealed(commit=commit, receipt=receipt)
 
     def _git(self, args: list[str], env: dict[str, str]) -> str:
-        proc = subprocess.run(
-            ["git", "-C", str(self.repo), *args],
-            capture_output=True,
-            text=True,
-            env=env,
-        )
+        # Guarded: this runs on a worktree an agent wrote, and a repo-local
+        # `core.fsmonitor` there executes on `add`. See dd/git.py.
+        proc = run_git(self.repo, *args, env=env)
         if proc.returncode != 0:
             raise PipelineFault(
                 f"git {args[0]} failed: {(proc.stderr or proc.stdout).strip()[:400]}"

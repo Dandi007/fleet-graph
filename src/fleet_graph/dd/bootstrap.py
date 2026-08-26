@@ -67,14 +67,9 @@ def committed_target_base(worktree: Path, *, revision: str = "HEAD") -> str | No
     a base the committed identity never named, and it refuses that with
     BINDING_MISMATCH -- correctly. So this is read, not guessed.
     """
-    import subprocess
+    from fleet_graph.dd.git import run_git
 
-    found = subprocess.run(
-        ["git", "-C", str(worktree), "show", f"{revision}:{DEVELOPMENT_PATH}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    found = run_git(worktree, "show", f"{revision}:{DEVELOPMENT_PATH}")
     if found.returncode != 0:
         return None
     try:
