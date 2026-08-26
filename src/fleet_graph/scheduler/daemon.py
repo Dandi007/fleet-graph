@@ -16,13 +16,21 @@ nothing else. Whether the work is going well is the coordinator's business,
 and reading round contents here is how an orchestrator turns into a second,
 unaccountable judge (INV-3).
 
-The maintenance-stop gate keeps its file semantics: the file exists, the fleet
-does not start. That is the same switch `/data/ronin/maintenance-stop` has
-been, so an operator's muscle memory keeps working across the cutover.
+The maintenance-stop gate keeps the switch `/data/ronin/maintenance-stop` has
+been, **including its expiry**: babysitter v23 made `expires_at` mandatory and
+an expired flag inert (a 2026-08-23 ruling). Reading only `path.exists()` looks
+like the same gate and is not -- an expired flag nobody cleaned up would hold
+the fleet down forever, and the operator's muscle memory ("it expired, so we
+are free") is exactly what would break.
+
+One deliberate divergence: a flag we cannot parse gates the fleet rather than
+opening it. The old gate treated a malformed file as absent; a gate file that
+is broken is an operator error worth stopping on, not worth silently ignoring.
 """
 
 from __future__ import annotations
 
+import calendar
 import json
 import subprocess
 import time
@@ -142,7 +150,29 @@ class Scheduler:
     # --- observation ------------------------------------------------------
 
     def maintenance_stop(self) -> bool:
-        return self.config.maintenance_stop_path.exists()
+        """Is the fleet-wide gate holding right now?
+
+        Present and unexpired -> gated. Expired -> inert, per the v23 ruling.
+        Unparseable -> gated, and the reason is in the refusal detail.
+        """
+        path = self.config.maintenance_stop_path
+        if not path.exists():
+            return False
+        return not self._gate_expired(path)
+
+    def _gate_expired(self, path: Path) -> bool:
+        try:
+            flag = json.loads(path.read_text(encoding="utf-8"))
+            expires_at = flag["expires_at"]
+            stamp = str(expires_at).replace("+00:00", "Z")[:19] + "Z"
+            deadline = calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))
+        except (OSError, ValueError, TypeError, KeyError):
+            # Cannot tell -> keep holding. See the module docstring.
+            return False
+        return self._now() >= deadline
+
+    def _now(self) -> float:
+        return float(self.clock())
 
     def terminal_of(self, folder_id: str) -> str | None:
         """What the line last wrote, or None if it never terminated.
