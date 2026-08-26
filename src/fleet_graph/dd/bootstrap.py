@@ -58,6 +58,33 @@ class BootstrapError(RuntimeError):
     """The attempt context cannot be written as asked."""
 
 
+def committed_target_base(worktree: Path, *, revision: str = "HEAD") -> str | None:
+    """The `target_base_commit` the development already committed, if any.
+
+    Bootstrap freezes the commit the spec was approved against; by the time a
+    run starts, HEAD has moved past it (the bootstrap commit itself, at
+    least). A run that re-derived this from HEAD would hand the review sealer
+    a base the committed identity never named, and it refuses that with
+    BINDING_MISMATCH -- correctly. So this is read, not guessed.
+    """
+    import subprocess
+
+    found = subprocess.run(
+        ["git", "-C", str(worktree), "show", f"{revision}:{DEVELOPMENT_PATH}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if found.returncode != 0:
+        return None
+    try:
+        identity = json.loads(found.stdout)
+    except ValueError:
+        return None
+    base = identity.get("target_base_commit")
+    return base if isinstance(base, str) and base else None
+
+
 def canonical_bytes(value: Any) -> bytes:
     """Exactly what the plugin re-serialises with, trailing newline included."""
     data = (
@@ -162,5 +189,6 @@ __all__ = [
     "BootstrapError",
     "build_attempt_context",
     "canonical_bytes",
+    "committed_target_base",
     "digest_of",
 ]

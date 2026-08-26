@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -81,6 +82,65 @@ class TestTheDdSubcommand:
         assert args.resume is True
         with pytest.raises(SystemExit, match="--checkpoint"):
             _dd_run(args)
+
+    def test_the_base_comes_from_the_committed_identity_not_from_head(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`dd bootstrap` then `dd run` must compose. HEAD has moved past the
+        base by then, and a run that claimed HEAD is refused by the review
+        sealer with BINDING_MISMATCH."""
+        from conftest import git, head
+        from fleet_graph.cli import _dd_run
+        from fleet_graph.dd import vendor
+        from fleet_graph.dd.bootstrap import build_attempt_context
+        from fleet_graph.graphs import dd_runner
+
+        workspace = tmp_path / "work"
+        workspace.mkdir()
+        git(workspace, "init", "-q", "-b", "main")
+        (workspace / "seed.txt").write_text("x\n", encoding="utf-8")
+        git(workspace, "add", "-A")
+        git(workspace, "commit", "-q", "-m", "seed")
+        base = head(workspace)
+        build_attempt_context(development_id="d", spec=b"# spec\n", target_base_commit=base).write(
+            workspace
+        )
+        git(workspace, "add", "-A")
+        git(workspace, "commit", "-q", "-m", "bootstrap")
+
+        seen: dict[str, Any] = {}
+        monkeypatch.setattr(vendor.plugin_adapter, "load_plugin_binding", lambda config: object())
+        monkeypatch.setattr(
+            dd_runner,
+            "run_pipeline",
+            lambda config, **kwargs: seen.update(config=config) or {"terminal": "complete"},
+        )
+        binding = tmp_path / "b.json"
+        binding.write_text("{}", encoding="utf-8")
+
+        args = build_parser().parse_args(
+            [
+                "dd",
+                "run",
+                "--development",
+                "d",
+                "--workspace",
+                str(workspace),
+                "--plugin-binding",
+                str(binding),
+                "--remote-url",
+                "u",
+                "--remote-ref",
+                "refs/heads/main",
+                "--root-digest",
+                "sha256:" + "a" * 64,
+            ]
+        )
+        assert _dd_run(args) == 0
+        config = seen["config"]
+        assert config.target_base_commit == base
+        assert config.head_commit == head(workspace), "the walk still starts at HEAD"
+        assert config.target_base_commit != config.head_commit
 
     def test_stage_model_overrides_accumulate(self) -> None:
         args = build_parser().parse_args(
