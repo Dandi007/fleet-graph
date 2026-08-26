@@ -270,6 +270,10 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             # asking an agent to hand back a digest it has no business
             # authoring.
             "receipt_digests": dict(state.get("receipt_digests") or {}),
+            # Which commit each artifact kind was sealed at. A review has to
+            # name the implement commit it is reviewing, and that is not its
+            # own input commit once a second review runs after the first.
+            "artifact_commits": dict(state.get("artifacts") or {}),
             "required_artifacts": list(stage.required_artifacts),
             "produced_artifacts": list(stage.produced_artifacts),
             "contract_version": lifecycle.contract_version,
