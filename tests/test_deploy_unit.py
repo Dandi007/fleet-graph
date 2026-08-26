@@ -9,7 +9,12 @@ a unit file that is only validated in production.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
+
+import pytest
 
 from fleet_graph.cli import build_parser
 
@@ -45,12 +50,44 @@ class TestTheUnitRunsSomethingThatExists:
 
 class TestTheUnitCannotFailForUnreadableReasons:
     def test_a_missing_env_file_is_tolerated(self) -> None:
-        """Without the leading `-`, an absent env file fails the unit with a
-        message about systemd, not about the credential that is missing."""
+        """The optional marker belongs after the `=`.
+
+        The first version of this test asserted `^-EnvironmentFile=` and so
+        pinned the broken spelling in place: systemd reads that as an unknown
+        key, drops the line, starts the unit anyway, and the daemon runs with
+        no credentials. A regex can only check the grammar I believed in.
+        `test_systemd_itself_accepts_every_key` below asks systemd instead.
+        """
         text = UNIT.read_text(encoding="utf-8")
-        assert re.search(r"^-EnvironmentFile=", text, re.MULTILINE), (
+        assert re.search(r"^EnvironmentFile=-", text, re.MULTILINE), (
             "EnvironmentFile must be optional; the scheduler reports its own missing credentials"
         )
+        assert not re.search(r"^-\w+=", text, re.MULTILINE), (
+            "a leading `-` on a key is not systemd syntax; the whole line is dropped"
+        )
+
+    def test_systemd_itself_accepts_every_key(self) -> None:
+        """Ask the parser, not the author.
+
+        `systemd-analyze verify` exits 0 even when it drops keys it does not
+        recognise, so the exit code proves nothing -- the warning text is the
+        finding. This catches any misspelled directive in the unit, not just
+        the one that already bit us.
+        """
+        analyze = shutil.which("systemd-analyze")
+        if analyze is None:
+            pytest.skip("systemd-analyze not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = Path(tmp) / UNIT.name
+            staged.write_text(UNIT.read_text(encoding="utf-8"), encoding="utf-8")
+            done = subprocess.run(
+                [analyze, "--user", "verify", str(staged)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        noise = done.stderr + done.stdout
+        assert "Unknown key" not in noise, noise
 
     def test_no_credential_is_baked_into_the_unit(self) -> None:
         """Credentials are env-only (golden rule 3). A token in a unit file is
