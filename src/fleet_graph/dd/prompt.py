@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import re
 import shlex
-import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -40,7 +39,10 @@ REVIEW_PHASE = {
 # as soon as a second review runs after the first.
 IMPLEMENT_EVIDENCE = "implementation_evidence"
 
-REVIEW_ID_NAMESPACE = uuid.UUID("4a9d0e17-8b52-5c63-a7f8-1d3e5b9c2a44")
+REVIEW_ID_PREFIX = {
+    str(ReviewPhase.CONTINUOUS): "rc-",
+    str(ReviewPhase.FINAL): "rf-",
+}
 
 PLACEHOLDER = re.compile(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)(\?)?\}\}")
 
@@ -247,8 +249,15 @@ All eleven keys must be present, and nothing else.\
 
 
 def derive_review_id(attempt_id: str, phase: str) -> str:
-    """Derived, like every other id here: a retry names the same review."""
-    return str(uuid.uuid5(REVIEW_ID_NAMESPACE, f"{attempt_id}\x1f{phase}"))
+    """The canonical review id, exactly as the plugin computes it.
+
+    Not a free value and not something to invent: the sealer recomputes it and
+    refuses a receipt whose `review_id` differs
+    (`BINDING_MISMATCH: review_id must equal canonical rc-...`). It is a prefix
+    on the attempt id -- `rc-` continuous, `rf-` final -- which is why a
+    uuid5 of my own devising was wrong however consistently it was derived.
+    """
+    return f"{REVIEW_ID_PREFIX[phase]}{attempt_id}"
 
 
 def render_review_prompt(
@@ -362,6 +371,7 @@ __all__ = [
     "IMPLEMENT_PERSONA",
     "IMPLEMENT_TEMPLATE",
     "RESULT_TRANSPORT",
+    "REVIEW_ID_PREFIX",
     "REVIEW_PHASE",
     "REVIEW_PROMPT",
     "PluginPromptSource",

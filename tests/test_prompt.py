@@ -315,11 +315,21 @@ class TestTheReviewPrompt:
         assert "contract violation" in rendered
         assert "inventing a finding" in rendered
 
-    def test_the_review_id_is_derived_not_random(self) -> None:
+    def test_the_review_id_is_the_plugins_canonical_one(self) -> None:
+        """Not a free value: the sealer recomputes it and refuses a receipt
+        whose `review_id` differs. A uuid5 of my own was wrong however
+        consistently it was derived."""
         from fleet_graph.dd.prompt import derive_review_id
 
-        assert derive_review_id("att-1", "continuous") == derive_review_id("att-1", "continuous")
-        assert derive_review_id("att-1", "continuous") != derive_review_id("att-1", "final")
+        assert derive_review_id("att-1", "continuous") == "rc-att-1"
+        assert derive_review_id("att-1", "final") == "rf-att-1"
+
+    def test_the_prefixes_match_the_plugins_own_source(self) -> None:
+        plugin = PINNED_PLUGIN / "scripts/attempt-context.py"
+        if not plugin.is_file():
+            pytest.skip("the pinned plugin release is not on this machine")
+        source = plugin.read_text(encoding="utf-8")
+        assert '"rc-" if phase == "continuous" else "rf-"' in source
 
     def test_acceptance_gets_no_prompt_from_here(self) -> None:
         """It is dispatched in the schema's stage enum but the plugin ships no
