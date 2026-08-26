@@ -27,7 +27,8 @@ from pathlib import Path
 from typing import Any
 
 from fleet_graph.bus.board import Board, GateTicket
-from fleet_graph.dd.lifecycle import Stage
+from fleet_graph.dd.dispatch import derive_attempt_id
+from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.executors.agent_run import (
     AgentRunLauncher,
     AgentRunSpec,
@@ -45,6 +46,29 @@ from fleet_graph.graphs.dd_pipeline import (
 )
 from fleet_graph.state.run_artifacts import write_json_durable
 
+# The roles agent-runtime already ships for these stages. They exist because
+# dd has always dispatched them; fleet-graph reuses them rather than minting
+# parallel ones that would drift from the personas the plugin bundle carries.
+DEFAULT_ROLES = {
+    "implement": "implementer",
+    "continuous_review": "continuous_reviewer",
+    "final_review": "final_reviewer",
+}
+
+# Which stage owns which protocol artifact, per the contract. Defined here so
+# the materializer and the dispatcher agree by construction.
+IMPLEMENT_HANDOFF_ARTIFACT = "attempt_context_implement_handoff"
+REVIEW_ARTIFACT = "attempt_context_review"
+
+
+def implement_stage(lifecycle: Lifecycle) -> str | None:
+    return lifecycle.sole_producer_of(IMPLEMENT_HANDOFF_ARTIFACT)
+
+
+def review_stages(lifecycle: Lifecycle) -> tuple[str, ...]:
+    return lifecycle.protocol_producers.get(REVIEW_ARTIFACT, ())
+
+
 # The one word in the pipeline that means "go on". The contract declares which
 # values a gate_decision may carry; it does not, and cannot, say which of them
 # the pipeline should treat as consent. That is a policy, so it is written
@@ -59,7 +83,7 @@ INVALID_HANDOFF_SCHEMA = "INVALID_HANDOFF_SCHEMA"
 
 
 def stage_role(stage: Stage, roles: dict[str, str]) -> str:
-    return roles.get(stage.id, f"dd_{stage.id}")
+    return roles.get(stage.id) or DEFAULT_ROLES.get(stage.id) or f"dd_{stage.id}"
 
 
 @dataclass
@@ -69,6 +93,8 @@ class AgentRunStageActor:
     launcher: AgentRunLauncher
     development_id: str
     run_root: Path
+    worktree_path: Path = Path(".")
+    lifecycle: Lifecycle = field(default_factory=Lifecycle.load)
     roles: dict[str, str] = field(default_factory=dict)
     timeouts: dict[str, int] = field(default_factory=dict)
     default_timeout_seconds: int = 3600
@@ -79,10 +105,32 @@ class AgentRunStageActor:
     def _timeout(self, stage: Stage) -> int:
         return self.timeouts.get(stage.id, self.default_timeout_seconds)
 
+    def role_input(self, stage: Stage, dispatch: Dispatch, run_id: str) -> dict[str, Any]:
+        """What the role's own input schema asks for, and nothing more.
+
+        `attempt-context.v1.json` wants six fields; the rest of the context is
+        committed in the worktree, which is where the persona reads it. Sending
+        the walker's richer dispatch instead would fail the role's own
+        validation -- and would be telling the agent things the contract says
+        it should be reading from the tree.
+        """
+        return {
+            "attempt_id": derive_attempt_id(
+                self.development_id, dispatch["generation"], dispatch["attempt"]
+            ),
+            "development_id": self.development_id,
+            "spec_commit": dispatch["input_commit"],
+            "stage": stage.id,
+            "worktree_path": str(self.worktree_path),
+            "run_id": run_id,
+        }
+
     def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
         attempt_tag = f"g{dispatch['generation']}-a{dispatch['attempt']}"
+        run_id = derive_run_id(f"{self.development_id}:{stage.id}", attempt_tag)
         input_path = write_json_durable(
-            self.run_root / "stages" / f"{stage.id}-{attempt_tag}-input.json", dispatch
+            self.run_root / "stages" / f"{stage.id}-{attempt_tag}-input.json",
+            self.role_input(stage, dispatch, run_id),
         )
 
         labels = {
@@ -102,9 +150,8 @@ class AgentRunStageActor:
             labels=labels,
         )
 
-        # Derived, not random: the same stage and attempt always names the same
-        # run, so a restarted graph adopts the run already in flight.
-        run_id = derive_run_id(f"{self.development_id}:{stage.id}", attempt_tag)
+        # `run_id` is derived, not random: the same stage and attempt always
+        # names the same run, so a restarted graph adopts the run in flight.
         ticket = self.launcher.launch(spec, run_id)
 
         try:
@@ -143,28 +190,37 @@ class AgentRunStageActor:
                 detail=str(fault),
             )
 
-        return _outcome_from(declared)
+        return self._outcome_from(stage, declared)
 
+    def _outcome_from(self, stage: Stage, declared: dict[str, Any]) -> StageOutcome:
+        """The declared result, passed on as it stands.
 
-def _outcome_from(declared: dict[str, Any]) -> StageOutcome:
-    """Read the declared fields, and only those.
+        The role's result *is* the actor result the sealer consumes -- an
+        `implement.result.v1` or a `review.result.v2`. It is forwarded whole
+        rather than filtered, because the plugin validates it against its own
+        schema and says exactly which field is missing. A translation layer
+        here would only get between the agent and that answer.
 
-    A stage that declares no verdict reports the spine event. For a stage the
-    contract steers a verdict out of, that is not a quiet approval: the walker
-    has no spine edge there and faults, which is the intended outcome for an
-    agent that did not answer the question it was asked.
-    """
-    verdict = declared.get("verdict")
-    event = str(verdict).strip() if isinstance(verdict, str) and verdict.strip() else SPINE_EVENT
-    receipt = declared.get("receipt")
-    produced = declared.get("produced_artifacts")
-    return StageOutcome(
-        event=event,
-        receipt=receipt if isinstance(receipt, dict) else None,
-        produced=tuple(str(k) for k in produced) if isinstance(produced, list) else (),
-        failure_code=str(declared.get("failure_code", "")),
-        detail=str(declared.get("detail", "")),
-    )
+        A result with no verdict reports the spine event. For a stage the
+        contract steers a verdict out of, that is not a quiet approval: the
+        walker has no spine edge there and faults, which is the right end for
+        an agent that did not answer the question it was asked.
+        """
+        verdict = declared.get("verdict")
+        event = (
+            str(verdict).strip() if isinstance(verdict, str) and verdict.strip() else SPINE_EVENT
+        )
+        if stage.id in review_stages(self.lifecycle):
+            receipt: dict[str, Any] | None = {"review_result": declared}
+        else:
+            receipt = declared
+        return StageOutcome(
+            event=event,
+            receipt=receipt,
+            produced=(),
+            failure_code=str(declared.get("failure_code", "")),
+            detail=str(declared.get("detail", "")),
+        )
 
 
 @dataclass
@@ -232,8 +288,11 @@ class BoardGate:
 
 
 __all__ = [
+    "DEFAULT_ROLES",
     "GATE_APPROVE",
     "AgentRunStageActor",
     "BoardGate",
+    "implement_stage",
+    "review_stages",
     "stage_role",
 ]

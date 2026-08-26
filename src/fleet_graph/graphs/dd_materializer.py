@@ -35,6 +35,11 @@ from typing import Any
 from fleet_graph.dd.dispatch import DispatchError, StageDispatchBuilder
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.dd.vendor import plugin_adapter
+from fleet_graph.graphs.dd_actors import (
+    IMPLEMENT_HANDOFF_ARTIFACT,
+    implement_stage,
+    review_stages,
+)
 from fleet_graph.graphs.dd_pipeline import Dispatch, Sealed, StageOutcome, StageRefused
 
 # Upstream's identity for the commits the sealer writes. Deliberately not a
@@ -43,16 +48,10 @@ from fleet_graph.graphs.dd_pipeline import Dispatch, Sealed, StageOutcome, Stage
 AUTHOR_NAME = "Dev Dispatch"
 AUTHOR_EMAIL = "dev-dispatch@example.invalid"
 
-# The two protocol artifacts the plugin's two sealers write. The contract says
-# which stages produce them, so the stages are looked up rather than named.
-#
-# This matters more than it looks: `acceptance` appears in the dispatch
-# schema's stage enum, so "served by the sealer" is *not* the same set as
-# "appears in a dispatch". The plugin ships exactly two materializers, and
-# asking the contract which stages own their outputs is how that set stays
-# right when the contract changes.
-IMPLEMENT_HANDOFF_ARTIFACT = "attempt_context_implement_handoff"
-REVIEW_ARTIFACT = "attempt_context_review"
+# `acceptance` appears in the dispatch schema's stage enum, so "served by the
+# sealer" is *not* the same set as "appears in a dispatch". The plugin ships
+# exactly two materializers; which stages own their outputs comes from the
+# contract, via the helpers in dd_actors.
 
 APPLIED = "APPLIED"
 NON_APPLIED_OUTCOMES = ("DISPUTED", "BLOCKED")
@@ -143,11 +142,11 @@ class PluginMaterializer:
 
     @property
     def implement_stage(self) -> str | None:
-        return self.lifecycle.sole_producer_of(IMPLEMENT_HANDOFF_ARTIFACT)
+        return implement_stage(self.lifecycle)
 
     @property
     def review_stages(self) -> tuple[str, ...]:
-        return self.lifecycle.protocol_producers.get(REVIEW_ARTIFACT, ())
+        return review_stages(self.lifecycle)
 
     @property
     def sealed_stages(self) -> frozenset[str]:
@@ -218,7 +217,14 @@ class PluginMaterializer:
             else plugin_adapter.invoke_review_materializer
         )
         result = invoke(self.binding, request, verify_worktree_head=self.verify_worktree_head)
-        return self._read(stage, result)
+        sealed = self._read(stage, result)
+        # The sealer wrote the stage's artifacts, so it -- not the agent --
+        # is what output_verify should be believing.
+        return Sealed(
+            commit=sealed.commit,
+            receipt=sealed.receipt,
+            produced=tuple(stage.produced_artifacts),
+        )
 
     def _implement_digest(self, dispatch: Dispatch) -> str:
         """The implement receipt this review reviews, taken from the chain.
