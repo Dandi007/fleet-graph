@@ -60,6 +60,15 @@ class TestRendering:
 
 
 class TestStageValues:
+    def test_acceptance_commands_render_as_runnable_lines(self) -> None:
+        from fleet_graph.dd.prompt import render_commands
+
+        assert render_commands([["pytest", "-q"], ["ruff", "check", "."]]) == (
+            "pytest -q, ruff check ."
+        )
+        assert "'a b'" in render_commands([["echo", "a b"]]), "argv quoting must survive"
+        assert render_commands([]) == "(none declared)"
+
     def test_the_dispatch_fields_are_available_by_name_and_whole(self) -> None:
         dispatch = {"input_commit": "a" * 40, "stage": "implement", "mode": "initial"}
         values = stage_values(
@@ -72,7 +81,7 @@ class TestStageValues:
         assert values["input_commit"] == "a" * 40
         assert values["dispatch"] == dispatch
         assert values["worktree_path"] == "/w"
-        assert values["acceptance_commands"] == [["true"]]
+        assert values["acceptance_commands"] == "true"
 
     def test_the_trigger_id_stands_in_rather_than_being_invented(self) -> None:
         """fleet-graph has no trigger store; the run id is the honest stand-in."""
@@ -125,7 +134,8 @@ class TestAgainstThePinnedBundle:
         )
         assert "{{" not in rendered, "nothing was left unfilled"
         assert "a" * 40 in rendered
-        assert '["python3","-m","pytest","-q"]' in rendered
+        assert "python3 -m pytest -q" in rendered
+        assert '[["python3"' not in rendered, "argv rendered as JSON is not an instruction"
 
     def test_it_carries_what_the_role_persona_leaves_out(self) -> None:
         """The whole reason for reading the prompt out of the bundle."""
@@ -145,11 +155,11 @@ class TestAgainstThePinnedBundle:
         assert "verification_record" in rendered
         assert "contract violation" in rendered, "the anti-fabrication rule must survive"
 
-    def test_it_restates_the_required_result_fields(self) -> None:
-        """Not a missing instruction -- the persona already names
-        `Envelope.result`. Three real runs returned it once, so the fields are
-        listed concretely at the end, where the last thing read is the thing
-        asked for."""
+    def test_it_overrides_the_bundles_own_envelope_example(self) -> None:
+        """The bundle's example nests the payload under `result` -- that is
+        loop-engine's envelope. agent-run validates `Envelope.result` itself,
+        so the fields belong at the top level. An agent copying the example is
+        rejected for missing exactly the three top-level fields."""
         rendered = render_stage_prompt(
             self._resources(),
             IMPLEMENT_PERSONA,
@@ -162,7 +172,8 @@ class TestAgainstThePinnedBundle:
                 acceptance_commands=[["true"]],
             ),
         )
-        assert "Result checklist" in rendered
+        assert "Result envelope" in rendered
+        assert "this overrides the example above" in rendered
         for field in ("actor_job_id", "outcome", "work_head_commit", "verification_record"):
             assert field in rendered, field
 
@@ -174,7 +185,7 @@ class TestAgainstThePinnedBundle:
             stage_values(self._dispatch(), worktree_path="/w", run_id="r", actor_job_id="j"),
             transport="",
         )
-        assert "Result checklist" not in rendered
+        assert "Result envelope" not in rendered
         assert "Envelope.result" in rendered, "the persona says it either way"
 
     def test_a_missing_part_of_the_bundle_is_refused(self) -> None:
@@ -191,6 +202,25 @@ class TestBundleDecoding:
         assert bundle_resources((Resource(),)) == {
             "implement/templates/implement.md": "hello {{name}}"
         }
+
+
+class TestTheEnvelopeMismatchThatCostFourRuns:
+    """Two harnesses, two envelopes; the one shipping the template is not the
+    one dispatching."""
+
+    def test_the_bundle_template_really_does_nest_under_result(self) -> None:
+        if not PINNED_PLUGIN.is_dir():
+            pytest.skip("the pinned plugin release is not on this machine")
+        template = (
+            PINNED_PLUGIN / "workflows/dev-dispatch/implement/templates/implement.md"
+        ).read_text(encoding="utf-8")
+        assert '"result": {' in template, "if this stops being true, the override can go"
+
+    def test_the_override_says_plainly_which_keys_do_not_belong(self) -> None:
+        from fleet_graph.dd.prompt import RESULT_TRANSPORT
+
+        assert "No outer `result` key" in RESULT_TRANSPORT
+        assert "top level" in RESULT_TRANSPORT
 
 
 class TestReviewsAreLeftAlone:

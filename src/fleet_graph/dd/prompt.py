@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,29 +34,43 @@ PLACEHOLDER = re.compile(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)(\?)?\}\}")
 IMPLEMENT_PERSONA = "implement/personas/implementer.md"
 IMPLEMENT_TEMPLATE = "implement/templates/implement.md"
 
-# A restatement of how the result travels, not a missing instruction: both
-# personas already say to put the object in `Envelope.result`. It is here
-# because three real runs returned it once. The bundle's persona spreads the
-# required fields across two bullet groups and describes them in prose; this
-# lists them concretely at the end, where the last thing read is the thing
-# asked for. Cheap, and it costs nothing if the persona was already enough.
+# **The one thing this has to override.** The bundle's template shows its
+# APPLIED example as `{"result": {...}, "effects": []}` -- loop-engine's
+# envelope, where the payload is nested under `result`. agent-run validates
+# `Envelope.result` itself against `implement-result.v1`, so the fields belong
+# at the *top* level. An agent following the bundle's example returns the
+# nested shape and is rejected with "missing required field: actor_job_id;
+# input_commit; work_head_commit" -- exactly the three top-level fields, having
+# seen an object with only `result` and `effects`.
+#
+# That cost four real runs to find, and it is not the agent's fault: it did the
+# work correctly every time and copied the example it was shown. Two harnesses,
+# two envelopes; the one that ships the template is not the one dispatching.
 RESULT_TRANSPORT = """\
-## Result checklist (fleet-graph dispatch)
+## Result envelope (fleet-graph dispatch -- this overrides the example above)
 
-To restate the reporting rule above concretely: put one JSON object in
-`Envelope.result` -- not in prose, not in a fenced block in your commentary.
-It must carry exactly:
+The APPLIED/DISPUTED/BLOCKED examples above are written for loop-engine's
+harness, which nests the payload under a `result` key. **This dispatch does
+not.** Put the fields at the top level of `Envelope.result`:
 
-- `actor_job_id`: the `actor_job_id` given above, echoed back verbatim
-- `input_commit`: the `input_commit` given above, echoed back verbatim
-- `outcome`: `APPLIED`, `DISPUTED` or `BLOCKED`
-- `work_head_commit`: the full 40-hex commit you finished on (APPLIED only)
-- `verification_record`: `{"verification_commands": [{"argv": [...], "exit_code": N}]}`
-  for every acceptance command you ran (APPLIED only)
-- `rebuttal` (DISPUTED) or `blocker` (BLOCKED) instead of the two above
+```json
+{
+  "actor_job_id": "<echoed back verbatim>",
+  "input_commit": "<echoed back verbatim>",
+  "outcome": "APPLIED",
+  "work_head_commit": "<full 40-hex commit you finished on>",
+  "verification_record": {
+    "verification_commands": [{"argv": ["..."], "exit_code": 0}]
+  }
+}
+```
 
-Doing the work and returning nothing readable is the same as not doing it: the
-deterministic seal has no other way to learn what you produced.\
+No outer `result` key, no outer `effects` key -- those belong to the other
+harness. For DISPUTED or BLOCKED, replace `work_head_commit` and
+`verification_record` with `rebuttal` or `blocker` respectively.
+
+Doing the work and returning a shape the seal cannot read is the same as not
+doing it: there is no other way for it to learn what you produced.\
 """
 
 
@@ -99,6 +114,18 @@ def render_template(text: str, values: dict[str, Any]) -> str:
     return rendered
 
 
+def render_commands(commands: list[list[str]]) -> str:
+    """argv lists as something an agent can actually run.
+
+    The template drops this into "Run {{acceptance_commands}} and fix all
+    failures". Rendering the raw list left that sentence saying
+    `[["python3","-m","pytest"]]`, which is not an instruction anyone can
+    follow -- and the persona is explicit that these are argv, never a shell
+    string, so the quoting has to survive.
+    """
+    return ", ".join(shlex.join(command) for command in commands if command) or "(none declared)"
+
+
 def stage_values(
     stage_dispatch: dict[str, Any],
     *,
@@ -115,7 +142,7 @@ def stage_values(
     values["worktree_path"] = worktree_path
     values["run_id"] = run_id
     values["actor_job_id"] = actor_job_id
-    values["acceptance_commands"] = acceptance_commands or []
+    values["acceptance_commands"] = render_commands(acceptance_commands or [])
     # loop-engine's own correlation id. fleet-graph has no trigger store, so
     # the run id stands in rather than a value invented to look like one.
     values["trigger_id"] = trigger_id or run_id
@@ -207,6 +234,7 @@ __all__ = [
     "PromptError",
     "as_value",
     "bundle_resources",
+    "render_commands",
     "render_stage_prompt",
     "render_template",
     "stage_values",
