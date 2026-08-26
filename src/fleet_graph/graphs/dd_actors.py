@@ -131,7 +131,14 @@ class AgentRunStageActor:
 
     def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
         attempt_tag = f"g{dispatch['generation']}-a{dispatch['attempt']}"
-        run_id = derive_run_id(f"{self.development_id}:{stage.id}", attempt_tag)
+        retry = int(dispatch.get("retry", 0))
+        if retry:
+            attempt_tag = f"{attempt_tag}-r{retry}"
+        # `derive_run_id`'s attempt dimension is exactly this: bump it and you
+        # get a genuinely new run instead of re-adopting the old one. Without
+        # it a bounded retry re-adopts the completed run it is retrying and
+        # returns the same answer, which makes the bound decorative.
+        run_id = derive_run_id(f"{self.development_id}:{stage.id}", attempt_tag, attempt=retry + 1)
         role_input = self.role_input(stage, dispatch, run_id)
         input_path = write_json_durable(
             self.run_root / "stages" / f"{stage.id}-{attempt_tag}-input.json", role_input
