@@ -29,9 +29,12 @@ contract that already states it.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
+from fleet_graph.dd.capability import CONTRACTS_DIR
 from fleet_graph.dd.dispatch import DispatchError, StageDispatchBuilder
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.dd.vendor import plugin_adapter
@@ -104,6 +107,26 @@ class MaterializationTarget:
     remote_ref: str
     worktree: str
     state_root: str
+
+
+@lru_cache(maxsize=1)
+def review_result_fields() -> frozenset[str]:
+    """The keys `review-result.schema.json` admits, read from the schema itself.
+
+    It sets `additionalProperties: false`, and the reviewer's persona tells it
+    to answer "with `effects: []`" -- agent-runtime's envelope convention, which
+    ends up inside the result object and which the plugin does not admit. Read
+    from the contract rather than listed here, so a contract that grows a field
+    does not need this to be remembered.
+    """
+    schema = json.loads((CONTRACTS_DIR / "review-result.schema.json").read_text(encoding="utf-8"))
+    return frozenset(schema["properties"])
+
+
+def review_actor_result(declared: dict[str, Any]) -> dict[str, Any]:
+    """The reviewer's declared result, narrowed to what the plugin admits."""
+    admitted = review_result_fields()
+    return {key: value for key, value in declared.items() if key in admitted}
 
 
 def implement_actor_result(receipt: dict[str, Any]) -> dict[str, Any]:
@@ -231,7 +254,7 @@ class PluginMaterializer:
                     "INVALID_HANDOFF_SCHEMA",
                     "a review actor result must declare a review_result object",
                 )
-            request["review_result"] = review_result
+            request["review_result"] = review_actor_result(review_result)
             request["implementation_handoff_receipt_digest"] = self._implement_digest(dispatch)
         return request
 
@@ -320,4 +343,6 @@ __all__ = [
     "StageMaterializers",
     "UnservedStage",
     "implement_actor_result",
+    "review_actor_result",
+    "review_result_fields",
 ]
