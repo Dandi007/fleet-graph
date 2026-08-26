@@ -287,7 +287,7 @@ class TestHumanGate:
                         "channel_seq": 12,
                         "payload": {
                             "decision": "take option (a)",
-                            "decided_by": "human:uther",
+                            "decided_by": "human:operator",
                             "question": "a or b?",
                             "rationale": "cheapest",
                             "card_entity_id": "card_1",
@@ -300,7 +300,7 @@ class TestHumanGate:
         decision = board.decision_for(GateTicket("msg_q", "card_1"))
         assert decision is not None
         assert decision.decision == "take option (a)"
-        assert decision.decided_by == "human:uther"
+        assert decision.decided_by == "human:operator"
         assert decision.message_id == "msg_d"
 
     def test_a_non_decision_reply_does_not_count_as_a_verdict(
