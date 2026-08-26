@@ -12,6 +12,7 @@ from fleet_graph.scheduler.ignition import (
     IgnitionDecision,
     LineStatus,
     Refusal,
+    backoff_seconds,
     decide,
 )
 from fleet_graph.scheduler.probe import (
@@ -37,6 +38,7 @@ def call(st: LineStatus, **kwargs: Any) -> IgnitionDecision:
         "now": NOW,
         "enabled": True,
         "maintenance_stop": False,
+        "zero_progress_streak": 0,
         "gateway_healthy": True,
         "total_started": 0,
     }
@@ -89,6 +91,43 @@ class TestTheRoster:
         incident would walk straight past the emergency stop."""
         decision = call(status(), enabled=True, maintenance_stop=True)
         assert decision.refusal is Refusal.MAINTENANCE_STOP
+
+
+class TestAStalledLineBacksOff:
+    """A line that keeps ending without advancing must not keep restarting.
+
+    The canary blocked on a missing data source that only a human can supply,
+    and the scheduler restarted it every 5 minutes to re-derive the same
+    conclusion: 9 launches, `rounds.jsonl` still one line. Not silent -- it
+    wrote a terminal each time -- but just as useless, and it burns tokens.
+    """
+
+    def test_a_clean_line_uses_the_plain_cooldown(self) -> None:
+        assert backoff_seconds(300, 0) == 300
+
+    def test_each_fruitless_run_doubles_the_wait(self) -> None:
+        assert [backoff_seconds(300, n) for n in (1, 2, 3)] == [600, 1200, 2400]
+
+    def test_the_wait_is_capped(self) -> None:
+        """Unbounded doubling reaches "next year" in about a day, which is a
+        latch wearing a backoff costume."""
+        assert backoff_seconds(300, 40, cap=6 * 3600) == 6 * 3600
+
+    def test_a_stalled_line_is_refused_under_its_own_label(self) -> None:
+        """`cooling_down` reads as "it just ran". An operator scanning the log
+        should be able to see "this one is stuck" without doing arithmetic on
+        timestamps."""
+        decision = call(status(last_start_at=NOW - 400), zero_progress_streak=3)
+        assert decision.refusal is Refusal.NO_PROGRESS
+        assert "without advancing a round" in decision.detail
+
+    def test_the_backoff_does_expire(self) -> None:
+        """The whole reason this is a backoff and not a latch: a blocker that
+        clears on its own gets picked up with nobody unlatching anything."""
+        assert call(status(last_start_at=NOW - 2401), zero_progress_streak=3).ignite is True
+
+    def test_a_line_that_advanced_is_not_penalised(self) -> None:
+        assert call(status(last_start_at=NOW - 301), zero_progress_streak=0).ignite is True
 
 
 class TestRefusals:

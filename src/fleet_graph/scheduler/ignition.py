@@ -22,9 +22,16 @@ DEFAULT_COOLDOWN_SECONDS = 300
 # gateway, a bad release) turns into an unbounded restart storm.
 DEFAULT_TOTAL_CAP = 60
 
+# A line that keeps terminating without advancing a single round is not going
+# to be fixed by starting it again five minutes later. Each repeat doubles the
+# wait, so a genuinely stuck line costs a handful of attempts a day instead of
+# 288, while a blocker that does clear still gets picked up on its own.
+DEFAULT_BACKOFF_CAP_SECONDS = 6 * 3600
+
 
 class Refusal(StrEnum):
     LINE_DISABLED = "line_disabled"
+    NO_PROGRESS = "no_progress"
     MAINTENANCE_STOP = "maintenance_stop"
     ALREADY_RUNNING = "already_running"
     TERMINAL_DONE = "terminal_done"
@@ -32,6 +39,24 @@ class Refusal(StrEnum):
     TOTAL_CAP_REACHED = "total_cap_reached"
     GATEWAY_RED = "gateway_red"
     NO_PROBE = "no_probe"
+
+
+def backoff_seconds(
+    base: float,
+    zero_progress_streak: int,
+    cap: float = DEFAULT_BACKOFF_CAP_SECONDS,
+) -> float:
+    """How long to wait before the next attempt, given a stall streak.
+
+    Doubling rather than latching, deliberately. A hard stop after N repeats
+    would also stop the case this has to keep working for: a blocker that
+    clears on its own (a service comes back, someone answers the question).
+    A latched line needs a human to notice and unlatch it, which is the same
+    manual bookkeeping the old fleet did by hand. Backoff needs nobody.
+    """
+    if zero_progress_streak <= 0:
+        return base
+    return min(base * (2**zero_progress_streak), cap)
 
 
 @dataclass(frozen=True)
@@ -64,8 +89,10 @@ def decide(
     maintenance_stop: bool,
     gateway_healthy: bool | None,
     total_started: int,
+    zero_progress_streak: int,
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
     total_cap: int = DEFAULT_TOTAL_CAP,
+    backoff_cap_seconds: float = DEFAULT_BACKOFF_CAP_SECONDS,
 ) -> IgnitionDecision:
     """Decide whether to ignite `status`, in the babysitter's order.
 
@@ -103,8 +130,20 @@ def decide(
         # already passed acceptance.
         return IgnitionDecision(False, Refusal.TERMINAL_DONE, f"{status.folder_id} terminated done")
 
-    if status.last_start_at is not None and now - status.last_start_at < cooldown_seconds:
-        remaining = cooldown_seconds - (now - status.last_start_at)
+    wait = backoff_seconds(cooldown_seconds, zero_progress_streak, backoff_cap_seconds)
+    if status.last_start_at is not None and now - status.last_start_at < wait:
+        remaining = wait - (now - status.last_start_at)
+        if zero_progress_streak > 0:
+            # A separate label on purpose. "cooling down" reads as "it just
+            # ran"; this line has run and got nowhere several times, and an
+            # operator scanning the log should be able to tell those apart
+            # without doing arithmetic on timestamps.
+            return IgnitionDecision(
+                False,
+                Refusal.NO_PROGRESS,
+                f"{status.folder_id} ended {zero_progress_streak} run(s) in a row without "
+                f"advancing a round; backing off, {remaining:.0f}s left of {wait:.0f}s",
+            )
         return IgnitionDecision(False, Refusal.COOLING_DOWN, f"{remaining:.0f}s of cooldown left")
 
     if total_started >= total_cap:
@@ -139,10 +178,12 @@ def decide(
 
 
 __all__ = [
+    "DEFAULT_BACKOFF_CAP_SECONDS",
     "DEFAULT_COOLDOWN_SECONDS",
     "DEFAULT_TOTAL_CAP",
     "IgnitionDecision",
     "LineStatus",
     "Refusal",
+    "backoff_seconds",
     "decide",
 ]

@@ -49,12 +49,37 @@ rm /data/fleet-graph/maintenance-stop
 - 路径曾是 `/data/ronin/maintenance-stop`，随该栈 P4 退役一并迁走。旧路径现在**不
   被读取**，往那儿写没有任何效果。
 
+## 卡住的线会自己退避（不用你管）
+
+一条线如果**结束时一轮都没往前走**（`terminal.json` 里 `rounds: 0` 且不是 `done`），
+调度器给它记一次。连续几次之后重试间隔逐次翻倍：5min → 10 → 20 → 40 …
+**上限 6 小时**。日志里的词是 `no_progress`，不是 `cooling_down`：
+
+```json
+{"folder_id": "wf-40fa8d", "ignited": false, "refusal": "no_progress",
+ "detail": "wf-40fa8d ended 3 run(s) in a row without advancing a round; backing off, 1180s left of 2400s"}
+```
+
+看到它，去读那条线自己的 `terminal.json` 的 `reason`——**调度器不读那段文字**（那是
+agent 写的散文，读它就成了替它判活干得对不对），但你该读。
+
+三件要知道的事：
+
+- **是退避不是锁死**。blocker 自己好了（服务回来了、有人回答了问题），下一次尝试就会
+  接上，不需要谁来解锁。
+- **计数落盘**（`<run_root>/.scheduler/<folder_id>.json`），发布重启不清零。否则每次发版
+  都会把卡住的线放回全速——而发版正是最没人盯着它的时候。
+- **判据是计数不是文字**。同一个 blocker 被 agent 换个说法写出来，字符 bigram 相似度可以
+  只有 0.28；任何基于 reason 文本的判重都会当成两个不同问题。
+
+要立刻让它再试一次：删掉那个计数文件。要让它彻底别跑：改名册 `enabled: false`。
+
 ## 判断顺序
 
 `decide()` 里名册排在最前：一条没进名册的线，refusal 是 `line_disabled` 而不是
 `maintenance_stop`——否则运维会被支使去清一张根本不是元凶的 flag。
 
-反过来，`enabled: true` 不等于放行：紧急停机、已在跑、terminal=done、冷却、
+反过来，`enabled: true` 不等于放行：紧急停机、已在跑、terminal=done、冷却/退避、
 总熔断、网关探针红，六道闸照常。
 
 ## 现场怎么看

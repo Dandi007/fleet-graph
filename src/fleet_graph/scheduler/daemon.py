@@ -10,11 +10,19 @@ Two things it deliberately does not do.
 function fixes. A scheduler that grew its own conditions would be a second
 description of when a line may run, and the first thing to drift.
 
-**It does not interpret a line's work.** It reads three observable facts --
-is a unit up, did the line write a terminal, when did we last start it -- and
-nothing else. Whether the work is going well is the coordinator's business,
-and reading round contents here is how an orchestrator turns into a second,
-unaccountable judge (INV-3).
+**It does not interpret a line's work.** It reads observable facts -- is a
+unit up, what terminal did the line write, how many rounds did it advance,
+when did we last start it -- and nothing else. Whether the work is going well
+is the coordinator's business, and reading round *contents* here is how an
+orchestrator turns into a second, unaccountable judge (INV-3).
+
+The line between the two is counts versus prose. `rounds` is a number this
+engine's own pump increments; `reason` is text an agent wrote. The stall guard
+below is built entirely on the count, and never looks at the text -- which
+matters, because the text is not stable: the same canary blocked twice on the
+same missing data source and worded it differently enough that character
+bigram similarity came out at 0.28. Anything keyed on that prose would have
+seen two unrelated problems.
 
 **Two gates, for two different urgencies.**
 
@@ -53,6 +61,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from fleet_graph.scheduler.ignition import (
+    DEFAULT_BACKOFF_CAP_SECONDS,
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_TOTAL_CAP,
     IgnitionDecision,
@@ -135,6 +144,7 @@ class SchedulerConfig:
     interval_seconds: float = DEFAULT_INTERVAL_SECONDS
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS
     total_cap: int = DEFAULT_TOTAL_CAP
+    backoff_cap_seconds: float = DEFAULT_BACKOFF_CAP_SECONDS
     #: Extra environment handed to every line, on top of the scheduler's PATH.
     extra_line_environment: dict[str, str] = field(default_factory=dict)
 
@@ -148,6 +158,7 @@ class SchedulerConfig:
             interval_seconds=float(raw.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)),
             cooldown_seconds=float(raw.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS)),
             total_cap=int(raw.get("total_cap", DEFAULT_TOTAL_CAP)),
+            backoff_cap_seconds=float(raw.get("backoff_cap_seconds", DEFAULT_BACKOFF_CAP_SECONDS)),
             extra_line_environment=dict(raw.get("line_environment", {})),
         )
 
@@ -203,20 +214,85 @@ class Scheduler:
     def _now(self) -> float:
         return float(self.clock())
 
-    def terminal_of(self, folder_id: str) -> str | None:
-        """What the line last wrote, or None if it never terminated.
+    def terminal_record(self, folder_id: str) -> dict[str, Any] | None:
+        """The three mechanical fields of the last terminal, or None.
 
-        Only the `terminal` field is read. Anything else in that file is the
-        line's own account of its work, and reading it here would be the
-        orchestrator forming an opinion it has no standing to form.
+        `terminal`, `rounds` and `run_id` only -- all three are written by this
+        engine's own pump. `reason` is deliberately not read: it is an agent's
+        prose, and a scheduler that acted on it would be judging the work.
         """
         path = self.config.run_root / folder_id / "terminal.json"
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
+        if not isinstance(record, dict):
+            return None
+        return {
+            "terminal": record.get("terminal"),
+            "rounds": record.get("rounds"),
+            "run_id": record.get("run_id"),
+        }
+
+    def terminal_of(self, folder_id: str) -> str | None:
+        """What the line last wrote, or None if it never terminated."""
+        record = self.terminal_record(folder_id)
+        if record is None:
+            return None
         value = record.get("terminal")
         return str(value) if value else None
+
+    # --- stall bookkeeping ------------------------------------------------
+
+    def _stall_path(self, folder_id: str) -> Path:
+        return self.config.run_root / ".scheduler" / f"{folder_id}.json"
+
+    def stall_state(self, folder_id: str) -> dict[str, Any]:
+        try:
+            state = json.loads(self._stall_path(folder_id).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"streak": 0, "accounted_run_id": None}
+        if not isinstance(state, dict):
+            return {"streak": 0, "accounted_run_id": None}
+        return {
+            "streak": int(state.get("streak") or 0),
+            "accounted_run_id": state.get("accounted_run_id"),
+        }
+
+    def _write_stall_state(self, folder_id: str, state: dict[str, Any]) -> None:
+        path = self._stall_path(folder_id)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+        except OSError:
+            # Losing the counter costs an extra attempt, not correctness.
+            pass
+
+    def account_last_run(self, folder_id: str) -> int:
+        """Fold the newest terminal into the stall streak, once.
+
+        Persisted rather than kept in memory because the daemon restarts on
+        every release, and a counter that resets on deploy would let a stuck
+        line go back to full speed each time we ship -- exactly when someone is
+        least likely to be watching it.
+
+        A terminal is accounted at most once, keyed on the run id that wrote
+        it, so re-reading the same file on every 60s tick does not inflate the
+        streak.
+        """
+        state = self.stall_state(folder_id)
+        record = self.terminal_record(folder_id)
+        if record is None:
+            return int(state["streak"])
+        run_id = record.get("run_id")
+        if run_id is None or run_id == state["accounted_run_id"]:
+            return int(state["streak"])
+
+        advanced = int(record.get("rounds") or 0) > 0
+        finished = record.get("terminal") == "done"
+        streak = 0 if (advanced or finished) else int(state["streak"]) + 1
+        self._write_stall_state(folder_id, {"streak": streak, "accounted_run_id": run_id})
+        return streak
 
     def status_of(self, line: LineSpec) -> LineStatus:
         return LineStatus(
@@ -282,10 +358,12 @@ class Scheduler:
                 now=now,
                 enabled=line.enabled,
                 maintenance_stop=stopped,
+                zero_progress_streak=self.account_last_run(line.folder_id),
                 gateway_healthy=self.gateway_healthy(line.seat),
                 total_started=self.total_started,
                 cooldown_seconds=self.config.cooldown_seconds,
                 total_cap=self.config.total_cap,
+                backoff_cap_seconds=self.config.backoff_cap_seconds,
             )
             result = TickResult(line.folder_id, decision)
             if decision.refusal is Refusal.NO_PROBE:

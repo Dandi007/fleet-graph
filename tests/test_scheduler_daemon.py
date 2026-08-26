@@ -184,16 +184,101 @@ class TestItReadsOnlyWhatItNeeds:
         path.write_text("{not json", encoding="utf-8")
         assert make(tmp_path).terminal_of("wf-1") is None
 
-    def test_it_reads_the_terminal_field_and_nothing_else(self, tmp_path: Path) -> None:
-        """Reading a line's own account of its work would make the scheduler a
-        second, unaccountable judge of it (INV-3)."""
+    def test_it_reads_counts_but_never_the_lines_prose(self, tmp_path: Path) -> None:
+        """INV-3, restated where the real line is.
+
+        This started as "only `terminal` is read". The stall guard needs
+        `rounds` and `run_id` too, and widening the assertion to admit them is
+        not a loosening: all three are numbers and ids this engine's own pump
+        writes. What must stay out is `reason` -- prose an agent wrote. A
+        scheduler that keyed on that would be judging the work, and would also
+        be wrong: the canary blocked twice on the same missing data source and
+        reworded it to a bigram similarity of 0.28.
+        """
         import re
 
         from fleet_graph.scheduler import daemon
 
         source = Path(daemon.__file__).read_text(encoding="utf-8")
         reads = set(re.findall(r'record\.get\("([a-z_]+)"\)', source))
-        assert reads == {"terminal"}, reads
+        assert reads <= {"terminal", "rounds", "run_id"}, reads
+        assert "reason" not in reads
+
+
+def write_terminal_record(
+    tmp_path: Path, folder_id: str, terminal: str, rounds: int, run_id: str
+) -> None:
+    path = tmp_path / "runs" / folder_id / "terminal.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "terminal": terminal,
+                "rounds": rounds,
+                "run_id": run_id,
+                "reason": "prose the scheduler must not act on",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+class TestTheStallStreak:
+    def test_a_fruitless_run_counts(self, tmp_path: Path) -> None:
+        scheduler = make(tmp_path)
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1")
+        assert scheduler.account_last_run("wf-1") == 1
+
+    def test_the_same_terminal_is_counted_once(self, tmp_path: Path) -> None:
+        """The scheduler re-reads this file every 60s. Counting per read would
+        put a line into a six-hour backoff within minutes of one bad run."""
+        scheduler = make(tmp_path)
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1")
+        assert [scheduler.account_last_run("wf-1") for _ in range(5)] == [1, 1, 1, 1, 1]
+
+    def test_consecutive_fruitless_runs_accumulate(self, tmp_path: Path) -> None:
+        scheduler = make(tmp_path)
+        for n in (1, 2, 3):
+            write_terminal_record(tmp_path, "wf-1", "blocked", 0, f"run-{n}")
+            assert scheduler.account_last_run("wf-1") == n
+
+    def test_a_run_that_advanced_clears_the_streak(self, tmp_path: Path) -> None:
+        """Progress is progress even if the line then blocked. The guard is
+        about lines going nowhere, not about lines ending unhappily."""
+        scheduler = make(tmp_path)
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1")
+        scheduler.account_last_run("wf-1")
+        write_terminal_record(tmp_path, "wf-1", "blocked", 2, "run-2")
+        assert scheduler.account_last_run("wf-1") == 0
+
+    def test_finishing_clears_the_streak(self, tmp_path: Path) -> None:
+        scheduler = make(tmp_path)
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1")
+        scheduler.account_last_run("wf-1")
+        write_terminal_record(tmp_path, "wf-1", "done", 0, "run-2")
+        assert scheduler.account_last_run("wf-1") == 0
+
+    def test_the_streak_survives_a_restart(self, tmp_path: Path) -> None:
+        """The daemon restarts on every release. A counter that reset on deploy
+        would send a stuck line back to full speed exactly when we ship --
+        which is when nobody is watching that line."""
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1")
+        make(tmp_path).account_last_run("wf-1")
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-2")
+        assert make(tmp_path).account_last_run("wf-1") == 2, "streak was kept in memory"
+
+    def test_no_terminal_yet_is_not_a_stall(self, tmp_path: Path) -> None:
+        assert make(tmp_path).account_last_run("wf-1") == 0
+
+    def test_the_streak_reaches_the_decision(self, tmp_path: Path) -> None:
+        """A counter nothing consults is a counter that looks like a working
+        guard right up until the line it should have held restarts anyway."""
+        scheduler = make(tmp_path, now=1000.0)
+        for n in (1, 2, 3):
+            write_terminal_record(tmp_path, "wf-1", "blocked", 0, f"run-{n}")
+            scheduler.account_last_run("wf-1")
+        scheduler.last_start_at["wf-1"] = 1000.0 - 400
+        assert scheduler.tick()[0].decision.refusal is Refusal.NO_PROGRESS
 
 
 class TestTicking:
