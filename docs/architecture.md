@@ -184,15 +184,19 @@ fleet-graph 的等价物：checkpointer 记录每个在跑执行的 `run_id` / `
 LangGraph interrupt → agent-bus 发 question note → 等 work.decision.v1 → resume
 ```
 
-裁决只认 `work.decision.v1` 消息，**agent 不得代拍**。旧的 auto-gate 自动放行策略作为一个可选 policy 被收编，默认关闭。
+裁决只认 `work.decision.v1` 消息，**编排层不得自决**。旧的 auto-gate 自动放行策略作为一个可选 policy 被收编，默认关闭。
 
-实现上有三处是刻意的，都为了同一件事——让「代拍」在结构上做不到：
+这条纪律的边界值得说清楚，否则容易读成「人必须自己敲命令」：**约束的对象是引擎，不是操作工具**。引擎给自己放行是自决；agent 代人操作看板、把人已经拍下的裁决转录上板不是——但转录必须署明原话与「仅转录未代拍」，否则板上的记录就在撒谎。
+
+实现上有三处是刻意的，都为了同一件事——让**引擎**代拍在结构上做不到：
 
 - `bus/board.py` **没有**发布 `work.decision.v1` 的方法。想代拍得先改这个文件，那就是一次显式的、reviewer 看得见的改动。
 - `dd run --resume` **不喂任何输入**。gate 自己回板上重读，所以恢复这条线的人无法通过「恢复」把票投了。
 - 没有板子时 `human_gate` 是**没有默认实现**的：走图会指名拒绝，而不是有个占位实现悄悄放行。
 
 挂起时 run 结果会给出 `awaiting`（在等哪张 question note），CLI 退 75；这样「待会儿再来」和「跑挂了」不会混成同一个信号。
+
+放行之后，裁决被封进产品树：`.dev-dispatch/gate/decision-g{n}.json`，带 verdict、`decided_by`、裁决消息 id、**以及它回答的那张 question note id**。前两项说明「放行了、谁放的」，后两项才让人能从产物一路查回板上。**REJECT 不写文件**——那个 stage 根本没产出 `gate_decision`，写一份「被拒绝的 gate_decision」是在编造契约里不存在的产物。
 
 ### 6.3 网关探针必须探真实依赖面
 
