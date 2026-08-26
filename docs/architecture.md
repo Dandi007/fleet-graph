@@ -78,11 +78,31 @@ flowchart TB
 
 | 包 | 职责 | 关键类型 |
 |---|---|---|
-| `graphs/` | StateGraph 与其接线；**唯一允许 import langgraph 的地方**（不变量一） | `build_goal_line_graph` / `LineDeps` / `LineGuards` / `build_line` |
+| `graphs/` | StateGraph 与其接线；**唯一允许 import langgraph 的地方**（不变量一）。浪人线在 `goal_line` / `runner`，dev-dispatch 在 `dd_*` 五件（§2.2） | `build_goal_line_graph` / `LineDeps` / `build_dd_pipeline_graph` / `PipelineDeps` |
 | `executors/` | 一次 agent 执行的封装。`agent_run` / `agent_session` 是对 L1 二进制的 subprocess 封装；`text_node` 是进程内直连网关，不经 L1 | `AgentRunLauncher` / `AgentSessionSeat` / `TextNode` |
 | `bus/` | agent-bus 客户端与工作看板。**没有发布 `work.decision.v1` 的方法**——裁决只归人（§6.2） | `BusClient` / `Board` / `GateTicket` / `Inbox` |
 | `state/` | durable state（不变量四）。`run_artifacts` 是 fleet-sentinel 直接消费的磁盘契约；`work_folder` 是 katana work-folder MCP 客户端 | `RunArtifacts` / `WorkFolder` |
-| `scheduler/` | 点火门禁与网关探针。探针是 **seat → 面 + 凭证 lane** 的映射，不是单一健康检查（§6.3） | `decide` / `GatewayProber` / `ProbeSpec` |
+| `scheduler/` | 点火门禁、网关探针与常驻调度。探针是 **seat → 面 + 凭证 lane** 的映射，不是单一健康检查（§6.3）；`daemon` 是按 tick 起线的常驻体，只读 terminal.json 的 `terminal` 字段 | `decide` / `GatewayProber` / `ProbeSpec` / `Scheduler` / `LineSpec` |
+| `dd/` | dev-dispatch 的**契约面**：生命周期、派发、prompt、attempt context、能力锁。契约是 plugin 的，本包只读不改写（§2.2） | `Lifecycle` / `StageDispatchBuilder` / `PluginPromptSource` / `build_attempt_context` / `CapabilityLock` |
+
+### 2.2 dev-dispatch pipeline 的形状
+
+dd 的阶段机**不在 Python 里**。它在 plugin 的 `development-lifecycle.json` 里，`dd/lifecycle.py` 只是把它读出来。这条约束决定了这几个包的分工：
+
+| 文件 | 职责 |
+|---|---|
+| `dd/lifecycle.py` | 读契约。阶段、`required_artifacts` / `produced_artifacts`、verdict 边、wrapper steps 全部来自契约文件 |
+| `graphs/dd_pipeline.py` | 走图。一个 stage 走 `input_verify → actor → materialize → output_verify` 四步，判定、重试、rework、终态都在这里 |
+| `graphs/dd_actors.py` | llm 阶段派谁去做：角色、模型、以及那 6 个字段的 attempt context |
+| `graphs/dd_materializer.py` | 封存。调 plugin 自己的 sealer，收据摘要一律取**落盘文件的字节** |
+| `graphs/dd_scripts.py` | 非 llm 阶段：configure / acceptance / merge，以及给未被 plugin 封存的阶段兜底的 `WorkspaceSealer` |
+| `graphs/dd_runner.py` | 组装。把上面几件接成一条可跑的 development，并提供挂起后的 `resume` |
+| `dd/bootstrap.py` | 起跑线：把 attempt context 四个文件按 canonical bytes 写好并提交 |
+
+两条在实现里踩出来的规矩，写在这里免得再犯：
+
+- **脊柱是推导出来的，不是抄来的**。`transitions` 表只登记 verdict 会改道的边；`configure → implement` 这类无条件边由「谁产出、谁消费同一个 artifact」推导。推导不出唯一解就抛 `AmbiguousSpine`，不猜。
+- **三套词表不是一套**。dd 的阶段 id（`continuous_review`）、agent-runtime 角色输入的 stage 枚举（`review`）、契约的 `review_phase`（`continuous`）长得像但互不相等，跨界必须翻译。
 
 ## 3. 四条反锁定不变量（宪法）
 
@@ -148,7 +168,7 @@ flowchart LR
     SENT["fleet-sentinel"] -.->|只读采集| G
 ```
 
-## 6. 两个关键机制
+## 6. 三个关键机制
 
 ### 6.1 re-adopt（detached 语义）
 
@@ -165,6 +185,14 @@ LangGraph interrupt → agent-bus 发 question note → 等 work.decision.v1 →
 ```
 
 裁决只认 `work.decision.v1` 消息，**agent 不得代拍**。旧的 auto-gate 自动放行策略作为一个可选 policy 被收编，默认关闭。
+
+实现上有三处是刻意的，都为了同一件事——让「代拍」在结构上做不到：
+
+- `bus/board.py` **没有**发布 `work.decision.v1` 的方法。想代拍得先改这个文件，那就是一次显式的、reviewer 看得见的改动。
+- `dd run --resume` **不喂任何输入**。gate 自己回板上重读，所以恢复这条线的人无法通过「恢复」把票投了。
+- 没有板子时 `human_gate` 是**没有默认实现**的：走图会指名拒绝，而不是有个占位实现悄悄放行。
+
+挂起时 run 结果会给出 `awaiting`（在等哪张 question note），CLI 退 75；这样「待会儿再来」和「跑挂了」不会混成同一个信号。
 
 ### 6.3 网关探针必须探真实依赖面
 
