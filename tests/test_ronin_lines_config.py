@@ -46,11 +46,20 @@ class TestTheShippedConfigLoads:
             assert line.seat, line.folder_id
             assert line.alias, line.folder_id
 
-    def test_the_maintenance_gate_is_the_fleet_wide_one(self) -> None:
-        """Not a private flag: the gate that stopped the old fleet must be the
-        same file, or a stop would only stop half the fleet."""
+    def test_it_no_longer_points_at_the_retired_stacks_gate(self) -> None:
+        """The shipped config used to name /data/ronin/maintenance-stop. That
+        whole gate was retired on the 2026-08-26 ruling; the roster below is
+        what holds lines now, and the emergency stop lives at a fleet-graph
+        path. A config still naming the old file would make the new scheduler
+        depend on a retired stack's directory."""
+        raw = json.loads(CONFIG.read_text(encoding="utf-8"))
+        assert "maintenance_stop" not in raw
+        # Not a substring check on the file: `_provenance` legitimately names
+        # /data/ronin/babysitter-20260822.sh as where these values came from,
+        # and a grep would have failed on the one line that should say it.
+        assert not any(str(v).startswith("/data/ronin") for v in raw.values() if isinstance(v, str))
         config = SchedulerConfig.from_json(CONFIG)
-        assert str(config.maintenance_stop_path) == "/data/ronin/maintenance-stop"
+        assert str(config.maintenance_stop_path) == "/data/fleet-graph/maintenance-stop"
 
     def test_no_line_carries_the_retired_mcp(self) -> None:
         """babysitter passed --session-mcp-allow loop-engine-development to

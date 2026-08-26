@@ -2,7 +2,6 @@
   "_comment": "浪人存量线的新引擎配置（P5 配置面迁移）。同一 work folder 继续用，不建新 folder。",
   "_provenance": "取自 /data/ronin/babysitter-20260822.sh v28 的 FOLDERS/seat()/maxrounds()；逐条与该脚本取值核对",
   "run_root": "/data/fleet-graph/runs",
-  "maintenance_stop": "/data/ronin/maintenance-stop",
   "lines": [
     {
       "folder_id": "wf-287e81",

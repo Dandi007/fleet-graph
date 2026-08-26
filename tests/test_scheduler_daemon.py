@@ -66,7 +66,7 @@ def make(
 ) -> Scheduler:
     return Scheduler(
         SchedulerConfig(
-            lines=lines or [LineSpec(folder_id="wf-1", seat="opencode-dsv4pro")],
+            lines=lines or [LineSpec(folder_id="wf-1", seat="opencode-dsv4pro", enabled=True)],
             run_root=tmp_path / "runs",
             maintenance_stop_path=tmp_path / "maintenance-stop",
             **config,
@@ -130,7 +130,9 @@ class TestEveryRefusalComesFromDecide:
         assert scheduler.tick()[0].decision.refusal is Refusal.COOLING_DOWN
 
     def test_the_total_cap_trips(self, tmp_path: Path) -> None:
-        lines = [LineSpec(folder_id=f"wf-{i}", seat="opencode-dsv4pro") for i in range(4)]
+        lines = [
+            LineSpec(folder_id=f"wf-{i}", seat="opencode-dsv4pro", enabled=True) for i in range(4)
+        ]
         results = make(tmp_path, lines=lines, total_cap=2).tick()
         refusals = [r.decision.refusal for r in results]
         assert refusals == [None, None, Refusal.TOTAL_CAP_REACHED, Refusal.TOTAL_CAP_REACHED]
@@ -138,7 +140,9 @@ class TestEveryRefusalComesFromDecide:
     def test_a_failed_launch_still_counts_against_the_cap(self, tmp_path: Path) -> None:
         """Otherwise a launch that fails every time never trips the cap that
         exists to catch exactly that."""
-        lines = [LineSpec(folder_id=f"wf-{i}", seat="opencode-dsv4pro") for i in range(3)]
+        lines = [
+            LineSpec(folder_id=f"wf-{i}", seat="opencode-dsv4pro", enabled=True) for i in range(3)
+        ]
         results = make(
             tmp_path, lines=lines, launcher=FakeLauncher(started=False), total_cap=2
         ).tick()
@@ -234,10 +238,83 @@ class TestConfig:
     def test_lines_from_entries(self) -> None:
         assert lines_from([{"folder_id": "a", "seat": "b"}]) == [LineSpec("a", "b")]
 
-    def test_the_gate_path_keeps_the_operators_muscle_memory(self) -> None:
+    def test_the_emergency_stop_is_a_path_fleet_graph_owns(self) -> None:
+        """It used to be /data/ronin/maintenance-stop, inherited from the
+        stack P4 retired. Keeping that path would have left the new scheduler
+        depending on a directory whose owner no longer exists -- and the old
+        flag's expiry could still have ignited a fleet nobody was watching.
+        The switch survives; the address is ours."""
         from fleet_graph.scheduler.daemon import DEFAULT_MAINTENANCE_STOP
 
-        assert str(DEFAULT_MAINTENANCE_STOP) == "/data/ronin/maintenance-stop"
+        assert str(DEFAULT_MAINTENANCE_STOP) == "/data/fleet-graph/maintenance-stop"
+        assert "ronin" not in str(DEFAULT_MAINTENANCE_STOP)
+
+
+class TestTheRosterReachesTheDecision:
+    """The config field and the refusal have to be the same fact.
+
+    `LineSpec.enabled` is only worth anything if the scheduler actually hands
+    it to `decide`. A field that is loaded, stored and never read would look
+    exactly like a working rollout switch right up until the batch it was
+    supposed to hold got started anyway.
+    """
+
+    def test_a_line_spec_is_off_unless_it_says_otherwise(self) -> None:
+        """The default is the safety property. Staging a line in the config
+        must not be the same act as releasing it."""
+        assert LineSpec(folder_id="wf-1", seat="opencode-dsv4pro").enabled is False
+
+    def test_a_disabled_line_is_not_launched(self, tmp_path: Path) -> None:
+        launcher = FakeLauncher()
+        scheduler = make(
+            tmp_path,
+            lines=[LineSpec(folder_id="wf-1", seat="opencode-dsv4pro", enabled=False)],
+            launcher=launcher,
+        )
+        result = scheduler.tick()[0]
+        assert result.decision.refusal is Refusal.LINE_DISABLED
+        assert launcher.launched == []
+
+    def test_a_disabled_line_does_not_burn_the_global_cap(self, tmp_path: Path) -> None:
+        """Otherwise holding eight lines back for a week would trip the
+        circuit breaker that exists for restart storms."""
+        scheduler = make(
+            tmp_path,
+            lines=[LineSpec(folder_id="wf-1", seat="opencode-dsv4pro", enabled=False)],
+        )
+        scheduler.tick()
+        assert scheduler.total_started == 0
+
+    def test_one_disabled_line_does_not_hold_back_an_enabled_one(self, tmp_path: Path) -> None:
+        """The batch has to be per line. A rollout switch that stopped the
+        whole tick on the first `false` would make "one canary, then five"
+        impossible to express."""
+        scheduler = make(
+            tmp_path,
+            lines=[
+                LineSpec(folder_id="wf-off", seat="opencode-dsv4pro", enabled=False),
+                LineSpec(folder_id="wf-on", seat="opencode-dsv4pro", enabled=True),
+            ],
+        )
+        results = {r.folder_id: r.decision for r in scheduler.tick()}
+        assert results["wf-off"].refusal is Refusal.LINE_DISABLED
+        assert results["wf-on"].ignite is True
+
+    def test_the_config_loader_carries_the_flag_through(self, tmp_path: Path) -> None:
+        path = tmp_path / "lines.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "lines": [
+                        {"folder_id": "wf-on", "seat": "s", "enabled": True},
+                        {"folder_id": "wf-off", "seat": "s"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        loaded = {line.folder_id: line.enabled for line in SchedulerConfig.from_json(path).lines}
+        assert loaded == {"wf-on": True, "wf-off": False}
 
 
 @pytest.mark.parametrize("terminal", ["blocked", "bounds", "fault", ""])

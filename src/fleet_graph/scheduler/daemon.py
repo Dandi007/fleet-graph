@@ -16,16 +16,28 @@ nothing else. Whether the work is going well is the coordinator's business,
 and reading round contents here is how an orchestrator turns into a second,
 unaccountable judge (INV-3).
 
-The maintenance-stop gate keeps the switch `/data/ronin/maintenance-stop` has
-been, **including its expiry**: babysitter v23 made `expires_at` mandatory and
-an expired flag inert (a 2026-08-23 ruling). Reading only `path.exists()` looks
-like the same gate and is not -- an expired flag nobody cleaned up would hold
-the fleet down forever, and the operator's muscle memory ("it expired, so we
-are free") is exactly what would break.
+**Two gates, for two different urgencies.**
 
-One deliberate divergence: a flag we cannot parse gates the fleet rather than
-opening it. The old gate treated a malformed file as absent; a gate file that
-is broken is an operator error worth stopping on, not worth silently ignoring.
+`LineSpec.enabled` is the roster: which lines this scheduler is allowed to
+start at all. It defaults to *off*, so a line runs only because a reviewed
+config says it runs. That default is the point. The gate it replaces --
+`/data/ronin/maintenance-stop`, an external flag file that held the whole
+fleet down -- had the opposite shape: every line was live and one file stood
+in the way. That file carries a mandatory `expires_at` and goes inert when it
+passes (babysitter v23, a 2026-08-23 ruling), which makes "the fleet ignites
+because nobody renewed a file" a reachable state. A safety mechanism should
+not have an edge where unattended means go. Retired on a 2026-08-26 ruling
+("原来的那一整套全部退役"); the roster replaces it.
+
+The maintenance-stop file survives as the *other* gate: the emergency stop.
+Changing the roster means a PR and a release; stopping a burning fleet must
+take seconds. So the file stays, with its v23 expiry semantics intact, but at
+a path fleet-graph owns rather than one inherited from the retired stack.
+
+One deliberate divergence there: a flag we cannot parse gates the fleet rather
+than opening it. The old gate treated a malformed file as absent; a gate file
+that is broken is an operator error worth stopping on, not worth silently
+ignoring.
 """
 
 from __future__ import annotations
@@ -53,7 +65,7 @@ from fleet_graph.scheduler.probe import (
     UnknownSeat,
 )
 
-DEFAULT_MAINTENANCE_STOP = Path("/data/ronin/maintenance-stop")
+DEFAULT_MAINTENANCE_STOP = Path("/data/fleet-graph/maintenance-stop")
 DEFAULT_INTERVAL_SECONDS = 60.0
 
 
@@ -66,6 +78,11 @@ class LineSpec:
     max_rounds: int = 10
     alias: str | None = None
     generation: int = 1
+    #: Off unless the config says otherwise. A line that appears here without
+    #: being switched on is a line someone staged and has not released; the
+    #: tick logs it as `line_disabled` every interval, so it is visible rather
+    #: than silent.
+    enabled: bool = False
 
 
 @dataclass
@@ -234,6 +251,7 @@ class Scheduler:
             decision = decide(
                 self.status_of(line),
                 now=now,
+                enabled=line.enabled,
                 maintenance_stop=stopped,
                 gateway_healthy=self.gateway_healthy(line.seat),
                 total_started=self.total_started,
