@@ -1,0 +1,12 @@
+{
+  "contract_version": 1,
+  "profiles": {
+    "default": {
+      "targets": {
+        "implementer": [{"runtime": "kimicode", "provider": "kimi-sub", "model": "k3"}],
+        "continuous_reviewer": [{"selector": "glm/code-plan"}],
+        "final_reviewer": [{"selector": "opus/lingzhi"}]
+      }
+    }
+  }
+}

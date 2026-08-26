@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-engine.dev-dispatch/contracts/implement-handoff-receipt.schema.json",
+  "title": "dev-dispatch.attempt-context/v1 ImplementHandoffReceipt",
+  "description": "Controller receipt for a sealed Implement handoff commit I<n>. The sealer creates output_commit with work_head_commit as its direct parent, changing only the reserved .dev-dispatch/ namespace.",
+  "type": "object",
+  "required": [
+    "contract_version",
+    "development_id",
+    "attempt_id",
+    "input_commit",
+    "work_head_commit",
+    "output_commit",
+    "parent_handoff_receipt_digest",
+    "spec_digest",
+    "feedback_digest",
+    "artifacts",
+    "actor_job_id",
+    "materialization_intent_id",
+    "verification_record"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {"$ref": "attempt-context.schema.json#/$defs/contract_version"},
+    "development_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+    "attempt_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+    "input_commit": {"$ref": "attempt-context.schema.json#/$defs/full_commit"},
+    "work_head_commit": {"$ref": "attempt-context.schema.json#/$defs/full_commit"},
+    "output_commit": {"$ref": "attempt-context.schema.json#/$defs/full_commit"},
+    "parent_handoff_receipt_digest": {"$ref": "attempt-context.schema.json#/$defs/sha256_digest"},
+    "spec_digest": {"$ref": "attempt-context.schema.json#/$defs/sha256_digest"},
+    "feedback_digest": {"$ref": "attempt-context.schema.json#/$defs/sha256_digest"},
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "attempt-context.schema.json#/$defs/artifact_ref"},
+      "contains": {
+        "$ref": "attempt-context.schema.json#/$defs/implement_handoff_artifact_ref"
+      },
+      "minContains": 1
+    },
+    "actor_job_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+    "materialization_intent_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+    "verification_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verification_commands"],
+      "properties": {
+        "verification_commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["argv", "exit_code"],
+            "properties": {
+              "argv": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "exit_code": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              },
+              "counts": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["passed", "failed", "total"],
+                "properties": {
+                  "passed": {"type": "integer", "minimum": 0},
+                  "failed": {"type": "integer", "minimum": 0},
+                  "total": {"type": "integer", "minimum": 0}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

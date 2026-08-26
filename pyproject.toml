@@ -41,3 +41,12 @@ allowed-confusables = ["，", "：", "；", "（", "）", "、", "「", "」", "
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.ruff.format]
+exclude = ["src/fleet_graph/dd/vendor/*.py"]
+
+[tool.ruff.lint.per-file-ignores]
+# Vendored domain code from loop-engine-development-mcp. Kept byte-identical
+# apart from the import rewrite so a future diff against upstream stays
+# readable; restyling it here would make that diff useless.
+"src/fleet_graph/dd/vendor/*.py" = ["ALL"]

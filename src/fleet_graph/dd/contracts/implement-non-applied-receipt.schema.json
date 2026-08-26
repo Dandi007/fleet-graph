@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-engine.dev-dispatch/contracts/implement-non-applied-receipt.schema.json",
+  "title": "dev-dispatch.attempt-context/v1 ImplementNonAppliedReceipt",
+  "description": "Controller receipt for a non-applied Implement outcome (DISPUTED or BLOCKED). No product commit is created; work_head_commit matches input_commit and artifacts is an empty array.",
+  "type": "object",
+  "required": [
+    "contract_version",
+    "development_id",
+    "attempt_id",
+    "input_commit",
+    "work_head_commit",
+    "outcome",
+    "parent_handoff_receipt_digest",
+    "spec_digest",
+    "feedback_digest",
+    "artifacts",
+    "actor_job_id",
+    "materialization_intent_id"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {"outcome": {"const": "DISPUTED"}},
+        "required": ["outcome"]
+      },
+      "then": {
+        "required": ["rebuttal"]
+      }
+    },
+    {
+      "if": {
+        "properties": {"outcome": {"const": "BLOCKED"}},
+        "required": ["outcome"]
+      },
+      "then": {
+        "required": ["blocker"]
+      }
+    }
+  ],
+  "properties": {
+    "contract_version": {"$ref": "attempt-context.schema.json#/$defs/contract_version"},
+    "development_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+    "attempt_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+    "input_commit": {"$ref": "attempt-context.schema.json#/$defs/full_commit"},
+    "work_head_commit": {"$ref": "attempt-context.schema.json#/$defs/full_commit"},
+    "outcome": {
+      "enum": ["DISPUTED", "BLOCKED"]
+    },
+    "parent_handoff_receipt_digest": {"$ref": "attempt-context.schema.json#/$defs/sha256_digest"},
+    "spec_digest": {"$ref": "attempt-context.schema.json#/$defs/sha256_digest"},
+    "feedback_digest": {"$ref": "attempt-context.schema.json#/$defs/sha256_digest"},
+    "artifacts": {
+      "type": "array",
+      "maxItems": 0
+    },
+    "rebuttal": {
+      "type": "object",
+      "required": ["disputed_finding_ids", "summary"],
+      "additionalProperties": false,
+      "properties": {
+        "disputed_finding_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"}
+        },
+        "summary": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"}
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "required": ["reason", "summary"],
+      "additionalProperties": false,
+      "properties": {
+        "reason": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+        "summary": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"}
+      }
+    },
+    "actor_job_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"},
+    "materialization_intent_id": {"$ref": "attempt-context.schema.json#/$defs/nonempty_string"}
+  }
+}

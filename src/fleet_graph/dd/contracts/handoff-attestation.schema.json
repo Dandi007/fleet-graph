@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-engine.dev-dispatch/contracts/handoff-attestation.schema.json",
+  "title": "Handoff Attestation",
+  "description": "Matches exactly what scripts/verify-handoff.sh --write-attestation writes.",
+  "type": "object",
+  "required": [
+    "contract_version",
+    "kind",
+    "development_id",
+    "stage",
+    "generation",
+    "attempt",
+    "commit_sha",
+    "tree_sha",
+    "worktree_head",
+    "remote_sha",
+    "mr",
+    "artifacts",
+    "checks",
+    "verifier",
+    "verified_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {"const": 1},
+    "kind": {"const": "handoff_attestation"},
+    "development_id": {"type": "string", "minLength": 1},
+    "stage": {
+      "enum": [
+        "admission",
+        "configure",
+        "implement",
+        "continuous_review",
+        "final_review",
+        "acceptance",
+        "human_gate",
+        "merger"
+      ]
+    },
+    "generation": {"type": "integer", "minimum": 1},
+    "attempt": {"type": "integer", "minimum": 1},
+    "commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "tree_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "worktree_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "remote_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "mr": {
+      "type": "object",
+      "required": ["number", "url", "state", "head_branch", "base_branch", "head_sha"],
+      "additionalProperties": false,
+      "properties": {
+        "number": {"type": "integer", "minimum": 1},
+        "url": {
+          "type": "string",
+          "pattern": "^https://[A-Za-z0-9.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+$"
+        },
+        "state": {"enum": ["OPEN", "MERGED", "CLOSED"]},
+        "head_branch": {"type": "string", "minLength": 1},
+        "base_branch": {"type": "string", "minLength": 1},
+        "head_sha": {
+          "anyOf": [
+            {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "path", "blob_sha"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": {"type": "string", "minLength": 1},
+          "path": {"type": "string", "minLength": 1},
+          "blob_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+        }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "verifier": {"type": "string", "minLength": 1},
+    "verified_at": {"type": "string", "minLength": 1}
+  }
+}
