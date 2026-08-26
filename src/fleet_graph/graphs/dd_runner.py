@@ -24,6 +24,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from fleet_graph.dd.capability import CapabilityLock
 from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder
 from fleet_graph.dd.lifecycle import Lifecycle
+from fleet_graph.dd.prompt import PluginPromptSource
 from fleet_graph.executors.agent_run import AgentRunLauncher
 from fleet_graph.graphs.dd_actors import AgentRunStageActor, BoardGate
 from fleet_graph.graphs.dd_materializer import (
@@ -103,15 +104,6 @@ def build_pipeline(
     """Wire a development. Returns the graph and the deps it holds."""
     lifecycle = Lifecycle.load()
 
-    dispatcher = AgentRunStageActor(
-        launcher=launcher or AgentRunLauncher(state_root=str(config.run_root / "agent-runs")),
-        development_id=config.development_id,
-        run_root=config.run_root,
-        worktree_path=config.workspace_path,
-        roles=config.roles,
-        timeouts=config.timeouts,
-    )
-
     builder = StageDispatchBuilder(
         DevelopmentChain(
             development_id=config.development_id,
@@ -119,6 +111,24 @@ def build_pipeline(
             target_base_commit=config.target_base_commit,
             root_handoff_digest=config.root_handoff_digest,
         )
+    )
+
+    dispatcher = AgentRunStageActor(
+        launcher=launcher or AgentRunLauncher(state_root=str(config.run_root / "agent-runs")),
+        development_id=config.development_id,
+        run_root=config.run_root,
+        worktree_path=config.workspace_path,
+        roles=config.roles,
+        timeouts=config.timeouts,
+        # The stage's prompt comes from the bundle the capability check
+        # admitted, not from the role's own persona. See dd/prompt.py.
+        prompts=PluginPromptSource(
+            binding=config.plugin_binding,
+            builder=builder,
+            worktree_path=str(config.workspace_path),
+            acceptance_commands=list(config.run_config.get("acceptance_commands") or []),
+            verify_worktree_head=config.verify_worktree_head,
+        ),
     )
     sealer = PluginMaterializer(
         builder=builder,

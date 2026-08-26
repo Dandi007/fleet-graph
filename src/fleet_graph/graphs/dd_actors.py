@@ -95,6 +95,10 @@ class AgentRunStageActor:
     run_root: Path
     worktree_path: Path = Path(".")
     lifecycle: Lifecycle = field(default_factory=Lifecycle.load)
+    # Where the stage's own prompt comes from. None means the role's persona
+    # stands on its own, which is the right answer only where the bundle has
+    # nothing better to say.
+    prompts: Any = None
     roles: dict[str, str] = field(default_factory=dict)
     timeouts: dict[str, int] = field(default_factory=dict)
     default_timeout_seconds: int = 3600
@@ -128,10 +132,22 @@ class AgentRunStageActor:
     def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
         attempt_tag = f"g{dispatch['generation']}-a{dispatch['attempt']}"
         run_id = derive_run_id(f"{self.development_id}:{stage.id}", attempt_tag)
+        role_input = self.role_input(stage, dispatch, run_id)
         input_path = write_json_durable(
-            self.run_root / "stages" / f"{stage.id}-{attempt_tag}-input.json",
-            self.role_input(stage, dispatch, run_id),
+            self.run_root / "stages" / f"{stage.id}-{attempt_tag}-input.json", role_input
         )
+        prompt_path = input_path
+        if self.prompts is not None:
+            rendered = self.prompts.for_stage(
+                stage.id,
+                dispatch,
+                run_id=run_id,
+                actor_job_id=role_input["attempt_id"],
+            )
+            if rendered:
+                prompt_path = self.run_root / "stages" / f"{stage.id}-{attempt_tag}-prompt.md"
+                prompt_path.parent.mkdir(parents=True, exist_ok=True)
+                prompt_path.write_text(rendered, encoding="utf-8")
 
         labels = {
             "development": self.development_id,
@@ -143,7 +159,7 @@ class AgentRunStageActor:
             prompt="",
             role=stage_role(stage, self.roles),
             input_path=str(input_path),
-            prompt_file=str(input_path),
+            prompt_file=str(prompt_path),
             structured=True,
             write=self.write,
             timeout_seconds=self._timeout(stage),
