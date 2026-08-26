@@ -110,6 +110,10 @@ class BusClient:
             raise BusError(status, str(payload))
         return payload
 
+    def post(self, path: str, body: dict[str, Any]) -> Any:
+        """POST an arbitrary bus path. For endpoints outside the publish flow."""
+        return self._call("POST", path, body)
+
     def publish(
         self,
         channel_id: str,
