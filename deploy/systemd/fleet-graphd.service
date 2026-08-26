@@ -1,24 +1,33 @@
-# systemd *user* unit skeleton — wired up for real in P6.
+# systemd *user* unit for the resident line scheduler.
 #
 # KillMode=process is deliberate: executor processes (agent-run / agent-session)
 # must survive a daemon restart so the P1 re-adopt primitive can reclaim them,
 # the same property loop-engine's jobd relied on.
+#
+# `scheduler run` is the real subcommand, checked by tests/test_deploy_unit.py.
+# The skeleton this replaces named `fleet-graph serve`, which never existed --
+# with Restart=always that is a crash loop every 5 seconds, not a failure
+# anyone would read as "the unit is wrong".
 [Unit]
-Description=fleet-graph orchestration daemon
+Description=fleet-graph resident line scheduler
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=/data/apps/fleet-graph/current
-ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph serve
+ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph scheduler run \
+    --config /data/apps/fleet-graph/current/config/ronin-lines.json
 Restart=always
 RestartSec=5
 KillMode=process
 TimeoutStopSec=30
 # Credentials are env-only; never commit a token into this unit.
 Environment=FLEET_GRAPH_GATEWAY_BASE_URL=http://127.0.0.1:15722
-EnvironmentFile=%h/.config/fleet-graph/env
+# Leading `-`: a missing env file must not be an unexplained start failure.
+# The scheduler refuses on its own terms when a credential it needs is absent,
+# and that refusal names the variable.
+-EnvironmentFile=%h/.config/fleet-graph/env
 
 [Install]
 WantedBy=default.target
