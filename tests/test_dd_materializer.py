@@ -225,7 +225,7 @@ class TestTheActorResultIsChecked:
         assert request["implementation_handoff_receipt_digest"] == expected
 
     def test_a_review_with_no_sealed_implement_receipt_is_a_chain_hole(self, repo: Path) -> None:
-        with pytest.raises(MaterializationFailed, match="no sealed Implement receipt"):
+        with pytest.raises(MaterializationFailed, match="no sealed parent receipt"):
             make_materializer(repo).request(
                 REVIEW,
                 dispatch_for(repo, "continuous_review"),
@@ -260,14 +260,12 @@ class TestTheActorResultIsChecked:
         assert "effects" not in review_result_fields()
 
     def test_a_review_must_declare_a_review_result(self, repo: Path) -> None:
+        materializer = make_materializer(repo)
+        dispatch = dispatch_for(repo, "continuous_review")
+        seal_implement_receipt(repo, materializer.builder.build(dispatch)["attempt_id"])
+
         with pytest.raises(MaterializationFailed, match="review_result"):
-            make_materializer(repo).request(
-                REVIEW,
-                dispatch_for(repo, "continuous_review"),
-                StageOutcome(
-                    receipt={"implementation_handoff_receipt_digest": "sha256:" + "a" * 64}
-                ),
-            )
+            materializer.request(REVIEW, dispatch, StageOutcome(receipt={}))
 
 
 class TestReadingWhatTheSealerReturned:
@@ -354,6 +352,36 @@ class TestReadingWhatTheSealerReturned:
         sealed = materializer.materialize(REVIEW, dispatch, StageOutcome(receipt=review_receipt()))
         assert called == ["review"]
         assert sealed.receipt is not None and sealed.receipt["verdict"] == "APPROVE"
+
+
+class TestTheParentReceiptIsTheOneTheContractNames:
+    def test_each_review_names_its_own_parent_file(self) -> None:
+        """Continuous reviews the Implement receipt; Final reviews the
+        Continuous one. Both by the sealed file's bytes."""
+        from fleet_graph.graphs.dd_materializer import PARENT_RECEIPT_FILE
+
+        assert PARENT_RECEIPT_FILE == {
+            "continuous_review": "implement-receipt.json",
+            "final_review": "continuous-review-receipt.json",
+        }
+
+    def test_implement_has_no_parent_file(self, repo: Path) -> None:
+        """It is first, so its parent is the chain root the caller supplied."""
+        assert make_materializer(repo).parent_digest("implement", "att-1") is None
+
+    def test_the_filenames_match_the_plugins_own_source(self) -> None:
+        plugin = Path(
+            "/data/code/self/loop-engine-dev-dispatch-plugin-releases"
+            "/76c4003bd087890867b411186a0584ea3ba4364b/scripts/attempt-context.py"
+        )
+        if not plugin.is_file():
+            pytest.skip("the pinned plugin release is not on this machine")
+        source = plugin.read_text(encoding="utf-8")
+
+        from fleet_graph.graphs.dd_materializer import PARENT_RECEIPT_FILE
+
+        for name in set(PARENT_RECEIPT_FILE.values()):
+            assert f'"{name}"' in source, name
 
 
 class TestUnservedStagesRefuse:

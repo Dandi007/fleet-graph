@@ -134,26 +134,29 @@ def plugin_seals(repo: Path, monkeypatch: pytest.MonkeyPatch) -> RealCommitSeale
     """Stand in for the plugin's materialize-handoff script."""
     sealer = RealCommitSealer(repo)
 
-    def implement_seal(binding: Any, request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-        receipt = sealer.seal("implement", StageOutcome())
-        # The real sealer writes the receipt here, and the review sealer
-        # re-reads exactly these bytes to check the digest it was handed.
-        path = (
-            Path(request["state_root"])
-            / "receipts"
-            / request["dispatch"]["attempt_id"]
-            / "implement-receipt.json"
-        )
+    def write_receipt(request: dict[str, Any], name: str, receipt: dict[str, Any]) -> None:
+        """Where the real sealer persists a receipt; later stages digest these
+        exact bytes."""
+        path = Path(request["state_root"]) / "receipts" / request["dispatch"]["attempt_id"] / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+
+    def implement_seal(binding: Any, request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        receipt = sealer.seal("implement", StageOutcome())
+        write_receipt(request, "implement-receipt.json", receipt)
         return receipt
 
     def review_seal(binding: Any, request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-        verdict = request["review_result"]["verdict"]
-        return {
-            **sealer.seal(request["dispatch"]["stage"], StageOutcome()),
-            "verdict": verdict,
+        stage = request["dispatch"]["stage"]
+        receipt = {
+            **sealer.seal(stage, StageOutcome()),
+            "verdict": request["review_result"]["verdict"],
         }
+        if stage == "continuous_review":
+            # The real sealer persists this, and the Final Review dispatch has
+            # to name its bytes as the parent.
+            write_receipt(request, "continuous-review-receipt.json", receipt)
+        return receipt
 
     monkeypatch.setattr(plugin_adapter, "invoke_implement_materializer", implement_seal)
     monkeypatch.setattr(plugin_adapter, "invoke_review_materializer", review_seal)

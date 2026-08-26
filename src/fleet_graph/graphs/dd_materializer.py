@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from fleet_graph.dd.capability import CONTRACTS_DIR
-from fleet_graph.dd.dispatch import DispatchError, StageDispatchBuilder
+from fleet_graph.dd.dispatch import DispatchError, StageDispatchBuilder, derive_attempt_id
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.dd.vendor import plugin_adapter
 from fleet_graph.graphs.dd_actors import (
@@ -60,6 +60,15 @@ AUTHOR_EMAIL = "dev-dispatch@example.invalid"
 # Where the plugin's sealer writes the Implement receipt, relative to the
 # attempt's receipts directory under the state root.
 IMPLEMENT_RECEIPT_FILE = "implement-receipt.json"
+
+# Whose sealed receipt each stage's dispatch must name as its parent. The
+# digest is over the file's bytes, not over an equivalent object: the sealer
+# re-reads exactly those bytes. Implement has no predecessor, so its parent is
+# the chain root the caller supplied.
+PARENT_RECEIPT_FILE = {
+    "continuous_review": IMPLEMENT_RECEIPT_FILE,
+    "final_review": "continuous-review-receipt.json",
+}
 
 APPLIED = "APPLIED"
 NON_APPLIED_OUTCOMES = ("DISPUTED", "BLOCKED")
@@ -126,6 +135,18 @@ def review_result_fields() -> frozenset[str]:
     """
     schema = json.loads((CONTRACTS_DIR / "review-result.schema.json").read_text(encoding="utf-8"))
     return frozenset(schema["properties"])
+
+
+def receipt_digest(state_root: str, attempt_id: str, filename: str, *, label: str) -> str:
+    """sha256 of a sealed receipt's bytes, as the sealer re-reads them."""
+    path = Path(state_root) / "receipts" / attempt_id / filename
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise MaterializationFailed(
+            "HANDOFF_CHAIN_MISMATCH", f"no sealed {label} at {path}: {exc}"
+        ) from exc
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 def review_actor_result(declared: dict[str, Any]) -> dict[str, Any]:
@@ -218,7 +239,16 @@ class PluginMaterializer:
         declared = dict(outcome.receipt or {})
         try:
             stage_dispatch = self.builder.build(
-                dispatch, parent_receipt=dispatch.get("parent_receipt") or None
+                dispatch,
+                parent_receipt=dispatch.get("parent_receipt") or None,
+                parent_digest=self.parent_digest(
+                    stage.id,
+                    derive_attempt_id(
+                        self.builder.chain.development_id,
+                        int(dispatch.get("generation", 1)),
+                        int(dispatch.get("attempt", 1)),
+                    ),
+                ),
             )
         except DispatchError as exc:
             raise MaterializationFailed("INVALID_HANDOFF_SCHEMA", str(exc)) from exc
@@ -282,30 +312,25 @@ class PluginMaterializer:
             produced=tuple(stage.produced_artifacts),
         )
 
+    def parent_digest(self, stage_id: str, attempt_id: str) -> str | None:
+        """The parent receipt's byte digest, or None where there is no file."""
+        name = PARENT_RECEIPT_FILE.get(stage_id)
+        if name is None:
+            return None
+        return receipt_digest(self.target.state_root, attempt_id, name, label="parent receipt")
+
     def _implement_digest(self, stage_dispatch: dict[str, Any]) -> str:
-        """The digest of the sealed Implement receipt's **bytes**.
+        """The Implement receipt this review reviews, by its sealed bytes.
 
-        Not of the receipt object we hold. The sealer writes the receipt to
-        `<state_root>/receipts/<attempt_id>/implement-receipt.json` and the
-        review sealer re-reads exactly those bytes and compares
-        (`DIGEST_MISMATCH: Implement receipt bytes do not match the requested
-        digest`). A canonical-JSON digest of the equivalent dict is a different
-        number, because the file carries fields the returned receipt does not.
-
-        And it is not the reviewer's to supply either: an agent handing back
-        the digest of the thing it is reviewing would be attesting to its own
-        subject.
+        Not the reviewer's word: an agent handing back the digest of the thing
+        it is reviewing would be attesting to its own subject.
         """
-        attempt_id = str(stage_dispatch.get("attempt_id", ""))
-        path = Path(self.target.state_root) / "receipts" / attempt_id / IMPLEMENT_RECEIPT_FILE
-        try:
-            payload = path.read_bytes()
-        except OSError as exc:
-            raise MaterializationFailed(
-                "HANDOFF_CHAIN_MISMATCH",
-                f"no sealed Implement receipt for attempt {attempt_id}: {exc}",
-            ) from exc
-        return "sha256:" + hashlib.sha256(payload).hexdigest()
+        return receipt_digest(
+            self.target.state_root,
+            str(stage_dispatch.get("attempt_id", "")),
+            IMPLEMENT_RECEIPT_FILE,
+            label="Implement receipt",
+        )
 
     @staticmethod
     def _read(stage: Stage, result: dict[str, Any]) -> Sealed:
@@ -359,6 +384,7 @@ __all__ = [
     "StageMaterializers",
     "UnservedStage",
     "implement_actor_result",
+    "receipt_digest",
     "review_actor_result",
     "review_result_fields",
 ]
