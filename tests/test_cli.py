@@ -54,6 +54,34 @@ class TestTheDdSubcommand:
         assert build_parser().parse_args(base).publish_merge is False
         assert build_parser().parse_args([*base, "--publish-merge"]).publish_merge is True
 
+    def test_resuming_without_a_checkpoint_is_refused(self) -> None:
+        """An in-memory checkpointer has no thread to resume; starting over
+        would re-dispatch stages that are already sealed."""
+        from fleet_graph.cli import _dd_run
+
+        args = build_parser().parse_args(
+            [
+                "dd",
+                "run",
+                "--development",
+                "d",
+                "--workspace",
+                "/tmp/w",
+                "--plugin-binding",
+                "/tmp/b.json",
+                "--remote-url",
+                "u",
+                "--remote-ref",
+                "refs/heads/main",
+                "--root-digest",
+                "sha256:" + "a" * 64,
+                "--resume",
+            ]
+        )
+        assert args.resume is True
+        with pytest.raises(SystemExit, match="--checkpoint"):
+            _dd_run(args)
+
     def test_stage_model_overrides_accumulate(self) -> None:
         args = build_parser().parse_args(
             [

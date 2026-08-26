@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from conftest import DEVELOPMENT_ID, git, head
+from fleet_graph.bus.board import Decision, GateTicket
 from fleet_graph.dd.lifecycle import Lifecycle
 from fleet_graph.dd.prompt import IMPLEMENT_PERSONA, IMPLEMENT_TEMPLATE
 from fleet_graph.dd.vendor import plugin_adapter
@@ -23,6 +24,7 @@ from fleet_graph.executors.agent_run import RunStatus, RunTicket
 from fleet_graph.graphs.dd_pipeline import (
     TERMINAL_COMPLETE,
     TERMINAL_FAULT,
+    TERMINAL_REFUSED,
     Dispatch,
     Sealed,
     StageOutcome,
@@ -347,3 +349,124 @@ class TestTheWiringReadsTheContract:
         config = make_config(repo, tmp_path)
         assert config.thread_id == f"{DEVELOPMENT_ID}:g1"
         assert json.dumps(str(config.run_root))
+
+
+class FakeBoard:
+    """A board that records what was asked and answers when told to.
+
+    Faithful in the one way that matters here: `ask` is keyed, so re-asking
+    with the same key must not produce a second question note.
+    """
+
+    def __init__(self) -> None:
+        self.asked: dict[str, str] = {}
+        self.decision: Decision | None = None
+
+    def ask(self, *, card_entity_id: str, question: str, idempotency_key: str) -> GateTicket:
+        self.asked.setdefault(idempotency_key, question)
+        return GateTicket(question_note_id="note-1", card_entity_id=card_entity_id)
+
+    def decision_for(self, ticket: GateTicket) -> Decision | None:
+        return self.decision
+
+
+class TestWaitingOnAHumanAndComingBack:
+    """The gate suspends the run; a later invocation picks it up where it stopped."""
+
+    def _config(self, repo: Path, tmp_path: Path) -> DevelopmentConfig:
+        config = make_config(repo, tmp_path)
+        # A resume has to find the thread, so the checkpoint outlives the process.
+        config.checkpoint_path = str(tmp_path / "checkpoint.sqlite")
+        config.run_config = {"acceptance_commands": [["true"]]}
+        return config
+
+    def _run(self, config: DevelopmentConfig, board: FakeBoard, **kwargs: Any) -> dict[str, Any]:
+        return run_pipeline(
+            config,
+            board=board,
+            gate_card_entity_id="card-1",
+            launcher=AgentRunStub({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}),
+            **kwargs,
+        )
+
+    def test_an_open_question_reports_which_note_is_holding_the_line(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        board = FakeBoard()
+        result = self._run(self._config(repo, tmp_path), board)
+
+        assert result["terminal"] is None, "waiting is not an ending"
+        assert result["awaiting"] == {"question_note_id": "note-1", "card_entity_id": "card-1"}
+        assert list(board.asked) == [f"dd-gate:{DEVELOPMENT_ID}:g1"]
+
+    def test_resuming_after_the_verdict_finishes_the_run(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        board = FakeBoard()
+        config = self._config(repo, tmp_path)
+        assert self._run(config, board)["awaiting"] is not None
+
+        board.decision = Decision(
+            message_id="msg-1",
+            decision="APPROVE",
+            decided_by="青林",
+            question="",
+            rationale="",
+            card_entity_id="card-1",
+            raw={},
+        )
+        result = self._run(config, board, resume=True)
+
+        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        assert result["awaiting"] is None
+        # Same key both times: the wait restarted, the question did not.
+        assert list(board.asked) == [f"dd-gate:{DEVELOPMENT_ID}:g1"]
+
+    def test_resuming_does_not_replay_the_stages_already_sealed(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        """The point of the checkpoint: the agents do not run a second time."""
+        board = FakeBoard()
+        config = self._config(repo, tmp_path)
+        self._run(config, board)
+
+        launcher = AgentRunStub({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        board.decision = Decision(
+            message_id="msg-1",
+            decision="APPROVE",
+            decided_by="青林",
+            question="",
+            rationale="",
+            card_entity_id="card-1",
+            raw={},
+        )
+        run_pipeline(
+            config,
+            board=board,
+            gate_card_entity_id="card-1",
+            launcher=launcher,
+            resume=True,
+        )
+        assert launcher.dispatched == [], "a resume must not re-dispatch a sealed stage"
+
+    def test_a_rejection_on_resume_ends_it_without_a_fault(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        board = FakeBoard()
+        config = self._config(repo, tmp_path)
+        self._run(config, board)
+
+        board.decision = Decision(
+            message_id="msg-2",
+            decision="REJECT",
+            decided_by="青林",
+            question="",
+            rationale="不放行",
+            card_entity_id="card-1",
+            raw={},
+        )
+        result = self._run(config, board, resume=True)
+
+        assert result["terminal"] == TERMINAL_REFUSED
+        assert "REJECT" in result["terminal_reason"]
+        assert result["fault"] is False

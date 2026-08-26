@@ -235,7 +235,14 @@ def run_pipeline(
     gate_card_entity_id: str = "",
     launcher: Any = None,
     clock: Any = None,
+    resume: bool = False,
 ) -> dict[str, Any]:
+    """Run one development, or resume the one this thread already suspended.
+
+    `resume=True` hands the graph no input at all. That is deliberate: the
+    gate re-reads the board itself, so resuming carries no verdict and cannot
+    be used to cast one. It only says "look again".
+    """
     graph, _deps = build_pipeline(
         config,
         scripts=scripts,
@@ -249,15 +256,20 @@ def run_pipeline(
 
     with SqliteSaver.from_conn_string(config.checkpoint_path) as saver:
         compiled = graph.compile(checkpointer=saver)
-        state = compiled.invoke(
-            initial_state(
+        start = (
+            None
+            if resume
+            else initial_state(
                 development_id=config.development_id,
                 stage=config.start_stage,
                 head_commit=config.head_commit,
                 artifacts={SPEC_ARTIFACT: config.head_commit},
                 generation=config.generation,
                 attempt_started_at=iso(now()),
-            ),
+            )
+        )
+        state = compiled.invoke(
+            start,
             config={
                 "configurable": {"thread_id": config.thread_id},
                 # The bounds are the real limit; this is a runaway backstop.
@@ -273,13 +285,26 @@ def run_pipeline(
         "stage": state.get("stage"),
         "steps": state.get("steps", 0),
         "head_commit": state.get("head_commit"),
+        # Which question is holding the line. Without it the operator knows
+        # only that something suspended, not what to answer.
+        "awaiting": awaiting_decision(state),
         "history": state.get("history", []),
     }
+
+
+def awaiting_decision(state: dict[str, Any]) -> dict[str, Any] | None:
+    """The gate ticket the graph suspended on, if it suspended on one."""
+    for interrupt in state.get("__interrupt__") or ():
+        value = getattr(interrupt, "value", None)
+        if isinstance(value, dict) and "awaiting_decision" in value:
+            return dict(value["awaiting_decision"])
+    return None
 
 
 __all__ = [
     "SPEC_ARTIFACT",
     "DevelopmentConfig",
+    "awaiting_decision",
     "build_pipeline",
     "lifecycle_gate_stage",
     "run_pipeline",
