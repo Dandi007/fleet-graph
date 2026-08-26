@@ -139,6 +139,10 @@ class Sealed:
 
     commit: str
     receipt: dict[str, Any] | None = None
+    # Set only by a sealer that knows what it wrote. A sealer that merely
+    # commits whatever the stage left behind leaves this None, so the stage's
+    # own report still has to survive output_verify.
+    produced: tuple[str, ...] | None = None
 
 
 class Materializer(Protocol):
@@ -351,6 +355,11 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                         # The sealer attested; its account supersedes the
                         # actor's claim for every downstream binding.
                         outcome = replace(outcome, receipt=sealed.receipt)
+                    if sealed.produced is not None:
+                        # A seal that names what it wrote is a better witness
+                        # than an agent's self-report -- it is the thing that
+                        # actually wrote them.
+                        outcome = replace(outcome, produced=sealed.produced)
                         digests[stage.id] = compute_json_digest(sealed.receipt)
                 except StageRefused as refused:
                     # The sealer, not the actor, can end a stage too: a

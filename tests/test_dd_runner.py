@@ -65,29 +65,24 @@ class AgentRunStub:
         return RunTicket(run_id, "/tmp/x", None)
 
     def wait(self, ticket: RunTicket, **kwargs: Any) -> RunStatus:
+        """Answers in the roles' own result shapes: implement.result.v1 and
+        review.result.v2, which is what agent-runtime actually returns."""
         stage = LIFECYCLE.stages[self.stage]
         queue = self.verdicts.get(stage.id)
         verdict = queue.pop(0) if queue else "success"
         if stage.id == "implement":
-            receipt: dict[str, Any] = {
+            declared: dict[str, Any] = {
                 "actor_job_id": f"job-{stage.id}",
                 "input_commit": "1" * 40,
-                "outcome": "APPLIED",
                 "work_head_commit": "2" * 40,
-                "verification_record": {"checks": []},
+                "outcome": "APPLIED",
+                "verification_record": {
+                    "verification_commands": [{"argv": ["true"], "exit_code": 0}]
+                },
             }
         else:
-            receipt = {"review_result": {"verdict": verdict, "findings": []}}
-        return RunStatus(
-            "succeeded",
-            {
-                "structured_result": {
-                    "verdict": verdict,
-                    "receipt": receipt,
-                    "produced_artifacts": list(stage.produced_artifacts),
-                }
-            },
-        )
+            declared = {"verdict": verdict, "findings": [], "review_phase": stage.id}
+        return RunStatus("succeeded", {"structured_result": declared})
 
 
 class ScriptStub:

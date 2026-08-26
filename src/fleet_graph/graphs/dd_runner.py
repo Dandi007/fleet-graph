@@ -107,6 +107,7 @@ def build_pipeline(
         launcher=launcher or AgentRunLauncher(state_root=str(config.run_root / "agent-runs")),
         development_id=config.development_id,
         run_root=config.run_root,
+        worktree_path=config.workspace_path,
         roles=config.roles,
         timeouts=config.timeouts,
     )

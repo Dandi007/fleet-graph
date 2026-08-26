@@ -74,35 +74,69 @@ def make_actor(tmp_path: Path, launcher: RecordingLauncher) -> AgentRunStageActo
 
 
 class TestDispatchingAnLlmStage:
-    def test_the_declared_result_becomes_the_outcome(self, tmp_path: Path) -> None:
-        launcher = RecordingLauncher(
-            RunStatus(
-                "succeeded",
-                {
-                    "structured_result": {
-                        "verdict": "APPROVE",
-                        "receipt": {"output_commit": COMMIT},
-                        "produced_artifacts": ["continuous_verdict", "feedback"],
-                    }
-                },
-            )
-        )
+    def test_a_review_result_is_forwarded_whole(self, tmp_path: Path) -> None:
+        """The role returns a `review.result.v2`; that *is* the actor result.
+
+        Forwarding it unfiltered is what lets the plugin validate it against
+        its own schema and name the missing field, instead of a translation
+        layer here getting between the agent and that answer.
+        """
+        declared = {"verdict": "APPROVE", "findings": [], "review_phase": "continuous"}
+        launcher = RecordingLauncher(RunStatus("succeeded", {"structured_result": declared}))
         outcome = make_actor(tmp_path, launcher).act(REVIEW, dispatch_for(REVIEW))
 
         assert outcome.event == "APPROVE"
-        assert outcome.receipt == {"output_commit": COMMIT}
-        assert outcome.produced == ("continuous_verdict", "feedback")
+        assert outcome.receipt == {"review_result": declared}
 
-    def test_the_dispatch_travels_in_a_file_not_in_argv(self, tmp_path: Path) -> None:
-        """`/proc` makes argv world-readable, and a dispatch names commits."""
+    def test_an_implement_result_is_forwarded_whole(self, tmp_path: Path) -> None:
+        declared = {
+            "actor_job_id": "job-1",
+            "input_commit": "1" * 40,
+            "work_head_commit": "2" * 40,
+        }
+        launcher = RecordingLauncher(RunStatus("succeeded", {"structured_result": declared}))
+        outcome = make_actor(tmp_path, launcher).act(IMPLEMENT, dispatch_for(IMPLEMENT))
+
+        assert outcome.event == SPINE_EVENT, "implement declares no verdict"
+        assert outcome.receipt == declared
+
+    def test_the_input_travels_in_a_file_not_in_argv(self, tmp_path: Path) -> None:
+        """`/proc` makes argv world-readable, and the input names commits."""
         launcher = RecordingLauncher()
-        dispatch = dispatch_for(IMPLEMENT)
-        make_actor(tmp_path, launcher).act(IMPLEMENT, dispatch)
+        make_actor(tmp_path, launcher).act(IMPLEMENT, dispatch_for(IMPLEMENT))
 
         spec, _ = launcher.launched[0]
         assert spec.prompt == ""
         assert spec.input_path and spec.prompt_file
-        assert json.loads(Path(spec.input_path).read_text(encoding="utf-8")) == dispatch
+        written = json.loads(Path(spec.input_path).read_text(encoding="utf-8"))
+        assert set(written) == {
+            "attempt_id",
+            "development_id",
+            "spec_commit",
+            "stage",
+            "worktree_path",
+            "run_id",
+        }
+
+    def test_the_input_is_what_the_roles_own_schema_asks_for(self, tmp_path: Path) -> None:
+        """Validated against `attempt-context.v1.json` where it is present.
+
+        Sending the walker's richer dispatch would fail the role's own
+        validation, and would be telling the agent things the contract says it
+        should read from the tree.
+        """
+        schema_path = Path(
+            "/data/code/self/agent-runtime/profiles/roles/schemas/attempt-context.v1.json"
+        )
+        if not schema_path.is_file():
+            pytest.skip("agent-runtime is not on this machine")
+        import jsonschema
+
+        launcher = RecordingLauncher()
+        make_actor(tmp_path, launcher).act(IMPLEMENT, dispatch_for(IMPLEMENT))
+        spec, _ = launcher.launched[0]
+        written = json.loads(Path(spec.input_path).read_text(encoding="utf-8"))
+        jsonschema.validate(written, json.loads(schema_path.read_text(encoding="utf-8")))
 
     def test_the_run_is_labelled_for_attribution(self, tmp_path: Path) -> None:
         launcher = RecordingLauncher()
@@ -131,9 +165,20 @@ class TestDispatchingAnLlmStage:
 
         assert launcher.launched[0][1] != launcher.launched[1][1]
 
-    def test_the_role_defaults_per_stage_and_can_be_overridden(self) -> None:
-        assert stage_role(IMPLEMENT, {}) == "dd_implement"
-        assert stage_role(IMPLEMENT, {"implement": "dd_impl_v2"}) == "dd_impl_v2"
+    def test_the_roles_are_the_ones_agent_runtime_already_ships(self) -> None:
+        """Reused rather than minted: a parallel role would drift from the
+        personas the plugin bundle carries."""
+        assert stage_role(IMPLEMENT, {}) == "implementer"
+        assert stage_role(REVIEW, {}) == "continuous_reviewer"
+        assert stage_role(LIFECYCLE.stages["final_review"], {}) == "final_reviewer"
+        assert stage_role(IMPLEMENT, {"implement": "implementer_v2"}) == "implementer_v2"
+
+    def test_those_roles_exist_where_agent_runtime_keeps_them(self) -> None:
+        roles = Path("/data/code/self/agent-runtime/profiles/roles")
+        if not roles.is_dir():
+            pytest.skip("agent-runtime is not on this machine")
+        for stage in (IMPLEMENT, REVIEW, LIFECYCLE.stages["final_review"]):
+            assert (roles / f"{stage_role(stage, {})}.yaml").is_file(), stage.id
 
 
 class TestFailuresUseTheContractsOwnTaxonomy:
