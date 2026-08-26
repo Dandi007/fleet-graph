@@ -37,14 +37,21 @@ class RecordingTransport:
         return [c["url"].split("127.0.0.1:7490")[-1] for c in self.calls]
 
 
-def delivery(n: int, attempt: int = 0) -> dict[str, Any]:
+def delivery(n: int, attempt: int = 0, **payload: Any) -> dict[str, Any]:
+    """A bus delivery, in the shape the bus really returns: message nested."""
+    body = {"body": f"hello {n}"}
+    body.update(payload)
     return {
         "delivery_id": f"dl-{n}",
         "lease_token": f"lease-{n}",
-        "message_id": f"msg-{n}",
-        "kind": "chat.message.v1",
-        "payload": {"text": f"hello {n}"},
         "attempt": attempt,
+        "message": {
+            "message_id": f"msg-{n}",
+            "kind": "chat.message.v1",
+            "sender_agent_id": "ronin-other",
+            "created_at": "2026-08-26T04:00:00Z",
+            "payload": body,
+        },
     }
 
 
@@ -127,7 +134,7 @@ class TestConsume:
 class TestAck:
     def test_posts_the_lease_token(self, inbox: Inbox, transport: RecordingTransport) -> None:
         transport.queue(200, {})
-        outcome = inbox.ack(Delivery("dl-1", "lease-1", "msg-1", "k", {}))
+        outcome = inbox.ack(Delivery("dl-1", "lease-1", {"message_id": "msg-1"}))
         assert outcome == "acked"
         assert transport.paths() == ["/v1/deliveries/dl-1/ack"]
         assert transport.calls[0]["body"] == {"lease_token": "lease-1"}
@@ -136,11 +143,11 @@ class TestAck:
         self, inbox: Inbox, transport: RecordingTransport
     ) -> None:
         transport.queue(409, {"code": "LEASE_LOST"})
-        assert inbox.ack(Delivery("dl-1", "lease-1", "msg-1", "k", {})) == "lease_lost"
+        assert inbox.ack(Delivery("dl-1", "lease-1", {"message_id": "msg-1"})) == "lease_lost"
 
     def test_other_status_is_error(self, inbox: Inbox, transport: RecordingTransport) -> None:
         transport.queue(500, {"code": "BOOM"})
-        assert inbox.ack(Delivery("dl-1", "lease-1", "msg-1", "k", {})) == "error"
+        assert inbox.ack(Delivery("dl-1", "lease-1", {"message_id": "msg-1"})) == "error"
 
 
 class TestMustDeliverOrdering:
@@ -203,3 +210,106 @@ class TestDurableWrite:
     def test_non_ascii_is_preserved(self, tmp_path: Path) -> None:
         path = write_json_durable(tmp_path / "x.json", {"reason": "验收通过"})
         assert "验收通过" in path.read_text(encoding="utf-8")
+
+
+class TestEnvelopeMapping:
+    """The fixed eight-field envelope the coordinator role's schema demands."""
+
+    def test_produces_exactly_the_declared_fields(
+        self, inbox: Inbox, transport: RecordingTransport
+    ) -> None:
+        from fleet_graph.bus.inbox import ENVELOPE_FIELDS
+
+        transport.queue(200, {"deliveries": [delivery(1)]})
+        assert set(inbox.consume().messages[0]) == set(ENVELOPE_FIELDS)
+
+    def test_reads_from_the_nested_message_object(
+        self, inbox: Inbox, transport: RecordingTransport
+    ) -> None:
+        transport.queue(200, {"deliveries": [delivery(1)]})
+        message = inbox.consume().messages[0]
+        assert message["message_id"] == "msg-1"
+        assert message["body"] == "hello 1"
+        assert message["received_at"] == "2026-08-26T04:00:00Z"
+
+    def test_sender_fills_the_identity_fields(
+        self, inbox: Inbox, transport: RecordingTransport
+    ) -> None:
+        transport.queue(200, {"deliveries": [delivery(1)]})
+        message = inbox.consume().messages[0]
+        assert message["from_alias"] == "ronin-other"
+        assert message["from_agent_id"] == "ronin-other"
+
+    def test_delivery_without_a_message_id_is_dropped(
+        self, inbox: Inbox, transport: RecordingTransport
+    ) -> None:
+        broken = delivery(1)
+        del broken["message"]["message_id"]
+        transport.queue(200, {"deliveries": [broken]})
+        assert len(inbox.consume()) == 0
+
+
+class TestMalformedMessagesCannotPoisonARound:
+    """A real incident: an unexpected shape arrived all-null with an empty body,
+    the coordinator input schema rejected the round, and the pump died on it.
+
+    Anything can be published into an inbox, so every field degrades rather
+    than failing validation.
+    """
+
+    def test_empty_body_falls_back_to_summary_and_detail(
+        self, inbox: Inbox, transport: RecordingTransport
+    ) -> None:
+        raw = delivery(1)
+        raw["message"]["payload"] = {"summary": "quota alert", "detail": "channel 13 down"}
+        transport.queue(200, {"deliveries": [raw]})
+        assert inbox.consume().messages[0]["body"] == "quota alert\nchannel 13 down"
+
+    def test_a_shapeless_payload_still_yields_readable_text(
+        self, inbox: Inbox, transport: RecordingTransport
+    ) -> None:
+        raw = delivery(1)
+        raw["message"]["payload"] = {"weird": {"nested": 1}}
+        transport.queue(200, {"deliveries": [raw]})
+        body = inbox.consume().messages[0]["body"]
+        assert body and "weird" in body
+
+    def test_body_is_never_empty(self, inbox: Inbox, transport: RecordingTransport) -> None:
+        raw = delivery(1)
+        raw["message"]["payload"] = {}
+        transport.queue(200, {"deliveries": [raw]})
+        assert inbox.consume().messages[0]["body"] != ""
+
+    def test_wrongly_typed_depth_degrades_to_zero(
+        self, inbox: Inbox, transport: RecordingTransport
+    ) -> None:
+        transport.queue(200, {"deliveries": [delivery(1, depth="deep")]})
+        assert inbox.consume().messages[0]["depth"] == 0
+
+    def test_boolean_depth_is_not_mistaken_for_an_int(
+        self, inbox: Inbox, transport: RecordingTransport
+    ) -> None:
+        transport.queue(200, {"deliveries": [delivery(1, depth=True)]})
+        assert inbox.consume().messages[0]["depth"] == 0
+
+    def test_missing_identity_degrades_to_unknown(
+        self, inbox: Inbox, transport: RecordingTransport
+    ) -> None:
+        raw = delivery(1)
+        del raw["message"]["sender_agent_id"]
+        transport.queue(200, {"deliveries": [raw]})
+        message = inbox.consume().messages[0]
+        assert message["from_alias"] == "unknown"
+        assert message["from_agent_id"] == "unknown"
+
+    def test_thread_id_falls_back_to_the_message_id(
+        self, inbox: Inbox, transport: RecordingTransport
+    ) -> None:
+        transport.queue(200, {"deliveries": [delivery(1)]})
+        assert inbox.consume().messages[0]["thread_id"] == "msg-1"
+
+    def test_non_string_body_is_stringified(
+        self, inbox: Inbox, transport: RecordingTransport
+    ) -> None:
+        transport.queue(200, {"deliveries": [delivery(1, body=12345)]})
+        assert inbox.consume().messages[0]["body"] == "12345"

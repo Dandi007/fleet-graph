@@ -25,11 +25,14 @@ interpret message semantics.
 
 from __future__ import annotations
 
+import json
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from fleet_graph.bus.client import BusClient, BusError
+from fleet_graph.state.run_artifacts import iso
 
 DEFAULT_MAX_MESSAGES = 10
 DEFAULT_LEASE_MS = 60_000
@@ -53,30 +56,94 @@ class InboxForbidden(InboxError):
     """
 
 
+ENVELOPE_FIELDS = (
+    "message_id",
+    "from_alias",
+    "from_agent_id",
+    "thread_id",
+    "depth",
+    "sent_at",
+    "received_at",
+    "body",
+)
+
+
+def _text(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _body_of(payload: dict[str, Any]) -> str:
+    """Never return an empty body.
+
+    A real incident is the reason this exists: a message in an unexpected
+    shape arrived with every field null and an empty body, the coordinator
+    input schema rejected the whole round, and the pump died on it. Anything
+    can be published into an inbox, so the fallback chain degrades to readable
+    text rather than letting one malformed message poison the line.
+    """
+    body = payload.get("body")
+    if isinstance(body, str) and body:
+        return body
+    if body is not None and not isinstance(body, str):
+        return str(body)
+
+    parts = [payload[key] for key in ("summary", "detail") if isinstance(payload.get(key), str)]
+    if parts:
+        return "\n".join(parts)
+    return json.dumps(payload, ensure_ascii=False)
+
+
 @dataclass(frozen=True)
 class Delivery:
     delivery_id: str
     lease_token: str
-    message_id: str
-    kind: str
-    payload: dict[str, Any]
+    message: dict[str, Any] = field(default_factory=dict)
     attempt: int = 0
+
+    @property
+    def message_id(self) -> str:
+        return str(self.message.get("message_id", ""))
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        payload = self.message.get("payload")
+        return payload if isinstance(payload, dict) else {}
 
     @property
     def near_dead(self) -> bool:
         return self.attempt >= NEAR_DEAD_ATTEMPT_THRESHOLD
 
-    def as_message(self) -> dict[str, Any]:
-        """The structured form handed to the coordinator.
+    def as_message(self, received_fallback: str = "") -> dict[str, Any]:
+        """The fixed eight-field envelope the coordinator role's schema requires.
 
-        message_id is included because redelivery is expected: the coordinator
-        de-duplicates on it, and that is what makes ack-after-fsync safe.
+        Every field is coerced to the declared type. Inbox content is
+        untrusted and arrives in whatever shape the sender chose, so a missing
+        or wrongly typed field degrades to a usable default instead of failing
+        schema validation and taking the round down with it.
         """
+        payload = self.payload
+        sender = _text(self.message.get("sender_agent_id"))
+        depth = payload.get("depth")
+        created_at = self.message.get("created_at")
+
         return {
             "message_id": self.message_id,
-            "kind": self.kind,
-            "payload": self.payload,
-            "attempt": self.attempt,
+            "from_alias": (
+                _text(payload.get("from_alias"))
+                or _text(payload.get("from"))
+                or sender
+                or "unknown"
+            ),
+            "from_agent_id": _text(payload.get("from_agent_id")) or sender or "unknown",
+            "thread_id": (
+                _text(payload.get("thread_id"))
+                or _text(payload.get("thread_entity_id"))
+                or self.message_id
+            ),
+            "depth": depth if isinstance(depth, int) and not isinstance(depth, bool) else 0,
+            "sent_at": (_text(payload.get("sent_at")) or _text(created_at) or received_fallback),
+            "received_at": _text(created_at) or received_fallback,
+            "body": _body_of(payload),
         }
 
 
@@ -84,9 +151,11 @@ class Delivery:
 class Drain:
     deliveries: list[Delivery] = field(default_factory=list)
 
+    received_at: str = ""
+
     @property
     def messages(self) -> list[dict[str, Any]]:
-        return [d.as_message() for d in self.deliveries]
+        return [d.as_message(self.received_at) for d in self.deliveries]
 
     @property
     def near_dead(self) -> list[Delivery]:
@@ -133,20 +202,22 @@ class Inbox:
         if deliveries is None:
             raise InboxError("consume response had no deliveries array")
 
-        drain = Drain()
+        drain = Drain(received_at=iso(time.time()))
         for raw in deliveries:
             delivery_id = raw.get("delivery_id")
             lease_token = raw.get("lease_token")
             if not delivery_id or not lease_token:
                 # Unackable; skip rather than pretend we can hold it.
                 continue
+            message = raw.get("message")
+            if not isinstance(message, dict) or not message.get("message_id"):
+                # No message_id means nothing can de-duplicate it downstream.
+                continue
             drain.deliveries.append(
                 Delivery(
                     delivery_id=delivery_id,
                     lease_token=lease_token,
-                    message_id=str(raw.get("message_id", "")),
-                    kind=str(raw.get("kind", "")),
-                    payload=raw.get("payload") or {},
+                    message=message,
                     attempt=int(raw.get("attempt") or 0),
                 )
             )
@@ -179,6 +250,7 @@ class Inbox:
 
 
 __all__ = [
+    "ENVELOPE_FIELDS",
     "NEAR_DEAD_ATTEMPT_THRESHOLD",
     "AckOutcome",
     "Delivery",
