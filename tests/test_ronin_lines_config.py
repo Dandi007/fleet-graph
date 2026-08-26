@@ -99,3 +99,35 @@ class TestTheShippedConfigLoads:
         for entry in raw["lines"]:
             assert entry["folder_id"].startswith("wf-")
             assert len(entry["folder_id"]) == 9
+
+
+class TestTheRunbookMatchesTheCode:
+    """事故里没人会翻 docstring。
+
+    紧急停机口的地址写在 docs/operating.md 上，运维会照抄。抄到一个和代码
+    默认值对不上的路径，命令会安静地什么都不做——而那正是最不该安静的时刻。
+    """
+
+    RUNBOOK = Path(__file__).resolve().parent.parent / "docs" / "operating.md"
+
+    def test_every_copyable_command_names_the_path_the_code_reads(self) -> None:
+        """按代码块查，不按全文查。
+
+        第一版只断言「正确路径在文中出现过」——文档里同时留着一句「路径曾是
+        /data/ronin/...」的历史说明，于是一条 `cat > /data/ronin/...` 的错命令
+        照样通过。出现过不等于抄下来是对的；要查的是可复制的那几行。"""
+        from fleet_graph.scheduler.daemon import DEFAULT_MAINTENANCE_STOP
+
+        current = str(DEFAULT_MAINTENANCE_STOP)
+        in_code, checked = False, 0
+        for line in self.RUNBOOK.read_text(encoding="utf-8").splitlines():
+            if line.startswith("```"):
+                in_code = not in_code
+                continue
+            if in_code and "maintenance-stop" in line:
+                checked += 1
+                assert current in line, line
+        assert checked >= 2, "runbook lost its stop/release commands"
+
+    def test_the_runbook_names_the_canary_currently_switched_on(self) -> None:
+        assert CANARY in self.RUNBOOK.read_text(encoding="utf-8")
