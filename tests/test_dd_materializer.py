@@ -131,6 +131,35 @@ class TestTheActorResultIsChecked:
         with pytest.raises(MaterializationFailed, match="verification_record"):
             implement_actor_result(receipt)
 
+    def test_a_legacy_three_field_result_passes_through(self) -> None:
+        """What agent-runtime's `implement.result.v1` actually returns.
+
+        The vendored adapter defaults this shape to APPLIED. Refusing it here
+        would refuse a result that bridge exists to accept, and would report a
+        missing field the caller could do nothing about.
+        """
+        result = implement_actor_result(
+            {"actor_job_id": "j", "input_commit": "1" * 40, "work_head_commit": "2" * 40}
+        )
+        assert result == {
+            "actor_job_id": "j",
+            "input_commit": "1" * 40,
+            "work_head_commit": "2" * 40,
+        }
+
+    def test_fields_the_plugin_does_not_admit_are_dropped(self) -> None:
+        """`implement.output.schema.json` sets additionalProperties: false, and
+        the role returns `effects`."""
+        result = implement_actor_result(
+            {
+                "actor_job_id": "j",
+                "input_commit": "1" * 40,
+                "work_head_commit": "2" * 40,
+                "effects": [],
+            }
+        )
+        assert "effects" not in result
+
     def test_a_disputed_result_must_carry_its_rebuttal(self) -> None:
         receipt = {"actor_job_id": "j", "input_commit": "1" * 40, "outcome": "DISPUTED"}
         with pytest.raises(MaterializationFailed, match="rebuttal"):
@@ -153,6 +182,23 @@ class TestTheActorResultIsChecked:
     def test_nothing_beyond_the_declared_fields_is_forwarded(self) -> None:
         receipt = {**applied_receipt(), "chatty_extra": "ignore me"}
         assert "chatty_extra" not in implement_actor_result(receipt)
+
+    def test_the_admitted_fields_match_the_plugins_own_schema(self) -> None:
+        import json
+        from pathlib import Path as P
+
+        from fleet_graph.graphs.dd_materializer import IMPLEMENT_ACTOR_FIELDS
+
+        plugin = P(
+            "/data/code/self/loop-engine-dev-dispatch-plugin-releases"
+            "/76c4003bd087890867b411186a0584ea3ba4364b"
+            "/workflows/dev-dispatch/implement/contracts/implement.output.schema.json"
+        )
+        if not plugin.is_file():
+            pytest.skip("the pinned plugin release is not on this machine")
+        schema = json.loads(plugin.read_text(encoding="utf-8"))
+        assert set(IMPLEMENT_ACTOR_FIELDS) == set(schema["properties"])
+        assert schema.get("additionalProperties") is False
 
     def test_the_reviewed_receipt_comes_from_the_chain_not_the_reviewer(self, repo: Path) -> None:
         """A reviewer handing back the digest of its own subject would be

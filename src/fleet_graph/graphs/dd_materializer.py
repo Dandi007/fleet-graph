@@ -57,10 +57,22 @@ APPLIED = "APPLIED"
 NON_APPLIED_OUTCOMES = ("DISPUTED", "BLOCKED")
 NON_APPLIED_DETAIL_FIELD = {"DISPUTED": "rebuttal", "BLOCKED": "blocker"}
 
-# Restated from upstream `parse_implement_actor_result`. Kept minimal on
-# purpose: the plugin validates the request against its own schema, so this
-# only has to stop a request that is obviously not one.
-IMPLEMENT_ACTOR_BASE_FIELDS = ("actor_job_id", "input_commit", "outcome")
+# The fields `implement.output.schema.json` admits. It sets
+# `additionalProperties: false`, so anything else the role happens to return --
+# `effects`, say -- has to be dropped rather than forwarded.
+IMPLEMENT_ACTOR_FIELDS = (
+    "actor_job_id",
+    "input_commit",
+    "outcome",
+    "work_head_commit",
+    "rebuttal",
+    "blocker",
+    "verification_record",
+)
+# What the plugin requires regardless of outcome. `outcome` is deliberately not
+# here: the vendored adapter defaults a legacy three-field result to APPLIED,
+# so demanding it earlier refuses a result that bridge exists to accept.
+IMPLEMENT_REQUIRED_FIELDS = ("actor_job_id", "input_commit")
 APPLIED_EXTRA_FIELDS = ("work_head_commit", "verification_record")
 
 
@@ -95,15 +107,31 @@ class MaterializationTarget:
 
 
 def implement_actor_result(receipt: dict[str, Any]) -> dict[str, Any]:
-    """The actor's declared result, checked for the fields its outcome owes."""
-    missing = [f for f in IMPLEMENT_ACTOR_BASE_FIELDS if not receipt.get(f)]
+    """The actor's declared result, narrowed to what the plugin admits.
+
+    Two jobs, and only two. It drops fields the plugin's
+    `additionalProperties: false` would reject, and it refuses a result whose
+    *declared* outcome is missing the evidence that outcome owes.
+
+    What it deliberately does not do is demand more than the plugin does. An
+    `implement.result.v1` from agent-runtime carries three fields and no
+    `outcome`, and the vendored adapter defaults exactly that shape to APPLIED.
+    Requiring `outcome` here refused a result the bridge was written to accept,
+    and named a missing field the caller could have done nothing about -- the
+    real gap was one field further on.
+    """
+    missing = [f for f in IMPLEMENT_REQUIRED_FIELDS if not receipt.get(f)]
     if missing:
         raise MaterializationFailed(
             "INVALID_HANDOFF_SCHEMA",
             f"implement actor result is missing {sorted(missing)}",
         )
-    outcome = str(receipt["outcome"])
-    result = {field: receipt[field] for field in IMPLEMENT_ACTOR_BASE_FIELDS}
+    result = {f: receipt[f] for f in IMPLEMENT_ACTOR_FIELDS if receipt.get(f) is not None}
+
+    declared = receipt.get("outcome")
+    if declared is None:
+        return result
+    outcome = str(declared)
 
     if outcome == APPLIED:
         absent = [f for f in APPLIED_EXTRA_FIELDS if receipt.get(f) is None]
@@ -112,7 +140,6 @@ def implement_actor_result(receipt: dict[str, Any]) -> dict[str, Any]:
                 "INVALID_HANDOFF_SCHEMA",
                 f"an APPLIED implement result must carry {sorted(absent)}",
             )
-        result.update({field: receipt[field] for field in APPLIED_EXTRA_FIELDS})
         return result
 
     if outcome in NON_APPLIED_OUTCOMES:
@@ -121,7 +148,6 @@ def implement_actor_result(receipt: dict[str, Any]) -> dict[str, Any]:
             raise MaterializationFailed(
                 "INVALID_HANDOFF_SCHEMA", f"a {outcome} implement result must carry {field!r}"
             )
-        result[field] = receipt[field]
         return result
 
     raise MaterializationFailed(
