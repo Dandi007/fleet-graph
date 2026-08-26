@@ -83,6 +83,16 @@ def dispatch_for(repo: Path, stage_id: str, *, stamp: str = STAMP, attempt: int 
     }
 
 
+def seal_implement_receipt(repo: Path, attempt_id: str, payload: bytes = b'{"ok":1}') -> str:
+    """Write what the real Implement sealer writes, and return its byte digest."""
+    import hashlib
+
+    path = repo / ".state" / "receipts" / attempt_id / "implement-receipt.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
 class TestTheRequestIsFrozenAndReproducible:
     def test_two_builds_of_the_same_attempt_are_byte_identical(self, repo: Path) -> None:
         """Same canonical JSON means same digest means the same frozen intent.
@@ -200,24 +210,26 @@ class TestTheActorResultIsChecked:
         assert set(IMPLEMENT_ACTOR_FIELDS) == set(schema["properties"])
         assert schema.get("additionalProperties") is False
 
-    def test_the_reviewed_receipt_comes_from_the_chain_not_the_reviewer(self, repo: Path) -> None:
-        """A reviewer handing back the digest of its own subject would be
-        attesting to what it is reviewing."""
+    def test_the_reviewed_digest_is_the_sealed_receipts_bytes(self, repo: Path) -> None:
+        """Not the reviewer's word, and not a digest of the receipt object we
+        hold: the review sealer re-reads exactly those bytes."""
+        materializer = make_materializer(repo)
+        dispatch = dispatch_for(repo, "continuous_review")
+        expected = seal_implement_receipt(repo, materializer.builder.build(dispatch)["attempt_id"])
+
         receipt = {
             **review_receipt(),
             "implementation_handoff_receipt_digest": "sha256:" + "f" * 64,
         }
-        request = make_materializer(repo).request(
-            REVIEW, dispatch_for(repo, "continuous_review"), StageOutcome(receipt=receipt)
-        )
-        assert request["implementation_handoff_receipt_digest"] == IMPLEMENT_DIGEST
+        request = materializer.request(REVIEW, dispatch, StageOutcome(receipt=receipt))
+        assert request["implementation_handoff_receipt_digest"] == expected
 
     def test_a_review_with_no_sealed_implement_receipt_is_a_chain_hole(self, repo: Path) -> None:
-        dispatch = dispatch_for(repo, "continuous_review")
-        dispatch["receipt_digests"] = {}
-        with pytest.raises(MaterializationFailed, match="chain has a hole"):
+        with pytest.raises(MaterializationFailed, match="no sealed Implement receipt"):
             make_materializer(repo).request(
-                REVIEW, dispatch, StageOutcome(receipt=review_receipt())
+                REVIEW,
+                dispatch_for(repo, "continuous_review"),
+                StageOutcome(receipt=review_receipt()),
             )
 
     def test_the_envelope_convention_is_stripped_from_a_review_result(self) -> None:
@@ -336,11 +348,10 @@ class TestReadingWhatTheSealerReturned:
         monkeypatch.setattr(plugin_adapter, "invoke_implement_materializer", implement_seal)
         monkeypatch.setattr(plugin_adapter, "invoke_review_materializer", review_seal)
 
-        sealed = make_materializer(repo).materialize(
-            REVIEW,
-            dispatch_for(repo, "continuous_review"),
-            StageOutcome(receipt=review_receipt()),
-        )
+        materializer = make_materializer(repo)
+        dispatch = dispatch_for(repo, "continuous_review")
+        seal_implement_receipt(repo, materializer.builder.build(dispatch)["attempt_id"])
+        sealed = materializer.materialize(REVIEW, dispatch, StageOutcome(receipt=review_receipt()))
         assert called == ["review"]
         assert sealed.receipt is not None and sealed.receipt["verdict"] == "APPROVE"
 
