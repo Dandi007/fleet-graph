@@ -41,8 +41,8 @@ class TestExtractionIsClean:
             source = module.read_text()
             assert not re.search(r"^\s*(from|import)\s+loop_engine", source, re.M), module.name
 
-    def test_the_closure_is_just_these_two_modules(self) -> None:
-        """1748 lines of git discipline came across with one import rewritten.
+    def test_the_closure_is_just_these_modules(self) -> None:
+        """Three files of domain code, each brought over with its imports rewritten.
 
         If this grows, the D1 calculus changes and the finding needs revisiting.
         """
@@ -50,7 +50,72 @@ class TestExtractionIsClean:
             "__init__.py",
             "git_ops.py",
             "external_ops.py",
+            "plugin_adapter.py",
         }
+
+    def test_the_plugin_adapter_imports(self) -> None:
+        from fleet_graph.dd.vendor import plugin_adapter
+
+        for name in (
+            "invoke_implement_materializer",
+            "invoke_review_materializer",
+            "verify_plugin_capability",
+            "load_plugin_binding",
+            "find_script",
+            "PluginBinding",
+        ):
+            assert hasattr(plugin_adapter, name), name
+
+    def test_the_adapter_needed_only_a_constants_shim(self) -> None:
+        """1208 more lines for one import block and four restated values.
+
+        The second D1 data point, and it says the same as the first: the cost
+        of reusing this domain code is an import rewrite, not a rewrite.
+        """
+        source = (VENDOR / "plugin_adapter.py").read_text()
+        assert "from fleet_graph.dd.upstream_constants import" in source
+        assert "from fleet_graph.dd.vendor import external_ops" in source
+
+
+class TestTheRestatedConstantsMatchTheContracts:
+    """A restated constant nobody checks is a constant waiting to drift.
+
+    Each of these is pinned against a contract file *in this repo* rather than
+    against the upstream checkout, so the check still runs in CI where
+    loop-engine is not present.
+    """
+
+    def test_the_handoff_contract_version_matches_its_schema(self) -> None:
+        from fleet_graph.dd.upstream_constants import HANDOFF_CONTRACT_VERSION
+
+        schema = json.loads((CONTRACTS / "handoff.schema.json").read_text())
+        assert schema["properties"]["contract_version"]["const"] == HANDOFF_CONTRACT_VERSION
+
+    def test_the_attempt_context_protocol_matches_two_contracts(self) -> None:
+        from fleet_graph.dd.upstream_constants import ATTEMPT_CONTEXT_CONTRACT_VERSION
+
+        attempt = json.loads((CONTRACTS / "attempt-context.schema.json").read_text())
+        lifecycle = json.loads((CONTRACTS / "development-lifecycle.json").read_text())
+        protocol = ATTEMPT_CONTEXT_CONTRACT_VERSION
+        assert attempt["$defs"]["contract_version"]["const"] == protocol
+        assert lifecycle["capabilities"]["attempt_context"]["protocol"] == protocol
+
+    def test_the_review_phases_match_the_artifact_paths(self) -> None:
+        from fleet_graph.dd.upstream_constants import ReviewPhase
+
+        artifacts = json.loads((CONTRACTS / "stage-artifacts.json").read_text())["artifact_kinds"]
+        assert f"/{ReviewPhase.CONTINUOUS}/" in artifacts["continuous_verdict"]["path_pattern"]
+        assert f"/{ReviewPhase.FINAL}/" in artifacts["final_verdict"]["path_pattern"]
+
+    def test_canonical_json_is_canonical(self) -> None:
+        """Digests are computed over this spelling. A different spelling is a
+        digest of something else."""
+        from fleet_graph.dd.upstream_constants import canonical_json, compute_json_digest
+
+        assert canonical_json({"b": 1, "a": {"d": 2, "c": 3}}) == '{"a":{"c":3,"d":2},"b":1}'
+        assert canonical_json({"k": "青林"}) == '{"k":"青林"}', "UTF-8 must survive"
+        assert compute_json_digest({"a": 1, "b": 2}) == compute_json_digest({"b": 2, "a": 1})
+        assert compute_json_digest({}).startswith("sha256:")
 
 
 class TestContracts:
