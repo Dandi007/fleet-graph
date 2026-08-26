@@ -132,12 +132,21 @@ def _dd_run(args: argparse.Namespace) -> int:
 
         board = Board(BusClient())
 
-    result = run_pipeline(config, board=board, gate_card_entity_id=args.board_card or "")
+    result = run_pipeline(
+        config,
+        board=board,
+        gate_card_entity_id=args.board_card or "",
+        resume=args.resume,
+    )
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
     sys.stdout.write("\n")
     # `complete` is the only ending that means the pipeline did what it was
-    # asked. A refusal is a legitimate answer, not a success.
-    return 0 if result.get("terminal") == "complete" else 1
+    # asked. A refusal is a legitimate answer, not a success. Waiting on a
+    # human is neither, and gets its own code so a caller can tell "come back
+    # later" apart from "this failed".
+    if result.get("terminal") == "complete":
+        return 0
+    return 75 if result.get("awaiting") else 1
 
 
 def _dd_bootstrap(args: argparse.Namespace) -> int:
@@ -270,6 +279,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="an acceptance command; repeatable",
     )
     dd_run.add_argument("--board-card", default=None, help="card entity id; enables the gate")
+    dd_run.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume the thread this development already suspended, instead of starting it. "
+        "Carries no verdict: the gate re-reads the board itself. Needs the same --checkpoint",
+    )
     dd_run.add_argument(
         "--stage-model",
         action="append",
