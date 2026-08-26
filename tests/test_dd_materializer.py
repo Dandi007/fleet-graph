@@ -220,6 +220,33 @@ class TestTheActorResultIsChecked:
                 REVIEW, dispatch, StageOutcome(receipt=review_receipt())
             )
 
+    def test_the_envelope_convention_is_stripped_from_a_review_result(self) -> None:
+        """The reviewer's persona tells it to answer "with `effects: []`" --
+        agent-runtime's envelope convention, which lands inside the result
+        object. `review-result.schema.json` sets additionalProperties: false
+        and does not admit it."""
+        from fleet_graph.graphs.dd_materializer import review_actor_result
+
+        cleaned = review_actor_result(
+            {"verdict": "APPROVE", "findings": [], "effects": [], "notes": "chatty"}
+        )
+        assert cleaned == {"verdict": "APPROVE", "findings": []}
+
+    def test_the_admitted_review_fields_come_from_the_schema(self) -> None:
+        """Read from the contract, so a contract that grows a field does not
+        need this to be remembered."""
+        import json as _json
+
+        from fleet_graph.dd.capability import CONTRACTS_DIR
+        from fleet_graph.graphs.dd_materializer import review_result_fields
+
+        schema = _json.loads(
+            (CONTRACTS_DIR / "review-result.schema.json").read_text(encoding="utf-8")
+        )
+        assert review_result_fields() == frozenset(schema["properties"])
+        assert schema.get("additionalProperties") is False
+        assert "effects" not in review_result_fields()
+
     def test_a_review_must_declare_a_review_result(self, repo: Path) -> None:
         with pytest.raises(MaterializationFailed, match="review_result"):
             make_materializer(repo).request(
