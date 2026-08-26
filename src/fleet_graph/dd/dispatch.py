@@ -208,7 +208,11 @@ class StageDispatchBuilder:
         return stage in self.allowed_stages
 
     def build(
-        self, dispatch: dict[str, Any], *, parent_receipt: dict[str, Any] | None = None
+        self,
+        dispatch: dict[str, Any],
+        *,
+        parent_receipt: dict[str, Any] | None = None,
+        parent_digest: str | None = None,
     ) -> dict[str, Any]:
         stage = str(dispatch.get("stage", ""))
         if stage not in self.allowed_stages:
@@ -248,7 +252,7 @@ class StageDispatchBuilder:
                 self.chain.development_id, stage, generation, attempt, input_commit
             ),
             "mode": mode,
-            "parent_handoff_receipt_digest": self.parent_digest(parent_receipt),
+            "parent_handoff_receipt_digest": parent_digest or self.parent_digest(parent_receipt),
             "spec_ref": refs.spec,
             "stage": stage,
             "target_base_commit": self.chain.target_base_commit,
