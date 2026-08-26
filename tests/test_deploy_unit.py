@@ -98,6 +98,21 @@ class TestTheUnitCannotFailForUnreadableReasons:
                 assert "KEY" not in line.upper(), line
 
 
+class TestTheUnitGivesLinesAWorkingPath:
+    def test_bun_is_on_the_path_the_unit_defines(self) -> None:
+        """agent-run's shebang is `#!/usr/bin/env bun`. A systemd user unit
+        does not inherit a login shell's PATH, so without this every line dies
+        with `env: 'bun': No such file or directory` before doing any work."""
+        path_lines = [
+            line
+            for line in UNIT.read_text(encoding="utf-8").splitlines()
+            if line.startswith("Environment=PATH=")
+        ]
+        assert path_lines, "the unit must define PATH; the default has no bun"
+        assert ".bun/bin" in path_lines[0], path_lines[0]
+        assert "/usr/bin" in path_lines[0], "PATH must still carry the system binaries"
+
+
 class TestTheRestartPolicyMatchesTheReAdoptDesign:
     def test_kill_mode_lets_executors_outlive_the_daemon(self) -> None:
         """The whole point of the re-adopt primitive: killing the daemon must

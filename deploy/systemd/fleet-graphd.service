@@ -24,6 +24,12 @@ KillMode=process
 TimeoutStopSec=30
 # Credentials are env-only; never commit a token into this unit.
 Environment=FLEET_GRAPH_GATEWAY_BASE_URL=http://127.0.0.1:15722
+# A systemd user unit does not get a login shell's PATH. agent-run is a bun
+# script (`#!/usr/bin/env bun`) and ~/.bun/bin is not on the default PATH, so
+# every line died with `env: 'bun': No such file or directory` -- the old
+# babysitter never hit this because it ran from an interactive shell. The
+# fleet's PATH is defined here, once; lines inherit it via the launcher.
+Environment=PATH=%h/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # `EnvironmentFile=-...`: the `-` goes *after* the `=`. Written as
 # `-EnvironmentFile=`, systemd logs "Unknown key" and silently drops the whole
 # line -- the unit still starts, still looks healthy, and the daemon simply

@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import calendar
 import json
+import os
 import subprocess
 import time
 from collections.abc import Iterable
@@ -134,6 +135,8 @@ class SchedulerConfig:
     interval_seconds: float = DEFAULT_INTERVAL_SECONDS
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS
     total_cap: int = DEFAULT_TOTAL_CAP
+    #: Extra environment handed to every line, on top of the scheduler's PATH.
+    extra_line_environment: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_json(cls, path: Path) -> SchedulerConfig:
@@ -145,6 +148,7 @@ class SchedulerConfig:
             interval_seconds=float(raw.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)),
             cooldown_seconds=float(raw.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS)),
             total_cap=int(raw.get("total_cap", DEFAULT_TOTAL_CAP)),
+            extra_line_environment=dict(raw.get("line_environment", {})),
         )
 
 
@@ -251,7 +255,21 @@ class Scheduler:
             generation=line.generation,
             max_rounds=line.max_rounds,
             run_root=self.config.run_root / line.folder_id,
+            environment=self.line_environment(),
         )
+
+    def line_environment(self) -> dict[str, str]:
+        """A line must be able to run the executables the scheduler can.
+
+        Transient units start from the user manager's environment, not the
+        scheduler's, so PATH does not carry across on its own. agent-run is a
+        bun script; without `~/.bun/bin` every line dies with
+        `env: 'bun': No such file or directory` before it does any work.
+        The unit defines the fleet's PATH; this passes it down.
+        """
+        env = {"PATH": os.environ.get("PATH", "")}
+        env.update(self.config.extra_line_environment)
+        return {k: v for k, v in env.items() if v}
 
     def tick(self) -> list[TickResult]:
         now = self.clock()

@@ -285,6 +285,40 @@ class TestARefusalNamesItsRealCause:
         assert "registered" not in record["detail"]
 
 
+class TestALineCanRunWhatTheSchedulerCanRun:
+    """PATH does not cross into a transient unit on its own.
+
+    agent-run is a bun script and `~/.bun/bin` is not on a systemd user
+    manager's default PATH, so the first real line died with
+    `env: 'bun': No such file or directory` before doing any work. The old
+    babysitter never hit it: it ran from an interactive shell. Environment is
+    part of migration equivalence, same as bounds and the gate path.
+    """
+
+    def test_the_launch_carries_the_schedulers_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("PATH", "/home/x/.bun/bin:/usr/bin")
+        spec = make(tmp_path).spec_for(LineSpec(folder_id="wf-1", seat="s", enabled=True))
+        assert spec.environment["PATH"] == "/home/x/.bun/bin:/usr/bin"
+        assert "--setenv=PATH=/home/x/.bun/bin:/usr/bin" in spec.argv()
+
+    def test_the_config_can_add_more(self, tmp_path: Path) -> None:
+        scheduler = make(tmp_path, extra_line_environment={"AGENT_RUNTIME_ROOT": "/data/x"})
+        env = scheduler.spec_for(LineSpec(folder_id="wf-1", seat="s", enabled=True)).environment
+        assert env["AGENT_RUNTIME_ROOT"] == "/data/x"
+        assert "PATH" in env
+
+    def test_an_empty_value_is_not_passed_at_all(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--setenv=PATH=` would set an empty PATH, which is worse than
+        inheriting nothing: execvp then finds nothing anywhere."""
+        monkeypatch.delenv("PATH", raising=False)
+        spec = make(tmp_path).spec_for(LineSpec(folder_id="wf-1", seat="s", enabled=True))
+        assert "PATH" not in spec.environment
+
+
 class TestTheRosterReachesTheDecision:
     """The config field and the refusal have to be the same fact.
 
