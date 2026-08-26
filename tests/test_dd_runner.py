@@ -135,7 +135,18 @@ def plugin_seals(repo: Path, monkeypatch: pytest.MonkeyPatch) -> RealCommitSeale
     sealer = RealCommitSealer(repo)
 
     def implement_seal(binding: Any, request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-        return sealer.seal("implement", StageOutcome())
+        receipt = sealer.seal("implement", StageOutcome())
+        # The real sealer writes the receipt here, and the review sealer
+        # re-reads exactly these bytes to check the digest it was handed.
+        path = (
+            Path(request["state_root"])
+            / "receipts"
+            / request["dispatch"]["attempt_id"]
+            / "implement-receipt.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+        return receipt
 
     def review_seal(binding: Any, request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         verdict = request["review_result"]["verdict"]

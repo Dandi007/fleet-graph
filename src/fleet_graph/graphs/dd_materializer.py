@@ -29,9 +29,11 @@ contract that already states it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from fleet_graph.dd.capability import CONTRACTS_DIR
@@ -39,7 +41,6 @@ from fleet_graph.dd.dispatch import DispatchError, StageDispatchBuilder
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.dd.vendor import plugin_adapter
 from fleet_graph.graphs.dd_actors import (
-    IMPLEMENT_HANDOFF_ARTIFACT,
     implement_stage,
     review_stages,
 )
@@ -55,6 +56,10 @@ AUTHOR_EMAIL = "dev-dispatch@example.invalid"
 # sealer" is *not* the same set as "appears in a dispatch". The plugin ships
 # exactly two materializers; which stages own their outputs comes from the
 # contract, via the helpers in dd_actors.
+
+# Where the plugin's sealer writes the Implement receipt, relative to the
+# attempt's receipts directory under the state root.
+IMPLEMENT_RECEIPT_FILE = "implement-receipt.json"
 
 APPLIED = "APPLIED"
 NON_APPLIED_OUTCOMES = ("DISPUTED", "BLOCKED")
@@ -255,7 +260,9 @@ class PluginMaterializer:
                     "a review actor result must declare a review_result object",
                 )
             request["review_result"] = review_actor_result(review_result)
-            request["implementation_handoff_receipt_digest"] = self._implement_digest(dispatch)
+            request["implementation_handoff_receipt_digest"] = self._implement_digest(
+                stage_dispatch
+            )
         return request
 
     def materialize(self, stage: Stage, dispatch: Dispatch, outcome: StageOutcome) -> Sealed:
@@ -275,21 +282,30 @@ class PluginMaterializer:
             produced=tuple(stage.produced_artifacts),
         )
 
-    def _implement_digest(self, dispatch: Dispatch) -> str:
-        """The implement receipt this review reviews, taken from the chain.
+    def _implement_digest(self, stage_dispatch: dict[str, Any]) -> str:
+        """The digest of the sealed Implement receipt's **bytes**.
 
-        Not from the actor. A reviewer handing back the digest of the thing it
-        is reviewing would be attesting to its own subject, and a wrong value
-        would re-point the chain at work nobody reviewed.
+        Not of the receipt object we hold. The sealer writes the receipt to
+        `<state_root>/receipts/<attempt_id>/implement-receipt.json` and the
+        review sealer re-reads exactly those bytes and compares
+        (`DIGEST_MISMATCH: Implement receipt bytes do not match the requested
+        digest`). A canonical-JSON digest of the equivalent dict is a different
+        number, because the file carries fields the returned receipt does not.
+
+        And it is not the reviewer's to supply either: an agent handing back
+        the digest of the thing it is reviewing would be attesting to its own
+        subject.
         """
-        sealer_stage = self.lifecycle.sole_producer_of(IMPLEMENT_HANDOFF_ARTIFACT)
-        digest = (dispatch.get("receipt_digests") or {}).get(sealer_stage or "")
-        if not isinstance(digest, str) or not digest:
+        attempt_id = str(stage_dispatch.get("attempt_id", ""))
+        path = Path(self.target.state_root) / "receipts" / attempt_id / IMPLEMENT_RECEIPT_FILE
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
             raise MaterializationFailed(
                 "HANDOFF_CHAIN_MISMATCH",
-                f"no sealed {sealer_stage!r} receipt to review; the chain has a hole",
-            )
-        return digest
+                f"no sealed Implement receipt for attempt {attempt_id}: {exc}",
+            ) from exc
+        return "sha256:" + hashlib.sha256(payload).hexdigest()
 
     @staticmethod
     def _read(stage: Stage, result: dict[str, Any]) -> Sealed:
