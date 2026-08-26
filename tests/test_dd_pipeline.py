@@ -22,6 +22,7 @@ from fleet_graph.graphs.dd_pipeline import (
     GatePending,
     PipelineBounds,
     PipelineDeps,
+    Sealed,
     StageOutcome,
     StageRefused,
     build_dd_pipeline_graph,
@@ -63,10 +64,14 @@ class Sealer:
     def __init__(self) -> None:
         self.commits: list[str] = []
 
-    def materialize(self, stage: Stage, dispatch: Dispatch, outcome: StageOutcome) -> str:
+    def materialize(self, stage: Stage, dispatch: Dispatch, outcome: StageOutcome) -> Sealed:
         commit = sealed_commit(dispatch)
         self.commits.append(commit)
-        return commit
+        # A real sealer attests; this stand-in attests to the same commit it
+        # wrote, which is what makes the binding checks meaningful.
+        receipt = dict(outcome.receipt or {})
+        receipt["output_commit"] = commit
+        return Sealed(commit=commit, receipt=receipt)
 
 
 def make_deps(**overrides: Any) -> PipelineDeps:
@@ -232,7 +237,14 @@ class TestTheWrapperIsEnforced:
 
 
 class TestBindingsAreEnforcedNotTrusted:
-    def test_a_receipt_claiming_a_commit_nobody_sealed_breaks_the_chain(self) -> None:
+    def test_an_actor_claiming_a_commit_it_did_not_produce_is_overruled(self) -> None:
+        """The actor reports; the sealer attests. The claim simply does not count.
+
+        This is the whole reason the materializer returns a receipt: the chain
+        is built from what was actually written, so an actor inventing an
+        `output_commit` changes nothing downstream.
+        """
+
         class Liar(ContractActor):
             def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
                 outcome = super().act(stage, dispatch)
@@ -241,7 +253,27 @@ class TestBindingsAreEnforcedNotTrusted:
                 return StageOutcome(event=outcome.event, receipt=receipt, produced=outcome.produced)
 
         actor = Liar({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
-        state = run(make_deps(actor=actor))
+        sealer = Sealer()
+        state = run(make_deps(actor=actor, materializer=sealer))
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert "deadbeef" not in str(state["history"])
+
+    def test_a_sealer_attesting_to_a_commit_it_did_not_write_breaks_the_chain(self) -> None:
+        """The check that survives: the attestation must match what was written."""
+
+        class InconsistentSealer(Sealer):
+            def materialize(
+                self, stage: Stage, dispatch: Dispatch, outcome: StageOutcome
+            ) -> Sealed:
+                sealed = super().materialize(stage, dispatch, outcome)
+                receipt = dict(sealed.receipt or {})
+                receipt["output_commit"] = "deadbeef" * 5
+                return Sealed(commit=sealed.commit, receipt=receipt)
+
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run(make_deps(actor=actor, materializer=InconsistentSealer()))
+
         assert state["terminal"] == TERMINAL_FAULT
         assert "forward chain is severed" in state["terminal_reason"]
 
