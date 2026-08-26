@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import tokenize
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +27,7 @@ from fleet_graph.graphs.dd_pipeline import (
     build_dd_pipeline_graph,
     initial_state,
 )
+from source_tools import executable_source
 
 SPEC_COMMIT = "0" * 40
 
@@ -439,21 +439,6 @@ class TestTheHumanGate:
         assert state["terminal"] == TERMINAL_REFUSED
         assert state.get("fault") is False
         assert "REJECT" in state["terminal_reason"]
-
-
-def executable_source(path: Path) -> str:
-    """The module's code with every comment and string literal removed.
-
-    Prose may name a stage; code may not. Searching the raw file would only
-    prove the docstrings are shy.
-    """
-    kept: list[str] = []
-    with path.open("rb") as handle:
-        for token in tokenize.tokenize(handle.readline):
-            if token.type in (tokenize.COMMENT, tokenize.STRING):
-                continue
-            kept.append(token.string)
-    return " ".join(kept)
 
 
 class TestNoSecondDescriptionOfTheMachine:
