@@ -11,7 +11,16 @@ concurrency:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    # Self-hosted, on the machine that runs the fleet. GitHub Actions minutes
+    # for this private repo are blocked on account billing, so hosted runners
+    # never started a job -- which meant "CI green" was never actually a gate
+    # and every PR merged on the author's own say-so.
+    #
+    # The runner is deliberately weak: its own unix user (`ghrunner`), no
+    # access to ~/.config/fleet-graph/env or any agent-bus token, no deploy
+    # rights. It runs lint and tests, nothing else. Never add a secret to this
+    # workflow without revisiting that.
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
