@@ -281,6 +281,59 @@ class TestTheStallStreak:
         assert scheduler.tick()[0].decision.refusal is Refusal.NO_PROGRESS
 
 
+class TestARestartDoesNotHandOutAFreeLaunch:
+    """Observed on the real fleet, not derived from the code.
+
+    The stall streak was persisted precisely because the daemon restarts on
+    every release -- but `last_start_at` was left in memory, and `decide`
+    skips the entire cooldown branch when there is no start time to measure
+    from. So a release at 22:13 re-ignited a line that had already earned a
+    streak of 2. The counter survived; the timestamp it multiplies did not.
+    Half a fix looks exactly like a whole one until you watch the machine.
+    """
+
+    def test_the_start_time_outlives_the_process(self, tmp_path: Path) -> None:
+        first = make(tmp_path, now=1000.0)
+        first.tick()
+        assert make(tmp_path).last_start_of("wf-1") == 1000.0
+
+    def test_a_fresh_daemon_still_honours_the_cooldown(self, tmp_path: Path) -> None:
+        make(tmp_path, now=1000.0).tick()
+        launcher = FakeLauncher()
+        after = make(tmp_path, now=1000.0 + 60, launcher=launcher)
+        assert after.tick()[0].decision.refusal is Refusal.COOLING_DOWN
+        assert launcher.launched == []
+
+    def test_a_fresh_daemon_still_honours_the_backoff(self, tmp_path: Path) -> None:
+        make(tmp_path, now=1000.0).tick()
+        for n in (1, 2):
+            write_terminal_record(tmp_path, "wf-1", "blocked", 0, f"run-{n}")
+            make(tmp_path).account_last_run("wf-1")
+        # 300 * 2**2 = 1200s of backoff earned; 700s in, a restart must not
+        # shorten it.
+        after = make(tmp_path, now=1000.0 + 700)
+        assert after.tick()[0].decision.refusal is Refusal.NO_PROGRESS
+
+    def test_accounting_a_terminal_does_not_erase_the_start_time(self, tmp_path: Path) -> None:
+        """The two facts share one file; writing one must not drop the other."""
+        make(tmp_path, now=1000.0).tick()
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1")
+        scheduler = make(tmp_path)
+        scheduler.account_last_run("wf-1")
+        assert scheduler.last_start_of("wf-1") == 1000.0
+
+    def test_the_global_cap_is_deliberately_not_persisted(self, tmp_path: Path) -> None:
+        """Not an oversight. The cap is a breaker for systemic faults -- a dead
+        gateway, a bad release -- and shipping new code is a plausible remedy
+        for those. Shipping code is not a remedy for one line's missing data
+        source, which is why the per-line stall state is persisted and this is
+        not."""
+        first = make(tmp_path, now=1000.0)
+        first.tick()
+        assert first.total_started == 1
+        assert make(tmp_path).total_started == 0
+
+
 class TestTicking:
     def test_run_forever_stops_after_the_bounded_ticks(self, tmp_path: Path) -> None:
         scheduler = make(tmp_path, cooldown_seconds=0)

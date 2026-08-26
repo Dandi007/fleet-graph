@@ -251,12 +251,13 @@ class Scheduler:
         try:
             state = json.loads(self._stall_path(folder_id).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {"streak": 0, "accounted_run_id": None}
+            return {"streak": 0, "accounted_run_id": None, "last_start_at": None}
         if not isinstance(state, dict):
-            return {"streak": 0, "accounted_run_id": None}
+            return {"streak": 0, "accounted_run_id": None, "last_start_at": None}
         return {
             "streak": int(state.get("streak") or 0),
             "accounted_run_id": state.get("accounted_run_id"),
+            "last_start_at": state.get("last_start_at"),
         }
 
     def _write_stall_state(self, folder_id: str, state: dict[str, Any]) -> None:
@@ -291,8 +292,46 @@ class Scheduler:
         advanced = int(record.get("rounds") or 0) > 0
         finished = record.get("terminal") == "done"
         streak = 0 if (advanced or finished) else int(state["streak"]) + 1
-        self._write_stall_state(folder_id, {"streak": streak, "accounted_run_id": run_id})
+        self._write_stall_state(
+            folder_id,
+            {
+                "streak": streak,
+                "accounted_run_id": run_id,
+                "last_start_at": state["last_start_at"],
+            },
+        )
         return streak
+
+    def last_start_of(self, folder_id: str) -> float | None:
+        """When this line was last started, across daemon restarts.
+
+        Kept on disk with the streak, and for the same reason. The streak
+        surviving a restart buys nothing on its own: `decide` skips the whole
+        cooldown branch when there is no start time to measure from, so a
+        daemon that forgot the timestamp hands the line a free launch the
+        moment we ship -- which is exactly when the backoff is longest and
+        nobody is watching. Observed on the real fleet: a release at 22:13
+        re-ignited a line with an already-earned streak of 2.
+
+        `total_started` is deliberately *not* persisted. That breaker exists
+        for a systemic fault -- a dead gateway, a bad release -- and shipping
+        new code is a plausible remedy for exactly those, so letting it reset
+        on deploy is the right reading. Shipping unrelated code is not a
+        remedy for one line's missing data source.
+        """
+        value = self.stall_state(folder_id)["last_start_at"]
+        if value is None:
+            return self.last_start_at.get(folder_id)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return self.last_start_at.get(folder_id)
+
+    def record_start(self, folder_id: str, when: float) -> None:
+        self.last_start_at[folder_id] = when
+        state = self.stall_state(folder_id)
+        state["last_start_at"] = when
+        self._write_stall_state(folder_id, state)
 
     def status_of(self, line: LineSpec) -> LineStatus:
         return LineStatus(
@@ -300,7 +339,7 @@ class Scheduler:
             seat=line.seat,
             running=self.units.is_active(self.spec_for(line).unit_name),
             terminal=self.terminal_of(line.folder_id),
-            last_start_at=self.last_start_at.get(line.folder_id),
+            last_start_at=self.last_start_of(line.folder_id),
         )
 
     def gateway_healthy(self, seat: str) -> bool | None:
@@ -374,7 +413,7 @@ class Scheduler:
                 # every time would otherwise never reach the cap it exists to
                 # trip.
                 self.total_started += 1
-                self.last_start_at[line.folder_id] = now
+                self.record_start(line.folder_id, now)
             results.append(result)
             if self.observe is not None:
                 self.observe(result)
