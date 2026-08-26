@@ -38,10 +38,22 @@ from fleet_graph.graphs.dd_pipeline import (
     build_dd_pipeline_graph,
     initial_state,
 )
+from fleet_graph.graphs.dd_scripts import (
+    AcceptanceStage,
+    ConfigureStage,
+    MergeStage,
+    WorkspaceSealer,
+)
 from fleet_graph.state.run_artifacts import iso
 
 # The root input every stage requires and no stage produces.
 SPEC_ARTIFACT = "spec"
+
+# Artifact kinds used to find the stage that owns each script default.
+RUN_CONFIG = "run_config"
+ACCEPTANCE_RESULT = "acceptance_result"
+MERGE_RESULT = "merge_result"
+GATE_DECISION = "gate_decision"
 
 
 @dataclass
@@ -67,6 +79,10 @@ class DevelopmentConfig:
     max_rework: int = 6
     max_retries: int = 2
     verify_worktree_head: bool = True
+    run_config: dict[str, Any] = field(default_factory=dict)
+    acceptance_timeout_seconds: int = 1800
+    # Pushing to a durable ref is the one step here that cannot be undone.
+    publish_merge: bool = False
 
     @property
     def thread_id(self) -> str:
@@ -115,16 +131,33 @@ def build_pipeline(
         verify_worktree_head=config.verify_worktree_head,
     )
 
-    registered: dict[str, Actor] = dict(scripts or {})
+    # Defaults that make an assembled pipeline runnable. A caller-supplied
+    # entry always wins; nothing here is mandatory.
+    registered: dict[str, Actor] = {
+        stage_producing(lifecycle, RUN_CONFIG): ConfigureStage(
+            repo=config.workspace_path, run_config=config.run_config
+        ),
+        stage_producing(lifecycle, ACCEPTANCE_RESULT): AcceptanceStage(
+            repo=config.workspace_path,
+            timeout_seconds=config.acceptance_timeout_seconds,
+        ),
+        stage_producing(lifecycle, MERGE_RESULT): MergeStage(
+            repo=config.workspace_path,
+            remote_url=config.remote_url,
+            target_ref=config.remote_ref,
+            publish=config.publish_merge,
+        ),
+    }
     if board is not None and gate_card_entity_id:
-        registered.setdefault(
-            lifecycle_gate_stage(lifecycle),
-            BoardGate(
-                board=board,
-                card_entity_id=gate_card_entity_id,
-                development_id=config.development_id,
-            ),
+        # The one stage with no default. An assembly that approved on its own
+        # would be an agent casting a human's verdict; a caller who wants a
+        # different policy registers their own actor, deliberately.
+        registered[lifecycle_gate_stage(lifecycle)] = BoardGate(
+            board=board,
+            card_entity_id=gate_card_entity_id,
+            development_id=config.development_id,
         )
+    registered.update(scripts or {})
 
     deps = PipelineDeps(
         lifecycle=lifecycle,
@@ -138,6 +171,12 @@ def build_pipeline(
         # commit through.
         materializer=StageMaterializers(
             by_stage={
+                # Everything the plugin does not seal commits its own output.
+                **{
+                    name: WorkspaceSealer(repo=config.workspace_path)
+                    for name in lifecycle.stages
+                    if name not in sealer.sealed_stages
+                },
                 **{stage: sealer for stage in sealer.sealed_stages},
                 **(materializers or {}),
             }
@@ -153,18 +192,21 @@ def build_pipeline(
     return build_dd_pipeline_graph(deps), deps
 
 
-def lifecycle_gate_stage(lifecycle: Lifecycle) -> str:
-    """The stage whose product is the human decision.
+def stage_producing(lifecycle: Lifecycle, artifact: str) -> str:
+    """The stage that produces this artifact, per the contract.
 
-    Found through the artifact contract rather than named, for the same reason
-    the walker names no stage: the contract already says which stage produces
-    the gate decision, and reading it there keeps one description of the
-    machine instead of two.
+    Cheaper than writing four stage names down again, and it stays right if
+    the contract moves an artifact to a different stage.
     """
-    for stage in lifecycle.stages.values():
-        if any(kind.endswith("gate_decision") for kind in stage.produced_artifacts):
-            return stage.id
-    raise ValueError("no stage in the contract produces a gate decision")
+    producers = lifecycle.artifact_producers.get(artifact, ())
+    if len(producers) != 1:
+        raise ValueError(f"{artifact} has producers {producers!r}; expected exactly one")
+    return producers[0]
+
+
+def lifecycle_gate_stage(lifecycle: Lifecycle) -> str:
+    """The stage whose product is the human decision."""
+    return stage_producing(lifecycle, GATE_DECISION)
 
 
 def run_pipeline(
@@ -224,4 +266,5 @@ __all__ = [
     "build_pipeline",
     "lifecycle_gate_stage",
     "run_pipeline",
+    "stage_producing",
 ]

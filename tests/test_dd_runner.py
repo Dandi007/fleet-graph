@@ -32,6 +32,7 @@ from fleet_graph.graphs.dd_runner import (
     lifecycle_gate_stage,
     run_pipeline,
 )
+from fleet_graph.graphs.dd_scripts import ACCEPTANCE_PATH, RUN_CONFIG_PATH
 
 LIFECYCLE = Lifecycle.load()
 
@@ -222,26 +223,40 @@ class TestTheWholePipelineComposes:
         assert launcher.dispatched.count("implement") == 2
 
 
-class TestWhatIsNotWiredYetFailsLoudly:
-    def test_a_stage_with_no_script_refuses_by_name(
-        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
-    ) -> None:
-        """Better than a placeholder that reports a stage as done."""
-        result = run_pipeline(make_config(repo, tmp_path), launcher=AgentRunStub())
-        assert result["terminal"] == TERMINAL_FAULT
-        assert "no registered script" in result["terminal_reason"]
+class TestTheDefaultsMakeItRunnable:
+    """Assembled means runnable. The gate is the one thing left unfilled."""
 
-    def test_a_stage_with_no_sealer_refuses_rather_than_carrying_the_commit(
+    def test_the_script_stages_need_no_registration(
         self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
     ) -> None:
-        scripts = ScriptStub()
+        config = make_config(repo, tmp_path)
+        config.run_config = {"acceptance_commands": [["true"]]}
+        result = run_pipeline(
+            config,
+            scripts={"human_gate": ScriptStub()},
+            launcher=AgentRunStub({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}),
+        )
+        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        assert (repo / RUN_CONFIG_PATH).is_file()
+        assert (repo / ACCEPTANCE_PATH).is_file()
+
+    def test_the_gate_still_refuses_without_a_board(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        """No default approves on its own -- that would be an agent casting a
+        human's verdict."""
         result = run_pipeline(
             make_config(repo, tmp_path),
-            scripts={name: scripts for name, s in LIFECYCLE.stages.items() if not s.is_llm},
-            launcher=AgentRunStub(),
+            launcher=AgentRunStub({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}),
         )
         assert result["terminal"] == TERMINAL_FAULT
-        assert "does not serve stage 'configure'" in result["terminal_reason"]
+        assert "human_gate" in result["terminal_reason"]
+        assert "no registered script" in result["terminal_reason"]
+
+    def test_a_caller_can_still_override_any_stage(self, repo: Path, tmp_path: Path) -> None:
+        mine = ScriptStub()
+        _graph, deps = build_pipeline(make_config(repo, tmp_path), scripts={"configure": mine})
+        assert deps.scripts["configure"] is mine
 
 
 class TestTheWiringReadsTheContract:
