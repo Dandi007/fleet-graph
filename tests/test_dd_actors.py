@@ -37,7 +37,7 @@ def dispatch_for(stage: Stage, *, attempt: int = 1, generation: int = 1) -> Disp
     return {
         "development_id": "dev-1",
         "stage": stage.id,
-        "mode": "normal",
+        "mode": "initial",
         "generation": generation,
         "attempt": attempt,
         "input_commit": COMMIT,

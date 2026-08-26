@@ -70,7 +70,13 @@ KNOWN_WRAPPER_STEPS = frozenset(
     {STEP_INPUT_VERIFY, STEP_ACTOR, STEP_MATERIALIZE, STEP_OUTPUT_VERIFY}
 )
 
-MODE_NORMAL = "normal"
+# The dispatch mode vocabulary is the contract's, not ours:
+# `stage-dispatch.schema.json` admits exactly `initial` and `rework`, and
+# `development-lifecycle.json` spells the third value `inherit` in `next_mode`.
+# Calling the first one "normal" would have produced a dispatch the plugin's
+# own schema rejects. Pinned by test against both contracts.
+MODE_INITIAL = "initial"
+MODE_REWORK = "rework"
 MODE_INHERIT = "inherit"
 
 TERMINAL_COMPLETE = "complete"
@@ -224,7 +230,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         return {
             "development_id": state.get("development_id", ""),
             "stage": stage.id,
-            "mode": state.get("mode", MODE_NORMAL),
+            "mode": state.get("mode", MODE_INITIAL),
             "generation": state.get("generation", 1),
             "attempt": state.get("attempt", 1),
             "input_commit": state.get("head_commit", ""),
@@ -237,6 +243,16 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         if deps.observe is not None:
             deps.observe(entry)
         return [*state.get("history", []), entry]
+
+    def _refused(
+        state: PipelineState, stage_id: str, step: str, refused: StageRefused, steps: int
+    ) -> PipelineState:
+        """A stage ended on purpose. Recorded and observed like any other step."""
+        return {
+            **_terminal(TERMINAL_REFUSED, str(refused)),
+            "steps": steps,
+            "history": _record(state, {"stage": stage_id, "step": step, "refused": str(refused)}),
+        }
 
     def run_stage(state: PipelineState) -> PipelineState:
         stage_id = state.get("stage", "")
@@ -284,13 +300,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                 try:
                     outcome = _act_or_wait(deps.actor_for(stage), stage, dispatch)
                 except StageRefused as refused:
-                    return {
-                        **_terminal(TERMINAL_REFUSED, str(refused)),
-                        "steps": steps,
-                        "history": _record(
-                            state, {"stage": stage.id, "step": step, "refused": str(refused)}
-                        ),
-                    }
+                    return _refused(state, stage.id, step, refused, steps)
                 except PipelineFault as fault:
                     return _terminal(TERMINAL_FAULT, str(fault), fault=True)
 
@@ -307,6 +317,12 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     )
                 try:
                     head_commit = deps.materializer.materialize(stage, dispatch, outcome)
+                except StageRefused as refused:
+                    # The sealer, not the actor, can end a stage too: a
+                    # non-applied receipt is a legitimate "I will not apply
+                    # this", which upstream also terminalises rather than
+                    # reworking. Nothing broke, so it is not a fault.
+                    return _refused(state, stage.id, step, refused, steps)
                 except Exception as exc:  # reported as a fault, never swallowed
                     return _terminal(
                         TERMINAL_FAULT, f"materialize failed on {stage.id}: {exc}", fault=True
@@ -387,13 +403,13 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                 return _terminal(TERMINAL_FAULT, str(ambiguous), fault=True)
             if successor is None:
                 return _terminal(TERMINAL_FAULT, str(exc), fault=True)
-            return {"stage": successor, "mode": state.get("mode", MODE_NORMAL)}
+            return {"stage": successor, "mode": state.get("mode", MODE_INITIAL)}
 
         if not transition.is_rework:
             # `inherit` means what it says: an attempt that entered as rework
             # stays rework for the rest of its pass, so the stages downstream
             # of a rejection know they are looking at reworked output.
-            mode = state.get("mode", MODE_NORMAL)
+            mode = state.get("mode", MODE_INITIAL)
             if transition.next_mode != MODE_INHERIT:
                 mode = transition.next_mode
             return {"stage": transition.target, "mode": mode}
@@ -437,7 +453,7 @@ def initial_state(
     return {
         "development_id": development_id,
         "stage": stage,
-        "mode": MODE_NORMAL,
+        "mode": MODE_INITIAL,
         "generation": generation,
         "attempt": 1,
         "head_commit": head_commit,
@@ -452,7 +468,8 @@ def initial_state(
 __all__ = [
     "FAILURE_EVENT",
     "MODE_INHERIT",
-    "MODE_NORMAL",
+    "MODE_INITIAL",
+    "MODE_REWORK",
     "SPINE_EVENT",
     "TERMINAL_BOUNDS",
     "TERMINAL_COMPLETE",

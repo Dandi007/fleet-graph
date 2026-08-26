@@ -441,6 +441,36 @@ class TestTheHumanGate:
         assert "REJECT" in state["terminal_reason"]
 
 
+class TestTheModeVocabularyIsTheContracts:
+    """Calling the first mode "normal" produced a dispatch the plugin rejects."""
+
+    def test_the_dispatch_modes_come_from_the_dispatch_schema(self) -> None:
+        from fleet_graph.dd.capability import CONTRACTS_DIR
+        from fleet_graph.graphs.dd_pipeline import MODE_INITIAL, MODE_REWORK
+
+        schema = json.loads(
+            (CONTRACTS_DIR / "stage-dispatch.schema.json").read_text(encoding="utf-8")
+        )
+        assert set(schema["properties"]["mode"]["enum"]) == {MODE_INITIAL, MODE_REWORK}
+
+    def test_inherit_is_the_lifecycle_spelling(self) -> None:
+        from fleet_graph.graphs.dd_pipeline import MODE_INHERIT
+
+        modes = {t.next_mode for t in Lifecycle.load().transitions}
+        assert MODE_INHERIT in modes
+
+    def test_a_fresh_pipeline_dispatches_as_initial(self) -> None:
+        modes: list[str] = []
+
+        class Recorder(ContractActor):
+            def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
+                modes.append(dispatch["mode"])
+                return super().act(stage, dispatch)
+
+        run(make_deps(actor=Recorder({"continuous_review": ["APPROVE"]})))
+        assert modes[0] == "initial"
+
+
 class TestNoSecondDescriptionOfTheMachine:
     """One table, not two. The walker must know no stage by name."""
 
