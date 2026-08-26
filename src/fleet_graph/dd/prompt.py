@@ -33,6 +33,30 @@ PLACEHOLDER = re.compile(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)(\?)?\}\}")
 IMPLEMENT_PERSONA = "implement/personas/implementer.md"
 IMPLEMENT_TEMPLATE = "implement/templates/implement.md"
 
+# How to hand the result back. The bundle's persona is written for
+# loop-engine's harness, which collects the result over its own dependency
+# channel, so it says nothing about envelopes. fleet-graph dispatches through
+# `agent-run`, and how the answer travels is therefore fleet-graph's to state.
+# Leaving it unsaid is what an earlier run did, and the agent did the work and
+# then returned nothing a machine could read.
+RESULT_TRANSPORT = """\
+## Returning your result (fleet-graph dispatch)
+
+Put one JSON object in `Envelope.result` -- not in prose, not in a fenced block
+in your commentary. It must carry exactly:
+
+- `actor_job_id`: the `actor_job_id` given above, echoed back verbatim
+- `input_commit`: the `input_commit` given above, echoed back verbatim
+- `outcome`: `APPLIED`, `DISPUTED` or `BLOCKED`
+- `work_head_commit`: the full 40-hex commit you finished on (APPLIED only)
+- `verification_record`: `{"verification_commands": [{"argv": [...], "exit_code": N}]}`
+  for every acceptance command you ran (APPLIED only)
+- `rebuttal` (DISPUTED) or `blocker` (BLOCKED) instead of the two above
+
+Doing the work and returning nothing readable is the same as not doing it: the
+deterministic seal has no other way to learn what you produced.\
+"""
+
 
 class PromptError(RuntimeError):
     """The prompt cannot be rendered as written. Do not dispatch a half-filled one."""
@@ -99,7 +123,11 @@ def stage_values(
 
 
 def render_stage_prompt(
-    resources: dict[str, str], persona_key: str, template_key: str, values: dict[str, Any]
+    resources: dict[str, str],
+    persona_key: str,
+    template_key: str,
+    values: dict[str, Any],
+    transport: str = RESULT_TRANSPORT,
 ) -> str:
     """Persona first, then the rendered template -- the order the workflow uses."""
     for key in (persona_key, template_key):
@@ -107,7 +135,10 @@ def render_stage_prompt(
             raise PromptError(f"the bundle carries no {key!r}")
     persona = render_template(resources[persona_key], values)
     body = render_template(resources[template_key], values)
-    return f"{persona.rstrip()}\n\n---\n\n{body.lstrip()}"
+    parts = [persona.rstrip(), body.strip()]
+    if transport:
+        parts.append(transport.strip())
+    return "\n\n---\n\n".join(parts)
 
 
 def bundle_resources(loaded: Any) -> dict[str, str]:
@@ -170,6 +201,7 @@ class PluginPromptSource:
 __all__ = [
     "IMPLEMENT_PERSONA",
     "IMPLEMENT_TEMPLATE",
+    "RESULT_TRANSPORT",
     "PluginPromptSource",
     "PromptError",
     "as_value",

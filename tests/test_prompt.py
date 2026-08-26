@@ -145,6 +145,37 @@ class TestAgainstThePinnedBundle:
         assert "verification_record" in rendered
         assert "contract violation" in rendered, "the anti-fabrication rule must survive"
 
+    def test_it_says_how_to_hand_the_result_back(self) -> None:
+        """The bundle's persona is written for loop-engine's harness, which
+        collects the result over its own channel. fleet-graph dispatches
+        through agent-run, so how the answer travels is fleet-graph's to say --
+        a real run did the work and then returned nothing machine-readable."""
+        rendered = render_stage_prompt(
+            self._resources(),
+            IMPLEMENT_PERSONA,
+            IMPLEMENT_TEMPLATE,
+            stage_values(
+                self._dispatch(),
+                worktree_path="/w",
+                run_id="r",
+                actor_job_id="job-1",
+                acceptance_commands=[["true"]],
+            ),
+        )
+        assert "Envelope.result" in rendered
+        for field in ("actor_job_id", "outcome", "work_head_commit", "verification_record"):
+            assert field in rendered, field
+
+    def test_the_transport_note_can_be_turned_off(self) -> None:
+        rendered = render_stage_prompt(
+            self._resources(),
+            IMPLEMENT_PERSONA,
+            IMPLEMENT_TEMPLATE,
+            stage_values(self._dispatch(), worktree_path="/w", run_id="r", actor_job_id="j"),
+            transport="",
+        )
+        assert "Envelope.result" not in rendered
+
     def test_a_missing_part_of_the_bundle_is_refused(self) -> None:
         with pytest.raises(PromptError, match="carries no"):
             render_stage_prompt({}, IMPLEMENT_PERSONA, IMPLEMENT_TEMPLATE, {})
