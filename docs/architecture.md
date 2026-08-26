@@ -23,7 +23,7 @@ fleet-graph 把**编排**这一件事收敛成一张显式的 LangGraph 图，�
 ```mermaid
 flowchart TB
     subgraph L4["L4 协调 / 监督层（不动）"]
-        BUS["agent-bus 板<br/>:7490 HTTP · :5608 MCP"]
+        BUSSVC["agent-bus 板<br/>:7490 HTTP · :5608 MCP"]
         SUP["fleet-supervisor / 人"]
     end
     subgraph L3["L3 状态 / 知识层（不动）"]
@@ -33,32 +33,35 @@ flowchart TB
         GIT["git"]
     end
     subgraph L2["L2 编排层（本 repo）"]
-        SCHED["schedulerd<br/>点火 · 门禁 · 熔断"]
+        SCHED["scheduler/<br/>点火门禁 · seat-aware 探针"]
         GOAL["graphs/goal_line<br/>浪人线 StateGraph"]
-        DD["graphs/dd_pipeline<br/>SPEC → MR StateGraph"]
+        DD["graphs/dd_pipeline<br/>SPEC → MR StateGraph（P3，尚未实现）"]
+        EXEC["executors/<br/>agent_run · agent_session · text_node"]
+        BUS["bus/<br/>client · board · inbox"]
+        STATE["state/<br/>run_artifacts · work_folder"]
         CKPT[("SQLite checkpointer<br/>仅 in-flight 易失态")]
     end
-    subgraph L1["L1 执行层（不动）"]
+    subgraph L1["L1 执行边界（外部二进制，不动）"]
         RUN["bin/agent-run<br/>一次性派发"]
         SESS["bin/agent-session<br/>长驻座位"]
-        TEXT["TextNode<br/>进程内纯文本角色"]
     end
     subgraph L0["L0 模型网关层（不动）"]
         GW["New API<br/>127.0.0.1:15722"]
     end
 
-    SUP --> BUS
-    BUS <--> GOAL
-    BUS <--> DD
+    SUP --> BUSSVC
     SCHED --> GOAL
     SCHED --> DD
-    GOAL --> RUN & SESS & TEXT
-    DD --> RUN & TEXT
-    GOAL & DD --> WF
+    GOAL & DD --> EXEC
+    GOAL & DD --> BUS
+    GOAL & DD --> STATE
+    EXEC --> RUN & SESS
+    EXEC -->|TextNode 进程内直连| GW
+    BUS --> BUSSVC
+    STATE --> WF
     GOAL & DD -.-> CKPT
     WF --> GIT
     RUN & SESS --> GW
-    TEXT --> GW
 ```
 
 各层职责边界：
@@ -67,9 +70,19 @@ flowchart TB
 |---|---|---|---|
 | L4 | agent-bus、fleet-supervisor | 外部，不动 | 看板、人机裁决协议（`work.decision.v1`） |
 | L3 | katana work-folder / wiki / memory MCP、git | 外部，不动 | durable state 的唯一家；goal/DoD/spec 保持框架无关纯文本 |
-| L2 | **fleet-graph** | 本 repo | 编排：图、gate、循环、分支、点火、熔断 |
-| L1 | agent-runtime CLI (`agent-run` / `agent-session`) | 外部，不动 | 一次 agent 执行的进程边界 |
+| L2 | **fleet-graph** | 本 repo | 编排：图、gate、循环、分支、点火、熔断；以及 `executors/`（对 L1 二进制的 subprocess 封装 + 进程内 TextNode）、`bus/`（agent-bus 客户端）、`state/`（磁盘契约与 work-folder 客户端） |
+| L1 | agent-runtime CLI (`agent-run` / `agent-session`) | 外部，不动 | 一次 agent 执行的进程边界。**注意**：本 repo 的 `executors/` 是它的调用方，属 L2；`TextNode` 更是纯进程内实现，不经 L1 |
 | L0 | New API 网关 | 外部，不动 | key 管理、channel 阶梯 failover、亲和、计量 |
+
+### 2.1 本 repo 的包结构
+
+| 包 | 职责 | 关键类型 |
+|---|---|---|
+| `graphs/` | StateGraph 与其接线；**唯一允许 import langgraph 的地方**（不变量一） | `build_goal_line_graph` / `LineDeps` / `LineGuards` / `build_line` |
+| `executors/` | 一次 agent 执行的封装。`agent_run` / `agent_session` 是对 L1 二进制的 subprocess 封装；`text_node` 是进程内直连网关，不经 L1 | `AgentRunLauncher` / `AgentSessionSeat` / `TextNode` |
+| `bus/` | agent-bus 客户端与工作看板。**没有发布 `work.decision.v1` 的方法**——裁决只归人（§6.2） | `BusClient` / `Board` / `GateTicket` / `Inbox` |
+| `state/` | durable state（不变量四）。`run_artifacts` 是 fleet-sentinel 直接消费的磁盘契约；`work_folder` 是 katana work-folder MCP 客户端 | `RunArtifacts` / `WorkFolder` |
+| `scheduler/` | 点火门禁与网关探针。探针是 **seat → 面 + 凭证 lane** 的映射，不是单一健康检查（§6.3） | `decide` / `GatewayProber` / `ProbeSpec` |
 
 ## 3. 四条反锁定不变量（宪法）
 
@@ -152,6 +165,17 @@ LangGraph interrupt → agent-bus 发 question note → 等 work.decision.v1 →
 ```
 
 裁决只认 `work.decision.v1` 消息，**agent 不得代拍**。旧的 auto-gate 自动放行策略作为一个可选 policy 被收编，默认关闭。
+
+### 6.3 网关探针必须探真实依赖面
+
+一个「面」= **endpoint + 凭证 lane**，两者都不能错：
+
+- 调研座探 OpenAI 面 `/v1/chat/completions`，用 openai lane 的 token
+- 订阅座探 `/v1/responses`，**必须 `stream:true`**（订阅 channel 只收流式），用 responses lane 的 token
+
+探错 endpoint 或探错凭证 lane，都会**报出漏报**——明明线依赖的那个面是坏的，探针却说健康。这比不探更糟：它把「我们不知道」变成「我们查过了，没问题」。实测过：用 openai lane 的 token 探 `/v1/responses` 返回 `503 No available channel ... under group anthropic`，而座位本身完全健康。
+
+没有注册探针的座位**直接拒绝点火**，不借用别的座位的面。
 
 ## 7. 需人拍板的开放问题
 
