@@ -44,6 +44,7 @@ from fleet_graph.graphs.dd_pipeline import (
     StageOutcome,
     StageRefused,
 )
+from fleet_graph.graphs.dd_scripts import GATE_PATH, write_json
 from fleet_graph.state.run_artifacts import write_json_durable
 
 # The roles agent-runtime already ships for these stages. They exist because
@@ -296,6 +297,9 @@ class BoardGate:
     board: Board
     card_entity_id: str
     development_id: str
+    # Where the verdict is written down. Without it the only record of who let
+    # a development through lives in the run's history -- and the run ends.
+    repo: Path | None = None
     question: str = ""
     approve: str = GATE_APPROVE
     allowed_decisions: tuple[str, ...] = (GATE_APPROVE, "REJECT")
@@ -334,15 +338,30 @@ class BoardGate:
             operator = decision.decided_by or "an operator"
             raise StageRefused(f"gate decision {verdict} by {operator}")
 
+        record = {
+            "stage": stage.id,
+            "decision": verdict,
+            "decided_by": decision.decided_by,
+            "decision_message_id": decision.message_id,
+            "question_note_id": ticket.question_note_id,
+            "card_entity_id": ticket.card_entity_id,
+            "output_commit": dispatch["input_commit"],
+        }
+        if self.repo is not None:
+            # Sealed into the product tree, like the reviews and the merge
+            # result. A gate whose verdict is not attributable afterwards is
+            # a gate nobody can audit.
+            write_json(
+                self.repo,
+                GATE_PATH.format(generation=dispatch.get("generation", 1)),
+                {
+                    "development_id": self.development_id,
+                    **{k: v for k, v in record.items() if k != "stage"},
+                },
+            )
         return StageOutcome(
             event=SPINE_EVENT,
-            receipt={
-                "stage": stage.id,
-                "decision": verdict,
-                "decided_by": decision.decided_by,
-                "decision_message_id": decision.message_id,
-                "output_commit": dispatch["input_commit"],
-            },
+            receipt=record,
             produced=tuple(stage.produced_artifacts),
         )
 

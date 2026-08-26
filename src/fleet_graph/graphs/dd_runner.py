@@ -169,6 +169,7 @@ def build_pipeline(
             board=board,
             card_entity_id=gate_card_entity_id,
             development_id=config.development_id,
+            repo=config.workspace_path,
         )
     registered.update(scripts or {})
 
