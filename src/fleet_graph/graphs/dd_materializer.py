@@ -29,11 +29,11 @@ contract that already states it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from fleet_graph.dd.dispatch import DispatchError, StageDispatchBuilder
-from fleet_graph.dd.lifecycle import Stage
+from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.dd.vendor import plugin_adapter
 from fleet_graph.graphs.dd_pipeline import Dispatch, Sealed, StageOutcome, StageRefused
 
@@ -42,6 +42,17 @@ from fleet_graph.graphs.dd_pipeline import Dispatch, Sealed, StageOutcome, Stage
 # written by a machine on a contract's behalf.
 AUTHOR_NAME = "Dev Dispatch"
 AUTHOR_EMAIL = "dev-dispatch@example.invalid"
+
+# The two protocol artifacts the plugin's two sealers write. The contract says
+# which stages produce them, so the stages are looked up rather than named.
+#
+# This matters more than it looks: `acceptance` appears in the dispatch
+# schema's stage enum, so "served by the sealer" is *not* the same set as
+# "appears in a dispatch". The plugin ships exactly two materializers, and
+# asking the contract which stages own their outputs is how that set stays
+# right when the contract changes.
+IMPLEMENT_HANDOFF_ARTIFACT = "attempt_context_implement_handoff"
+REVIEW_ARTIFACT = "attempt_context_review"
 
 APPLIED = "APPLIED"
 NON_APPLIED_OUTCOMES = ("DISPUTED", "BLOCKED")
@@ -127,10 +138,24 @@ class PluginMaterializer:
     builder: StageDispatchBuilder
     binding: Any
     target: MaterializationTarget
+    lifecycle: Lifecycle = field(default_factory=Lifecycle.load)
     verify_worktree_head: bool = True
 
+    @property
+    def implement_stage(self) -> str | None:
+        return self.lifecycle.sole_producer_of(IMPLEMENT_HANDOFF_ARTIFACT)
+
+    @property
+    def review_stages(self) -> tuple[str, ...]:
+        return self.lifecycle.protocol_producers.get(REVIEW_ARTIFACT, ())
+
+    @property
+    def sealed_stages(self) -> frozenset[str]:
+        implement = {self.implement_stage} if self.implement_stage else set()
+        return frozenset(implement | set(self.review_stages))
+
     def serves(self, stage: Stage) -> bool:
-        return self.builder.serves(stage.id)
+        return stage.id in self.sealed_stages and self.builder.serves(stage.id)
 
     def request(self, stage: Stage, dispatch: Dispatch, outcome: StageOutcome) -> dict[str, Any]:
         """Assemble the frozen materialization request. Deterministic per attempt."""
@@ -172,7 +197,7 @@ class PluginMaterializer:
             "worktree": self.target.worktree,
         }
 
-        if self._is_implement(stage_dispatch):
+        if stage.id == self.implement_stage:
             request["actor_result"] = implement_actor_result(declared)
         else:
             review_result = declared.get("review_result")
@@ -182,28 +207,34 @@ class PluginMaterializer:
                     "a review actor result must declare a review_result object",
                 )
             request["review_result"] = review_result
-            parent_digest = declared.get("implementation_handoff_receipt_digest")
-            if not isinstance(parent_digest, str) or not parent_digest:
-                raise MaterializationFailed(
-                    "HANDOFF_CHAIN_MISMATCH",
-                    "a review materialization must name the implement receipt it reviews",
-                )
-            request["implementation_handoff_receipt_digest"] = parent_digest
+            request["implementation_handoff_receipt_digest"] = self._implement_digest(dispatch)
         return request
 
     def materialize(self, stage: Stage, dispatch: Dispatch, outcome: StageOutcome) -> Sealed:
         request = self.request(stage, dispatch, outcome)
         invoke = (
             plugin_adapter.invoke_implement_materializer
-            if self._is_implement(request["dispatch"])
+            if stage.id == self.implement_stage
             else plugin_adapter.invoke_review_materializer
         )
         result = invoke(self.binding, request, verify_worktree_head=self.verify_worktree_head)
         return self._read(stage, result)
 
-    @staticmethod
-    def _is_implement(stage_dispatch: dict[str, Any]) -> bool:
-        return stage_dispatch.get("stage") == "implement"
+    def _implement_digest(self, dispatch: Dispatch) -> str:
+        """The implement receipt this review reviews, taken from the chain.
+
+        Not from the actor. A reviewer handing back the digest of the thing it
+        is reviewing would be attesting to its own subject, and a wrong value
+        would re-point the chain at work nobody reviewed.
+        """
+        sealer_stage = self.lifecycle.sole_producer_of(IMPLEMENT_HANDOFF_ARTIFACT)
+        digest = (dispatch.get("receipt_digests") or {}).get(sealer_stage or "")
+        if not isinstance(digest, str) or not digest:
+            raise MaterializationFailed(
+                "HANDOFF_CHAIN_MISMATCH",
+                f"no sealed {sealer_stage!r} receipt to review; the chain has a hole",
+            )
+        return digest
 
     @staticmethod
     def _read(stage: Stage, result: dict[str, Any]) -> Sealed:

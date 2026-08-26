@@ -56,6 +56,7 @@ from fleet_graph.dd.lifecycle import (
     LifecycleError,
     Stage,
 )
+from fleet_graph.dd.upstream_constants import compute_json_digest
 from fleet_graph.state.run_artifacts import iso
 
 # The event an actor reports when nothing was steered -- the spine edge.
@@ -168,6 +169,7 @@ class PipelineState(TypedDict, total=False):
     rework_count: int
     retries: dict[str, int]
     last_receipt: dict[str, Any]
+    receipt_digests: dict[str, str]
     last_event: str
     last_failure_code: str
     history: list[dict[str, Any]]
@@ -255,6 +257,11 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             "attempt_started_at": state.get("attempt_started_at", ""),
             "input_commit": state.get("head_commit", ""),
             "parent_receipt": dict(state.get("last_receipt") or {}),
+            # Chain digests by the stage that sealed them. A later stage that
+            # must name an earlier receipt reads it from here rather than
+            # asking an agent to hand back a digest it has no business
+            # authoring.
+            "receipt_digests": dict(state.get("receipt_digests") or {}),
             "required_artifacts": list(stage.required_artifacts),
             "produced_artifacts": list(stage.produced_artifacts),
             "contract_version": lifecycle.contract_version,
@@ -287,6 +294,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
 
         dispatch: Dispatch = _dispatch_for(state, stage)
         artifacts = dict(state.get("artifacts", {}))
+        digests = dict(state.get("receipt_digests", {}))
         outcome: StageOutcome | None = None
         head_commit = state.get("head_commit", "")
 
@@ -343,6 +351,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                         # The sealer attested; its account supersedes the
                         # actor's claim for every downstream binding.
                         outcome = replace(outcome, receipt=sealed.receipt)
+                        digests[stage.id] = compute_json_digest(sealed.receipt)
                 except StageRefused as refused:
                     # The sealer, not the actor, can end a stage too: a
                     # non-applied receipt is a legitimate "I will not apply
@@ -373,6 +382,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         return {
             "steps": steps,
             "artifacts": artifacts,
+            "receipt_digests": digests,
             "head_commit": head_commit,
             "last_event": outcome.event,
             "last_receipt": outcome.receipt or {},
@@ -490,6 +500,7 @@ def initial_state(
         "steps": 0,
         "rework_count": 0,
         "retries": {},
+        "receipt_digests": {},
         "history": [],
     }
 
