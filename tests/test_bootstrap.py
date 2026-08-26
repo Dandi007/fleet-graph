@@ -16,6 +16,7 @@ from fleet_graph.dd.bootstrap import (
     SPEC_MANIFEST_PATH,
     SPEC_PATH,
     BootstrapError,
+    IdentityChanged,
     build_attempt_context,
     canonical_bytes,
     committed_target_base,
@@ -159,6 +160,39 @@ class TestTheBaseIsReadBackFromWhatWasCommitted:
             development_id="dev-1", spec=b"# spec\n", target_base_commit=head(repo)
         ).write(repo)
         assert committed_target_base(repo) is None
+
+    def test_an_identity_edited_after_bootstrap_is_refused(self, repo: Path) -> None:
+        """The graded party can write the whole worktree. If a run inferred its
+        dispatch from an edited identity, the sealer would compare that file
+        against itself -- always true, worth nothing (findings §21a)."""
+        import json as json_module
+
+        base = head(repo)
+        self._bootstrap(repo, base)
+
+        identity = json_module.loads((repo / DEVELOPMENT_PATH).read_text(encoding="utf-8"))
+        identity["target_base_commit"] = "d" * 40
+        (repo / DEVELOPMENT_PATH).write_text(
+            json_module.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "feat: and a quiet edit to the identity")
+
+        with pytest.raises(IdentityChanged, match="edited since bootstrap"):
+            committed_target_base(repo)
+
+    def test_commits_that_leave_it_alone_are_fine(self, repo: Path) -> None:
+        """The check must not fire on ordinary work -- an agent committing
+        product code is the normal case, not an alarm."""
+        base = head(repo)
+        self._bootstrap(repo, base)
+
+        (repo / "product.py").write_text("x = 1\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "feat: real work")
+
+        assert committed_target_base(repo) == base
 
     def test_unreadable_json_is_no_answer_rather_than_a_crash(self, repo: Path) -> None:
         (repo / DEVELOPMENT_PATH).parent.mkdir(parents=True, exist_ok=True)

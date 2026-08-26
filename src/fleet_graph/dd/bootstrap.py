@@ -58,6 +58,10 @@ class BootstrapError(RuntimeError):
     """The attempt context cannot be written as asked."""
 
 
+class IdentityChanged(RuntimeError):
+    """The committed development identity is not the one bootstrap wrote."""
+
+
 def committed_target_base(worktree: Path, *, revision: str = "HEAD") -> str | None:
     """The `target_base_commit` the development already committed, if any.
 
@@ -66,18 +70,54 @@ def committed_target_base(worktree: Path, *, revision: str = "HEAD") -> str | No
     least). A run that re-derived this from HEAD would hand the review sealer
     a base the committed identity never named, and it refuses that with
     BINDING_MISMATCH -- correctly. So this is read, not guessed.
+
+    **And it is read only if nobody has edited it since.** The identity lives
+    in the worktree, and the implementer's role grants `write:
+    [worktree_path]`. If a run derived its dispatch from an edited identity,
+    the sealer's check -- committed identity equals dispatch -- would compare
+    the agent's file against itself: always true, worth nothing. That is the
+    same shape as the `expected_remote_head` mistake in findings §21a.
+
+    Raises `IdentityChanged` rather than returning the edited value. The
+    operator can still say `--target-base` explicitly; what is refused is
+    *inferring* it from something the graded party can rewrite.
     """
     from fleet_graph.dd.git import run_git
 
     found = run_git(worktree, "show", f"{revision}:{DEVELOPMENT_PATH}")
     if found.returncode != 0:
         return None
+    _refuse_if_edited_since_bootstrap(worktree, found.stdout)
     try:
         identity = json.loads(found.stdout)
     except ValueError:
         return None
     base = identity.get("target_base_commit")
     return base if isinstance(base, str) and base else None
+
+
+def _refuse_if_edited_since_bootstrap(worktree: Path, current: str) -> None:
+    """Compare the identity at HEAD with the one in the commit that added it.
+
+    The introducing commit is the anchor because an agent cannot change it
+    after the fact: rewriting history would change every descendant hash, and
+    the chain the sealer verifies is built on those hashes.
+    """
+    from fleet_graph.dd.git import run_git
+
+    history = run_git(worktree, "log", "--diff-filter=A", "--format=%H", "--", DEVELOPMENT_PATH)
+    introduced = [line for line in history.stdout.split() if line]
+    if not introduced:
+        return
+    original = run_git(worktree, "show", f"{introduced[-1]}:{DEVELOPMENT_PATH}")
+    if original.returncode != 0:
+        return
+    if original.stdout != current:
+        raise IdentityChanged(
+            f"{DEVELOPMENT_PATH} has been edited since bootstrap ({introduced[-1][:12]}); "
+            "refusing to derive the target base from it. Pass --target-base explicitly "
+            "if this change is intended"
+        )
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -182,6 +222,7 @@ __all__ = [
     "SPEC_PATH",
     "AttemptContext",
     "BootstrapError",
+    "IdentityChanged",
     "build_attempt_context",
     "canonical_bytes",
     "committed_target_base",
