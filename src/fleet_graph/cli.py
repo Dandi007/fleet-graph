@@ -1,6 +1,6 @@
 """Thin CLI entrypoint.
 
-`version`, `hello`, and `line run`. The scheduler daemon lands in P6.
+`version`, `hello`, `line run`, and `dd run`. The scheduler daemon lands in P6.
 """
 
 from __future__ import annotations
@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from typing import Any
 
 from fleet_graph import __version__
 
@@ -70,6 +71,74 @@ def _line_run(args: argparse.Namespace) -> int:
     return 0 if result.get("terminal") in {"done", "blocked", "bounds"} else 1
 
 
+def plugin_binding_config(path: Any) -> dict[str, Any]:
+    """Read a plugin binding, whole config or bare section.
+
+    dd already runs on one of these; being able to point at a copy of it
+    without editing is the difference between wiring this up and transcribing
+    twelve digests by hand.
+    """
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} does not hold an object")
+    if "plugin_producer" in loaded:
+        return loaded
+    return {"plugin_producer": loaded}
+
+
+def _dd_run(args: argparse.Namespace) -> int:
+    """Run one development through the dd pipeline to termination."""
+    import pathlib
+    import subprocess
+
+    from fleet_graph.dd.vendor.plugin_adapter import load_plugin_binding
+    from fleet_graph.graphs.dd_runner import DevelopmentConfig, run_pipeline
+
+    workspace = pathlib.Path(args.workspace).resolve()
+    binding = load_plugin_binding(plugin_binding_config(pathlib.Path(args.plugin_binding)))
+
+    head = args.spec_commit
+    if not head:
+        head = subprocess.run(
+            ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    run_root = pathlib.Path(args.run_root or f"/data/fleet-graph/dd/{args.development}")
+    config = DevelopmentConfig(
+        development_id=args.development,
+        workspace_path=workspace,
+        state_root=pathlib.Path(args.state_root or run_root / "state"),
+        run_root=run_root,
+        remote_url=args.remote_url,
+        remote_ref=args.remote_ref,
+        target_base_commit=args.target_base or head,
+        root_handoff_digest=args.root_digest,
+        plugin_binding=binding,
+        head_commit=head,
+        generation=args.generation,
+        checkpoint_path=args.checkpoint or ":memory:",
+        run_config={"acceptance_commands": [c.split() for c in args.accept]},
+        publish_merge=args.publish_merge,
+    )
+
+    board = None
+    if args.board_card:
+        from fleet_graph.bus.board import Board
+        from fleet_graph.bus.client import BusClient
+
+        board = Board(BusClient())
+
+    result = run_pipeline(config, board=board, gate_card_entity_id=args.board_card or "")
+    json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
+    sys.stdout.write("\n")
+    # `complete` is the only ending that means the pipeline did what it was
+    # asked. A refusal is a legitimate answer, not a success.
+    return 0 if result.get("terminal") == "complete" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fleet-graph")
     parser.add_argument("--version", action="version", version=__version__)
@@ -99,6 +168,39 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--checkpoint", default=None)
     run.add_argument("--run-id", default=None)
     run.set_defaults(func=_line_run)
+
+    dd = subparsers.add_parser("dd", help="run a dev-dispatch development")
+    dd_sub = dd.add_subparsers()
+    dd_run = dd_sub.add_parser("run", help="run one development to termination")
+    dd_run.add_argument("--development", required=True, help="development id")
+    dd_run.add_argument("--workspace", required=True, help="the git worktree to work in")
+    dd_run.add_argument(
+        "--plugin-binding",
+        required=True,
+        help="JSON file holding the plugin_producer section dd already runs on",
+    )
+    dd_run.add_argument("--remote-url", required=True)
+    dd_run.add_argument("--remote-ref", required=True, help="refs/heads/... durable ref")
+    dd_run.add_argument("--root-digest", required=True, help="sha256: of the initial handoff")
+    dd_run.add_argument("--spec-commit", default=None, help="defaults to the workspace HEAD")
+    dd_run.add_argument("--target-base", default=None, help="defaults to the spec commit")
+    dd_run.add_argument("--generation", type=int, default=1)
+    dd_run.add_argument("--run-root", default=None)
+    dd_run.add_argument("--state-root", default=None)
+    dd_run.add_argument("--checkpoint", default=None)
+    dd_run.add_argument(
+        "--accept",
+        action="append",
+        default=[],
+        help="an acceptance command; repeatable",
+    )
+    dd_run.add_argument("--board-card", default=None, help="card entity id; enables the gate")
+    dd_run.add_argument(
+        "--publish-merge",
+        action="store_true",
+        help="push the durable ref. Off by default: it is the one step here that cannot be undone",
+    )
+    dd_run.set_defaults(func=_dd_run)
     return parser
 
 
