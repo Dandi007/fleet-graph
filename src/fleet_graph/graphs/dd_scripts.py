@@ -36,6 +36,7 @@ AUTHOR_EMAIL = "dev-dispatch@example.invalid"
 RUN_CONFIG_PATH = ".dev-dispatch/run-config.json"
 ACCEPTANCE_PATH = ".dd-evidence/acceptance.json"
 MERGE_PATH = ".dev-dispatch/merge/result-g{generation}.json"
+GATE_PATH = ".dev-dispatch/gate/decision-g{generation}.json"
 
 PREPARED = "PREPARED"
 MERGED = "MERGED"
@@ -247,6 +248,7 @@ class MergeStage:
 
 __all__ = [
     "ACCEPTANCE_PATH",
+    "GATE_PATH",
     "MERGED",
     "MERGE_PATH",
     "PREPARED",

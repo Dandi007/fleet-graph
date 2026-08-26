@@ -35,7 +35,7 @@ from fleet_graph.graphs.dd_runner import (
     lifecycle_gate_stage,
     run_pipeline,
 )
-from fleet_graph.graphs.dd_scripts import ACCEPTANCE_PATH, RUN_CONFIG_PATH
+from fleet_graph.graphs.dd_scripts import ACCEPTANCE_PATH, GATE_PATH, RUN_CONFIG_PATH
 
 LIFECYCLE = Lifecycle.load()
 
@@ -419,6 +419,10 @@ class TestWaitingOnAHumanAndComingBack:
 
         assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
         assert result["awaiting"] is None
+        # The verdict outlives the run: an assembled pipeline seals it into
+        # the product tree without the caller asking for it.
+        sealed = json.loads((repo / GATE_PATH.format(generation=1)).read_text(encoding="utf-8"))
+        assert (sealed["decision"], sealed["decided_by"]) == ("APPROVE", "青林")
         # Same key both times: the wait restarted, the question did not.
         assert list(board.asked) == [f"dd-gate:{DEVELOPMENT_ID}:g1"]
 

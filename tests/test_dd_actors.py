@@ -402,6 +402,45 @@ class TestTheHumanGateWaitsRatherThanDecides:
         board = FakeBoard(a_decision("approve"))
         assert make_gate(board).act(GATE, dispatch_for(GATE)).event == SPINE_EVENT
 
+    def test_the_verdict_is_written_into_the_product_tree(self, tmp_path: Path) -> None:
+        """The run ends and its history goes with it. Who let a development
+        through has to survive that."""
+        from fleet_graph.graphs.dd_scripts import GATE_PATH
+
+        board = FakeBoard(a_decision(GATE_APPROVE))
+        gate = BoardGate(
+            board=board,  # type: ignore[arg-type]
+            card_entity_id="card-1",
+            development_id="dev-1",
+            repo=tmp_path,
+        )
+        gate.act(GATE, dispatch_for(GATE, generation=2))
+
+        sealed = json.loads((tmp_path / GATE_PATH.format(generation=2)).read_text(encoding="utf-8"))
+        assert sealed["decision"] == GATE_APPROVE
+        assert sealed["decided_by"] == "青林"
+        # The two ids that make it auditable: the verdict message, and the
+        # question it answered.
+        assert sealed["decision_message_id"] == "msg-decision"
+        assert sealed["question_note_id"] == "note-1"
+        assert sealed["development_id"] == "dev-1"
+
+    def test_a_refused_gate_writes_nothing(self, tmp_path: Path) -> None:
+        """A REJECT is not a gate_decision artifact; the stage produced none."""
+        from fleet_graph.graphs.dd_scripts import GATE_PATH
+
+        board = FakeBoard(a_decision("REJECT"))
+        gate = BoardGate(
+            board=board,  # type: ignore[arg-type]
+            card_entity_id="card-1",
+            development_id="dev-1",
+            repo=tmp_path,
+        )
+        with pytest.raises(StageRefused):
+            gate.act(GATE, dispatch_for(GATE))
+
+        assert not (tmp_path / GATE_PATH.format(generation=1)).exists()
+
     def test_the_gate_has_no_way_to_cast_a_vote(self) -> None:
         """Structural, not behavioural: there is no method to misuse."""
         from fleet_graph.bus import board as board_module
