@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import calendar
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -262,3 +264,60 @@ class TestTheRealProbeTransport:
 
         assert HttpxProbeTransport()._client.timeout.read is not None
         assert HttpxProbeTransport(timeout=5.0)._client.timeout.read == 5.0
+
+
+class TestTheGateExpires:
+    """babysitter v23 made `expires_at` mandatory and an expired flag inert
+    (2026-08-23 ruling). Reading only `path.exists()` looks like the same gate
+    and is not: an expired flag nobody cleaned up holds the fleet down forever.
+    """
+
+    def _scheduler(self, tmp_path: Path, flag: str | None, *, now: float) -> Scheduler:
+        path = tmp_path / "maintenance-stop"
+        if flag is not None:
+            path.write_text(flag, encoding="utf-8")
+        return Scheduler(
+            SchedulerConfig(lines=[], maintenance_stop_path=path),
+            clock=lambda: now,
+        )
+
+    def test_an_unexpired_flag_holds_the_fleet(self, tmp_path: Path) -> None:
+        flag = json.dumps({"reason": "stop", "expires_at": "2026-08-26T05:00:00Z"})
+        assert self._scheduler(tmp_path, flag, now=1787000000.0).maintenance_stop() is True
+
+    def test_an_expired_flag_is_inert(self, tmp_path: Path) -> None:
+        """The real one on this machine expired at 2026-08-26T05:03:37Z while
+        the fleet was still down; `exists()` alone would gate forever."""
+        flag = json.dumps({"reason": "stop", "expires_at": "2026-08-26T05:03:37Z"})
+        # 2026-08-26T12:00:00Z, hours after the deadline.
+        assert self._scheduler(tmp_path, flag, now=1787745600.0).maintenance_stop() is False
+
+    def test_the_deadline_itself_is_already_past(self, tmp_path: Path) -> None:
+        """`>=`, not `>`: a flag is not still holding at the instant it lapses."""
+        flag = json.dumps({"expires_at": "2026-08-26T05:03:37Z"})
+        exactly = calendar.timegm(time.strptime("2026-08-26T05:03:37Z", "%Y-%m-%dT%H:%M:%SZ"))
+        assert self._scheduler(tmp_path, flag, now=float(exactly)).maintenance_stop() is False
+
+    def test_no_flag_at_all_is_not_a_gate(self, tmp_path: Path) -> None:
+        assert self._scheduler(tmp_path, None, now=1787745600.0).maintenance_stop() is False
+
+    def test_an_offset_timestamp_is_understood(self, tmp_path: Path) -> None:
+        """The file on this machine has been written both ways."""
+        flag = json.dumps({"expires_at": "2026-08-27T00:00:00+00:00"})
+        assert self._scheduler(tmp_path, flag, now=1787745600.0).maintenance_stop() is True
+
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "not json at all",
+            "{}",
+            json.dumps({"expires_at": "whenever"}),
+            json.dumps({"expires_at": None}),
+        ],
+    )
+    def test_a_flag_we_cannot_read_keeps_holding(self, tmp_path: Path, flag: str) -> None:
+        """Deliberate divergence from the old gate, which treated a malformed
+        file as absent. A broken gate file is an operator error to stop on,
+        not to silently ignore -- opening the fleet on a parse failure is the
+        one outcome nobody would have asked for."""
+        assert self._scheduler(tmp_path, flag, now=1787745600.0).maintenance_stop() is True
