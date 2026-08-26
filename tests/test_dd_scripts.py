@@ -150,6 +150,25 @@ class TestWorkspaceSealer:
         sealed = WorkspaceSealer(repo=repo).materialize(MERGER, dispatch(), _outcome())
         assert sealed.commit != before
 
+    def test_it_publishes_to_the_durable_ref_when_told(self, repo: Path, tmp_path: Path) -> None:
+        """Not the merge -- the chain. The plugin sealer verifies the remote
+        head equals the commit it was handed, so a stage that seals locally
+        and never publishes severs the link before the next stage runs."""
+        bare = tmp_path / "durable.git"
+        git(repo, "init", "-q", "--bare", str(bare))
+
+        sealed = WorkspaceSealer(
+            repo=repo, remote_url=str(bare), remote_ref="refs/heads/dev-1"
+        ).materialize(CONFIGURE, dispatch(), _outcome())
+
+        listed = git(repo, "ls-remote", str(bare), "refs/heads/dev-1")
+        assert sealed.commit in listed
+
+    def test_without_a_remote_it_only_commits(self, repo: Path) -> None:
+        before = head(repo)
+        sealed = WorkspaceSealer(repo=repo).materialize(CONFIGURE, dispatch(), _outcome())
+        assert sealed.commit != before
+
     def test_a_declared_verdict_survives_into_the_receipt(self, repo: Path) -> None:
         sealed = WorkspaceSealer(repo=repo).materialize(
             CONFIGURE, dispatch(), _outcome({"verdict": "APPROVE"})

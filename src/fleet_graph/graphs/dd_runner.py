@@ -184,7 +184,11 @@ def build_pipeline(
             by_stage={
                 # Everything the plugin does not seal commits its own output.
                 **{
-                    name: WorkspaceSealer(repo=config.workspace_path)
+                    name: WorkspaceSealer(
+                        repo=config.workspace_path,
+                        remote_url=config.remote_url,
+                        remote_ref=config.remote_ref,
+                    )
                     for name in lifecycle.stages
                     if name not in sealer.sealed_stages
                 },

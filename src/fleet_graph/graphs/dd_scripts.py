@@ -60,6 +60,12 @@ class WorkspaceSealer:
     repo: Path
     author_name: str = AUTHOR_NAME
     author_email: str = AUTHOR_EMAIL
+    # The development's own durable ref. Publishing to it is not the merge --
+    # it is what makes the chain a chain: the plugin sealer verifies the
+    # remote head equals the commit it was handed, so a stage that seals
+    # locally and never publishes severs the link before the next stage runs.
+    remote_url: str = ""
+    remote_ref: str = ""
 
     def materialize(self, stage: Any, dispatch: Dispatch, outcome: StageOutcome) -> Sealed:
         stamp = str(dispatch.get("attempt_started_at") or "")
@@ -84,6 +90,8 @@ class WorkspaceSealer:
             env,
         )
         commit = self._git(["rev-parse", "HEAD"], env).strip()
+        if self.remote_url and self.remote_ref:
+            self._git(["push", "--quiet", self.remote_url, f"HEAD:{self.remote_ref}"], env)
 
         receipt: dict[str, Any] = {
             "stage": stage.id,

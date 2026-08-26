@@ -39,12 +39,17 @@ LIFECYCLE = Lifecycle.load()
 
 
 def make_config(repo: Path, tmp_path: Path) -> DevelopmentConfig:
+    # A real bare repo, because the script sealer publishes to the durable ref
+    # and a pipeline that cannot publish is not the one we ship.
+    bare = tmp_path / "durable.git"
+    if not bare.exists():
+        git(repo, "init", "-q", "--bare", str(bare))
     return DevelopmentConfig(
         development_id=DEVELOPMENT_ID,
         workspace_path=repo,
         state_root=tmp_path / "state",
         run_root=tmp_path / "runs",
-        remote_url="https://example.invalid/repo.git",
+        remote_url=str(bare),
         remote_ref="refs/heads/dev-001",
         target_base_commit="b" * 40,
         root_handoff_digest="sha256:" + "c" * 64,
