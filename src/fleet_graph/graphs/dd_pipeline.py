@@ -259,6 +259,10 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             "generation": state.get("generation", 1),
             "attempt": state.get("attempt", 1),
             "attempt_started_at": state.get("attempt_started_at", ""),
+            # How many times this stage has already been retried. It travels
+            # on the dispatch because the run id is derived, and a retry that
+            # derives the same id re-adopts the run it is retrying.
+            "retry": int(state.get("retries", {}).get(stage.id, 0)),
             "input_commit": state.get("head_commit", ""),
             "parent_receipt": dict(state.get("last_receipt") or {}),
             # Chain digests by the stage that sealed them. A later stage that

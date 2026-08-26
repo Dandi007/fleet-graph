@@ -157,6 +157,28 @@ class TestDispatchingAnLlmStage:
 
         assert launcher.launched[0][1] == launcher.launched[1][1]
 
+    def test_a_retry_names_a_different_run(self, tmp_path: Path) -> None:
+        """Otherwise a bounded retry re-adopts the completed run it is retrying
+        and returns the same answer, which makes the bound decorative."""
+        launcher = RecordingLauncher()
+        actor = make_actor(tmp_path, launcher)
+        actor.act(IMPLEMENT, dispatch_for(IMPLEMENT))
+        actor.act(IMPLEMENT, {**dispatch_for(IMPLEMENT), "retry": 1})
+        actor.act(IMPLEMENT, {**dispatch_for(IMPLEMENT), "retry": 2})
+
+        ids = [run_id for _, run_id in launcher.launched]
+        assert len(set(ids)) == 3, ids
+
+    def test_the_same_retry_still_re_adopts(self, tmp_path: Path) -> None:
+        """Re-adoption is the point of a derived id; only a *deliberate* retry
+        should get a new one."""
+        launcher = RecordingLauncher()
+        actor = make_actor(tmp_path, launcher)
+        actor.act(IMPLEMENT, {**dispatch_for(IMPLEMENT), "retry": 1})
+        actor.act(IMPLEMENT, {**dispatch_for(IMPLEMENT), "retry": 1})
+
+        assert launcher.launched[0][1] == launcher.launched[1][1]
+
     def test_a_later_attempt_names_a_different_run(self, tmp_path: Path) -> None:
         launcher = RecordingLauncher()
         actor = make_actor(tmp_path, launcher)

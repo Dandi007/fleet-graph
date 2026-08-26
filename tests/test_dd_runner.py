@@ -245,6 +245,33 @@ class TestTheWholePipelineComposes:
         assert launcher.dispatched.count("implement") == 2
 
 
+class TestABoundedRetryReallyRetries:
+    def test_each_retry_dispatches_a_new_run(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        """The whole point of the bound: a retry that re-adopts the completed
+        run it is retrying gets the same answer and the bound never bites."""
+        run_ids: list[str] = []
+
+        class AlwaysDown(AgentRunStub):
+            def launch(self, spec: Any, run_id: str) -> RunTicket:
+                run_ids.append(run_id)
+                return super().launch(spec, run_id)
+
+            def wait(self, ticket: RunTicket, **kwargs: Any) -> RunStatus:
+                if self.stage == "implement":
+                    return RunStatus("failed", {"exit_code": 1})
+                return super().wait(ticket, **kwargs)
+
+        config = make_config(repo, tmp_path)
+        config.max_retries = 2
+        result = run_pipeline(config, scripts={"human_gate": ScriptStub()}, launcher=AlwaysDown())
+
+        assert result["terminal"] == "failed"
+        assert "2 bounded retries" in result["terminal_reason"]
+        assert len(set(run_ids)) == 3, f"one dispatch per attempt, got {run_ids}"
+
+
 class TestTheDefaultsMakeItRunnable:
     """Assembled means runnable. The gate is the one thing left unfilled."""
 
