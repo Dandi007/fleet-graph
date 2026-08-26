@@ -40,6 +40,10 @@ class LaunchSpec:
     environment: dict[str, str] = field(default_factory=dict)
 
     @property
+    def log_file(self) -> Path:
+        return self.log_path or Path(f"/data/fleet-graph/logs/{self.folder_id}.log")
+
+    @property
     def unit_name(self) -> str:
         """Generation keeps restarts from colliding with a unit systemd is
         still tearing down."""
@@ -47,7 +51,7 @@ class LaunchSpec:
 
     def argv(self) -> list[str]:
         run_root = self.run_root or Path(f"/data/fleet-graph/runs/{self.folder_id}")
-        log_path = self.log_path or Path(f"/data/fleet-graph/logs/{self.folder_id}.log")
+        log_path = self.log_file
 
         argv = [
             "systemd-run",
@@ -62,8 +66,14 @@ class LaunchSpec:
         for key, value in sorted(self.environment.items()):
             argv += [f"--setenv={key}={value}"]
         argv += [
-            f"-p StandardOutput=append:{log_path}",
-            f"-p StandardError=append:{log_path}",
+            # `--property=K=V` as one token, not `-p V` as one token. There is
+            # no shell here: execve hands systemd-run whatever string this is,
+            # and "-p StandardOutput=..." arrives as a single argument whose
+            # value begins with a space -- systemd-run answers
+            # "Unknown assignment:  StandardOutput=...". It looks like a typo
+            # in the property name and is not.
+            f"--property=StandardOutput=append:{log_path}",
+            f"--property=StandardError=append:{log_path}",
             self.executable,
             "line",
             "run",
@@ -94,6 +104,14 @@ class TransientLauncher:
         argv = spec.argv()
         if self.dry_run:
             return LaunchResult(spec.unit_name, False, shlex.join(argv))
+
+        # `append:` does not create the directory; systemd fails the unit and
+        # the line never starts. /data/fleet-graph/logs did not exist on the
+        # first real launch, waiting directly behind the property bug above.
+        try:
+            spec.log_file.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return LaunchResult(spec.unit_name, False, f"cannot create log directory: {exc}")
 
         completed = subprocess.run(argv, capture_output=True, text=True, check=False)
         if completed.returncode != 0:
