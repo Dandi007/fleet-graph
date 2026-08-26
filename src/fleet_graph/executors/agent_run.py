@@ -46,7 +46,15 @@ from typing import Any, Literal
 # breaks re-adopt for runs in flight at the moment of the change.
 RUN_ID_NAMESPACE = uuid.UUID("6f6c3c8e-2b6a-5f21-9c47-1f0f5a4d8e10")
 
-DEFAULT_AGENT_RUN_BIN = "/data/code/self/agent-runtime/bin/agent-run"
+# `-current` is a symlink the deploy flow points at an immutable release
+# snapshot; the bare checkout is a working tree someone edits. The old
+# babysitter overrode the pump's default to exactly this path for every line,
+# and the reason shows up the moment a fleet runs: `agent-runtime` gets
+# `git pull --ff-only`ed as part of normal deployment, and one of the migrated
+# lines (`ronin-model-switch`) has agent-runtime as its subject. Executing the
+# fleet's executor out of a tree that the fleet itself edits is a loop nobody
+# wants to debug at 3am.
+DEFAULT_AGENT_RUN_BIN = "/data/code/self/agent-runtime-current/bin/agent-run"
 DEFAULT_STATE_ROOT = "/data/fleet-graph/runs"
 
 RunState = Literal["running", "succeeded", "failed", "lost"]

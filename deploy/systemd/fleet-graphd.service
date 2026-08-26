@@ -29,7 +29,11 @@ Environment=FLEET_GRAPH_GATEWAY_BASE_URL=http://127.0.0.1:15722
 # every line died with `env: 'bun': No such file or directory` -- the old
 # babysitter never hit this because it ran from an interactive shell. The
 # fleet's PATH is defined here, once; lines inherit it via the launcher.
-Environment=PATH=%h/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Mirrors the old babysitter's FULLPATH. `.bun/bin` carries agent-run's
+# interpreter; `.opencode/bin` (and its `.local/bin` symlink) carry the
+# `opencode` binary every migrated seat is named after; `.cargo/bin` was in
+# the old list and is kept rather than re-derived.
+Environment=PATH=%h/.bun/bin:%h/.local/bin:%h/.opencode/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # `EnvironmentFile=-...`: the `-` goes *after* the `=`. Written as
 # `-EnvironmentFile=`, systemd logs "Unknown key" and silently drops the whole
 # line -- the unit still starts, still looks healthy, and the daemon simply
