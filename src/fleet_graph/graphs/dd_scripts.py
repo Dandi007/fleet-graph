@@ -144,9 +144,22 @@ class AcceptanceStage:
     happened, the answer was no. The contract declares no failure edge out of
     acceptance, and inventing one to express "the tests failed" would be
     reading meaning the contract does not carry.
+
+    **The operator's declaration is the authority, not the file in the
+    worktree.** The implementer's role grants it `write: [worktree_path]`, so
+    it can rewrite `run-config.json` -- the very commands that decide whether
+    its work passed. Measured: the same repo with a failing test went from
+    refused to `passed: true` once the acceptance command was replaced with
+    `true`. The thing being graded must not be able to edit the exam.
+
+    The committed file is still read, because a disagreement between it and
+    the declaration is worth refusing loudly rather than quietly overriding.
     """
 
     repo: Path
+    # What the operator asked for. Compared against the worktree's copy; the
+    # comparison is what makes tampering visible.
+    declared: list[list[str]] = field(default_factory=list)
     timeout_seconds: int = 1800
 
     def commands(self) -> list[list[str]]:
@@ -154,8 +167,16 @@ class AcceptanceStage:
         if not path.is_file():
             raise StageRefused(f"{RUN_CONFIG_PATH} is missing; configure did not run")
         config = json.loads(path.read_text(encoding="utf-8"))
-        declared = config.get("acceptance_commands") or []
-        return [list(command) for command in declared if command]
+        in_tree = [
+            list(command) for command in (config.get("acceptance_commands") or []) if command
+        ]
+        wanted = [list(command) for command in self.declared if command]
+        if in_tree != wanted:
+            raise StageRefused(
+                f"{RUN_CONFIG_PATH} declares {in_tree!r} but this run was configured with "
+                f"{wanted!r}; refusing to accept against commands nobody declared"
+            )
+        return wanted
 
     def act(self, stage: Any, dispatch: Dispatch) -> StageOutcome:
         results = []
