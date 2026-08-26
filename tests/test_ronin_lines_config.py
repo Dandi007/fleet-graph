@@ -14,9 +14,17 @@ from fleet_graph.scheduler.daemon import SchedulerConfig
 CONFIG = Path(__file__).resolve().parent.parent / "config" / "ronin-lines.json"
 
 # The lines babysitter v28 carried that were still live when the fleet stopped
-# (last terminal=killed at the maintenance-stop moment), minus the three whose
-# subject is the engine that P4 retired. See wf-3f30cd findings §32.
+# (last terminal=killed at the maintenance-stop moment), minus the two whose
+# subject really is the engine P4 retired. See wf-3f30cd findings §32/§33.
+#
+# wf-287e81 was excluded on a first pass and put back: its short title reads
+# "loop-engine-fallback-and-goal-to-spec-plugin", but its goal.md is a
+# Goal-to-Spec queue closeout whose work lives in repo-spec-forge-plugin and
+# merger-plugin. dev-dispatch was only the vehicle, and fleet-graph is now
+# that vehicle. Classifying by title instead of by goal is the same
+# "name match is not semantics" trap this repo keeps hitting.
 MIGRATED = {
+    "wf-287e81",
     "wf-5664e5",
     "wf-386b2f",
     "wf-7bc4d1",
