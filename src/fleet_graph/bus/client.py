@@ -144,8 +144,20 @@ class BusClient:
             deduplicated=bool(result.get("deduplicated", False)),
         )
 
-    def messages(self, channel_id: str, *, limit: int = 100) -> tuple[list[dict[str, Any]], int]:
-        result = self._call("GET", f"/v1/channels/{channel_id}/messages?limit={limit}")
+    def messages(
+        self, channel_id: str, *, limit: int = 100, after_seq: int = 0
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Messages after `after_seq` in channel order, plus the head seq.
+
+        `after_seq` exists because the bus pages *ascending*: on a long-lived
+        channel the plain call returns the oldest messages, and a reader that
+        wants the newest must first learn head_seq (limit=1 is enough) and then
+        re-read from just below it.
+        """
+        query = f"limit={limit}"
+        if after_seq:
+            query += f"&after_seq={after_seq}"
+        result = self._call("GET", f"/v1/channels/{channel_id}/messages?{query}")
         return result.get("messages", []), int(result.get("head_seq", 0))
 
     def refs_to(self, entity_id: str) -> list[dict[str, Any]]:

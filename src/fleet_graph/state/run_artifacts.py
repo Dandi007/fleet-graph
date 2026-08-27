@@ -54,8 +54,37 @@ HEARTBEAT_FIELDS = frozenset(
 )
 
 TERMINAL_FIELDS = frozenset(
-    {"run_id", "folder_id", "terminal", "pump_fault", "rounds", "reason", "at", "pid"}
+    {
+        "run_id",
+        "folder_id",
+        "terminal",
+        "pump_fault",
+        "rounds",
+        "reason",
+        "at",
+        "pid",
+        "waiting_on",
+        "waiting_on_declared",
+    }
 )
+
+#: The machine-readable values of `waiting_on`. Anything else the coordinator
+#: declares is preserved verbatim in `waiting_on_declared` and *normalised* to
+#: "none" -- parking is an optimisation, not a judgement, so an unknown value
+#: must never fault a line (R0c ruling).
+WAITING_ON_VALUES = frozenset({"decision", "external", "none"})
+WAITING_ON_DEFAULT = "none"
+
+
+def normalize_waiting_on(raw: Any) -> tuple[str, str | None]:
+    """(normalised, declared). Absent -> ("none", None); unknown -> ("none", raw)."""
+    if raw is None:
+        return WAITING_ON_DEFAULT, None
+    declared = str(raw)
+    value = declared.strip().lower()
+    if value in WAITING_ON_VALUES:
+        return value, declared
+    return WAITING_ON_DEFAULT, declared
 
 
 def iso(ts: float) -> str:
@@ -170,6 +199,8 @@ class RunArtifacts:
         rounds: int,
         reason: str | None = None,
         pump_fault: bool = False,
+        waiting_on: str = WAITING_ON_DEFAULT,
+        waiting_on_declared: str | None = None,
     ) -> Path:
         """Record the terminal event locally. Call this *before* any publish.
 
@@ -177,6 +208,12 @@ class RunArtifacts:
         heartbeat degrades observability; losing the terminal record means a
         line that ended looks identical to one that disappeared, and that is
         worth failing loudly over.
+
+        `waiting_on` is the machine field the scheduler's parking reads: for a
+        `blocked` terminal, "decision" means only a human ruling can unblock
+        this line. Always written (default "none") so the field set stays
+        exact; `waiting_on_declared` preserves whatever raw value the
+        coordinator actually declared, unknown values included.
         """
         event = {
             "run_id": self.run_id,
@@ -187,6 +224,8 @@ class RunArtifacts:
             "reason": reason,
             "at": iso(self._clock()),
             "pid": self._pid,
+            "waiting_on": waiting_on,
+            "waiting_on_declared": waiting_on_declared,
         }
         with self._terminal_path.open("w", encoding="utf-8") as handle:
             json.dump(event, handle, ensure_ascii=False, indent=2)
@@ -220,8 +259,11 @@ __all__ = [
     "HEARTBEAT_INTERVAL_SECONDS",
     "ISO_FORMAT",
     "TERMINAL_FIELDS",
+    "WAITING_ON_DEFAULT",
+    "WAITING_ON_VALUES",
     "RunArtifacts",
     "iso",
+    "normalize_waiting_on",
     "signal_terminal_name",
     "write_json_durable",
 ]

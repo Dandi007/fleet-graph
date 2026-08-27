@@ -67,13 +67,22 @@ class FakeArtifacts:
         return True
 
     def write_terminal(
-        self, *, terminal: str, rounds: int, reason: str | None = None, pump_fault: bool = False
+        self,
+        *,
+        terminal: str,
+        rounds: int,
+        reason: str | None = None,
+        pump_fault: bool = False,
+        waiting_on: str = "none",
+        waiting_on_declared: str | None = None,
     ) -> str:
         self.terminal = {
             "terminal": terminal,
             "rounds": rounds,
             "reason": reason,
             "pump_fault": pump_fault,
+            "waiting_on": waiting_on,
+            "waiting_on_declared": waiting_on_declared,
         }
         return "terminal.json"
 
@@ -258,3 +267,58 @@ class TestNoSemanticInterpretation:
         # worker's text contained the word.
         assert artifacts.terminal["reason"] == "coordinator said so"
         assert len(artifacts.rounds) == 2
+
+
+class TestWaitingOn:
+    """The one machine field a blocked verdict carries beyond the verdict.
+
+    Parking (scheduler R0c) keys on it, so the transport must be exact: known
+    values pass through, unknown values normalise to "none" and are preserved
+    verbatim, and absence is not an error. Never a fault -- parking is an
+    optimisation, not a judgement.
+    """
+
+    def test_blocked_with_decision_reaches_the_terminal(self) -> None:
+        artifacts, _ = run_line(
+            [{"verdict": "blocked", "reason": "needs a human", "waiting_on": "decision"}]
+        )
+        assert artifacts.terminal["terminal"] == TERMINAL_BLOCKED
+        assert artifacts.terminal["waiting_on"] == "decision"
+        assert artifacts.terminal["waiting_on_declared"] == "decision"
+
+    def test_absent_waiting_on_defaults_to_none(self) -> None:
+        artifacts, _ = run_line([{"verdict": "blocked", "reason": "stuck"}])
+        assert artifacts.terminal["waiting_on"] == "none"
+        assert artifacts.terminal["waiting_on_declared"] is None
+
+    def test_an_unknown_value_is_none_but_recorded_verbatim(self) -> None:
+        """A coordinator inventing a value must not fault the line."""
+        artifacts, _ = run_line(
+            [{"verdict": "blocked", "reason": "stuck", "waiting_on": "the_stars_to_align"}]
+        )
+        assert artifacts.terminal["terminal"] == TERMINAL_BLOCKED
+        assert artifacts.terminal["waiting_on"] == "none"
+        assert artifacts.terminal["waiting_on_declared"] == "the_stars_to_align"
+
+    def test_external_passes_through(self) -> None:
+        artifacts, _ = run_line(
+            [{"verdict": "blocked", "reason": "waiting on a service", "waiting_on": "external"}]
+        )
+        assert artifacts.terminal["waiting_on"] == "external"
+
+    def test_done_and_bounds_terminals_stay_none(self) -> None:
+        artifacts, _ = run_line([{"verdict": "done", "reason": "finished"}])
+        assert artifacts.terminal["waiting_on"] == "none"
+
+    def test_streak_blocked_is_not_waiting_on_a_decision(self) -> None:
+        """A line blocked by its own noop breaker is stalled, not waiting on a
+        human; parking it would hide a line that needs attention, not a ruling."""
+        script = [
+            {"verdict": "continue", "next_prompt": "same thing"},
+            {"verdict": "continue", "next_prompt": "same thing"},
+            {"verdict": "continue", "next_prompt": "same thing"},
+            {"verdict": "continue", "next_prompt": "same thing"},
+        ]
+        artifacts, _ = run_line(script, bounds=LineBounds(noop_limit=1))
+        assert artifacts.terminal["terminal"] == TERMINAL_BLOCKED
+        assert artifacts.terminal["waiting_on"] == "none"

@@ -28,6 +28,7 @@ from typing import Any, Protocol, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from fleet_graph.graphs.guards import LineGuards, PromptVerdict
+from fleet_graph.state.run_artifacts import WAITING_ON_DEFAULT, normalize_waiting_on
 
 COORDINATOR_ROLE = "goal_coordinator"
 DISPATCHER_LABEL = "fleet-graph"
@@ -55,6 +56,10 @@ class Verdict(TypedDict, total=False):
     next_prompt: str
     reason: str
     no_progress: bool
+    #: Machine field for a blocked verdict: "decision" | "external" | "none".
+    #: Optional; absent means "none"; an unknown value is treated as "none"
+    #: and recorded verbatim -- never a fault. Parking is an optimisation.
+    waiting_on: str
 
 
 class LineState(TypedDict, total=False):
@@ -63,6 +68,9 @@ class LineState(TypedDict, total=False):
     last_turn_status: dict[str, Any]
     terminal: str
     terminal_reason: str
+    #: Set only on a blocked terminal from the coordinator's declared verdict.
+    waiting_on: str
+    waiting_on_declared: str
     pump_fault: bool
     rounds_recorded: int
     # Set only between the coordinator accepting a prompt and the worker
@@ -91,7 +99,14 @@ class ArtifactsPort(Protocol):
     def heartbeat(self, round_no: int, phase: str, *, force: bool = False) -> bool: ...
     def append_round(self, line: dict[str, Any]) -> bool: ...
     def write_terminal(
-        self, *, terminal: str, rounds: int, reason: str | None = ..., pump_fault: bool = ...
+        self,
+        *,
+        terminal: str,
+        rounds: int,
+        reason: str | None = ...,
+        pump_fault: bool = ...,
+        waiting_on: str = ...,
+        waiting_on_declared: str | None = ...,
     ) -> Any: ...
 
 
@@ -163,10 +178,20 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
                 "terminal_reason": str(result.get("reason", "")),
             }
         if verdict == TERMINAL_BLOCKED:
-            return {
+            # The one machine field read off a blocked verdict beyond the
+            # verdict itself. Unknown values normalise to "none" and are
+            # preserved verbatim -- a coordinator inventing a new value must
+            # not fault the line, because parking is an optimisation the
+            # scheduler may skip, never a judgement on the work.
+            waiting_on, declared = normalize_waiting_on(result.get("waiting_on"))
+            update: LineState = {
                 "terminal": TERMINAL_BLOCKED,
                 "terminal_reason": str(result.get("reason", "")),
+                "waiting_on": waiting_on,
             }
+            if declared is not None:
+                update["waiting_on_declared"] = declared
+            return update
         if verdict != "continue":
             # An unrecognised verdict is a coordinator fault, not something to
             # interpret. Guessing here would be exactly the INV-3 violation
@@ -262,6 +287,8 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             rounds=state.get("rounds_recorded", 0),
             reason=state.get("terminal_reason") or None,
             pump_fault=bool(state.get("pump_fault", False)),
+            waiting_on=state.get("waiting_on", WAITING_ON_DEFAULT),
+            waiting_on_declared=state.get("waiting_on_declared"),
         )
         return {}
 

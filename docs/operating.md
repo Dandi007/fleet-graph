@@ -74,13 +74,58 @@ agent 写的散文，读它就成了替它判活干得对不对），但你该�
 
 要立刻让它再试一次：删掉那个计数文件。要让它彻底别跑：改名册 `enabled: false`。
 
+## 等人的线会停牌（R0c）
+
+退避解决的是「blocker 可能自己好」的线。还有一类线好不了：coordinator 判了
+`blocked` 且声明 `waiting_on: "decision"`——**只有人的裁决能解除**。对这种线，
+按退避节奏反复点火只是在按全额 coordinator 成本反复推导出同一个 blockage。
+所以调度器把它**停牌**（parked）：不点火，直到出现机械可判定的唤醒事实。
+
+```json
+{"folder_id": "wf-1", "ignited": false, "refusal": "parked_awaiting_decision",
+ "parked": true, "blocker": "等监督面拍板（L2-5）"}
+```
+
+停牌成立的条件（全部机械事实，不读散文）：
+
+- 最近**已记账**的 terminal 是 `blocked` 且 `waiting_on: "decision"`
+  （字段由线自己的 finalise 写进 `terminal.json`；缺省和未知值都按 `none`
+  处理——只有明确声明 decision 才停牌）；
+- 停牌时拍下快照：`parked_at`、goal.md 的 `content_revision`、对应 `run_id`，
+  存进同一个计数文件（`<run_root>/.scheduler/<folder_id>.json`），**发布重启
+  不丢**。
+
+三个唤醒源，任何一个成立就清快照、回到正常判断顺序（该冷却冷却）：
+
+1. **inbox 来信**：线的 `agent:<alias>` 频道里出现了**晚于 blocked terminal**
+   的消息（更早的那些，blocked 那一轮已经读过了）。无 alias 的线没有这个源。
+2. **goal.md 变了**：work-folder MCP `fs_stat` 的 `content_revision` 与停牌快照
+   不同。改 goal（走治理写门）就是叫醒它的正规方式。
+3. **逃生口**：手动把计数文件里的 `parked_run_id` / `parked_at` /
+   `parked_goal_revision` 三个字段清成 null——下一个 tick 立即可点火，且同一个
+   terminal 不会被重新停牌（`park_considered_run_id` 留着就是干这个的）。
+   删整个计数文件也放行（顺带清退避计数）。
+
+三件要知道的事：
+
+- **停牌是省钱优化，不是判决**。唤醒探测失败（bus 不通、MCP 超时、时间戳解析
+  不了）一律 **fail-open**：当作没有停牌条件，回到普通退避。坏掉的探针最多费
+  钱，不能把线锁死。
+- **每个 terminal 至多停牌一次**。唤醒或放行之后同一个 run 不会再停；如果重新
+  点火后又 blocked 在同一个裁决上，新 terminal 会自己再停一次。
+- **停牌那个 tick 会尽力向 board 发一条 question note**（带幂等键）。已知契约
+  缺口：`work.note.v1` 要求 ref 指向一个**已存在**的 board entity，而 goal 线
+  没有卡——发不出去时降级为仅日志可见（`board_question` 字段记录结果），升报面
+  的完整化归 R4。
+
 ## 判断顺序
 
 `decide()` 里名册排在最前：一条没进名册的线，refusal 是 `line_disabled` 而不是
 `maintenance_stop`——否则运维会被支使去清一张根本不是元凶的 flag。
 
-反过来，`enabled: true` 不等于放行：紧急停机、已在跑、terminal=done、冷却/退避、
-总熔断、网关探针红，六道闸照常。
+反过来，`enabled: true` 不等于放行：紧急停机、已在跑、terminal=done、停牌、
+冷却/退避、总熔断、网关探针红，七道闸照常。停牌排在退避之前：一条等裁决的线
+显示的是 `parked_awaiting_decision`，不是 `no_progress`。
 
 ## 现场怎么看
 
@@ -90,4 +135,4 @@ journalctl --user -u fleet-graphd -f          # 每 60s 一批，每条线一行
 ```
 
 每行形如 `{"folder_id": ..., "ignited": false, "refusal": "line_disabled", ...}`。
-`refusal` 就是上面六道闸加名册的名字，一一对应。
+`refusal` 就是上面七道闸加名册的名字，一一对应。

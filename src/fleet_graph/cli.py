@@ -218,13 +218,29 @@ def _scheduler_run(args: argparse.Namespace) -> int:
     from fleet_graph.scheduler.daemon import Scheduler, SchedulerConfig
     from fleet_graph.scheduler.launcher import TransientLauncher
     from fleet_graph.scheduler.probe import GatewayProber, HttpxProbeTransport
+    from fleet_graph.scheduler.wake import LiveWakeSignals
 
     config = SchedulerConfig.from_json(pathlib.Path(args.config))
+
+    # The board question on parking is best-effort: a scheduler without a bus
+    # credential still schedules, it just cannot escalate. Constructing the
+    # client is what needs the token, so that is what the try guards.
+    board = None
+    try:
+        from fleet_graph.bus.board import Board
+        from fleet_graph.bus.client import BusClient
+
+        board = Board(BusClient())
+    except Exception:  # escalation is optional, scheduling is not
+        board = None
+
     scheduler = Scheduler(
         config,
         prober=None if args.no_probe else GatewayProber(HttpxProbeTransport()),
         launcher=TransientLauncher(dry_run=args.dry_run),
         observe=lambda result: print(json.dumps(result.as_dict(), ensure_ascii=False), flush=True),
+        wake=LiveWakeSignals(),
+        board=board,
     )
 
     if args.once:

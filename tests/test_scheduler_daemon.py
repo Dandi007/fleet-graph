@@ -208,21 +208,31 @@ class TestItReadsOnlyWhatItNeeds:
         """INV-3, restated where the real line is.
 
         This started as "only `terminal` is read". The stall guard needs
-        `rounds` and `run_id` too, and widening the assertion to admit them is
-        not a loosening: all three are numbers and ids this engine's own pump
-        writes. What must stay out is `reason` -- prose an agent wrote. A
-        scheduler that keyed on that would be judging the work, and would also
-        be wrong: the canary blocked twice on the same missing data source and
-        reworded it to a bigram similarity of 0.28.
+        `rounds` and `run_id` too; parking added `waiting_on` (a normalised
+        enum the engine's own finalise writes -- never free text) and `at` (a
+        timestamp). Widening the assertion to admit those is not a loosening:
+        all five are counts, ids, enums and stamps this engine's own pump
+        writes. What must stay out of *decisions* is `reason` -- prose an
+        agent wrote. A scheduler that keyed on that would be judging the work,
+        and would also be wrong: the canary blocked twice on the same missing
+        data source and reworded it to a bigram similarity of 0.28.
+
+        `reason` is granted exactly one reader: `blocker_summary`, whose
+        output flows into the observe log and the board question -- a human's
+        eyes -- and never into `decide`. The second assertion pins that the
+        one reader is the only one.
         """
+        import inspect
         import re
 
         from fleet_graph.scheduler import daemon
 
         source = Path(daemon.__file__).read_text(encoding="utf-8")
         reads = set(re.findall(r'record\.get\("([a-z_]+)"\)', source))
-        assert reads <= {"terminal", "rounds", "run_id"}, reads
-        assert "reason" not in reads
+        assert reads - {"reason"} <= {"terminal", "rounds", "run_id", "waiting_on", "at"}, reads
+
+        display_only = inspect.getsource(daemon.Scheduler.blocker_summary)
+        assert source.count('record.get("reason")') == display_only.count('record.get("reason")')
 
 
 def write_terminal_record(
