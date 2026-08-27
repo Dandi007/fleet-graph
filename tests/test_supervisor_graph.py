@@ -633,6 +633,133 @@ class TestPreauthReleaseEndToEnd:
         assert Path(result["receipt_path"]).exists()
 
 
+def dd_record_root(tmp_path: Path, development_id: str = "dev-abc", **overrides: Any) -> Path:
+    """A dd admission root holding one record.json whose repo_path exists."""
+    repo = tmp_path / "clone"
+    repo.mkdir(exist_ok=True)
+    dd_root = tmp_path / "dd"
+    dev_dir = dd_root / development_id
+    dev_dir.mkdir(parents=True, exist_ok=True)
+    record: dict[str, Any] = {"development_id": development_id, "repo_path": str(repo)}
+    record.update(overrides)
+    (dev_dir / "record.json").write_text(json.dumps(record), encoding="utf-8")
+    return dd_root
+
+
+class TestDevelopmentResolution:
+    """E1 without --repo: card head development_id -> dd record -> repo_path.
+
+    The mechanical chain only -- the dev id lives structurally in the
+    `work.card.v1` head payload (the dd engine wrote it there), never parsed
+    out of the question note's prose. Every failed step is a recorded gap and
+    a needs_human, not an error."""
+
+    def test_repo_resolves_from_card_head_and_admission_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fleet_graph.supervise.audit import GraphEngineSource
+
+        monkeypatch.setenv("FAKE_AUDIT_BEHAVIOR", "hold")
+        dd_root = dd_record_root(tmp_path)
+        seen: dict[str, Any] = {}
+
+        def fake_audit(development_id: str, *, engine: Any, repo: Path) -> Any:
+            seen["development_id"] = development_id
+            seen["engine"] = engine
+            seen["repo"] = repo
+            return green_dev_report()
+
+        monkeypatch.setattr("fleet_graph.graphs.supervisor.audit_development", fake_audit)
+        bus = board_with_gate(None)
+        result = run_supervisor(config_for(tmp_path, dict(GATE_EVENT), bus=bus, dd_root=dd_root))
+
+        assert seen["development_id"] == "dev-abc"
+        assert seen["repo"] == tmp_path / "clone"
+        # Record on disk -> the in-process engine, same rule as `supervise audit`.
+        assert isinstance(seen["engine"], GraphEngineSource)
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["report"]["kind"] == "development"
+        assert receipt["report"]["assertions"]
+
+    def test_card_head_without_development_id_gaps_to_needs_human(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FAKE_AUDIT_BEHAVIOR", "hold")
+        bus = board_with_gate(None)
+        for note in bus.notes:
+            if note.get("kind") == "work.card.v1":
+                note["payload"] = {"status": "gate"}  # no development_id, no wf-
+        result = run_supervisor(
+            config_for(tmp_path, dict(GATE_EVENT), bus=bus, dd_root=tmp_path / "dd")
+        )
+
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["classification"] == CLASSIFY_NEEDS_HUMAN
+        assert receipt["report"]["kind"] == "unresolved"
+        assert any("未解析到 wf- 目标也无可审 development" in g for g in receipt["report"]["gaps"])
+
+    def test_missing_record_json_gaps_to_needs_human(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FAKE_AUDIT_BEHAVIOR", "hold")
+        bus = board_with_gate(None)  # card head does carry development_id dev-abc
+        result = run_supervisor(
+            config_for(tmp_path, dict(GATE_EVENT), bus=bus, dd_root=tmp_path / "dd-empty")
+        )
+
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["classification"] == CLASSIFY_NEEDS_HUMAN
+        assert receipt["report"]["kind"] == "unresolved"
+        gaps = receipt["report"]["gaps"]
+        assert any("dd record 不可读" in g for g in gaps)
+        assert any("dev-abc 已解析但无可用 repo" in g for g in gaps)
+
+    def test_record_without_repo_path_gaps_to_needs_human(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FAKE_AUDIT_BEHAVIOR", "hold")
+        dd_root = dd_record_root(tmp_path, repo_path="")
+        bus = board_with_gate(None)
+        result = run_supervisor(config_for(tmp_path, dict(GATE_EVENT), bus=bus, dd_root=dd_root))
+
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["classification"] == CLASSIFY_NEEDS_HUMAN
+        assert any("缺 repo_path 字段" in g for g in receipt["report"]["gaps"])
+
+    def test_e1_gate_end_to_end_reaches_the_fourth_gate_without_repo_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The production gap this line fixes: an E1 over a dd gate, no --repo
+        configured, must still produce a development audit with assertions --
+        and with a valid preauth the fourth gate is finally reachable."""
+        monkeypatch.setenv("FAKE_AUDIT_BEHAVIOR", "hold")
+        monkeypatch.setattr(
+            "fleet_graph.graphs.supervisor.audit_development",
+            lambda development_id, *, engine, repo: green_dev_report(),
+        )
+        dd_root = dd_record_root(tmp_path)
+        bus = board_with_gate(valid_preauth_payload())
+        decision_client = FakeBus()
+        result = run_supervisor(
+            config_for(
+                tmp_path,
+                dict(GATE_EVENT),
+                publish_notes=True,
+                bus=bus,
+                dd_root=dd_root,
+                decision_client=decision_client,
+            )
+        )
+
+        assert result["classification"] == CLASSIFY_PREAUTH_RELEASE
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["report"]["kind"] == "development"
+        assert receipt["report"]["assertions"]
+        [decision] = decision_client.published
+        assert decision["payload"]["decision"] == "APPROVE"
+        assert decision["payload"]["target_ref"] == "refs/heads/dd/dev-abc"
+
+
 class TestIdempotency:
     def test_finished_event_is_a_no_op_on_rerun(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

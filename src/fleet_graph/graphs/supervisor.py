@@ -45,6 +45,7 @@ from langgraph.graph import END, START, StateGraph
 
 from fleet_graph.bus.board import DECISION_KIND_V2, NOTE_KIND, WORK_NOTES, Board, GateTicket
 from fleet_graph.bus.client import DEFAULT_BUS_URL, BusClient
+from fleet_graph.dd.control_plane import DEFAULT_DD_ROOT, RECORD_FILE
 from fleet_graph.executors.agent_run import (
     AgentRunLauncher,
     AgentRunSpec,
@@ -57,6 +58,7 @@ from fleet_graph.supervise.audit import (
     DEFAULT_ENGINE_URL,
     Assertion,
     AuditReport,
+    GraphEngineSource,
     OldEngineClient,
     audit_development,
     audit_goal_line,
@@ -183,10 +185,15 @@ class SupervisorDeps:
     audit_timeout_seconds: int = 900
     audit_poll_interval: float = 2.0
     engine_url: str = DEFAULT_ENGINE_URL
-    #: Local clone for development audits (E1 over a dd gate). None means a
-    #: development target records the gap and goes to needs_human -- facts,
-    #: not guesses.
+    #: Explicit local clone for development audits (E1 over a dd gate). None
+    #: falls back to the dd admission record's `repo_path` (see dd_root); a
+    #: development that resolves neither records the gap and goes to
+    #: needs_human -- facts, not guesses.
     repo: Path | None = None
+    #: dd admission records root (server-side state; agents have no write face
+    #: on it). The E1 resolution chain is card head `development_id` ->
+    #: `<dd_root>/<id>/record.json` -> `repo_path`.
+    dd_root: Path = DEFAULT_DD_ROOT
     publish_notes: bool = True
     #: Where the decision publisher talks to. Deliberately a plain URL, not a
     #: client: the decision credential is read inside the act node's call,
@@ -226,6 +233,35 @@ def _development_id(event: SupervisorEvent, intake: dict[str, Any]) -> str:
         return explicit
     head_payload = intake.get("card_head_payload") or {}
     return str(head_payload.get("development_id") or "")
+
+
+def resolve_development_repo(development_id: str, dd_root: Path) -> tuple[Path | None, list[str]]:
+    """dd admission record -> the development's repo, or the gaps that say why not.
+
+    The record (`<dd_root>/<development_id>/record.json`) is server-side state
+    the dd control plane wrote at admission -- agents have no write face on it,
+    so reading `repo_path` out of it is mechanical resolution, never prose
+    extraction from a note. Every failure step is a recorded fact, not an
+    exception: the caller degrades to needs_human on a None repo.
+    """
+    record_path = dd_root / development_id / RECORD_FILE
+    try:
+        raw = record_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, [f"dd record 不可读（{record_path}）: {type(exc).__name__}: {exc}"[:300]]
+    try:
+        record = json.loads(raw)
+    except ValueError as exc:
+        return None, [f"dd record 非法 JSON（{record_path}）: {exc}"[:300]]
+    if not isinstance(record, dict):
+        return None, [f"dd record 顶层不是 JSON 对象（{record_path}）"]
+    repo_path = str(record.get("repo_path") or "")
+    if not repo_path:
+        return None, [f"dd record 缺 repo_path 字段（{record_path}）"]
+    repo = Path(repo_path)
+    if not repo.is_dir():
+        return None, [f"dd record repo_path 不是可用目录: {repo_path}"[:300]]
+    return repo, []
 
 
 def reproducible_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
@@ -462,12 +498,29 @@ def build_supervisor_graph(deps: SupervisorDeps) -> StateGraph:
             return {"report": report.as_dict()}
 
         development_id = _development_id(event, intake_facts)
-        if development_id and deps.repo is not None:
+        repo = deps.repo
+        resolution_gaps: list[str] = []
+        if development_id and repo is None:
+            # The mechanical chain: card head development_id (structured, from
+            # the dd engine's own card revisions) -> dd admission record ->
+            # repo_path. Nothing is ever parsed out of note prose.
+            repo, resolution_gaps = resolve_development_repo(development_id, deps.dd_root)
+        if development_id and repo is not None:
+            # Engine selection is a fact on disk, not a flag (same rule as
+            # cli._supervise_audit): a development the new control plane
+            # admitted has a record under dd_root and its evidence assembles
+            # in-process; anything else is legacy, old controller, GETs only.
+            if (deps.dd_root / development_id / RECORD_FILE).is_file():
+                from fleet_graph.dd.control_plane import DdControlPlane
+
+                engine: Any = GraphEngineSource(DdControlPlane(root=deps.dd_root))
+            else:
+                engine = OldEngineClient(deps.engine_url)
             try:
                 report = audit_development(
                     development_id,
-                    engine=OldEngineClient(deps.engine_url),
-                    repo=deps.repo,
+                    engine=engine,
+                    repo=repo,
                 )
             except Exception as exc:
                 report = AuditReport(target=development_id, kind="development")
@@ -475,9 +528,15 @@ def build_supervisor_graph(deps: SupervisorDeps) -> StateGraph:
             return {"report": report.as_dict()}
 
         report = AuditReport(target=event.key, kind="unresolved")
+        report.gaps.extend(resolution_gaps)
         report.gaps.append(
             "事件既未解析到 wf- 目标也无可审 development"
-            + ("（development 审计需 --repo，未配置）" if development_id else "")
+            + (
+                f"（development {development_id} 已解析但无可用 repo："
+                "--repo 未配置，dd record 也未给出 repo_path——缘由见前一条 gap）"
+                if development_id
+                else ""
+            )
             + "——证据不全，不猜，径直升报"
         )
         return {"report": report.as_dict()}
@@ -765,6 +824,7 @@ class SupervisorRunConfig:
     audit_poll_interval: float = 2.0
     engine_url: str = DEFAULT_ENGINE_URL
     repo: Path | None = None
+    dd_root: Path = DEFAULT_DD_ROOT
     publish_notes: bool = True
     bus: BusClient | None = None
     bus_url: str = DEFAULT_BUS_URL
@@ -790,6 +850,7 @@ def build_supervisor(config: SupervisorRunConfig) -> tuple[Any, SupervisorDeps, 
         audit_poll_interval=config.audit_poll_interval,
         engine_url=config.engine_url,
         repo=config.repo,
+        dd_root=config.dd_root,
         publish_notes=config.publish_notes,
         bus_url=config.bus_url,
         decision_client=config.decision_client,
@@ -858,6 +919,7 @@ __all__ = [
     "git_target_ref",
     "render_supervisor_note",
     "reproducible_failures",
+    "resolve_development_repo",
     "run_supervisor",
     "validate_audit_verdict",
 ]
