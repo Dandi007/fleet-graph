@@ -35,14 +35,170 @@ Two contracts the tools themselves enforce:
 from __future__ import annotations
 
 import json
+import logging
+import os
 import socket
+import threading
 from pathlib import Path
 from typing import Any
 
-from fleet_graph.dd.control_plane import ControlPlaneError, DdControlPlane
+from fleet_graph.dd.control_plane import (
+    STATE_AWAITING_GATE,
+    ControlPlaneError,
+    DdControlPlane,
+)
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5610
+
+#: R4-3 收尾：决议落板自动 resume 巡检的开关与间隔（默认开、60s 级）。
+#: 环境变量供 systemd unit 配置；CLI `dd serve --no-auto-resume /
+#: --auto-resume-interval` 覆盖环境变量。
+AUTO_RESUME_ENABLED_ENV = "FLEET_GRAPH_DD_AUTO_RESUME"
+AUTO_RESUME_INTERVAL_ENV = "FLEET_GRAPH_DD_AUTO_RESUME_INTERVAL"
+DEFAULT_AUTO_RESUME_INTERVAL = 60.0
+
+_FALSE_WORDS = frozenset({"0", "false", "no", "off"})
+
+
+def auto_resume_enabled_from_env(environ: dict[str, str] | None = None) -> bool:
+    """默认开；只有显式的否定词才关（unset/空串/其它值都算开）。"""
+    raw = (environ if environ is not None else os.environ).get(AUTO_RESUME_ENABLED_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _FALSE_WORDS
+
+
+def auto_resume_interval_from_env(environ: dict[str, str] | None = None) -> float:
+    """巡检间隔秒数；非法或非正值回落默认 60s，不让配置错拖垮服务。"""
+    raw = (environ if environ is not None else os.environ).get(AUTO_RESUME_INTERVAL_ENV)
+    if raw is None:
+        return DEFAULT_AUTO_RESUME_INTERVAL
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_AUTO_RESUME_INTERVAL
+    return value if value > 0 else DEFAULT_AUTO_RESUME_INTERVAL
+
+
+class GateAutoResumer:
+    """决议落板自动 resume：消掉第四道闸链路里最后一个人工步骤。
+
+    dd development 不是 scheduler line，R0c 的停牌唤醒三源不覆盖它；而
+    "The service IS the control plane"——所以这套巡检长在 dd serve 自己身上，
+    不新增第二个 daemon，也不与 supervisor 耦合（supervisor 只发 decision，
+    谁消费它不知道）。
+
+    纪律（全部复用既有路径，不引入新裁决逻辑）：
+
+    - **判定只读**：扫 awaiting_gate 用 ``DdControlPlane.list``（O(n) run
+      artifacts，既有裁定的代价）；"决议是否已落板" 读的是
+      ``DdControlPlane.gate`` 报告里的 ``decision_on_board``——与人工调
+      development_gate 看到的是同一条板读逻辑（``_decision_on_board``）。
+    - **启动即 development_gate(resume=True)**：同一个函数，同一条
+      ``_launch(resume=True)`` 路径，resume 依旧无值——图内自己重读板，
+      巡检无法夹带任何 verdict（第二道闸语义原样保留）。
+    - **fail-open**：板不可达时 ``decision_on_board`` 为 None，按 "尚无决议"
+      跳过；单个 development 判定/启动异常只记日志跳过；整个 tick 的意外
+      异常也只记日志——巡检永不拖垮 MCP 面。
+    - **幂等**：running 的 development 根本不在 awaiting_gate 扫描结果里；
+      判定与启动之间的竞态由 ``gate(resume=True)`` 自身的 ALREADY_RUNNING
+      refuse 兜住（launch 层既有判定），巡检把它当跳过处理。
+    """
+
+    def __init__(
+        self,
+        control: Any,
+        *,
+        interval: float = DEFAULT_AUTO_RESUME_INTERVAL,
+        page_size: int = 20,
+    ) -> None:
+        self.control = control
+        self.interval = interval
+        self.page_size = page_size
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # --- one pass ---------------------------------------------------------
+
+    def tick(self) -> dict[str, Any]:
+        """一轮巡检：扫 awaiting_gate、判 decision_on_board、resume。"""
+        summary: dict[str, Any] = {"scanned": 0, "resumed": [], "skipped": [], "errors": []}
+        try:
+            awaiting = self._awaiting_ids()
+        except Exception as exc:  # fail-open：扫描失败只跳过本轮
+            logger.warning("dd auto-resume: development scan failed, skipping tick: %s", exc)
+            summary["errors"].append({"development_id": None, "error": str(exc)})
+            return summary
+        for development_id in awaiting:
+            summary["scanned"] += 1
+            try:
+                self._consider(development_id, summary)
+            except ControlPlaneError as exc:
+                # 判定与启动之间状态变了（如 ALREADY_RUNNING）：既有 refuse
+                # 就是幂等保护，按跳过处理。
+                logger.info(
+                    "dd auto-resume: %s skipped by the control plane: %s", development_id, exc.code
+                )
+                summary["skipped"].append({"development_id": development_id, "reason": exc.code})
+            except Exception as exc:  # fail-open：单个 development 异常不崩巡检
+                logger.warning("dd auto-resume: %s raised, skipping: %s", development_id, exc)
+                summary["errors"].append({"development_id": development_id, "error": str(exc)})
+        return summary
+
+    def _awaiting_ids(self) -> list[str]:
+        """既有 development_list 的 O(n) 扫描，翻页取全量 awaiting_gate。"""
+        ids: list[str] = []
+        cursor: str | None = None
+        while True:
+            page = self.control.list(state=STATE_AWAITING_GATE, limit=self.page_size, cursor=cursor)
+            ids.extend(str(row["development_id"]) for row in page.get("developments") or [])
+            cursor = page.get("cursor")
+            if not cursor:
+                break
+        return ids
+
+    def _consider(self, development_id: str, summary: dict[str, Any]) -> None:
+        report = self.control.gate(development_id)  # 只读：与人工看闸完全同一逻辑
+        if report.get("state") != STATE_AWAITING_GATE or not report.get("pending"):
+            summary["skipped"].append({"development_id": development_id, "reason": "not_pending"})
+            return
+        if report.get("decision_on_board") is not True:
+            # False = 决议未落板；None = 板不可达（fail-open，当作未落板）。
+            summary["skipped"].append(
+                {"development_id": development_id, "reason": "no_decision_on_board"}
+            )
+            return
+        resumed = self.control.gate(development_id, resume=True)  # 同一条 resume 路径
+        summary["resumed"].append(development_id)
+        logger.info(
+            "dd auto-resume: decision on board, resumed %s as %s",
+            development_id,
+            (resumed.get("resume") or {}).get("unit", ""),
+        )
+
+    # --- lifecycle: 随 dd serve 起、随进程止 ------------------------------
+
+    def run_forever(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.tick()
+            except Exception:  # tick 已自吞异常，这里是最后一道保险
+                logger.exception("dd auto-resume: tick crashed; the patrol continues")
+            if self._stop.wait(self.interval):
+                break
+
+    def start(self) -> threading.Thread:
+        thread = threading.Thread(target=self.run_forever, name="dd-gate-auto-resume", daemon=True)
+        self._thread = thread
+        thread.start()
+        return thread
+
+    def stop(self) -> None:
+        self._stop.set()
+
 
 # Legacy tool names that are registered but refuse with an explicit error
 # structure instead of pretending the legacy semantics exist here.
@@ -296,6 +452,8 @@ def serve(
     working_directory: str | None = None,
     executable: str | None = None,
     stage_models: dict[str, str] | None = None,
+    auto_resume: bool | None = None,
+    auto_resume_interval: float | None = None,
 ) -> None:
     if not port_is_available(host, port):
         raise RuntimeError(f"fleet-graph dev-dispatch port {host}:{port} is unavailable")
@@ -310,17 +468,41 @@ def serve(
         overrides["executable"] = executable
     if stage_models:
         overrides["stage_models"] = stage_models
-    build_mcp_server(DdControlPlane(**overrides)).run(
-        transport="streamable-http", host=host, port=port, path="/mcp"
+    control = DdControlPlane(**overrides)
+    # R4-3 收尾：决议落板自动 resume 巡检随服务生命周期启停（daemon 线程，
+    # 进程退出即止）。None = 未显式配置，回落环境变量，默认开。
+    enabled = auto_resume_enabled_from_env() if auto_resume is None else auto_resume
+    interval = (
+        auto_resume_interval_from_env() if auto_resume_interval is None else auto_resume_interval
     )
+    resumer: GateAutoResumer | None = None
+    if enabled:
+        resumer = GateAutoResumer(control, interval=interval)
+        resumer.start()
+        logger.info("dd auto-resume patrol started (interval %.0fs)", interval)
+    else:
+        logger.info("dd auto-resume patrol disabled by configuration")
+    try:
+        build_mcp_server(control).run(
+            transport="streamable-http", host=host, port=port, path="/mcp"
+        )
+    finally:
+        if resumer is not None:
+            resumer.stop()
 
 
 __all__ = [
+    "AUTO_RESUME_ENABLED_ENV",
+    "AUTO_RESUME_INTERVAL_ENV",
+    "DEFAULT_AUTO_RESUME_INTERVAL",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
     "NOT_SUPPORTED_RULING",
     "NOT_SUPPORTED_TOOLS",
     "SUPPORTED_TOOLS",
+    "GateAutoResumer",
+    "auto_resume_enabled_from_env",
+    "auto_resume_interval_from_env",
     "build_mcp_server",
     "port_is_available",
     "serve",
