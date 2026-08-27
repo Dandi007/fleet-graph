@@ -205,9 +205,14 @@ journalctl --user -u fleet-graphd -f          # 每 60s 一批，每条线一行
 | E3 `line_fault` | terminal `fault` 或 `pump_fault: true` | `e3-<run_id>` |
 | E4 `cap_breaker` | `TickResult.refusal == total_cap_reached` | `e4-cap-<时间桶>` |
 
-thread_id = `supervisor:{key}`，checkpoint 在
-`/data/fleet-graph/supervisor/checkpoint.sqlite3`：同一事件 kill-restart 后
-**re-adopt 在飞审计 run**，不重派、不重付费（测试钉死）。E2 与 R0c 停牌**共存**：
+thread_id = `supervisor:{key}:a{attempt}`（attempt = 观察器 cursor 里该键的
+终身 launch 计数，从 1 起），checkpoint 在
+`/data/fleet-graph/supervisor/checkpoint.sqlite3`。世代语义与 ronin 线的
+`{folder_id}:g{n}` 同款：**每次 launch 是新 attempt、新 thread，checkpoint
+天然隔离**——重跑一个事件不再需要对共享 sqlite 做外科手术；同一 attempt 内
+kill-restart 照旧**精确 re-adopt 在飞审计 run**，不重派、不重付费（测试钉死）。
+旧格式 thread（无 `:aN` 后缀）留在库里成为惰性行，无需迁移。receipt 路径
+照旧按 `event.key`（一事件一 receipt，重跑覆盖写）。E2 与 R0c 停牌**共存**：
 停牌照旧省钱，观察器只负责把事实递给审计。
 
 ### 预算与游标
@@ -218,7 +223,21 @@ thread_id = `supervisor:{key}`，checkpoint 在
   adopt-baseline**：游标落在当前 head，存量 pending 问题不回放（那是人已有的
   backlog，`fleet-graph inbox list` 看得到）。要回放，把 `board_seq` 改小。
 - 事件审完出 receipt（`/data/fleet-graph/supervisor/reports/<key>.json`），
-  同键永不再拉起。要重审：删对应 receipt 文件（尝试计数照旧生效）。
+  同键永不再拉起。**要重审，用文档化重置命令**（幂等，只动 supervisor 自己的
+  状态面）：
+
+  ```bash
+  fleet-graph supervisor reset e3-<run_id>          # 删 receipt + 清尝试计数
+  fleet-graph supervisor reset e1-<note_id>         # 另外机械回拨 board_seq 到该问题之前
+  fleet-graph supervisor reset e1-<note_id> --board-seq N   # 机械定位不了时显式指定
+  ```
+
+  三件套一次做完：删 receipt、清 cursor 里该键的 attempts、（仅 E1）回拨
+  `board_seq`——E2/E3/E4 每 tick 从 terminal/tick 结果重推导，无游标可回拨。
+  **不碰 checkpoint db**：重跑是新 attempt、新 thread，旧行天然惰性。
+  **不需要重启 fleet-graphd**：观察器每 tick 从盘上重载 cursor 文件；唯一
+  例外是 reset 恰与一个在飞 tick 竞态（该 tick 收尾覆写一次），重跑一遍
+  reset 或 `systemctl --user restart fleet-graphd` 兜底。
 
 ### 一次 supervisor turn 的形状
 

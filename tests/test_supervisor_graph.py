@@ -134,6 +134,36 @@ def config_for(tmp_path: Path, event: dict[str, Any], **overrides: Any) -> Super
     return SupervisorRunConfig(**defaults)
 
 
+class TestThreadIdentity:
+    """R4 generation semantics: the attempt is part of the thread identity."""
+
+    def test_thread_id_carries_the_attempt_suffix(self) -> None:
+        event = validate_event({"type": "line_fault", "key": "e3-run-1", "payload": {}})
+        assert event.attempt == 1
+        assert event.thread_id == "supervisor:e3-run-1:a1"
+
+    def test_attempt_round_trips_through_the_event_json(self) -> None:
+        raw = {"type": "line_fault", "key": "e3-run-1", "payload": {}, "attempt": 3}
+        event = validate_event(raw)
+        assert event.thread_id == "supervisor:e3-run-1:a3"
+        assert validate_event(event.as_dict()) == event
+
+    def test_run_id_derivation_differs_per_attempt(self) -> None:
+        """The audit run id derives from the thread id, so a new attempt pays
+        for a genuinely new run while the same attempt re-adopts."""
+        from fleet_graph.executors.agent_run import derive_run_id
+
+        a1 = validate_event({"type": "line_fault", "key": "e3-r", "attempt": 1})
+        a2 = validate_event({"type": "line_fault", "key": "e3-r", "attempt": 2})
+        assert derive_run_id(a1.thread_id, "audit") != derive_run_id(a2.thread_id, "audit")
+        assert derive_run_id(a1.thread_id, "audit") == derive_run_id(a1.thread_id, "audit")
+
+    @pytest.mark.parametrize("attempt", [0, -1, True, "2", 1.5])
+    def test_non_positive_or_non_int_attempts_are_refused(self, attempt: Any) -> None:
+        with pytest.raises(SupervisorEventError, match="attempt"):
+            validate_event({"type": "line_fault", "key": "e3-run-1", "attempt": attempt})
+
+
 class TestEventVocabulary:
     def test_unknown_event_type_is_refused_not_mapped(self) -> None:
         with pytest.raises(SupervisorEventError, match="vocabulary is closed"):
@@ -777,6 +807,34 @@ class TestIdempotency:
         ledgers = list((tmp_path / "supervisor" / "agent-runs").rglob("dispatch.log"))
         assert len(ledgers) == 1
         assert len(ledgers[0].read_text().splitlines()) == 1
+
+    def test_a_new_attempt_is_a_fresh_run_not_already_complete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The production re-run path: same event key, next attempt. The new
+        thread starts clean (no already_complete), dispatches its own audit
+        run, and the receipt is overwritten in place -- one file per key."""
+        monkeypatch.setenv("FAKE_AUDIT_BEHAVIOR", "hold")
+        fault_line(tmp_path / "runs")
+        base = line_fault_event("wf-testfault", "run-e3-1").as_dict()
+        first = run_supervisor(config_for(tmp_path, {**base, "attempt": 1}))
+        assert "resumed" not in first
+        config = config_for(tmp_path, {**base, "attempt": 2})
+        second = run_supervisor(config)
+
+        assert "resumed" not in second, "attempt 2 must not resolve to attempt 1's thread"
+        assert second["thread_id"] == "supervisor:e3-run-e3-1:a2"
+        assert first["thread_id"] == "supervisor:e3-run-e3-1:a1"
+        # One receipt per key, overwritten -- not one per attempt.
+        assert second["receipt_path"] == first["receipt_path"]
+        assert json.loads(Path(second["receipt_path"]).read_text())["thread_id"].endswith(":a2")
+        # Two genuinely separate audit dispatches (per-attempt run ids).
+        ledgers = list((tmp_path / "supervisor" / "agent-runs").rglob("dispatch.log"))
+        assert sum(len(ledger.read_text().splitlines()) for ledger in ledgers) == 2
+
+        # And attempt 2 re-run stays idempotent within its own generation.
+        third = run_supervisor(config_for(tmp_path, {**base, "attempt": 2}))
+        assert third["resumed"] == "already_complete"
 
 
 class TestKillRestartReAdopt:
