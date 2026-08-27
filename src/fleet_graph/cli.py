@@ -1,6 +1,7 @@
 """Thin CLI entrypoint.
 
-`version`, `hello`, `line run`, `dd run`, and `scheduler run`.
+`version`, `hello`, `line run`, `dd run`, `scheduler run`, `inbox list`, and
+`supervise audit`.
 """
 
 from __future__ import annotations
@@ -234,6 +235,72 @@ def _scheduler_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _inbox_list(args: argparse.Namespace) -> int:
+    """Render the pending-verdict view straight off the board. Read-only."""
+    from fleet_graph.bus.client import BusClient
+    from fleet_graph.supervise.inbox import list_pending, render_text
+
+    client = BusClient(base_url=args.bus_url)
+    rows = list_pending(client)
+    if args.json:
+        json.dump([row.as_dict() for row in rows], sys.stdout, ensure_ascii=False, indent=1)
+        sys.stdout.write("\n")
+    else:
+        print(render_text(rows))
+    return 0
+
+
+def _supervise_audit(args: argparse.Namespace) -> int:
+    """Mechanical audit of one development or goal line. Casts no verdict."""
+    import pathlib
+
+    from fleet_graph.supervise.audit import (
+        DEFAULT_RUN_ROOT,
+        OldEngineClient,
+        audit_development,
+        audit_goal_line,
+        publish_report,
+        render_note,
+    )
+
+    if args.target.startswith("wf-"):
+        report = audit_goal_line(
+            args.target, run_root=pathlib.Path(args.run_root or DEFAULT_RUN_ROOT)
+        )
+    else:
+        if not args.repo:
+            raise SystemExit("development 审计需要 --repo：一个持有 accepted commit 的本地 clone")
+        report = audit_development(
+            args.target,
+            engine=OldEngineClient(args.engine_url),
+            repo=pathlib.Path(args.repo).resolve(),
+        )
+
+    if args.no_note:
+        report.gaps.append("evidence note 被 --no-note 抑制，仅本地输出")
+    elif args.card:
+        from fleet_graph.bus.client import BusClient
+
+        result = publish_report(
+            BusClient(base_url=args.bus_url),
+            report,
+            card_entity_id=args.card,
+            question_note_id=args.question or "",
+        )
+        report.gaps.append(f"evidence note 已落板: {result.message_id}")
+    else:
+        # The ref contract needs a card to hang the note on; without one the
+        # honest move is a local report plus a named gap, not a guessed ref.
+        report.gaps.append("无 --card 可挂 evidence note（老引擎 gate 不产板卡）；报告仅本地输出")
+
+    if args.json:
+        json.dump(report.as_dict(), sys.stdout, ensure_ascii=False, indent=1)
+        sys.stdout.write("\n")
+    else:
+        print(render_note(report))
+    return 0 if report.ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fleet-graph")
     parser.add_argument("--version", action="version", version=__version__)
@@ -351,6 +418,50 @@ def build_parser() -> argparse.ArgumentParser:
         "which is the honest reading of not being able to ask",
     )
     sched_run.set_defaults(func=_scheduler_run)
+
+    from fleet_graph.bus.client import DEFAULT_BUS_URL
+
+    inbox = subparsers.add_parser("inbox", help="the pending-verdict view of the board")
+    inbox_sub = inbox.add_subparsers()
+    inbox_list = inbox_sub.add_parser(
+        "list", help="questions on the board that no work.decision.v1 references"
+    )
+    inbox_list.add_argument("--json", action="store_true")
+    inbox_list.add_argument("--bus-url", default=DEFAULT_BUS_URL)
+    inbox_list.set_defaults(func=_inbox_list)
+
+    supervise = subparsers.add_parser(
+        "supervise", help="the supervision face (audits, no verdicts)"
+    )
+    supervise_sub = supervise.add_subparsers()
+    audit = supervise_sub.add_parser(
+        "audit",
+        help="mechanical evidence audit of a development id or a wf- folder id",
+    )
+    audit.add_argument("target", help="development_id, or a goal line's wf- folder id")
+    audit.add_argument("--json", action="store_true")
+    audit.add_argument(
+        "--repo",
+        default=None,
+        help="local clone holding the development's commits (required for development targets)",
+    )
+    audit.add_argument(
+        "--engine-url",
+        default="http://127.0.0.1:7460",
+        help="legacy controller base URL; only ever queried with GET",
+    )
+    audit.add_argument(
+        "--run-root", default=None, help="goal line run root (default /data/fleet-graph/runs)"
+    )
+    audit.add_argument("--card", default=None, help="card entity id to hang the evidence note on")
+    audit.add_argument(
+        "--question", default=None, help="question note id the evidence note should also reference"
+    )
+    audit.add_argument("--bus-url", default=DEFAULT_BUS_URL)
+    audit.add_argument(
+        "--no-note", action="store_true", help="print the report only; publish nothing to the board"
+    )
+    audit.set_defaults(func=_supervise_audit)
     return parser
 
 
