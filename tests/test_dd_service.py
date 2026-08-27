@@ -53,6 +53,8 @@ ALL_TOOLS = {
 
 # Arguments that satisfy each legacy-only tool's schema, so the refusal we
 # observe is the NOT_SUPPORTED structure and not an argument-validation error.
+# `development_reconfigure` is deliberately absent: R1-c moved it into the
+# real surface (the environment/contract failure exit).
 NOT_SUPPORTED_CALLS: dict[str, dict[str, object]] = {
     "deployment_create": {"request": {"operation": "deploy"}},
     "deployment_status": {"operation_id": "operation-1"},
@@ -61,11 +63,6 @@ NOT_SUPPORTED_CALLS: dict[str, dict[str, object]] = {
         "instruction": "continue",
         "idempotency_key": "steer-key",
         "expected_revision": 8,
-    },
-    "development_reconfigure": {
-        "development_id": "dev-1",
-        "idempotency_key": "config-key",
-        "expected_revision": 9,
     },
     "development_control": {
         "development_id": "dev-1",
@@ -127,10 +124,17 @@ class FakeControlPlane:
     def gate(self, **kwargs: object) -> dict[str, object]:
         return self._record("gate", **kwargs)
 
+    def reconfigure(self, **kwargs: object) -> dict[str, object]:
+        return self._record("reconfigure", **kwargs)
+
 
 def test_selected_port_is_free_and_not_a_legacy_port() -> None:
     assert DEFAULT_PORT == 5610
-    assert port_is_available(port=DEFAULT_PORT)
+    if not port_is_available(port=DEFAULT_PORT):
+        # On the production host the dd MCP service itself holds :5610 (it
+        # went live 2026-08-27); a bind failure there is the service doing its
+        # job, not a port collision. CI still proves the port is free.
+        pytest.skip("port 5610 is already being served on this host")
 
 
 def test_all_thirteen_tools_are_reachable() -> None:
@@ -140,7 +144,12 @@ def test_all_thirteen_tools_are_reachable() -> None:
 
 
 def test_the_surface_split_is_exactly_the_ruling() -> None:
-    """Supported + refused partitions the 13 names, with no overlap."""
+    """Supported + refused partitions the 13 names, with no overlap.
+
+    R1-c moved `development_reconfigure` from the refused side to the real
+    side (the environment/contract failure exit); steer / relock / control /
+    deployment_* stay refused.
+    """
     assert SUPPORTED_TOOLS | set(NOT_SUPPORTED_TOOLS) == ALL_TOOLS
     assert not SUPPORTED_TOOLS & set(NOT_SUPPORTED_TOOLS)
     assert {
@@ -151,7 +160,42 @@ def test_the_surface_split_is_exactly_the_ruling() -> None:
         "development_create",
         "development_start",
         "development_gate",
+        "development_reconfigure",
     } == SUPPORTED_TOOLS
+    assert {
+        "development_steer",
+        "development_relock",
+        "development_control",
+        "deployment_create",
+        "deployment_status",
+    } == set(NOT_SUPPORTED_TOOLS)
+
+
+def test_the_reconfigure_tool_admits_only_the_acceptance_context() -> None:
+    """The three-exit ruling, enforced by schema: reconfigure can change the
+    acceptance context and nothing else. No spec, no implementation, no
+    role patch, no legacy revision/idempotency vocabulary."""
+    server = build_mcp_server(FakeControlPlane())
+    tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
+    schema = tools["development_reconfigure"].parameters
+    assert set(schema["properties"]) == {
+        "development_id",
+        "acceptance_env",
+        "acceptance_argv",
+        "setup",
+    }
+    assert schema["required"] == ["development_id"]
+    for forbidden in (
+        "spec_text",
+        "spec_path",
+        "profile",
+        "role_target_patch",
+        "policy",
+        "idempotency_key",
+        "expected_revision",
+        "instruction",
+    ):
+        assert forbidden not in schema["properties"]
 
 
 def test_the_create_tool_admits_only_the_derivation_inputs() -> None:
@@ -224,6 +268,15 @@ def test_every_supported_tool_drives_the_control_plane_over_the_running_endpoint
         ),
         ("development_start", {"development_id": "dev-1"}),
         ("development_gate", {"development_id": "dev-1", "resume": True}),
+        (
+            "development_reconfigure",
+            {
+                "development_id": "dev-1",
+                "acceptance_argv": ["make verify"],
+                "setup": ["npm ci"],
+                "acceptance_env": {"CI": "1"},
+            },
+        ),
     ]
     assert {name for name, _ in calls} == set(SUPPORTED_TOOLS)
 
@@ -242,7 +295,7 @@ def test_every_supported_tool_drives_the_control_plane_over_the_running_endpoint
     assert plane.calls == [
         ("list", {"state": "running", "limit": 4, "cursor": "c1"}),
         ("get", {"development_id": "dev-1"}),
-        ("events", {"development_id": "dev-1", "after": "e1", "limit": 3}),
+        ("events", {"development_id": "dev-1", "after": "e1", "limit": 3, "generation": None}),
         ("evidence", {"development_id": "dev-1"}),
         (
             "create",
@@ -255,6 +308,15 @@ def test_every_supported_tool_drives_the_control_plane_over_the_running_endpoint
         ),
         ("start", {"development_id": "dev-1"}),
         ("gate", {"development_id": "dev-1", "resume": True}),
+        (
+            "reconfigure",
+            {
+                "development_id": "dev-1",
+                "acceptance_argv": ["make verify"],
+                "setup": ["npm ci"],
+                "acceptance_env": {"CI": "1"},
+            },
+        ),
     ]
 
 
@@ -308,7 +370,7 @@ def test_the_fake_control_plane_mirrors_the_real_surface() -> None:
     method it fakes exists on DdControlPlane with the same parameters."""
     from fleet_graph.dd.control_plane import DdControlPlane
 
-    for method in ("create", "start", "get", "list", "events", "evidence", "gate"):
+    for method in ("create", "start", "get", "list", "events", "evidence", "gate", "reconfigure"):
         assert hasattr(DdControlPlane, method), method
     real = {
         name
@@ -322,3 +384,9 @@ def test_the_fake_control_plane_mirrors_the_real_surface() -> None:
         if name != "self"
     }
     assert gate == {"development_id", "resume"}
+    reconfigure = {
+        name
+        for name, _ in inspect.signature(DdControlPlane.reconfigure).parameters.items()
+        if name != "self"
+    }
+    assert reconfigure == {"development_id", "acceptance_env", "acceptance_argv", "setup"}

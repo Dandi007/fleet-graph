@@ -87,6 +87,12 @@ TERMINAL_REFUSED = "refused"
 TERMINAL_BOUNDS = "bounds"
 TERMINAL_FAULT = "fault"
 
+# Terminal codes minted by the walker itself, for the two bounds exits. They
+# are not in the contract's failure taxonomy because the contract declares no
+# bound of its own (PipelineBounds' docstring); each names exactly one cause.
+REWORK_LIMIT_REACHED = "REWORK_LIMIT_REACHED"
+STEP_LIMIT_REACHED = "STEP_LIMIT_REACHED"
+
 
 class PipelineFault(RuntimeError):
     """The pipeline cannot continue and will not guess. Recorded, then stop."""
@@ -97,7 +103,15 @@ class StageRefused(RuntimeError):
 
     The human gate raises this on a REJECT decision. It is deliberately not a
     fault: nothing broke, someone said no.
+
+    `code` names the one mechanical cause of the refusal (one code, one
+    cause -- the m-1e94ea lesson). The raiser that knows why it refused says
+    so here; a refusal without a code classifies by its raw text alone.
     """
+
+    def __init__(self, message: str, *, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -176,9 +190,14 @@ class PipelineState(TypedDict, total=False):
     receipt_digests: dict[str, str]
     last_event: str
     last_failure_code: str
+    last_failure_detail: str
     history: list[dict[str, Any]]
     terminal: str
     terminal_reason: str
+    # The one mechanical cause of the ending, where one is known: a taxonomy
+    # failure code, a refusal's own code, or a walker bounds code. Empty for
+    # `complete` and for faults, whose raw reason is the whole story.
+    terminal_code: str
     fault: bool
 
 
@@ -244,8 +263,15 @@ def _act_or_wait(actor: Actor, stage: Stage, dispatch: Dispatch) -> StageOutcome
     )
 
 
-def _terminal(state_kind: str, reason: str, *, fault: bool = False) -> PipelineState:
-    return {"terminal": state_kind, "terminal_reason": reason, "fault": fault}
+def _terminal(
+    state_kind: str, reason: str, *, fault: bool = False, code: str = ""
+) -> PipelineState:
+    return {
+        "terminal": state_kind,
+        "terminal_reason": reason,
+        "terminal_code": code,
+        "fault": fault,
+    }
 
 
 def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
@@ -288,10 +314,19 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         state: PipelineState, stage_id: str, step: str, refused: StageRefused, steps: int
     ) -> PipelineState:
         """A stage ended on purpose. Recorded and observed like any other step."""
+        code = getattr(refused, "code", "")
         return {
-            **_terminal(TERMINAL_REFUSED, str(refused)),
+            **_terminal(TERMINAL_REFUSED, str(refused), code=code),
             "steps": steps,
-            "history": _record(state, {"stage": stage_id, "step": step, "refused": str(refused)}),
+            "history": _record(
+                state,
+                {
+                    "stage": stage_id,
+                    "step": step,
+                    "refused": str(refused),
+                    **({"refusal_code": code} if code else {}),
+                },
+            ),
         }
 
     def run_stage(state: PipelineState) -> PipelineState:
@@ -302,7 +337,11 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
 
         steps = state.get("steps", 0) + 1
         if steps > deps.bounds.max_steps:
-            return _terminal(TERMINAL_BOUNDS, f"step limit {deps.bounds.max_steps} reached")
+            return _terminal(
+                TERMINAL_BOUNDS,
+                f"step limit {deps.bounds.max_steps} reached",
+                code=STEP_LIMIT_REACHED,
+            )
 
         dispatch: Dispatch = _dispatch_for(state, stage)
         artifacts = dict(state.get("artifacts", {}))
@@ -404,6 +443,11 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             "last_event": outcome.event,
             "last_receipt": outcome.receipt or {},
             "last_failure_code": outcome.failure_code,
+            # The raw error text as the failing collaborator reported it. The
+            # advance() terminal keeps only the code in its reason; without
+            # this the original wording -- the thing an operator greps for --
+            # would be gone by the time the run is a record.
+            "last_failure_detail": outcome.detail if outcome.event == FAILURE_EVENT else "",
             "history": _record(
                 state,
                 {
@@ -411,6 +455,11 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     "event": outcome.event,
                     "attempt": dispatch["attempt"],
                     "output_commit": head_commit,
+                    **(
+                        {"failure_code": outcome.failure_code, "detail": outcome.detail}
+                        if outcome.event == FAILURE_EVENT
+                        else {}
+                    ),
                 },
             ),
         }
@@ -434,7 +483,10 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             reason = f"{stage_id} failed ({failure_code or 'no failure code'})"
             if used:
                 reason += f" after {used} bounded retries"
-            return {**_terminal(TERMINAL_FAILED, reason), "retries": retries}
+            return {
+                **_terminal(TERMINAL_FAILED, reason, code=failure_code),
+                "retries": retries,
+            }
 
         next_dispatch = {"input_commit": state.get("head_commit", "")}
         try:
@@ -470,7 +522,9 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         rework = state.get("rework_count", 0) + 1
         if rework > deps.bounds.max_rework:
             return _terminal(
-                TERMINAL_BOUNDS, f"rework limit {deps.bounds.max_rework} reached at {stage_id}"
+                TERMINAL_BOUNDS,
+                f"rework limit {deps.bounds.max_rework} reached at {stage_id}",
+                code=REWORK_LIMIT_REACHED,
             )
         return {
             "stage": transition.target,
@@ -527,7 +581,9 @@ __all__ = [
     "MODE_INHERIT",
     "MODE_INITIAL",
     "MODE_REWORK",
+    "REWORK_LIMIT_REACHED",
     "SPINE_EVENT",
+    "STEP_LIMIT_REACHED",
     "TERMINAL_BOUNDS",
     "TERMINAL_COMPLETE",
     "TERMINAL_FAILED",

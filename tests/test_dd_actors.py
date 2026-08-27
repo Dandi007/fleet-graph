@@ -452,3 +452,25 @@ class TestTheHumanGateWaitsRatherThanDecides:
             "decision" in name and name.startswith(("publish", "post", "cast"))
             for name in dir(board_module.Board)
         )
+
+
+class TestGenerationDerivedIdentities:
+    """R1-c: a fresh generation derives fresh run identities, so a rerun of
+    the same development never collides with -- or silently re-adopts -- its
+    previous generation's runs. The gate's bus idempotency key is covered by
+    test_a_new_generation_asks_a_new_question above."""
+
+    def test_a_new_generation_names_a_new_run(self, tmp_path: Path) -> None:
+        launcher = RecordingLauncher()
+        actor = make_actor(tmp_path, launcher)
+        actor.act(IMPLEMENT, {**dispatch_for(IMPLEMENT), "generation": 1})
+        actor.act(IMPLEMENT, {**dispatch_for(IMPLEMENT), "generation": 2})
+
+        ids = [run_id for _, run_id in launcher.launched]
+        assert len(set(ids)) == 2, ids
+
+    def test_a_rejection_carries_the_implementation_class_code(self) -> None:
+        board = FakeBoard(a_decision("REJECT"))
+        with pytest.raises(StageRefused) as refused:
+            make_gate(board).act(GATE, dispatch_for(GATE))
+        assert refused.value.code == "GATE_REJECTED"

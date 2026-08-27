@@ -332,11 +332,12 @@ class BoardGate:
             # "proceed" is not a gate.
             raise StageRefused(
                 f"gate decision {decision.decision!r} is not one of "
-                f"{sorted(self.allowed_decisions)}; refusing to interpret it"
+                f"{sorted(self.allowed_decisions)}; refusing to interpret it",
+                code="GATE_VERDICT_UNRECOGNIZED",
             )
         if verdict != self.approve:
             operator = decision.decided_by or "an operator"
-            raise StageRefused(f"gate decision {verdict} by {operator}")
+            raise StageRefused(f"gate decision {verdict} by {operator}", code="GATE_REJECTED")
 
         record = {
             "stage": stage.id,

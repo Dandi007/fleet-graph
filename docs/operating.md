@@ -272,3 +272,33 @@ fleet-graph supervisor run --event-json \
   是部署侧 flag，不进 client 词表。
 - **审计**：`fleet-graph supervise audit <dev-id> --repo <clone>`——`--dd-root`
   下有 record 的 development 自动走进程内 `GraphEngineSource`，其余走老引擎。
+
+### 失败三分出口（R1-c）
+
+每个非 `complete` 终局在 `status.failure` / `evidence[].failure` 上带一条失败
+记录：`{class, code, raw_error, retryable, exit}`——因果分类、单一机械成因码
+（一码一因，禁垃圾桶码）、失败方原话、可重试位、开放的出口。分类在读侧从
+run 工件现算，不落第二份真相。
+
+| class | 判定（code） | 出口 | 语义 |
+|---|---|---|---|
+| `environment_contract` | 除下两类外的一切（taxonomy 环境/契约码、`ACCEPTANCE_FAILED` / `SETUP_FAILED` / `RUN_CONFIG_MISSING` 等验收上下文拒绝、fault） | `reconfigure`：`development_reconfigure` 改验收上下文 → `development_start` 起新 generation | 验收环境缺件 / acceptance argv / setup 契约错。老引擎 FAILED 后 reconfigure 恒 409 之痛在此消灭：FAILED 与一切非终态都可调 |
+| `implementation` | `GATE_REJECTED` / `REWORK_LIMIT_REACHED` / `REVIEWER_GIT_MUTATION` / `UNDECLARED_ARTIFACT` / `SECRET_SENTINEL_DETECTED` | `rework`：图内 continuous REJECT → 新 attempt（原样保留）；终局后 start 新 generation 重做 | 工作本身被判不合格，换环境救不了 |
+| `fabrication` | `UNVERIFIED_TEST_CLAIM` / `ARTIFACT_BLOB_MISMATCH`（seal 复跑与 actor 断言不符族） | `none`：终局。reconfigure 与 start 都以 `FABRICATION_FINAL` 拒绝并指明原因 | 撒谎的 actor 不配换考卷也不配重考 |
+
+`development_reconfigure(development_id, acceptance_env?, acceptance_argv?,
+setup?)` 的 schema 就是它的边界：只有验收上下文三个参数，没有 spec / 实现 /
+role patch 参数——spec 冻在 bootstrap digest 下，改 spec 永远等于新 development。
+
+### 重跑 generation
+
+- thread id = `{dev}:g{n}`；`--generation` 进 argv，派生 run id
+  （`g{n}-a{m}` tag）、gate 的 bus idempotency key（`dd-gate:{dev}:g{n}`）全部
+  带 generation——同单重跑不再撞 `IDEMPOTENCY_CONFLICT`。
+- `development_start`：非终态续跑本代 thread；可重试终局（或 reconfigure 后）
+  起 g{n+1} 全新一代；`complete` 与伪造类拒绝。
+- run 工件按代分目录：g1 在 `<dev>/`（存量布局不动），g{n>1} 在
+  `<dev>/g{n}/`；checkpoint.sqlite3 全代共享（thread id 内含代号）。
+- `development_evidence` 每代一个 entry，receipt 链跨代连续：g{n} 的链以
+  g{n-1} 的尾 commit + 尾 digest 为种子，revision 跨代累计编号；
+  `development_events` 默认读当前代，传 `generation` 读历史代。
