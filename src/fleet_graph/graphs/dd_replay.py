@@ -170,6 +170,7 @@ class ReceiptReplayer:
             event=step.event,
             receipt=dict(step.receipt),
             output_commit=step.output_commit,
+            attempt_id=str(step.receipt.get("attempt_id") or ""),
         )
 
     # --- plan construction (read-only) ------------------------------------
@@ -375,6 +376,12 @@ class ReceiptReplayer:
             return None
         if not isinstance(receipt, dict):
             return None
+        if str(receipt.get("attempt_id") or "") != attempt_id:
+            # A receipt claiming an identity other than the one it was
+            # sealed under is not a link, whatever else it says. The sealer
+            # enforces the same equality; refusing here keeps the pinned
+            # identity's provenance receipt-only.
+            return None
         return raw, receipt
 
     def _valid_implement(self, receipt: dict[str, Any], head: str) -> bool:
@@ -425,15 +432,19 @@ class ReceiptReplayer:
             if reset.returncode != 0:
                 return False
 
-        target = (
-            self.state_root
-            / "receipts"
-            / derive_attempt_id(self.development_id, self.generation, 1)
-        )
+        # Installed under the identity the receipts were sealed with -- their
+        # own `attempt_id`, which the walker pins for the rest of the pass.
+        # The plugin sealer reads the parent receipt at the *dispatch's*
+        # attempt id and refuses a receipt whose embedded identity differs
+        # (measured: g4's review at a re-derived id hit BINDING_MISMATCH
+        # "Implement receipt identity does not match Review dispatch"), so a
+        # re-derived install path would be a chain nobody can continue.
         for step in plan:
             filename = RECEIPT_FILES.get(step.stage_id)
-            if not step.raw or filename is None:
+            attempt_id = str(step.receipt.get("attempt_id") or "")
+            if not step.raw or filename is None or not attempt_id:
                 continue
+            target = self.state_root / "receipts" / attempt_id
             target.mkdir(parents=True, exist_ok=True)
             (target / filename).write_bytes(step.raw)
         return True

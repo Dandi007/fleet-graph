@@ -152,9 +152,13 @@ class AgentRunStageActor:
         it should be reading from the tree.
         """
         return {
-            "attempt_id": derive_attempt_id(
-                self.development_id, dispatch["generation"], dispatch["attempt"]
-            ),
+            # The identity the sealed chain continues under: a replayed
+            # prefix pins the receipt's own identity, and the role reads the
+            # committed context (`.dev-dispatch/handoffs/<attempt_id>/...`)
+            # at exactly that identity -- re-deriving from the current
+            # generation would point it at handoffs nobody sealed.
+            "attempt_id": str(dispatch.get("pinned_attempt_id") or "")
+            or derive_attempt_id(self.development_id, dispatch["generation"], dispatch["attempt"]),
             "development_id": self.development_id,
             "spec_commit": dispatch["input_commit"],
             "stage": ROLE_STAGE.get(stage.id, stage.id),

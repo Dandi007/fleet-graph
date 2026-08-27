@@ -132,7 +132,12 @@ class G1:
         )
 
     def installed(self, filename: str) -> Path:
-        attempt_id = derive_attempt_id(DEVELOPMENT_ID, 2, 1)
+        # Under the receipt's own sealed identity (g1 attempt 1), never a
+        # re-derived g2 one: the plugin reads the parent receipt at the
+        # dispatch's attempt id and refuses an embedded identity that
+        # differs, so the install path and the pinned dispatch id must both
+        # be the receipt's own.
+        attempt_id = derive_attempt_id(DEVELOPMENT_ID, 1, 1)
         return self.dev_root / "g2" / "state" / "receipts" / attempt_id / filename
 
 
@@ -296,6 +301,80 @@ class TestARejectionIsNeverReplayed:
         assert replayed_stages(state) == ["configure", "implement"]
         assert next(stage for stage, _ in actor.calls) == "continuous_review"
         assert head(repo) == g1.implement, "the rejected review's seal is dead weight"
+
+
+class TestTheReplayedIdentityBindsTheRealReview:
+    """The g4 lesson: the review of replayed work must dispatch under the
+    identity the implement receipt was sealed with, or the plugin refuses
+    with BINDING_MISMATCH "Implement receipt identity does not match Review
+    dispatch"."""
+
+    def test_the_first_real_review_dispatch_carries_the_replayed_identity(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        g1 = G1(repo, tmp_path)
+        seen: list[tuple[str, str]] = []
+
+        class Recorder(ContractActor):
+            def act(self, stage: Any, dispatch: dict[str, Any]) -> Any:
+                seen.append((stage.id, str(dispatch.get("pinned_attempt_id") or "")))
+                return super().act(stage, dispatch)
+
+        actor = Recorder({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(
+            make_deps(actor=actor, replayer=g1.replayer()), g1.junk_configure()
+        )
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        sealed_identity = g1.receipt["attempt_id"]
+        assert sealed_identity == derive_attempt_id(DEVELOPMENT_ID, 1, 1)
+        assert ("continuous_review", sealed_identity) in seen
+        assert ("final_review", sealed_identity) in seen
+
+    def test_a_rework_returns_to_a_derived_identity(self, repo: Path, tmp_path: Path) -> None:
+        """A new attempt is new work: the pin ends where the rework begins."""
+        g1 = G1(repo, tmp_path)
+        seen: list[tuple[str, int, str]] = []
+
+        class Recorder(ContractActor):
+            def act(self, stage: Any, dispatch: dict[str, Any]) -> Any:
+                seen.append(
+                    (
+                        stage.id,
+                        int(dispatch.get("attempt", 1)),
+                        str(dispatch.get("pinned_attempt_id") or ""),
+                    )
+                )
+                return super().act(stage, dispatch)
+
+        actor = Recorder({"continuous_review": ["REJECT", "APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(
+            make_deps(actor=actor, replayer=g1.replayer()), g1.junk_configure()
+        )
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        sealed_identity = g1.receipt["attempt_id"]
+        assert ("continuous_review", 1, sealed_identity) in seen
+        assert ("implement", 2, "") in seen, "the rework implement must not inherit the pin"
+        assert ("continuous_review", 2, "") in seen
+
+    def test_a_receipt_claiming_another_identity_is_not_a_link(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """Provenance stays receipt-only: a receipt whose embedded attempt_id
+        is not the identity it was sealed under replays nothing."""
+        g1 = G1(repo, tmp_path)
+        liar = dict(g1.receipt)
+        liar["attempt_id"] = derive_attempt_id(DEVELOPMENT_ID, 9, 9)
+        write_receipt(g1.state_root, 1, 1, "implement-receipt.json", liar)
+        junk = g1.junk_configure()
+
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+
+        assert replayed_stages(state) == []
+        assert next(stage for stage, _ in actor.calls) == "configure"
+        assert head(repo) == junk
 
 
 class TestReplayFailsClosed:

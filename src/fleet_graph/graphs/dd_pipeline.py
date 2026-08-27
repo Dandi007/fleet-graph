@@ -179,6 +179,11 @@ class Replayed:
     event: str
     receipt: dict[str, Any]
     output_commit: str
+    # The attempt identity the receipt was sealed under, from the receipt
+    # body itself. The stages that continue this receipt's chain in the same
+    # pass must dispatch under it -- the sealer reads the parent receipt at
+    # exactly this identity and refuses one whose identity differs.
+    attempt_id: str = ""
 
 
 class Replayer(Protocol):
@@ -209,6 +214,11 @@ class PipelineState(TypedDict, total=False):
     generation: int
     attempt: int
     attempt_started_at: str
+    # The sealed identity a replayed prefix pinned for the rest of this
+    # attempt. Empty means derive from (generation, attempt) as always; a
+    # rework clears it, because a new attempt is new work under its own
+    # identity.
+    pinned_attempt_id: str
     head_commit: str
     artifacts: dict[str, str]
     steps: int
@@ -318,6 +328,13 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             "generation": state.get("generation", 1),
             "attempt": state.get("attempt", 1),
             "attempt_started_at": state.get("attempt_started_at", ""),
+            # The identity the sealed chain continues under, where a replayed
+            # prefix pinned one. Everything that derives an attempt identity
+            # downstream -- the dispatch builder, the role input, the parent
+            # receipt path -- prefers this over re-deriving from the current
+            # generation, so a review of replayed work names the receipt that
+            # actually sealed it.
+            "pinned_attempt_id": state.get("pinned_attempt_id", ""),
             # How many times this stage has already been retried. It travels
             # on the dispatch because the run id is derived, and a retry that
             # derives the same id re-adopts the run it is retrying.
@@ -397,6 +414,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     "artifacts": artifacts,
                     "receipt_digests": digests,
                     "head_commit": replayed.output_commit,
+                    "pinned_attempt_id": replayed.attempt_id or state.get("pinned_attempt_id", ""),
                     "last_event": replayed.event,
                     "last_receipt": dict(replayed.receipt),
                     "last_failure_code": "",
@@ -595,6 +613,9 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             "mode": transition.next_mode,
             "attempt": state.get("attempt", 1) + 1,
             "attempt_started_at": deps.stamp(),
+            # A new attempt is new work under its own derived identity; the
+            # replayed prefix's sealed identity ends here.
+            "pinned_attempt_id": "",
             "rework_count": rework,
         }
 

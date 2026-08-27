@@ -262,9 +262,15 @@ class PluginMaterializer:
             stage_dispatch = self.builder.build(
                 dispatch,
                 parent_receipt=dispatch.get("parent_receipt") or None,
+                # The parent receipt lives under the attempt identity the
+                # chain is sealed under -- the pinned one where a replayed
+                # prefix installed the receipt, the derived one otherwise.
+                # Must agree with what the builder puts in the dispatch, or
+                # the digest sent would not be the file the sealer re-reads.
                 parent_digest=self.parent_digest(
                     stage.id,
-                    derive_attempt_id(
+                    str(dispatch.get("pinned_attempt_id") or "")
+                    or derive_attempt_id(
                         self.builder.chain.development_id,
                         int(dispatch.get("generation", 1)),
                         int(dispatch.get("attempt", 1)),
