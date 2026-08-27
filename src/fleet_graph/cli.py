@@ -453,6 +453,7 @@ def _supervisor_run(args: argparse.Namespace) -> int:
         audit_timeout_seconds=args.audit_timeout,
         engine_url=args.engine_url,
         repo=pathlib.Path(args.repo).resolve() if args.repo else None,
+        dd_root=pathlib.Path(args.dd_root),
         publish_notes=not args.no_note,
         bus=bus,
         # R4-3: the decision publisher builds its own client against this URL,
@@ -692,8 +693,16 @@ def build_parser() -> argparse.ArgumentParser:
     supervisor_run.add_argument(
         "--repo",
         default=None,
-        help="local clone for development audits; without it a development "
-        "target reports the gap and classifies needs_human",
+        help="explicit local clone for development audits; without it the repo "
+        "resolves from the dd admission record (card head development_id -> "
+        "<dd-root>/<id>/record.json -> repo_path), and a development that "
+        "resolves neither reports the gap and classifies needs_human",
+    )
+    supervisor_run.add_argument(
+        "--dd-root",
+        default="/data/fleet-graph/dd",
+        help="dd admission records root; E1 dd-gate events resolve their "
+        "audit repo from <dd-root>/<development_id>/record.json",
     )
     supervisor_run.add_argument("--bus-url", default=DEFAULT_BUS_URL)
     supervisor_run.add_argument(
