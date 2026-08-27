@@ -896,12 +896,17 @@ class DdControlPlane:
         next_cursor = None
         for name in ids:
             status_path = self._dev_root(name) / STATUS_FILE
+            status: dict[str, Any] | None = None
             if status_path.is_file():
                 try:
                     status = json.loads(status_path.read_text(encoding="utf-8"))
                 except ValueError:
-                    status = self.rebuild_status(name)
-            else:
+                    status = None
+            # A terminal state is immutable, so its cache is trustworthy; a
+            # cached "running"/"created" row can be stale the moment the unit
+            # exits (measured: a failed run listed as running), so anything
+            # non-terminal is recomputed rather than served from the file.
+            if status is None or not status.get("terminal"):
                 status = self.rebuild_status(name)
             if state and status.get("state") != state:
                 continue

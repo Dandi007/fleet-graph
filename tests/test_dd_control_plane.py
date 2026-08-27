@@ -565,3 +565,43 @@ class TestStageModelPolicy:
         plane.start(dev)
         argv = launcher.specs[0].argv()
         assert argv[argv.index("--stage-model") + 1] == "continuous_review=deepseek-v4-pro"
+
+
+class TestListDoesNotServeStaleLiveness:
+    def test_a_cached_running_row_is_recomputed_once_the_unit_is_gone(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        """Measured on the real machine: a run that failed after the cache was
+        written kept listing as running. Terminal cache rows are immutable and
+        trusted; non-terminal rows are recomputed on every list."""
+        plane = make_plane(tmp_path)
+        dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
+        dev_root = plane.root / dev
+        stale = {
+            "development_id": dev,
+            "state": "running",
+            "stage": "",
+            "terminal": "",
+            "terminal_reason": "",
+            "head_commit": "",
+            "awaiting": None,
+            "active_unit": "fleet-graph-dd-gone-r1",
+            "launches": 1,
+        }
+        (dev_root / STATUS_FILE).write_text(json.dumps(stale), encoding="utf-8")
+        (dev_root / RESULT_FILE).write_text(
+            json.dumps(
+                {
+                    "development_id": dev,
+                    "terminal": "failed",
+                    "terminal_reason": "implement failed (PROVIDER_UNAVAILABLE)",
+                    "stage": "implement",
+                    "head_commit": "",
+                    "awaiting": None,
+                    "history": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        listed = plane.list()
+        assert listed["developments"][0]["state"] == "failed"
