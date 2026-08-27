@@ -34,7 +34,11 @@ log = logging.getLogger(__name__)
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 Phase = Literal["coordinator", "worker"]
-VALID_PHASES: frozenset[str] = frozenset({"coordinator", "worker"})
+# "acceptance" joined in the R0d hotfix: the acceptance step heartbeats like any
+# other phase, and a phase enum that lags the graph is a crash loop -- the
+# checkpoint resumes straight back into the raising node on every relaunch
+# (observed in production on wf-a08949, 2026-08-27 19:18-22:14).
+VALID_PHASES: frozenset[str] = frozenset({"coordinator", "worker", "acceptance"})
 
 # The pump refreshes at least this often; fleet-sentinel's staleness check is
 # calibrated against it, so slowing it down would create false alarms.

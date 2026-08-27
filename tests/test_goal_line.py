@@ -412,3 +412,89 @@ class TestWaitingOn:
         artifacts, _ = run_line(script, bounds=LineBounds(noop_limit=1))
         assert artifacts.terminal["terminal"] == TERMINAL_BLOCKED
         assert artifacts.terminal["waiting_on"] == "none"
+
+
+class TestFailedAttemptIsNotReAdopted:
+    """Hotfix: a failed prior coordinator attempt must get a new derived id.
+
+    Re-dispatching the failed id replays its bus lifecycle key with different
+    intent -> 409 -> exit 91 -> the round bricks until generation bumps, which
+    itself needs a coordinator run. Rollback of the attempt loop turns this red.
+    """
+
+    def test_failed_prior_attempt_gets_next_attempt_id(self, tmp_path):
+        import json as _json
+
+        from fleet_graph.executors.agent_run import AgentRunLauncher, derive_run_id
+        from fleet_graph.graphs.adapters import AgentRunCoordinator
+
+        launcher = AgentRunLauncher(state_root=str(tmp_path / "agent-runs"))
+        thread = "wf-t:g1"
+        failed_id = derive_run_id(thread, "coordinator-1", 1)
+        root = launcher.session_root_for(failed_id) / "run"
+        root.mkdir(parents=True)
+        (root / "result.json").write_text(
+            _json.dumps({"state": "failed", "exit_code": 91})
+        )
+
+        seen: list[str] = []
+
+        class SpyLauncher:
+            def session_root_for(self, run_id):
+                return launcher.session_root_for(run_id)
+
+            def launch(self, spec, run_id):
+                seen.append(run_id)
+                raise RuntimeError("stop at launch")
+
+        coord = AgentRunCoordinator(
+            launcher=SpyLauncher(),
+            folder_id="wf-t",
+            thread_id=thread,
+            run_root=tmp_path,
+        )
+        try:
+            coord.turn(1, {"folder_id": "wf-t"})
+        except RuntimeError:
+            pass
+        assert seen == [derive_run_id(thread, "coordinator-1", 2)]
+
+    def test_succeeded_prior_attempt_is_adopted_not_bumped(self, tmp_path):
+        import json as _json
+
+        from fleet_graph.executors.agent_run import AgentRunLauncher, derive_run_id
+        from fleet_graph.graphs.adapters import AgentRunCoordinator
+
+        launcher = AgentRunLauncher(state_root=str(tmp_path / "agent-runs"))
+        thread = "wf-t:g1"
+        ok_id = derive_run_id(thread, "coordinator-1", 1)
+        root = launcher.session_root_for(ok_id) / "run"
+        root.mkdir(parents=True)
+        (root / "result.json").write_text(
+            _json.dumps(
+                {"state": "succeeded", "exit_code": 0, "structured_result": {"verdict": "done"}}
+            )
+        )
+
+        seen: list[str] = []
+
+        class SpyLauncher:
+            def session_root_for(self, run_id):
+                return launcher.session_root_for(run_id)
+
+            def launch(self, spec, run_id):
+                seen.append(run_id)
+                return launcher.launch(spec, run_id)
+
+            def wait(self, ticket, **kw):
+                return launcher.wait(ticket, **kw)
+
+        coord = AgentRunCoordinator(
+            launcher=SpyLauncher(),
+            folder_id="wf-t",
+            thread_id=thread,
+            run_root=tmp_path,
+        )
+        result = coord.turn(1, {"folder_id": "wf-t"})
+        assert seen == [ok_id]
+        assert result["verdict"] == "done"
