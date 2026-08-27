@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -226,3 +227,29 @@ class TestCli:
         assert args.max_rounds == 10
         assert args.noop_limit == 3
         assert args.timeout_limit == 2
+
+
+class TestAcceptancePassing:
+    """The declaration crosses into the unit as one JSON argument. Its
+    visibility in argv is deliberate: the trust anchor is the roster's PR
+    review, and nothing secret or agent-written is in it."""
+
+    def test_the_declaration_is_one_json_argument(self) -> None:
+        declaration = json.dumps(
+            {
+                "argvs": [["systemctl", "--user", "is-active", "loop-engine-jobd"]],
+                "cwd": "/tmp",
+                "timeout_seconds": 300,
+            }
+        )
+        spec = LaunchSpec(folder_id="wf-1", seat="s", acceptance_json=declaration)
+        argv = spec.argv()
+        recovered = json.loads(argv[argv.index("--acceptance-json") + 1])
+        assert recovered["argvs"] == [["systemctl", "--user", "is-active", "loop-engine-jobd"]]
+        assert recovered["cwd"] == "/tmp"
+        assert recovered["timeout_seconds"] == 300
+
+    def test_no_declaration_means_no_flag(self, spec: LaunchSpec) -> None:
+        """The line tells `not declared` apart from `declared empty` by the
+        flag's absence; passing an empty one would erase that distinction."""
+        assert "--acceptance-json" not in spec.argv()

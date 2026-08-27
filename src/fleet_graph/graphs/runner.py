@@ -14,6 +14,7 @@ from typing import Any
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from fleet_graph.acceptance import AcceptanceRunner, AcceptanceSpec
 from fleet_graph.bus.client import BusClient
 from fleet_graph.bus.inbox import Inbox
 from fleet_graph.executors.agent_run import AgentRunLauncher
@@ -47,6 +48,9 @@ class LineConfig:
     #: Test seam: the kill-restart contract test points this at a fake binary.
     #: Production leaves it None and gets DEFAULT_AGENT_RUN_BIN.
     agent_run_bin: str | None = None
+    #: What the roster declared for the acceptance step (R0d). None still gets
+    #: the step -- it states `not_declared` rather than staying silent.
+    acceptance: AcceptanceSpec | None = None
 
     @property
     def inbox_alias(self) -> str | None:
@@ -117,6 +121,9 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         persist_coord_input=lambda round_no, payload: write_json_durable(
             config.run_root / "coord" / f"round-{round_no}-input.json", payload
         ),
+        # Always constructed: an undeclared spec yields the explicit
+        # `not_declared` fact instead of a silently absent step.
+        acceptance=AcceptanceRunner(config.acceptance),
     )
     return build_goal_line_graph(deps), deps
 

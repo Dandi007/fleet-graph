@@ -118,6 +118,45 @@ agent 写的散文，读它就成了替它判活干得对不对），但你该�
   没有卡——发不出去时降级为仅日志可见（`board_question` 字段记录结果），升报面
   的完整化归 R4。
 
+## 验收执行步（R0d）
+
+goal 线每个 worker turn 之后有一个**机械验收步**：进程内 subprocess 逐条执行
+名册里声明的 argv，产出 `[{command, exit_code, duration_s, tail}]`，作为下一轮
+coordinator 输入的 `last_acceptance` 字段。**执行归编排层，裁决仍归
+coordinator**——这一步只报退出码和尾部输出，红了也不改任何路由；红意味着什么，
+由 coordinator 在下一轮拿着事实裁。这是 counts-versus-prose 边界的又一次应用：
+执行不是裁决。
+
+**声明处 = 本仓 `config/ronin-lines.json`（PR-reviewed）**，字段：
+
+```json
+"acceptance": [["systemctl", "--user", "is-active", "loop-engine-jobd"]],
+"acceptance_cwd": "/tmp",
+"acceptance_timeout_seconds": 300
+```
+
+为什么不放 goal.md / work folder：**凡 agent 可写的面都是不当控制输入**
+（wf-13ff9e findings §31c）——把「编排层会替你执行什么命令」交给 agent 可写的
+文件，等于让被验收者自己写验收器。声明只认走 PR review 的名册。
+
+信任锚与可见性：声明经 launcher 以 `--acceptance-json '<json>'` 一参传给线，
+在 `systemctl --user` 的 argv 里**可见，且这是 acceptable 的**——信任锚是名册的
+PR review，不是 argv 的保密性；argv 里没有任何秘密，也没有任何 agent 写的东西。
+
+三件要知道的事：
+
+- **`not_declared` 是显式事实，不是静默跳过**。没声明命令的线，coordinator 每轮
+  照样收到 `{"status": "not_declared"}`——「没验收」和「验收过了」必须不可混淆
+  （这正是三条在跑线每轮记 "NOT RUN" 的教训）。声明了命令但没写
+  `acceptance_cwd` 的线，收到 `{"status": "skipped:no_cwd"}`：执行目录是声明的
+  一部分，不许隐式继承引擎自己的 cwd。
+- **超时/起不来记合成退出码**（同 supervise/audit.py 约定：124 超时、127 找不到
+  命令），tail 是 stdout/stderr 各截末 2000 字符；每条命令都会执行，前一条红
+  不吞掉后一条。命令只继承 PATH/HOME（白名单在 `acceptance.py` 的 `ENV_KEEP`，
+  扩白名单走 PR）。
+- **执行步自身炸了不 fault 线**：记 `{"status": "acceptance_error"}` 事实，
+  coordinator 自己裁。坏掉的验收器最多损失可观测性，不能杀掉工作。
+
 ## 判断顺序
 
 `decide()` 里名册排在最前：一条没进名册的线，refusal 是 `line_disabled` 而不是

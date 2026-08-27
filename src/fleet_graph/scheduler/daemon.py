@@ -60,6 +60,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from fleet_graph.acceptance import AcceptanceSpec
 from fleet_graph.scheduler.ignition import (
     DEFAULT_BACKOFF_CAP_SECONDS,
     DEFAULT_CAP_WINDOW_SECONDS,
@@ -108,6 +109,18 @@ class LineSpec:
     #: tick logs it as `line_disabled` every interval, so it is visible rather
     #: than silent.
     enabled: bool = False
+    #: The acceptance declaration (R0d): argv lists the line's acceptance step
+    #: runs mechanically after each worker turn. Declared *here* -- a
+    #: PR-reviewed file -- and never in goal.md or the work folder, because
+    #: anything an agent can write is an improper control input for what gets
+    #: executed on this host (wf-13ff9e findings §31c).
+    acceptance: list[list[str]] = field(default_factory=list)
+    #: Where those commands run. Deliberately not defaulted to the engine's
+    #: own cwd: an undeclared directory means the step refuses to run and
+    #: records `skipped:no_cwd` instead of inheriting ambient state.
+    acceptance_cwd: str | None = None
+    #: Per command, not for the batch.
+    acceptance_timeout_seconds: int = 300
 
 
 @dataclass
@@ -211,7 +224,13 @@ class SchedulerConfig:
     def from_json(cls, path: Path) -> SchedulerConfig:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
         return cls(
-            lines=[LineSpec(**entry) for entry in raw.get("lines", [])],
+            # Keys starting with "_" are the file's comment convention
+            # (_comment/_provenance at the root); allowing them inside a line
+            # entry lets a declaration carry its provenance next to itself.
+            lines=[
+                LineSpec(**{k: v for k, v in entry.items() if not k.startswith("_")})
+                for entry in raw.get("lines", [])
+            ],
             run_root=Path(raw.get("run_root", "/data/fleet-graph/runs")),
             maintenance_stop_path=Path(raw.get("maintenance_stop", str(DEFAULT_MAINTENANCE_STOP))),
             interval_seconds=float(raw.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)),
@@ -719,7 +738,25 @@ class Scheduler:
             max_rounds=line.max_rounds,
             run_root=self.config.run_root / line.folder_id,
             environment=self.line_environment(),
+            acceptance_json=self.acceptance_json_for(line),
         )
+
+    def acceptance_json_for(self, line: LineSpec) -> str | None:
+        """The roster's acceptance declaration, serialised for the launcher.
+
+        A declaration with commands but no cwd is still passed down: the
+        line's acceptance step is the one place that refuses it, and it does
+        so out loud (`skipped:no_cwd`) where the coordinator can see the
+        declaration is incomplete. Dropping it here would turn a reviewable
+        config mistake into a silent `not_declared`.
+        """
+        if not line.acceptance:
+            return None
+        return AcceptanceSpec(
+            argvs=tuple(tuple(str(part) for part in argv) for argv in line.acceptance),
+            cwd=line.acceptance_cwd,
+            timeout_seconds=line.acceptance_timeout_seconds,
+        ).to_cli_json()
 
     def line_environment(self) -> dict[str, str]:
         """A line must be able to run the executables the scheduler can.

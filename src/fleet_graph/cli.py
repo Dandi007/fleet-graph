@@ -50,7 +50,17 @@ def _line_run(args: argparse.Namespace) -> int:
     """Run one ronin line to termination, printing its terminal record."""
     import pathlib
 
+    from fleet_graph.acceptance import AcceptanceSpec
     from fleet_graph.graphs.runner import LineConfig, run_line
+
+    acceptance = None
+    if args.acceptance_json:
+        try:
+            acceptance = AcceptanceSpec.from_cli_json(args.acceptance_json)
+        except (ValueError, TypeError) as exc:
+            # A declaration we cannot read is an operator error worth stopping
+            # on, not something to silently degrade to "not declared".
+            raise SystemExit(f"--acceptance-json is not a valid declaration: {exc}") from exc
 
     config = LineConfig(
         folder_id=args.folder,
@@ -65,6 +75,7 @@ def _line_run(args: argparse.Namespace) -> int:
         generation=args.generation,
         # None -> durable default under run_root; ":memory:" must be asked for.
         checkpoint_path=args.checkpoint,
+        acceptance=acceptance,
     )
     result = run_line(config, run_id=args.run_id)
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
@@ -367,6 +378,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="checkpoint sqlite path; defaults to <run-root>/checkpoint.sqlite3",
     )
     run.add_argument("--run-id", default=None)
+    run.add_argument(
+        "--acceptance-json",
+        default=None,
+        help="the roster's acceptance declaration as one JSON argument "
+        '({"argvs": [[...]], "cwd": ..., "timeout_seconds": ...}). The trust '
+        "anchor is the roster config's PR review, so its visibility in argv "
+        "is acceptable; absence means the line records `not_declared`",
+    )
     run.set_defaults(func=_line_run)
 
     dd = subparsers.add_parser("dd", help="run a dev-dispatch development")

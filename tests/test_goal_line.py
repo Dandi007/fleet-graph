@@ -87,12 +87,30 @@ class FakeArtifacts:
         return "terminal.json"
 
 
+class FakeAcceptance:
+    """Replays fixed facts, or raises to prove the step never faults the line."""
+
+    def __init__(
+        self, facts: dict[str, Any] | None = None, *, raises: Exception | None = None
+    ) -> None:
+        self.facts = facts or {"status": "ran", "results": []}
+        self.raises = raises
+        self.calls = 0
+
+    def run(self) -> dict[str, Any]:
+        self.calls += 1
+        if self.raises is not None:
+            raise self.raises
+        return self.facts
+
+
 def run_line(
     script: list[dict[str, Any]],
     *,
     bounds: LineBounds | None = None,
     worker: FakeWorker | None = None,
     inbox: FakeInbox | None = None,
+    acceptance: Any = None,
 ) -> tuple[FakeArtifacts, LineDeps]:
     artifacts = FakeArtifacts()
     deps = LineDeps(
@@ -102,6 +120,7 @@ def run_line(
         artifacts=artifacts,
         guards=LineGuards(bounds=bounds or LineBounds()),
         folder_id="wf-3f30cd",
+        acceptance=acceptance,
     )
     compiled = build_goal_line_graph(deps).compile(checkpointer=InMemorySaver())
     compiled.invoke(
@@ -166,12 +185,12 @@ class TestRounds:
         )
         assert [r["round"] for r in artifacts.rounds] == [1, 2]
 
-    def test_heartbeat_marks_both_phases(self) -> None:
+    def test_heartbeat_marks_all_three_phases(self) -> None:
         artifacts, _ = run_line(
             [{"verdict": "continue", "next_prompt": "first"}, {"verdict": "done"}]
         )
         phases = {phase for _, phase in artifacts.beats}
-        assert phases == {"coordinator", "worker"}
+        assert phases == {"coordinator", "worker", "acceptance"}
 
 
 class TestBreakers:
@@ -267,6 +286,77 @@ class TestNoSemanticInterpretation:
         # worker's text contained the word.
         assert artifacts.terminal["reason"] == "coordinator said so"
         assert len(artifacts.rounds) == 2
+
+
+class TestAcceptanceStep:
+    """R0d: the mechanical acceptance step between the worker and the next
+    coordinator turn. Execution is not judgement -- the facts flow into
+    `last_acceptance` and nothing about routing changes here."""
+
+    def test_facts_reach_the_next_coordinator_input(self) -> None:
+        acceptance = FakeAcceptance(
+            {"status": "ran", "results": [{"command": ["true"], "exit_code": 0}]}
+        )
+        _, deps = run_line(
+            [{"verdict": "continue", "next_prompt": "do it"}, {"verdict": "done"}],
+            acceptance=acceptance,
+        )
+        assert "last_acceptance" not in deps.coordinator.calls[0], (
+            "round 1 has no worker turn behind it, so no acceptance facts yet"
+        )
+        assert deps.coordinator.calls[1]["last_acceptance"]["status"] == "ran"
+        assert acceptance.calls == 1
+
+    def test_no_declaration_is_an_explicit_fact_not_a_silent_skip(self) -> None:
+        """The NOT-RUN failure: "not declared" and "passed" must never be
+        confusable, so absence is stated in the coordinator input."""
+        _, deps = run_line(
+            [{"verdict": "continue", "next_prompt": "do it"}, {"verdict": "done"}],
+        )
+        assert deps.coordinator.calls[1]["last_acceptance"] == {"status": "not_declared"}
+
+    def test_a_broken_acceptance_runner_never_faults_the_line(self) -> None:
+        """The step failing must cost observability, not the work."""
+        artifacts, deps = run_line(
+            [
+                {"verdict": "continue", "next_prompt": "do it"},
+                {"verdict": "done", "reason": "coordinator judged it"},
+            ],
+            acceptance=FakeAcceptance(raises=RuntimeError("runner exploded")),
+        )
+        assert artifacts.terminal["terminal"] == TERMINAL_DONE
+        assert artifacts.terminal["pump_fault"] is False
+        facts = deps.coordinator.calls[1]["last_acceptance"]
+        assert facts["status"] == "acceptance_error"
+        assert "runner exploded" in facts["detail"]
+
+    def test_red_exit_codes_change_no_routing(self) -> None:
+        """A red command is a fact for the coordinator, never a verdict here."""
+        worker = FakeWorker()
+        run_line(
+            [
+                {"verdict": "continue", "next_prompt": "first instruction"},
+                {"verdict": "continue", "next_prompt": "second, quite different"},
+                {"verdict": "done"},
+            ],
+            worker=worker,
+            acceptance=FakeAcceptance(
+                {"status": "ran", "results": [{"command": ["false"], "exit_code": 1}]}
+            ),
+        )
+        assert len(worker.prompts) == 2, "the line kept going; red is not blocked"
+
+    def test_facts_run_even_after_a_worker_timeout(self) -> None:
+        acceptance = FakeAcceptance()
+        run_line(
+            [
+                {"verdict": "continue", "next_prompt": "attempt the task"},
+                {"verdict": "done"},
+            ],
+            worker=FakeWorker(raises=TimeoutError("no answer")),
+            acceptance=acceptance,
+        )
+        assert acceptance.calls == 1
 
 
 class TestWaitingOn:

@@ -9,11 +9,16 @@ One round:
 
     bounds -> drain inbox -> coordinator turn -> verdict
                                                   |- done/blocked -> terminal
-                                                  `- continue -> guards -> worker turn -> loop
+                                                  `- continue -> guards -> worker turn
+                                                                 -> acceptance step -> loop
 
 What this module refuses to do is as important as what it does. It never reads
-meaning out of the coordinator's answer beyond the declared verdict field, it
-never runs an acceptance check, and it never writes to a work folder (INV-3).
+meaning out of the coordinator's answer beyond the declared verdict field, and
+it never writes to a work folder (INV-3). The acceptance step (R0d) is not an
+exception to that: it mechanically runs argv the *roster config* declared --
+never anything an agent wrote -- and hands the exit codes to the next
+coordinator turn as facts. Execution is not judgement; the verdict on what a
+red command means stays the coordinator's.
 It reaches agents only through agent-run and agent-session, never by spawning a
 harness itself (INV-4/B8). Both rules exist because the orchestrator becoming a
 second, unaccountable coordinator is the failure mode that killed the previous
@@ -27,6 +32,7 @@ from typing import Any, Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from fleet_graph.acceptance import STATUS_ERROR, STATUS_NOT_DECLARED
 from fleet_graph.graphs.guards import LineGuards, PromptVerdict
 from fleet_graph.state.run_artifacts import WAITING_ON_DEFAULT, normalize_waiting_on
 
@@ -73,6 +79,11 @@ class LineState(TypedDict, total=False):
     waiting_on_declared: str
     pump_fault: bool
     rounds_recorded: int
+    #: Facts from the last acceptance step: status plus per-command exit codes
+    #: and tails. Written by the orchestration layer's own subprocesses, never
+    #: by an agent -- which is exactly why the coordinator may weigh it above
+    #: any self-report.
+    last_acceptance: dict[str, Any]
     # Set only between the coordinator accepting a prompt and the worker
     # consuming it; never persisted anywhere durable.
     pending_prompt: str
@@ -93,6 +104,12 @@ class Worker(Protocol):
 
 class InboxPort(Protocol):
     def drain_then_ack(self, persist: Any) -> tuple[Any, list[str]]: ...
+
+
+class AcceptancePort(Protocol):
+    """Runs the roster-declared acceptance commands, returns the facts dict."""
+
+    def run(self) -> dict[str, Any]: ...
 
 
 class ArtifactsPort(Protocol):
@@ -122,6 +139,9 @@ class LineDeps:
     folder_id: str = ""
     persist_coord_input: Any = None
     clock: Any = None
+    #: None means no acceptance was declared for this line; the step still
+    #: states that fact explicitly rather than staying silent.
+    acceptance: AcceptancePort | None = None
 
     def now(self) -> float | None:
         return self.clock() if self.clock is not None else None
@@ -159,6 +179,11 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         }
         if state.get("last_turn_status"):
             coord_input["last_turn_status"] = state["last_turn_status"]
+        if state.get("last_acceptance"):
+            # Mechanical facts from the orchestration layer's own acceptance
+            # step -- the persona instructs the coordinator to weigh these
+            # above any self-report in the worker's prose.
+            coord_input["last_acceptance"] = state["last_acceptance"]
 
         # Must-deliver ordering: the messages land in the durable coordinator
         # input before anything is acked. See bus/inbox.py.
@@ -280,6 +305,34 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             "last_turn_status": {},
         }
 
+    def acceptance_step(state: LineState) -> LineState:
+        """Script step, on the counts side of counts-versus-prose.
+
+        Runs the roster's declared argv and records exit codes and tails.
+        Never a judge: a red exit code changes nothing here, it only becomes a
+        fact in the next coordinator input. And never a fault: a broken
+        acceptance runner is itself a fact for the coordinator to weigh
+        (STATUS_ERROR), not a reason to kill the line -- the step failing must
+        cost observability, not the work.
+        """
+        round_no = state.get("round_no", 1)
+        deps.artifacts.heartbeat(round_no, "acceptance")
+
+        if deps.acceptance is None:
+            # Stated, never silent: "not declared" and "passed" being
+            # confusable is the NOT-RUN failure this step exists to end.
+            return {"last_acceptance": {"status": STATUS_NOT_DECLARED}}
+        try:
+            facts = deps.acceptance.run()
+        except Exception as exc:  # the step must not fault the line
+            facts = {
+                "status": STATUS_ERROR,
+                "detail": f"{type(exc).__name__}: {exc}"[:400],
+            }
+        if not isinstance(facts, dict):
+            facts = {"status": STATUS_ERROR, "detail": "acceptance runner returned a non-dict"}
+        return {"last_acceptance": facts}
+
     def finalise(state: LineState) -> LineState:
         """Terminal record lands locally before anything is published."""
         deps.artifacts.write_terminal(
@@ -307,12 +360,16 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     graph.add_node("check_bounds", check_bounds)
     graph.add_node("coordinator_turn", coordinator_turn)
     graph.add_node("worker_turn", worker_turn)
+    graph.add_node("acceptance_step", acceptance_step)
     graph.add_node("finalise", finalise)
 
     graph.add_edge(START, "check_bounds")
     graph.add_conditional_edges("check_bounds", after_bounds)
     graph.add_conditional_edges("coordinator_turn", after_coordinator)
-    graph.add_edge("worker_turn", "check_bounds")
+    # Unconditional: the facts are gathered even after a worker timeout --
+    # they are cheap, and the coordinator judging a timeout deserves them too.
+    graph.add_edge("worker_turn", "acceptance_step")
+    graph.add_edge("acceptance_step", "check_bounds")
     graph.add_edge("finalise", END)
     return graph
 
@@ -323,6 +380,7 @@ __all__ = [
     "TERMINAL_BOUNDS",
     "TERMINAL_DONE",
     "TERMINAL_FAULT",
+    "AcceptancePort",
     "LineDeps",
     "LineState",
     "build_goal_line_graph",

@@ -38,6 +38,12 @@ class LaunchSpec:
     working_directory: str = "/data/apps/fleet-graph/current"
     executable: str = "/data/apps/fleet-graph/current/.venv/bin/fleet-graph"
     environment: dict[str, str] = field(default_factory=dict)
+    #: The roster's acceptance declaration, already serialised by
+    #: AcceptanceSpec.to_cli_json. One JSON argument so it crosses the
+    #: systemd-run boundary without quoting rules; visible in argv by design,
+    #: because the trust anchor is the roster config's PR review, not secrecy.
+    #: None means the roster declared nothing and the line records that fact.
+    acceptance_json: str | None = None
 
     @property
     def log_file(self) -> Path:
@@ -96,6 +102,8 @@ class LaunchSpec:
             "--checkpoint",
             str(run_root / "checkpoint.sqlite3"),
         ]
+        if self.acceptance_json:
+            argv += ["--acceptance-json", self.acceptance_json]
         return argv
 
 
