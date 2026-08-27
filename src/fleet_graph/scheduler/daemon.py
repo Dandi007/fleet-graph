@@ -63,6 +63,7 @@ from typing import Any, Protocol
 from fleet_graph.scheduler.ignition import (
     DEFAULT_BACKOFF_CAP_SECONDS,
     DEFAULT_COOLDOWN_SECONDS,
+    DEFAULT_CAP_WINDOW_SECONDS,
     DEFAULT_TOTAL_CAP,
     IgnitionDecision,
     LineStatus,
@@ -144,6 +145,8 @@ class SchedulerConfig:
     interval_seconds: float = DEFAULT_INTERVAL_SECONDS
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS
     total_cap: int = DEFAULT_TOTAL_CAP
+    #: See DEFAULT_CAP_WINDOW_SECONDS -- the span `total_cap` is counted over.
+    cap_window_seconds: float = DEFAULT_CAP_WINDOW_SECONDS
     backoff_cap_seconds: float = DEFAULT_BACKOFF_CAP_SECONDS
     #: Extra environment handed to every line, on top of the scheduler's PATH.
     extra_line_environment: dict[str, str] = field(default_factory=dict)
@@ -166,6 +169,10 @@ class SchedulerConfig:
             interval_seconds=float(raw.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)),
             cooldown_seconds=float(raw.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS)),
             total_cap=int(raw.get("total_cap", DEFAULT_TOTAL_CAP)),
+            cap_window_seconds=float(raw.get("cap_window_seconds", DEFAULT_CAP_WINDOW_SECONDS)),
+            # Was missing: the field existed with a default but the file was
+            # never read, so setting it in config had no effect at all.
+            launch_stagger_seconds=float(raw.get("launch_stagger_seconds", 45.0)),
             backoff_cap_seconds=float(raw.get("backoff_cap_seconds", DEFAULT_BACKOFF_CAP_SECONDS)),
             extra_line_environment=dict(raw.get("line_environment", {})),
         )
@@ -191,6 +198,9 @@ class Scheduler:
         self.observe = observe
         self.sleep = sleep or time.sleep
         self.total_started = 0
+        #: Timestamps of launches that followed a run which advanced no round.
+        #: The global cap counts these, not every launch -- see `decide`.
+        self.unproductive_launches: list[float] = []
         self.last_start_at: dict[str, float] = {}
         #: Why a seat's probe could not answer, keyed by seat. `decide` only
         #: learns that we could not ask; the reason belongs in the log line an
@@ -344,11 +354,16 @@ class Scheduler:
         nobody is watching. Observed on the real fleet: a release at 22:13
         re-ignited a line with an already-earned streak of 2.
 
-        `total_started` is deliberately *not* persisted. That breaker exists
-        for a systemic fault -- a dead gateway, a bad release -- and shipping
-        new code is a plausible remedy for exactly those, so letting it reset
-        on deploy is the right reading. Shipping unrelated code is not a
-        remedy for one line's missing data source.
+        The global cap's evidence is deliberately *not* persisted either. That
+        breaker exists for a systemic fault -- a dead gateway, a bad release --
+        and shipping new code is a plausible remedy for exactly those, so
+        letting it reset on deploy is the right reading. Shipping unrelated
+        code is not a remedy for one line's missing data source.
+
+        It now counts zero-progress launches inside a window rather than every
+        launch ever. Restarting to clear it is still valid, but no longer the
+        routine it had become: a healthy fleet used to trip the cap roughly
+        every six hours purely by working.
         """
         value = self.stall_state(folder_id)["last_start_at"]
         if value is None:
@@ -417,6 +432,16 @@ class Scheduler:
         env.update(self.config.extra_line_environment)
         return {k: v for k, v in env.items() if v}
 
+    def unproductive_recent(self, now: float) -> int:
+        """Zero-progress launches still inside the cap window.
+
+        Pruning here rather than on append keeps the list correct even when the
+        daemon sits idle for longer than the window.
+        """
+        cutoff = now - self.config.cap_window_seconds
+        self.unproductive_launches = [t for t in self.unproductive_launches if t >= cutoff]
+        return len(self.unproductive_launches)
+
     def tick(self) -> list[TickResult]:
         now = self.clock()
         stopped = self.maintenance_stop()
@@ -424,16 +449,18 @@ class Scheduler:
         launched_this_tick = 0
 
         for line in self.config.lines:
+            streak = self.account_last_run(line.folder_id)
             decision = decide(
                 self.status_of(line),
                 now=now,
                 enabled=line.enabled,
                 maintenance_stop=stopped,
-                zero_progress_streak=self.account_last_run(line.folder_id),
+                zero_progress_streak=streak,
                 gateway_healthy=self.gateway_healthy(line.seat),
-                total_started=self.total_started,
+                unproductive_recent=self.unproductive_recent(now),
                 cooldown_seconds=self.config.cooldown_seconds,
                 total_cap=self.config.total_cap,
+                cap_window_seconds=self.config.cap_window_seconds,
                 backoff_cap_seconds=self.config.backoff_cap_seconds,
             )
             result = TickResult(line.folder_id, decision)
@@ -451,6 +478,20 @@ class Scheduler:
                 # every time would otherwise never reach the cap it exists to
                 # trip.
                 self.total_started += 1
+                if not result.launch.started or streak > 0:
+                    # Evidence toward "something is systemically wrong", in the
+                    # two shapes that actually mean it: the unit would not start
+                    # at all, or the line it starts has run and got nowhere.
+                    #
+                    # The first disjunct is not optional. A bad release is the
+                    # breaker's main case, and there the launch fails outright
+                    # on a line whose streak is still 0 -- dropping it would
+                    # switch the breaker off for exactly what it is for.
+                    #
+                    # What is deliberately *not* counted: a launch of a line
+                    # that advanced a round last time. That is the fleet
+                    # working, however much of it there is.
+                    self.unproductive_launches.append(now)
                 self.record_start(line.folder_id, now)
             results.append(result)
             if self.observe is not None:

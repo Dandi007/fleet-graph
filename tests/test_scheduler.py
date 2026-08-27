@@ -40,7 +40,7 @@ def call(st: LineStatus, **kwargs: Any) -> IgnitionDecision:
         "maintenance_stop": False,
         "zero_progress_streak": 0,
         "gateway_healthy": True,
-        "total_started": 0,
+        "unproductive_recent": 0,
     }
     params.update(kwargs)
     return decide(st, **params)
@@ -81,7 +81,7 @@ class TestTheRoster:
             status(running=True, terminal="done", last_start_at=NOW),
             enabled=False,
             gateway_healthy=False,
-            total_started=DEFAULT_TOTAL_CAP,
+            unproductive_recent=DEFAULT_TOTAL_CAP,
         )
         assert decision.refusal is Refusal.LINE_DISABLED
 
@@ -155,8 +155,23 @@ class TestRefusals:
         assert "s of cooldown left" in decision.detail
 
     def test_global_cap_stops_a_restart_storm(self) -> None:
-        decision = call(status(), total_started=DEFAULT_TOTAL_CAP)
+        decision = call(status(), unproductive_recent=DEFAULT_TOTAL_CAP)
         assert decision.refusal is Refusal.TOTAL_CAP_REACHED
+
+    def test_the_cap_says_what_it_actually_counted(self) -> None:
+        """An operator reading the log should not have to guess whether the
+        number means launches or faults; the old text said "global cap reached"
+        and left them to find out the hard way."""
+        decision = call(status(), unproductive_recent=DEFAULT_TOTAL_CAP)
+        assert "zero-progress launches" in decision.detail
+        assert "60min" in decision.detail
+
+    def test_a_busy_but_productive_fleet_never_trips_the_cap(self) -> None:
+        """The regression this whole change exists for. wf-40fa8d ran 25 rounds
+        and reached its goal, contributing 23 launches to a cap of 60 -- work,
+        counted as evidence of malfunction."""
+        decision = call(status(), unproductive_recent=0)
+        assert decision.refusal is not Refusal.TOTAL_CAP_REACHED
 
     def test_red_gateway_blocks_ignition(self) -> None:
         assert call(status(), gateway_healthy=False).refusal is Refusal.GATEWAY_RED

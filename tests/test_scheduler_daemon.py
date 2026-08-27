@@ -132,12 +132,27 @@ class TestEveryRefusalComesFromDecide:
         assert scheduler.tick()[0].decision.refusal is Refusal.COOLING_DOWN
 
     def test_the_total_cap_trips(self, tmp_path: Path) -> None:
+        """Launches that produce nothing trip it, and the daemon surfaces the
+        refusal decide returned rather than inventing its own."""
         lines = [
             LineSpec(folder_id=f"wf-{i}", seat="opencode-dsv4pro", enabled=True) for i in range(4)
         ]
-        results = make(tmp_path, lines=lines, total_cap=2).tick()
-        refusals = [r.decision.refusal for r in results]
+        scheduler = make(
+            tmp_path, lines=lines, launcher=FakeLauncher(started=False), total_cap=2
+        )
+        refusals = [r.decision.refusal for r in scheduler.tick()]
         assert refusals == [None, None, Refusal.TOTAL_CAP_REACHED, Refusal.TOTAL_CAP_REACHED]
+
+    def test_four_healthy_launches_do_not_trip_a_cap_of_two(self, tmp_path: Path) -> None:
+        """The behaviour change, stated as a guarantee: the cap counts faults,
+        so a fleet that is merely busy can never reach it. Before this, four
+        working lines and a cap of two meant two of them were refused for
+        looking like a restart storm."""
+        lines = [
+            LineSpec(folder_id=f"wf-{i}", seat="opencode-dsv4pro", enabled=True) for i in range(4)
+        ]
+        refusals = [r.decision.refusal for r in make(tmp_path, lines=lines, total_cap=2).tick()]
+        assert refusals == [None, None, None, None]
 
     def test_a_failed_launch_still_counts_against_the_cap(self, tmp_path: Path) -> None:
         """Otherwise a launch that fails every time never trips the cap that
@@ -379,8 +394,30 @@ class TestARestartDoesNotHandOutAFreeLaunch:
         not."""
         first = make(tmp_path, now=1000.0)
         first.tick()
-        assert first.total_started == 1
-        assert make(tmp_path).total_started == 0
+        first.unproductive_launches.append(1000.0)
+        assert first.unproductive_recent(1000.0) == 1
+        assert make(tmp_path).unproductive_recent(1000.0) == 0
+
+    def test_a_productive_launch_is_not_evidence_of_a_fault(self, tmp_path: Path) -> None:
+        """The bug this replaced: the cap counted every launch, so a line that
+        ran 25 rounds and reached its goal pushed the fleet toward a breaker
+        meant for dead gateways. Work is not a malfunction."""
+        scheduler = make(tmp_path, now=1000.0, cooldown_seconds=0)
+        scheduler.tick()
+        assert scheduler.total_started == 1, "the launch still counts as a launch"
+        assert scheduler.unproductive_recent(1000.0) == 0, "but not as evidence of a fault"
+
+    def test_evidence_older_than_the_window_stops_counting(self, tmp_path: Path) -> None:
+        """A cumulative count on a long-lived daemon reaches any cap eventually,
+        which makes it a timer rather than a detector -- observed on the real
+        fleet as a trip roughly every six hours of healthy operation."""
+        scheduler = make(tmp_path, now=1000.0)
+        window = scheduler.config.cap_window_seconds
+        scheduler.unproductive_launches.extend([1000.0, 1000.0 + window / 2])
+        assert scheduler.unproductive_recent(1000.0 + window / 2) == 2
+        assert scheduler.unproductive_recent(1000.0 + window + 1) == 1, (
+            "the older one has aged out"
+        )
 
 
 class TestItWalksTheRosterRatherThanStartingIt:

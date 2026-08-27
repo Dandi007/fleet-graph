@@ -21,6 +21,11 @@ DEFAULT_COOLDOWN_SECONDS = 300
 # Global circuit breaker across all lines. Without it a systemic fault (a dead
 # gateway, a bad release) turns into an unbounded restart storm.
 DEFAULT_TOTAL_CAP = 60
+#: The window the global cap counts over. The cap asks "are this many launches
+#: plausibly independent faults?", and that question only has an answer over a
+#: span of time -- a cumulative count on a long-lived daemon reaches any cap
+#: eventually, which makes it a timer rather than a detector.
+DEFAULT_CAP_WINDOW_SECONDS = 3600.0
 
 # A line that keeps terminating without advancing a single round is not going
 # to be fixed by starting it again five minutes later. Each repeat doubles the
@@ -88,10 +93,11 @@ def decide(
     enabled: bool,
     maintenance_stop: bool,
     gateway_healthy: bool | None,
-    total_started: int,
+    unproductive_recent: int,
     zero_progress_streak: int,
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
     total_cap: int = DEFAULT_TOTAL_CAP,
+    cap_window_seconds: float = DEFAULT_CAP_WINDOW_SECONDS,
     backoff_cap_seconds: float = DEFAULT_BACKOFF_CAP_SECONDS,
 ) -> IgnitionDecision:
     """Decide whether to ignite `status`, in the babysitter's order.
@@ -146,12 +152,20 @@ def decide(
             )
         return IgnitionDecision(False, Refusal.COOLING_DOWN, f"{remaining:.0f}s of cooldown left")
 
-    if total_started >= total_cap:
+    if unproductive_recent >= total_cap:
+        # Counts zero-progress launches only, and only within a window. The
+        # breaker's own sentence is "this many *independent faults* is less
+        # likely than one systemic fault" -- so a launch that advanced a round
+        # is not evidence for it, and neither is one from six hours ago. The
+        # first spelling counted every launch for the daemon's whole lifetime,
+        # which made a healthy fleet trip it on a schedule: one line that ran
+        # 25 rounds and reached its goal contributed 23 of the 60.
         return IgnitionDecision(
             False,
             Refusal.TOTAL_CAP_REACHED,
-            f"global cap {total_cap} reached; a systemic fault is more likely than "
-            f"{total_cap} independent ones",
+            f"{unproductive_recent} zero-progress launches in the last "
+            f"{cap_window_seconds / 60:.0f}min reached the cap of {total_cap}; "
+            f"a systemic fault is more likely than {total_cap} independent ones",
         )
 
     if gateway_healthy is None:
@@ -181,6 +195,7 @@ __all__ = [
     "DEFAULT_BACKOFF_CAP_SECONDS",
     "DEFAULT_COOLDOWN_SECONDS",
     "DEFAULT_TOTAL_CAP",
+    "DEFAULT_CAP_WINDOW_SECONDS",
     "IgnitionDecision",
     "LineStatus",
     "Refusal",
