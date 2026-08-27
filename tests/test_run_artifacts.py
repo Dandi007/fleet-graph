@@ -288,3 +288,12 @@ class TestNormalizeWaitingOn:
 
         assert normalize_waiting_on("human") == ("none", "human")
         assert normalize_waiting_on(42) == ("none", "42")
+
+
+class TestAcceptancePhaseHeartbeat:
+    """R0d hotfix: the acceptance step heartbeats; a phase enum that lags the
+    graph is a deterministic crash loop (checkpoint resumes into the raiser)."""
+
+    def test_acceptance_is_a_valid_heartbeat_phase(self, tmp_path):
+        artifacts = RunArtifacts(tmp_path, run_id="r", folder_id="wf-x")
+        assert artifacts.heartbeat(1, "acceptance", force=True)

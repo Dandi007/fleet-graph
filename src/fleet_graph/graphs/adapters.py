@@ -20,10 +20,16 @@ from fleet_graph.executors.agent_run import (
     AgentRunLauncher,
     AgentRunSpec,
     RunStatus,
+    _classify,
     derive_run_id,
+    find_result,
 )
 from fleet_graph.executors.agent_session import AgentSessionSeat, SeatHandle
 from fleet_graph.state.run_artifacts import write_json_durable
+
+#: Upper bound on derived coordinator attempts per round. Failures normally
+#: fault the line well before this; the bound only stops a pathological spin.
+MAX_COORDINATOR_ATTEMPTS = 8
 
 DISPATCHER = "fleet-graph"
 
@@ -92,7 +98,25 @@ class AgentRunCoordinator:
             timeout_seconds=self.timeout_seconds,
             labels=labels,
         )
-        run_id = derive_run_id(self.thread_id, f"coordinator-{round_no}")
+        # A failed prior attempt must not be re-adopted: its run id is already
+        # registered on the bus lifecycle with that attempt's intent, and
+        # re-dispatching the same id gets a 409 IDEMPOTENCY_CONFLICT -> exit 91
+        # -> the round bricks forever (generation only bumps on a terminal,
+        # which needs this very coordinator to run). Adopt running/succeeded;
+        # a failed attempt gets the next derived attempt id. Bounded: a round
+        # that fails MAX_COORDINATOR_ATTEMPTS times is a fault, not a loop.
+        run_id = ""
+        for attempt in range(1, MAX_COORDINATOR_ATTEMPTS + 1):
+            run_id = derive_run_id(self.thread_id, f"coordinator-{round_no}", attempt)
+            prior = find_result(self.launcher.session_root_for(run_id))
+            if prior is not None and _classify(prior).state == "failed":
+                continue
+            break
+        else:
+            raise CoordinatorFault(
+                f"coordinator round {round_no} failed {MAX_COORDINATOR_ATTEMPTS} "
+                "derived attempts in a row; refusing to spin further"
+            )
         ticket = self.launcher.launch(spec, run_id)
         status: RunStatus = self.launcher.wait(
             ticket,
