@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import sys
 from typing import Any
@@ -303,16 +304,27 @@ def _scheduler_run(args: argparse.Namespace) -> int:
     # credential degrades E1 to nothing but leaves E2-E4 observing.
     if config.supervisor_events:
         from fleet_graph.scheduler.daemon import SystemdUnitProbe
-        from fleet_graph.scheduler.supervisor_events import ObserverConfig, SupervisorObserver
+        from fleet_graph.scheduler.supervisor_events import (
+            ObserverConfig,
+            SupervisorObserver,
+            observer_environment,
+        )
+
+        # The same env lines get: PATH plus the reviewed extras (bus token
+        # file among them), so the short-run supervisor process can publish
+        # its evidence note. The decision credential rides separately and
+        # only here: it comes from the daemon's own environment, never from
+        # the config's line_environment -- putting it there would hand every
+        # line pump the key the fourth gate exists to keep away from lines
+        # (agent children are scrubbed either way, but a pump process has no
+        # business holding it at all).
+        supervisor_environment = observer_environment(scheduler.line_environment(), os.environ)
 
         scheduler.supervisor = SupervisorObserver(
             ObserverConfig(
                 run_root=config.run_root,
                 cap_window_seconds=config.cap_window_seconds,
-                # The same env lines get: PATH plus the reviewed extras
-                # (bus token file among them), so the short-run supervisor
-                # process can publish its evidence note.
-                environment=scheduler.line_environment(),
+                environment=supervisor_environment,
             ),
             launcher=TransientLauncher(dry_run=args.dry_run),
             bus=board.client if board is not None else None,
