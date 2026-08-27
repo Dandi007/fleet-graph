@@ -62,8 +62,8 @@ from typing import Any, Protocol
 
 from fleet_graph.scheduler.ignition import (
     DEFAULT_BACKOFF_CAP_SECONDS,
-    DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_CAP_WINDOW_SECONDS,
+    DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_TOTAL_CAP,
     IgnitionDecision,
     LineStatus,
