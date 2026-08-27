@@ -16,6 +16,16 @@ make sync     # uv sync into .venv (Python 3.11)
 make verify   # ruff check + format check + pytest — the same gate CI runs
 ```
 
+When verifying or operating the user service outside a login shell, use the
+explicit user-session bus environment:
+
+```bash
+export XDG_RUNTIME_DIR=/run/user/1000
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+systemctl --user is-system-running
+make verify
+```
+
 ## Status
 
 P0 (project setup and architecture doc). Nothing here orchestrates anything

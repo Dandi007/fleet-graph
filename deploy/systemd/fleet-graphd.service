@@ -24,6 +24,10 @@ KillMode=process
 TimeoutStopSec=30
 # Credentials are env-only; never commit a token into this unit.
 Environment=FLEET_GRAPH_GATEWAY_BASE_URL=http://127.0.0.1:15722
+# User services are not guaranteed to inherit a login session's bus variables.
+# Pin the known runtime bus so systemctl and bus-aware setup remain connected.
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 # A systemd user unit does not get a login shell's PATH. agent-run is a bun
 # script (`#!/usr/bin/env bun`) and ~/.bun/bin is not on the default PATH, so
 # every line died with `env: 'bun': No such file or directory` -- the old

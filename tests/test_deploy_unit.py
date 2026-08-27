@@ -155,6 +155,17 @@ class TestTheUnitGivesLinesAWorkingPath:
             assert wanted in path_line, f"{wanted} missing from {path_line}"
 
 
+class TestTheUnitConnectsToTheUserSessionBus:
+    def test_the_runtime_directory_and_bus_address_are_explicit(self) -> None:
+        environments = {
+            line.removeprefix("Environment=")
+            for line in UNIT.read_text(encoding="utf-8").splitlines()
+            if line.startswith("Environment=")
+        }
+        assert "XDG_RUNTIME_DIR=/run/user/1000" in environments
+        assert "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus" in environments
+
+
 class TestTheRestartPolicyMatchesTheReAdoptDesign:
     def test_kill_mode_lets_executors_outlive_the_daemon(self) -> None:
         """The whole point of the re-adopt primitive: killing the daemon must
