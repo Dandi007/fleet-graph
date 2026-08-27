@@ -20,8 +20,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/data/apps/fleet-graph/current
 ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph dd serve \
-    --host 127.0.0.1 --port 5610 \
-    --graph-api-url http://127.0.0.1:5611
+    --host 127.0.0.1 --port 5610
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

@@ -1,11 +1,13 @@
-"""The localhost dev-dispatch MCP surface backed by fleet-graph APIs.
+"""The localhost dev-dispatch MCP surface. The service *is* the control plane.
 
-The service deliberately contains no lifecycle policy.  It preserves the public
-tool contracts and forwards requests to the graph control-plane, whose API owns
-admission, revision, idempotency, receipts, and evidence validation.
+The supervision plane struck the separate graph-API tier this surface used to
+forward to (:5611): there is no second service behind these tools. Every real
+tool drives `fleet_graph.dd.control_plane` in-process -- admission derivation,
+transient-unit launches, and read-side assembly from git + checkpoint + run
+artifacts all happen right here.
 
 Tool surface (wf-a08949 goal.md 2026-08-27 use-case-family ruling; wf-13ff9e
-plan.md §1 R1-d): only the consumed use-case family forwards --
+plan.md §1 R1-d): only the consumed use-case family does work --
 ``development_list / get / events / evidence / create / start / gate``.  The
 remaining legacy tool names stay registered so every historical caller gets an
 explicit, machine-readable ``NOT_SUPPORTED`` refusal instead of an unknown-tool
@@ -13,19 +15,30 @@ error, but they perform no work: ``steer`` / ``reconfigure`` were permanent 409s
 on the legacy engine and are not replicated; ``relock`` / ``control`` /
 ``deployment_*`` belong to the legacy engine's patch surface and are outside the
 equivalence scope.
+
+Two contracts the tools themselves enforce:
+
+- **Admission is server-side derivation.** ``development_create`` takes a repo
+  path, a target base, and the spec. There is no handoff parameter, no digest
+  parameter, no receipt parameter -- the whole vocabulary a client used to
+  have to guess is derived by the server and returned, not requested.
+- **The gate carries no verdict.** ``development_gate`` reports the pending
+  question note and offers a valueless ``resume``; on resume the graph
+  re-reads the board itself. Decisions travel only as ``work.decision.v1`` on
+  the bus, published by a human.
 """
 
 from __future__ import annotations
 
 import json
 import socket
-from typing import Any, cast
+from pathlib import Path
+from typing import Any
 
-import httpx
+from fleet_graph.dd.control_plane import ControlPlaneError, DdControlPlane
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5610
-DEFAULT_GRAPH_API_URL = "http://127.0.0.1:5611"
 
 # Legacy tool names that are registered but refuse with an explicit error
 # structure instead of pretending the legacy semantics exist here.
@@ -46,7 +59,7 @@ NOT_SUPPORTED_TOOLS: dict[str, str] = {
 
 NOT_SUPPORTED_RULING = "wf-a08949 goal.md 2026-08-27 use-case-family ruling"
 
-# The consumed use-case family: the only tools that forward to the graph API.
+# The consumed use-case family: the only tools that do real work.
 SUPPORTED_TOOLS: frozenset[str] = frozenset(
     {
         "development_list",
@@ -60,43 +73,6 @@ SUPPORTED_TOOLS: frozenset[str] = frozenset(
 )
 
 
-class GraphApiError(RuntimeError):
-    """The graph control-plane refused a request or could not be reached."""
-
-
-class GraphApi:
-    """Small HTTP boundary so MCP remains a transport adapter, not a second engine."""
-
-    def __init__(self, base_url: str = DEFAULT_GRAPH_API_URL) -> None:
-        self.base_url = base_url.rstrip("/")
-
-    def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._request("GET", path, params=params)
-
-    def post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        return self._request("POST", path, json=body)
-
-    def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        try:
-            response = httpx.request(method, f"{self.base_url}{path}", timeout=30.0, **kwargs)
-        except httpx.HTTPError as exc:
-            raise GraphApiError(f"graph API {method} {path} failed: {exc}") from exc
-        try:
-            payload: Any = response.json()
-        except ValueError:
-            payload = response.text
-        if not response.is_success:
-            detail = payload if isinstance(payload, str) else json.dumps(payload, sort_keys=True)
-            raise GraphApiError(
-                f"graph API {method} {path} returned HTTP {response.status_code}: {detail}"
-            )
-        if not isinstance(payload, dict):
-            raise GraphApiError(
-                f"graph API {method} {path} returned {type(payload).__name__}, expected object"
-            )
-        return cast(dict[str, Any], payload)
-
-
 def port_is_available(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> bool:
     """Bind-test the selected loopback port before FastMCP tries to serve it."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -108,25 +84,19 @@ def port_is_available(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> boo
     return True
 
 
-def build_mcp_server(api: GraphApi | None = None) -> Any:
-    """Build all active dev-dispatch tools without importing a legacy engine."""
+def build_mcp_server(plane: DdControlPlane | None = None) -> Any:
+    """Build all active dev-dispatch tools over the in-process control plane."""
     from fastmcp import FastMCP
     from fastmcp.exceptions import ToolError
 
-    graph = api or GraphApi()
+    control = plane or DdControlPlane()
     mcp = FastMCP("fleet-graph-dev-dispatch")
 
-    def get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def call(method: str, /, **kwargs: Any) -> dict[str, Any]:
         try:
-            return graph.get(path, params)
-        except GraphApiError as exc:
-            raise ToolError(str(exc)) from exc
-
-    def post(path: str, body: dict[str, Any]) -> dict[str, Any]:
-        try:
-            return graph.post(path, body)
-        except GraphApiError as exc:
-            raise ToolError(str(exc)) from exc
+            return dict(getattr(control, method)(**kwargs))
+        except ControlPlaneError as exc:
+            raise ToolError(json.dumps(exc.to_dict(), sort_keys=True)) from exc
 
     def refuse(tool: str) -> dict[str, Any]:
         """Raise the explicit NOT_SUPPORTED structure for a legacy-only tool."""
@@ -156,91 +126,78 @@ def build_mcp_server(api: GraphApi | None = None) -> Any:
     @mcp.tool()
     def development_list(
         state: str | None = None,
-        repo: str | None = None,
         limit: int = 20,
         cursor: str | None = None,
     ) -> dict[str, Any]:
-        """List development summaries using graph-owned pagination."""
-        return get(
-            "/v1/developments", {"state": state, "repo": repo, "limit": limit, "cursor": cursor}
-        )
+        """List development statuses. O(n) over the run artifacts, by ruling."""
+        return call("list", state=state, limit=limit, cursor=cursor)
 
     @mcp.tool()
     def development_get(development_id: str) -> dict[str, Any]:
-        return get(f"/v1/developments/{development_id}")
+        """One development's admission record plus its recomputed live status."""
+        return call("get", development_id=development_id)
 
     @mcp.tool()
     def development_events(
         development_id: str, after: str | None = None, limit: int = 100
     ) -> dict[str, Any]:
-        return get(f"/v1/developments/{development_id}/events", {"after": after, "limit": limit})
+        """The run's event log (events.jsonl), paged by event id."""
+        return call("events", development_id=development_id, after=after, limit=limit)
 
     @mcp.tool()
     def development_evidence(development_id: str) -> dict[str, Any]:
-        return get(f"/v1/developments/{development_id}/evidence")
+        """The evidence entry, assembled live from git + checkpoint + receipts."""
+        return call("evidence", development_id=development_id)
 
     @mcp.tool()
     def development_create(
-        name: str,
-        goal: str,
-        idempotency_key: str,
-        reason: str,
-        initial_handoff: dict[str, Any],
-        phase: str = "development",
-        acceptance_commands: list[dict[str, Any]] | None = None,
-        setup_commands: list[dict[str, Any]] | None = None,
-        host_verify_commands: list[dict[str, Any]] | None = None,
-        profile: str = "default",
-        policy: str = "isolated-release-auto",
-        work_folder: str | None = None,
-        role_target_patch: dict[str, Any] | None = None,
-        auto_start: bool = False,
+        repo_path: str,
+        target_base: str | None = None,
+        spec_text: str | None = None,
+        spec_path: str | None = None,
     ) -> dict[str, Any]:
-        body = {
-            "name": name,
-            "goal": goal,
-            "idempotency_key": idempotency_key,
-            "reason": reason,
-            "initial_handoff": initial_handoff,
-            "phase": phase,
-            "profile": profile,
-            "policy": policy,
-            "auto_start": auto_start,
-        }
-        for key, value in {
-            "acceptance_commands": acceptance_commands,
-            "setup_commands": setup_commands,
-            "host_verify_commands": host_verify_commands,
-            "work_folder": work_folder,
-            "role_target_patch": role_target_patch,
-        }.items():
-            if value is not None:
-                body[key] = value
-        return post("/v1/developments", body)
+        """Admit one development. Everything else is derived server-side.
 
-    def mutation(
-        name: str,
-        development_id: str,
-        idempotency_key: str,
-        expected_revision: int,
-        reason: str,
-        **extra: Any,
-    ) -> dict[str, Any]:
-        return post(
-            f"/v1/developments/{development_id}/commands/{name}",
-            {
-                "idempotency_key": idempotency_key,
-                "expected_revision": expected_revision,
-                "reason": reason,
-                **{key: value for key, value in extra.items() if value is not None},
-            },
+        Takes a dedicated git worktree (or clone) path, an optional target
+        base (defaults to the repo's HEAD), and the approved spec as text or
+        as a path. The server derives the development id, freezes the spec
+        and target base into the bootstrap commit, computes the H0 handoff
+        and its chain-root digest, derives the durable ref and the acceptance
+        argv (from the spec's ```dd-acceptance block), and publishes the work
+        board card. Idempotent for the same (repo, spec, base).
+        """
+        return call(
+            "create",
+            repo_path=repo_path,
+            target_base=target_base,
+            spec_text=spec_text,
+            spec_path=spec_path,
         )
 
     @mcp.tool()
-    def development_start(
-        development_id: str, idempotency_key: str, expected_revision: int, reason: str = ""
-    ) -> dict[str, Any]:
-        return mutation("start", development_id, idempotency_key, expected_revision, reason)
+    def development_start(development_id: str) -> dict[str, Any]:
+        """Run the development detached in a transient systemd unit.
+
+        The thread identity and checkpoint path are derived from the
+        development id, so starting again after a kill resumes the same
+        thread and re-adopts agent runs in flight instead of re-dispatching
+        sealed stages. Starting a development that is already running is a
+        no-op that says so.
+        """
+        return call("start", development_id=development_id)
+
+    @mcp.tool()
+    def development_gate(development_id: str, resume: bool = False) -> dict[str, Any]:
+        """The human gate's state; optionally resume the suspended thread.
+
+        This tool accepts **no decision**. It reports the question note the
+        gate is waiting on, and `resume=True` re-enters the suspended thread
+        with no input at all -- the gate re-reads the board itself, so the
+        caller cannot cast a verdict by resuming. Decisions travel only as
+        `work.decision.v1` messages on the bus, published by a human, with
+        `refs=[{"target_entity": <question_note_id>}]`.
+        """
+        return call("gate", development_id=development_id, resume=resume)
 
     @mcp.tool()
     def development_steer(
@@ -270,27 +227,6 @@ def build_mcp_server(api: GraphApi | None = None) -> Any:
         return refuse("development_reconfigure")
 
     @mcp.tool()
-    def development_gate(
-        development_id: str,
-        gate_id: str,
-        decision: str,
-        idempotency_key: str,
-        expected_revision: int,
-        operator_identity: str,
-        reason: str = "",
-    ) -> dict[str, Any]:
-        return mutation(
-            "gate",
-            development_id,
-            idempotency_key,
-            expected_revision,
-            reason,
-            gate_id=gate_id,
-            decision=decision,
-            operator_identity=operator_identity,
-        )
-
-    @mcp.tool()
     def development_control(
         development_id: str,
         action: str,
@@ -316,24 +252,36 @@ def build_mcp_server(api: GraphApi | None = None) -> Any:
 
 
 def serve(
-    host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, api_url: str = DEFAULT_GRAPH_API_URL
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    *,
+    root: str | None = None,
+    plugin_binding: str | None = None,
+    working_directory: str | None = None,
+    executable: str | None = None,
 ) -> None:
     if not port_is_available(host, port):
         raise RuntimeError(f"fleet-graph dev-dispatch port {host}:{port} is unavailable")
-    build_mcp_server(GraphApi(api_url)).run(
+    overrides: dict[str, Any] = {}
+    if root:
+        overrides["root"] = Path(root)
+    if plugin_binding:
+        overrides["plugin_binding"] = Path(plugin_binding)
+    if working_directory:
+        overrides["working_directory"] = working_directory
+    if executable:
+        overrides["executable"] = executable
+    build_mcp_server(DdControlPlane(**overrides)).run(
         transport="streamable-http", host=host, port=port, path="/mcp"
     )
 
 
 __all__ = [
-    "DEFAULT_GRAPH_API_URL",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
     "NOT_SUPPORTED_RULING",
     "NOT_SUPPORTED_TOOLS",
     "SUPPORTED_TOOLS",
-    "GraphApi",
-    "GraphApiError",
     "build_mcp_server",
     "port_is_available",
     "serve",

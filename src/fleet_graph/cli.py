@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from typing import Any
 
@@ -146,7 +147,9 @@ def _dd_run(args: argparse.Namespace) -> int:
         head_commit=head,
         generation=args.generation,
         checkpoint_path=args.checkpoint or ":memory:",
-        run_config={"acceptance_commands": [c.split() for c in args.accept]},
+        # shlex, not str.split: a quoted argument in an acceptance command
+        # must survive the round-trip through the launcher's shlex.join.
+        run_config={"acceptance_commands": [shlex.split(c) for c in args.accept]},
         models=dict(pair.split("=", 1) for pair in args.stage_model),
         publish_merge=args.publish_merge,
     )
@@ -224,10 +227,17 @@ def _dd_bootstrap(args: argparse.Namespace) -> int:
 
 
 def _dd_serve(args: argparse.Namespace) -> int:
-    """Serve the graph-backed dev-dispatch MCP adapter on loopback."""
+    """Serve the dev-dispatch MCP surface on loopback. It is the control plane."""
     from fleet_graph.dd.service import serve
 
-    serve(host=args.host, port=args.port, api_url=args.graph_api_url)
+    serve(
+        host=args.host,
+        port=args.port,
+        root=args.root,
+        plugin_binding=args.plugin_binding,
+        working_directory=args.working_directory,
+        executable=args.executable,
+    )
     return 0
 
 
@@ -336,9 +346,21 @@ def _supervise_audit(args: argparse.Namespace) -> int:
     else:
         if not args.repo:
             raise SystemExit("development 审计需要 --repo：一个持有 accepted commit 的本地 clone")
+        # Engine selection is a fact on disk, not a flag to remember: a
+        # development the new control plane admitted has a record under its
+        # root, and its evidence is assembled in-process. Everything else is
+        # a legacy development and goes to the old controller, GETs only.
+        dd_root = pathlib.Path(args.dd_root)
+        if (dd_root / args.target / "record.json").is_file():
+            from fleet_graph.dd.control_plane import DdControlPlane
+            from fleet_graph.supervise.audit import GraphEngineSource
+
+            engine: Any = GraphEngineSource(DdControlPlane(root=dd_root))
+        else:
+            engine = OldEngineClient(args.engine_url)
         report = audit_development(
             args.target,
-            engine=OldEngineClient(args.engine_url),
+            engine=engine,
             repo=pathlib.Path(args.repo).resolve(),
         )
 
@@ -524,10 +546,30 @@ def build_parser() -> argparse.ArgumentParser:
     dd_boot.add_argument("--target-base", default=None, help="defaults to the workspace HEAD")
     dd_boot.set_defaults(func=_dd_bootstrap)
 
-    dd_serve = dd_sub.add_parser("serve", help="serve the graph-backed dev-dispatch MCP")
+    dd_serve = dd_sub.add_parser(
+        "serve", help="serve the dev-dispatch MCP surface (the in-process control plane)"
+    )
     dd_serve.add_argument("--host", default="127.0.0.1")
     dd_serve.add_argument("--port", type=int, default=5610)
-    dd_serve.add_argument("--graph-api-url", default="http://127.0.0.1:5611")
+    dd_serve.add_argument(
+        "--root", default=None, help="development state root (default /data/fleet-graph/dd)"
+    )
+    dd_serve.add_argument(
+        "--plugin-binding",
+        default=None,
+        help="JSON file holding the production-pinned plugin_producer section "
+        "(default /data/fleet-graph/dd/plugin-binding.json)",
+    )
+    dd_serve.add_argument(
+        "--working-directory",
+        default=None,
+        help="working directory for launched dd runs (default the deployed release)",
+    )
+    dd_serve.add_argument(
+        "--executable",
+        default=None,
+        help="fleet-graph executable for launched dd runs (default the deployed release)",
+    )
     dd_serve.set_defaults(func=_dd_serve)
 
     scheduler = subparsers.add_parser("scheduler", help="the resident line scheduler")
@@ -626,6 +668,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--engine-url",
         default="http://127.0.0.1:7460",
         help="legacy controller base URL; only ever queried with GET",
+    )
+    audit.add_argument(
+        "--dd-root",
+        default="/data/fleet-graph/dd",
+        help="new-engine development root; a development with a record here "
+        "is audited through the in-process control plane instead",
     )
     audit.add_argument(
         "--run-root", default=None, help="goal line run root (default /data/fleet-graph/runs)"

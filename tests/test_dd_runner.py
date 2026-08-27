@@ -474,3 +474,33 @@ class TestWaitingOnAHumanAndComingBack:
         assert result["terminal"] == TERMINAL_REFUSED
         assert "REJECT" in result["terminal_reason"]
         assert result["fault"] is False
+
+
+class TestTheRunLeavesArtifactsBehind:
+    """The control plane's read side assembles get/events from these files
+    after the process is gone -- they are the state model, not telemetry."""
+
+    def test_a_run_persists_its_events_and_result(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        from fleet_graph.graphs.dd_runner import EVENTS_FILE, RESULT_FILE
+
+        result, _launcher, _scripts = run(
+            repo, tmp_path, verdicts={"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}
+        )
+        run_root = make_config(repo, tmp_path).run_root
+
+        persisted = json.loads((run_root / RESULT_FILE).read_text(encoding="utf-8"))
+        assert persisted["terminal"] == result["terminal"] == TERMINAL_COMPLETE
+        assert persisted["head_commit"] == result["head_commit"]
+        assert persisted["written_at"]
+
+        lines = [
+            json.loads(raw)
+            for raw in (run_root / EVENTS_FILE).read_text(encoding="utf-8").splitlines()
+            if raw
+        ]
+        assert [entry["stage"] for entry in lines] == [
+            entry["stage"] for entry in result["history"]
+        ]
+        assert all(entry["at"] for entry in lines)
