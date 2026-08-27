@@ -209,3 +209,91 @@ def _outcome(receipt: dict[str, Any] | None = None) -> Any:
     from fleet_graph.graphs.dd_pipeline import StageOutcome
 
     return StageOutcome(receipt=receipt)
+
+
+class TestAcceptanceContext:
+    """The reconfigurable acceptance context (R1-c): setup commands run first,
+    the env overlays both, and both are held to the same anti-tamper rule as
+    the acceptance commands themselves."""
+
+    def _wire(
+        self,
+        repo: Path,
+        *,
+        commands: list[list[str]],
+        setup: list[list[str]] | None = None,
+        env: dict[str, str] | None = None,
+    ) -> AcceptanceStage:
+        run_config = {
+            "acceptance_commands": commands,
+            "setup_commands": setup or [],
+            "acceptance_env": env or {},
+        }
+        ConfigureStage(repo=repo, run_config=run_config).act(CONFIGURE, dispatch())
+        return AcceptanceStage(repo=repo, declared=commands, setup=setup or [], env=env or {})
+
+    def test_setup_runs_before_acceptance_and_its_products_are_visible(self, repo: Path) -> None:
+        stage = self._wire(
+            repo,
+            commands=[["test", "-f", "prepared.txt"]],
+            setup=[["touch", "prepared.txt"]],
+        )
+        stage.act(ACCEPTANCE, dispatch())
+        record = json.loads((repo / ACCEPTANCE_PATH).read_text(encoding="utf-8"))
+        assert record["passed"] is True
+        assert record["setup_results"][0]["exit_code"] == 0
+
+    def test_a_failing_setup_refuses_with_its_own_code_not_the_tests(self, repo: Path) -> None:
+        stage = self._wire(repo, commands=[["true"]], setup=[["false"]])
+        with pytest.raises(StageRefused, match="setup failed") as refused:
+            stage.act(ACCEPTANCE, dispatch())
+        assert refused.value.code == "SETUP_FAILED"
+        record = json.loads((repo / ACCEPTANCE_PATH).read_text(encoding="utf-8"))
+        assert record["passed"] is False
+        assert record["results"] == []  # the tests never ran; nothing pretends they did
+
+    def test_the_env_overlay_reaches_setup_and_acceptance(self, repo: Path) -> None:
+        stage = self._wire(
+            repo,
+            commands=[["sh", "-c", 'test "$DD_ACCEPT_FLAG" = "on"']],
+            env={"DD_ACCEPT_FLAG": "on"},
+        )
+        stage.act(ACCEPTANCE, dispatch())
+        record = json.loads((repo / ACCEPTANCE_PATH).read_text(encoding="utf-8"))
+        assert record["passed"] is True
+
+    def test_a_failing_acceptance_names_its_own_code(self, repo: Path) -> None:
+        stage = self._wire(repo, commands=[["false"]])
+        with pytest.raises(StageRefused, match="acceptance failed") as refused:
+            stage.act(ACCEPTANCE, dispatch())
+        assert refused.value.code == "ACCEPTANCE_FAILED"
+
+    def test_the_graded_cannot_edit_the_setup_either(self, repo: Path) -> None:
+        stage = self._wire(repo, commands=[["true"]], setup=[["true"]])
+        config = json.loads((repo / RUN_CONFIG_PATH).read_text(encoding="utf-8"))
+        config["setup_commands"] = [["touch", "pwned"]]
+        write_json(repo, RUN_CONFIG_PATH, config)
+        with pytest.raises(StageRefused, match="nobody declared") as refused:
+            stage.act(ACCEPTANCE, dispatch())
+        assert refused.value.code == "ACCEPTANCE_DECLARATION_MISMATCH"
+        assert not (repo / "pwned").exists()
+
+    def test_the_graded_cannot_edit_the_env_either(self, repo: Path) -> None:
+        stage = self._wire(repo, commands=[["true"]], env={"CI": "1"})
+        config = json.loads((repo / RUN_CONFIG_PATH).read_text(encoding="utf-8"))
+        config["acceptance_env"] = {"CI": "1", "PATH": "/tmp/evil"}
+        write_json(repo, RUN_CONFIG_PATH, config)
+        with pytest.raises(StageRefused, match="nobody declared"):
+            stage.act(ACCEPTANCE, dispatch())
+
+    def test_a_legacy_run_config_without_the_new_keys_still_accepts(self, repo: Path) -> None:
+        """Pre-R1-c trees carry only acceptance_commands; absent keys mean
+        empty declarations, not a mismatch."""
+        write_json(
+            repo,
+            RUN_CONFIG_PATH,
+            {"development_id": "dev-001", "generation": 1, "acceptance_commands": [["true"]]},
+        )
+        AcceptanceStage(repo=repo, declared=[["true"]]).act(ACCEPTANCE, dispatch())
+        record = json.loads((repo / ACCEPTANCE_PATH).read_text(encoding="utf-8"))
+        assert record["passed"] is True

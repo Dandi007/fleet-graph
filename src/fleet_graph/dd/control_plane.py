@@ -32,10 +32,18 @@ derived here and written down where it can be independently re-derived:
 
 **Starting is a transient systemd unit** (same isolation argument as
 scheduler/launcher.py): the control plane can restart without killing runs in
-flight. The thread identity is derived from the development id alone
-(`{development_id}:g1` via DevelopmentConfig), and the checkpoint lives at a
-path derived from the development id, so a kill-restart re-enters the same
-thread and re-adopts the agent runs in flight.
+flight. The thread identity is `{development_id}:g{generation}` (via
+DevelopmentConfig), and the checkpoint lives at a path derived from the
+development id, so a kill-restart re-enters the same generation's thread and
+re-adopts the agent runs in flight -- while a start after a retryable
+terminal (or a reconfigure) launches generation n+1 with fresh derived
+identities, so a rerun never collides with its own past (R1-c; the tick-14
+IDEMPOTENCY_CONFLICT lesson).
+
+**Failure is classified into three exits** (R1-c; `classify_failure`):
+environment/contract -> `reconfigure` the acceptance context, then start a
+new generation; implementation -> the in-graph rework loop, untouched here;
+fabrication (the UNVERIFIED_TEST_CLAIM family) -> final, refused everywhere.
 
 **The gate carries no verdict.** `gate` reports the pending question note and
 offers `resume`, which re-enters the suspended thread with no input at all --
@@ -86,9 +94,21 @@ LOG_FILE = "dd.log"
 
 UNIT_PREFIX = "fleet-graph-dd"
 
-GATE_DECISION_PATH = ".dev-dispatch/gate/decision-g1.json"
-MERGE_RESULT_PATH = ".dev-dispatch/merge/result-g1.json"
 ACCEPTANCE_RECORD_PATH = ".dd-evidence/acceptance.json"
+
+
+def gate_decision_path(generation: int) -> str:
+    """Where the gate seals its verdict for one generation (dd_scripts.GATE_PATH)."""
+    from fleet_graph.graphs.dd_scripts import GATE_PATH
+
+    return GATE_PATH.format(generation=generation)
+
+
+def merge_result_path(generation: int) -> str:
+    from fleet_graph.graphs.dd_scripts import MERGE_PATH
+
+    return MERGE_PATH.format(generation=generation)
+
 
 #: The spec's own acceptance declaration: one argv per non-empty line inside a
 #: ```dd-acceptance fenced block. Declared in the spec so it is frozen and
@@ -99,6 +119,7 @@ STATE_CREATED = "created"
 STATE_RUNNING = "running"
 STATE_AWAITING_GATE = "awaiting_gate"
 STATE_INTERRUPTED = "interrupted"
+STATE_COMPLETE = "complete"
 # Terminal states are the pipeline's own vocabulary, passed through:
 # complete / failed / refused / bounds / fault.
 
@@ -116,6 +137,107 @@ class ControlPlaneError(RuntimeError):
 
     def to_dict(self) -> dict[str, Any]:
         return {"code": self.code, "message": self.detail, "retryable": self.retryable}
+
+
+# --- failure classification: the three exits (R1-c) ----------------------
+#
+# Every terminal that is not `complete` classifies into exactly one of three
+# exits, and the classification is derived at read time from the run record --
+# never stored as a second truth:
+#
+#   environment_contract -> the acceptance context was wrong (missing env
+#       piece, wrong acceptance argv, missing setup). Exit: `reconfigure` the
+#       acceptance context, then `start` a new generation. This is the exit
+#       the legacy engine never had -- reconfigure was a permanent 409 after
+#       FAILED, and three developments in a row died of it (wf-13ff9e tick 12).
+#   implementation -> the work itself was judged insufficient. The in-graph
+#       exit is the existing continuous-review REJECT -> rework loop, which
+#       this module deliberately does not touch; at terminal (rework budget
+#       exhausted, gate REJECT) the exit is a fresh generation whose graph
+#       reworks with a fresh budget.
+#   fabrication -> the seal's replay contradicted the actor's own claim
+#       (the UNVERIFIED_TEST_CLAIM family). Final. Not reconfigurable, not
+#       restartable: an actor that lied about its verification does not get
+#       the exam changed or retaken (m-6d5aa4, a 5+-times-recurring behavior).
+
+CLASS_ENVIRONMENT_CONTRACT = "environment_contract"
+CLASS_IMPLEMENTATION = "implementation"
+CLASS_FABRICATION = "fabrication"
+
+EXIT_RECONFIGURE = "reconfigure"
+EXIT_REWORK = "rework"
+EXIT_NONE = "none"
+
+#: The fabrication family: codes whose one meaning is "the recorded claim and
+#: the re-measured reality disagree". Deliberately minimal -- a code lands
+#: here only when its taxonomy meaning is a claim/reality mismatch, because
+#: this set is the one that closes a development for good.
+FABRICATION_CODES = frozenset(
+    {
+        # Implement seal re-executed the verification commands and the real
+        # exit codes differ from the claimed ones.
+        "UNVERIFIED_TEST_CLAIM",
+        # Worktree bytes, commit blob or recorded blob SHA disagree: the
+        # recorded claim does not match what is actually there.
+        "ARTIFACT_BLOB_MISMATCH",
+    }
+)
+
+#: Codes where the work product or the actor's conduct -- not the acceptance
+#: context -- is what failed. The remedy is new work, not a new environment.
+IMPLEMENTATION_CODES = frozenset(
+    {
+        "REVIEWER_GIT_MUTATION",
+        "UNDECLARED_ARTIFACT",
+        "SECRET_SENTINEL_DETECTED",
+        "GATE_REJECTED",
+        "REWORK_LIMIT_REACHED",
+    }
+)
+
+#: Legacy results carry the code only inside the synthesized reason text
+#: ("implement failed (PROVIDER_UNAVAILABLE)"); results written before R1-c
+#: have no terminal_code field at all.
+_REASON_CODE = re.compile(r"\(([A-Z][A-Z0-9_]*)\)")
+
+
+def classify_failure(
+    terminal: str,
+    terminal_reason: str = "",
+    terminal_code: str = "",
+    terminal_detail: str = "",
+) -> dict[str, Any] | None:
+    """One failure record per non-complete terminal: cause class, the one
+    mechanical code where one exists, the raw error in the failing
+    collaborator's own words, and an honest retryability bit.
+
+    Everything not provably fabrication or implementation classifies as
+    environment/contract: that is the only default that cannot destroy
+    information, because its exit (reconfigure + new generation) is reversible
+    while the fabrication exit is final.
+    """
+    if not terminal or terminal == STATE_COMPLETE:
+        return None
+    code = terminal_code
+    if not code:
+        found = _REASON_CODE.search(terminal_reason or "")
+        code = found.group(1) if found else ""
+    raw_error = terminal_reason or ""
+    if terminal_detail and terminal_detail not in raw_error:
+        raw_error = f"{raw_error}; {terminal_detail}" if raw_error else terminal_detail
+    if code in FABRICATION_CODES:
+        cls, exit_, retryable = CLASS_FABRICATION, EXIT_NONE, False
+    elif code in IMPLEMENTATION_CODES:
+        cls, exit_, retryable = CLASS_IMPLEMENTATION, EXIT_REWORK, True
+    else:
+        cls, exit_, retryable = CLASS_ENVIRONMENT_CONTRACT, EXIT_RECONFIGURE, True
+    return {
+        "class": cls,
+        "code": code,
+        "raw_error": raw_error,
+        "retryable": retryable,
+        "exit": exit_,
+    }
 
 
 def derive_development_id(repo: Path, spec_digest: str, target_base_commit: str) -> str:
@@ -142,6 +264,38 @@ def derive_acceptance_commands(spec: bytes) -> list[list[str]]:
             if argv:
                 commands.append(argv)
     return commands
+
+
+def _parse_command_lines(lines: list[str], *, code: str) -> list[list[str]]:
+    """Command lines into argv lists, with shell quoting honoured and refusals
+    named. An empty list is a legitimate declaration of "no commands"."""
+    commands: list[list[str]] = []
+    for line in lines:
+        if not isinstance(line, str):
+            raise ControlPlaneError(code, f"commands are strings, got {line!r}")
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        try:
+            argv = shlex.split(stripped)
+        except ValueError as exc:
+            raise ControlPlaneError(code, f"cannot parse command {line!r}: {exc}") from exc
+        if argv:
+            commands.append(argv)
+    return commands
+
+
+def _validate_env(env: dict[str, str]) -> dict[str, str]:
+    validated: dict[str, str] = {}
+    for key, value in env.items():
+        if not isinstance(key, str) or not key or "=" in key or not isinstance(value, str):
+            raise ControlPlaneError(
+                "ACCEPTANCE_ENV_INVALID",
+                f"acceptance_env wants string names without '=' and string values, "
+                f"got {key!r}={value!r}",
+            )
+        validated[key] = value
+    return validated
 
 
 def build_h0_handoff(
@@ -210,9 +364,21 @@ class DdLaunchSpec:
     remote_ref: str
     root_digest: str
     acceptance_commands: list[list[str]] = field(default_factory=list)
+    #: The reconfigurable acceptance context (R1-c): setup commands run before
+    #: acceptance, and an env overlay for both.
+    setup_commands: list[list[str]] = field(default_factory=list)
+    acceptance_env: dict[str, str] = field(default_factory=dict)
     board_card: str = ""
     resume: bool = False
     launch_seq: int = 1
+    #: Which generation this launch runs. The thread id, the derived run ids,
+    #: and the gate's bus idempotency key all carry it, so a rerun of the same
+    #: development cannot collide with its previous generation's identities.
+    generation: int = 1
+    #: Where this generation's run artifacts live. Generation 1 keeps the
+    #: development root itself (existing on-disk layout); later generations
+    #: get their own subdirectory so a rerun never overwrites history.
+    run_root: Path | None = None
     #: Server-side policy, not client vocabulary: per-stage model overrides
     #: (the roles' own selectors stay the default). The §24 precedent runs
     #: review stages on deepseek-v4-pro.
@@ -262,10 +428,16 @@ class DdLaunchSpec:
             "--root-digest",
             self.root_digest,
             "--run-root",
-            str(self.dev_root),
+            str(self.run_root or self.dev_root),
+            # The generation names the thread ({dev}:g{n}); run ids and the
+            # gate's bus idempotency key derive from it too, so a fresh
+            # generation never collides with the identities of the last one.
+            "--generation",
+            str(self.generation),
             # On disk and derived from the development id: the contract that
             # makes a kill-restart re-enter the same thread instead of
-            # re-dispatching sealed stages.
+            # re-dispatching sealed stages. Shared across generations -- the
+            # thread id inside carries the generation.
             "--checkpoint",
             str(self.dev_root / CHECKPOINT_FILE),
             # The durable MR is the goal; the merge stage still runs only
@@ -274,6 +446,10 @@ class DdLaunchSpec:
         ]
         for command in self.acceptance_commands:
             argv += ["--accept", shlex.join(command)]
+        for command in self.setup_commands:
+            argv += ["--setup", shlex.join(command)]
+        for key, value in sorted(self.acceptance_env.items()):
+            argv += ["--accept-env", f"{key}={value}"]
         for stage, model in sorted(self.stage_models.items()):
             argv += ["--stage-model", f"{stage}={model}"]
         if self.board_card:
@@ -629,20 +805,52 @@ class DdControlPlane:
             )
         return record
 
+    def _generation(self, record: dict[str, Any]) -> int:
+        """The development's current generation; records from before R1-c are g1."""
+        try:
+            return max(1, int(record.get("generation") or 1))
+        except (TypeError, ValueError):
+            return 1
+
+    def _gen_root(self, development_id: str, generation: int) -> Path:
+        """Where one generation's run artifacts live. Generation 1 stays at the
+        development root itself -- the layout every pre-R1-c development on
+        disk already has -- and later generations get `g{n}/` so a rerun
+        appends history instead of overwriting it."""
+        root = self._dev_root(development_id)
+        return root if generation <= 1 else root / f"g{generation}"
+
     def _launches(self, development_id: str) -> list[dict[str, Any]]:
         path = self._dev_root(development_id) / LAUNCHES_FILE
         if not path.is_file():
             return []
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
-    def _read_result(self, development_id: str) -> dict[str, Any] | None:
-        path = self._dev_root(development_id) / RESULT_FILE
+    def _generation_launched(self, development_id: str, generation: int) -> bool:
+        """Whether this generation ever launched (entries before R1-c are g1)."""
+        return any(
+            int(entry.get("generation") or 1) == generation
+            for entry in self._launches(development_id)
+        )
+
+    def _read_result(self, development_id: str, generation: int = 1) -> dict[str, Any] | None:
+        path = self._gen_root(development_id, generation) / RESULT_FILE
         if not path.is_file():
             return None
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except ValueError:
             return None
+
+    def _failure_of(self, result: dict[str, Any] | None) -> dict[str, Any] | None:
+        if result is None:
+            return None
+        return classify_failure(
+            str(result.get("terminal") or ""),
+            str(result.get("terminal_reason") or ""),
+            str(result.get("terminal_code") or ""),
+            str(result.get("terminal_detail") or ""),
+        )
 
     def _unit_active(self, development_id: str) -> str | None:
         launches = self._launches(development_id)
@@ -653,8 +861,8 @@ class DdControlPlane:
             return unit
         return None
 
-    def _checkpoint_state(self, development_id: str) -> dict[str, Any] | None:
-        """The latest durable graph state for this development's thread."""
+    def _checkpoint_state(self, development_id: str, generation: int = 1) -> dict[str, Any] | None:
+        """The latest durable graph state for one generation's thread."""
         path = self._dev_root(development_id) / CHECKPOINT_FILE
         if not path.is_file():
             return None
@@ -662,7 +870,9 @@ class DdControlPlane:
             from langgraph.checkpoint.sqlite import SqliteSaver
 
             with SqliteSaver.from_conn_string(str(path)) as saver:
-                found = saver.get_tuple({"configurable": {"thread_id": f"{development_id}:g1"}})
+                found = saver.get_tuple(
+                    {"configurable": {"thread_id": f"{development_id}:g{generation}"}}
+                )
         except Exception:
             return None
         if found is None:
@@ -676,8 +886,9 @@ class DdControlPlane:
         This is the proof the cache is a cache: everything in `status.json`
         comes from here, and nothing reads the file except the list fast path.
         """
-        self._record(development_id)  # refuses unknown ids before anything else
-        result = self._read_result(development_id)
+        record = self._record(development_id)  # refuses unknown ids before anything else
+        generation = self._generation(record)
+        result = self._read_result(development_id, generation)
         active_unit = self._unit_active(development_id)
         checkpoint = self._dev_root(development_id) / CHECKPOINT_FILE
 
@@ -703,7 +914,7 @@ class DdControlPlane:
         elif checkpoint.is_file():
             # A durable thread with no result and no unit: killed mid-run.
             state = STATE_INTERRUPTED
-            values = self._checkpoint_state(development_id) or {}
+            values = self._checkpoint_state(development_id, generation) or {}
             stage = str(values.get("stage") or stage)
             head_commit = str(values.get("head_commit") or head_commit)
         else:
@@ -712,10 +923,15 @@ class DdControlPlane:
         status = {
             "development_id": development_id,
             "state": state,
+            "generation": generation,
             "stage": stage,
             "terminal": terminal,
             "terminal_reason": terminal_reason,
             "head_commit": head_commit,
+            # The failure record: cause class, one mechanical code, the raw
+            # error in the failing collaborator's own words, retryability, and
+            # which of the three exits is open. Derived, never stored twice.
+            "failure": self._failure_of(result),
             "awaiting": awaiting,
             "active_unit": active_unit or "",
             "launches": len(self._launches(development_id)),
@@ -726,7 +942,13 @@ class DdControlPlane:
     # --- start / gate ----------------------------------------------------
 
     def start(self, development_id: str) -> dict[str, Any]:
-        """Launch the development detached, resuming its thread if one exists."""
+        """Launch the development detached: resume the in-flight generation,
+        or -- after a retryable terminal or a reconfigure -- start the next one.
+
+        The three failure exits gate this door: a fabrication terminal refuses
+        (final), any other terminal starts generation n+1 fresh, and a
+        non-terminal development resumes its own generation's thread.
+        """
         record = self._record(development_id)
         active = self._unit_active(development_id)
         if active:
@@ -736,18 +958,51 @@ class DdControlPlane:
                 "already_running": True,
                 "unit": active,
             }
-        resume = (self._dev_root(development_id) / CHECKPOINT_FILE).is_file()
-        return self._launch(record, resume=resume)
+        development_root = self._dev_root(development_id)
+        generation = self._generation(record)
+        result = self._read_result(development_id, generation)
+        terminal = str((result or {}).get("terminal") or "")
+        if terminal == STATE_COMPLETE:
+            raise ControlPlaneError(
+                "DEVELOPMENT_COMPLETE",
+                f"{development_id} is complete; a finished development has nothing to restart",
+            )
+        failure = self._failure_of(result)
+        if failure is not None and failure["class"] == CLASS_FABRICATION:
+            raise ControlPlaneError(
+                "FABRICATION_FINAL",
+                f"{development_id} g{generation} failed as {failure['code']}: the seal's "
+                f"replay contradicted the actor's claim ({failure['raw_error'][:300]}); "
+                "a fabricated development is final and does not restart",
+            )
+        pending = bool(record.get("reconfigured_pending_start"))
+        bump = bool(terminal) or (pending and self._generation_launched(development_id, generation))
+        if bump or pending:
+            if bump:
+                generation += 1
+                record["generation"] = generation
+            record.pop("reconfigured_pending_start", None)
+            write_json_durable(development_root / RECORD_FILE, record)
+        if bump:
+            return self._launch(record, resume=False, generation=generation)
+        resume = (development_root / CHECKPOINT_FILE).is_file() and self._generation_launched(
+            development_id, generation
+        )
+        return self._launch(record, resume=resume, generation=generation)
 
-    def _launch(self, record: dict[str, Any], *, resume: bool) -> dict[str, Any]:
+    def _launch(
+        self, record: dict[str, Any], *, resume: bool, generation: int = 1
+    ) -> dict[str, Any]:
         development_id = str(record["development_id"])
         dev_root = self._dev_root(development_id)
+        run_root = self._gen_root(development_id, generation)
         if not self.plugin_binding.is_file():
             raise ControlPlaneError(
                 "PLUGIN_BINDING_UNREADABLE",
                 f"no plugin binding at {self.plugin_binding}; the capability "
                 "check is fail-closed and will not be skipped",
             )
+        run_root.mkdir(parents=True, exist_ok=True)
         seq = len(self._launches(development_id)) + 1
         spec = DdLaunchSpec(
             development_id=development_id,
@@ -758,9 +1013,13 @@ class DdControlPlane:
             remote_ref=str(record["remote_ref"]),
             root_digest=str(record["root_handoff_digest"]),
             acceptance_commands=[list(c) for c in record.get("acceptance_commands") or []],
+            setup_commands=[list(c) for c in record.get("setup_commands") or []],
+            acceptance_env=dict(record.get("acceptance_env") or {}),
             board_card=str(record.get("card_entity_id") or ""),
             resume=resume,
             launch_seq=seq,
+            generation=generation,
+            run_root=run_root,
             stage_models=dict(self.stage_models),
             working_directory=self.working_directory,
             executable=self.executable,
@@ -771,6 +1030,7 @@ class DdControlPlane:
             "seq": seq,
             "unit": spec.unit_name,
             "mode": "resume" if resume else "fresh",
+            "generation": generation,
             "at": iso(self.clock()),
             "started": launched.started,
             "detail": launched.detail,
@@ -789,8 +1049,100 @@ class DdControlPlane:
             "already_running": False,
             "unit": spec.unit_name,
             "mode": entry["mode"],
-            "thread_id": f"{development_id}:g1",
+            "generation": generation,
+            "thread_id": f"{development_id}:g{generation}",
             "checkpoint": str(dev_root / CHECKPOINT_FILE),
+        }
+
+    # --- reconfigure: the environment/contract exit -----------------------
+
+    def reconfigure(
+        self,
+        development_id: str,
+        acceptance_env: dict[str, str] | None = None,
+        acceptance_argv: list[str] | None = None,
+        setup: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Change the acceptance context -- and nothing else -- of a development.
+
+        This is the environment/contract exit the legacy engine never had:
+        reconfigure there was a permanent 409 once a development FAILED, so an
+        acceptance environment problem killed the whole development. Here it
+        is callable in FAILED and in every non-terminal state.
+
+        The scope is enforced by construction: the only parameters that exist
+        are the acceptance context (env overlay, acceptance argv, setup
+        commands). There is no spec parameter, no implementation parameter,
+        no role patch -- the spec stays frozen under its bootstrap digest and
+        a changed spec remains what it always was: a new development.
+
+        A fabrication terminal (the UNVERIFIED_TEST_CLAIM family) refuses:
+        an actor that lied about its verification does not get the exam
+        changed. `complete` refuses too; there is nothing left to accept.
+        """
+        record = self._record(development_id)
+        generation = self._generation(record)
+        result = self._read_result(development_id, generation)
+        terminal = str((result or {}).get("terminal") or "")
+        if terminal == STATE_COMPLETE:
+            raise ControlPlaneError(
+                "DEVELOPMENT_COMPLETE",
+                f"{development_id} is complete; its acceptance context no longer matters",
+            )
+        failure = self._failure_of(result)
+        if failure is not None and failure["class"] == CLASS_FABRICATION:
+            raise ControlPlaneError(
+                "FABRICATION_FINAL",
+                f"{development_id} g{generation} failed as {failure['code']}: the seal's "
+                f"replay contradicted the actor's claim ({failure['raw_error'][:300]}); "
+                "a fabricated development is final and cannot be reconfigured",
+            )
+        if acceptance_env is None and acceptance_argv is None and setup is None:
+            raise ControlPlaneError(
+                "RECONFIGURE_EMPTY",
+                "pass at least one of acceptance_env, acceptance_argv, setup",
+            )
+
+        changes: dict[str, Any] = {}
+        if acceptance_argv is not None:
+            changes["acceptance_commands"] = _parse_command_lines(
+                acceptance_argv, code="ACCEPTANCE_DECLARATION_INVALID"
+            )
+        if setup is not None:
+            changes["setup_commands"] = _parse_command_lines(
+                setup, code="SETUP_DECLARATION_INVALID"
+            )
+        if acceptance_env is not None:
+            changes["acceptance_env"] = _validate_env(acceptance_env)
+
+        record.update(changes)
+        history = list(record.get("reconfigures") or [])
+        history.append(
+            {
+                "at": iso(self.clock()),
+                "generation": generation,
+                "changed": sorted(changes),
+            }
+        )
+        record["reconfigures"] = history
+        record["reconfigured_pending_start"] = True
+        write_json_durable(self._dev_root(development_id) / RECORD_FILE, record)
+        self.rebuild_status(development_id)
+
+        next_generation = (
+            generation + 1
+            if terminal or self._generation_launched(development_id, generation)
+            else generation
+        )
+        return {
+            "development_id": development_id,
+            "reconfigured": True,
+            "applied": changes,
+            "generation": generation,
+            "next_start_generation": next_generation,
+            "spec_digest": record["spec_digest"],
+            "scope": "acceptance context only; the spec and the implementation "
+            "are untouchable by construction",
         }
 
     def gate(self, development_id: str, resume: bool = False) -> dict[str, Any]:
@@ -803,8 +1155,9 @@ class DdControlPlane:
         record = self._record(development_id)
         status = self.rebuild_status(development_id)
         awaiting = status.get("awaiting") or None
+        generation = self._generation(record)
 
-        decision = self._committed_gate_decision(record)
+        decision = self._committed_gate_decision(record, generation)
         gate_report: dict[str, Any] = {
             "development_id": development_id,
             "state": status["state"],
@@ -828,11 +1181,15 @@ class DdControlPlane:
                 "CHECKPOINT_MISSING",
                 f"{development_id} has no durable checkpoint; there is no thread to resume",
             )
-        gate_report["resume"] = self._launch(record, resume=True)
+        gate_report["resume"] = self._launch(record, resume=True, generation=generation)
         return gate_report
 
-    def _committed_gate_decision(self, record: dict[str, Any]) -> dict[str, Any] | None:
-        found = run_git(Path(str(record["repo_path"])), "show", f"HEAD:{GATE_DECISION_PATH}")
+    def _committed_gate_decision(
+        self, record: dict[str, Any], generation: int = 1
+    ) -> dict[str, Any] | None:
+        found = run_git(
+            Path(str(record["repo_path"])), "show", f"HEAD:{gate_decision_path(generation)}"
+        )
         if found.returncode != 0:
             return None
         try:
@@ -873,6 +1230,9 @@ class DdControlPlane:
             "bootstrap_commit": record["bootstrap_commit"],
             "root_handoff_digest": record["root_handoff_digest"],
             "acceptance_commands": record["acceptance_commands"],
+            "setup_commands": record.get("setup_commands", []),
+            "acceptance_env": record.get("acceptance_env", {}),
+            "reconfigures": record.get("reconfigures", []),
             "card_entity_id": record.get("card_entity_id", ""),
             "created_at": record.get("created_at", ""),
         }
@@ -917,10 +1277,21 @@ class DdControlPlane:
         return {"developments": rows, "cursor": next_cursor}
 
     def events(
-        self, development_id: str, after: str | None = None, limit: int = 100
+        self,
+        development_id: str,
+        after: str | None = None,
+        limit: int = 100,
+        generation: int | None = None,
     ) -> dict[str, Any]:
-        self._record(development_id)
-        path = self._dev_root(development_id) / EVENTS_FILE
+        record = self._record(development_id)
+        current = self._generation(record)
+        selected_generation = generation if generation is not None else current
+        if not 1 <= selected_generation <= current:
+            raise ControlPlaneError(
+                "GENERATION_UNKNOWN",
+                f"{development_id} has generations 1..{current}, not {selected_generation}",
+            )
+        path = self._gen_root(development_id, selected_generation) / EVENTS_FILE
         entries: list[dict[str, Any]] = []
         if path.is_file():
             for index, line in enumerate(
@@ -938,6 +1309,7 @@ class DdControlPlane:
         selected = [e for e in entries if int(e["event_id"].lstrip("e")) > threshold]
         return {
             "development_id": development_id,
+            "generation": selected_generation,
             "events": selected[: max(1, limit)],
             "head_event_id": entries[-1]["event_id"] if entries else None,
         }
@@ -945,71 +1317,106 @@ class DdControlPlane:
     # --- evidence --------------------------------------------------------
 
     def evidence(self, development_id: str) -> dict[str, Any]:
-        """Assemble the evidence entry from git + checkpoint + receipts, live.
+        """Assemble the evidence entries from git + checkpoint + receipts, live.
 
         Nothing here is a stored summary: the chain digests come from the
         sealed receipt files and the state the checkpoint carries, the
         acceptance and gate records are read out of the commits that carry
         them, and the remote head is resolved now. supervise/audit.py is the
         first consumer, through the same field names it already reads.
+
+        One entry per generation, oldest first, and the receipt chain stays
+        continuous across them: generation n's chain seeds on generation
+        n-1's tail commit and tail digest (generation 1 seeds on the H0
+        handoff), and revisions number cumulatively -- so a rerun appends to
+        one auditable chain rather than starting a parallel history.
         """
         record = self._record(development_id)
         repo = Path(str(record["repo_path"]))
-        values = self._checkpoint_state(development_id) or {}
-        result = self._read_result(development_id) or {}
-        history = list(values.get("history") or result.get("history") or [])
-        receipt_digests = dict(values.get("receipt_digests") or {})
+        current = self._generation(record)
 
-        chain = self._receipt_chain(record, repo, history, receipt_digests)
-        acceptance = next((r for r in chain if r["stage"] == "acceptance"), None)
-        gate = self._committed_gate_decision(record)
-        merge = self._committed_json(repo, MERGE_RESULT_PATH)
+        entries: list[dict[str, Any]] = []
+        seed_commit = str(record["bootstrap_commit"])
+        seed_digest = str(record["root_handoff_digest"])
+        revision_base = 0
+        for generation in range(1, current + 1):
+            values = self._checkpoint_state(development_id, generation) or {}
+            result = self._read_result(development_id, generation) or {}
+            history = list(values.get("history") or result.get("history") or [])
+            receipt_digests = dict(values.get("receipt_digests") or {})
 
-        head_commit = str(
-            (chain[-1]["output_commit"] if chain else "") or values.get("head_commit") or ""
-        )
-        ancestor_ok = False
-        if head_commit:
-            ancestor_ok = (
-                run_git(
-                    repo,
-                    "merge-base",
-                    "--is-ancestor",
-                    str(record["target_base_commit"]),
-                    head_commit,
-                ).returncode
-                == 0
+            chain = self._receipt_chain(
+                record,
+                repo,
+                history,
+                receipt_digests,
+                generation=generation,
+                seed_commit=seed_commit,
+                seed_digest=seed_digest,
+                revision_base=revision_base,
             )
-        remote_verified = self._remote_ref_matches(record, head_commit)
-        terminal = str(result.get("terminal") or "")
+            acceptance = next((r for r in chain if r["stage"] == "acceptance"), None)
+            gate = self._committed_gate_decision(record, generation)
+            merge = self._committed_json(repo, merge_result_path(generation))
 
-        entry = {
-            "revision": len(chain),
-            "generation": 1,
-            "verified": bool(
-                terminal == "complete"
-                and acceptance is not None
-                and remote_verified
-                and ancestor_ok
-            ),
-            "remote_main_verified": remote_verified,
-            "accepted_commit_ancestor": ancestor_ok,
-            "target_base_commit": record["target_base_commit"],
-            "bootstrap": {
-                "output_commit": record["bootstrap_commit"],
-                "receipt_digest": record["root_handoff_digest"],
+            head_commit = str(
+                (chain[-1]["output_commit"] if chain else "") or values.get("head_commit") or ""
+            )
+            ancestor_ok = False
+            if head_commit:
+                ancestor_ok = (
+                    run_git(
+                        repo,
+                        "merge-base",
+                        "--is-ancestor",
+                        str(record["target_base_commit"]),
+                        head_commit,
+                    ).returncode
+                    == 0
+                )
+            remote_verified = self._remote_ref_matches(record, head_commit)
+            terminal = str(result.get("terminal") or "")
+
+            bootstrap: dict[str, Any] = {
+                "output_commit": seed_commit,
+                "receipt_digest": seed_digest,
                 "spec_digest": record["spec_digest"],
-                "h0": self._h0(development_id),
-            },
-            "receipt_chain": chain,
-            "gate": gate,
-            "merge": merge,
-            "terminal": terminal,
-        }
+                "h0": self._h0(development_id) if generation == 1 else None,
+            }
+            if generation > 1:
+                bootstrap["seeded_from_generation"] = generation - 1
+
+            entries.append(
+                {
+                    "revision": revision_base + len(chain),
+                    "generation": generation,
+                    "verified": bool(
+                        terminal == "complete"
+                        and acceptance is not None
+                        and remote_verified
+                        and ancestor_ok
+                    ),
+                    "remote_main_verified": remote_verified,
+                    "accepted_commit_ancestor": ancestor_ok,
+                    "target_base_commit": record["target_base_commit"],
+                    "bootstrap": bootstrap,
+                    "receipt_chain": chain,
+                    "gate": gate,
+                    "merge": merge,
+                    "terminal": terminal,
+                    "failure": self._failure_of(result or None),
+                }
+            )
+            if chain:
+                seed_commit = str(chain[-1]["output_commit"])
+                if chain[-1]["receipt_digest"]:
+                    seed_digest = str(chain[-1]["receipt_digest"])
+            revision_base += len(chain)
         return {
             "development_id": development_id,
             "state": self.rebuild_status(development_id)["state"],
-            "evidence": [entry],
+            "generation": current,
+            "evidence": entries,
         }
 
     def _h0(self, development_id: str) -> dict[str, Any] | None:
@@ -1048,27 +1455,34 @@ class DdControlPlane:
         repo: Path,
         history: list[dict[str, Any]],
         receipt_digests: dict[str, str],
+        *,
+        generation: int = 1,
+        seed_commit: str | None = None,
+        seed_digest: str | None = None,
+        revision_base: int = 0,
     ) -> list[dict[str, Any]]:
         from fleet_graph.dd.dispatch import derive_attempt_id
         from fleet_graph.dd.upstream_constants import compute_json_digest
 
         development_id = str(record["development_id"])
-        state_root = self._dev_root(development_id) / "state"
+        state_root = self._gen_root(development_id, generation) / "state"
         chain: list[dict[str, Any]] = []
-        previous_output = str(record["bootstrap_commit"])
-        previous_digest = str(record["root_handoff_digest"])
+        previous_output = seed_commit or str(record["bootstrap_commit"])
+        previous_digest = seed_digest or str(record["root_handoff_digest"])
 
         sealed = [
             entry
             for entry in history
             if entry.get("output_commit") and entry.get("event") is not None
         ]
-        for revision, entry in enumerate(sealed, start=1):
+        for revision, entry in enumerate(sealed, start=revision_base + 1):
             stage = str(entry.get("stage") or "")
             output_commit = str(entry.get("output_commit") or "")
-            attempt_id = derive_attempt_id(development_id, 1, int(entry.get("attempt") or 1))
+            attempt_id = derive_attempt_id(
+                development_id, generation, int(entry.get("attempt") or 1)
+            )
             receipt, parent_from_receipt, file_digest = self._sealed_receipt(
-                state_root, attempt_id, stage, repo, output_commit
+                state_root, attempt_id, stage, repo, output_commit, generation
             )
             if receipt is None:
                 # A script stage with nothing sealed on file reconstructs the
@@ -1110,7 +1524,13 @@ class DdControlPlane:
         return chain
 
     def _sealed_receipt(
-        self, state_root: Path, attempt_id: str, stage: str, repo: Path, output_commit: str
+        self,
+        state_root: Path,
+        attempt_id: str,
+        stage: str,
+        repo: Path,
+        output_commit: str,
+        generation: int = 1,
     ) -> tuple[dict[str, Any] | None, str, str]:
         """(receipt, its own parent claim, its persisted bytes' digest).
 
@@ -1141,8 +1561,8 @@ class DdControlPlane:
 
         committed = {
             "acceptance": ACCEPTANCE_RECORD_PATH,
-            "human_gate": GATE_DECISION_PATH,
-            "merger": MERGE_RESULT_PATH,
+            "human_gate": gate_decision_path(generation),
+            "merger": merge_result_path(generation),
         }.get(stage)
         if committed and output_commit:
             found = run_git(repo, "show", f"{output_commit}:{committed}")
@@ -1186,14 +1606,21 @@ class DdControlPlane:
 __all__ = [
     "ACCEPTANCE_FENCE",
     "CHECKPOINT_FILE",
+    "CLASS_ENVIRONMENT_CONTRACT",
+    "CLASS_FABRICATION",
+    "CLASS_IMPLEMENTATION",
     "DEFAULT_DD_ROOT",
     "DEFAULT_EXECUTABLE",
     "DEFAULT_PLUGIN_BINDING",
     "DEFAULT_WORKING_DIRECTORY",
     "DEFAULT_WORKTREE_ROOTS",
     "EVENTS_FILE",
-    "GATE_DECISION_PATH",
+    "EXIT_NONE",
+    "EXIT_RECONFIGURE",
+    "EXIT_REWORK",
+    "FABRICATION_CODES",
     "H0_FILE",
+    "IMPLEMENTATION_CODES",
     "LAUNCHES_FILE",
     "RECORD_FILE",
     "RESULT_FILE",
@@ -1203,6 +1630,9 @@ __all__ = [
     "DdControlPlane",
     "DdLaunchSpec",
     "build_h0_handoff",
+    "classify_failure",
     "derive_acceptance_commands",
     "derive_development_id",
+    "gate_decision_path",
+    "merge_result_path",
 ]

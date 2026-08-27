@@ -605,3 +605,514 @@ class TestListDoesNotServeStaleLiveness:
         )
         listed = plane.list()
         assert listed["developments"][0]["state"] == "failed"
+
+
+# --- R1-c: the three failure exits and the rerun generation ---------------
+
+
+def write_result(
+    plane: DdControlPlane, dev: str, payload: dict[str, Any], generation: int = 1
+) -> None:
+    root = plane.root / dev if generation <= 1 else plane.root / dev / f"g{generation}"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / RESULT_FILE).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def failed_result(dev: str, *, code: str, reason: str, detail: str = "") -> dict[str, Any]:
+    return {
+        "development_id": dev,
+        "terminal": "failed",
+        "terminal_reason": reason,
+        "terminal_code": code,
+        "terminal_detail": detail,
+        "stage": "implement",
+        "head_commit": "",
+        "awaiting": None,
+        "history": [],
+    }
+
+
+class TestFailureClassification:
+    """One failure record per non-complete terminal: cause class, one
+    mechanical code, the raw error verbatim, retryability, and which of the
+    three exits is open."""
+
+    def test_an_environment_code_opens_the_reconfigure_exit(self) -> None:
+        from fleet_graph.dd.control_plane import classify_failure
+
+        failure = classify_failure(
+            "failed",
+            "acceptance failed: [['make', 'verify']]",
+            "ACCEPTANCE_FAILED",
+            "tsc: not found",
+        )
+        assert failure == {
+            "class": "environment_contract",
+            "code": "ACCEPTANCE_FAILED",
+            "raw_error": "acceptance failed: [['make', 'verify']]; tsc: not found",
+            "retryable": True,
+            "exit": "reconfigure",
+        }
+
+    def test_an_implementation_code_points_back_at_rework(self) -> None:
+        from fleet_graph.dd.control_plane import classify_failure
+
+        for code in ("GATE_REJECTED", "REWORK_LIMIT_REACHED", "REVIEWER_GIT_MUTATION"):
+            failure = classify_failure("failed", f"x failed ({code})", code)
+            assert failure is not None
+            assert (failure["class"], failure["exit"], failure["retryable"]) == (
+                "implementation",
+                "rework",
+                True,
+            ), code
+
+    def test_the_fabrication_family_is_final(self) -> None:
+        from fleet_graph.dd.control_plane import FABRICATION_CODES, classify_failure
+
+        assert "UNVERIFIED_TEST_CLAIM" in FABRICATION_CODES
+        for code in FABRICATION_CODES:
+            failure = classify_failure("failed", f"implement failed ({code})", code)
+            assert failure is not None
+            assert (failure["class"], failure["exit"], failure["retryable"]) == (
+                "fabrication",
+                "none",
+                False,
+            ), code
+
+    def test_a_pre_r1c_result_classifies_by_the_code_in_its_reason(self) -> None:
+        """Results written before terminal_code existed carry the code only in
+        the synthesized reason text; it is recovered, not guessed."""
+        from fleet_graph.dd.control_plane import classify_failure
+
+        failure = classify_failure("failed", "implement failed (PROVIDER_UNAVAILABLE)")
+        assert failure is not None
+        assert failure["code"] == "PROVIDER_UNAVAILABLE"
+        assert failure["class"] == "environment_contract"
+
+    def test_complete_and_no_terminal_classify_as_nothing(self) -> None:
+        from fleet_graph.dd.control_plane import classify_failure
+
+        assert classify_failure("complete", "merger is the last declared stage") is None
+        assert classify_failure("", "") is None
+
+    def test_the_status_carries_the_failure_record_verbatim(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        plane = make_plane(tmp_path)
+        dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
+        write_result(
+            plane,
+            dev,
+            failed_result(
+                dev,
+                code="ACCEPTANCE_FAILED",
+                reason="acceptance failed: [['python3', '-m', 'pytest', '-q']]",
+                detail="sqlite3.OperationalError: unable to open database file",
+            ),
+        )
+        status = plane.rebuild_status(dev)
+        assert status["failure"]["class"] == "environment_contract"
+        assert status["failure"]["code"] == "ACCEPTANCE_FAILED"
+        assert (
+            "sqlite3.OperationalError: unable to open database file"
+            in status["failure"]["raw_error"]
+        )
+        assert status["failure"]["retryable"] is True
+        assert status["generation"] == 1
+
+
+class TestReconfigure:
+    """The environment/contract exit: acceptance context only, callable in
+    FAILED and every non-terminal state, refused where it must be."""
+
+    def _failed_env(self, plane: DdControlPlane, scratch: Path) -> str:
+        dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
+        write_result(
+            plane,
+            dev,
+            failed_result(dev, code="ACCEPTANCE_FAILED", reason="acceptance failed: [['pytest']]"),
+        )
+        return dev
+
+    def test_it_changes_only_the_acceptance_context(self, scratch: Path, tmp_path: Path) -> None:
+        plane = make_plane(tmp_path)
+        dev = self._failed_env(plane, scratch)
+        before = json.loads((plane.root / dev / RECORD_FILE).read_text())
+
+        report = plane.reconfigure(
+            dev,
+            acceptance_argv=["python3 -m pytest -q", "sh -c 'echo done'"],
+            setup=["python3 -m venv .venv"],
+            acceptance_env={"DATABASE_URL": "sqlite:///tmp/x.db"},
+        )
+        after = json.loads((plane.root / dev / RECORD_FILE).read_text())
+
+        assert report["reconfigured"] is True
+        assert after["acceptance_commands"] == [
+            ["python3", "-m", "pytest", "-q"],
+            ["sh", "-c", "echo done"],
+        ]
+        assert after["setup_commands"] == [["python3", "-m", "venv", ".venv"]]
+        assert after["acceptance_env"] == {"DATABASE_URL": "sqlite:///tmp/x.db"}
+        # The frozen identity did not move: same spec, same base, same chain root.
+        for frozen in (
+            "spec_digest",
+            "target_base_commit",
+            "bootstrap_commit",
+            "root_handoff_digest",
+            "development_id",
+        ):
+            assert after[frozen] == before[frozen], frozen
+        assert after["reconfigures"][0]["changed"] == [
+            "acceptance_commands",
+            "acceptance_env",
+            "setup_commands",
+        ]
+
+    def test_it_is_callable_before_any_terminal_too(self, scratch: Path, tmp_path: Path) -> None:
+        """The legacy engine's 409 pain must not be replaced by a new gate:
+        a created (never started) development reconfigures fine."""
+        plane = make_plane(tmp_path)
+        dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
+        report = plane.reconfigure(dev, acceptance_env={"CI": "1"})
+        assert report["reconfigured"] is True
+        assert report["next_start_generation"] == 1, "nothing ran yet; no bump owed"
+
+    def test_a_complete_development_refuses(self, scratch: Path, tmp_path: Path) -> None:
+        plane = make_plane(tmp_path)
+        dev, _ = _complete_run(plane, scratch)
+        with pytest.raises(ControlPlaneError) as refused:
+            plane.reconfigure(dev, acceptance_env={"CI": "1"})
+        assert refused.value.code == "DEVELOPMENT_COMPLETE"
+
+    def test_a_fabrication_terminal_refuses_and_names_why(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        plane = make_plane(tmp_path)
+        dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
+        write_result(
+            plane,
+            dev,
+            failed_result(
+                dev,
+                code="UNVERIFIED_TEST_CLAIM",
+                reason="implement failed (UNVERIFIED_TEST_CLAIM)",
+                detail="claimed exit 0 for ['pytest'], measured exit 1",
+            ),
+        )
+        with pytest.raises(ControlPlaneError) as refused:
+            plane.reconfigure(dev, acceptance_env={"CI": "1"})
+        assert refused.value.code == "FABRICATION_FINAL"
+        assert "UNVERIFIED_TEST_CLAIM" in refused.value.detail
+        assert "measured exit 1" in refused.value.detail
+
+    def test_an_empty_reconfigure_is_refused(self, scratch: Path, tmp_path: Path) -> None:
+        plane = make_plane(tmp_path)
+        dev = self._failed_env(plane, scratch)
+        with pytest.raises(ControlPlaneError) as refused:
+            plane.reconfigure(dev)
+        assert refused.value.code == "RECONFIGURE_EMPTY"
+
+    def test_unparseable_quoting_is_refused_not_guessed(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        plane = make_plane(tmp_path)
+        dev = self._failed_env(plane, scratch)
+        with pytest.raises(ControlPlaneError) as refused:
+            plane.reconfigure(dev, acceptance_argv=['echo "unclosed'])
+        assert refused.value.code == "ACCEPTANCE_DECLARATION_INVALID"
+        with pytest.raises(ControlPlaneError) as refused:
+            plane.reconfigure(dev, setup=['sh -c "oops'])
+        assert refused.value.code == "SETUP_DECLARATION_INVALID"
+
+    def test_a_malformed_env_is_refused(self, scratch: Path, tmp_path: Path) -> None:
+        plane = make_plane(tmp_path)
+        dev = self._failed_env(plane, scratch)
+        with pytest.raises(ControlPlaneError) as refused:
+            plane.reconfigure(dev, acceptance_env={"A=B": "x"})
+        assert refused.value.code == "ACCEPTANCE_ENV_INVALID"
+
+
+class TestGenerationRestart:
+    """`start` after a retryable terminal (or a reconfigure) launches the next
+    generation fresh -- new thread id, new run root, no identity collision --
+    while the fabrication terminal stays final."""
+
+    def _failed_dev(self, plane: DdControlPlane, scratch: Path, *, code: str) -> str:
+        dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
+        plane.start(dev)  # g1 launched
+        (plane.root / dev / CHECKPOINT_FILE).touch()
+        write_result(plane, dev, failed_result(dev, code=code, reason=f"implement failed ({code})"))
+        return dev
+
+    def test_a_retryable_failure_starts_the_next_generation_fresh(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        launcher = RecordingLauncher()
+        plane = make_plane(tmp_path, launcher=launcher)
+        dev = self._failed_dev(plane, scratch, code="ACCEPTANCE_FAILED")
+
+        second = plane.start(dev)
+        assert second["generation"] == 2
+        assert second["thread_id"] == f"{dev}:g2"
+        assert second["mode"] == "fresh"
+        argv = launcher.specs[-1].argv()
+        assert argv[argv.index("--generation") + 1] == "2"
+        assert argv[argv.index("--run-root") + 1] == str(plane.root / dev / "g2")
+        assert "--resume" not in argv, "a new generation must not resume the failed thread"
+        # The checkpoint file is shared; the generation inside the thread id
+        # is what separates the histories.
+        assert argv[argv.index("--checkpoint") + 1] == str(plane.root / dev / CHECKPOINT_FILE)
+        record = json.loads((plane.root / dev / RECORD_FILE).read_text())
+        assert record["generation"] == 2
+
+    def test_a_reconfigure_feeds_the_next_generation_its_new_context(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        launcher = RecordingLauncher()
+        plane = make_plane(tmp_path, launcher=launcher)
+        dev = self._failed_dev(plane, scratch, code="ACCEPTANCE_FAILED")
+        plane.reconfigure(
+            dev,
+            acceptance_argv=["pytest -q"],
+            setup=["npm ci"],
+            acceptance_env={"CI": "1"},
+        )
+        plane.start(dev)
+        import shlex
+
+        argv = launcher.specs[-1].argv()
+        assert [argv[i + 1] for i, a in enumerate(argv) if a == "--accept"] == [
+            shlex.join(["pytest", "-q"])
+        ]
+        assert [argv[i + 1] for i, a in enumerate(argv) if a == "--setup"] == [
+            shlex.join(["npm", "ci"])
+        ]
+        assert [argv[i + 1] for i, a in enumerate(argv) if a == "--accept-env"] == ["CI=1"]
+        assert argv[argv.index("--generation") + 1] == "2"
+
+    def test_a_killed_second_generation_resumes_itself(self, scratch: Path, tmp_path: Path) -> None:
+        launcher = RecordingLauncher()
+        plane = make_plane(tmp_path, launcher=launcher)
+        dev = self._failed_dev(plane, scratch, code="ACCEPTANCE_FAILED")
+        plane.start(dev)  # g2 fresh
+        third = plane.start(dev)  # killed; no g2 result, checkpoint present
+        assert third["generation"] == 2
+        assert third["mode"] == "resume"
+        argv = launcher.specs[-1].argv()
+        assert "--resume" in argv
+        assert argv[argv.index("--generation") + 1] == "2"
+
+    def test_a_fabrication_terminal_does_not_restart(self, scratch: Path, tmp_path: Path) -> None:
+        plane = make_plane(tmp_path)
+        dev = self._failed_dev(plane, scratch, code="UNVERIFIED_TEST_CLAIM")
+        with pytest.raises(ControlPlaneError) as refused:
+            plane.start(dev)
+        assert refused.value.code == "FABRICATION_FINAL"
+        assert refused.value.retryable is False
+        record = json.loads((plane.root / dev / RECORD_FILE).read_text())
+        assert record.get("generation", 1) == 1, "a refused start must not burn a generation"
+
+    def test_a_complete_development_does_not_restart(self, scratch: Path, tmp_path: Path) -> None:
+        plane = make_plane(tmp_path)
+        dev, _ = _complete_run(plane, scratch)
+        with pytest.raises(ControlPlaneError) as refused:
+            plane.start(dev)
+        assert refused.value.code == "DEVELOPMENT_COMPLETE"
+
+
+class TestFullChainFailedReconfigureRestart:
+    """The R1-c keystone, end to end on the real pipeline with fake agents:
+    g1 dies on a missing acceptance environment piece, reconfigure fixes the
+    acceptance context, start launches g2, g2 runs to complete through the
+    gate -- one development, two generations, one continuous receipt chain,
+    and no identity collision anywhere (the wf-5664e5 shape, healed)."""
+
+    def _plugin_stub(self, scratch: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The same stand-in test_dd_runner.plugin_seals builds, bound to this
+        repo: plugin sealers write real commits and persist real receipt
+        bytes, the prompt resources come from the bundle stand-in."""
+        from fleet_graph.dd.prompt import IMPLEMENT_PERSONA, IMPLEMENT_TEMPLATE
+        from fleet_graph.dd.vendor import plugin_adapter
+        from fleet_graph.graphs.dd_pipeline import StageOutcome
+        from test_dd_runner import RealCommitSealer
+
+        sealer = RealCommitSealer(scratch)
+
+        def write_receipt(request: dict[str, Any], name: str, receipt: dict[str, Any]) -> None:
+            path = (
+                Path(request["state_root"]) / "receipts" / request["dispatch"]["attempt_id"] / name
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+
+        def implement_seal(binding: Any, request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            receipt = sealer.seal("implement", StageOutcome())
+            write_receipt(request, "implement-receipt.json", receipt)
+            return receipt
+
+        def review_seal(binding: Any, request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            stage = request["dispatch"]["stage"]
+            receipt = {
+                **sealer.seal(stage, StageOutcome()),
+                "verdict": request["review_result"]["verdict"],
+            }
+            if stage == "continuous_review":
+                write_receipt(request, "continuous-review-receipt.json", receipt)
+            return receipt
+
+        class Resource:
+            def __init__(self, path: str, text: str) -> None:
+                self.relative_path = path
+                self.content = text.encode("utf-8")
+                self.digest = "sha256:" + "0" * 64
+
+        monkeypatch.setattr(plugin_adapter, "invoke_implement_materializer", implement_seal)
+        monkeypatch.setattr(plugin_adapter, "invoke_review_materializer", review_seal)
+        monkeypatch.setattr(
+            plugin_adapter,
+            "load_implement_stage_resources",
+            lambda binding, **kwargs: (
+                Resource(IMPLEMENT_PERSONA, "You are the Implementer."),
+                Resource(
+                    IMPLEMENT_TEMPLATE,
+                    "input_commit: {{input_commit}}\nacceptance: {{acceptance_commands}}\n",
+                ),
+            ),
+        )
+
+    def _execute(
+        self,
+        plane: DdControlPlane,
+        scratch: Path,
+        dev: str,
+        *,
+        generation: int,
+        board: Any = None,
+    ) -> dict[str, Any]:
+        """What the transient unit does, run in-process: `dd run` with the
+        record's derived context and this generation's identity."""
+        from fleet_graph.graphs.dd_runner import DevelopmentConfig, run_pipeline
+        from test_dd_runner import AgentRunStub
+
+        record = json.loads((plane.root / dev / RECORD_FILE).read_text())
+        run_root = plane.root / dev if generation <= 1 else plane.root / dev / f"g{generation}"
+        config = DevelopmentConfig(
+            development_id=dev,
+            workspace_path=scratch,
+            state_root=run_root / "state",
+            run_root=run_root,
+            remote_url=record["remote_url"],
+            remote_ref=record["remote_ref"],
+            target_base_commit=record["target_base_commit"],
+            root_handoff_digest=record["root_handoff_digest"],
+            plugin_binding=object(),
+            head_commit=git(scratch, "rev-parse", "HEAD").strip(),
+            generation=generation,
+            checkpoint_path=str(plane.root / dev / CHECKPOINT_FILE),
+            run_config={
+                "acceptance_commands": [list(c) for c in record["acceptance_commands"]],
+                "setup_commands": [list(c) for c in record.get("setup_commands") or []],
+                "acceptance_env": dict(record.get("acceptance_env") or {}),
+            },
+        )
+        return run_pipeline(
+            config,
+            board=board,
+            gate_card_entity_id="card-1" if board is not None else "",
+            launcher=AgentRunStub({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}),
+        )
+
+    def test_failed_then_reconfigure_then_g2_to_complete(
+        self, scratch: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fleet_graph.bus.board import Decision
+        from test_dd_runner import FakeBoard as GateBoard
+
+        self._plugin_stub(scratch, monkeypatch)
+        spec = (
+            "# SPEC: greet\n\nMake greet() personal.\n\n"
+            "```dd-acceptance\ntest -f prepared.txt\n```\n"
+        )
+        launcher = RecordingLauncher()
+        plane = make_plane(tmp_path, launcher=launcher)
+        dev = plane.create(str(scratch), spec_text=spec)["development_id"]
+
+        # g1: the acceptance environment piece is missing; the run dies of it.
+        first = self._execute(plane, scratch, dev, generation=1)
+        assert first["terminal"] == "refused"
+        assert first["terminal_code"] == "ACCEPTANCE_FAILED"
+
+        status = plane.rebuild_status(dev)
+        assert status["failure"]["class"] == "environment_contract"
+        assert status["failure"]["exit"] == "reconfigure"
+        assert "acceptance failed" in status["failure"]["raw_error"]
+
+        # The environment/contract exit: fix the acceptance context, nothing else.
+        plane.reconfigure(dev, setup=["touch prepared.txt"])
+        started = plane.start(dev)
+        assert started["generation"] == 2
+        assert started["thread_id"] == f"{dev}:g2"
+
+        # g2, as the launched unit would run it: same spec, fixed context.
+        board = GateBoard()
+        board.decision = Decision(
+            message_id="msg-1",
+            decision="APPROVE",
+            decided_by="青林",
+            question="",
+            rationale="",
+            card_entity_id="card-1",
+            raw={},
+        )
+        second = self._execute(plane, scratch, dev, generation=2, board=board)
+        assert second["terminal"] == "complete", second["terminal_reason"]
+        assert second["generation"] == 2
+
+        # No identity collision with g1: the gate's bus idempotency key names g2.
+        assert list(board.asked) == [f"dd-gate:{dev}:g2"]
+
+        status = plane.rebuild_status(dev)
+        assert status["state"] == "complete"
+        assert status["generation"] == 2
+
+        # A finished development stays finished.
+        with pytest.raises(ControlPlaneError) as refused:
+            plane.start(dev)
+        assert refused.value.code == "DEVELOPMENT_COMPLETE"
+
+        # Evidence: both generations, one continuous chain.
+        payload = plane.evidence(dev)
+        entries = payload["evidence"]
+        assert [entry["generation"] for entry in entries] == [1, 2]
+        g1, g2 = entries
+
+        assert g1["terminal"] == "refused"
+        assert g1["failure"]["class"] == "environment_contract"
+        assert g1["bootstrap"]["h0"] is not None
+        assert g2["terminal"] == "complete"
+        assert g2["failure"] is None
+
+        # g2's chain seeds on g1's tail: commit and digest both continuous.
+        assert g2["bootstrap"]["seeded_from_generation"] == 1
+        assert g2["bootstrap"]["output_commit"] == g1["receipt_chain"][-1]["output_commit"]
+        assert g2["bootstrap"]["receipt_digest"] == g1["receipt_chain"][-1]["receipt_digest"]
+        assert g2["receipt_chain"][0]["input_commit"] == g1["receipt_chain"][-1]["output_commit"]
+        assert (
+            g2["receipt_chain"][0]["parent_handoff_receipt_digest"]
+            == g1["receipt_chain"][-1]["receipt_digest"]
+        )
+
+        # Revisions number cumulatively across generations.
+        revisions = [r["revision"] for entry in entries for r in entry["receipt_chain"]]
+        assert revisions == list(range(1, len(revisions) + 1))
+        assert g2["revision"] == revisions[-1]
+
+        # The audit's chain check holds on the latest entry, so the existing
+        # supervision consumer reads the multi-generation shape unchanged.
+        from fleet_graph.supervise.audit import AuditReport, _check_receipt_chain
+
+        report = AuditReport(target=dev, kind="development")
+        _check_receipt_chain(report, dev, g2)
+        by_name = {a.name: a for a in report.assertions}
+        assert by_name["receipt_chain_linked"].ok, by_name["receipt_chain_linked"].detail

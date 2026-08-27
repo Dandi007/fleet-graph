@@ -7,14 +7,18 @@ transient-unit launches, and read-side assembly from git + checkpoint + run
 artifacts all happen right here.
 
 Tool surface (wf-a08949 goal.md 2026-08-27 use-case-family ruling; wf-13ff9e
-plan.md §1 R1-d): only the consumed use-case family does work --
-``development_list / get / events / evidence / create / start / gate``.  The
+plan.md §1 R1-d, extended by R1-c): the consumed use-case family does work --
+``development_list / get / events / evidence / create / start / gate /
+reconfigure``.  ``reconfigure`` is the R1-c environment/contract failure exit:
+on the legacy engine it existed in name but was a permanent 409 once a
+development FAILED; here it is real, scoped by schema to the acceptance
+context alone, and pairs with ``start`` launching a fresh generation.  The
 remaining legacy tool names stay registered so every historical caller gets an
 explicit, machine-readable ``NOT_SUPPORTED`` refusal instead of an unknown-tool
-error, but they perform no work: ``steer`` / ``reconfigure`` were permanent 409s
-on the legacy engine and are not replicated; ``relock`` / ``control`` /
-``deployment_*`` belong to the legacy engine's patch surface and are outside the
-equivalence scope.
+error, but they perform no work: ``steer`` was a permanent 409 on the legacy
+engine and is not replicated; ``relock`` / ``control`` / ``deployment_*``
+belong to the legacy engine's patch surface and are outside the equivalence
+scope.
 
 Two contracts the tools themselves enforce:
 
@@ -45,9 +49,6 @@ DEFAULT_PORT = 5610
 # name -> reason, quoted in the refusal payload.
 NOT_SUPPORTED_TOOLS: dict[str, str] = {
     "development_steer": ("steer was a permanent 409 on the legacy engine and is not replicated"),
-    "development_reconfigure": (
-        "reconfigure was a permanent 409 on the legacy engine and is not replicated"
-    ),
     "development_relock": "relock belongs to the legacy engine's patch surface",
     "development_control": (
         "control is outside the consumed use-case family "
@@ -69,6 +70,7 @@ SUPPORTED_TOOLS: frozenset[str] = frozenset(
         "development_create",
         "development_start",
         "development_gate",
+        "development_reconfigure",
     }
 )
 
@@ -139,10 +141,23 @@ def build_mcp_server(plane: DdControlPlane | None = None) -> Any:
 
     @mcp.tool()
     def development_events(
-        development_id: str, after: str | None = None, limit: int = 100
+        development_id: str,
+        after: str | None = None,
+        limit: int = 100,
+        generation: int | None = None,
     ) -> dict[str, Any]:
-        """The run's event log (events.jsonl), paged by event id."""
-        return call("events", development_id=development_id, after=after, limit=limit)
+        """One generation's event log (events.jsonl), paged by event id.
+
+        Defaults to the current generation; pass `generation` to read an
+        earlier one's history.
+        """
+        return call(
+            "events",
+            development_id=development_id,
+            after=after,
+            limit=limit,
+            generation=generation,
+        )
 
     @mcp.tool()
     def development_evidence(development_id: str) -> dict[str, Any]:
@@ -178,11 +193,15 @@ def build_mcp_server(plane: DdControlPlane | None = None) -> Any:
     def development_start(development_id: str) -> dict[str, Any]:
         """Run the development detached in a transient systemd unit.
 
-        The thread identity and checkpoint path are derived from the
-        development id, so starting again after a kill resumes the same
-        thread and re-adopts agent runs in flight instead of re-dispatching
-        sealed stages. Starting a development that is already running is a
-        no-op that says so.
+        The thread identity is `{development_id}:g{generation}`: starting
+        again after a kill resumes the same generation's thread and re-adopts
+        agent runs in flight instead of re-dispatching sealed stages, while
+        starting after a retryable terminal (or after a reconfigure) launches
+        the next generation fresh -- new thread id, new derived run ids, new
+        gate idempotency key, so a rerun never collides with its own past. A
+        fabrication terminal refuses (final), and so does `complete`.
+        Starting a development that is already running is a no-op that says
+        so.
         """
         return call("start", development_id=development_id)
 
@@ -214,17 +233,34 @@ def build_mcp_server(plane: DdControlPlane | None = None) -> Any:
     @mcp.tool()
     def development_reconfigure(
         development_id: str,
-        idempotency_key: str,
-        expected_revision: int,
-        reason: str = "",
-        profile: str | None = None,
-        role_target_patch: dict[str, Any] | None = None,
-        policy: str | None = None,
-        acceptance_commands: list[dict[str, Any]] | None = None,
-        setup_commands: list[dict[str, Any]] | None = None,
+        acceptance_env: dict[str, str] | None = None,
+        acceptance_argv: list[str] | None = None,
+        setup: list[str] | None = None,
     ) -> dict[str, Any]:
-        """NOT_SUPPORTED: permanent 409 on the legacy engine, refuses explicitly."""
-        return refuse("development_reconfigure")
+        """Change a development's acceptance context -- and nothing else.
+
+        The environment/contract failure exit (R1-c): callable while the
+        development is FAILED and in every non-terminal state, so an
+        acceptance environment problem (missing piece, wrong acceptance argv,
+        missing setup) no longer kills the development the way the legacy
+        engine's permanent 409 did. After reconfiguring, `development_start`
+        launches a fresh generation with the new context.
+
+        The scope is the schema: `acceptance_env` (env overlay for setup and
+        acceptance commands), `acceptance_argv` (acceptance command lines,
+        shell quoting honoured), `setup` (setup command lines run first).
+        There is no spec parameter and no implementation parameter -- the
+        spec stays frozen under its bootstrap digest, and a changed spec is a
+        new development. A fabrication terminal (UNVERIFIED_TEST_CLAIM
+        family) refuses: that exit is final.
+        """
+        return call(
+            "reconfigure",
+            development_id=development_id,
+            acceptance_env=acceptance_env,
+            acceptance_argv=acceptance_argv,
+            setup=setup,
+        )
 
     @mcp.tool()
     def development_control(

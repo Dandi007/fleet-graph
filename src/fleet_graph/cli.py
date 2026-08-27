@@ -101,6 +101,17 @@ def plugin_binding_config(path: Any) -> dict[str, Any]:
     return {"plugin_producer": loaded}
 
 
+def _env_pairs(pairs: list[str]) -> dict[str, str]:
+    """KEY=VALUE flags into a dict; a pair with no '=' is a refusal, not a guess."""
+    env: dict[str, str] = {}
+    for pair in pairs:
+        key, separator, value = pair.partition("=")
+        if not separator or not key:
+            raise SystemExit(f"--accept-env wants KEY=VALUE, got {pair!r}")
+        env[key] = value
+    return env
+
+
 def _dd_run(args: argparse.Namespace) -> int:
     """Run one development through the dd pipeline to termination."""
     import pathlib
@@ -149,7 +160,11 @@ def _dd_run(args: argparse.Namespace) -> int:
         checkpoint_path=args.checkpoint or ":memory:",
         # shlex, not str.split: a quoted argument in an acceptance command
         # must survive the round-trip through the launcher's shlex.join.
-        run_config={"acceptance_commands": [shlex.split(c) for c in args.accept]},
+        run_config={
+            "acceptance_commands": [shlex.split(c) for c in args.accept],
+            "setup_commands": [shlex.split(c) for c in args.setup],
+            "acceptance_env": _env_pairs(args.accept_env),
+        },
         models=dict(pair.split("=", 1) for pair in args.stage_model),
         publish_merge=args.publish_merge,
     )
@@ -515,6 +530,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="an acceptance command; repeatable",
+    )
+    dd_run.add_argument(
+        "--setup",
+        action="append",
+        default=[],
+        help="a setup command run before the acceptance commands; repeatable",
+    )
+    dd_run.add_argument(
+        "--accept-env",
+        action="append",
+        default=[],
+        help="KEY=VALUE overlaid on setup and acceptance commands; repeatable",
     )
     dd_run.add_argument("--board-card", default=None, help="card entity id; enables the gate")
     dd_run.add_argument(

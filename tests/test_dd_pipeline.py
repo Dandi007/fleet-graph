@@ -528,3 +528,64 @@ class TestNoSecondDescriptionOfTheMachine:
 
         sample.write_text("implement = 1\n")
         assert "implement" in executable_source(sample)
+
+
+class TestTerminalCarriesItsCause:
+    """R1-c: every non-complete terminal keeps one mechanical cause and the
+    failing collaborator's raw words -- the fields the control plane's
+    three-exit classification reads."""
+
+    def test_a_failure_terminal_keeps_its_code_and_raw_detail(self) -> None:
+        class Failing(ContractActor):
+            def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
+                if stage.id != "implement":
+                    return super().act(stage, dispatch)
+                return StageOutcome(
+                    event="failed",
+                    failure_code="DIRTY_WORKTREE",
+                    detail="worktree carries edits: greet.py",
+                )
+
+        state = run(make_deps(actor=Failing()))
+        assert state["terminal"] == TERMINAL_FAILED
+        assert state["terminal_code"] == "DIRTY_WORKTREE"
+        assert state["last_failure_detail"] == "worktree carries edits: greet.py"
+        entry = next(e for e in state["history"] if e.get("failure_code"))
+        assert entry["failure_code"] == "DIRTY_WORKTREE"
+        assert entry["detail"] == "worktree carries edits: greet.py"
+
+    def test_a_refusal_terminal_keeps_the_refuser_named_code(self) -> None:
+        class Refusing(ContractActor):
+            def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
+                if stage.id != "acceptance":
+                    return super().act(stage, dispatch)
+                raise StageRefused(
+                    "acceptance failed: [['make', 'verify']]", code="ACCEPTANCE_FAILED"
+                )
+
+        lifecycle = Lifecycle.load()
+        actor = Refusing({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        scripts = {name: actor for name, stage in lifecycle.stages.items() if not stage.is_llm}
+        state = run(make_deps(actor=actor, scripts=scripts))
+        assert state["terminal"] == TERMINAL_REFUSED
+        assert state["terminal_code"] == "ACCEPTANCE_FAILED"
+        refusal = next(e for e in state["history"] if e.get("refused"))
+        assert refusal["refusal_code"] == "ACCEPTANCE_FAILED"
+
+    def test_the_rework_bound_names_its_own_code(self) -> None:
+        actor = ContractActor({"continuous_review": ["REJECT"] * 20})
+        state = run(make_deps(actor=actor, bounds=PipelineBounds(max_rework=3)))
+        assert state["terminal"] == TERMINAL_BOUNDS
+        assert state["terminal_code"] == "REWORK_LIMIT_REACHED"
+
+    def test_the_step_bound_names_its_own_code(self) -> None:
+        actor = ContractActor({"continuous_review": ["REJECT"] * 50})
+        state = run(make_deps(actor=actor, bounds=PipelineBounds(max_steps=5, max_rework=99)))
+        assert state["terminal"] == TERMINAL_BOUNDS
+        assert state["terminal_code"] == "STEP_LIMIT_REACHED"
+
+    def test_complete_carries_no_code(self) -> None:
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run(make_deps(actor=actor))
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert state.get("terminal_code", "") == ""

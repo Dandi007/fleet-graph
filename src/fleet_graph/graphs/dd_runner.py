@@ -162,6 +162,11 @@ def build_pipeline(
             # The same declaration configure writes down. Acceptance runs this,
             # not whatever the worktree ended up containing.
             declared=[list(c) for c in (config.run_config.get("acceptance_commands") or [])],
+            # The reconfigurable acceptance context (R1-c): setup runs first,
+            # the env overlays both. Declared here so it has an execution
+            # point -- a stored-but-unconsumed field is a dead mechanism.
+            setup=[list(c) for c in (config.run_config.get("setup_commands") or [])],
+            env=dict(config.run_config.get("acceptance_env") or {}),
             timeout_seconds=config.acceptance_timeout_seconds,
         ),
         stage_producing(lifecycle, MERGE_RESULT): MergeStage(
@@ -310,8 +315,14 @@ def run_pipeline(
 
     result = {
         "development_id": config.development_id,
+        "generation": config.generation,
         "terminal": state.get("terminal"),
         "terminal_reason": state.get("terminal_reason"),
+        # One mechanical cause and the failing collaborator's own words. The
+        # control plane's failure classification reads these two fields, so a
+        # run that failed keeps its cause and its raw error past the process.
+        "terminal_code": state.get("terminal_code", ""),
+        "terminal_detail": state.get("last_failure_detail", "") if state.get("terminal") else "",
         "fault": bool(state.get("fault", False)),
         "stage": state.get("stage"),
         "steps": state.get("steps", 0),

@@ -160,44 +160,89 @@ class AcceptanceStage:
     # What the operator asked for. Compared against the worktree's copy; the
     # comparison is what makes tampering visible.
     declared: list[list[str]] = field(default_factory=list)
+    # Setup runs before the acceptance commands, in the same environment: the
+    # R1-c environment/contract exit exists so a missing `node_modules` (the
+    # m-8f70cc shape) is fixed by declaring setup, not by editing the spec.
+    setup: list[list[str]] = field(default_factory=list)
+    # Environment overlaid on both setup and acceptance commands. Same
+    # authority rule as the commands: the declaration wins, the tree's copy is
+    # only checked against it.
+    env: dict[str, str] = field(default_factory=dict)
     timeout_seconds: int = 1800
 
     def commands(self) -> list[list[str]]:
         path = self.repo / RUN_CONFIG_PATH
         if not path.is_file():
-            raise StageRefused(f"{RUN_CONFIG_PATH} is missing; configure did not run")
-        config = json.loads(path.read_text(encoding="utf-8"))
-        in_tree = [
-            list(command) for command in (config.get("acceptance_commands") or []) if command
-        ]
-        wanted = [list(command) for command in self.declared if command]
-        if in_tree != wanted:
             raise StageRefused(
-                f"{RUN_CONFIG_PATH} declares {in_tree!r} but this run was configured with "
-                f"{wanted!r}; refusing to accept against commands nobody declared"
+                f"{RUN_CONFIG_PATH} is missing; configure did not run",
+                code="RUN_CONFIG_MISSING",
             )
-        return wanted
+        config = json.loads(path.read_text(encoding="utf-8"))
+        for key, wanted_value in (
+            ("acceptance_commands", [list(c) for c in self.declared if c]),
+            ("setup_commands", [list(c) for c in self.setup if c]),
+            ("acceptance_env", dict(self.env)),
+        ):
+            in_tree = config.get(key) or ([] if key != "acceptance_env" else {})
+            if key != "acceptance_env":
+                in_tree = [list(command) for command in in_tree if command]
+            if in_tree != wanted_value:
+                raise StageRefused(
+                    f"{RUN_CONFIG_PATH} declares {key}={in_tree!r} but this run was "
+                    f"configured with {wanted_value!r}; refusing to accept against "
+                    f"a {key} nobody declared",
+                    code="ACCEPTANCE_DECLARATION_MISMATCH",
+                )
+        return [list(c) for c in self.declared if c]
+
+    def _run(self, command: list[str]) -> dict[str, Any]:
+        import os
+
+        proc = subprocess.run(
+            command,
+            cwd=str(self.repo),
+            capture_output=True,
+            text=True,
+            timeout=self.timeout_seconds,
+            env={**os.environ, **self.env} if self.env else None,
+        )
+        return {
+            "command": command,
+            "exit_code": proc.returncode,
+            "stdout_tail": (proc.stdout or "")[-2000:],
+            "stderr_tail": (proc.stderr or "")[-2000:],
+        }
 
     def act(self, stage: Any, dispatch: Dispatch) -> StageOutcome:
+        declared = self.commands()
+
+        setup_results = []
+        for command in [list(c) for c in self.setup if c]:
+            entry = self._run(command)
+            setup_results.append(entry)
+            if entry["exit_code"] != 0:
+                # A failing setup is an environment fact, not a verdict on the
+                # work: recorded under its own code so the control plane's
+                # failure exits can tell it from a failing test.
+                write_json(
+                    self.repo,
+                    ACCEPTANCE_PATH,
+                    {
+                        "development_id": dispatch.get("development_id", ""),
+                        "attempt": dispatch.get("attempt", 1),
+                        "passed": False,
+                        "setup_results": setup_results,
+                        "results": [],
+                    },
+                )
+                raise StageRefused(f"setup failed: {command}", code="SETUP_FAILED")
+
         results = []
         failed = []
-        for command in self.commands():
-            proc = subprocess.run(
-                command,
-                cwd=str(self.repo),
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-            )
-            results.append(
-                {
-                    "command": command,
-                    "exit_code": proc.returncode,
-                    "stdout_tail": (proc.stdout or "")[-2000:],
-                    "stderr_tail": (proc.stderr or "")[-2000:],
-                }
-            )
-            if proc.returncode != 0:
+        for command in declared:
+            entry = self._run(command)
+            results.append(entry)
+            if entry["exit_code"] != 0:
                 failed.append(command)
 
         write_json(
@@ -207,11 +252,12 @@ class AcceptanceStage:
                 "development_id": dispatch.get("development_id", ""),
                 "attempt": dispatch.get("attempt", 1),
                 "passed": not failed,
+                **({"setup_results": setup_results} if setup_results else {}),
                 "results": results,
             },
         )
         if failed:
-            raise StageRefused(f"acceptance failed: {failed}")
+            raise StageRefused(f"acceptance failed: {failed}", code="ACCEPTANCE_FAILED")
         return StageOutcome(produced=tuple(stage.produced_artifacts))
 
 
@@ -261,7 +307,7 @@ class MergeStage:
                 handoff_commit=subject,
             )
         except git_ops.ExactWorkspaceError as exc:
-            raise StageRefused(f"merge refused: {exc}") from exc
+            raise StageRefused(f"merge refused: {exc}", code="MERGE_REFUSED") from exc
         return {"previous_target_head": observed}
 
 
