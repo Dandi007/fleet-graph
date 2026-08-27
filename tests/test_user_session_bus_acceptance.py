@@ -47,6 +47,26 @@ def test_degraded_manager_is_connected_and_records_raw_output(tmp_path: Path) ->
     assert "make verify exit=0" in done.stdout
 
 
+def test_running_manager_is_connected_and_records_raw_output(tmp_path: Path) -> None:
+    fake_command(tmp_path, "systemctl", "printf 'running\\n'; exit 0")
+    fake_command(tmp_path, "make", "printf 'verification output\\n'; exit 0")
+
+    done = subprocess.run(
+        ["/bin/bash", str(HELPER)],
+        capture_output=True,
+        text=True,
+        env=helper_environment(tmp_path),
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.count("UTC=") == 2
+    assert "running" in done.stdout
+    assert "systemctl --user is-system-running exit=0" in done.stdout
+    assert "verification output" in done.stdout
+    assert "make verify exit=0" in done.stdout
+
+
 def test_connection_failure_is_not_accepted_as_a_degraded_manager(tmp_path: Path) -> None:
     fake_command(tmp_path, "systemctl", "printf 'Failed to connect to bus\\n'; exit 1")
     fake_command(tmp_path, "make", "printf 'must not run\\n'; exit 0")
@@ -64,3 +84,23 @@ def test_connection_failure_is_not_accepted_as_a_degraded_manager(tmp_path: Path
     assert "Failed to connect to bus" in done.stdout
     assert "systemctl --user is-system-running exit=1" in done.stdout
     assert "must not run" not in done.stdout
+
+
+def test_verification_failure_records_raw_output_and_exit_code(tmp_path: Path) -> None:
+    fake_command(tmp_path, "systemctl", "printf 'degraded\\n'; exit 1")
+    fake_command(tmp_path, "make", "printf 'verification failed\\n'; exit 23")
+
+    done = subprocess.run(
+        ["/bin/bash", str(HELPER)],
+        capture_output=True,
+        text=True,
+        env=helper_environment(tmp_path),
+        check=False,
+    )
+
+    assert done.returncode == 23
+    assert done.stdout.count("UTC=") == 2
+    assert "degraded" in done.stdout
+    assert "systemctl --user is-system-running exit=1" in done.stdout
+    assert "verification failed" in done.stdout
+    assert "make verify exit=23" in done.stdout
