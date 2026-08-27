@@ -541,3 +541,27 @@ class TestCredentialDiscipline:
         monkeypatch.delenv("FLEET_GRAPH_BUS_TOKEN_FILE")
         bare = DdControlPlane(root=tmp_path / "dd", board_factory=lambda: None)
         assert set(bare.environment) == {"PATH"}, "a raw token value is never forwarded"
+
+
+class TestStageModelPolicy:
+    def test_server_side_stage_models_reach_the_launched_run(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        """Model overrides are deploy-level policy on the control plane, not
+        client vocabulary -- create's schema has no model parameter."""
+        launcher = RecordingLauncher()
+        binding = tmp_path / "plugin-binding.json"
+        binding.write_text('{"plugin_producer": {}}', encoding="utf-8")
+        plane = DdControlPlane(
+            root=tmp_path / "dd",
+            plugin_binding=binding,
+            worktree_roots=(str(tmp_path),),
+            launcher=launcher,
+            unit_probe=lambda unit: False,
+            board_factory=lambda: None,
+            stage_models={"continuous_review": "deepseek-v4-pro"},
+        )
+        dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
+        plane.start(dev)
+        argv = launcher.specs[0].argv()
+        assert argv[argv.index("--stage-model") + 1] == "continuous_review=deepseek-v4-pro"

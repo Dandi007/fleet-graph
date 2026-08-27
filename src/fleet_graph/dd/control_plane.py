@@ -213,6 +213,10 @@ class DdLaunchSpec:
     board_card: str = ""
     resume: bool = False
     launch_seq: int = 1
+    #: Server-side policy, not client vocabulary: per-stage model overrides
+    #: (the roles' own selectors stay the default). The §24 precedent runs
+    #: review stages on deepseek-v4-pro.
+    stage_models: dict[str, str] = field(default_factory=dict)
     working_directory: str = DEFAULT_WORKING_DIRECTORY
     executable: str = DEFAULT_EXECUTABLE
     environment: dict[str, str] = field(default_factory=dict)
@@ -270,6 +274,8 @@ class DdLaunchSpec:
         ]
         for command in self.acceptance_commands:
             argv += ["--accept", shlex.join(command)]
+        for stage, model in sorted(self.stage_models.items()):
+            argv += ["--stage-model", f"{stage}={model}"]
         if self.board_card:
             argv += ["--board-card", self.board_card]
         if self.resume:
@@ -294,6 +300,7 @@ class DdControlPlane:
         unit_probe: Callable[[str], bool] = _systemd_unit_is_active,
         board_factory: Callable[[], Any] | None = None,
         environment: dict[str, str] | None = None,
+        stage_models: dict[str, str] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         from fleet_graph.scheduler.launcher import TransientLauncher
@@ -309,6 +316,7 @@ class DdControlPlane:
         self.environment = (
             dict(environment) if environment is not None else _inherited_environment()
         )
+        self.stage_models = dict(stage_models or {})
         self.clock = clock
 
     # --- admission -------------------------------------------------------
@@ -753,6 +761,7 @@ class DdControlPlane:
             board_card=str(record.get("card_entity_id") or ""),
             resume=resume,
             launch_seq=seq,
+            stage_models=dict(self.stage_models),
             working_directory=self.working_directory,
             executable=self.executable,
             environment=dict(self.environment),

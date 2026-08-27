@@ -237,6 +237,7 @@ def _dd_serve(args: argparse.Namespace) -> int:
         plugin_binding=args.plugin_binding,
         working_directory=args.working_directory,
         executable=args.executable,
+        stage_models=dict(pair.split("=", 1) for pair in args.stage_model),
     )
     return 0
 
@@ -569,6 +570,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--executable",
         default=None,
         help="fleet-graph executable for launched dd runs (default the deployed release)",
+    )
+    dd_serve.add_argument(
+        "--stage-model",
+        action="append",
+        default=[],
+        metavar="STAGE=MODEL",
+        help="server-side policy: override one stage's model for every launched "
+        "run (e.g. continuous_review=deepseek-v4-pro); the roles' own "
+        "selectors stay the default",
     )
     dd_serve.set_defaults(func=_dd_serve)
 

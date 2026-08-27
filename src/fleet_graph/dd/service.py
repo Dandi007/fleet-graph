@@ -259,6 +259,7 @@ def serve(
     plugin_binding: str | None = None,
     working_directory: str | None = None,
     executable: str | None = None,
+    stage_models: dict[str, str] | None = None,
 ) -> None:
     if not port_is_available(host, port):
         raise RuntimeError(f"fleet-graph dev-dispatch port {host}:{port} is unavailable")
@@ -271,6 +272,8 @@ def serve(
         overrides["working_directory"] = working_directory
     if executable:
         overrides["executable"] = executable
+    if stage_models:
+        overrides["stage_models"] = stage_models
     build_mcp_server(DdControlPlane(**overrides)).run(
         transport="streamable-http", host=host, port=port, path="/mcp"
     )
