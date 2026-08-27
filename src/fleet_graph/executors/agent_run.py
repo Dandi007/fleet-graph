@@ -60,6 +60,7 @@ def scrubbed_environment(env: dict[str, str] | None = None) -> dict[str, str]:
     source = os.environ if env is None else env
     return {k: v for k, v in source.items() if not k.startswith(DECISION_ENV_PREFIX)}
 
+
 # `-current` is a symlink the deploy flow points at an immutable release
 # snapshot; the bare checkout is a working tree someone edits. The old
 # babysitter overrode the pump's default to exactly this path for every line,
