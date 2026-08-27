@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fleet_graph.graphs.goal_line import (
