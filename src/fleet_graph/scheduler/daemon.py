@@ -62,8 +62,8 @@ from typing import Any, Protocol
 
 from fleet_graph.scheduler.ignition import (
     DEFAULT_BACKOFF_CAP_SECONDS,
-    DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_CAP_WINDOW_SECONDS,
+    DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_TOTAL_CAP,
     IgnitionDecision,
     LineStatus,
@@ -448,7 +448,9 @@ class Scheduler:
         results: list[TickResult] = []
         launched_this_tick = 0
 
-        for line in self.config.lines:
+        # The enabled roster is the monitoring population. Lines removed from
+        # it (or staged with enabled=false) produce no observation at all.
+        for line in (line for line in self.config.lines if line.enabled):
             streak = self.account_last_run(line.folder_id)
             decision = decide(
                 self.status_of(line),

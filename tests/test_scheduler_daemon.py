@@ -137,9 +137,7 @@ class TestEveryRefusalComesFromDecide:
         lines = [
             LineSpec(folder_id=f"wf-{i}", seat="opencode-dsv4pro", enabled=True) for i in range(4)
         ]
-        scheduler = make(
-            tmp_path, lines=lines, launcher=FakeLauncher(started=False), total_cap=2
-        )
+        scheduler = make(tmp_path, lines=lines, launcher=FakeLauncher(started=False), total_cap=2)
         refusals = [r.decision.refusal for r in scheduler.tick()]
         assert refusals == [None, None, Refusal.TOTAL_CAP_REACHED, Refusal.TOTAL_CAP_REACHED]
 
@@ -415,9 +413,7 @@ class TestARestartDoesNotHandOutAFreeLaunch:
         window = scheduler.config.cap_window_seconds
         scheduler.unproductive_launches.extend([1000.0, 1000.0 + window / 2])
         assert scheduler.unproductive_recent(1000.0 + window / 2) == 2
-        assert scheduler.unproductive_recent(1000.0 + window + 1) == 1, (
-            "the older one has aged out"
-        )
+        assert scheduler.unproductive_recent(1000.0 + window + 1) == 1, "the older one has aged out"
 
 
 class TestItWalksTheRosterRatherThanStartingIt:
@@ -444,12 +440,14 @@ class TestItWalksTheRosterRatherThanStartingIt:
         make(tmp_path, lines=self._lines(1), slept=slept).tick()
         assert slept == []
 
-    def test_a_tick_that_starts_nothing_does_not_sleep(self, tmp_path: Path) -> None:
-        """Otherwise a fully disabled roster would burn 45s per line per tick
-        doing nothing at all."""
+    def test_a_tick_with_no_enabled_lines_emits_no_observations_or_sleeps(
+        self, tmp_path: Path
+    ) -> None:
+        """Disabled entries are outside the monitoring population."""
         slept: list[float] = []
         lines = [LineSpec(folder_id="wf-1", seat="s", enabled=False)]
-        make(tmp_path, lines=lines, slept=slept).tick()
+        scheduler = make(tmp_path, lines=lines, slept=slept)
+        assert scheduler.tick() == []
         assert slept == []
 
     def test_refusals_do_not_count_as_launches(self, tmp_path: Path) -> None:
@@ -620,16 +618,24 @@ class TestTheRosterReachesTheDecision:
         must not be the same act as releasing it."""
         assert LineSpec(folder_id="wf-1", seat="opencode-dsv4pro").enabled is False
 
-    def test_a_disabled_line_is_not_launched(self, tmp_path: Path) -> None:
+    def test_a_disabled_line_is_not_observed_or_launched(self, tmp_path: Path) -> None:
         launcher = FakeLauncher()
         scheduler = make(
             tmp_path,
             lines=[LineSpec(folder_id="wf-1", seat="opencode-dsv4pro", enabled=False)],
             launcher=launcher,
         )
-        result = scheduler.tick()[0]
-        assert result.decision.refusal is Refusal.LINE_DISABLED
+        assert scheduler.tick() == []
         assert launcher.launched == []
+
+    def test_a_disabled_line_is_not_checked_in_systemd(self, tmp_path: Path) -> None:
+        units = FakeUnits()
+        make(
+            tmp_path,
+            lines=[LineSpec(folder_id="wf-1", seat="opencode-dsv4pro", enabled=False)],
+            units=units,
+        ).tick()
+        assert units.asked == []
 
     def test_a_disabled_line_does_not_burn_the_global_cap(self, tmp_path: Path) -> None:
         """Otherwise holding eight lines back for a week would trip the
@@ -653,7 +659,7 @@ class TestTheRosterReachesTheDecision:
             ],
         )
         results = {r.folder_id: r.decision for r in scheduler.tick()}
-        assert results["wf-off"].refusal is Refusal.LINE_DISABLED
+        assert "wf-off" not in results
         assert results["wf-on"].ignite is True
 
     def test_the_config_loader_carries_the_flag_through(self, tmp_path: Path) -> None:
