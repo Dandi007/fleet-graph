@@ -4,6 +4,7 @@
   "_rollout": "P7 分批放量。第一批金丝雀 wf-40fa8d 已实证引擎全链（25 轮无重复推进、dd 四阶段封存、真实产品 diff、在授权边界正确停住）。第二批 +5 条（可观测/额度类，改面板与配置，不动核心服务），由 agent 依用户 2026-08-27 02:0x 全权委托代行监督面裁定。第三批 = 余下 3 条。enabled 是唯一放行开关；紧急停机口见 docs/operating.md。",
   "run_root": "/data/fleet-graph/runs",
   "probe_via_runtime": true,
+  "supervisor_events": true,
   "lines": [
     {
       "folder_id": "wf-197430",
@@ -83,8 +84,17 @@
       "max_rounds": 9999,
       "_acceptance_provenance": "R0d 金丝雀：两条只读探测取自该线 goal.md A4 观察窗/第一纪律的机械判据（:7455 老引擎端口在听、loop-engine-jobd unit 在役）。目的是让 last_acceptance 事实链首次真机跑通，不是替线做完整验收。",
       "acceptance": [
-        ["bash", "-lc", "ss -ltn | grep -c ':7455'"],
-        ["systemctl", "--user", "is-active", "loop-engine-jobd"]
+        [
+          "bash",
+          "-lc",
+          "ss -ltn | grep -c ':7455'"
+        ],
+        [
+          "systemctl",
+          "--user",
+          "is-active",
+          "loop-engine-jobd"
+        ]
       ],
       "acceptance_cwd": "/tmp"
     },
