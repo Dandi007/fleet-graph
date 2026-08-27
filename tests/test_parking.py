@@ -475,10 +475,17 @@ class TestEscalation:
         assert result.board_question is None
 
 
+def hermetic_signals(tmp_path: Path, **kwargs: Any) -> LiveWakeSignals:
+    """LiveWakeSignals whose line-token lookup can never hit the real
+    /data/ronin/secrets on the test host -- it points into tmp_path."""
+    kwargs.setdefault("line_token_template", str(tmp_path / "secrets" / "{alias}.token"))
+    return LiveWakeSignals(**kwargs)
+
+
 class TestLiveWakeSignals:
     """The production probes, over fakes of their transports."""
 
-    def test_inbox_reads_the_newest_tail_not_the_oldest_page(self) -> None:
+    def test_inbox_reads_the_newest_tail_not_the_oldest_page(self, tmp_path: Path) -> None:
         class FakeBus:
             def __init__(self) -> None:
                 self.calls: list[dict[str, Any]] = []
@@ -492,12 +499,12 @@ class TestLiveWakeSignals:
                 return [{"created_at": "2026-08-27T12:00:00.123Z"}], 500
 
         bus = FakeBus()
-        signals = LiveWakeSignals(bus_client=bus)
+        signals = hermetic_signals(tmp_path, bus_client=bus)
         assert signals.inbox_message_after("canary", BLOCKED_EPOCH) is True
         assert bus.calls[0]["channel"] == "agent:canary"
         assert bus.calls[1]["after_seq"] == 450
 
-    def test_old_mail_does_not_wake(self) -> None:
+    def test_old_mail_does_not_wake(self, tmp_path: Path) -> None:
         class FakeBus:
             def messages(
                 self, channel_id: str, *, limit: int = 100, after_seq: int = 0
@@ -506,17 +513,17 @@ class TestLiveWakeSignals:
                     return [], 3
                 return [{"created_at": "2026-08-27T09:00:00.000Z"}], 3
 
-        signals = LiveWakeSignals(bus_client=FakeBus())
+        signals = hermetic_signals(tmp_path, bus_client=FakeBus())
         assert signals.inbox_message_after("canary", BLOCKED_EPOCH) is False
 
-    def test_an_empty_channel_does_not_wake(self) -> None:
+    def test_an_empty_channel_does_not_wake(self, tmp_path: Path) -> None:
         class FakeBus:
             def messages(
                 self, channel_id: str, *, limit: int = 100, after_seq: int = 0
             ) -> tuple[list[dict[str, Any]], int]:
                 return [], 0
 
-        signals = LiveWakeSignals(bus_client=FakeBus())
+        signals = hermetic_signals(tmp_path, bus_client=FakeBus())
         assert signals.inbox_message_after("canary", BLOCKED_EPOCH) is False
 
     def test_goal_revision_comes_from_fs_stat(self) -> None:
@@ -657,3 +664,135 @@ class TestSourceDegradation:
         assert probe_error_tag(BusError(403, "no ACL")) == "BusError:403"
         assert probe_error_tag(BusError(404, "no channel")) == "BusError:404"
         assert probe_error_tag(RuntimeError("boom")) == "RuntimeError"
+
+
+class RecordingBus:
+    """A fake bus that answers `messages` and remembers being asked."""
+
+    def __init__(self, *, head_seq: int = 0) -> None:
+        self.head_seq = head_seq
+        self.calls: list[str] = []
+
+    def messages(
+        self, channel_id: str, *, limit: int = 100, after_seq: int = 0
+    ) -> tuple[list[dict[str, Any]], int]:
+        self.calls.append(channel_id)
+        return [], self.head_seq
+
+
+class TestInboxCredential:
+    """The inbox belongs to the line: `agent:{alias}` is private, owner-only
+    readable, and the owner is the line's pump agent. So the probe presents
+    the line's own mirrored token; the fleet-graph service token (which the
+    channel ACL structurally 403s) is only the fallback, and the channel ACL
+    is deliberately not widened."""
+
+    def test_the_line_token_file_is_the_credential_when_present(self, tmp_path: Path) -> None:
+        secrets = tmp_path / "secrets"
+        secrets.mkdir()
+        (secrets / "canary.token").write_text("line-secret\n", encoding="utf-8")
+
+        built_with: list[str] = []
+        line_bus = RecordingBus()
+
+        def factory(token: str) -> RecordingBus:
+            built_with.append(token)
+            return line_bus
+
+        service = RecordingBus()
+        signals = LiveWakeSignals(
+            bus_client=service,
+            line_token_template=str(secrets / "{alias}.token"),
+            line_bus_factory=factory,
+        )
+
+        assert signals.inbox_message_after("canary", BLOCKED_EPOCH) is False
+        assert built_with == ["line-secret"]  # the stripped file content, verbatim
+        assert line_bus.calls == ["agent:canary"]
+        assert service.calls == []  # the service token never touches the channel
+
+    def test_a_missing_token_file_falls_back_to_the_service_token(self, tmp_path: Path) -> None:
+        built_with: list[str] = []
+        service = RecordingBus()
+        signals = LiveWakeSignals(
+            bus_client=service,
+            line_token_template=str(tmp_path / "secrets" / "{alias}.token"),
+            line_bus_factory=lambda token: built_with.append(token),
+        )
+
+        assert signals.inbox_message_after("canary", BLOCKED_EPOCH) is False
+        assert built_with == []
+        assert service.calls == ["agent:canary"]
+
+    def test_a_successful_line_token_probe_marks_the_snapshot_available(
+        self, tmp_path: Path
+    ) -> None:
+        """`parked_inbox_available` tells the truth about the credential that
+        was actually used: probing with the line's token succeeds, so the
+        source is available -- and mid-park inbox checks keep running."""
+
+        class FakeCaller:
+            def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                return {"ok": True, "content_revision": "sha256:rev-1"}
+
+        secrets = tmp_path / "secrets"
+        secrets.mkdir()
+        (secrets / "canary.token").write_text("line-secret", encoding="utf-8")
+        wake = LiveWakeSignals(
+            bus_client=RecordingBus(),  # would 403 in production; must stay unused
+            wf_caller=FakeCaller(),
+            line_token_template=str(secrets / "{alias}.token"),
+            line_bus_factory=lambda token: RecordingBus(),
+        )
+        scheduler, _, _ = blocked_line(tmp_path, wake=wake)
+
+        result = scheduler.tick()[0]
+        assert result.decision.refusal is Refusal.PARKED_AWAITING_DECISION
+        assert result.park_event == "established"
+        state = json.loads(stall_file(tmp_path).read_text(encoding="utf-8"))
+        assert state["parked_inbox_available"] is True
+
+    def test_both_credentials_dead_still_parks_on_the_goal_anchor(self, tmp_path: Path) -> None:
+        """No token file *and* the service token 403s: the inbox source
+        degrades exactly as in #89 -- the goal.md anchor parks alone, nothing
+        crashes, and the snapshot records the source as unavailable."""
+        from fleet_graph.bus.client import BusError
+
+        class DeniedBus:
+            def messages(
+                self, channel_id: str, *, limit: int = 100, after_seq: int = 0
+            ) -> tuple[list[dict[str, Any]], int]:
+                raise BusError(403, "Cannot read this channel")
+
+        class FakeCaller:
+            def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                return {"ok": True, "content_revision": "sha256:rev-1"}
+
+        wake = LiveWakeSignals(
+            bus_client=DeniedBus(),
+            wf_caller=FakeCaller(),
+            line_token_template=str(tmp_path / "secrets" / "{alias}.token"),
+        )
+        scheduler, _, launcher = blocked_line(tmp_path, wake=wake)
+
+        result = scheduler.tick()[0]
+        assert result.decision.refusal is Refusal.PARKED_AWAITING_DECISION
+        assert result.park_event == "established:inbox_unavailable:BusError:403"
+        assert launcher.launched == []
+        state = json.loads(stall_file(tmp_path).read_text(encoding="utf-8"))
+        assert state["parked_inbox_available"] is False
+        assert state["parked_goal_revision"] == "sha256:rev-1"
+
+    def test_an_unsafe_alias_never_touches_the_filesystem(self, tmp_path: Path) -> None:
+        """The alias is a path component of the token file; anything that
+        could traverse out of the secrets dir skips straight to fallback."""
+        service = RecordingBus()
+        signals = LiveWakeSignals(
+            bus_client=service,
+            line_token_template=str(tmp_path / "secrets" / "{alias}.token"),
+            line_bus_factory=lambda token: (_ for _ in ()).throw(
+                AssertionError("no line client for an unsafe alias")
+            ),
+        )
+        assert signals.inbox_message_after("../../etc/passwd", BLOCKED_EPOCH) is False
+        assert service.calls == ["agent:../../etc/passwd"]
