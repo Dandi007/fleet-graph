@@ -137,9 +137,7 @@ class TestEveryRefusalComesFromDecide:
         lines = [
             LineSpec(folder_id=f"wf-{i}", seat="opencode-dsv4pro", enabled=True) for i in range(4)
         ]
-        scheduler = make(
-            tmp_path, lines=lines, launcher=FakeLauncher(started=False), total_cap=2
-        )
+        scheduler = make(tmp_path, lines=lines, launcher=FakeLauncher(started=False), total_cap=2)
         refusals = [r.decision.refusal for r in scheduler.tick()]
         assert refusals == [None, None, Refusal.TOTAL_CAP_REACHED, Refusal.TOTAL_CAP_REACHED]
 
@@ -415,9 +413,7 @@ class TestARestartDoesNotHandOutAFreeLaunch:
         window = scheduler.config.cap_window_seconds
         scheduler.unproductive_launches.extend([1000.0, 1000.0 + window / 2])
         assert scheduler.unproductive_recent(1000.0 + window / 2) == 2
-        assert scheduler.unproductive_recent(1000.0 + window + 1) == 1, (
-            "the older one has aged out"
-        )
+        assert scheduler.unproductive_recent(1000.0 + window + 1) == 1, "the older one has aged out"
 
 
 class TestItWalksTheRosterRatherThanStartingIt:
