@@ -1,0 +1,352 @@
+"""Replaying a restarted generation from its sealed receipts (F4).
+
+The scenario is dev-fg-4628ef887564: generation n sealed implement, a later
+stage failed, and generation n+1 used to re-dispatch a fresh implement actor
+against a tree that already contains the work -- which honestly reports
+BLOCKED, and the line jams. These tests fabricate the two generations on a
+real git repo and prove the receipt prefix replays mechanically, the chain
+breaks re-run for real, and REJECT is never replayed.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from conftest import DEVELOPMENT_ID, git, head
+from fleet_graph.dd.dispatch import derive_attempt_id
+from fleet_graph.dd.lifecycle import Lifecycle
+from fleet_graph.dd.upstream_constants import (
+    ATTEMPT_CONTEXT_CONTRACT_VERSION,
+    compute_json_digest,
+)
+from fleet_graph.dd.vendor import plugin_adapter
+from fleet_graph.graphs.dd_pipeline import (
+    TERMINAL_COMPLETE,
+    build_dd_pipeline_graph,
+    initial_state,
+)
+from fleet_graph.graphs.dd_replay import (
+    ReceiptReplayer,
+    byte_digest,
+    prior_generation_state_roots,
+)
+from test_dd_pipeline import ContractActor, make_deps
+
+LIFECYCLE = Lifecycle.load()
+
+
+def commit_file(repo: Path, relative: str, content: str, message: str = "seal") -> str:
+    path = repo / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", message)
+    return head(repo)
+
+
+def implement_receipt(seed: str, configure: str, implement: str) -> dict[str, Any]:
+    """A complete applied implement receipt, chained to its configure link."""
+    receipt = {
+        "actor_job_id": "job-1",
+        "artifacts": [],
+        "attempt_id": derive_attempt_id(DEVELOPMENT_ID, 1, 1),
+        "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
+        "development_id": DEVELOPMENT_ID,
+        "feedback_digest": "sha256:" + "0" * 64,
+        "input_commit": configure,
+        "materialization_intent_id": "intent-implement",
+        "output_commit": implement,
+        "parent_handoff_receipt_digest": compute_json_digest(
+            {"stage": "configure", "input_commit": seed, "output_commit": configure}
+        ),
+        "spec_digest": "sha256:" + "1" * 64,
+        "verification_record": {"verification_commands": []},
+        "work_head_commit": implement,
+    }
+    assert set(receipt) == plugin_adapter.IMPLEMENT_RECEIPT_FIELDS
+    return receipt
+
+
+def review_receipt(
+    *, parent_digest: str, subject: str, output: str, verdict: str, phase: str = "continuous"
+) -> dict[str, Any]:
+    receipt = {
+        "attempt_id": derive_attempt_id(DEVELOPMENT_ID, 1, 1),
+        "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
+        "development_id": DEVELOPMENT_ID,
+        "feedback_index": {"entries": []},
+        "implementation_handoff_receipt_digest": parent_digest,
+        "implementation_subject_commit": subject,
+        "input_commit": subject,
+        "materialization_intent_id": f"intent-{phase}",
+        "output_commit": output,
+        "parent_handoff_receipt_digest": parent_digest,
+        "review_artifact": {"path": "x"},
+        "review_id": f"R-{phase}",
+        "review_phase": phase,
+        "reviewer_job_id": "rev-1",
+        "subject_commit": subject,
+        "verdict": verdict,
+    }
+    assert set(receipt) == plugin_adapter.REVIEW_RECEIPT_FIELDS
+    return receipt
+
+
+def write_receipt(
+    state_root: Path, generation: int, attempt: int, filename: str, receipt: dict[str, Any]
+) -> bytes:
+    raw = json.dumps(receipt, sort_keys=True).encode("utf-8")
+    directory = state_root / "receipts" / derive_attempt_id(DEVELOPMENT_ID, generation, attempt)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / filename).write_bytes(raw)
+    return raw
+
+
+class G1:
+    """One previous generation: configure and implement sealed on a real repo."""
+
+    def __init__(self, repo: Path, tmp_path: Path) -> None:
+        self.repo = repo
+        self.dev_root = tmp_path / "dd"
+        self.state_root = self.dev_root / "state"
+        self.seed = head(repo)
+        self.configure = commit_file(repo, ".dev-dispatch/run-config.json", '{"generation": 1}')
+        self.implement = commit_file(repo, "product.py", "print('done')\n")
+        self.receipt = implement_receipt(self.seed, self.configure, self.implement)
+        self.raw = write_receipt(self.state_root, 1, 1, "implement-receipt.json", self.receipt)
+
+    def junk_configure(self) -> str:
+        """The pre-F4 restart's dead weight: a fresh configure re-seal."""
+        return commit_file(self.repo, ".dev-dispatch/run-config.json", '{"generation": 2}')
+
+    def replayer(self) -> ReceiptReplayer:
+        return ReceiptReplayer(
+            workspace=self.repo,
+            state_root=self.dev_root / "g2" / "state",
+            prior_state_roots=((1, self.state_root),),
+            development_id=DEVELOPMENT_ID,
+            generation=2,
+            lifecycle=LIFECYCLE,
+        )
+
+    def installed(self, filename: str) -> Path:
+        attempt_id = derive_attempt_id(DEVELOPMENT_ID, 2, 1)
+        return self.dev_root / "g2" / "state" / "receipts" / attempt_id / filename
+
+
+def run_generation_two(deps: Any, head_commit: str) -> dict[str, Any]:
+    graph = build_dd_pipeline_graph(deps).compile()
+    start = initial_state(
+        development_id=DEVELOPMENT_ID,
+        stage="configure",
+        head_commit=head_commit,
+        artifacts={"spec": head_commit},
+        generation=2,
+    )
+    return graph.invoke(start, config={"recursion_limit": 200})
+
+
+def replayed_stages(state: dict[str, Any]) -> list[str]:
+    return [e["stage"] for e in state["history"] if e.get("replayed")]
+
+
+class TestASealedPrefixReplays:
+    def test_the_implement_prefix_replays_and_the_review_runs_real(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """The F4 scenario end to end: no fresh implement agent is dispatched
+        against a tree that already carries the work."""
+        g1 = G1(repo, tmp_path)
+        junk = g1.junk_configure()
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), head_commit=junk)
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert [stage for stage, _ in actor.calls] == [
+            "continuous_review",
+            "final_review",
+            "acceptance",
+            "human_gate",
+            "merger",
+        ], "neither configure nor implement may be re-dispatched"
+        assert replayed_stages(state) == ["configure", "implement"]
+        implement_entry = state["history"][1]
+        assert implement_entry["output_commit"] == g1.implement
+
+    def test_the_dead_weight_above_the_tip_is_trimmed(self, repo: Path, tmp_path: Path) -> None:
+        """The plugin sealer requires remote head == input commit, so the
+        junk configure commit of the failed restart must go."""
+        g1 = G1(repo, tmp_path)
+        junk = g1.junk_configure()
+        assert head(repo) == junk
+        run_generation_two(make_deps(actor=ContractActor(), replayer=g1.replayer()), junk)
+        assert head(repo) == g1.implement
+
+    def test_the_replayed_receipt_bytes_are_installed_for_this_generation(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """A later real seal names its parent by the file's byte digest, read
+        from this generation's receipts directory -- so the bytes must be
+        there, and must be exactly the sealed bytes."""
+        g1 = G1(repo, tmp_path)
+        run_generation_two(
+            make_deps(actor=ContractActor(), replayer=g1.replayer()), g1.junk_configure()
+        )
+        installed = g1.installed("implement-receipt.json")
+        assert installed.read_bytes() == g1.raw
+        assert byte_digest(installed.read_bytes()) == byte_digest(g1.raw)
+
+    def test_an_approved_review_is_replayed_too(self, repo: Path, tmp_path: Path) -> None:
+        g1 = G1(repo, tmp_path)
+        review_commit = commit_file(
+            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
+        )
+        raw = write_receipt(
+            g1.state_root,
+            1,
+            1,
+            "continuous-review-receipt.json",
+            review_receipt(
+                parent_digest=byte_digest(g1.raw),
+                subject=g1.implement,
+                output=review_commit,
+                verdict="APPROVE",
+            ),
+        )
+        junk = g1.junk_configure()
+
+        actor = ContractActor({"final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
+        assert next(stage for stage, _ in actor.calls) == "final_review"
+        assert head(repo) == review_commit
+        assert g1.installed("continuous-review-receipt.json").read_bytes() == raw
+
+
+class TestABrokenChainRunsRealFromTheBreak:
+    def test_a_chain_broken_at_implement_replays_nothing(self, repo: Path, tmp_path: Path) -> None:
+        g1 = G1(repo, tmp_path)
+        broken = dict(g1.receipt)
+        broken["parent_handoff_receipt_digest"] = "sha256:" + "f" * 64
+        write_receipt(g1.state_root, 1, 1, "implement-receipt.json", broken)
+        junk = g1.junk_configure()
+
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert next(stage for stage, _ in actor.calls) == "configure"
+        assert replayed_stages(state) == []
+        assert head(repo) == junk, "a refused replay must not touch the tree"
+
+    def test_a_chain_broken_at_the_review_link_reruns_the_review(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        g1 = G1(repo, tmp_path)
+        write_receipt(
+            g1.state_root,
+            1,
+            1,
+            "continuous-review-receipt.json",
+            review_receipt(
+                parent_digest="sha256:" + "f" * 64,  # names a parent that never sealed
+                subject=g1.implement,
+                output=g1.implement,
+                verdict="APPROVE",
+            ),
+        )
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(
+            make_deps(actor=actor, replayer=g1.replayer()), g1.junk_configure()
+        )
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert replayed_stages(state) == ["configure", "implement"]
+        assert next(stage for stage, _ in actor.calls) == "continuous_review"
+
+
+class TestARejectionIsNeverReplayed:
+    def test_a_rejected_review_reruns_for_real(self, repo: Path, tmp_path: Path) -> None:
+        """The REJECT receipt is complete and chained -- and still not
+        replayed: only the success/APPROVE prefix is."""
+        g1 = G1(repo, tmp_path)
+        review_commit = commit_file(
+            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "REJECT"}'
+        )
+        write_receipt(
+            g1.state_root,
+            1,
+            1,
+            "continuous-review-receipt.json",
+            review_receipt(
+                parent_digest=byte_digest(g1.raw),
+                subject=g1.implement,
+                output=review_commit,
+                verdict="REJECT",
+            ),
+        )
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), head(repo))
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert replayed_stages(state) == ["configure", "implement"]
+        assert next(stage for stage, _ in actor.calls) == "continuous_review"
+        assert head(repo) == g1.implement, "the rejected review's seal is dead weight"
+
+
+class TestReplayFailsClosed:
+    def test_product_drift_above_the_tip_refuses_the_whole_replay(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """Trimming may cut only the reserved namespaces. A product file above
+        the sealed tip means the tree is not the sealed chain plus dead
+        weight, so nothing is replayed and nothing is cut."""
+        g1 = G1(repo, tmp_path)
+        drifted = commit_file(repo, "stray-product.py", "print('who wrote this')\n")
+
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), drifted)
+
+        assert replayed_stages(state) == []
+        assert next(stage for stage, _ in actor.calls) == "configure"
+        assert head(repo) == drifted
+
+    def test_a_rework_dispatch_is_never_replayed(self, repo: Path, tmp_path: Path) -> None:
+        g1 = G1(repo, tmp_path)
+        replayer = g1.replayer()
+        rework = {"attempt": 2, "retry": 0, "mode": "rework"}
+        assert replayer.replay(LIFECYCLE.stages["configure"], rework) is None
+        # And the miss is sticky: replay is a prefix, never a hole.
+        fresh = {"attempt": 1, "retry": 0, "mode": "initial"}
+        assert replayer.replay(LIFECYCLE.stages["configure"], fresh) is None
+
+    def test_a_mid_walk_resume_replays_nothing_and_mutates_nothing(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """A resumed thread consults the replayer from wherever it suspended.
+        That is not the prefix, so no replay -- and, critically, no trim."""
+        g1 = G1(repo, tmp_path)
+        junk = g1.junk_configure()
+        replayer = g1.replayer()
+        dispatch = {"attempt": 1, "retry": 0, "mode": "initial"}
+        assert replayer.replay(LIFECYCLE.stages["implement"], dispatch) is None
+        assert head(repo) == junk
+        assert not g1.installed("implement-receipt.json").exists()
+
+
+class TestTheRunnerWiresReplayOnlyWhereItBelongs:
+    def test_the_prior_roots_follow_the_control_plane_layout(self) -> None:
+        assert prior_generation_state_roots(Path("/dd/dev-x/g3"), 3) == (
+            (2, Path("/dd/dev-x/g2/state")),
+            (1, Path("/dd/dev-x/state")),
+        )
+
+    def test_generation_one_has_nothing_to_replay(self) -> None:
+        assert prior_generation_state_roots(Path("/dd/dev-x"), 1) == ()
+
+    def test_an_unrecognized_layout_replays_nothing(self) -> None:
+        assert prior_generation_state_roots(Path("/somewhere/custom"), 3) == ()
