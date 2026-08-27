@@ -36,7 +36,7 @@ import contextlib
 import json
 import shlex
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -58,6 +58,31 @@ DEFAULT_UNIT_PREFIX = "fleet-graph-supervisor"
 
 #: How many board messages one tick will page through at most.
 BOARD_PAGE_LIMIT = 200
+
+#: 与 supervise/decision_publisher.DECISION_TOKEN_ENV 同值（测试钉死相等）。
+#: 不 import 那个模块——Guard C 规定唯一 importer 是 supervisor act 节点，
+#: 调度层要的只是这个名字，不是发布入口。
+DECISION_TOKEN_ENV = "FLEET_GRAPH_DECISION_TOKEN_FILE"
+
+
+def observer_environment(
+    line_environment: dict[str, str], daemon_environ: Mapping[str, str]
+) -> dict[str, str]:
+    """The env a supervisor transient unit gets: the lines' env, plus the
+    decision credential -- and only here.
+
+    The credential comes from the daemon's own environment (the systemd
+    EnvironmentFile), never from the config's line_environment: putting it
+    there would hand every line pump the key the fourth gate exists to keep
+    away from lines. agent children are scrubbed either way
+    (executors/agent_run.py), but a pump process has no business holding it
+    at all.
+    """
+    env = dict(line_environment)
+    token_file = daemon_environ.get(DECISION_TOKEN_ENV, "")
+    if token_file:
+        env[DECISION_TOKEN_ENV] = token_file
+    return env
 
 
 @dataclass(frozen=True)
@@ -381,4 +406,5 @@ __all__ = [
     "ObserverConfig",
     "SupervisorLaunchSpec",
     "SupervisorObserver",
+    "observer_environment",
 ]

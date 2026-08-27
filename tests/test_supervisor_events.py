@@ -18,9 +18,11 @@ from typing import Any
 from fleet_graph.scheduler.daemon import LineSpec, Scheduler, SchedulerConfig, TickResult
 from fleet_graph.scheduler.ignition import IgnitionDecision, Refusal
 from fleet_graph.scheduler.supervisor_events import (
+    DECISION_TOKEN_ENV,
     ObserverConfig,
     SupervisorLaunchSpec,
     SupervisorObserver,
+    observer_environment,
 )
 from fleet_graph.supervise.events import line_fault_event
 
@@ -419,3 +421,29 @@ class TestSchedulerWiring:
         )
         record = scheduler.terminal_record("wf-a")
         assert record is not None and record["pump_fault"] is True
+
+
+class TestObserverEnvironment:
+    """R4-3 接线：决策凭证只进 supervisor unit 的 env，且只来自 daemon 自身
+    的环境（systemd EnvironmentFile），不来自 config line_environment。"""
+
+    def test_the_decision_credential_rides_only_when_the_daemon_has_it(self) -> None:
+        line_env = {"PATH": "/usr/bin", "FLEET_GRAPH_BUS_TOKEN_FILE": "/t/bus.token"}
+        out = observer_environment(line_env, {"FLEET_GRAPH_DECISION_TOKEN_FILE": "/t/d.token"})
+        assert out["FLEET_GRAPH_DECISION_TOKEN_FILE"] == "/t/d.token"
+        # 原 line env 原样保留，且未被就地污染
+        assert out["PATH"] == "/usr/bin"
+        assert "FLEET_GRAPH_DECISION_TOKEN_FILE" not in line_env
+
+    def test_no_daemon_credential_means_no_key_not_an_empty_key(self) -> None:
+        out = observer_environment({"PATH": "/usr/bin"}, {})
+        assert "FLEET_GRAPH_DECISION_TOKEN_FILE" not in out
+        out2 = observer_environment({"PATH": "/usr/bin"}, {"FLEET_GRAPH_DECISION_TOKEN_FILE": ""})
+        assert "FLEET_GRAPH_DECISION_TOKEN_FILE" not in out2
+
+    def test_the_env_name_matches_the_publisher_without_importing_it(self) -> None:
+        # supervisor_events 用字面量避开 Guard C；这条测试钉住两处同值，
+        # 名字漂移在这里炸而不是在生产静默失联。
+        from fleet_graph.supervise.decision_publisher import DECISION_TOKEN_ENV as publisher_name
+
+        assert publisher_name == DECISION_TOKEN_ENV
