@@ -603,3 +603,58 @@ def test_cli_wiring() -> None:
     )
     assert audit_args.func.__name__ == "_supervise_audit"
     assert audit_args.target == "dev_x"
+
+
+class TestVerifiedBitStateAwareness:
+    """verified 是控制面推导位（terminal==complete AND ...），gate 前构造性
+    恒 False。断言按 state 判推导一致性：未完成家族要求构成件全真且位未立；
+    完成态（及名单外未知态，fail-closed）要求位已立。"""
+
+    def test_awaiting_gate_with_honest_false_bit_is_green(
+        self, tmp_path: Path, tracked_tmp: list[Path]
+    ) -> None:
+        fixture = build_repo(tmp_path)
+        engine = FakeEngine(fixture)
+        engine.development = lambda d: {  # type: ignore[method-assign]
+            "development_id": d,
+            "state": "awaiting_gate",
+            "target_base_commit": fixture.base,
+            "worktree_path": None,
+        }
+        evidence = engine.evidence("dev_x")
+        evidence["evidence"][0]["verified"] = False
+        engine.evidence = lambda d: evidence  # type: ignore[method-assign]
+        report = audit_development("dev_x", engine=engine, repo=fixture.repo)
+        assert by_name(report)["verified_bit"].ok
+
+    def test_awaiting_gate_with_bit_already_true_is_red(
+        self, tmp_path: Path, tracked_tmp: list[Path]
+    ) -> None:
+        # gate 前 verified=True 只能来自推导被篡改或读错库——红。
+        fixture = build_repo(tmp_path)
+        engine = FakeEngine(fixture)
+        engine.development = lambda d: {  # type: ignore[method-assign]
+            "development_id": d,
+            "state": "awaiting_gate",
+            "target_base_commit": fixture.base,
+            "worktree_path": None,
+        }
+        report = audit_development("dev_x", engine=engine, repo=fixture.repo)
+        assert not by_name(report)["verified_bit"].ok
+
+    def test_unknown_state_still_requires_the_bit(
+        self, tmp_path: Path, tracked_tmp: list[Path]
+    ) -> None:
+        fixture = build_repo(tmp_path)
+        engine = FakeEngine(fixture)
+        engine.development = lambda d: {  # type: ignore[method-assign]
+            "development_id": d,
+            "state": "SOME_FUTURE_STATE",
+            "target_base_commit": fixture.base,
+            "worktree_path": None,
+        }
+        evidence = engine.evidence("dev_x")
+        evidence["evidence"][0]["verified"] = False
+        engine.evidence = lambda d: evidence  # type: ignore[method-assign]
+        report = audit_development("dev_x", engine=engine, repo=fixture.repo)
+        assert not by_name(report)["verified_bit"].ok

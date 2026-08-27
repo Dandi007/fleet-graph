@@ -353,14 +353,40 @@ def audit_development(
     if entry is None:
         return report
 
+    # verified 是控制面的推导位：terminal==complete AND acceptance AND
+    # remote_verified AND ancestor（dd/control_plane.py）。它在 gate 放行前
+    # 构造性恒 False——把 "verified is True" 当放行前置会让第四道闸结构性
+    # 不可达（e1-msg_01M120E6FV13238KW42WPWHRMF 实锤：15/16 绿仅此一红）。
+    # 断言改为与 state 的推导一致性：完成态要求位已立；未完成态要求
+    # 可先真的三个构成件全真、且位诚实地还没立（此时 verified=True 反而
+    # 说明推导被篡改或读错了库）。
+    # 未完成家族是封闭枚举（graph 引擎 + 老引擎两套态名都显式列出）；名单外
+    # 的任何 state 一律按完成态要求位已立——未知态 fail-closed，不放行。
+    state = str(detail.get("state") or "")
+    pre_completion = state in {
+        "created",
+        "running",
+        "awaiting_gate",
+        "interrupted",
+        "AWAITING_GATE",
+        "REVIEWING_CONTINUOUS",
+        "IMPLEMENTING",
+    }
+    constituents_ok = bool(entry.get("remote_main_verified")) and bool(
+        entry.get("accepted_commit_ancestor")
+    )
+    if pre_completion:
+        verified_consistent = constituents_ok and entry.get("verified") is not True
+    else:
+        verified_consistent = entry.get("verified") is True
     report.record(
         Assertion(
             name="verified_bit",
-            ok=entry.get("verified") is True,
+            ok=verified_consistent,
             command=evidence_path,
             exit_code=200,
             detail=(
-                f"verified={entry.get('verified')} "
+                f"state={state} verified={entry.get('verified')} "
                 f"remote_main_verified={entry.get('remote_main_verified')} "
                 f"accepted_commit_ancestor={entry.get('accepted_commit_ancestor')}"
             ),
