@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.dd import chain_rules
 from fleet_graph.dd.dispatch import derive_attempt_id
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
@@ -67,7 +68,10 @@ RECEIPT_FILES = {
 }
 
 APPROVE = "APPROVE"
-REJECT = "REJECT"
+# The rework-edge rules live in dd/chain_rules.py -- one source, shared with
+# supervise/audit.py's chain check, so the topology cannot drift between the
+# replayer and the auditor. REJECT is re-exported for existing importers.
+REJECT = chain_rules.REJECT
 
 #: The reserved control namespaces. Commits above the sealed tip that touch
 #: only these may be trimmed on replay; anything else is product drift and
@@ -322,7 +326,9 @@ class ReceiptReplayer:
         raw, receipt = loaded
         if not self._valid_implement(receipt, head):
             return None
-        if receipt.get("parent_handoff_receipt_digest") != compute_json_digest(rejecting_receipt):
+        if receipt.get("parent_handoff_receipt_digest") != chain_rules.rework_link_parent(
+            rejecting_receipt
+        ):
             return None
         return raw, receipt
 

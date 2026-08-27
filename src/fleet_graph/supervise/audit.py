@@ -37,6 +37,7 @@ from typing import Any, Protocol
 from fleet_graph.bus.board import NOTE_KIND, WORK_NOTES
 from fleet_graph.bus.client import BusClient, PublishResult
 from fleet_graph.dd.bootstrap import DEVELOPMENT_PATH, IdentityChanged, committed_target_base
+from fleet_graph.dd.chain_rules import is_rework_link, rework_link_parent
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.vendor import git_ops
 
@@ -228,7 +229,17 @@ def _check_receipt_chain(report: AuditReport, development_id: str, entry: dict[s
     previous: dict[str, Any] | None = None
     for record in chain:
         parent = str(record.get("parent_handoff_receipt_digest") or "")
-        if parent != expected:
+        acceptable = {expected}
+        if previous is not None and is_rework_link(str(previous.get("verdict") or "")):
+            # The rework edge (dd/chain_rules.py, the same rule dd_replay
+            # walks by): the implement a REJECT steered into names the
+            # rejecting review receipt's canonical-JSON digest -- the walker
+            # carries the receipt in memory on that edge, so there is no
+            # next file whose bytes it could name. Measured on
+            # dev-fg-369dacf607c1: a legitimate rework chain went red here
+            # before this case was modelled.
+            acceptable.add(rework_link_parent(previous.get("receipt") or {}))
+        if parent not in acceptable:
             breaks.append(
                 f"rev{record.get('revision')} {record.get('stage')}: parent "
                 f"{parent[:18]}… != expected {expected[:18]}…"

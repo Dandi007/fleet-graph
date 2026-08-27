@@ -468,6 +468,150 @@ def test_broken_receipt_chain_goes_red(tmp_path: Path, tracked_tmp: list[Path]) 
     assert not by_name(report)["receipt_chain_linked"].ok
 
 
+class TestReceiptChainReworkTopology:
+    """The rework edge (dd/chain_rules.py): the implement a REJECT steered
+    into names the rejecting review receipt's canonical-JSON digest, not the
+    file byte digest every other link names. dev-fg-369dacf607c1's legitimate
+    chain went red before the audit modelled it."""
+
+    @staticmethod
+    def _record(
+        revision: int,
+        stage: str,
+        verdict: str,
+        parent: str,
+        digest: str,
+        input_commit: str,
+        output_commit: str,
+        receipt: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "revision": revision,
+            "stage": stage,
+            "verdict": verdict,
+            "parent_handoff_receipt_digest": parent,
+            "receipt_digest": digest,
+            "input_commit": input_commit,
+            "output_commit": output_commit,
+            "receipt": receipt or {},
+        }
+
+    def _checked(self, chain: list[dict[str, Any]], bootstrap: str) -> Any:
+        report = AuditReport(target="dev_x", kind="development")
+        audit_module._check_receipt_chain(
+            report, "dev_x", {"bootstrap": {"receipt_digest": bootstrap}, "receipt_chain": chain}
+        )
+        return by_name(report)["receipt_chain_linked"]
+
+    def _rework_chain(self, rework_parent: str) -> list[dict[str, Any]]:
+        from fleet_graph.dd.upstream_constants import compute_json_digest
+
+        reject_receipt = {"verdict": "REJECT", "output_commit": "b" * 40}
+        chain = [
+            self._record(1, "implement", "success", "sha256:boot", "sha256:i1", "0" * 40, "a" * 40),
+            self._record(
+                2,
+                "final_review",
+                "REJECT",
+                "sha256:i1",
+                "sha256:r1",  # the sealed file's byte digest
+                "a" * 40,
+                "b" * 40,
+                receipt=reject_receipt,
+            ),
+            self._record(
+                3,
+                "implement",
+                "success",
+                rework_parent or compute_json_digest(reject_receipt),  # canonical, not sha256:r1
+                "sha256:i2",
+                "b" * 40,
+                "c" * 40,
+            ),
+        ]
+        return chain
+
+    def test_a_rework_chain_audits_green(self) -> None:
+        assertion = self._checked(self._rework_chain(""), "sha256:boot")
+        assert assertion.ok, assertion.detail
+
+    def test_a_forged_rework_parent_is_still_red(self) -> None:
+        from fleet_graph.dd.upstream_constants import compute_json_digest
+
+        forged = compute_json_digest({"verdict": "REJECT", "output_commit": "f" * 40})
+        assertion = self._checked(self._rework_chain(forged), "sha256:boot")
+        assert not assertion.ok
+        assert "rev3 implement" in assertion.detail
+
+    def test_the_canonical_shortcut_is_rework_only(self) -> None:
+        """No general loosening: after an APPROVE, the next link must still
+        name the byte digest -- its canonical digest does not pass."""
+        from fleet_graph.dd.upstream_constants import compute_json_digest
+
+        approve_receipt = {"verdict": "APPROVE", "output_commit": "b" * 40}
+        chain = [
+            self._record(
+                1,
+                "continuous_review",
+                "APPROVE",
+                "sha256:boot",
+                "sha256:r1",
+                "a" * 40,
+                "b" * 40,
+                receipt=approve_receipt,
+            ),
+            self._record(
+                2,
+                "final_review",
+                "APPROVE",
+                compute_json_digest(approve_receipt),  # not the byte digest
+                "sha256:r2",
+                "b" * 40,
+                "c" * 40,
+            ),
+        ]
+        assertion = self._checked(chain, "sha256:boot")
+        assert not assertion.ok
+
+    def test_dev_fg_369dacf607c1_rework_chain_regression(self) -> None:
+        """The production chain that went red, replayed from the sealed
+        receipt bytes themselves (fixtures copied byte-exact)."""
+        root = Path(__file__).parent / "fixtures" / "dev-fg-369dacf607c1-receipts"
+        a1 = "5ae1fe51-3bce-500f-844c-b0974a300272"
+        a2 = "cf3a78c9-7988-5700-86a7-194121bf0058"
+        order = [
+            (a1, "implement-receipt.json", "implement", "success"),
+            (a1, "continuous-review-receipt.json", "continuous_review", ""),
+            (a1, "final-review-receipt.json", "final_review", ""),
+            (a2, "implement-receipt.json", "implement", "success"),
+            (a2, "continuous-review-receipt.json", "continuous_review", ""),
+            (a2, "final-review-receipt.json", "final_review", ""),
+        ]
+        chain = []
+        for revision, (attempt_dir, filename, stage, verdict) in enumerate(order, 2):
+            raw = (root / attempt_dir / filename).read_bytes()
+            receipt = json.loads(raw)
+            chain.append(
+                self._record(
+                    revision,
+                    stage,
+                    verdict or receipt["verdict"],
+                    receipt["parent_handoff_receipt_digest"],
+                    "sha256:" + hashlib.sha256(raw).hexdigest(),
+                    receipt["input_commit"],
+                    receipt["output_commit"],
+                    receipt=receipt,
+                )
+            )
+        # Seeded exactly the way the evidence assembler seeds a chain: on the
+        # first link's own attested parent.
+        assertion = self._checked(chain, chain[0]["parent_handoff_receipt_digest"])
+        assert assertion.ok, assertion.detail
+        # The rework link really is the canonical-digest form, so this test
+        # would have caught the old byte-digest-only rule.
+        assert chain[3]["parent_handoff_receipt_digest"] != chain[2]["receipt_digest"]
+
+
 # --- goal line -------------------------------------------------------------
 
 
