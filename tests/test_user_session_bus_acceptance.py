@@ -39,6 +39,8 @@ def test_degraded_manager_is_connected_and_records_raw_output(tmp_path: Path) ->
 
     assert done.returncode == 0, done.stderr
     assert done.stdout.count("UTC=") == 2
+    assert "XDG_RUNTIME_DIR=/run/user/1000" in done.stdout
+    assert "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus" in done.stdout
     assert "degraded" in done.stdout
     assert "systemctl --user is-system-running exit=1" in done.stdout
     assert "verification output" in done.stdout

@@ -13,6 +13,8 @@ if [[ "${XDG_RUNTIME_DIR:-}" != "$REQUIRED_RUNTIME_DIR" ]] || \
 fi
 
 printf 'UTC=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf 'XDG_RUNTIME_DIR=%s\nDBUS_SESSION_BUS_ADDRESS=%s\n' \
+    "$XDG_RUNTIME_DIR" "$DBUS_SESSION_BUS_ADDRESS"
 manager_state="$(systemctl --user is-system-running 2>&1)"
 manager_exit=$?
 printf '%s\n' "$manager_state"
@@ -25,7 +27,8 @@ if [[ "$manager_state" != "running" && "$manager_state" != "degraded" ]]; then
 fi
 
 printf 'UTC=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-make verify
+verify_output="$(make verify 2>&1)"
 verify_exit=$?
+printf '%s\n' "$verify_output"
 printf 'make verify exit=%s\n' "$verify_exit"
 exit "$verify_exit"
