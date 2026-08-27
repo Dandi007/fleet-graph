@@ -193,9 +193,9 @@ def decide(
 
 __all__ = [
     "DEFAULT_BACKOFF_CAP_SECONDS",
+    "DEFAULT_CAP_WINDOW_SECONDS",
     "DEFAULT_COOLDOWN_SECONDS",
     "DEFAULT_TOTAL_CAP",
-    "DEFAULT_CAP_WINDOW_SECONDS",
     "IgnitionDecision",
     "LineStatus",
     "Refusal",
