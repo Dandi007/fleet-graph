@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from fleet_graph.executors.agent_run import RunStatus, RunTicket, derive_run_id
+from fleet_graph.executors.agent_run import RunStatus, RunTicket, RunWaitTimeout, derive_run_id
 from fleet_graph.graphs.research_pipeline import (
     CLUE_BLOCKED,
     CLUE_DONE,
@@ -74,6 +74,16 @@ def synthesis_result(report: str) -> dict[str, Any]:
     return {"state": "succeeded", "exit_code": 0, "structured_result": {"report": report}}
 
 
+def legacy_worker_result(findings: list[str], new_clues: list[str]) -> dict[str, Any]:
+    """旧信封：结果藏在 `result` 键（而不是 `structured_result`），只有
+    parse_envelope 能拆出来——harvest 不得手搓 `.get("structured_result")`。"""
+    return {
+        "state": "succeeded",
+        "exit_code": 0,
+        "result": {"findings": findings, "new_clues": new_clues},
+    }
+
+
 class Boom(RuntimeError):
     """站替 SIGKILL：在 collect 的 wait 中炸掉，留下一个可续跑的 checkpoint。"""
 
@@ -108,6 +118,8 @@ class FakeLauncher:
         item = self.worker_script.pop(0)
         if item == "fail":
             return RunStatus("failed", {"state": "failed", "exit_code": 1})
+        if item == "timeout":
+            raise RunWaitTimeout(ticket, waited_seconds=999.0)
         return RunStatus("succeeded", item)
 
 
@@ -290,6 +302,55 @@ class TestPartial:
         assert launcher.dispatched[:2] == [
             derive_run_id(thread, f"worker/{clue_one}", 1),
             derive_run_id(thread, f"worker/{clue_one}", 2),
+        ]
+
+
+class TestWorkerWaitTimeout:
+    def test_timeout_retries_then_blocks_instead_of_faulting(self, tmp_path: Path) -> None:
+        # 单个 worker wait 超时绝不 fault 整图（规格第 7 条）：两次超时耗尽 retry
+        # 后置 blocked，终态 partial，而不是把 RunWaitTimeout 抛穿 collect。
+        seed = FakeTextNode(json.dumps(["clue one"]))
+        launcher = FakeLauncher(["timeout", "timeout"], synthesis_result("report"))
+        config = ResearchConfig(question="q", run_root=tmp_path / "run")
+
+        result = run_research(config, text_node=seed, launcher=launcher)
+
+        assert result["terminal"] == TERMINAL_PARTIAL
+        assert result["rounds"] == 2
+        clue_one = derive_clue_id("clue one")
+        thread = config.thread_id
+        assert launcher.dispatched[:2] == [
+            derive_run_id(thread, f"worker/{clue_one}", 1),
+            derive_run_id(thread, f"worker/{clue_one}", 2),
+        ]
+
+
+class TestHarvestEnvelope:
+    def test_legacy_result_key_envelope_still_yields_sub_clues(self, tmp_path: Path) -> None:
+        # harvest 必须复用 parse_envelope：旧信封把结果放在 `result` 键时，子线索
+        # 仍要被提取并继续深挖，而不是静默丢弃后提前报 converged。
+        question = "q"
+        seed = FakeTextNode(json.dumps(["parent clue"]))
+        launcher = FakeLauncher(
+            [
+                legacy_worker_result(["f1"], ["child clue"]),
+                worker_result(["f2"], []),
+            ],
+            synthesis_result("report"),
+        )
+        config = ResearchConfig(question=question, run_root=tmp_path / "run")
+
+        result = run_research(config, text_node=seed, launcher=launcher)
+
+        # 子线索没有被丢弃：父线索 done 后继续派发 child clue，共两轮。
+        assert result["rounds"] == 2
+        assert result["terminal"] == TERMINAL_CONVERGED
+        parent = derive_clue_id("parent clue")
+        child = derive_clue_id("child clue")
+        thread = config.thread_id
+        assert launcher.dispatched[:2] == [
+            derive_run_id(thread, f"worker/{parent}", 1),
+            derive_run_id(thread, f"worker/{child}", 1),
         ]
 
 

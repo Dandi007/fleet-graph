@@ -28,7 +28,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from fleet_graph.executors.agent_run import AgentRunSpec, derive_run_id
+from fleet_graph.executors.agent_run import AgentRunSpec, RunWaitTimeout, derive_run_id
 from fleet_graph.executors.text_node import TextSpec
 from fleet_graph.graphs.adapters import parse_envelope
 from fleet_graph.state.run_artifacts import iso, write_json_durable
@@ -371,11 +371,30 @@ def _collect_node(deps: ResearchDeps):
             labels={"dispatcher": DISPATCHER_LABEL, "research": deps.research_id},
         )
         ticket = deps.launcher.launch(spec, run_id)
-        status = deps.launcher.wait(
-            ticket,
-            poll_interval=deps.poll_interval,
-            deadline_seconds=deps.worker_timeout_seconds + 120,
-        )
+        try:
+            status = deps.launcher.wait(
+                ticket,
+                poll_interval=deps.poll_interval,
+                deadline_seconds=deps.worker_timeout_seconds + 120,
+            )
+        except RunWaitTimeout:
+            # wait 超时 = 该 run 仍在跑，绝不是已丢：run id 派生恒定，retry 会
+            # re-adopt 在途 run 而不是二次派发（launcher 幂等）。按 clue 失败落
+            # retry/block，绝不 fault 整图（规格第 7 条），与 dd_actors.py /
+            # supervisor.py 的同款降级一致。
+            _observe(
+                deps,
+                {"event": "collect", "clue_id": clue_id, "run_id": run_id, "timeout": True},
+            )
+            retry = clue["retry"] + 1
+            return {
+                "clues": _set_clue(
+                    clues,
+                    clue_id,
+                    retry=retry,
+                    status=CLUE_BLOCKED if retry >= MAX_RETRIES else CLUE_OPEN,
+                )
+            }
         # run 结果落盘（harvest 据此提取新线索，resume 后也能重读）。
         write_json_durable(_result_path(deps.run_root, clue_id), status.result or {})
 
@@ -417,8 +436,13 @@ def _harvest_node(deps: ResearchDeps):
         clues = state.get("clues", [])
         clue = _clue(clues, clue_id)
         if clue is not None and clue["status"] == CLUE_DONE:
-            declared = json.loads(_result_path(deps.run_root, clue_id).read_text(encoding="utf-8"))
-            structured = declared.get("structured_result", declared)
+            raw = json.loads(_result_path(deps.run_root, clue_id).read_text(encoding="utf-8"))
+            try:
+                structured = parse_envelope(raw)
+            except Exception:
+                # collect 已判定 done 说明信封本可解析；这里解不出就按无子线索继续，
+                # 绝不 fault 整图（与 collect 的降级同义，保续跑健壮性）。
+                structured = {}
             new_clues = structured.get("new_clues", []) if isinstance(structured, dict) else []
             for text in new_clues:
                 if not isinstance(text, str) or not text.strip():
