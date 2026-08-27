@@ -1067,7 +1067,7 @@ class DdControlPlane:
             stage = str(entry.get("stage") or "")
             output_commit = str(entry.get("output_commit") or "")
             attempt_id = derive_attempt_id(development_id, 1, int(entry.get("attempt") or 1))
-            receipt, parent_from_receipt = self._sealed_receipt(
+            receipt, parent_from_receipt, file_digest = self._sealed_receipt(
                 state_root, attempt_id, stage, repo, output_commit
             )
             if receipt is None:
@@ -1079,7 +1079,14 @@ class DdControlPlane:
                     "input_commit": previous_output,
                     "output_commit": output_commit,
                 }
-            digest = receipt_digests.get(stage) or compute_json_digest(receipt)
+            # Which digest the *next* link actually names: the sealer re-reads
+            # a persisted receipt's exact bytes (dd_materializer.receipt_digest),
+            # so a stage with a file on disk chains by its byte digest; a stage
+            # with no file chains by the canonical-JSON digest the dispatch
+            # builder computes over the in-memory receipt. Measured live on
+            # dev-fg-55126095a185: the review receipts name the implement
+            # receipt's byte digest, not its canonical one.
+            digest = file_digest or receipt_digests.get(stage) or compute_json_digest(receipt)
             chain.append(
                 {
                     "revision": revision,
@@ -1104,8 +1111,13 @@ class DdControlPlane:
 
     def _sealed_receipt(
         self, state_root: Path, attempt_id: str, stage: str, repo: Path, output_commit: str
-    ) -> tuple[dict[str, Any] | None, str]:
-        """The best receipt on record for one sealed stage, plus its own parent claim."""
+    ) -> tuple[dict[str, Any] | None, str, str]:
+        """(receipt, its own parent claim, its persisted bytes' digest).
+
+        The byte digest is what a later receipt names as parent -- the sealer
+        re-reads exactly those bytes -- so it is returned alongside the parsed
+        receipt rather than recomputed from an equivalent object.
+        """
         filenames = {
             "implement": "implement-receipt.json",
             "continuous_review": "continuous-review-receipt.json",
@@ -1115,12 +1127,17 @@ class DdControlPlane:
         if name is not None:
             path = state_root / "receipts" / attempt_id / name
             if path.is_file():
+                raw = path.read_bytes()
                 try:
-                    receipt = dict(json.loads(path.read_text(encoding="utf-8")))
+                    receipt = dict(json.loads(raw.decode("utf-8")))
                 except ValueError:
                     receipt = None
                 if receipt is not None:
-                    return receipt, str(receipt.get("parent_handoff_receipt_digest") or "")
+                    return (
+                        receipt,
+                        str(receipt.get("parent_handoff_receipt_digest") or ""),
+                        "sha256:" + hashlib.sha256(raw).hexdigest(),
+                    )
 
         committed = {
             "acceptance": ACCEPTANCE_RECORD_PATH,
@@ -1150,8 +1167,8 @@ class DdControlPlane:
                                 ).hexdigest(),
                             }
                         ]
-                    return receipt, ""
-        return None, ""
+                    return receipt, "", ""
+        return None, "", ""
 
     def _git_show_bytes(self, repo: Path, spec: str) -> bytes:
         from fleet_graph.dd.git import git_argv
