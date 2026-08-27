@@ -154,6 +154,31 @@ class OldEngineClient:
         return self._get(f"/v1/developments/{development_id}/evidence")
 
 
+class GraphEngineSource:
+    """EvidenceSource over the new engine's in-process control plane.
+
+    Reads only: `get` recomputes status from run artifacts and `evidence`
+    assembles the entry live from git + checkpoint + receipts. The evidence
+    entry names no bootstrap-era `receipt_digest` chain the audit does not
+    already understand -- the field names are the ones `audit_development`
+    reads, and the fleet-graph-native fallbacks (`_check_identity_native_anchor`,
+    `results[].command` frozen argvs) cover the shapes that differ.
+    """
+
+    def __init__(self, plane: Any = None) -> None:
+        if plane is None:
+            from fleet_graph.dd.control_plane import DdControlPlane
+
+            plane = DdControlPlane()
+        self._plane = plane
+
+    def development(self, development_id: str) -> dict[str, Any]:
+        return self._plane.get(development_id)
+
+    def evidence(self, development_id: str) -> dict[str, Any]:
+        return self._plane.evidence(development_id)
+
+
 # --- development audit ----------------------------------------------------
 
 
@@ -975,6 +1000,7 @@ __all__ = [
     "AuditError",
     "AuditReport",
     "EvidenceSource",
+    "GraphEngineSource",
     "OldEngineClient",
     "audit_development",
     "audit_goal_line",

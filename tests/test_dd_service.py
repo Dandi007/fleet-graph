@@ -1,14 +1,18 @@
-"""Contract coverage for the graph-backed dev-dispatch MCP surface.
+"""Contract coverage for the dev-dispatch MCP surface.
 
-Tool-surface shape follows the wf-a08949 2026-08-27 use-case-family ruling:
-the full 13-name legacy surface stays reachable, only the consumed family
-(list/get/events/evidence/create/start/gate) forwards, and every legacy-only
-name refuses with an explicit NOT_SUPPORTED structure and zero graph calls.
+The surface is the control plane: every real tool drives the in-process
+`DdControlPlane` -- there is no graph-API forwarding tier any more. Tool-surface
+shape follows the wf-a08949 2026-08-27 use-case-family ruling: the full
+13-name legacy surface stays reachable, only the consumed family
+(list/get/events/evidence/create/start/gate) does work, and every legacy-only
+name refuses with an explicit NOT_SUPPORTED structure and zero control-plane
+calls.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import socket
 import threading
@@ -22,6 +26,7 @@ import uvicorn
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
+from fleet_graph.dd.control_plane import ControlPlaneError
 from fleet_graph.dd.service import (
     DEFAULT_PORT,
     NOT_SUPPORTED_TOOLS,
@@ -88,17 +93,39 @@ def _loopback_needs_no_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(var, raising=False)
 
 
-class FakeGraphApi:
+class FakeControlPlane:
+    """Records every method call; the service must add no policy of its own."""
+
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, dict[str, object] | None]] = []
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.error: ControlPlaneError | None = None
 
-    def get(self, path: str, params: dict[str, object] | None = None) -> dict[str, object]:
-        self.calls.append(("GET", path, params))
-        return {"path": path}
+    def _record(self, method: str, **kwargs: object) -> dict[str, object]:
+        self.calls.append((method, kwargs))
+        if self.error is not None:
+            raise self.error
+        return {"method": method}
 
-    def post(self, path: str, body: dict[str, object]) -> dict[str, object]:
-        self.calls.append(("POST", path, body))
-        return {"path": path}
+    def create(self, **kwargs: object) -> dict[str, object]:
+        return self._record("create", **kwargs)
+
+    def start(self, **kwargs: object) -> dict[str, object]:
+        return self._record("start", **kwargs)
+
+    def get(self, **kwargs: object) -> dict[str, object]:
+        return self._record("get", **kwargs)
+
+    def list(self, **kwargs: object) -> dict[str, object]:
+        return self._record("list", **kwargs)
+
+    def events(self, **kwargs: object) -> dict[str, object]:
+        return self._record("events", **kwargs)
+
+    def evidence(self, **kwargs: object) -> dict[str, object]:
+        return self._record("evidence", **kwargs)
+
+    def gate(self, **kwargs: object) -> dict[str, object]:
+        return self._record("gate", **kwargs)
 
 
 def test_selected_port_is_free_and_not_a_legacy_port() -> None:
@@ -107,7 +134,7 @@ def test_selected_port_is_free_and_not_a_legacy_port() -> None:
 
 
 def test_all_thirteen_tools_are_reachable() -> None:
-    server = build_mcp_server(FakeGraphApi())
+    server = build_mcp_server(FakeControlPlane())
     tools = asyncio.run(server.list_tools())
     assert {tool.name for tool in tools} == ALL_TOOLS
 
@@ -125,6 +152,29 @@ def test_the_surface_split_is_exactly_the_ruling() -> None:
         "development_start",
         "development_gate",
     } == SUPPORTED_TOOLS
+
+
+def test_the_create_tool_admits_only_the_derivation_inputs() -> None:
+    """Admission is server-side derivation: no handoff, digest, receipt,
+    idempotency or policy parameter exists to guess at."""
+    server = build_mcp_server(FakeControlPlane())
+    tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
+    schema = tools["development_create"].parameters
+    assert set(schema["properties"]) == {"repo_path", "target_base", "spec_text", "spec_path"}
+    assert schema["required"] == ["repo_path"]
+
+
+def test_the_gate_tool_carries_no_decision() -> None:
+    """The fourth gate, extended: the tool cannot transport a verdict at all.
+
+    The legacy engine's gate command took `decision`; that shape is not
+    replicated. The only mutation this tool offers is a valueless resume."""
+    server = build_mcp_server(FakeControlPlane())
+    tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
+    gate_params = set(tools["development_gate"].parameters["properties"])
+    assert gate_params == {"development_id", "resume"}
+    for forbidden in ("decision", "verdict", "operator_identity"):
+        assert forbidden not in gate_params
 
 
 @contextmanager
@@ -156,39 +206,24 @@ def running_server(server: object) -> Iterator[str]:
         thread.join(timeout=5)
 
 
-def test_every_supported_tool_forwards_requests_over_the_running_mcp_endpoint() -> None:
-    graph = FakeGraphApi()
-    server = build_mcp_server(graph)
+def test_every_supported_tool_drives_the_control_plane_over_the_running_endpoint() -> None:
+    plane = FakeControlPlane()
+    server = build_mcp_server(plane)
     calls = [
-        ("development_list", {"state": "running", "repo": "repo", "limit": 4, "cursor": "c1"}),
+        ("development_list", {"state": "running", "limit": 4, "cursor": "c1"}),
         ("development_get", {"development_id": "dev-1"}),
         ("development_events", {"development_id": "dev-1", "after": "e1", "limit": 3}),
         ("development_evidence", {"development_id": "dev-1"}),
         (
             "development_create",
             {
-                "name": "name",
-                "goal": "goal",
-                "idempotency_key": "create-key",
-                "reason": "reason",
-                "initial_handoff": {"kind": "handoff"},
+                "repo_path": "/data/worktrees/dev-1",
+                "target_base": "refs/remotes/origin/main",
+                "spec_text": "# spec",
             },
         ),
-        (
-            "development_start",
-            {"development_id": "dev-1", "idempotency_key": "start-key", "expected_revision": 7},
-        ),
-        (
-            "development_gate",
-            {
-                "development_id": "dev-1",
-                "gate_id": "gate-1",
-                "decision": "approve",
-                "idempotency_key": "gate-key",
-                "expected_revision": 10,
-                "operator_identity": "operator",
-            },
-        ),
+        ("development_start", {"development_id": "dev-1"}),
+        ("development_gate", {"development_id": "dev-1", "resume": True}),
     ]
     assert {name for name, _ in calls} == set(SUPPORTED_TOOLS)
 
@@ -204,55 +239,52 @@ def test_every_supported_tool_forwards_requests_over_the_running_mcp_endpoint() 
     with running_server(server) as url:
         asyncio.run(exercise_endpoint(url))
 
-    assert graph.calls == [
+    assert plane.calls == [
+        ("list", {"state": "running", "limit": 4, "cursor": "c1"}),
+        ("get", {"development_id": "dev-1"}),
+        ("events", {"development_id": "dev-1", "after": "e1", "limit": 3}),
+        ("evidence", {"development_id": "dev-1"}),
         (
-            "GET",
-            "/v1/developments",
-            {"state": "running", "repo": "repo", "limit": 4, "cursor": "c1"},
-        ),
-        ("GET", "/v1/developments/dev-1", None),
-        ("GET", "/v1/developments/dev-1/events", {"after": "e1", "limit": 3}),
-        ("GET", "/v1/developments/dev-1/evidence", None),
-        (
-            "POST",
-            "/v1/developments",
+            "create",
             {
-                "name": "name",
-                "goal": "goal",
-                "idempotency_key": "create-key",
-                "reason": "reason",
-                "initial_handoff": {"kind": "handoff"},
-                "phase": "development",
-                "profile": "default",
-                "policy": "isolated-release-auto",
-                "auto_start": False,
+                "repo_path": "/data/worktrees/dev-1",
+                "target_base": "refs/remotes/origin/main",
+                "spec_text": "# spec",
+                "spec_path": None,
             },
         ),
-        (
-            "POST",
-            "/v1/developments/dev-1/commands/start",
-            {"idempotency_key": "start-key", "expected_revision": 7, "reason": ""},
-        ),
-        (
-            "POST",
-            "/v1/developments/dev-1/commands/gate",
-            {
-                "idempotency_key": "gate-key",
-                "expected_revision": 10,
-                "reason": "",
-                "gate_id": "gate-1",
-                "decision": "approve",
-                "operator_identity": "operator",
-            },
-        ),
+        ("start", {"development_id": "dev-1"}),
+        ("gate", {"development_id": "dev-1", "resume": True}),
     ]
+
+
+def test_a_control_plane_refusal_reaches_the_client_machine_readably() -> None:
+    plane = FakeControlPlane()
+    plane.error = ControlPlaneError("WORKTREE_DIRTY", "uncommitted changes", retryable=False)
+    server = build_mcp_server(plane)
+
+    async def call(url: str) -> str:
+        async with Client(url) as client:
+            with pytest.raises(ToolError) as excinfo:
+                await client.call_tool("development_start", {"development_id": "dev-1"})
+            return str(excinfo.value)
+
+    with running_server(server) as url:
+        message = asyncio.run(call(url))
+
+    payload = json.loads(message[message.index("{") : message.rindex("}") + 1])
+    assert payload == {
+        "code": "WORKTREE_DIRTY",
+        "message": "uncommitted changes",
+        "retryable": False,
+    }
 
 
 @pytest.mark.parametrize("tool", sorted(NOT_SUPPORTED_TOOLS))
 def test_every_legacy_only_tool_refuses_with_the_explicit_structure(tool: str) -> None:
-    """The refusal carries a machine-readable payload and touches no graph API."""
-    graph = FakeGraphApi()
-    server = build_mcp_server(graph)
+    """The refusal carries a machine-readable payload and touches no control plane."""
+    plane = FakeControlPlane()
+    server = build_mcp_server(plane)
 
     async def call(url: str) -> str:
         async with Client(url) as client:
@@ -268,4 +300,25 @@ def test_every_legacy_only_tool_refuses_with_the_explicit_structure(tool: str) -
     assert payload["tool"] == tool
     assert payload["reason"] == NOT_SUPPORTED_TOOLS[tool]
     assert payload["supported_tools"] == sorted(SUPPORTED_TOOLS)
-    assert graph.calls == [], "a refused tool must never reach the graph API"
+    assert plane.calls == [], "a refused tool must never reach the control plane"
+
+
+def test_the_fake_control_plane_mirrors_the_real_surface() -> None:
+    """The fake above proves forwarding; this proves it cannot drift: every
+    method it fakes exists on DdControlPlane with the same parameters."""
+    from fleet_graph.dd.control_plane import DdControlPlane
+
+    for method in ("create", "start", "get", "list", "events", "evidence", "gate"):
+        assert hasattr(DdControlPlane, method), method
+    real = {
+        name
+        for name, _ in inspect.signature(DdControlPlane.create).parameters.items()
+        if name != "self"
+    }
+    assert real == {"repo_path", "target_base", "spec_text", "spec_path"}
+    gate = {
+        name
+        for name, _ in inspect.signature(DdControlPlane.gate).parameters.items()
+        if name != "self"
+    }
+    assert gate == {"development_id", "resume"}

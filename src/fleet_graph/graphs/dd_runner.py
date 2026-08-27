@@ -14,6 +14,7 @@ report a stage as done that never ran.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,10 +46,15 @@ from fleet_graph.graphs.dd_scripts import (
     MergeStage,
     WorkspaceSealer,
 )
-from fleet_graph.state.run_artifacts import iso
+from fleet_graph.state.run_artifacts import iso, write_json_durable
 
 # The root input every stage requires and no stage produces.
 SPEC_ARTIFACT = "spec"
+
+# Run artifacts the control plane's read side assembles from. One name each,
+# defined here where they are written.
+EVENTS_FILE = "events.jsonl"
+RESULT_FILE = "result.json"
 
 # Artifact kinds used to find the stage that owns each script default.
 RUN_CONFIG = "run_config"
@@ -101,6 +107,7 @@ def build_pipeline(
     launcher: Any = None,
     capability: CapabilityLock | None = None,
     clock: Any = None,
+    observe: Any = None,
 ) -> tuple[Any, PipelineDeps]:
     """Wire a development. Returns the graph and the deps it holds."""
     lifecycle = Lifecycle.load()
@@ -203,6 +210,7 @@ def build_pipeline(
             }
         ),
         capability=capability if capability is not None else CapabilityLock.load(),
+        observe=observe,
         bounds=PipelineBounds(
             max_steps=config.max_steps,
             max_rework=config.max_rework,
@@ -246,7 +254,26 @@ def run_pipeline(
     `resume=True` hands the graph no input at all. That is deliberate: the
     gate re-reads the board itself, so resuming carries no verdict and cannot
     be used to cast one. It only says "look again".
+
+    Every history entry is also appended to `<run_root>/events.jsonl`, and the
+    final summary is written to `<run_root>/result.json`, durably, before it
+    is returned. Those two files -- run artifacts, not a database -- are what
+    the control plane's read side assembles `events`/`get` from after this
+    process is gone.
     """
+    now = clock or time.time
+    events_path = config.run_root / EVENTS_FILE
+
+    def persist_event(entry: dict[str, Any]) -> None:
+        try:
+            events_path.parent.mkdir(parents=True, exist_ok=True)
+            with events_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"at": iso(now()), **entry}, ensure_ascii=False) + "\n")
+                handle.flush()
+        except OSError:
+            # Observability must not fail the work it observes.
+            pass
+
     graph, _deps = build_pipeline(
         config,
         scripts=scripts,
@@ -255,8 +282,8 @@ def run_pipeline(
         gate_card_entity_id=gate_card_entity_id,
         launcher=launcher,
         clock=clock,
+        observe=persist_event,
     )
-    now = clock or time.time
 
     with SqliteSaver.from_conn_string(config.checkpoint_path) as saver:
         compiled = graph.compile(checkpointer=saver)
@@ -281,7 +308,7 @@ def run_pipeline(
             },
         )
 
-    return {
+    result = {
         "development_id": config.development_id,
         "terminal": state.get("terminal"),
         "terminal_reason": state.get("terminal_reason"),
@@ -294,6 +321,8 @@ def run_pipeline(
         "awaiting": awaiting_decision(state),
         "history": state.get("history", []),
     }
+    write_json_durable(config.run_root / RESULT_FILE, {**result, "written_at": iso(now())})
+    return result
 
 
 def awaiting_decision(state: dict[str, Any]) -> dict[str, Any] | None:
@@ -306,6 +335,8 @@ def awaiting_decision(state: dict[str, Any]) -> dict[str, Any] | None:
 
 
 __all__ = [
+    "EVENTS_FILE",
+    "RESULT_FILE",
     "SPEC_ARTIFACT",
     "DevelopmentConfig",
     "awaiting_decision",

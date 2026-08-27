@@ -126,7 +126,7 @@ dd 的阶段机**不在 Python 里**。它在 plugin 的 `development-lifecycle.
 | dd `submit_job()` 路径 | `reconciler.py:4418` | **替换** | `AgentRunNode` |
 | dd git_ops / materializer | `git_ops.py`（1748 行） | **库化复用** | vendor 进本 repo（见 §7 D1） |
 | dd contracts 16 schema | `loop-engine-dev-dispatch-plugin/contracts/` | **库化复用** | 语义等效，schema 不改 |
-| dd MCP 13 工具面 (`:5606`) | `controller_server.py` | **薄壳重建** | 映射到新 graph API，新端口 |
+| dd MCP 13 工具面 (`:5606`) | `controller_server.py` | **用例集重建** | `dd/service.py` (`:5610`)：7 实工具直驱进程内 `dd/control_plane.py`（MCP 服务即控制面，无独立 graph-API 层）；6 老工具显式 NOT_SUPPORTED |
 | goal-agent pump | `/data/code/self/goal-agent`，`pump.py`（1639 行） | **语义保留、实现重写** | `graphs/goal_line.py` |
 | pump 的 INV-3/4/8/9 | 同上 | **逐条移植** | graph 节点约束 + 契约测试 |
 | heartbeat.json / rounds.jsonl / terminal.json | `/data/ronin/runs/` | **文件契约保持兼容** | fleet-sentinel 无需改动即可采集 |
