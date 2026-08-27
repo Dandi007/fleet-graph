@@ -45,6 +45,23 @@ class WakeSignals(Protocol):
     def goal_revision(self, folder_id: str) -> str: ...
 
 
+def probe_error_tag(exc: BaseException) -> str:
+    """A probe failure's mechanical attribution: class name, plus HTTP status.
+
+    `BusError` (and anything else carrying a `status` int) tags as
+    `BusError:403` rather than a bare class name, because the difference
+    matters operationally: 403 is a token ACL gap (structural -- fix the
+    grant), 404 a missing channel, and a timeout class name a transport
+    problem. The real fleet hit exactly this: every establish attempt logged
+    `probe_failed:BusError` and the log could not say the inbox source was
+    ACL-blocked rather than the bus being down.
+    """
+    status = getattr(exc, "status", None)
+    if isinstance(status, int):
+        return f"{type(exc).__name__}:{status}"
+    return type(exc).__name__
+
+
 def parse_bus_timestamp(value: Any) -> float:
     """Epoch seconds from an ISO-8601 UTC stamp, fractional part ignored.
 
@@ -111,4 +128,5 @@ __all__ = [
     "LiveWakeSignals",
     "WakeSignals",
     "parse_bus_timestamp",
+    "probe_error_tag",
 ]

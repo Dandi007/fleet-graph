@@ -78,7 +78,7 @@ from fleet_graph.scheduler.probe import (
     MissingProbeCredential,
     UnknownSeat,
 )
-from fleet_graph.scheduler.wake import WakeSignals, parse_bus_timestamp
+from fleet_graph.scheduler.wake import WakeSignals, parse_bus_timestamp, probe_error_tag
 
 DEFAULT_MAINTENANCE_STOP = Path("/data/fleet-graph/maintenance-stop")
 DEFAULT_INTERVAL_SECONDS = 60.0
@@ -93,6 +93,7 @@ _EMPTY_PARK_FIELDS: dict[str, Any] = {
     "parked_run_id": None,
     "parked_at": None,
     "parked_goal_revision": None,
+    "parked_inbox_available": None,
 }
 
 
@@ -412,6 +413,7 @@ class Scheduler:
             "parked_run_id": state.get("parked_run_id"),
             "parked_at": state.get("parked_at"),
             "parked_goal_revision": state.get("parked_goal_revision"),
+            "parked_inbox_available": state.get("parked_inbox_available"),
         }
 
     def _write_stall_state(self, folder_id: str, state: dict[str, Any]) -> None:
@@ -625,31 +627,48 @@ class Scheduler:
         # Considered exactly once, whatever happens next: fail-open and
         # already-present wake facts must not be re-probed every tick forever.
         state["park_considered_run_id"] = run_id
+
+        # The two sources degrade *independently*. The first fleet rollout
+        # wrapped both in one try, and a structural inbox failure -- the
+        # service token had no read ACL on `agent:*` channels, every GET a
+        # 403 -- failed the whole establish open, forever: parking never
+        # happened and the goal.md source was taken down by a fault that had
+        # nothing to do with it. So: an inbox probe failure marks that one
+        # source unavailable and parking proceeds on the goal.md anchor
+        # alone; only losing the goal.md anchor -- the one source every line
+        # has -- keeps the whole thing fail-open.
+        inbox_available = False
+        inbox_note: str | None = None
+        if self.wake is not None and line.alias:
+            try:
+                if self.wake.inbox_message_after(line.alias, self._terminal_epoch(record)):
+                    # The wake fact predates the parking: something already
+                    # arrived for this line. Never park it -- backoff will
+                    # pick the message up on its own schedule.
+                    self._write_stall_state(line.folder_id, state)
+                    return ParkOutcome(event="not_parked:inbox_already_has_mail")
+                inbox_available = True
+            except Exception as exc:  # degrade this source, keep parking
+                inbox_note = f"inbox_unavailable:{probe_error_tag(exc)}"
+
         try:
             if self.wake is None:
                 raise RuntimeError("scheduler has no wake signals configured")
-            if line.alias and self.wake.inbox_message_after(
-                line.alias, self._terminal_epoch(record)
-            ):
-                # The wake fact predates the parking: something already
-                # arrived for this line. Never park it -- backoff will pick
-                # the message up on its own schedule.
-                self._write_stall_state(line.folder_id, state)
-                return ParkOutcome(event="not_parked:inbox_already_has_mail")
             revision = self.wake.goal_revision(line.folder_id)
-        except Exception as exc:  # fail open, by design
+        except Exception as exc:  # fail open, by design: no anchor, no parking
             self._write_stall_state(line.folder_id, state)
-            return ParkOutcome(event=f"not_parked:probe_failed:{type(exc).__name__}")
+            return ParkOutcome(event=f"not_parked:probe_failed:{probe_error_tag(exc)}")
 
         state["parked_run_id"] = run_id
         state["parked_at"] = now
         state["parked_goal_revision"] = revision
+        state["parked_inbox_available"] = inbox_available
         self._write_stall_state(line.folder_id, state)
 
         blocker = self.blocker_summary(line.folder_id)
         return ParkOutcome(
             parked=True,
-            event="established",
+            event="established" if inbox_note is None else f"established:{inbox_note}",
             blocker=blocker,
             board_question=self._ask_board(line, record, blocker),
         )
@@ -657,17 +676,33 @@ class Scheduler:
     def _check_wake(
         self, line: LineSpec, record: dict[str, Any], state: dict[str, Any]
     ) -> ParkOutcome:
+        # The inbox source is consulted only if the establishment probe found
+        # it usable (`parked_inbox_available`), and its availability is *not*
+        # re-assessed during the park: a source that was down when parking
+        # began (a 403 is an ACL gap, not a blip) coming back mid-park is a
+        # case not worth a per-tick probe against a known-broken endpoint --
+        # the next parked terminal re-assesses it at establishment. A probe
+        # that was available and errors mid-park skips this tick's inbox
+        # check rather than waking: waking on a transient inbox error would
+        # re-ignite a line whose goal.md anchor is still perfectly checkable.
+        # Only the goal.md anchor failing -- the one fact parking stands on --
+        # wakes conservatively.
+        if line.alias and state["parked_inbox_available"] is not False:
+            try:
+                if self.wake is not None and self.wake.inbox_message_after(
+                    line.alias, self._terminal_epoch(record)
+                ):
+                    return self._wake(line, state, "woken:inbox")
+            except Exception:  # skip this source, the goal.md anchor still holds
+                pass
+
         try:
             if self.wake is None:
                 raise RuntimeError("scheduler has no wake signals configured")
-            if line.alias and self.wake.inbox_message_after(
-                line.alias, self._terminal_epoch(record)
-            ):
-                return self._wake(line, state, "woken:inbox")
             if self.wake.goal_revision(line.folder_id) != state["parked_goal_revision"]:
                 return self._wake(line, state, "woken:goal_revision")
         except Exception as exc:  # fail open, by design
-            return self._wake(line, state, f"woken:probe_failed:{type(exc).__name__}")
+            return self._wake(line, state, f"woken:probe_failed:{probe_error_tag(exc)}")
         return ParkOutcome(parked=True, blocker=self.blocker_summary(line.folder_id))
 
     def _wake(self, line: LineSpec, state: dict[str, Any], event: str) -> ParkOutcome:
@@ -682,6 +717,7 @@ class Scheduler:
             "parked_run_id": None,
             "parked_at": None,
             "parked_goal_revision": None,
+            "parked_inbox_available": None,
         }
         self._write_stall_state(line.folder_id, cleared)
         return ParkOutcome(parked=False, event=event)

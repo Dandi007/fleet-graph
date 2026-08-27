@@ -66,7 +66,8 @@ class FakeProber:
 
 
 class FakeWake:
-    """Scriptable wake facts. `error` makes every probe raise."""
+    """Scriptable wake facts. `error` makes every probe raise; `inbox_error`
+    and `revision_error` fail one source at a time."""
 
     def __init__(
         self,
@@ -74,23 +75,29 @@ class FakeWake:
         revision: str = "sha256:rev-1",
         inbox: bool = False,
         error: Exception | None = None,
+        inbox_error: Exception | None = None,
+        revision_error: Exception | None = None,
     ) -> None:
         self.revision = revision
         self.inbox = inbox
         self.error = error
+        self.inbox_error = inbox_error
+        self.revision_error = revision_error
         self.inbox_calls: list[tuple[str, float]] = []
         self.revision_calls: list[str] = []
 
     def inbox_message_after(self, alias: str, after_epoch: float) -> bool:
         self.inbox_calls.append((alias, after_epoch))
-        if self.error is not None:
-            raise self.error
+        failure = self.error or self.inbox_error
+        if failure is not None:
+            raise failure
         return self.inbox
 
     def goal_revision(self, folder_id: str) -> str:
         self.revision_calls.append(folder_id)
-        if self.error is not None:
-            raise self.error
+        failure = self.error or self.revision_error
+        if failure is not None:
+            raise failure
         return self.revision
 
 
@@ -375,11 +382,19 @@ class TestFailOpen:
         scheduler, _, _ = blocked_line(tmp_path, wake=None)
         assert scheduler.tick()[0].decision.ignite
 
-    def test_an_unparseable_terminal_timestamp_fails_open(self, tmp_path: Path) -> None:
+    def test_an_unparseable_terminal_timestamp_degrades_only_the_inbox_source(
+        self, tmp_path: Path
+    ) -> None:
+        """The terminal's `at` is consumed by the inbox comparison alone, so a
+        corrupt stamp costs that one source; the goal.md anchor still parks
+        the line. (Before the per-source hotfix this failed the whole
+        establish open.)"""
         scheduler, clock, _ = blocked_line(tmp_path, wake=FakeWake())
         write_blocked(tmp_path, at="not a timestamp", run_id="run-b2")
         clock.now += 60.0
-        assert scheduler.tick()[0].decision.ignite
+        result = scheduler.tick()[0]
+        assert result.decision.refusal is Refusal.PARKED_AWAITING_DECISION
+        assert result.park_event == "established:inbox_unavailable:ValueError"
 
 
 class TestEscapeHatch:
@@ -531,3 +546,114 @@ class TestLiveWakeSignals:
         assert parse_bus_timestamp("2026-08-27T10:00:00Z") == parse_bus_timestamp(
             "2026-08-27T10:00:00.999Z"
         )
+
+
+class TestSourceDegradation:
+    """The hotfix contract: the two wake sources degrade independently.
+
+    The real fleet's inbox reads came back 403 -- the service token has no
+    read ACL on `agent:*` channels, a structural gap, not a blip -- and the
+    original one-try establish failed the whole parking open on it, every
+    tick, forever (park_event `not_parked:probe_failed:BusError` on
+    wf-7bc4d1). The goal.md anchor was perfectly checkable the whole time.
+    """
+
+    def test_an_inbox_403_still_parks_on_the_goal_anchor(self, tmp_path: Path) -> None:
+        """The rollback contrast, pinned: restore the old combined try and
+        this line never parks -- this test turns red."""
+        from fleet_graph.bus.client import BusError
+
+        wake = FakeWake(inbox_error=BusError(403, "Cannot read this channel"))
+        scheduler, _, launcher = blocked_line(tmp_path, wake=wake)
+
+        result = scheduler.tick()[0]
+
+        assert result.decision.refusal is Refusal.PARKED_AWAITING_DECISION
+        assert result.park_event == "established:inbox_unavailable:BusError:403"
+        assert launcher.launched == []
+
+    def test_the_degraded_snapshot_records_the_source_as_unavailable(self, tmp_path: Path) -> None:
+        from fleet_graph.bus.client import BusError
+
+        wake = FakeWake(inbox_error=BusError(403, "Cannot read this channel"))
+        scheduler, _, _ = blocked_line(tmp_path, wake=wake)
+        scheduler.tick()
+
+        state = json.loads(stall_file(tmp_path).read_text(encoding="utf-8"))
+        assert state["parked_inbox_available"] is False
+        assert state["parked_goal_revision"] == "sha256:rev-1"
+
+    def test_a_degraded_park_never_probes_the_inbox_again(self, tmp_path: Path) -> None:
+        """Availability is assessed once, at establishment. A 403 is an ACL
+        gap that no per-tick probe will fix; the next parked terminal
+        re-assesses at its own establishment. So an inbox recovering mid-park
+        is deliberately not detected."""
+        from fleet_graph.bus.client import BusError
+
+        wake = FakeWake(inbox_error=BusError(403, "Cannot read this channel"))
+        scheduler, clock, _ = blocked_line(tmp_path, wake=wake)
+        scheduler.tick()
+        establish_probes = len(wake.inbox_calls)
+
+        wake.inbox_error = None  # the ACL gets fixed mid-park
+        wake.inbox = True
+        for _ in range(3):
+            clock.now += 60.0
+            assert scheduler.tick()[0].decision.refusal is Refusal.PARKED_AWAITING_DECISION
+        assert len(wake.inbox_calls) == establish_probes
+
+    def test_a_degraded_park_still_wakes_on_a_goal_edit(self, tmp_path: Path) -> None:
+        from fleet_graph.bus.client import BusError
+
+        wake = FakeWake(
+            revision="sha256:rev-1", inbox_error=BusError(403, "Cannot read this channel")
+        )
+        scheduler, clock, _ = blocked_line(tmp_path, wake=wake)
+        assert scheduler.tick()[0].decision.refusal is Refusal.PARKED_AWAITING_DECISION
+
+        wake.revision = "sha256:rev-2"
+        clock.now += 60.0
+        result = scheduler.tick()[0]
+        assert result.park_event == "woken:goal_revision"
+        assert result.decision.ignite
+
+    def test_a_mid_park_inbox_error_skips_the_source_instead_of_waking(
+        self, tmp_path: Path
+    ) -> None:
+        """Waking on a transient inbox error would re-ignite a line whose
+        goal.md anchor is still perfectly checkable."""
+        from fleet_graph.bus.client import BusError
+
+        wake = FakeWake()
+        scheduler, clock, _ = blocked_line(tmp_path, wake=wake)
+        assert scheduler.tick()[0].park_event == "established"
+
+        wake.inbox_error = BusError(403, "alias rebound mid-park")
+        clock.now += 60.0
+        result = scheduler.tick()[0]
+        assert result.decision.refusal is Refusal.PARKED_AWAITING_DECISION
+        assert result.park_event is None
+
+        wake.revision = "sha256:rev-2"  # the anchor still works
+        clock.now += 60.0
+        assert scheduler.tick()[0].park_event == "woken:goal_revision"
+
+    def test_losing_the_goal_anchor_still_fails_the_whole_establish_open(
+        self, tmp_path: Path
+    ) -> None:
+        """The goal.md anchor is the one fact parking stands on: without it
+        there is nothing to wake on, so no parking -- unchanged semantics."""
+        wake = FakeWake(revision_error=RuntimeError("mcp down"))
+        scheduler, _, _ = blocked_line(tmp_path, wake=wake)
+        result = scheduler.tick()[0]
+        assert result.parked is False
+        assert result.park_event == "not_parked:probe_failed:RuntimeError"
+        assert result.decision.ignite
+
+    def test_the_error_tag_carries_the_http_status(self) -> None:
+        from fleet_graph.bus.client import BusError
+        from fleet_graph.scheduler.wake import probe_error_tag
+
+        assert probe_error_tag(BusError(403, "no ACL")) == "BusError:403"
+        assert probe_error_tag(BusError(404, "no channel")) == "BusError:404"
+        assert probe_error_tag(RuntimeError("boom")) == "RuntimeError"
