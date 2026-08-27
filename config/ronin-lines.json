@@ -80,7 +80,13 @@
       "seat": "opencode-gpt-terra",
       "enabled": true,
       "alias": "ronin-dd-cutover",
-      "max_rounds": 9999
+      "max_rounds": 9999,
+      "_acceptance_provenance": "R0d 金丝雀：两条只读探测取自该线 goal.md A4 观察窗/第一纪律的机械判据（:7455 老引擎端口在听、loop-engine-jobd unit 在役）。目的是让 last_acceptance 事实链首次真机跑通，不是替线做完整验收。",
+      "acceptance": [
+        ["bash", "-lc", "ss -ltn | grep -c ':7455'"],
+        ["systemctl", "--user", "is-active", "loop-engine-jobd"]
+      ],
+      "acceptance_cwd": "/tmp"
     },
     {
       "folder_id": "wf-a87b04",

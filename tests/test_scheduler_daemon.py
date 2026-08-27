@@ -887,3 +887,85 @@ class TestGenerationAdvancesPastASpentThread:
 
         raised = LineSpec(folder_id="wf-1", seat="opencode-dsv4pro", enabled=True, generation=7)
         assert scheduler.generation_of(raised) == 7
+
+
+class TestAcceptanceDeclaration:
+    """R0d: the roster declares the acceptance commands, and the scheduler
+    hands them down verbatim. The launch_stagger lesson applies with force
+    here: a declaration the loader never read would be a NOT-RUN with extra
+    steps."""
+
+    def test_from_json_actually_reads_the_declaration(self, tmp_path: Path) -> None:
+        path = tmp_path / "scheduler.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "lines": [
+                        {
+                            "folder_id": "wf-9",
+                            "seat": "s",
+                            "acceptance": [["systemctl", "--user", "is-active", "x"]],
+                            "acceptance_cwd": "/tmp",
+                            "acceptance_timeout_seconds": 120,
+                        }
+                    ]
+                }
+            )
+        )
+        line = SchedulerConfig.from_json(path).lines[0]
+        assert line.acceptance == [["systemctl", "--user", "is-active", "x"]]
+        assert line.acceptance_cwd == "/tmp"
+        assert line.acceptance_timeout_seconds == 120
+
+    def test_the_defaults_declare_nothing(self, tmp_path: Path) -> None:
+        path = tmp_path / "scheduler.json"
+        path.write_text(json.dumps({"lines": [{"folder_id": "wf-9", "seat": "s"}]}))
+        line = SchedulerConfig.from_json(path).lines[0]
+        assert line.acceptance == []
+        assert line.acceptance_cwd is None
+        assert line.acceptance_timeout_seconds == 300
+
+    def test_comment_keys_inside_a_line_entry_are_allowed(self, tmp_path: Path) -> None:
+        """A declaration should carry its provenance next to itself, the way
+        the file's root-level _comment keys already do."""
+        path = tmp_path / "scheduler.json"
+        path.write_text(
+            json.dumps(
+                {"lines": [{"folder_id": "wf-9", "seat": "s", "_acceptance_provenance": "why"}]}
+            )
+        )
+        assert SchedulerConfig.from_json(path).lines[0].folder_id == "wf-9"
+
+    def test_spec_for_serialises_the_declaration(self, tmp_path: Path) -> None:
+        scheduler = make(tmp_path)
+        spec = scheduler.spec_for(
+            LineSpec(
+                folder_id="wf-1",
+                seat="s",
+                enabled=True,
+                acceptance=[["bash", "-lc", "ss -ltn | grep -c ':7455'"]],
+                acceptance_cwd="/tmp",
+            )
+        )
+        assert spec.acceptance_json is not None
+        payload = json.loads(spec.acceptance_json)
+        assert payload["argvs"] == [["bash", "-lc", "ss -ltn | grep -c ':7455'"]]
+        assert payload["cwd"] == "/tmp"
+        argv = spec.argv()
+        assert argv[argv.index("--acceptance-json") + 1] == spec.acceptance_json
+
+    def test_an_undeclared_line_passes_no_flag(self, tmp_path: Path) -> None:
+        spec = make(tmp_path).spec_for(LineSpec(folder_id="wf-1", seat="s", enabled=True))
+        assert spec.acceptance_json is None
+        assert "--acceptance-json" not in spec.argv()
+
+    def test_a_declaration_without_a_cwd_is_still_passed_down(self, tmp_path: Path) -> None:
+        """The line's acceptance step is the one place that refuses a missing
+        cwd, and it does so out loud (skipped:no_cwd) where the coordinator
+        sees it. Dropping the declaration here would turn a reviewable config
+        mistake into a silent not_declared."""
+        spec = make(tmp_path).spec_for(
+            LineSpec(folder_id="wf-1", seat="s", enabled=True, acceptance=[["true"]])
+        )
+        assert spec.acceptance_json is not None
+        assert json.loads(spec.acceptance_json)["cwd"] is None

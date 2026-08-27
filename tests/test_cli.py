@@ -258,3 +258,37 @@ class TestTheOtherSubcommandsStillParse:
 
     def test_hello(self) -> None:
         assert build_parser().parse_args(["hello"]).topic
+
+
+class TestLineRunAcceptance:
+    def test_the_flag_defaults_to_none(self) -> None:
+        args = build_parser().parse_args(["line", "run", "--folder", "wf-1", "--seat", "s"])
+        assert args.acceptance_json is None
+
+    def test_the_flag_parses_as_one_json_argument(self) -> None:
+        declaration = json.dumps({"argvs": [["true"]], "cwd": "/tmp", "timeout_seconds": 60})
+        args = build_parser().parse_args(
+            ["line", "run", "--folder", "wf-1", "--seat", "s", "--acceptance-json", declaration]
+        )
+        assert json.loads(args.acceptance_json)["cwd"] == "/tmp"
+
+    def test_an_unreadable_declaration_is_refused_not_degraded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Silently degrading to "not declared" would misreport a reviewed
+        declaration as absent -- an operator error worth stopping on."""
+        from fleet_graph.cli import main
+
+        with pytest.raises(SystemExit, match="acceptance-json"):
+            main(
+                [
+                    "line",
+                    "run",
+                    "--folder",
+                    "wf-1",
+                    "--seat",
+                    "s",
+                    "--acceptance-json",
+                    "{not json",
+                ]
+            )

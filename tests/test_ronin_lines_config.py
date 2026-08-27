@@ -169,3 +169,30 @@ class TestTheRunbookMatchesTheCode:
 
     def test_the_runbook_names_the_canary_currently_switched_on(self) -> None:
         assert CANARY in self.RUNBOOK.read_text(encoding="utf-8")
+
+
+class TestTheAcceptanceCanary:
+    """R0d 首批声明：wf-a08949 一条线。目的是让 last_acceptance 事实链首次在
+    真机跑通，不是替线做完整验收——两条命令都是该线 goal.md A4 观察窗/第一纪律
+    的只读机械判据（老引擎端口在听、loop-engine-jobd 在役）。"""
+
+    def test_the_canary_declares_two_read_only_probes(self) -> None:
+        line = {c.folder_id: c for c in SchedulerConfig.from_json(CONFIG).lines}["wf-a08949"]
+        assert line.acceptance == [
+            ["bash", "-lc", "ss -ltn | grep -c ':7455'"],
+            ["systemctl", "--user", "is-active", "loop-engine-jobd"],
+        ]
+        assert line.acceptance_cwd == "/tmp", "cwd 是声明的一部分，缺了整个声明只会 skipped:no_cwd"
+
+    def test_every_declared_line_also_declares_a_cwd(self) -> None:
+        for line in SchedulerConfig.from_json(CONFIG).lines:
+            if line.acceptance:
+                assert line.acceptance_cwd, f"{line.folder_id} declares commands but no cwd"
+                for argv in line.acceptance:
+                    assert argv and all(isinstance(part, str) for part in argv)
+
+    def test_no_other_line_is_in_the_canary_batch(self) -> None:
+        declared = {
+            line.folder_id for line in SchedulerConfig.from_json(CONFIG).lines if line.acceptance
+        }
+        assert declared == {"wf-a08949"}
