@@ -183,6 +183,14 @@ class TestNotes:
 
 
 class TestCards:
+    def test_create_is_the_durable_identity_operation(
+        self, board: Board, transport: RecordingTransport
+    ) -> None:
+        transport.queue(*publish_ok("card_1"))
+        result = board.create({"title": "t"}, "i")
+        assert result.entity_id == "card_1"
+        assert transport.calls[0]["body"]["kind"] == CARD_KIND
+
     def test_revision_sends_entity_and_supersedes(
         self, board: Board, transport: RecordingTransport
     ) -> None:
@@ -249,6 +257,42 @@ class TestCards:
         transport.queue(200, {"messages": [], "head_seq": 0})
         assert board.card_head("nope") is None
 
+    def test_list_returns_only_the_current_revision_of_each_card(
+        self, board: Board, transport: RecordingTransport
+    ) -> None:
+        transport.queue(
+            200,
+            {
+                "messages": [
+                    {"entity_id": "one", "kind": CARD_KIND, "channel_seq": 1},
+                    {"entity_id": "two", "kind": CARD_KIND, "channel_seq": 2},
+                    {"entity_id": "one", "kind": CARD_KIND, "channel_seq": 3},
+                ]
+            },
+        )
+        assert [card["entity_id"] for card in board.list()] == ["two", "one"]
+
+    def test_start_requires_the_current_revision_and_preserves_payload(
+        self, board: Board, transport: RecordingTransport
+    ) -> None:
+        transport.queue(
+            200,
+            {
+                "messages": [
+                    {
+                        "message_id": "m1",
+                        "entity_id": "card_1",
+                        "kind": CARD_KIND,
+                        "channel_seq": 1,
+                        "payload": {"title": "t"},
+                    }
+                ]
+            },
+        )
+        transport.queue(*publish_ok("m2", 2))
+        board.start(entity_id="card_1", supersedes="m1", idempotency_key="start-1")
+        assert transport.calls[1]["body"]["payload"] == {"title": "t", "status": "started"}
+
 
 class TestHumanGate:
     def test_ask_posts_a_question_note_and_returns_a_ticket(
@@ -272,6 +316,23 @@ class TestHumanGate:
         transport.queue(200, {"refs": []})
         ticket = GateTicket("msg_q", "card_1")
         assert board.decision_for(ticket) is None
+
+
+class TestEvents:
+    def test_events_are_immutable_notes_for_one_card(
+        self, board: Board, transport: RecordingTransport
+    ) -> None:
+        transport.queue(
+            200,
+            {
+                "messages": [
+                    {"kind": NOTE_KIND, "channel_seq": 2, "payload": {"card_entity_id": "one"}},
+                    {"kind": NOTE_KIND, "channel_seq": 1, "payload": {"card_entity_id": "one"}},
+                    {"kind": NOTE_KIND, "channel_seq": 3, "payload": {"card_entity_id": "two"}},
+                ]
+            },
+        )
+        assert [event["channel_seq"] for event in board.events("one")] == [1, 2]
 
     def test_decision_is_resolved_through_the_ref_graph(
         self, board: Board, transport: RecordingTransport
