@@ -451,10 +451,8 @@ class TestFailedAttemptIsNotReAdopted:
             thread_id=thread,
             run_root=tmp_path,
         )
-        try:
+        with pytest.raises(RuntimeError, match="stop at launch"):
             coord.turn(1, {"folder_id": "wf-t"})
-        except RuntimeError:
-            pass
         assert seen == [derive_run_id(thread, "coordinator-1", 2)]
 
     def test_succeeded_prior_attempt_is_adopted_not_bumped(self, tmp_path):
