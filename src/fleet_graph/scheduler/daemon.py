@@ -393,6 +393,7 @@ class Scheduler:
             "accounted_run_id": None,
             "last_start_at": None,
             "generation": None,
+            "board_card_entity_id": None,
             **_EMPTY_PARK_FIELDS,
         }
         try:
@@ -414,6 +415,11 @@ class Scheduler:
             "parked_at": state.get("parked_at"),
             "parked_goal_revision": state.get("parked_goal_revision"),
             "parked_inbox_available": state.get("parked_inbox_available"),
+            # The line's board card entity (`work.card.v1` on board:work-index),
+            # materialised by the first escalation. Per line, not per parking:
+            # it survives new terminals and re-parkings, so later question
+            # notes ref the same entity instead of re-publishing the card.
+            "board_card_entity_id": state.get("board_card_entity_id"),
         }
 
     def _write_stall_state(self, folder_id: str, state: dict[str, Any]) -> None:
@@ -530,6 +536,10 @@ class Scheduler:
                 "accounted_run_id": run_id,
                 "last_start_at": state["last_start_at"],
                 "generation": self._next_generation(current_generation, record.get("terminal")),
+                # The board card is per *line*, not per parking: a new terminal
+                # must not orphan it, or every re-parking would publish a
+                # duplicate card.
+                "board_card_entity_id": state["board_card_entity_id"],
                 # A new terminal supersedes any parking of the previous run:
                 # its snapshot is cleared, and this run is not yet considered,
                 # so the parking logic gets to look at it exactly once.
@@ -670,7 +680,7 @@ class Scheduler:
             parked=True,
             event="established" if inbox_note is None else f"established:{inbox_note}",
             blocker=blocker,
-            board_question=self._ask_board(line, record, blocker),
+            board_question=self._ask_board(line, record, blocker, state),
         )
 
     def _check_wake(
@@ -722,24 +732,59 @@ class Scheduler:
         self._write_stall_state(line.folder_id, cleared)
         return ParkOutcome(parked=False, event=event)
 
-    def _ask_board(self, line: LineSpec, record: dict[str, Any], blocker: str | None) -> str | None:
+    def _ask_board(
+        self,
+        line: LineSpec,
+        record: dict[str, Any],
+        blocker: str | None,
+        state: dict[str, Any],
+    ) -> str | None:
         """Best-effort question note on the work board, once per parking.
 
-        Known contract gap, deliberately not worked around: `work.note.v1`
-        requires a ref to an *existing* board entity, and a goal line has no
-        board card. The ask is attempted with the folder id and the bus is
-        left to accept or refuse it; a refusal degrades parking to
-        observe-log visibility only. Full escalation surfacing is R4's.
+        `work.note.v1` requires a ref to an *existing* board entity, and a
+        goal line historically had none -- every ask 422'd with
+        DERIVATION_ERROR ("ref target entity 'wf-…' not found"). So the first
+        escalation *materialises* the line's card: one `work.card.v1` on
+        board:work-index. The kind is entity_role='root' on the bus, which
+        rejects a caller-chosen entity_id on the first publish (entity_id
+        without supersedes is itself a DERIVATION_ERROR), so the entity id is
+        whatever the bus derives -- the card message's own id. That id is
+        persisted in the stall-state file (`board_card_entity_id`) and every
+        later ask refs it. The card publish carries a stable idempotency key,
+        so a lost state file re-yields the same card instead of a duplicate.
+
+        Failure discipline is unchanged (#89): the board is telemetry and
+        must not bite. A failed card publish degrades to log visibility and
+        the question is not attempted -- it would 422 against the same
+        missing entity. A failed question after a good card costs only the
+        note. Parking itself is never affected either way.
         """
         if self.board is None:
             return None
+        card_entity_id = state.get("board_card_entity_id")
+        if not card_entity_id:
+            try:
+                card = self.board.publish_card(
+                    {
+                        "title": line.alias or line.folder_id,
+                        "status": "doing",
+                        "intent": f"goal-line escalation surface for {line.folder_id}",
+                        "work_folder_id": line.folder_id,
+                    },
+                    idempotency_key=f"goal-line-card:{line.folder_id}",
+                )
+            except Exception as exc:  # telemetry must not bite
+                return f"card_failed:{type(exc).__name__}:{str(exc)[:160]}"
+            card_entity_id = card.entity_id
+            state["board_card_entity_id"] = card_entity_id
+            self._write_stall_state(line.folder_id, state)
         question = (
             f"line {line.folder_id} parked: blocked waiting on a human decision "
             f"(run {record['run_id']}). blocker: {blocker or 'see terminal.json'}"
         )
         try:
             ticket = self.board.ask(
-                card_entity_id=line.folder_id,
+                card_entity_id=card_entity_id,
                 question=question,
                 idempotency_key=f"parked:{line.folder_id}:{record['run_id']}",
             )

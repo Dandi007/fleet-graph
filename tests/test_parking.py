@@ -105,12 +105,37 @@ class FakeTicket:
     question_note_id = "note-123"
 
 
+class FakePublishResult:
+    """The bus derives a root entity's id from its first message id."""
+
+    def __init__(self, entity_id: str) -> None:
+        self.entity_id = entity_id
+        self.message_id = entity_id
+        self.channel_seq = 1
+        self.deduplicated = False
+
+
 class FakeBoard:
-    def __init__(self, *, error: Exception | None = None) -> None:
+    """Records every publish in order, so tests can pin card-before-question."""
+
+    def __init__(
+        self, *, error: Exception | None = None, card_error: Exception | None = None
+    ) -> None:
         self.error = error
+        self.card_error = card_error
         self.asked: list[dict[str, Any]] = []
+        self.cards: list[dict[str, Any]] = []
+        self.publishes: list[str] = []
+
+    def publish_card(self, payload: dict[str, Any], idempotency_key: str) -> FakePublishResult:
+        self.publishes.append("card")
+        self.cards.append({"payload": payload, "idempotency_key": idempotency_key})
+        if self.card_error is not None:
+            raise self.card_error
+        return FakePublishResult(f"msg-card-{len(self.cards)}")
 
     def ask(self, *, card_entity_id: str, question: str, idempotency_key: str) -> FakeTicket:
+        self.publishes.append("question")
         self.asked.append(
             {
                 "card_entity_id": card_entity_id,
@@ -473,6 +498,74 @@ class TestEscalation:
         result = scheduler.tick()[0]
         assert result.decision.refusal is Refusal.PARKED_AWAITING_DECISION
         assert result.board_question is None
+
+
+class TestCardMaterialisation:
+    """The 422 fix: a goal line has no board card until its first escalation
+    materialises one, and every question note refs that entity -- never the
+    bare folder id the bus has no entity for."""
+
+    def test_first_escalation_publishes_the_card_before_the_question(self, tmp_path: Path) -> None:
+        board = FakeBoard()
+        scheduler, _, _ = blocked_line(tmp_path, wake=FakeWake(), board=board)
+        result = scheduler.tick()[0]
+
+        assert board.publishes == ["card", "question"]
+        assert board.cards[0]["idempotency_key"] == "goal-line-card:wf-1"
+        payload = board.cards[0]["payload"]
+        assert payload["title"] == "canary"
+        assert payload["status"] == "doing"
+        assert "wf-1" in payload["intent"]
+        assert payload["work_folder_id"] == "wf-1"
+        assert result.board_question == "question_sent:note-123"
+
+    def test_the_question_refs_the_materialised_entity_not_the_folder_id(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression for the production 422: `DERIVATION_ERROR: ref target
+        entity 'wf-…' not found`. The ask must ref the card entity the bus
+        actually derived, and the folder id is not it."""
+        board = FakeBoard()
+        scheduler, _, _ = blocked_line(tmp_path, wake=FakeWake(), board=board)
+        scheduler.tick()
+
+        assert board.asked[0]["card_entity_id"] == "msg-card-1"
+        assert board.asked[0]["card_entity_id"] != "wf-1"
+        state = json.loads(stall_file(tmp_path).read_text(encoding="utf-8"))
+        assert state["board_card_entity_id"] == "msg-card-1"
+
+    def test_a_persisted_card_entity_is_not_republished(self, tmp_path: Path) -> None:
+        """The card is per line: a second parking (new blocked terminal, new
+        run) asks again but refs the card already in the stall-state file."""
+        board = FakeBoard()
+        scheduler, clock, _ = blocked_line(tmp_path, wake=FakeWake(), board=board)
+        scheduler.tick()
+        clear_parked_fields(tmp_path)
+        clock.now += 60.0
+        assert scheduler.tick()[0].decision.ignite  # released, relaunched
+
+        write_blocked(tmp_path, run_id="run-b2")
+        clock.now += 3600.0
+        result = scheduler.tick()[0]
+
+        assert result.decision.refusal is Refusal.PARKED_AWAITING_DECISION
+        assert board.publishes == ["card", "question", "question"]
+        assert board.asked[1]["card_entity_id"] == "msg-card-1"
+        assert board.asked[1]["idempotency_key"] == "parked:wf-1:run-b2"
+
+    def test_a_failed_card_publish_degrades_and_skips_the_question(self, tmp_path: Path) -> None:
+        """Card materialisation failing must cost nothing but the escalation:
+        the line still parks, and the question is not even attempted -- it
+        would 422 against the same missing entity."""
+        board = FakeBoard(card_error=RuntimeError("bus down"))
+        scheduler, _, _ = blocked_line(tmp_path, wake=FakeWake(), board=board)
+        result = scheduler.tick()[0]
+
+        assert result.decision.refusal is Refusal.PARKED_AWAITING_DECISION
+        assert result.board_question.startswith("card_failed:RuntimeError")
+        assert board.publishes == ["card"]
+        state = json.loads(stall_file(tmp_path).read_text(encoding="utf-8"))
+        assert state.get("board_card_entity_id") is None
 
 
 def hermetic_signals(tmp_path: Path, **kwargs: Any) -> LiveWakeSignals:
