@@ -159,8 +159,11 @@ def implement_actor_result(receipt: dict[str, Any]) -> dict[str, Any]:
     """The actor's declared result, narrowed to what the plugin admits.
 
     Two jobs, and only two. It drops fields the plugin's
-    `additionalProperties: false` would reject, and it refuses a result whose
-    *declared* outcome is missing the evidence that outcome owes.
+    `additionalProperties: false` would reject -- including, for a non-applied
+    outcome, an honestly redundant `work_head_commit` that equals the
+    `input_commit` -- and it refuses a result whose *declared* outcome is
+    missing the evidence that outcome owes (or carries evidence that
+    contradicts it).
 
     What it deliberately does not do is demand more than the plugin does. An
     `implement.result.v1` from agent-runtime carries three fields and no
@@ -197,6 +200,24 @@ def implement_actor_result(receipt: dict[str, Any]) -> dict[str, Any]:
             raise MaterializationFailed(
                 "INVALID_HANDOFF_SCHEMA", f"a {outcome} implement result must carry {field!r}"
             )
+        declared_head = receipt.get("work_head_commit")
+        if declared_head is not None:
+            # An honest no-op reports the head it finished on, which for a
+            # no-op equals the input it started from. The plugin's non-applied
+            # schema does not admit the field (measured on
+            # dev-fg-4628ef887564 g3: INVALID_INPUT "unknown semantic
+            # fields"), so a *consistent* value is checked and then dropped
+            # rather than forwarded. An inconsistent one is a claim that a
+            # no-op moved the head, which is refused, not repaired.
+            if str(declared_head) != str(receipt.get("input_commit")):
+                raise MaterializationFailed(
+                    "INVALID_HANDOFF_SCHEMA",
+                    f"a {outcome} implement result claims work_head_commit "
+                    f"{declared_head!r} but started from "
+                    f"{receipt.get('input_commit')!r}; a no-op that moved the "
+                    "head is not a no-op",
+                )
+            result.pop("work_head_commit", None)
         return result
 
     raise MaterializationFailed(
