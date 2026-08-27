@@ -247,6 +247,43 @@ class TestTheActorResultIsChecked:
         assert set(IMPLEMENT_ACTOR_FIELDS) == set(schema["properties"])
         assert schema.get("additionalProperties") is False
 
+    def test_a_pinned_identity_binds_the_review_to_the_replayed_receipt(self, repo: Path) -> None:
+        """The g4 lesson (BINDING_MISMATCH: "Implement receipt identity does
+        not match Review dispatch"): the review of a replayed implement must
+        dispatch under the identity the installed receipt was sealed with.
+        The dispatch's attempt_id and the parent-digest path must both follow
+        the pin, so the digest sent is the bytes the sealer re-reads at that
+        same identity."""
+        from fleet_graph.dd.dispatch import derive_attempt_id
+
+        materializer = make_materializer(repo)
+        pinned = derive_attempt_id(DEVELOPMENT_ID, 2, 1)  # a previous generation's
+        dispatch = dispatch_for(repo, "continuous_review")
+        dispatch["generation"] = 4
+        dispatch["pinned_attempt_id"] = pinned
+        expected = seal_implement_receipt(repo, pinned)
+
+        receipt = {
+            **review_receipt(),
+            "implementation_handoff_receipt_digest": "sha256:" + "f" * 64,
+        }
+        request = materializer.request(REVIEW, dispatch, StageOutcome(receipt=receipt))
+        assert request["dispatch"]["attempt_id"] == pinned
+        assert request["implementation_handoff_receipt_digest"] == expected
+
+    def test_a_pinned_identity_with_nothing_sealed_is_still_a_chain_hole(self, repo: Path) -> None:
+        """The pin changes where the expected identity comes from, never what
+        is checked: no sealed receipt at the pinned identity refuses exactly
+        as it would at a derived one."""
+        from fleet_graph.dd.dispatch import derive_attempt_id
+
+        dispatch = dispatch_for(repo, "continuous_review")
+        dispatch["pinned_attempt_id"] = derive_attempt_id(DEVELOPMENT_ID, 2, 1)
+        with pytest.raises(MaterializationFailed, match="no sealed parent receipt"):
+            make_materializer(repo).request(
+                REVIEW, dispatch, StageOutcome(receipt=review_receipt())
+            )
+
     def test_the_reviewed_digest_is_the_sealed_receipts_bytes(self, repo: Path) -> None:
         """Not the reviewer's word, and not a digest of the receipt object we
         hold: the review sealer re-reads exactly those bytes."""

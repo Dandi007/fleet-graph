@@ -160,6 +160,23 @@ class TestDerivedIdsAreStable:
         assert derive_attempt_id(DEVELOPMENT_ID, 1, 1) != derive_attempt_id(DEVELOPMENT_ID, 1, 2)
         assert derive_attempt_id(DEVELOPMENT_ID, 1, 1) != derive_attempt_id(DEVELOPMENT_ID, 2, 1)
 
+    def test_a_pinned_attempt_identity_wins_over_derivation(self, repo: Path) -> None:
+        """A replayed prefix pins the identity its receipts were sealed under;
+        the built dispatch must carry it, and it still validates against the
+        plugin's own schema."""
+        pinned = derive_attempt_id(DEVELOPMENT_ID, 2, 1)
+        dispatch = walker_dispatch(repo, generation=4)
+        dispatch["pinned_attempt_id"] = pinned
+        built = make_builder(repo).build(dispatch)
+        assert built["attempt_id"] == pinned
+        validator().validate(built)
+
+    def test_an_empty_pin_falls_back_to_derivation(self, repo: Path) -> None:
+        dispatch = walker_dispatch(repo, generation=4)
+        dispatch["pinned_attempt_id"] = ""
+        built = make_builder(repo).build(dispatch)
+        assert built["attempt_id"] == derive_attempt_id(DEVELOPMENT_ID, 4, 1)
+
     def test_a_different_input_commit_derives_a_different_intent(self) -> None:
         assert derive_intent_id(DEVELOPMENT_ID, "implement", 1, 1, "e" * 40) != derive_intent_id(
             DEVELOPMENT_ID, "implement", 1, 1, "f" * 40

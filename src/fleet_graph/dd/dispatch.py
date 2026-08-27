@@ -230,6 +230,17 @@ class StageDispatchBuilder:
 
         generation = int(dispatch.get("generation", 1))
         attempt = int(dispatch.get("attempt", 1))
+        # The attempt identity: derived from (generation, attempt) as always,
+        # unless a replayed prefix pinned the identity its receipts were
+        # sealed under. The pin travels on the walker's own state -- it is
+        # set only from a replay-verified receipt body, never from an actor's
+        # claim -- and every binding the sealer enforces still runs: it reads
+        # the parent receipt at exactly this identity and refuses one whose
+        # embedded identity differs. What changes is where the *expected*
+        # identity comes from, not what is checked against it.
+        attempt_id = str(dispatch.get("pinned_attempt_id") or "") or derive_attempt_id(
+            self.chain.development_id, generation, attempt
+        )
         refs = read_committed_refs(
             self.chain.workspace_path,
             input_commit,
@@ -239,7 +250,7 @@ class StageDispatchBuilder:
         )
 
         payload = {
-            "attempt_id": derive_attempt_id(self.chain.development_id, generation, attempt),
+            "attempt_id": attempt_id,
             "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
             "development_id": self.chain.development_id,
             # Upstream sets this to the input commit rather than reading the
