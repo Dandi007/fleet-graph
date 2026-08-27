@@ -248,3 +248,27 @@ fleet-graph supervisor run --event-json \
 守卫（`make conformance`，随 verify 跑）：supervisor 模块不 import
 `scheduler.ignition`/`scheduler.launcher`；全仓无 `work.decision.v1` 发布路径。
 两条都有 sabotage 自证测试。
+
+## dd 控制面（R1-b：MCP 服务即控制面）
+
+`fleet-graph dd serve`（`:5610`，unit 模板 `deploy/systemd/fleet-graph-dd-mcp.service`）
+就是 dev-dispatch 的控制面：7 个实工具（create/start/get/list/events/evidence/gate）
+直驱进程内 `dd/control_plane.py`，背后没有第二个服务。
+
+- **状态在哪**：git 祖先链 + `/data/fleet-graph/dd/<development_id>/` 下的
+  durable checkpoint 与 run 工件（`record.json` / `events.jsonl` / `result.json` /
+  `launches.jsonl`）。`status.json` 只是可重建缓存，删了会被 `rebuild_status`
+  原样重算。**没有数据库。**
+- **admission**：`development_create` 只收 `{repo_path, target_base, spec_text|spec_path}`；
+  development id、H0 digest、durable ref、acceptance argv（spec 里的
+  ```dd-acceptance 块）全部服务端推导。同一 admission 幂等返回同一个 id。
+- **start**：transient systemd unit（`fleet-graph-dd-<dev>-r<n>`）。控制面重启
+  不影响在跑 run；kill 后再 start 自动带 `--resume` 重入同一 thread
+  （`<dev>:g1`），已封存 stage 不会重派。
+- **gate 不收裁决**：`development_gate` 只报挂起的 question note，`resume=true`
+  无值重入，图自己重读板。裁决只经 board `work.decision.v1`
+  （带 `refs=[{"target_entity": <question_note_id>}]`）。
+- **模型策略**：`dd serve --stage-model continuous_review=deepseek-v4-pro`
+  是部署侧 flag，不进 client 词表。
+- **审计**：`fleet-graph supervise audit <dev-id> --repo <clone>`——`--dd-root`
+  下有 record 的 development 自动走进程内 `GraphEngineSource`，其余走老引擎。

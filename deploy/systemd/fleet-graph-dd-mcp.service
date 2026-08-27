@@ -1,4 +1,8 @@
-# systemd *user* unit for the graph-backed dev-dispatch MCP surface.
+# systemd *user* unit for the dev-dispatch MCP surface.
+#
+# The service IS the control plane (supervision ruling, 2026-08-27): the 7
+# real tools drive fleet_graph.dd.control_plane in-process. There is no
+# separate graph-API tier behind this unit any more.
 #
 # Template only: shipped in the repo, deliberately not enabled or installed by
 # any script here -- deployment is a supervision-plane decision (wf-a08949).
