@@ -5,6 +5,13 @@
   "run_root": "/data/fleet-graph/runs",
   "lines": [
     {
+      "folder_id": "wf-197430",
+      "seat": "opencode-gpt-terra",
+      "alias": "ronin-perm-decl",
+      "max_rounds": 9999,
+      "enabled": true
+    },
+    {
       "folder_id": "wf-287e81",
       "seat": "opencode-gpt-terra",
       "max_rounds": 9999,
