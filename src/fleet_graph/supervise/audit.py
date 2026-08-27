@@ -11,7 +11,12 @@ commands whose exit codes go in the report. Three disciplines are load-bearing:
 - **The re-run executes the frozen argv from the receipt-bound artifact, on a
   one-shot detached worktree, with no existence guards.** A missing file is a
   red result, not a skip; zero frozen commands is a failure; the worktree is
-  removed on every path out (§38f/§39b/§39c).
+  removed on every path out (§38f/§39b/§39c). When the receipt froze no
+  artifact at all (old-engine evidence), the argv falls back -- in order -- to
+  the acceptance `record_json` command_results, then the union of the chain's
+  `verification_record.verification_commands`; both are the audited party's
+  own account, so the assertion name and the report mark the degradation
+  explicitly. All sources empty is still a failure.
 - **Reads only.** The old engine is consulted over GET; git is driven through
   `dd/git.py`'s guarded argv because the worktrees involved were written by
   agents. The single write this module can perform is an `evidence` note to
@@ -407,7 +412,7 @@ def audit_development(
         )
         _check_diff_manifest(report, repo, claimed_base, subject_commit)
         _check_worktree_binding(report, detail, development_id)
-        _rerun_acceptance(report, repo, worktree, acceptance, evidence_commit)
+        _rerun_acceptance(report, repo, worktree, entry, acceptance, evidence_commit)
     finally:
         removed = run_git(repo, "worktree", "remove", "--force", str(worktree))
         if removed.returncode != 0:
@@ -622,10 +627,72 @@ def _check_worktree_binding(
     )
 
 
+def _fallback_frozen_argvs(
+    entry: dict[str, Any],
+) -> tuple[str, str, list[list[str]], int, str] | None:
+    """Self-attested argv sources, tried in order, for when the acceptance
+    receipt froze no artifact (old-engine evidence has no `artifacts` field).
+
+    Returns (assertion_name, command, argvs, skipped, detail) or None if every
+    source is empty. Both sources live inside the audited party's own evidence
+    chain: using them is an explicit degradation -- the audit re-runs what the
+    receipts *say* ran instead of an independently frozen record, and the
+    report must say so (the assertion name carries the source, the caller adds
+    the degradation gap). It never upgrades the audit to first-hand freezing.
+    """
+    # Tier 2: the controller-persisted acceptance record (old engine
+    # `acceptances[].record_json`, whose inner shape is command_results[].argv).
+    for acceptance in reversed(list(entry.get("acceptances") or [])):
+        raw = acceptance.get("record_json")
+        if not raw:
+            continue
+        try:
+            record = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        argvs, skipped = _frozen_argvs(record)
+        if argvs or skipped:
+            return (
+                "frozen_acceptance_from_record_json",
+                "GET evidence → acceptances[].record_json → command_results[].argv",
+                argvs,
+                skipped,
+                f"receipt 无 artifacts；argv 兜底取自 acceptance record_json 的 "
+                f"command_results（{len(argvs)} 条）——被审方自述链，非一手冻结",
+            )
+
+    # Tier 3: union (order-preserving, deduped) of every receipt's
+    # verification_record.verification_commands argv across the chain.
+    argvs = []
+    seen: set[tuple[str, ...]] = set()
+    for record in entry.get("receipt_chain") or []:
+        verification = (record.get("receipt") or {}).get("verification_record") or {}
+        for cmd in verification.get("verification_commands") or []:
+            argv = cmd.get("argv") if isinstance(cmd, dict) else None
+            if isinstance(argv, list) and argv:
+                normalized = [str(part) for part in argv]
+                key = tuple(normalized)
+                if key not in seen:
+                    seen.add(key)
+                    argvs.append(normalized)
+    if argvs:
+        return (
+            "frozen_acceptance_from_verification_record",
+            "GET evidence → receipt_chain[].receipt"
+            ".verification_record.verification_commands[].argv",
+            argvs,
+            0,
+            f"receipt 无 artifacts 且无可用 record_json；argv 兜底取自 receipt_chain "
+            f"各 verification_record 的并集去重（{len(argvs)} 条）——被审方自述链，非一手冻结",
+        )
+    return None
+
+
 def _rerun_acceptance(
     report: AuditReport,
     repo: Path,
     worktree: Path,
+    entry: dict[str, Any],
     acceptance: dict[str, Any],
     evidence_commit: str,
 ) -> None:
@@ -634,55 +701,75 @@ def _rerun_acceptance(
         (a for a in artifacts if str(a.get("path", "")).endswith("acceptance.json")),
         artifacts[0] if artifacts else None,
     )
-    if frozen_ref is None:
+    source_note = ""
+    if frozen_ref is not None:
+        frozen_path = str(frozen_ref.get("path") or "")
+        spec = f"{evidence_commit}:{frozen_path}"
+        returncode, blob = _git_show_bytes(repo, spec)
+        digest = "sha256:" + hashlib.sha256(blob).hexdigest()
+        declared = str(frozen_ref.get("digest") or "")
         report.record(
             Assertion(
                 name="frozen_acceptance_digest",
-                ok=False,
-                command="(acceptance receipt artifacts)",
-                exit_code=1,
-                detail="acceptance receipt 没有 artifacts，冻结 argv 无处可取",
+                ok=returncode == 0 and digest == declared,
+                command=f"git -C {repo} show {spec} | sha256sum",
+                exit_code=returncode,
+                detail=f"现算 {digest[:24]}… vs receipt 声明 {declared[:24]}…",
             )
         )
-        return
+        if returncode != 0:
+            # A declared-but-unreadable (or tampered) frozen artifact is a hard
+            # red -- the fallback sources are only for evidence that never
+            # froze an artifact at all.
+            return
 
-    frozen_path = str(frozen_ref.get("path") or "")
-    spec = f"{evidence_commit}:{frozen_path}"
-    returncode, blob = _git_show_bytes(repo, spec)
-    digest = "sha256:" + hashlib.sha256(blob).hexdigest()
-    declared = str(frozen_ref.get("digest") or "")
-    report.record(
-        Assertion(
-            name="frozen_acceptance_digest",
-            ok=returncode == 0 and digest == declared,
-            command=f"git -C {repo} show {spec} | sha256sum",
-            exit_code=returncode,
-            detail=f"现算 {digest[:24]}… vs receipt 声明 {declared[:24]}…",
-        )
-    )
-    if returncode != 0:
-        return
+        try:
+            frozen = json.loads(blob.decode("utf-8"))
+        except ValueError:
+            report.record(
+                Assertion(
+                    name="acceptance_rerun",
+                    ok=False,
+                    command=f"git -C {repo} show {spec}",
+                    exit_code=1,
+                    detail="冻结的 acceptance 文件不是合法 JSON",
+                )
+            )
+            return
 
-    try:
-        frozen = json.loads(blob.decode("utf-8"))
-    except ValueError:
+        argvs, skipped = _frozen_argvs(frozen)
+        source_command = f"git -C {repo} show {spec}"
+    else:
+        fallback = _fallback_frozen_argvs(entry)
+        if fallback is None:
+            report.record(
+                Assertion(
+                    name="frozen_acceptance_digest",
+                    ok=False,
+                    command="(acceptance receipt artifacts)",
+                    exit_code=1,
+                    detail=(
+                        "acceptance receipt 没有 artifacts，record_json 与 "
+                        "verification_record 兜底源也全空——冻结 argv 无处可取"
+                    ),
+                )
+            )
+            return
+        name, source_command, argvs, skipped, detail = fallback
         report.record(
-            Assertion(
-                name="acceptance_rerun",
-                ok=False,
-                command=f"git -C {repo} show {spec}",
-                exit_code=1,
-                detail="冻结的 acceptance 文件不是合法 JSON",
-            )
+            Assertion(name=name, ok=True, command=source_command, exit_code=200, detail=detail)
         )
-        return
+        source_note = "（argv 兜底取自 receipt 自述，非一手冻结）"
+        report.gaps.append(
+            f"frozen argv 降级来源（{name}）：复跑命令取自被审方自述链，"
+            "复跑结果仍是机械事实，但 audit 不因此升格为一手验证"
+        )
 
-    argvs, skipped = _frozen_argvs(frozen)
     report.record(
         Assertion(
             name="acceptance_no_skips",
             ok=skipped == 0,
-            command=f"git -C {repo} show {spec}",
+            command=source_command,
             exit_code=0,
             detail=(
                 f"冻结记录 {len(argvs)} 条命令，0 条 SKIP"
@@ -696,7 +783,7 @@ def _rerun_acceptance(
             Assertion(
                 name="acceptance_rerun",
                 ok=False,
-                command=f"git -C {repo} show {spec}",
+                command=source_command,
                 exit_code=1,
                 detail="冻结记录里没有任何可执行的 acceptance 命令：零条命令 = 失败",
             )
@@ -713,10 +800,11 @@ def _rerun_acceptance(
             command="; ".join(" ".join(r["command"]) for r in results)[:400],
             exit_code=max((r["exit_code"] for r in results), default=1),
             detail=(
-                f"{len(results)} 条冻结 argv 在一次性 worktree 上全绿"
+                f"{len(results)} 条冻结 argv 在一次性 worktree 上全绿{source_note}"
                 if not failed
                 else f"{len(failed)}/{len(results)} 条失败: "
                 + "; ".join(" ".join(r["command"])[:80] for r in failed)
+                + source_note
             ),
         )
     )

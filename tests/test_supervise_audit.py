@@ -133,6 +133,25 @@ class FakeEngine:
     def evidence(self, development_id: str) -> dict[str, Any]:
         fixture = self.fixture
         digest = self.overrides.get("frozen_digest", fixture.frozen_digest)
+        implement_receipt: dict[str, Any] = {}
+        if "implement_verification_commands" in self.overrides:
+            implement_receipt = {
+                "verification_record": {
+                    "verification_commands": self.overrides["implement_verification_commands"]
+                }
+            }
+        acceptance_receipt: dict[str, Any] = {
+            "subject_commit": fixture.subject,
+            "outcome": "PASS",
+        }
+        if not self.overrides.get("no_artifacts"):
+            acceptance_receipt["artifacts"] = [
+                {"path": ".dd-evidence/acceptance.json", "digest": digest}
+            ]
+        if "acceptance_verification_commands" in self.overrides:
+            acceptance_receipt["verification_record"] = {
+                "verification_commands": self.overrides["acceptance_verification_commands"]
+            }
         chain = [
             {
                 "revision": 3,
@@ -142,7 +161,7 @@ class FakeEngine:
                 "receipt_digest": "sha256:d1",
                 "input_commit": fixture.base,
                 "output_commit": fixture.subject,
-                "receipt": {},
+                "receipt": implement_receipt,
             },
             {
                 "revision": 9,
@@ -153,30 +172,25 @@ class FakeEngine:
                 "input_commit": fixture.subject,
                 "output_commit": fixture.evidence_commit,
                 "verdict": "PASS",
-                "receipt": {
-                    "subject_commit": fixture.subject,
-                    "outcome": "PASS",
-                    "artifacts": [{"path": ".dd-evidence/acceptance.json", "digest": digest}],
-                },
+                "receipt": acceptance_receipt,
             },
         ]
-        return {
-            "evidence": [
-                {
-                    "revision": 9,
-                    "verified": True,
-                    "remote_main_verified": True,
-                    "accepted_commit_ancestor": True,
-                    "accepted_candidate_commit": fixture.subject,
-                    "target_base_commit": fixture.base,
-                    "bootstrap": self.overrides.get(
-                        "bootstrap",
-                        {"receipt_digest": "sha256:boot", "output_commit": fixture.bootstrap},
-                    ),
-                    "receipt_chain": chain,
-                }
-            ]
+        entry: dict[str, Any] = {
+            "revision": 9,
+            "verified": True,
+            "remote_main_verified": True,
+            "accepted_commit_ancestor": True,
+            "accepted_candidate_commit": fixture.subject,
+            "target_base_commit": fixture.base,
+            "bootstrap": self.overrides.get(
+                "bootstrap",
+                {"receipt_digest": "sha256:boot", "output_commit": fixture.bootstrap},
+            ),
+            "receipt_chain": chain,
         }
+        if "acceptances" in self.overrides:
+            entry["acceptances"] = self.overrides["acceptances"]
+        return {"evidence": [entry]}
 
 
 def by_name(report: AuditReport) -> dict[str, Any]:
@@ -343,6 +357,84 @@ def test_fleet_graph_native_acceptance_shape_is_understood(
 
     assert report.ok, [a.as_dict() for a in report.assertions if not a.ok]
     assert report.acceptance_results[0]["command"] == PASSING_ARGV
+
+
+def test_no_artifacts_falls_back_to_record_json(tmp_path: Path, tracked_tmp: list[Path]) -> None:
+    """Old-engine evidence: receipt froze no artifact, but the controller-side
+    acceptance record (record_json) carries the executed command_results argv.
+    First-hand freezing (tier 1) stays covered by test_green_development_audit."""
+    fixture = build_repo(tmp_path)
+    engine = FakeEngine(
+        fixture,
+        no_artifacts=True,
+        acceptances=[
+            {
+                "acceptance_id": "acc_1",
+                "record_json": json.dumps(
+                    {"command_results": [{"argv": PASSING_ARGV, "exit_code": 0}]}
+                ),
+            }
+        ],
+    )
+    report = audit_development("dev_x", engine=engine, repo=fixture.repo)
+
+    assert report.ok, [a.as_dict() for a in report.assertions if not a.ok]
+    names = by_name(report)
+    assert "frozen_acceptance_digest" not in names
+    source = names["frozen_acceptance_from_record_json"]
+    assert source.ok
+    assert "非一手冻结" in source.detail
+    rerun = names["acceptance_rerun"]
+    assert rerun.ok
+    assert "兜底" in rerun.detail  # the degraded provenance is visible in the verdict line
+    assert any("降级" in gap for gap in report.gaps)
+    assert [r["exit_code"] for r in report.acceptance_results] == [0]
+
+
+def test_no_artifacts_falls_back_to_verification_record_union(
+    tmp_path: Path, tracked_tmp: list[Path]
+) -> None:
+    """No artifacts and no usable record_json: the argv is the deduped union of
+    every receipt's verification_record.verification_commands."""
+    other_argv = [sys.executable, "-c", "import sys; sys.exit(0)"]
+    fixture = build_repo(tmp_path)
+    engine = FakeEngine(
+        fixture,
+        no_artifacts=True,
+        acceptances=[{"acceptance_id": "acc_1", "record_json": "not json"}],
+        implement_verification_commands=[
+            {"argv": PASSING_ARGV, "exit_code": 0},
+            {"argv": PASSING_ARGV, "exit_code": 0},  # duplicate: must collapse
+        ],
+        acceptance_verification_commands=[
+            {"argv": PASSING_ARGV, "exit_code": 0},  # cross-receipt duplicate
+            {"argv": other_argv, "exit_code": 0},
+        ],
+    )
+    report = audit_development("dev_x", engine=engine, repo=fixture.repo)
+
+    assert report.ok, [a.as_dict() for a in report.assertions if not a.ok]
+    names = by_name(report)
+    source = names["frozen_acceptance_from_verification_record"]
+    assert source.ok
+    assert "非一手冻结" in source.detail
+    # Union deduped: two distinct argvs ran, not four.
+    assert [r["command"] for r in report.acceptance_results] == [PASSING_ARGV, other_argv]
+    assert any("降级" in gap for gap in report.gaps)
+
+
+def test_no_artifacts_and_all_fallbacks_empty_still_fails(
+    tmp_path: Path, tracked_tmp: list[Path]
+) -> None:
+    fixture = build_repo(tmp_path)
+    engine = FakeEngine(fixture, no_artifacts=True)
+    report = audit_development("dev_x", engine=engine, repo=fixture.repo)
+
+    assert not report.ok
+    frozen = by_name(report)["frozen_acceptance_digest"]
+    assert not frozen.ok
+    assert "兜底源也全空" in frozen.detail
+    assert report.acceptance_results == []
 
 
 def test_worktree_removed_even_when_rerun_raises(
