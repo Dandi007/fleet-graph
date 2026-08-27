@@ -413,22 +413,25 @@ class TestReset:
         state_root, cursor = self._seed(tmp_path, key)
         first = reset_supervisor_event(key, state_root=state_root, cursor_path=cursor)
         assert first["receipt"].startswith("deleted:")
-        assert first["attempts"] == "cleared:2"
+        # attempts 保留：计数器正是让下次 launch 拿到新 thread（a{n+1}）的东西。
+        # 清零会重派 a{n} 撞旧 thread 的 terminal checkpoint（生产实锤
+        # e1-msg_01M12MRW…：reset 后重跑 resumed:already_complete）。
+        assert first["attempts"] == "kept:2 (next launch is a3)"
         assert not (state_root / "reports" / f"{key}.json").exists()
         state = json.loads(cursor.read_text())
-        assert state["attempts"] == {"other": 1}  # only this key's counter moved
+        assert state["attempts"] == {key: 2, "other": 1}  # untouched
         assert state["board_seq"] == 9  # E3: nothing to rewind
 
         second = reset_supervisor_event(key, state_root=state_root, cursor_path=cursor)
         assert second["receipt"] == "absent"
-        assert second["attempts"] == "absent"
+        assert second["attempts"] == "kept:2 (next launch is a3)"
         assert json.loads(cursor.read_text()) == state
 
     def test_the_observer_refires_a_reset_terminal_event(self, tmp_path: Path) -> None:
         """End to end against the real observer: exhaust the key, reset it,
         and the very next tick launches again -- same observer object, no
         restart, because the cursor is reloaded every tick."""
-        observer, launcher = observer_for(tmp_path, max_attempts=1)
+        observer, launcher = observer_for(tmp_path, max_attempts=2)
         folders = {"wf-a": terminal("fault", "run-1")}
         tick(observer, folders)
         reports = tmp_path / "supervisor" / "reports"
@@ -441,7 +444,8 @@ class TestReset:
         reset_supervisor_event("e3-run-1", state_root=state_root, cursor_path=cursor)
         tick(observer, folders)
         assert len(launcher.events()) == 2
-        assert launcher.events()[-1]["attempt"] == 1  # a genuinely fresh budget
+        # attempts 保留下的重跑是 a2——新 thread，绝不撞 a1 的 terminal checkpoint
+        assert launcher.events()[-1]["attempt"] == 2
 
     def test_e1_board_seq_rewinds_mechanically_and_never_forwards(self, tmp_path: Path) -> None:
         key = "e1-msg_q1"
