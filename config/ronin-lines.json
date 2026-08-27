@@ -104,5 +104,9 @@
       "alias": "ronin-wf-robust",
       "max_rounds": 9999
     }
-  ]
+  ],
+  "line_environment": {
+    "FLEET_GRAPH_BUS_TOKEN_FILE": "/data/agent-bus/tokens/fleet-graph.token"
+  },
+  "_line_environment_provenance": "R4-2/R4-3 实锤补齐：cli.py 注释声称 line env 含 bus token file，但 config 从未声明——supervisor 短跑进程因此无凭证读板，E1 审计降级 needs_human（e1-msg_01M120E6FV13238KW42WPWHRMF 报告实证）。线 pump 的板上升报（R0c）同样依赖它。"
 }
