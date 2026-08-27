@@ -30,9 +30,5 @@ jobs:
         run: uv python install 3.11
       - name: Sync dependencies
         run: uv sync
-      - name: Lint
-        run: |
-          uv run ruff check .
-          uv run ruff format --check .
-      - name: Test
-        run: uv run pytest
+      - name: Verify
+        run: make verify
