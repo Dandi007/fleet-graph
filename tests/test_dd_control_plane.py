@@ -530,9 +530,14 @@ class TestCredentialDiscipline:
         monkeypatch.setenv("FLEET_GRAPH_BUS_TOKEN", "secret-value")
         monkeypatch.setenv("FLEET_GRAPH_BUS_TOKEN_FILE", "/data/agent-bus/tokens/fleet-graph.token")
         plane = DdControlPlane(root=tmp_path / "dd", board_factory=lambda: None)
-        assert plane.environment == {
-            "FLEET_GRAPH_BUS_TOKEN_FILE": "/data/agent-bus/tokens/fleet-graph.token"
-        }
+        assert (
+            plane.environment["FLEET_GRAPH_BUS_TOKEN_FILE"]
+            == "/data/agent-bus/tokens/fleet-graph.token"
+        )
+        assert "secret-value" not in json.dumps(plane.environment)
+        # PATH rides along: agent-run is a bun script and transient units do
+        # not inherit this process's PATH (scheduler line_environment lesson).
+        assert plane.environment["PATH"]
         monkeypatch.delenv("FLEET_GRAPH_BUS_TOKEN_FILE")
         bare = DdControlPlane(root=tmp_path / "dd", board_factory=lambda: None)
-        assert bare.environment == {}, "a raw token value is never forwarded"
+        assert set(bare.environment) == {"PATH"}, "a raw token value is never forwarded"

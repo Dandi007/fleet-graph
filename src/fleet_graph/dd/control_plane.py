@@ -166,16 +166,23 @@ def build_h0_handoff(
 def _inherited_environment() -> dict[str, str]:
     """What a launched run inherits from the control plane's own environment.
 
-    Only the bus token *file path* -- the gate needs a credential, and a path
-    in a transient unit's argv points at a 0600 file rather than being one.
-    A raw FLEET_GRAPH_BUS_TOKEN value is deliberately never forwarded:
-    `--setenv` travels through argv, and a token in argv is a token in
-    `/proc`. Production runs on the token file (findings §26).
+    - PATH: transient units start from the user manager's environment, not
+      this process's, and agent-run is a `#!/usr/bin/env bun` script -- the
+      same lesson scheduler/daemon.py:line_environment already carries
+      (measured again here: `env: 'bun': No such file or directory`).
+    - FLEET_GRAPH_BUS_TOKEN_FILE: the gate needs a credential, and a *path*
+      in a transient unit's argv points at a 0600 file rather than being one.
+      A raw FLEET_GRAPH_BUS_TOKEN value is deliberately never forwarded:
+      `--setenv` travels through argv, and a token in argv is a token in
+      `/proc`. Production runs on the token file (findings §26).
     """
     import os
 
+    env = {"PATH": os.environ.get("PATH", "")}
     token_file = os.environ.get("FLEET_GRAPH_BUS_TOKEN_FILE")
-    return {"FLEET_GRAPH_BUS_TOKEN_FILE": token_file} if token_file else {}
+    if token_file:
+        env["FLEET_GRAPH_BUS_TOKEN_FILE"] = token_file
+    return env
 
 
 def _systemd_unit_is_active(unit: str) -> bool:
@@ -333,6 +340,15 @@ class DdControlPlane:
                     f"{development_id} already admitted with a different spec or repo; "
                     "a changed spec is a new development in a fresh worktree",
                 )
+            if not existing.get("card_entity_id"):
+                # The bus was down (or refused) at first admission; the card
+                # publish is idempotency-keyed, so healing it here cannot fork.
+                card = self._publish_card(
+                    development_id, repo, str(existing.get("remote_ref") or "")
+                )
+                if card:
+                    existing["card_entity_id"] = card
+                    write_json_durable(dev_root / RECORD_FILE, existing)
             return self._creation_result(existing, already_admitted=True)
 
         self._refuse_foreign_binding(repo, development_id)
@@ -568,18 +584,21 @@ class DdControlPlane:
         if board is None:
             return ""
         try:
+            # The exact work.card.v1 schema the board enforces: title/status/
+            # intent required, additionalProperties false (measured 2026-08-27).
             result = board.publish_card(
                 {
                     "title": f"dd {development_id}",
-                    "kind_hint": "dd-development",
+                    "status": "doing",
+                    "intent": f"dev-dispatch development in {repo}",
                     "development_id": development_id,
-                    "repo_path": str(repo),
-                    "remote_ref": remote_ref,
-                    "status": "created",
+                    "links": [remote_ref],
                 },
                 idempotency_key=f"dd-card:{development_id}",
             )
         except Exception:
+            # Best-effort: admission must survive a downed bus. The gate then
+            # stays disabled and the result says so; a later create heals it.
             return ""
         return result.entity_id
 
