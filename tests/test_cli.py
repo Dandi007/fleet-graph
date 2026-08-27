@@ -246,6 +246,15 @@ class TestTheOtherSubcommandsStillParse:
             ["line", "run", "--folder", "wf-1", "--seat", "opencode-dsv4pro"]
         )
         assert args.folder == "wf-1"
+        assert args.generation == 1
+        # None -> the durable default under run_root, never ":memory:".
+        assert args.checkpoint is None
+
+    def test_line_run_generation(self) -> None:
+        args = build_parser().parse_args(
+            ["line", "run", "--folder", "wf-1", "--seat", "s", "--generation", "2"]
+        )
+        assert args.generation == 2
 
     def test_hello(self) -> None:
         assert build_parser().parse_args(["hello"]).topic

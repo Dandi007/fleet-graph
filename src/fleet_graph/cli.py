@@ -61,7 +61,9 @@ def _line_run(args: argparse.Namespace) -> int:
         turn_timeout_seconds=args.turn_timeout,
         coordinator_timeout_seconds=args.coordinator_timeout,
         alias=args.alias,
-        checkpoint_path=args.checkpoint or ":memory:",
+        generation=args.generation,
+        # None -> durable default under run_root; ":memory:" must be asked for.
+        checkpoint_path=args.checkpoint,
     )
     result = run_line(config, run_id=args.run_id)
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
@@ -258,7 +260,18 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--turn-timeout", type=int, default=3000)
     run.add_argument("--coordinator-timeout", type=int, default=2700)
     run.add_argument("--alias", default=None, help="agent-bus inbox alias")
-    run.add_argument("--checkpoint", default=None)
+    run.add_argument(
+        "--generation",
+        type=int,
+        default=1,
+        help="stable thread identity is folder:g{generation}; a restart of the "
+        "same generation resumes its checkpoint and re-adopts in-flight runs",
+    )
+    run.add_argument(
+        "--checkpoint",
+        default=None,
+        help="checkpoint sqlite path; defaults to <run-root>/checkpoint.sqlite3",
+    )
     run.add_argument("--run-id", default=None)
     run.set_defaults(func=_line_run)
 
