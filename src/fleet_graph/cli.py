@@ -209,6 +209,14 @@ def _dd_bootstrap(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dd_serve(args: argparse.Namespace) -> int:
+    """Serve the graph-backed dev-dispatch MCP adapter on loopback."""
+    from fleet_graph.dd.service import serve
+
+    serve(host=args.host, port=args.port, api_url=args.graph_api_url)
+    return 0
+
+
 def _scheduler_run(args: argparse.Namespace) -> int:
     """Run the resident scheduler: look at each line, ask, start or record why not."""
     import pathlib
@@ -322,6 +330,12 @@ def build_parser() -> argparse.ArgumentParser:
     dd_boot.add_argument("--spec", required=True, help="the approved spec to freeze")
     dd_boot.add_argument("--target-base", default=None, help="defaults to the workspace HEAD")
     dd_boot.set_defaults(func=_dd_bootstrap)
+
+    dd_serve = dd_sub.add_parser("serve", help="serve the graph-backed dev-dispatch MCP")
+    dd_serve.add_argument("--host", default="127.0.0.1")
+    dd_serve.add_argument("--port", type=int, default=5610)
+    dd_serve.add_argument("--graph-api-url", default="http://127.0.0.1:5611")
+    dd_serve.set_defaults(func=_dd_serve)
 
     scheduler = subparsers.add_parser("scheduler", help="the resident line scheduler")
     scheduler_sub = scheduler.add_subparsers()
