@@ -40,6 +40,7 @@ from fleet_graph.graphs.dd_pipeline import (
     build_dd_pipeline_graph,
     initial_state,
 )
+from fleet_graph.graphs.dd_replay import ReceiptReplayer, prior_generation_state_roots
 from fleet_graph.graphs.dd_scripts import (
     AcceptanceStage,
     ConfigureStage,
@@ -108,9 +109,28 @@ def build_pipeline(
     capability: CapabilityLock | None = None,
     clock: Any = None,
     observe: Any = None,
+    replayer: Any = None,
 ) -> tuple[Any, PipelineDeps]:
     """Wire a development. Returns the graph and the deps it holds."""
     lifecycle = Lifecycle.load()
+
+    if replayer is None and config.generation > 1:
+        # A restarted generation replays the receipt-sealed prefix of the
+        # previous one instead of re-dispatching agents against work already
+        # in the tree (F4). Generation 1 has nothing behind it, and a layout
+        # the roots helper does not recognize replays nothing.
+        prior_roots = prior_generation_state_roots(config.run_root, config.generation)
+        if prior_roots:
+            replayer = ReceiptReplayer(
+                workspace=config.workspace_path,
+                state_root=config.state_root,
+                prior_state_roots=prior_roots,
+                development_id=config.development_id,
+                generation=config.generation,
+                remote_url=config.remote_url,
+                remote_ref=config.remote_ref,
+                lifecycle=lifecycle,
+            )
 
     builder = StageDispatchBuilder(
         DevelopmentChain(
@@ -192,6 +212,7 @@ def build_pipeline(
         lifecycle=lifecycle,
         dispatcher=dispatcher,
         scripts=registered,
+        replayer=replayer,
         # The plugin ships two sealers, and the contract says which stages
         # own their outputs. That is a narrower set than the dispatch schema's
         # stage enum -- `acceptance` is dispatched but not sealed here. The

@@ -166,6 +166,34 @@ class Materializer(Protocol):
 
 
 @dataclass(frozen=True)
+class Replayed:
+    """A stage already sealed by a previous generation, re-entered from its receipt.
+
+    Nothing here is an actor's claim: the event and the commit come from a
+    sealed receipt a replayer verified mechanically (digest chain closed,
+    commit an ancestor of the current tree). The walker records it and
+    advances exactly as it would for a freshly sealed stage, so every
+    downstream binding still checks the same receipt.
+    """
+
+    event: str
+    receipt: dict[str, Any]
+    output_commit: str
+
+
+class Replayer(Protocol):
+    """Decides, per stage, whether a sealed receipt stands in for a real run.
+
+    Returns None to say "run it for real". The decision must be pure receipt
+    mechanics -- prose, agent claims and history summaries do not count -- and
+    once it declines a stage it must decline every later one, so a replay is
+    always a prefix of the walk, never a hole in it.
+    """
+
+    def replay(self, stage: Stage, dispatch: Dispatch) -> Replayed | None: ...
+
+
+@dataclass(frozen=True)
 class PipelineBounds:
     """Pure counting, INV-8 style. The contract declares no bound of its own."""
 
@@ -209,6 +237,11 @@ class PipelineDeps:
     dispatcher: Actor
     scripts: dict[str, Actor] = field(default_factory=dict)
     materializer: Materializer | None = None
+    # Set for a restarted generation: replays the receipt-sealed prefix of the
+    # previous one instead of re-dispatching agents against work that is
+    # already in the tree (the F4 lesson: a fresh implement actor handed an
+    # already-satisfied spec honestly reports BLOCKED, and the line jams).
+    replayer: Replayer | None = None
     capability: CapabilityLock | None = None
     bounds: PipelineBounds = field(default_factory=PipelineBounds)
     observe: Any = None
@@ -348,6 +381,37 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         digests = dict(state.get("receipt_digests", {}))
         outcome: StageOutcome | None = None
         head_commit = state.get("head_commit", "")
+
+        if deps.replayer is not None:
+            replayed = deps.replayer.replay(stage, dispatch)
+            if replayed is not None:
+                # The stage is already sealed on the chain; enter its receipt
+                # into the state exactly as a fresh seal would be entered, so
+                # advance() checks the same bindings against the same receipt.
+                # No actor runs and nothing is written -- that is the point.
+                for kind in stage.produced_artifacts:
+                    artifacts[kind] = replayed.output_commit
+                digests[stage.id] = compute_json_digest(replayed.receipt)
+                return {
+                    "steps": steps,
+                    "artifacts": artifacts,
+                    "receipt_digests": digests,
+                    "head_commit": replayed.output_commit,
+                    "last_event": replayed.event,
+                    "last_receipt": dict(replayed.receipt),
+                    "last_failure_code": "",
+                    "last_failure_detail": "",
+                    "history": _record(
+                        state,
+                        {
+                            "stage": stage.id,
+                            "event": replayed.event,
+                            "attempt": dispatch["attempt"],
+                            "output_commit": replayed.output_commit,
+                            "replayed": True,
+                        },
+                    ),
+                }
 
         for step in lifecycle.wrapper_steps:
             if step not in KNOWN_WRAPPER_STEPS:
@@ -597,6 +661,8 @@ __all__ = [
     "PipelineDeps",
     "PipelineFault",
     "PipelineState",
+    "Replayed",
+    "Replayer",
     "Sealed",
     "StageOutcome",
     "StageRefused",

@@ -184,6 +184,43 @@ class TestTheActorResultIsChecked:
         }
         assert implement_actor_result(receipt)["blocker"] == {"summary": "no upstream"}
 
+    @pytest.mark.parametrize(
+        ("outcome", "field"), [("DISPUTED", "rebuttal"), ("BLOCKED", "blocker")]
+    )
+    def test_an_honestly_redundant_work_head_commit_is_stripped_not_refused(
+        self, outcome: str, field: str
+    ) -> None:
+        """A no-op that reports the head it finished on reports its input.
+
+        Measured on dev-fg-4628ef887564 g3: the plugin's non-applied schema
+        does not admit `work_head_commit`, so forwarding the honest redundancy
+        turned a legitimate BLOCKED into INVALID_INPUT and a faulted line.
+        Consistent means dropped, not refused.
+        """
+        receipt = {
+            "actor_job_id": "j",
+            "input_commit": "1" * 40,
+            "outcome": outcome,
+            field: {"summary": "the spec is already satisfied"},
+            "work_head_commit": "1" * 40,
+        }
+        result = implement_actor_result(receipt)
+        assert "work_head_commit" not in result
+        assert result[field] == {"summary": "the spec is already satisfied"}
+        assert result["input_commit"] == "1" * 40
+
+    def test_a_non_applied_result_that_moved_the_head_is_refused(self) -> None:
+        """A no-op that claims a different head is not a no-op."""
+        receipt = {
+            "actor_job_id": "j",
+            "input_commit": "1" * 40,
+            "outcome": "BLOCKED",
+            "blocker": {"summary": "no upstream"},
+            "work_head_commit": "2" * 40,
+        }
+        with pytest.raises(MaterializationFailed, match="not a no-op"):
+            implement_actor_result(receipt)
+
     def test_an_unknown_outcome_is_refused(self) -> None:
         receipt = {"actor_job_id": "j", "input_commit": "1" * 40, "outcome": "PROBABLY_FINE"}
         with pytest.raises(MaterializationFailed, match="not one of"):
