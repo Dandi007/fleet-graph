@@ -1,0 +1,34 @@
+# systemd *user* unit for the graph-backed dev-dispatch MCP surface.
+#
+# Template only: shipped in the repo, deliberately not enabled or installed by
+# any script here -- deployment is a supervision-plane decision (wf-a08949).
+#
+# `dd serve` is a real subcommand, checked by tests/test_deploy_unit.py the
+# same way fleet-graphd.service is: an invented subcommand plus Restart=always
+# is a silent crash loop, not a visible failure.
+#
+# Port 5610 was bind-tested free on the fleet host (2026-08-27) and collides
+# with none of the reserved ports (5606/7455/7460/8113/5601/5602/5605/5608/
+# 7490/9090/9093/3300/8101/3002). The service itself refuses to start when the
+# port is taken (see fleet_graph.dd.service.port_is_available).
+[Unit]
+Description=fleet-graph dev-dispatch MCP surface
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/apps/fleet-graph/current
+ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph dd serve \
+    --host 127.0.0.1 --port 5610 \
+    --graph-api-url http://127.0.0.1:5611
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+# Credentials are env-only; never commit a token into this unit. The optional
+# marker (`-` after the `=`) matches fleet-graphd.service: a missing env file
+# must not be an unexplained start failure.
+EnvironmentFile=-%h/.config/fleet-graph/env
+
+[Install]
+WantedBy=default.target
