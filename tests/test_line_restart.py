@@ -88,9 +88,16 @@ class Boom(RuntimeError):
 
 
 class ScriptedCoordinator:
-    def __init__(self, *, die_on_round: int | None = None, done_on_round: int = 5) -> None:
+    def __init__(
+        self,
+        *,
+        die_on_round: int | None = None,
+        done_on_round: int = 5,
+        terminal_verdict: str = "done",
+    ) -> None:
         self.die_on_round = die_on_round
         self.done_on_round = done_on_round
+        self.terminal_verdict = terminal_verdict
         self.calls: list[int] = []
 
     def turn(self, round_no: int, coord_input: dict[str, Any]) -> dict[str, Any]:
@@ -98,7 +105,7 @@ class ScriptedCoordinator:
         if self.die_on_round is not None and round_no >= self.die_on_round:
             raise Boom(f"killed during coordinator round {round_no}")
         if round_no >= self.done_on_round:
-            return {"verdict": "done", "reason": "script end"}
+            return {"verdict": self.terminal_verdict, "reason": "script end"}
         return {"verdict": "continue", "next_prompt": f"step {round_no}"}
 
 
@@ -372,3 +379,66 @@ def _alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+class TestBumpedGenerationGivesAFreshThread:
+    """R0a-2, across both layers: a blocked line's thread is spent (relaunching
+    it no-op finalises, pinned above), so the scheduler's accounted-terminal
+    generation bump is what makes re-ignition do work again. This test runs
+    the real sequence: g1 runs to blocked on a durable checkpoint, the
+    scheduler accounts the terminal, and the generation it hands the next
+    launch must yield a thread on which the coordinator is genuinely called
+    from round 1."""
+
+    def test_blocked_line_reignites_on_a_fresh_thread_and_actually_works(
+        self, tmp_path: Path
+    ) -> None:
+        import json
+
+        from fleet_graph.scheduler.daemon import LineSpec, Scheduler, SchedulerConfig
+
+        folder = "wf-bump"
+        run_root = tmp_path / "runs" / folder
+        run_root.mkdir(parents=True)
+        db = str(run_root / "checkpoint.sqlite3")
+
+        def cfg(generation: int) -> dict[str, Any]:
+            return {
+                "configurable": {"thread_id": f"{folder}:g{generation}"},
+                "recursion_limit": 200,
+            }
+
+        # Generation 1 runs and ends blocked; the line leaves its terminal.
+        first = ScriptedCoordinator(done_on_round=2, terminal_verdict="blocked")
+        graph, _ = line_graph(first)
+        with SqliteSaver.from_conn_string(db) as saver:
+            state = graph.compile(checkpointer=saver).invoke({"round_no": 1}, config=cfg(1))
+        assert state["terminal"] == "blocked"
+        (run_root / "terminal.json").write_text(
+            json.dumps(
+                {"terminal": "blocked", "rounds": state["rounds_recorded"], "run_id": "r-1"}
+            ),
+            encoding="utf-8",
+        )
+
+        # The scheduler accounts that terminal and advances the generation.
+        line = LineSpec(folder_id=folder, seat="s", enabled=True)
+        scheduler = Scheduler(SchedulerConfig(lines=[line], run_root=tmp_path / "runs"))
+        scheduler.account_last_run(folder, base_generation=line.generation)
+        generation = scheduler.generation_of(line)
+
+        # Re-ignite as the scheduler would: same checkpoint file, the
+        # scheduler's generation. The coordinator must be genuinely called.
+        second = ScriptedCoordinator(done_on_round=2)
+        graph2, _ = line_graph(second)
+        with SqliteSaver.from_conn_string(db) as saver:
+            compiled = graph2.compile(checkpointer=saver)
+            invoke_config = cfg(generation)
+            state = compiled.invoke(resume_start(compiled, invoke_config), config=invoke_config)
+
+        assert second.calls[:1] == [1], (
+            "the re-ignited line never called its coordinator -- it relaunched "
+            "the spent thread and no-op finalised"
+        )
+        assert state["terminal"] == "done"
+        assert generation == 2

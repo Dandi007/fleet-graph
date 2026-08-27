@@ -80,10 +80,15 @@ def make(
     )
 
 
-def write_terminal(tmp_path: Path, folder_id: str, terminal: str) -> None:
+def write_terminal(
+    tmp_path: Path, folder_id: str, terminal: str, *, run_id: str | None = None, rounds: int = 3
+) -> None:
+    record: dict[str, Any] = {"terminal": terminal, "rounds": rounds}
+    if run_id is not None:
+        record["run_id"] = run_id
     path = tmp_path / "runs" / folder_id / "terminal.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"terminal": terminal, "rounds": 3}), encoding="utf-8")
+    path.write_text(json.dumps(record), encoding="utf-8")
 
 
 class TestItIgnitesWhenNothingRefuses:
@@ -750,3 +755,113 @@ class TestTheGateExpires:
         not to silently ignore -- opening the fleet on a parse failure is the
         one outcome nobody would have asked for."""
         assert self._scheduler(tmp_path, flag, now=1787745600.0).maintenance_stop() is True
+
+
+class TestGenerationAdvancesPastASpentThread:
+    """R0a made thread_id `{folder}:g{generation}` and durable: a thread whose
+    checkpoint already terminated is spent -- relaunching the same generation
+    routes straight to finalise and does no work (pinned in
+    tests/test_line_restart.py). So an accounted terminal must advance a
+    persisted per-line generation, and both the liveness probe and the next
+    ignition must speak of the bumped unit."""
+
+    LINE = LineSpec(folder_id="wf-1", seat="opencode-dsv4pro", enabled=True)
+
+    def test_an_accounted_terminal_bumps_the_next_ignition(self, tmp_path: Path) -> None:
+        launcher = FakeLauncher()
+        scheduler = make(tmp_path, launcher=launcher, cooldown_seconds=0)
+        scheduler.tick()
+        assert launcher.launched[0].generation == 1
+
+        write_terminal(tmp_path, "wf-1", "blocked", run_id="r-1")
+        scheduler.tick()
+
+        assert scheduler.generation_of(self.LINE) == 2
+        assert launcher.launched[1].generation == 2
+        assert launcher.launched[1].unit_name.endswith("-g2")
+
+    def test_the_same_terminal_bumps_at_most_once(self, tmp_path: Path) -> None:
+        """Keyed on the accounted run_id, exactly like the streak: re-reading
+        the same terminal.json on every 60s tick must not inflate it."""
+        scheduler = make(tmp_path, cooldown_seconds=0)
+        scheduler.tick()
+        write_terminal(tmp_path, "wf-1", "blocked", run_id="r-1")
+        scheduler.tick()
+        scheduler.tick()
+        scheduler.tick()
+        assert scheduler.generation_of(self.LINE) == 2
+
+    def test_done_neither_bumps_nor_ignites(self, tmp_path: Path) -> None:
+        """A finished line never re-ignites, so there is no launch for a
+        bumped counter to serve."""
+        launcher = FakeLauncher()
+        scheduler = make(tmp_path, launcher=launcher, cooldown_seconds=0)
+        scheduler.tick()
+        write_terminal(tmp_path, "wf-1", "done", run_id="r-1")
+
+        results = scheduler.tick()
+        assert results[0].decision.refusal is Refusal.TERMINAL_DONE
+        assert scheduler.generation_of(self.LINE) == 1
+        assert len(launcher.launched) == 1
+
+    def test_the_generation_survives_a_daemon_restart(self, tmp_path: Path) -> None:
+        """Same reason the streak persists: a counter that reset on deploy
+        would relaunch a spent thread on every release."""
+        first = make(tmp_path, cooldown_seconds=0)
+        first.tick()
+        write_terminal(tmp_path, "wf-1", "blocked", run_id="r-1")
+        first.tick()
+        assert first.generation_of(self.LINE) == 2
+
+        restarted = make(tmp_path, cooldown_seconds=0)
+        assert restarted.generation_of(self.LINE) == 2
+
+    def test_probe_and_ignition_use_the_same_generation(self, tmp_path: Path) -> None:
+        """A probe on g1 while igniting g2 would miss a still-running previous
+        unit and double-start the line. After a bump, the unit asked about and
+        the unit launched must be the same string."""
+        launcher = FakeLauncher()
+        units = FakeUnits()
+        scheduler = make(tmp_path, launcher=launcher, units=units, cooldown_seconds=0)
+        scheduler.tick()
+        write_terminal(tmp_path, "wf-1", "blocked", run_id="r-1")
+
+        units.asked.clear()
+        scheduler.tick()
+        assert units.asked == [launcher.launched[1].unit_name]
+        assert units.asked[0].endswith("-g2")
+
+        # And when that bumped unit is still up, the line is not started twice.
+        units.active = {launcher.launched[1].unit_name}
+        assert scheduler.tick()[0].decision.refusal is Refusal.ALREADY_RUNNING
+
+    def test_a_baseline_terminal_initialises_the_generation_past_it(self, tmp_path: Path) -> None:
+        """No bookkeeping yet, but a terminal is lying there: whoever wrote it
+        spent its thread. This is also what keeps the runbook's escape hatch
+        ('delete the counter file to retry now') honest -- re-adopting the
+        baseline at g1 would relaunch the spent thread."""
+        launcher = FakeLauncher()
+        scheduler = make(tmp_path, launcher=launcher, cooldown_seconds=0)
+        write_terminal(tmp_path, "wf-1", "blocked", run_id="r-0")
+
+        scheduler.tick()
+        assert scheduler.generation_of(self.LINE) == 2
+        assert launcher.launched[0].generation == 2
+
+    def test_a_baseline_done_keeps_the_roster_generation(self, tmp_path: Path) -> None:
+        write_terminal(tmp_path, "wf-1", "done", run_id="r-0")
+        scheduler = make(tmp_path, cooldown_seconds=0)
+        results = scheduler.tick()
+        assert results[0].decision.refusal is Refusal.TERMINAL_DONE
+        assert scheduler.generation_of(self.LINE) == 1
+
+    def test_a_raised_roster_generation_still_wins(self, tmp_path: Path) -> None:
+        """An operator bumping LineSpec.generation in config must not be
+        undone by an older persisted counter."""
+        scheduler = make(tmp_path, cooldown_seconds=0)
+        scheduler.tick()
+        write_terminal(tmp_path, "wf-1", "blocked", run_id="r-1")
+        scheduler.tick()  # persisted counter is now 2
+
+        raised = LineSpec(folder_id="wf-1", seat="opencode-dsv4pro", enabled=True, generation=7)
+        assert scheduler.generation_of(raised) == 7
