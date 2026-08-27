@@ -5,8 +5,9 @@ hand: every check a supervisor was doing with a scratchpad, executed as
 commands whose exit codes go in the report. Three disciplines are load-bearing:
 
 - **The target base is recomputed from git, never read from the agent's own
-  account** -- the identity file is read at the commit that *introduced* it,
-  and edits since bootstrap are a refusal (`dd/bootstrap.py`, same rule).
+  account** -- the identity file is read at the bootstrap commit the receipt
+  chain starts from (falling back to `dd/bootstrap.py`'s introducing-commit
+  anchor), and edits since bootstrap are a refusal.
 - **The re-run executes the frozen argv from the receipt-bound artifact, on a
   one-shot detached worktree, with no existence guards.** A missing file is a
   red result, not a skip; zero frozen commands is a failure; the worktree is
@@ -82,6 +83,8 @@ class AuditReport:
     assertions: list[Assertion] = field(default_factory=list)
     acceptance_results: list[dict[str, Any]] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
+    # Set after a successful publish; not part of the audit verdict itself.
+    evidence_note_id: str = ""
 
     @property
     def ok(self) -> bool:
@@ -99,10 +102,14 @@ class AuditReport:
             "assertions": [a.as_dict() for a in self.assertions],
             "acceptance_results": self.acceptance_results,
             "gaps": self.gaps,
+            "evidence_note_id": self.evidence_note_id,
         }
 
     def fingerprint(self) -> str:
-        payload = json.dumps(self.as_dict(), sort_keys=True, ensure_ascii=False)
+        """Content fingerprint for the idempotency key. Excludes the note id:
+        the same findings must dedup to the same note across re-runs."""
+        content = {k: v for k, v in self.as_dict().items() if k != "evidence_note_id"}
+        payload = json.dumps(content, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
@@ -384,7 +391,10 @@ def audit_development(
         if not added.ok:
             return report
 
-        _check_identity_and_base(report, worktree, development_id, claimed_base)
+        bootstrap_commit = str((entry.get("bootstrap") or {}).get("output_commit") or "")
+        _check_identity_and_base(
+            report, worktree, development_id, claimed_base, bootstrap_commit=bootstrap_commit
+        )
         _git_assertion(
             report,
             "target_base_is_ancestor",
@@ -410,14 +420,94 @@ def audit_development(
 
 
 def _check_identity_and_base(
-    report: AuditReport, worktree: Path, development_id: str, claimed_base: str
+    report: AuditReport,
+    worktree: Path,
+    development_id: str,
+    claimed_base: str,
+    *,
+    bootstrap_commit: str = "",
 ) -> None:
     """Identity binding and target base, both anchored in git history.
 
-    `committed_target_base` reads the identity at the commit that introduced
-    it and refuses when HEAD's copy differs -- the graded party can rewrite
-    the file but not the history the digests chain over.
+    The anchor is the bootstrap commit the receipt chain starts from: its
+    identity file is what every digest downstream chains over, so the graded
+    party can rewrite the working copy but not that commit. On old-engine
+    repos many developments share one lineage and each bootstrap rewrites the
+    identity file in place, so `--diff-filter=A` (the fleet-graph-native
+    anchor `committed_target_base` uses) finds someone *else's* introduction
+    -- measured on adl0_b1, whose oldest A-commit belongs to adl0_m2a2. When
+    the evidence names no bootstrap commit, the native anchor is the fallback.
     """
+    if not bootstrap_commit:
+        _check_identity_native_anchor(report, worktree, development_id, claimed_base)
+        return
+
+    anchored, _ = _git_assertion(
+        report,
+        "bootstrap_anchor_in_history",
+        worktree,
+        "merge-base",
+        "--is-ancestor",
+        bootstrap_commit,
+        "HEAD",
+        ok_detail=f"bootstrap commit {bootstrap_commit[:12]}（receipt 链起点）是 subject 的祖先",
+    )
+    show_anchor = f"git -C {worktree} show {bootstrap_commit}:{DEVELOPMENT_PATH}"
+    anchor_proc = run_git(worktree, "show", f"{bootstrap_commit}:{DEVELOPMENT_PATH}")
+    anchor_identity: dict[str, Any] = {}
+    if anchored.ok and anchor_proc.returncode == 0:
+        try:
+            anchor_identity = json.loads(anchor_proc.stdout)
+        except ValueError:
+            anchor_identity = {}
+
+    recomputed = str(anchor_identity.get("target_base_commit") or "")
+    report.record(
+        Assertion(
+            name="target_base_recomputed",
+            ok=bool(recomputed) and recomputed == claimed_base,
+            command=show_anchor,
+            exit_code=anchor_proc.returncode,
+            detail=(
+                f"git 现算（bootstrap commit 内识别文件）target base="
+                f"{recomputed[:12] or '<无法读取>'}，引擎自述={claimed_base[:12]}"
+            ),
+        )
+    )
+    bound_id = str(anchor_identity.get("development_id") or "")
+    report.record(
+        Assertion(
+            name="identity_binding",
+            ok=bool(bound_id) and bound_id == development_id,
+            command=show_anchor,
+            exit_code=anchor_proc.returncode,
+            detail=(
+                f"{DEVELOPMENT_PATH} @ bootstrap 绑定 development_id="
+                f"{bound_id or '<无法读取>'}，被审对象={development_id}"
+            ),
+        )
+    )
+
+    head_proc = run_git(worktree, "show", f"HEAD:{DEVELOPMENT_PATH}")
+    report.record(
+        Assertion(
+            name="identity_unedited_since_bootstrap",
+            ok=head_proc.returncode == 0 and head_proc.stdout == anchor_proc.stdout,
+            command=f"git -C {worktree} show HEAD:{DEVELOPMENT_PATH}",
+            exit_code=head_proc.returncode,
+            detail=(
+                "subject 树中的识别文件与 bootstrap commit 逐字节一致"
+                if head_proc.returncode == 0 and head_proc.stdout == anchor_proc.stdout
+                else "识别文件在 bootstrap 之后被改写——拒绝采信其内容"
+            ),
+        )
+    )
+
+
+def _check_identity_native_anchor(
+    report: AuditReport, worktree: Path, development_id: str, claimed_base: str
+) -> None:
+    """Fallback for evidence that names no bootstrap commit (fleet-graph dd)."""
     show = f"git -C {worktree} show HEAD:{DEVELOPMENT_PATH}"
     try:
         recomputed = committed_target_base(worktree)
@@ -431,7 +521,6 @@ def _check_identity_and_base(
                 detail=str(changed)[:400],
             )
         )
-        recomputed = None
     else:
         report.record(
             Assertion(

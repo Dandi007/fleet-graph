@@ -287,7 +287,7 @@ def _supervise_audit(args: argparse.Namespace) -> int:
             card_entity_id=args.card,
             question_note_id=args.question or "",
         )
-        report.gaps.append(f"evidence note 已落板: {result.message_id}")
+        report.evidence_note_id = result.message_id
     else:
         # The ref contract needs a card to hang the note on; without one the
         # honest move is a local report plus a named gap, not a guessed ref.
@@ -298,6 +298,8 @@ def _supervise_audit(args: argparse.Namespace) -> int:
         sys.stdout.write("\n")
     else:
         print(render_note(report))
+        if report.evidence_note_id:
+            print(f"evidence note 已落板: {report.evidence_note_id}")
     return 0 if report.ok else 1
 
 

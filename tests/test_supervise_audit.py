@@ -59,9 +59,12 @@ PASSING_ARGV = [
 
 
 class RepoFixture:
-    def __init__(self, repo: Path, base: str, subject: str, evidence_commit: str) -> None:
+    def __init__(
+        self, repo: Path, base: str, bootstrap: str, subject: str, evidence_commit: str
+    ) -> None:
         self.repo = repo
         self.base = base
+        self.bootstrap = bootstrap
         self.subject = subject
         self.evidence_commit = evidence_commit
         self.frozen_digest = ""
@@ -84,7 +87,7 @@ def build_repo(
         development_id=development_id, spec=b"# spec\n", target_base_commit=base
     )
     context.write(repo)
-    commit_all(repo, "dev-dispatch: bootstrap")
+    bootstrap = commit_all(repo, "dev-dispatch: bootstrap")
 
     (repo / "src").mkdir()
     (repo / "src" / "feature.py").write_text("VALUE = 1\n", encoding="utf-8")
@@ -106,7 +109,7 @@ def build_repo(
     path.write_bytes(frozen_bytes)
     evidence_commit = commit_all(repo, "dev-dispatch: acceptance")
 
-    fixture = RepoFixture(repo, base, subject, evidence_commit)
+    fixture = RepoFixture(repo, base, bootstrap, subject, evidence_commit)
     fixture.frozen_digest = "sha256:" + hashlib.sha256(frozen_bytes).hexdigest()
     return fixture
 
@@ -166,7 +169,10 @@ class FakeEngine:
                     "accepted_commit_ancestor": True,
                     "accepted_candidate_commit": fixture.subject,
                     "target_base_commit": fixture.base,
-                    "bootstrap": {"receipt_digest": "sha256:boot"},
+                    "bootstrap": self.overrides.get(
+                        "bootstrap",
+                        {"receipt_digest": "sha256:boot", "output_commit": fixture.bootstrap},
+                    ),
                     "receipt_chain": chain,
                 }
             ]
@@ -207,6 +213,8 @@ def test_green_development_audit(tmp_path: Path, tracked_tmp: list[Path]) -> Non
         "throwaway_worktree_added",
         "target_base_recomputed",
         "identity_binding",
+        "bootstrap_anchor_in_history",
+        "identity_unedited_since_bootstrap",
         "target_base_is_ancestor",
         "diff_manifest",
         "worktree_binding",
@@ -256,6 +264,20 @@ def test_identity_edited_after_bootstrap_is_refused(
 ) -> None:
     fixture = build_repo(tmp_path, edit_identity_after_bootstrap=True)
     report = audit_development("dev_x", engine=FakeEngine(fixture), repo=fixture.repo)
+
+    assert not report.ok
+    unedited = by_name(report)["identity_unedited_since_bootstrap"]
+    assert not unedited.ok
+    assert "被改写" in unedited.detail
+
+
+def test_native_anchor_fallback_without_bootstrap_commit(
+    tmp_path: Path, tracked_tmp: list[Path]
+) -> None:
+    """Evidence with no bootstrap commit falls back to the A-commit anchor."""
+    fixture = build_repo(tmp_path, edit_identity_after_bootstrap=True)
+    engine = FakeEngine(fixture, bootstrap={"receipt_digest": "sha256:boot"})
+    report = audit_development("dev_x", engine=engine, repo=fixture.repo)
 
     assert not report.ok
     recomputed = by_name(report)["target_base_recomputed"]
