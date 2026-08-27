@@ -174,13 +174,15 @@ class TestTheRunbookMatchesTheCode:
 class TestTheAcceptanceCanary:
     """R0d 首批声明：wf-a08949 一条线。目的是让 last_acceptance 事实链首次在
     真机跑通，不是替线做完整验收——两条命令都是该线 goal.md A4 观察窗/第一纪律
-    的只读机械判据（老引擎端口在听、loop-engine-jobd 在役）。"""
+    的只读机械判据（:7455 老引擎端口在听、:7460 loop-engine dd 面在听）。第二条
+    原是 systemctl --user is-active，但验收命令在 transient unit 里没有 DBUS
+    环境、恒 exit 1（g2 round-5 事实链实测），改为同构端口探测。"""
 
     def test_the_canary_declares_two_read_only_probes(self) -> None:
         line = {c.folder_id: c for c in SchedulerConfig.from_json(CONFIG).lines}["wf-a08949"]
         assert line.acceptance == [
             ["bash", "-lc", "ss -ltn | grep -c ':7455'"],
-            ["systemctl", "--user", "is-active", "loop-engine-jobd"],
+            ["bash", "-lc", "ss -ltn | grep -c ':7460'"],
         ]
         assert line.acceptance_cwd == "/tmp", "cwd 是声明的一部分，缺了整个声明只会 skipped:no_cwd"
 

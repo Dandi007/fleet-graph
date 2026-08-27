@@ -32,6 +32,13 @@ TimeoutStopSec=30
 # marker (`-` after the `=`) matches fleet-graphd.service: a missing env file
 # must not be an unexplained start failure.
 EnvironmentFile=-%h/.config/fleet-graph/env
+# Same PATH as fleet-graphd.service, for the same reason: the control plane
+# hands its own PATH to every transient dd unit it launches, and those units
+# exec `agent-run` -- a bun script. Under the systemd user manager the default
+# PATH has no ~/.bun/bin, so without this line every implement dispatch dies
+# at `env: 'bun': No such file or directory` before the agent even starts
+# (observed live on dev-fg-4628ef887564, three runs "ended lost").
+Environment=PATH=%h/.bun/bin:%h/.local/bin:%h/.opencode/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 [Install]
 WantedBy=default.target
