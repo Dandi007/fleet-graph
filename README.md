@@ -25,6 +25,8 @@ UTC timestamps, raw command output, and both exit codes. Only `running` and
 export XDG_RUNTIME_DIR=/run/user/1000
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 bash deploy/verify-user-session-bus.sh
+# equivalent Make target:
+make acceptance
 ```
 
 ## Status

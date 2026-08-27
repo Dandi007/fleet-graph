@@ -1,4 +1,4 @@
-.PHONY: help sync lint fmt test verify clean
+.PHONY: help sync lint fmt test verify acceptance clean
 
 help:
 	@echo "sync    - install deps into .venv (uv)"
@@ -6,6 +6,7 @@ help:
 	@echo "fmt     - ruff format + autofix"
 	@echo "test    - pytest"
 	@echo "verify  - lint + test (the gate CI runs)"
+	@echo "acceptance - capture user-session manager and verification evidence"
 
 sync:
 	uv sync --frozen || uv sync
@@ -22,6 +23,9 @@ test:
 	uv run pytest
 
 verify: lint test
+
+acceptance:
+	bash deploy/verify-user-session-bus.sh
 
 clean:
 	rm -rf .pytest_cache .ruff_cache dist build

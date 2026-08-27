@@ -86,6 +86,24 @@ def test_connection_failure_is_not_accepted_as_a_degraded_manager(tmp_path: Path
     assert "must not run" not in done.stdout
 
 
+def test_manager_output_must_be_an_exact_connected_state(tmp_path: Path) -> None:
+    fake_command(tmp_path, "systemctl", "printf 'running but unhealthy\\n'; exit 0")
+    fake_command(tmp_path, "make", "printf 'must not run\\n'; exit 0")
+
+    done = subprocess.run(
+        ["/bin/bash", str(HELPER)],
+        capture_output=True,
+        text=True,
+        env=helper_environment(tmp_path),
+        check=False,
+    )
+
+    assert done.returncode == 1
+    assert "running but unhealthy" in done.stdout
+    assert "systemctl --user is-system-running exit=0" in done.stdout
+    assert "must not run" not in done.stdout
+
+
 def test_verification_failure_records_raw_output_and_exit_code(tmp_path: Path) -> None:
     fake_command(tmp_path, "systemctl", "printf 'degraded\\n'; exit 1")
     fake_command(tmp_path, "make", "printf 'verification failed\\n'; exit 23")
