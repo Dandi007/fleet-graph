@@ -329,6 +329,12 @@ def _inherited_environment() -> dict[str, str]:
       A raw FLEET_GRAPH_BUS_TOKEN value is deliberately never forwarded:
       `--setenv` travels through argv, and a token in argv is a token in
       `/proc`. Production runs on the token file (findings §26).
+
+    This is a whitelist, which is itself load-bearing for R4-3's credential
+    separation: FLEET_GRAPH_DECISION_TOKEN_FILE (the decision publisher's
+    credential) is not on it and must never be -- a dd run that inherits the
+    decision credential is a pipeline that can approve itself (pinned by
+    test).
     """
     import os
 

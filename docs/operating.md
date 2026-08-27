@@ -182,12 +182,12 @@ journalctl --user -u fleet-graphd -f          # 每 60s 一批，每条线一行
 每行形如 `{"folder_id": ..., "ignited": false, "refusal": "line_disabled", ...}`。
 `refusal` 就是上面七道闸加名册的名字，一一对应。
 
-## 监督面：supervisor 图与事件泵（R4-2）
+## 监督面：supervisor 图与事件泵（R4-2/R4-3）
 
 值守的机械化：四类**机械事件**唤醒一次短跑审计，审计报告落板（evidence note）
-与 supervisor 自己的 run root。**本单不发任何 `work.decision.v1`——分类只有
-`needs_human` 与 `recommend_reject`，人仍拍板**；依预授权代拍是 R4-3 的第四道闸，
-现在的代码里那条分支是显式 `NotImplementedError`。
+与 supervisor 自己的 run root。分类三种：`needs_human`、`recommend_reject`、
+`preauth_release`（R4-3 第四道闸）。逐条拍板仍是人的：唯一的自动放行路径要求
+**人先在板上签发机械预授权**，且结构上只够得到集成分支 merge（见下）。
 
 ### 开关
 
@@ -245,9 +245,45 @@ fleet-graph supervisor run --event-json \
   '{"type":"line_fault","key":"e3-<run_id>","payload":{"folder_id":"wf-…","run_id":"<run_id>"}}'
 ```
 
+### 预授权放行闸（R4-3 第四道闸）
+
+前三道防代拍闸原样不动（Board 无 decision 发布方法、gate resume 值被丢弃每次
+重读板、decision 只经 ref 图解析）。第四道 = **独立主体 + 机械预授权 + 凭证分离**：
+
+- **preauth 是板上的一等对象**：人发一条 `work.decision.v1`，payload
+  `kind: "preauth"`，机器可读字段 `{card_entity_id, allowed_actions:
+  ["approve"], target_ref_allowlist: [<ref 前缀>], expires_at}`。
+  `expires_at` **必填**（无期限 = 常开自批按钮，校验层拒收）；allowlist 用
+  **前缀白名单**（不用正则），且**构造性不可能覆盖 main/master/production/
+  release**——含它们的 preauth 在校验层被拒，负例测试钉死。
+- **classify 三要素机械判定**（script，llm 的建议不是输入）：① 原文覆盖
+  （动作 ∈ allowed_actions、卡 entity 精确匹配、now < expires_at）；② 目标
+  ref 从 git 锚定现算（development id 出自 bootstrap commit 锚定的识别文件，
+  ref = 控制面固定规则 `refs/heads/dd/<id>`，不采信任何 agent 自述）∈ 前缀
+  白名单；③ 署名锚点齐备（question note id + preauth 消息 id）。另加前置：
+  机械审计**全绿且无 gap**、该 question 尚无 decision。**缺一 → needs_human，
+  不报错、不猜**。
+- **唯一 decision publisher + 凭证分离**：`supervise/decision_publisher.py`
+  是全仓唯一允许构造/发布 `work.decision.v1` 的模块；只发 `APPROVE` +
+  `scope: "merge_only"`（**合入≠部署**），`decided_by` 固定为
+  `"supervisor-graph (依预授权 <msg_id> 代行；非人逐条拍板)"`，refs 同时指向
+  question note 与 preauth 消息。凭证走独立 env
+  `FLEET_GRAPH_DECISION_TOKEN_FILE`，只在 act script 节点进程内读取；
+  `executors/agent_run.py` 按 `FLEET_GRAPH_DECISION_` 前缀从一切 agent 子进程
+  env 剥除，dd 控制面的 env 白名单从不转发它。
+- **必须停人闸的封闭枚举**（`supervise/preauth.py` 的
+  `HUMAN_ONLY_CATEGORIES`，测试钉死）：production main/release promotion、
+  部署授权、判据/spec 改判、cancel 在跑 development、preauth 本身的签发与
+  展期、REJECT（v1 不纳入 preauth，驳回只出建议）。
+- decision 发布被拒（无凭证/bus 故障）只降级记录：板上不出现 decision，
+  question 仍开着，gate 继续等人——这条分支的失败模式是 needs_human，
+  永远不是静默放行。
+
 守卫（`make conformance`，随 verify 跑）：supervisor 模块不 import
-`scheduler.ignition`/`scheduler.launcher`；全仓无 `work.decision.v1` 发布路径。
-两条都有 sabotage 自证测试。
+`scheduler.ignition`/`scheduler.launcher`；`work.decision.v1` 发布调用唯一
+豁免 `supervise/decision_publisher.py`；publisher 的 import 白名单只有
+`graphs/supervisor.py`（act script 节点），llm 执行路径（executors/、dd 图）
+结构上够不到发布入口。三条都有 sabotage 自证测试。
 
 ## dd 控制面（R1-b：MCP 服务即控制面）
 

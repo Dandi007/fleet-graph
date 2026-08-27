@@ -4,40 +4,47 @@
         -> act -> receipt -> END
 
 Script nodes bracket the single llm node, and the llm only ever *advises*:
-`classify` gates the classification on mechanical predicates, and in this
-ticket (R4-2) the only classifications that exist are `needs_human` and
-`recommend_reject`. The `preauth_release` branch is deliberately a
-NotImplementedError stub until R4-3 lands the fourth gate -- see
-`preauth_release`, and do not be the person who fills it in early (§38b:
-a complete evidence chain is not a merge verdict, and a supervisor that can
-release work on its own judgement is a self-approval button).
+`classify` gates the classification on mechanical predicates. Three
+classifications exist: `needs_human`, `recommend_reject`, and (since R4-3)
+`preauth_release` -- the fourth gate. A release is not the supervisor's own
+judgement (§38b: a complete evidence chain is not a merge verdict): it is the
+mechanical application of a *human-issued* preauth on the board, checked by
+the three-factor predicate in `supervise/preauth.py` (coverage, git-anchored
+target ref in a prefix allowlist, honest attribution), and any missing factor
+degrades to needs_human -- no error, no guess.
 
 Three structural refusals, each pinned by scripts/check_supervisor_conformance.py
 or by the module simply not importing the capability:
 
-- **This module cannot publish a `work.decision.v1`.** The whole repo cannot
-  (bus/board.py's standing rule); the conformance guard makes the regression
-  loud.
+- **Decisions publish through exactly one door.** Only
+  `supervise/decision_publisher.py` may construct a `work.decision.v1`
+  publish (Guard B), only this module's `act` script node may import it
+  (Guard C), and its credential never reaches an agent subprocess env
+  (executors/agent_run.py scrubs the namespace). The published decision is
+  `scope: merge_only` and its allowlist constructively cannot cover
+  main/master/production -- promotion stays human, by validation not policy.
 - **This module cannot schedule.** It never imports `scheduler.ignition` or
   `scheduler.launcher`; it is a *scheduled* thing (launched as a transient
   unit by the observer), never a second scheduler (r4-design §5, D9).
 - **It never writes into the line it is auditing.** Its outputs are a board
-  note and files under its own state root. §38e's governance livelock -- the
-  supervisor locked out of the work folder it was trying to write into -- is
-  resolved by not wanting to write there at all.
+  note, at most one preauth-released decision, and files under its own state
+  root. §38e's governance livelock -- the supervisor locked out of the work
+  folder it was trying to write into -- is resolved by not wanting to write
+  there at all.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from fleet_graph.bus.board import NOTE_KIND, WORK_NOTES, Board, GateTicket
-from fleet_graph.bus.client import BusClient
+from fleet_graph.bus.board import DECISION_KIND, NOTE_KIND, WORK_NOTES, Board, GateTicket
+from fleet_graph.bus.client import DEFAULT_BUS_URL, BusClient
 from fleet_graph.executors.agent_run import (
     AgentRunLauncher,
     AgentRunSpec,
@@ -54,6 +61,7 @@ from fleet_graph.supervise.audit import (
     audit_development,
     audit_goal_line,
 )
+from fleet_graph.supervise.decision_publisher import publish_release_decision
 from fleet_graph.supervise.events import (
     EVENT_BLOCKED_DECISION,
     EVENT_BOARD_QUESTION,
@@ -62,12 +70,19 @@ from fleet_graph.supervise.events import (
     SupervisorEvent,
     validate_event,
 )
+from fleet_graph.supervise.preauth import (
+    PREAUTH_PAYLOAD_KIND,
+    ReleaseEvaluation,
+    evaluate_release,
+    latest_preauth_for,
+)
 
 AUDIT_ROLE = "supervisor_auditor"
 AUDIT_NODE = "audit"
 
 CLASSIFY_NEEDS_HUMAN = "needs_human"
 CLASSIFY_RECOMMEND_REJECT = "recommend_reject"
+CLASSIFY_PREAUTH_RELEASE = "preauth_release"
 
 #: Failed assertions in this set are *reproducible* failures: each carries the
 #: exact command, its exit code, and the error text -- the three things §38d
@@ -79,23 +94,67 @@ REJECT_GROUNDS = frozenset({"frozen_acceptance_digest", "acceptance_no_skips", "
 AUDIT_RECOMMENDATIONS = frozenset({"approve", "reject", "hold"})
 
 
-def preauth_release(
-    event: dict[str, Any], report: dict[str, Any], audit_verdict: dict[str, Any]
-) -> bool:
-    """R4-3's fourth gate. Deliberately not implemented in R4-2.
+def git_target_ref(report: dict[str, Any]) -> str:
+    """The merge target ref, anchored in git -- or "" when it cannot be.
 
-    The three-factor predicate (preauth coverage, server-side target base in
-    the allowlist, honest attribution) and the credential-separated decision
-    publisher do not exist yet, so there is nothing this function could
-    legitimately consult. Raising -- rather than returning False quietly -- is
-    the point: code that starts calling this before R4-3 should fail its
-    tests, not silently classify everything as needs_human while believing it
-    evaluated a preauth.
+    Never read from any agent's account. The dd control plane constructs a
+    development's integration ref as ``refs/heads/dd/<development_id>`` at
+    admission (dd/control_plane.py, `remote_ref = f"refs/heads/dd/{...}"`),
+    and the audit's `identity_binding` assertion has already recomputed the
+    development id from the identity file inside git history (bootstrap-commit
+    anchored, edits since bootstrap refused). Ref name = fixed rule over a
+    git-anchored id; nothing self-attested survives into the result. A report
+    that is not a development audit, or whose identity binding did not hold,
+    yields "" -- and factor 2 of the preauth predicate then fails closed.
     """
-    raise NotImplementedError(
-        "preauth_release is R4-3's fourth gate (three-factor mechanical "
-        "predicate + credential-separated decision publisher); R4-2 ships "
-        "only needs_human / recommend_reject"
+    if report.get("kind") != "development":
+        return ""
+    ok_by_name = {a.get("name"): bool(a.get("ok")) for a in report.get("assertions") or []}
+    if not ok_by_name.get("identity_binding"):
+        return ""
+    development_id = str(report.get("target") or "")
+    return f"refs/heads/dd/{development_id}" if development_id else ""
+
+
+def evaluate_preauth_release(
+    event: SupervisorEvent,
+    intake_facts: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    now: float,
+) -> ReleaseEvaluation:
+    """R4-3's fourth gate: the three-factor mechanical predicate, assembled
+    from this turn's facts. Script, not llm -- the auditor's recommendation is
+    deliberately not an input, in either direction.
+
+    Only an E1 board question can ever be released: it is the one event type
+    that *is* a gate. Everything else has no question to answer and no merge
+    to unlock, so the evaluation fails closed with the reason recorded.
+    """
+    if event.type != EVENT_BOARD_QUESTION:
+        return ReleaseEvaluation(
+            granted=False,
+            reasons=(f"事件类型 {event.type} 不是 gate question——无可放行之物",),
+        )
+    card_entity_id = str(
+        event.payload.get("card_entity_id") or intake_facts.get("card_entity_id") or ""
+    )
+    preauth, rejections = latest_preauth_for(
+        list(intake_facts.get("preauth_candidates") or []), card_entity_id
+    )
+    report_green = (
+        bool(report.get("ok")) and bool(report.get("assertions")) and not report.get("gaps")
+    )
+    return evaluate_release(
+        preauth=preauth,
+        action="approve",
+        card_entity_id=card_entity_id,
+        question_note_id=str(event.payload.get("question_note_id") or ""),
+        target_ref=git_target_ref(report),
+        report_green=report_green,
+        already_decided=bool(intake_facts.get("already_decided")),
+        now=now,
+        rejections=tuple(rejections),
     )
 
 
@@ -106,6 +165,7 @@ class SupervisorState(TypedDict, total=False):
     rerun_facts: dict[str, Any]
     audit_verdict: dict[str, Any]
     classification: str
+    preauth_evaluation: dict[str, Any]
     act_result: dict[str, Any]
     receipt_path: str
 
@@ -128,6 +188,13 @@ class SupervisorDeps:
     #: not guesses.
     repo: Path | None = None
     publish_notes: bool = True
+    #: Where the decision publisher talks to. Deliberately a plain URL, not a
+    #: client: the decision credential is read inside the act node's call,
+    #: never held on this dataclass next to the board client.
+    bus_url: str = DEFAULT_BUS_URL
+    #: Test seam for the decision publisher only. Production leaves it None so
+    #: the publisher builds its own client from the separated credential.
+    decision_client: Any | None = None
 
     def thread_dir(self, key: str) -> Path:
         return self.state_root / "threads" / key
@@ -229,13 +296,27 @@ def render_supervisor_note(
     audit_verdict: dict[str, Any],
     classification: str,
     failures: list[dict[str, Any]],
+    preauth: dict[str, Any] | None = None,
 ) -> str:
-    """The board-facing audit note. Casts no verdict; recommends at most."""
-    header = (
-        f"supervisor {event.type} {event.key}: {classification}"
-        f"（自动审计，本单不发 work.decision.v1——人仍拍板）"
-    )
+    """The board-facing audit note. Recommends, or names the preauth it acted
+    on -- the one thing it never does is present a release as a human verdict."""
+    if classification == CLASSIFY_PREAUTH_RELEASE:
+        header = (
+            f"supervisor {event.type} {event.key}: {classification}"
+            f"（依预授权 {(preauth or {}).get('preauth_message_id')} 代行放行，"
+            f"scope=merge_only——合入≠部署，production promotion 仍停人闸）"
+        )
+    else:
+        header = (
+            f"supervisor {event.type} {event.key}: {classification}"
+            f"（自动审计，本单不发 work.decision.v1——人仍拍板）"
+        )
     lines = [header]
+    if preauth is not None and classification == CLASSIFY_PREAUTH_RELEASE:
+        lines.append(
+            f"[PREAUTH] 目标 ref {preauth.get('target_ref')}（git 现算锚定）∈ 前缀白名单；"
+            f"decision refs 指向 question note 与 preauth 两者"
+        )
     for assertion in report.get("assertions") or []:
         mark = "PASS" if assertion.get("ok") else "FAIL"
         lines.append(
@@ -313,6 +394,17 @@ def build_supervisor_graph(deps: SupervisorDeps) -> StateGraph:
                     )
                     if head is not None:
                         facts["card_head_payload"] = head.get("payload") or {}
+                    # R4-3: the raw preauth candidates for this card. Fetched
+                    # here (intake is the fetch node), validated in classify
+                    # (the predicate node) -- an invalid candidate is a
+                    # recorded rejection there, never an error here.
+                    notes, _ = deps.bus.messages(WORK_NOTES, limit=1000)
+                    facts["preauth_candidates"] = [
+                        m
+                        for m in notes
+                        if m.get("kind") == DECISION_KIND
+                        and (m.get("payload") or {}).get("kind") == PREAUTH_PAYLOAD_KIND
+                    ]
                 except Exception as exc:  # facts, not guesses
                     facts["gaps"].append(f"board 取证失败: {type(exc).__name__}: {exc}"[:300])
 
@@ -476,38 +568,47 @@ def build_supervisor_graph(deps: SupervisorDeps) -> StateGraph:
     def classify(state: SupervisorState) -> SupervisorState:
         """Mechanical gate. The llm's recommendation is advice, never the input.
 
-        R4-2 policy: two classes only. `recommend_reject` requires a
-        reproducible failure (exact argv + exit code + error text); everything
-        else -- including an llm that says "reject" without a mechanical
-        ground, and an llm that says "approve" -- is `needs_human`, because
-        the release path (`preauth_release`) does not exist until R4-3.
+        `recommend_reject` requires a reproducible failure (exact argv + exit
+        code + error text) and takes precedence -- a red evidence chain is
+        never released, whatever the board says. `preauth_release` requires
+        the full three-factor predicate over a human-issued preauth; any
+        missing factor -- including an llm that says "approve" -- degrades to
+        `needs_human`, silently and on purpose.
         """
         failures = reproducible_failures(state.get("report") or {})
         if failures:
             return {"classification": CLASSIFY_RECOMMEND_REJECT}
-        # NOT taken in R4-2, by construction: preauth_release() raises
-        # NotImplementedError. The branch is written out so R4-3 has exactly
-        # one place to land, and so nobody re-invents it elsewhere.
-        return {"classification": CLASSIFY_NEEDS_HUMAN}
+        evaluation = evaluate_preauth_release(
+            _event_of(state),
+            state.get("intake_facts") or {},
+            state.get("report") or {},
+            now=time.time(),
+        )
+        if evaluation.granted:
+            return {
+                "classification": CLASSIFY_PREAUTH_RELEASE,
+                "preauth_evaluation": evaluation.as_dict(),
+            }
+        return {
+            "classification": CLASSIFY_NEEDS_HUMAN,
+            "preauth_evaluation": evaluation.as_dict(),
+        }
 
     def act(state: SupervisorState) -> SupervisorState:
         """Publish the audit as an evidence note; degrade to local on refusal.
 
-        Structurally incapable of publishing a decision: neither this module
-        nor anything it imports has such a method, and the conformance guard
-        turns any future attempt into a red CI."""
+        On `preauth_release`, also publish the one decision this graph may
+        ever cast -- through `decision_publisher`, the repo's single sanctioned
+        door, with the separated credential read inside that call. A refused
+        decision publish is recorded and nothing else changes: the question
+        stays open on the board, so the gate still waits for a human -- the
+        failure mode of this branch is needs_human, never a silent release."""
         event = _event_of(state)
         intake_facts = state.get("intake_facts") or {}
         classification = state.get("classification") or CLASSIFY_NEEDS_HUMAN
         failures = reproducible_failures(state.get("report") or {})
-        note = render_supervisor_note(
-            event,
-            state.get("report") or {},
-            state.get("audit_verdict") or {},
-            classification,
-            failures,
-        )
-        result: dict[str, Any] = {"classification": classification, "note": note}
+        preauth_evaluation = state.get("preauth_evaluation") or {}
+        result: dict[str, Any] = {"classification": classification}
 
         card_entity_id = str(
             event.payload.get("card_entity_id")
@@ -516,6 +617,49 @@ def build_supervisor_graph(deps: SupervisorDeps) -> StateGraph:
             or ""
         )
         question_note_id = str(event.payload.get("question_note_id") or "")
+
+        if classification == CLASSIFY_PREAUTH_RELEASE:
+            report = state.get("report") or {}
+            evaluation = ReleaseEvaluation(
+                granted=bool(preauth_evaluation.get("granted")),
+                reasons=tuple(preauth_evaluation.get("reasons") or ()),
+                preauth_message_id=str(preauth_evaluation.get("preauth_message_id") or ""),
+                target_ref=str(preauth_evaluation.get("target_ref") or ""),
+                rejections=tuple(preauth_evaluation.get("rejections") or ()),
+            )
+            try:
+                decision = publish_release_decision(
+                    evaluation=evaluation,
+                    card_entity_id=card_entity_id,
+                    question_note_id=question_note_id,
+                    rationale=(
+                        f"机械审计全绿（{len(report.get('assertions') or [])} 条断言，"
+                        f"target={report.get('target')}）；依预授权 "
+                        f"{evaluation.preauth_message_id} 放行 merge_only"
+                    ),
+                    # Same-turn retries and kill-restarts dedup on the question:
+                    # one question, at most one released decision.
+                    idempotency_key=f"supervisor-preauth:{event.key}",
+                    bus_url=deps.bus_url,
+                    client=deps.decision_client,
+                )
+                result["decision_published"] = True
+                result["decision_message_id"] = decision.message_id
+            except Exception as exc:
+                result["decision_published"] = False
+                result["decision_degraded"] = f"decision 发布被拒: {type(exc).__name__}: {exc}"[
+                    :400
+                ]
+
+        note = render_supervisor_note(
+            event,
+            state.get("report") or {},
+            state.get("audit_verdict") or {},
+            classification,
+            failures,
+            preauth=preauth_evaluation or None,
+        )
+        result["note"] = note
 
         if not deps.publish_notes:
             result["published"] = False
@@ -568,6 +712,7 @@ def build_supervisor_graph(deps: SupervisorDeps) -> StateGraph:
                 "rerun": state.get("rerun_facts") or {},
                 "audit_verdict": state.get("audit_verdict") or {},
                 "classification": state.get("classification") or CLASSIFY_NEEDS_HUMAN,
+                "preauth_evaluation": state.get("preauth_evaluation") or {},
                 "act_result": state.get("act_result") or {},
             },
         )
@@ -617,6 +762,8 @@ class SupervisorRunConfig:
     repo: Path | None = None
     publish_notes: bool = True
     bus: BusClient | None = None
+    bus_url: str = DEFAULT_BUS_URL
+    decision_client: Any | None = None
 
     @property
     def resolved_checkpoint_path(self) -> str:
@@ -639,6 +786,8 @@ def build_supervisor(config: SupervisorRunConfig) -> tuple[Any, SupervisorDeps, 
         engine_url=config.engine_url,
         repo=config.repo,
         publish_notes=config.publish_notes,
+        bus_url=config.bus_url,
+        decision_client=config.decision_client,
     )
     return build_supervisor_graph(deps), deps, event
 
@@ -693,13 +842,15 @@ def run_supervisor(config: SupervisorRunConfig) -> dict[str, Any]:
 __all__ = [
     "AUDIT_ROLE",
     "CLASSIFY_NEEDS_HUMAN",
+    "CLASSIFY_PREAUTH_RELEASE",
     "CLASSIFY_RECOMMEND_REJECT",
     "SupervisorDeps",
     "SupervisorRunConfig",
     "SupervisorState",
     "build_supervisor",
     "build_supervisor_graph",
-    "preauth_release",
+    "evaluate_preauth_release",
+    "git_target_ref",
     "render_supervisor_note",
     "reproducible_failures",
     "run_supervisor",

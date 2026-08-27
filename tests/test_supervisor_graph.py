@@ -1,4 +1,4 @@
-"""The supervisor graph: seven nodes, two classifications, no verdicts.
+"""The supervisor graph: seven nodes, three classifications, one narrow door.
 
 The load-bearing cases:
 
@@ -6,7 +6,10 @@ The load-bearing cases:
   writes nothing into the supervised line's directory;
 - `classify` is gated on mechanical predicates -- an llm shouting "reject"
   without a reproducible failure lands in needs_human;
-- `preauth_release` raises NotImplementedError (the R4-3 stub is a stub);
+- `preauth_release` (R4-3) fires only on the full three-factor predicate over
+  a human-issued preauth, publishes exactly one merge_only APPROVE through the
+  decision publisher, and degrades to needs_human -- never to a release -- on
+  any missing factor or refused publish;
 - a finished event is idempotent, and a killed run re-adopts its in-flight
   audit instead of dispatching a second one (the R0/R4 contract).
 """
@@ -27,14 +30,16 @@ import pytest
 from fleet_graph.graphs.adapters import CoordinatorFault
 from fleet_graph.graphs.supervisor import (
     CLASSIFY_NEEDS_HUMAN,
+    CLASSIFY_PREAUTH_RELEASE,
     CLASSIFY_RECOMMEND_REJECT,
     SupervisorRunConfig,
-    preauth_release,
+    git_target_ref,
     render_supervisor_note,
     reproducible_failures,
     run_supervisor,
     validate_audit_verdict,
 )
+from fleet_graph.supervise.audit import Assertion, AuditReport
 from fleet_graph.supervise.events import (
     SupervisorEventError,
     line_fault_event,
@@ -143,10 +148,25 @@ class TestEventVocabulary:
             validate_event({"type": "line_fault", "key": "e3/../../etc", "payload": {}})
 
 
-class TestPreauthStub:
-    def test_preauth_release_is_not_implemented_in_r4_2(self) -> None:
-        with pytest.raises(NotImplementedError, match="R4-3"):
-            preauth_release({}, {}, {})
+class TestGitTargetRef:
+    def _report(self, **overrides: Any) -> dict[str, Any]:
+        report = {
+            "kind": "development",
+            "target": "dev-abc",
+            "assertions": [{"name": "identity_binding", "ok": True}],
+        }
+        report.update(overrides)
+        return report
+
+    def test_git_anchored_development_yields_the_constructive_ref(self) -> None:
+        assert git_target_ref(self._report()) == "refs/heads/dd/dev-abc"
+
+    def test_non_development_report_yields_nothing(self) -> None:
+        assert git_target_ref(self._report(kind="goal_line")) == ""
+
+    def test_broken_identity_binding_yields_nothing(self) -> None:
+        report = self._report(assertions=[{"name": "identity_binding", "ok": False}])
+        assert git_target_ref(report) == ""
 
 
 class TestClassify:
@@ -395,6 +415,221 @@ class TestActPublishing:
         act = result["act_result"]
         assert act["published"] is False
         assert "DERIVATION_ERROR" in act["degraded"]
+        assert Path(result["receipt_path"]).exists()
+
+
+def board_with_gate(preauth_payload: dict[str, Any] | None = None) -> FakeBus:
+    """A board holding one open gate question on card-7, optionally preauthed."""
+    bus = FakeBus()
+    bus.notes = [
+        {
+            "message_id": "msg-q-1",
+            "channel_seq": 1,
+            "kind": "work.note.v1",
+            "payload": {"note_type": "question", "card_entity_id": "card-7", "note": "放行 merge?"},
+        },
+        {
+            "message_id": "msg-card-1",
+            "channel_seq": 2,
+            "kind": "work.card.v1",
+            "entity_id": "card-7",
+            "payload": {"development_id": "dev-abc"},
+        },
+    ]
+    if preauth_payload is not None:
+        bus.notes.append(
+            {
+                "message_id": "msg-preauth-1",
+                "channel_seq": 3,
+                "kind": "work.decision.v1",
+                "payload": preauth_payload,
+            }
+        )
+    return bus
+
+
+def valid_preauth_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "kind": "preauth",
+        "card_entity_id": "card-7",
+        "allowed_actions": ["approve"],
+        "target_ref_allowlist": ["refs/heads/dd/"],
+        "expires_at": "2099-01-01T00:00:00Z",
+        "decided_by": "张三（人签发）",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def green_dev_report() -> AuditReport:
+    report = AuditReport(target="dev-abc", kind="development")
+    for name in (
+        "evidence_present",
+        "verified_bit",
+        "receipt_chain_linked",
+        "identity_binding",
+        "target_base_recomputed",
+        "acceptance_rerun",
+    ):
+        report.record(Assertion(name=name, ok=True, command="fake", exit_code=0, detail="green"))
+    report.acceptance_results.append(
+        {"command": ["true"], "exit_code": 0, "stdout_tail": "", "stderr_tail": ""}
+    )
+    return report
+
+
+GATE_EVENT = {
+    "type": "board_question",
+    "key": "e1-msg-q-1",
+    "payload": {"question_note_id": "msg-q-1", "card_entity_id": "card-7"},
+}
+
+
+class TestPreauthReleaseEndToEnd:
+    """R4-3 DoD: three factors green -> exactly one merge_only APPROVE through
+    the publisher; anything less -> needs_human, and the decision client is
+    never touched."""
+
+    def _run(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        bus: FakeBus,
+        decision_client: Any,
+        report: AuditReport | None = None,
+    ) -> dict[str, Any]:
+        monkeypatch.setenv("FAKE_AUDIT_BEHAVIOR", "hold")
+        monkeypatch.setattr(
+            "fleet_graph.graphs.supervisor.audit_development",
+            lambda development_id, *, engine, repo: report or green_dev_report(),
+        )
+        config = config_for(
+            tmp_path,
+            dict(GATE_EVENT),
+            publish_notes=True,
+            bus=bus,
+            repo=tmp_path,
+            decision_client=decision_client,
+        )
+        return run_supervisor(config)
+
+    def test_three_green_factors_release_one_merge_only_approve(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bus = board_with_gate(valid_preauth_payload())
+        decision_client = FakeBus()
+        result = self._run(tmp_path, monkeypatch, bus=bus, decision_client=decision_client)
+
+        assert result["classification"] == CLASSIFY_PREAUTH_RELEASE
+        act = result["act_result"]
+        assert act["decision_published"] is True
+
+        [decision] = decision_client.published
+        assert decision["kind"] == "work.decision.v1"
+        assert decision["payload"]["decision"] == "APPROVE"
+        assert decision["payload"]["scope"] == "merge_only"
+        assert decision["payload"]["target_ref"] == "refs/heads/dd/dev-abc"
+        assert "依预授权 msg-preauth-1 代行" in decision["payload"]["decided_by"]
+        assert {"target_entity": "msg-q-1"} in decision["refs"]
+        assert {"target_entity": "msg-preauth-1"} in decision["refs"]
+
+        # 板 client 只发 evidence note，决策只经独立 client（凭证分离的图侧）。
+        assert all(r["kind"] != "work.decision.v1" for r in bus.published)
+        assert any(r["payload"].get("note_type") == "evidence" for r in bus.published)
+
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["preauth_evaluation"]["granted"] is True
+        assert receipt["preauth_evaluation"]["preauth_message_id"] == "msg-preauth-1"
+
+    def test_no_preauth_on_board_stays_needs_human(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bus = board_with_gate(None)
+        decision_client = FakeBus()
+        result = self._run(tmp_path, monkeypatch, bus=bus, decision_client=decision_client)
+        assert result["classification"] == CLASSIFY_NEEDS_HUMAN
+        assert decision_client.published == []
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert any("preauth" in r for r in receipt["preauth_evaluation"]["reasons"])
+
+    def test_llm_approve_without_preauth_is_not_a_release(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An llm that says "approve" moves nothing: the predicate never reads it."""
+        bus = board_with_gate(None)
+        decision_client = FakeBus()
+        monkeypatch.setenv("FAKE_AUDIT_BEHAVIOR", "approve")
+        monkeypatch.setattr(
+            "fleet_graph.graphs.supervisor.audit_development",
+            lambda development_id, *, engine, repo: green_dev_report(),
+        )
+        config = config_for(
+            tmp_path,
+            dict(GATE_EVENT),
+            publish_notes=True,
+            bus=bus,
+            repo=tmp_path,
+            decision_client=decision_client,
+        )
+        result = run_supervisor(config)
+        assert result["classification"] == CLASSIFY_NEEDS_HUMAN
+        assert decision_client.published == []
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["audit_verdict"]["verdict"]["recommendation"] == "approve"
+
+    def test_expired_preauth_stays_needs_human(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bus = board_with_gate(valid_preauth_payload(expires_at="2020-01-01T00:00:00Z"))
+        decision_client = FakeBus()
+        result = self._run(tmp_path, monkeypatch, bus=bus, decision_client=decision_client)
+        assert result["classification"] == CLASSIFY_NEEDS_HUMAN
+        assert decision_client.published == []
+
+    def test_ref_outside_allowlist_stays_needs_human(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bus = board_with_gate(valid_preauth_payload(target_ref_allowlist=["refs/heads/other/"]))
+        decision_client = FakeBus()
+        result = self._run(tmp_path, monkeypatch, bus=bus, decision_client=decision_client)
+        assert result["classification"] == CLASSIFY_NEEDS_HUMAN
+        assert decision_client.published == []
+
+    def test_red_report_never_releases_even_with_valid_preauth(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        report = green_dev_report()
+        report.record(
+            Assertion(
+                name="target_base_is_ancestor",
+                ok=False,
+                command="git merge-base --is-ancestor",
+                exit_code=1,
+                detail="not an ancestor",
+            )
+        )
+        bus = board_with_gate(valid_preauth_payload())
+        decision_client = FakeBus()
+        result = self._run(
+            tmp_path, monkeypatch, bus=bus, decision_client=decision_client, report=report
+        )
+        assert result["classification"] == CLASSIFY_NEEDS_HUMAN
+        assert decision_client.published == []
+
+    def test_refused_decision_publish_degrades_and_keeps_the_gate_waiting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bus = board_with_gate(valid_preauth_payload())
+        decision_client = FakeBus()
+        decision_client.refuse_publish = RuntimeError("HTTP 503: bus down")
+        result = self._run(tmp_path, monkeypatch, bus=bus, decision_client=decision_client)
+        act = result["act_result"]
+        assert act["decision_published"] is False
+        assert "503" in act["decision_degraded"]
+        # 板上没出现 decision，question 仍开着——失败模式是 needs_human，
+        # 不是静默放行。
+        assert all(r["kind"] != "work.decision.v1" for r in bus.published)
         assert Path(result["receipt_path"]).exists()
 
 

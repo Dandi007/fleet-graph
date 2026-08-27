@@ -46,6 +46,21 @@ from typing import Any, Literal
 # breaks re-adopt for runs in flight at the moment of the change.
 RUN_ID_NAMESPACE = uuid.UUID("6f6c3c8e-2b6a-5f21-9c47-1f0f5a4d8e10")
 
+# 决策凭证隔离（R4-3 第四道闸的凭证分离半边）：FLEET_GRAPH_DECISION_* 一律
+# 不进任何 agent 子进程 env。decision token 只属于 supervisor act script
+# 节点进程（supervise/decision_publisher.py 读 FLEET_GRAPH_DECISION_TOKEN_FILE，
+# 测试钉死该名字落在这个前缀下）；一个能拿到决策凭证的 llm 子进程就是一个
+# 能自批的 llm。按前缀剥而不是按单个名字剥：新加一个决策相关 env 不需要
+# 记得回来改这里。
+DECISION_ENV_PREFIX = "FLEET_GRAPH_DECISION_"
+
+
+def scrubbed_environment(env: dict[str, str] | None = None) -> dict[str, str]:
+    """agent 子进程实际继承的 env：宿主 env 减去决策凭证命名空间。"""
+    source = os.environ if env is None else env
+    return {k: v for k, v in source.items() if not k.startswith(DECISION_ENV_PREFIX)}
+
+
 # `-current` is a symlink the deploy flow points at an immutable release
 # snapshot; the bare checkout is a working tree someone edits. The old
 # babysitter overrode the pump's default to exactly this path for every line,
@@ -313,6 +328,7 @@ class AgentRunLauncher:
                 # KillMode=process property, moved into the launcher.
                 start_new_session=True,
                 cwd=spec.cwd or None,
+                env=scrubbed_environment(),
             )
         pidfile.write_text(str(proc.pid))
         return RunTicket(run_id, str(session_root), proc.pid, adopted=False)

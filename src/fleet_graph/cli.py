@@ -443,6 +443,9 @@ def _supervisor_run(args: argparse.Namespace) -> int:
         repo=pathlib.Path(args.repo).resolve() if args.repo else None,
         publish_notes=not args.no_note,
         bus=bus,
+        # R4-3: the decision publisher builds its own client against this URL,
+        # with its own credential -- the board client above is never reused.
+        bus_url=args.bus_url,
     )
     result = run_supervisor(config)
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
