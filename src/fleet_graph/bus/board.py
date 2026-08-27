@@ -23,6 +23,12 @@ WORK_NOTES = "board:work-notes"
 CARD_KIND = "work.card.v1"
 NOTE_KIND = "work.note.v1"
 DECISION_KIND = "work.decision.v1"
+DECISION_KIND_V2 = "work.decision.v2"
+#: 读径兼收的全部 decision 消息 kind。v1 是人工问答裁决的老形状（bus 端
+#: schema 5 字段、additionalProperties:false，发不出 preauth/gate_release
+#: 载荷）；v2 是监督面注册的 oneOf 两变体（preauth / gate_release）。识别
+#: 「这是不是一条裁决」的读径一律用本元组，不点名单个版本。
+DECISION_KINDS = (DECISION_KIND, DECISION_KIND_V2)
 
 NoteType = str  # "progress" | "evidence" | "finding" | "question"
 
@@ -179,7 +185,7 @@ class Board:
         decisions = [
             m
             for m in messages
-            if m["message_id"] in candidate_ids and m.get("kind") == DECISION_KIND
+            if m["message_id"] in candidate_ids and m.get("kind") in DECISION_KINDS
         ]
         if not decisions:
             return None
