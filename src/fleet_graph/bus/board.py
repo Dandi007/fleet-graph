@@ -77,6 +77,10 @@ class Board:
 
     # --- cards -----------------------------------------------------------
 
+    def create(self, payload: dict[str, Any], idempotency_key: str) -> PublishResult:
+        """Create a durable work identity."""
+        return self.publish_card(payload, idempotency_key)
+
     def publish_card(self, payload: dict[str, Any], idempotency_key: str) -> PublishResult:
         return self.client.publish(self.index_channel, CARD_KIND, payload, idempotency_key)
 
@@ -113,6 +117,37 @@ class Board:
             return None
         return max(revisions, key=lambda m: m["channel_seq"])
 
+    def get(self, entity_id: str) -> dict[str, Any] | None:
+        """Return the current durable revision for a work identity."""
+        return self.card_head(entity_id)
+
+    def list(self) -> list[dict[str, Any]]:
+        """Return one current revision per work identity, in channel order."""
+        messages, _ = self.client.messages(self.index_channel, limit=1000)
+        heads: dict[str, dict[str, Any]] = {}
+        for message in messages:
+            entity_id = message.get("entity_id")
+            if message.get("kind") != CARD_KIND or not isinstance(entity_id, str):
+                continue
+            previous = heads.get(entity_id)
+            if previous is None or message["channel_seq"] > previous["channel_seq"]:
+                heads[entity_id] = message
+        return sorted(heads.values(), key=lambda message: message["channel_seq"])
+
+    def start(self, *, entity_id: str, supersedes: str, idempotency_key: str) -> PublishResult:
+        """Advance a card to started through the bus's revision CAS."""
+        head = self.card_head(entity_id)
+        if head is None or head["message_id"] != supersedes:
+            raise BusConflict(409, f"{entity_id} is not headed by {supersedes}")
+        payload = dict(head.get("payload", {}))
+        payload["status"] = "started"
+        return self.revise_card(
+            entity_id=entity_id,
+            supersedes=supersedes,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+
     # --- notes -----------------------------------------------------------
 
     def note(
@@ -145,6 +180,19 @@ class Board:
             text=text,
             note_type="progress",
             idempotency_key=idempotency_key,
+        )
+
+    def events(self, card_entity_id: str) -> list[dict[str, Any]]:
+        """Return immutable notes for one card, ordered as the bus observed them."""
+        messages, _ = self.client.messages(self.notes_channel, limit=1000)
+        return sorted(
+            [
+                message
+                for message in messages
+                if message.get("kind") == NOTE_KIND
+                and message.get("payload", {}).get("card_entity_id") == card_entity_id
+            ],
+            key=lambda message: message["channel_seq"],
         )
 
     # --- human gate ------------------------------------------------------
