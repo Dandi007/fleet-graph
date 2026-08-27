@@ -25,11 +25,12 @@ from fleet_graph.executors.agent_run import (
     find_result,
 )
 
+from fleet_graph.executors.agent_session import AgentSessionSeat, SeatHandle
+from fleet_graph.state.run_artifacts import write_json_durable
+
 #: Upper bound on derived coordinator attempts per round. Failures normally
 #: fault the line well before this; the bound only stops a pathological spin.
 MAX_COORDINATOR_ATTEMPTS = 8
-from fleet_graph.executors.agent_session import AgentSessionSeat, SeatHandle
-from fleet_graph.state.run_artifacts import write_json_durable
 
 DISPATCHER = "fleet-graph"
 
