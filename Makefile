@@ -4,8 +4,8 @@ help:
 	@echo "sync    - install deps into .venv (uv)"
 	@echo "lint    - ruff check + format check"
 	@echo "fmt     - ruff format + autofix"
-	@echo "test    - pytest"
-	@echo "verify  - lint + test (the gate CI runs)"
+	@echo "test    - pytest in an isolated user-systemd session"
+	@echo "verify  - lint + test in an isolated user-systemd session"
 
 sync:
 	uv sync --frozen || uv sync
@@ -19,7 +19,7 @@ fmt:
 	uv run ruff format .
 
 test:
-	uv run pytest
+	bash deploy/verify-user-systemd.sh uv run pytest
 
 verify: lint test
 
