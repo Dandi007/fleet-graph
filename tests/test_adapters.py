@@ -24,6 +24,13 @@ class FakeLauncher:
         self.specs: list[AgentRunSpec] = []
         self.run_ids: list[str] = []
 
+    def session_root_for(self, run_id: str):
+        # #95 的 attempt 循环会先看派生 id 的 session root 有没有 failed
+        # result；fake 没有磁盘状态，给一个必然为空的路径即可（attempt=1 直用）。
+        from pathlib import Path
+
+        return Path("/nonexistent-fake-session-roots") / run_id
+
     def launch(self, spec: AgentRunSpec, run_id: str) -> RunTicket:
         self.specs.append(spec)
         self.run_ids.append(run_id)
