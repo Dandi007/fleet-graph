@@ -24,7 +24,7 @@ from fleet_graph.scheduler.supervisor_events import (
     SupervisorObserver,
     observer_environment,
 )
-from fleet_graph.supervise.events import line_fault_event
+from fleet_graph.supervise.events import line_fault_event, validate_event
 
 
 class RecordingLauncher:
@@ -245,6 +245,40 @@ class TestBudgets:
             (tmp_path / "runs" / ".scheduler" / "supervisor-cursor.json").read_text()
         )
         assert state["attempts"] == {}
+
+    def test_each_launch_is_a_new_attempt_and_a_new_thread(self, tmp_path: Path) -> None:
+        """Generation semantics: the launch's attempt number rides in the event
+        JSON and therefore in the thread identity -- re-runs never share a
+        checkpoint thread with the launch they replace."""
+        observer, launcher = observer_for(tmp_path)
+        folders = {"wf-a": terminal("fault", "run-1")}
+        for _ in range(3):
+            tick(observer, folders)
+        events = launcher.events()
+        assert [e["attempt"] for e in events] == [1, 2, 3]
+        threads = [validate_event(e).thread_id for e in events]
+        assert threads == [
+            "supervisor:e3-run-1:a1",
+            "supervisor:e3-run-1:a2",
+            "supervisor:e3-run-1:a3",
+        ]
+        assert len(set(threads)) == 3
+
+    def test_cursor_edits_on_disk_are_honored_next_tick(self, tmp_path: Path) -> None:
+        """The observer reloads the cursor file at the start of every tick, so
+        `supervisor reset` needs no daemon restart. Pinned here: an external
+        edit (clearing attempts) between ticks re-arms the same observer."""
+        observer, launcher = observer_for(tmp_path, max_attempts=1)
+        folders = {"wf-a": terminal("fault", "run-1")}
+        tick(observer, folders)
+        actions = tick(observer, folders)
+        assert any("attempts_exhausted" in a.get("action", "") for a in actions)
+        cursor = tmp_path / "runs" / ".scheduler" / "supervisor-cursor.json"
+        state = json.loads(cursor.read_text())
+        state["attempts"] = {}
+        cursor.write_text(json.dumps(state))
+        tick(observer, folders)  # same object, no restart
+        assert len(launcher.events()) == 2
 
     def test_receipt_ends_the_event_for_good(self, tmp_path: Path) -> None:
         observer, launcher = observer_for(tmp_path)

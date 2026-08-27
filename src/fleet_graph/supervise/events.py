@@ -54,21 +54,36 @@ class SupervisorEvent:
     """One fact worth an audit, plus the identity that makes retries idempotent.
 
     `key` is the dedup key from r4-design §1's table, prefixed with the event
-    number so the four keyspaces cannot collide. `thread_id` derives from it,
-    which is what makes a kill-restart of the same event re-adopt its in-flight
-    audit run instead of dispatching a second one.
+    number so the four keyspaces cannot collide. `thread_id` derives from it
+    *and* from `attempt` -- the generation semantics the ronin lines already
+    have (`{folder_id}:g{n}`), ported here after a production night of sqlite
+    surgery: a re-run is a new attempt with a fresh checkpoint thread, never
+    a knife fight with the old thread's rows. Within one attempt the identity
+    is stable, so a kill-restart of the same launch still re-adopts its
+    in-flight audit run instead of dispatching a second one.
+
+    `attempt` is the observer's per-key lifetime launch counter (the cursor's
+    `attempts` value at launch time), starting at 1. Old-format threads
+    (`supervisor:{key}`, no suffix) are simply abandoned in the shared
+    checkpoint db -- new launches never resolve to them, so no migration.
     """
 
     type: str
     key: str
     payload: dict[str, Any] = field(default_factory=dict)
+    attempt: int = 1
 
     @property
     def thread_id(self) -> str:
-        return f"supervisor:{self.key}"
+        return f"supervisor:{self.key}:a{self.attempt}"
 
     def as_dict(self) -> dict[str, Any]:
-        return {"type": self.type, "key": self.key, "payload": dict(self.payload)}
+        return {
+            "type": self.type,
+            "key": self.key,
+            "payload": dict(self.payload),
+            "attempt": self.attempt,
+        }
 
 
 def validate_event(raw: dict[str, Any]) -> SupervisorEvent:
@@ -91,7 +106,12 @@ def validate_event(raw: dict[str, Any]) -> SupervisorEvent:
     payload = raw.get("payload") or {}
     if not isinstance(payload, dict):
         raise SupervisorEventError("event.payload must be an object")
-    return SupervisorEvent(type=str(kind), key=key, payload=payload)
+    attempt = raw.get("attempt", 1)
+    # bool is an int subclass; refuse it explicitly rather than minting a
+    # thread called ...:aTrue.
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise SupervisorEventError(f"event.attempt must be an integer >= 1, got {attempt!r}")
+    return SupervisorEvent(type=str(kind), key=key, payload=payload, attempt=attempt)
 
 
 # --- constructors -----------------------------------------------------------

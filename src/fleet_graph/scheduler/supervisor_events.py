@@ -37,7 +37,7 @@ import json
 import shlex
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -362,7 +362,12 @@ class SupervisorObserver:
         if attempts >= self.config.max_attempts_per_key:
             return {**base, "action": f"skipped:attempts_exhausted:{attempts}"}
 
-        spec = self._spec_for(event)
+        # The attempt number rides into the event and therefore into the
+        # thread identity (`supervisor:{key}:a{n}`) -- each observer launch is
+        # a fresh generation with its own checkpoint thread, so a re-run never
+        # needs surgery on the shared sqlite. The unit name stays keyed on the
+        # event alone: two attempts cannot run concurrently.
+        spec = self._spec_for(replace(event, attempt=attempts + 1))
         if self.units is not None:
             try:
                 if self.units.is_active(spec.unit_name):

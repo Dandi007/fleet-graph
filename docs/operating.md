@@ -205,9 +205,14 @@ journalctl --user -u fleet-graphd -f          # 每 60s 一批，每条线一行
 | E3 `line_fault` | terminal `fault` 或 `pump_fault: true` | `e3-<run_id>` |
 | E4 `cap_breaker` | `TickResult.refusal == total_cap_reached` | `e4-cap-<时间桶>` |
 
-thread_id = `supervisor:{key}`，checkpoint 在
-`/data/fleet-graph/supervisor/checkpoint.sqlite3`：同一事件 kill-restart 后
-**re-adopt 在飞审计 run**，不重派、不重付费（测试钉死）。E2 与 R0c 停牌**共存**：
+thread_id = `supervisor:{key}:a{attempt}`（attempt = 观察器 cursor 里该键的
+终身 launch 计数，从 1 起），checkpoint 在
+`/data/fleet-graph/supervisor/checkpoint.sqlite3`。世代语义与 ronin 线的
+`{folder_id}:g{n}` 同款：**每次 launch 是新 attempt、新 thread，checkpoint
+天然隔离**——重跑一个事件不再需要对共享 sqlite 做外科手术；同一 attempt 内
+kill-restart 照旧**精确 re-adopt 在飞审计 run**，不重派、不重付费（测试钉死）。
+旧格式 thread（无 `:aN` 后缀）留在库里成为惰性行，无需迁移。receipt 路径
+照旧按 `event.key`（一事件一 receipt，重跑覆盖写）。E2 与 R0c 停牌**共存**：
 停牌照旧省钱，观察器只负责把事实递给审计。
 
 ### 预算与游标
