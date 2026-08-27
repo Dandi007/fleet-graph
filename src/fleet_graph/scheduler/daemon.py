@@ -71,6 +71,7 @@ from fleet_graph.scheduler.ignition import (
     decide,
 )
 from fleet_graph.scheduler.launcher import LaunchResult, LaunchSpec, TransientLauncher
+from fleet_graph.scheduler.metrics import LineLiveness, TextfileMetrics
 from fleet_graph.scheduler.probe import (
     GatewayProber,
     MissingProbeCredential,
@@ -79,6 +80,7 @@ from fleet_graph.scheduler.probe import (
 
 DEFAULT_MAINTENANCE_STOP = Path("/data/fleet-graph/maintenance-stop")
 DEFAULT_INTERVAL_SECONDS = 60.0
+DEFAULT_METRICS_PATH = Path("/data/fleet-graph/metrics/fleet-graph.prom")
 
 
 @dataclass(frozen=True)
@@ -90,10 +92,8 @@ class LineSpec:
     max_rounds: int = 10
     alias: str | None = None
     generation: int = 1
-    #: Off unless the config says otherwise. A line that appears here without
-    #: being switched on is a line someone staged and has not released; the
-    #: tick logs it as `line_disabled` every interval, so it is visible rather
-    #: than silent.
+    #: Off unless the config says otherwise. Disabled lines are outside both
+    #: the scheduler and monitoring populations.
     enabled: bool = False
 
 
@@ -142,6 +142,7 @@ class SchedulerConfig:
     lines: list[LineSpec] = field(default_factory=list)
     run_root: Path = Path("/data/fleet-graph/runs")
     maintenance_stop_path: Path = DEFAULT_MAINTENANCE_STOP
+    metrics_path: Path = DEFAULT_METRICS_PATH
     interval_seconds: float = DEFAULT_INTERVAL_SECONDS
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS
     total_cap: int = DEFAULT_TOTAL_CAP
@@ -166,6 +167,7 @@ class SchedulerConfig:
             lines=[LineSpec(**entry) for entry in raw.get("lines", [])],
             run_root=Path(raw.get("run_root", "/data/fleet-graph/runs")),
             maintenance_stop_path=Path(raw.get("maintenance_stop", str(DEFAULT_MAINTENANCE_STOP))),
+            metrics_path=Path(raw.get("metrics_path", str(DEFAULT_METRICS_PATH))),
             interval_seconds=float(raw.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)),
             cooldown_seconds=float(raw.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS)),
             total_cap=int(raw.get("total_cap", DEFAULT_TOTAL_CAP)),
@@ -188,6 +190,7 @@ class Scheduler:
         units: UnitProbe | None = None,
         clock: Any = None,
         observe: Any = None,
+        metrics: TextfileMetrics | None = None,
         sleep: Any = None,
     ) -> None:
         self.config = config
@@ -196,6 +199,7 @@ class Scheduler:
         self.units = units or SystemdUnitProbe()
         self.clock = clock or time.time
         self.observe = observe
+        self.metrics = metrics or TextfileMetrics(config.metrics_path)
         self.sleep = sleep or time.sleep
         self.total_started = 0
         #: Timestamps of launches that followed a run which advanced no round.
@@ -446,14 +450,19 @@ class Scheduler:
         now = self.clock()
         stopped = self.maintenance_stop()
         results: list[TickResult] = []
+        liveness: list[LineLiveness] = []
         launched_this_tick = 0
 
         # The enabled roster is the monitoring population. Lines removed from
         # it (or staged with enabled=false) produce no observation at all.
         for line in (line for line in self.config.lines if line.enabled):
             streak = self.account_last_run(line.folder_id)
+            status = self.status_of(line)
+            liveness.append(
+                LineLiveness(line.folder_id, self.spec_for(line).unit_name, status.running)
+            )
             decision = decide(
-                self.status_of(line),
+                status,
                 now=now,
                 enabled=line.enabled,
                 maintenance_stop=stopped,
@@ -498,6 +507,7 @@ class Scheduler:
             results.append(result)
             if self.observe is not None:
                 self.observe(result)
+        self.metrics.write(liveness)
         return results
 
     def run_forever(self, *, sleep: Any = time.sleep, ticks: int | None = None) -> None:
@@ -519,6 +529,7 @@ def lines_from(entries: Iterable[dict[str, Any]]) -> list[LineSpec]:
 __all__ = [
     "DEFAULT_INTERVAL_SECONDS",
     "DEFAULT_MAINTENANCE_STOP",
+    "DEFAULT_METRICS_PATH",
     "LineSpec",
     "Scheduler",
     "SchedulerConfig",

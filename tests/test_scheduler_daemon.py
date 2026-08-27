@@ -65,6 +65,7 @@ def make(
     slept: list[float] | None = None,
     **config: Any,
 ) -> Scheduler:
+    config.setdefault("metrics_path", tmp_path / "metrics" / "fleet-graph.prom")
     return Scheduler(
         SchedulerConfig(
             lines=lines or [LineSpec(folder_id="wf-1", seat="opencode-dsv4pro", enabled=True)],
@@ -636,6 +637,44 @@ class TestTheRosterReachesTheDecision:
             units=units,
         ).tick()
         assert units.asked == []
+
+    def test_metrics_only_contain_enabled_lines_and_their_unit_liveness(
+        self, tmp_path: Path
+    ) -> None:
+        metrics_path = tmp_path / "metrics" / "fleet-graph.prom"
+        running = "fleet-graph-line-wf-on-g1"
+        scheduler = make(
+            tmp_path,
+            lines=[
+                LineSpec(folder_id="wf-on", seat="s", enabled=True),
+                LineSpec(folder_id="wf-off", seat="s", enabled=False),
+            ],
+            units=FakeUnits({running}),
+            metrics_path=metrics_path,
+        )
+        scheduler.tick()
+        metrics = metrics_path.read_text(encoding="utf-8")
+        assert 'folder_id="wf-on",unit="fleet-graph-line-wf-on-g1"} 1' in metrics
+        assert "wf-off" not in metrics
+
+    def test_metrics_report_a_stopped_enabled_unit(self, tmp_path: Path) -> None:
+        metrics_path = tmp_path / "metrics" / "fleet-graph.prom"
+        make(tmp_path, metrics_path=metrics_path).tick()
+        assert 'folder_id="wf-1",unit="fleet-graph-line-wf-1-g1"} 0' in metrics_path.read_text(
+            encoding="utf-8"
+        )
+
+    def test_metrics_replace_removed_roster_labels_within_one_tick(self, tmp_path: Path) -> None:
+        metrics_path = tmp_path / "metrics" / "fleet-graph.prom"
+        scheduler = make(
+            tmp_path,
+            lines=[LineSpec(folder_id="wf-on", seat="s", enabled=True)],
+            metrics_path=metrics_path,
+        )
+        scheduler.tick()
+        scheduler.config.lines = []
+        scheduler.tick()
+        assert "wf-on" not in metrics_path.read_text(encoding="utf-8")
 
     def test_a_disabled_line_does_not_burn_the_global_cap(self, tmp_path: Path) -> None:
         """Otherwise holding eight lines back for a week would trip the

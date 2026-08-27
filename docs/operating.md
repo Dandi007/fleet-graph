@@ -15,7 +15,7 @@
 - **改法**：改配置 → PR → 合入 → `deploy/release.sh` → `systemctl --user restart fleet-graphd`
 - **生效**：分钟级（要走发布）
 - **用途**：P7 分批放量；长期决定舰队编成
-- 名册外的线每个 tick 打一行 `line_disabled`——**可见地不跑**，不是静默地不跑
+- 名册外的线不产生调度日志或监控序列；`enabled` 是唯一的监控名册。
 
 放量下一批要同时改 `tests/test_ronin_lines_config.py::test_exactly_the_canary_is_switched_on`，
 否则测试会拦下来。这是故意的：批次是断言，不是某人的记忆。
@@ -89,5 +89,8 @@ systemctl --user status fleet-graphd
 journalctl --user -u fleet-graphd -f          # 每 60s 一批，每条线一行 JSON
 ```
 
-每行形如 `{"folder_id": ..., "ignited": false, "refusal": "line_disabled", ...}`。
-`refusal` 就是上面六道闸加名册的名字，一一对应。
+每条启用线每个 tick 一行 JSON。另会原子替换
+`/data/fleet-graph/metrics/fleet-graph.prom` 的 Prometheus textfile scrape：
+`fleet_graph_line_unit_active{folder_id="...",unit="fleet-graph-line-...-g1"}` 为
+`1` 表示对应 systemd unit 正常运行，`0` 表示已停止。每次替换都从当前启用名册重建，
+所以关闭或删除一条线会在下一个 scrape 内移除它的 label。
