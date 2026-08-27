@@ -7,7 +7,10 @@ by prose. Two live sources, each a single cheap read:
   the blocked terminal was written. Anything earlier was already drained by the
   run that blocked. This reads channel messages (a plain GET) -- deliberately
   not `consume`, which takes a lease and would hide messages from the line the
-  wake exists to restart.
+  wake exists to restart. The channel is private and owner-only readable, so
+  the probe authenticates with the line's own mirrored token
+  (LINE_TOKEN_PATH_TEMPLATE), falling back to the service token only when
+  that file is absent.
 - **goal.md revision**: the work folder's `fs_stat` content_revision differs
   from the one snapshotted at parking time. The revision is a hash the MCP
   computes; nothing here reads the goal text.
@@ -25,11 +28,27 @@ guess: the fail-open policy lives in one place, the scheduler.
 from __future__ import annotations
 
 import calendar
+import os
+import re
 import time
+from pathlib import Path
 from typing import Any, Protocol
 
 #: Wake probes ride the 60s tick loop; a hung endpoint must cost seconds.
 WAKE_TIMEOUT_SECONDS = 5.0
+
+#: Where a line's own bus credential lives ("{alias}" is substituted). The
+#: `agent:{alias}` channel is private, owner-only readable, and the owner is
+#: the line's pump agent -- so the inbox probe must present the *line's*
+#: token, not the fleet-graph service token (which gets a structural 403).
+#: These files mirror the pump tokens (persona §5c). Overridable via the
+#: FLEET_GRAPH_LINE_TOKEN_PATH env var or the constructor.
+LINE_TOKEN_PATH_TEMPLATE = "/data/ronin/secrets/{alias}.token"
+LINE_TOKEN_PATH_ENV = "FLEET_GRAPH_LINE_TOKEN_PATH"
+
+#: An alias is a path component of the token file; anything outside this set
+#: never touches the filesystem (the probe falls back to the service token).
+_SAFE_ALIAS = re.compile(r"^[A-Za-z0-9._-]+$")
 
 #: How far below head_seq the inbox probe re-reads. Only *existence* of a
 #: newer-than-terminal message matters, and a parked line's channel gains
@@ -87,10 +106,19 @@ class LiveWakeSignals:
         timeout: float = WAKE_TIMEOUT_SECONDS,
         bus_client: Any = None,
         wf_caller: Any = None,
+        line_token_template: str | None = None,
+        line_bus_factory: Any = None,
     ) -> None:
         self.timeout = timeout
         self._bus: Any = bus_client
         self._wf_caller: Any = wf_caller
+        self.line_token_template = (
+            line_token_template or os.environ.get(LINE_TOKEN_PATH_ENV) or LINE_TOKEN_PATH_TEMPLATE
+        )
+        #: Test seam: token -> bus client. Production builds a BusClient.
+        self._line_bus_factory = line_bus_factory
+        #: alias -> (token, client); rebuilt if the token file's content moves.
+        self._line_bus: dict[str, tuple[str, Any]] = {}
 
     def _bus_client(self) -> Any:
         if self._bus is None:
@@ -99,8 +127,46 @@ class LiveWakeSignals:
             self._bus = BusClient(transport=HttpxTransport(timeout=self.timeout))
         return self._bus
 
+    def _line_token(self, alias: str) -> str | None:
+        """The line's own bus token, or None when the file is absent/unreadable.
+
+        The token stays in memory only -- never in argv, logs, or error text.
+        """
+        if not _SAFE_ALIAS.match(alias):
+            return None
+        try:
+            token = Path(self.line_token_template.format(alias=alias)).read_text().strip()
+        except OSError:
+            return None
+        return token or None
+
+    def _make_line_client(self, token: str) -> Any:
+        if self._line_bus_factory is not None:
+            return self._line_bus_factory(token)
+        from fleet_graph.bus.client import BusClient, HttpxTransport
+
+        return BusClient(token=token, transport=HttpxTransport(timeout=self.timeout))
+
+    def _inbox_client(self, alias: str) -> Any:
+        """Per-line credential first; the service token only as fallback.
+
+        The inbox belongs to the line: `agent:{alias}` is owner-only and the
+        owner is the line's pump, so its mirrored token is the *correct*
+        credential -- the channel ACL is deliberately not widened. A missing
+        or unreadable token file falls back to the service client, whose 403
+        then degrades this one source at establishment (#89 semantics).
+        """
+        token = self._line_token(alias)
+        if token is None:
+            return self._bus_client()
+        cached = self._line_bus.get(alias)
+        if cached is None or cached[0] != token:
+            cached = (token, self._make_line_client(token))
+            self._line_bus[alias] = cached
+        return cached[1]
+
     def inbox_message_after(self, alias: str, after_epoch: float) -> bool:
-        client = self._bus_client()
+        client = self._inbox_client(alias)
         channel = f"agent:{alias}"
         _, head_seq = client.messages(channel, limit=1)
         if head_seq <= 0:
@@ -124,6 +190,8 @@ class LiveWakeSignals:
 
 __all__ = [
     "INBOX_TAIL_WINDOW",
+    "LINE_TOKEN_PATH_ENV",
+    "LINE_TOKEN_PATH_TEMPLATE",
     "WAKE_TIMEOUT_SECONDS",
     "LiveWakeSignals",
     "WakeSignals",
