@@ -201,6 +201,11 @@ class SchedulerConfig:
     #: everything else on this host. Steady-state load is unchanged either
     #: way; this is only about the shape of the start.
     launch_stagger_seconds: float = 45.0
+    #: R3 step 2 canary switch: probe through `agent-run probe` (CliGatewayProber)
+    #: instead of the direct-HTTP GatewayProber. Default off; flipped per
+    #: instance by config PR during the canary window, removed with the old
+    #: prober in R3 step 3.
+    probe_via_runtime: bool = False
 
     @classmethod
     def from_json(cls, path: Path) -> SchedulerConfig:
@@ -216,6 +221,10 @@ class SchedulerConfig:
             # Was missing: the field existed with a default but the file was
             # never read, so setting it in config had no effect at all.
             launch_stagger_seconds=float(raw.get("launch_stagger_seconds", 45.0)),
+            # Read the file, not just the field: launch_stagger_seconds above
+            # once existed as a dataclass default the loader never read, and
+            # setting it in config silently did nothing.
+            probe_via_runtime=bool(raw.get("probe_via_runtime", False)),
             backoff_cap_seconds=float(raw.get("backoff_cap_seconds", DEFAULT_BACKOFF_CAP_SECONDS)),
             extra_line_environment=dict(raw.get("line_environment", {})),
         )

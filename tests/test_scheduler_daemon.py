@@ -536,6 +536,18 @@ class TestConfig:
     def test_lines_from_entries(self) -> None:
         assert lines_from([{"folder_id": "a", "seat": "b"}]) == [LineSpec("a", "b")]
 
+    def test_probe_via_runtime_defaults_off(self, tmp_path: Path) -> None:
+        path = tmp_path / "scheduler.json"
+        path.write_text(json.dumps({"lines": []}))
+        assert SchedulerConfig.from_json(path).probe_via_runtime is False
+
+    def test_probe_via_runtime_is_actually_read_from_the_file(self, tmp_path: Path) -> None:
+        """The launch_stagger lesson: a dataclass field the loader never reads
+        makes the config switch a no-op, and the canary flip flips nothing."""
+        path = tmp_path / "scheduler.json"
+        path.write_text(json.dumps({"lines": [], "probe_via_runtime": True}))
+        assert SchedulerConfig.from_json(path).probe_via_runtime is True
+
     def test_the_emergency_stop_is_a_path_fleet_graph_owns(self) -> None:
         """It used to be /data/ronin/maintenance-stop, inherited from the
         stack P4 retired. Keeping that path would have left the new scheduler
