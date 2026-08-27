@@ -1,4 +1,4 @@
-.PHONY: help sync lint fmt test verify clean
+.PHONY: help sync lint fmt test verify conformance clean
 
 help:
 	@echo "sync    - install deps into .venv (uv)"
@@ -21,7 +21,10 @@ fmt:
 test:
 	uv run pytest
 
-verify: lint test
+conformance:
+	uv run python scripts/check_supervisor_conformance.py
+
+verify: lint test conformance
 
 clean:
 	rm -rf .pytest_cache .ruff_cache dist build

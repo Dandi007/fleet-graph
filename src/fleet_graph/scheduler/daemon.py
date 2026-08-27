@@ -51,6 +51,7 @@ ignoring.
 from __future__ import annotations
 
 import calendar
+import contextlib
 import json
 import os
 import subprocess
@@ -219,6 +220,11 @@ class SchedulerConfig:
     #: instance by config PR during the canary window, removed with the old
     #: prober in R3 step 3.
     probe_via_runtime: bool = False
+    #: R4-2 rollout switch: run the supervisor event observer inside this
+    #: scheduler's tick (E1-E4 -> short-run `fleet-graph supervisor run`
+    #: units). Default off; enabling it is a reviewed config PR, exactly like
+    #: probe_via_runtime.
+    supervisor_events: bool = False
 
     @classmethod
     def from_json(cls, path: Path) -> SchedulerConfig:
@@ -244,6 +250,7 @@ class SchedulerConfig:
             # once existed as a dataclass default the loader never read, and
             # setting it in config silently did nothing.
             probe_via_runtime=bool(raw.get("probe_via_runtime", False)),
+            supervisor_events=bool(raw.get("supervisor_events", False)),
             backoff_cap_seconds=float(raw.get("backoff_cap_seconds", DEFAULT_BACKOFF_CAP_SECONDS)),
             extra_line_environment=dict(raw.get("line_environment", {})),
         )
@@ -262,6 +269,7 @@ class Scheduler:
         sleep: Any = None,
         wake: WakeSignals | None = None,
         board: Any = None,
+        supervisor: Any = None,
     ) -> None:
         self.config = config
         self.prober = prober
@@ -277,6 +285,10 @@ class Scheduler:
         #: bus.board.Board for the best-effort question note on parking.
         #: None means parking is log-visible only.
         self.board = board
+        #: The supervisor event observer (scheduler/supervisor_events.py),
+        #: parasitic on this tick. None means no supervision events -- the
+        #: fleet schedules exactly as before. Duck-typed on `after_tick`.
+        self.supervisor = supervisor
         self.total_started = 0
         #: Timestamps of launches that followed a run which advanced no round.
         #: The global cap counts these, not every launch -- see `decide`.
@@ -337,6 +349,10 @@ class Scheduler:
             # normalize_waiting_on), `at` a timestamp. Parking reads them.
             "waiting_on": record.get("waiting_on"),
             "at": record.get("at"),
+            # Also finalise's own bool, never agent prose. The supervisor
+            # observer's E3 scan reads it off this same record, so the fault
+            # event costs no extra file read.
+            "pump_fault": record.get("pump_fault"),
         }
 
     def blocker_summary(self, folder_id: str) -> str | None:
@@ -848,6 +864,17 @@ class Scheduler:
             results.append(result)
             if self.observe is not None:
                 self.observe(result)
+        if self.supervisor is not None:
+            # The observer rides this tick -- no second loop anywhere (D9).
+            # It reads the same terminal records this tick just read and the
+            # results above; whatever it does, scheduling must survive it.
+            with contextlib.suppress(Exception):
+                self.supervisor.after_tick(
+                    now=now,
+                    folder_ids=[line.folder_id for line in self.config.lines],
+                    terminal_reader=self.terminal_record,
+                    tick_results=results,
+                )
         return results
 
     def run_forever(self, *, sleep: Any = time.sleep, ticks: int | None = None) -> None:

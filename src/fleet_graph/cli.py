@@ -264,6 +264,28 @@ def _scheduler_run(args: argparse.Namespace) -> int:
         board=board,
     )
 
+    # R4-2: the supervisor event observer rides this scheduler's tick. Config
+    # gated (a reviewed rollout switch, like probe_via_runtime); a missing bus
+    # credential degrades E1 to nothing but leaves E2-E4 observing.
+    if config.supervisor_events:
+        from fleet_graph.scheduler.daemon import SystemdUnitProbe
+        from fleet_graph.scheduler.supervisor_events import ObserverConfig, SupervisorObserver
+
+        scheduler.supervisor = SupervisorObserver(
+            ObserverConfig(
+                run_root=config.run_root,
+                cap_window_seconds=config.cap_window_seconds,
+                # The same env lines get: PATH plus the reviewed extras
+                # (bus token file among them), so the short-run supervisor
+                # process can publish its evidence note.
+                environment=scheduler.line_environment(),
+            ),
+            launcher=TransientLauncher(dry_run=args.dry_run),
+            bus=board.client if board is not None else None,
+            units=SystemdUnitProbe(),
+            observe=lambda record: print(json.dumps(record, ensure_ascii=False), flush=True),
+        )
+
     if args.once:
         scheduler.tick()
         return 0
@@ -337,6 +359,51 @@ def _supervise_audit(args: argparse.Namespace) -> int:
         if report.evidence_note_id:
             print(f"evidence note 已落板: {report.evidence_note_id}")
     return 0 if report.ok else 1
+
+
+def _supervisor_run(args: argparse.Namespace) -> int:
+    """One supervisor turn: event in, audit report out. Publishes no decision."""
+    import pathlib
+
+    from fleet_graph.graphs.supervisor import SupervisorRunConfig, run_supervisor
+    from fleet_graph.supervise.events import SupervisorEventError, validate_event
+
+    try:
+        event = validate_event(json.loads(args.event_json))
+    except (ValueError, SupervisorEventError) as exc:
+        # A refusal, not a crash: unknown event names are rejected out loud,
+        # never mapped onto a neighbour.
+        raise SystemExit(f"--event-json is not a valid supervisor event: {exc}") from exc
+
+    bus = None
+    if not args.no_note:
+        try:
+            from fleet_graph.bus.client import BusClient
+
+            bus = BusClient(base_url=args.bus_url)
+        except Exception:
+            # No credential -> the act node records the degradation and the
+            # report still lands in the supervisor's own run root.
+            bus = None
+
+    config = SupervisorRunConfig(
+        event=event.as_dict(),
+        state_root=pathlib.Path(args.state_root),
+        run_root=pathlib.Path(args.run_root),
+        checkpoint_path=args.checkpoint,
+        agent_run_bin=args.agent_run_bin,
+        audit_timeout_seconds=args.audit_timeout,
+        engine_url=args.engine_url,
+        repo=pathlib.Path(args.repo).resolve() if args.repo else None,
+        publish_notes=not args.no_note,
+        bus=bus,
+    )
+    result = run_supervisor(config)
+    json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
+    sys.stdout.write("\n")
+    # Reaching a receipt is this process doing its job; the classification is
+    # the report's content, not this process's exit status.
+    return 0 if result.get("receipt_path") else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -475,6 +542,56 @@ def build_parser() -> argparse.ArgumentParser:
     inbox_list.add_argument("--json", action="store_true")
     inbox_list.add_argument("--bus-url", default=DEFAULT_BUS_URL)
     inbox_list.set_defaults(func=_inbox_list)
+
+    supervisor = subparsers.add_parser(
+        "supervisor", help="the event-triggered supervisor graph (audits, no verdicts)"
+    )
+    supervisor_sub = supervisor.add_subparsers()
+    supervisor_run = supervisor_sub.add_parser(
+        "run",
+        help="run one supervisor turn for one event; idempotent per event key",
+    )
+    supervisor_run.add_argument(
+        "--event-json",
+        required=True,
+        help='the event as one JSON argument: {"type": ..., "key": ..., "payload": {...}}. '
+        "The vocabulary is closed (board_question/blocked_decision/line_fault/cap_breaker); "
+        "unknown names are refused",
+    )
+    supervisor_run.add_argument(
+        "--state-root",
+        default="/data/fleet-graph/supervisor",
+        help="the supervisor's own root: checkpoint, agent runs, reports. "
+        "Never a supervised line's work folder",
+    )
+    supervisor_run.add_argument(
+        "--run-root", default="/data/fleet-graph/runs", help="where the lines' terminal.json live"
+    )
+    supervisor_run.add_argument(
+        "--checkpoint",
+        default=None,
+        help="checkpoint sqlite path; defaults to <state-root>/checkpoint.sqlite3",
+    )
+    supervisor_run.add_argument(
+        "--agent-run-bin", default=None, help="test seam: alternative agent-run binary"
+    )
+    supervisor_run.add_argument("--audit-timeout", type=int, default=900)
+    supervisor_run.add_argument(
+        "--engine-url",
+        default="http://127.0.0.1:7460",
+        help="legacy controller base URL for development audits; GETs only",
+    )
+    supervisor_run.add_argument(
+        "--repo",
+        default=None,
+        help="local clone for development audits; without it a development "
+        "target reports the gap and classifies needs_human",
+    )
+    supervisor_run.add_argument("--bus-url", default=DEFAULT_BUS_URL)
+    supervisor_run.add_argument(
+        "--no-note", action="store_true", help="publish nothing; report to the state root only"
+    )
+    supervisor_run.set_defaults(func=_supervisor_run)
 
     supervise = subparsers.add_parser(
         "supervise", help="the supervision face (audits, no verdicts)"
