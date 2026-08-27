@@ -269,7 +269,7 @@ class TestSupervisorReset:
         assert args.state_root == "/data/fleet-graph/supervisor"
 
     def test_it_resets_the_three_pieces_and_is_idempotent(self, tmp_path: Path) -> None:
-        """CLI end to end on an E3 key: receipt gone, attempts cleared, exit 0
+        """CLI end to end on an E3 key: receipt gone, attempts kept, exit 0
         both times. board_seq is untouched -- terminal events re-derive."""
         from fleet_graph.cli import main
 
@@ -292,7 +292,7 @@ class TestSupervisorReset:
         assert main(argv) == 0
         assert not (state_root / "reports" / "e3-run-1.json").exists()
         state = json.loads(cursor.read_text())
-        assert state["attempts"] == {}
+        assert state["attempts"] == {"e3-run-1": 3}  # kept -- next launch is a4
         assert state["board_seq"] == 7
         assert main(argv) == 0  # idempotent
 

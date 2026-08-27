@@ -422,12 +422,18 @@ def reset_supervisor_event(
     cursor attempts, rewind board_seq, restart daemon) with the two steps that
     are still real under attempt-in-thread-identity:
 
-    - delete the receipt (`reports/<key>.json`) -- the observer's "done" mark;
-    - clear the cursor's `attempts[<key>]` -- the lifetime launch budget.
+    - delete the receipt (`reports/<key>.json`) -- the observer's "done" mark.
 
-    The checkpoint db is deliberately untouched: the next launch is a new
-    attempt and therefore a fresh thread (`supervisor:{key}:a{n}`); the old
-    thread's rows are inert.
+    The cursor's `attempts[<key>]` is deliberately **kept**: the attempt
+    counter is exactly what makes the next launch a fresh thread
+    (`supervisor:{key}:a{n+1}`). Clearing it re-derives the same `a{n}` and
+    the relaunch lands on the old thread's terminal checkpoint as
+    `resumed:already_complete` -- observed live on
+    e1-msg_01M12MRW680AJZJH40182FXYW1 the very first time this command was
+    used in production. The checkpoint db is untouched for the same reason:
+    old threads' rows are inert once the attempt moves on. The budget cost is
+    honest: a reset consumes lifetime attempts; raise max_attempts_per_key if
+    an event legitimately needs many reruns.
 
     `board_seq` rewinding only matters for E1 (E2/E3 re-derive from terminals
     every tick, E4 from tick results): an explicit value wins; otherwise an
@@ -457,10 +463,11 @@ def reset_supervisor_event(
     attempts = state.get("attempts")
     if not isinstance(attempts, dict):
         attempts = {}
-    if key in attempts:
-        summary["attempts"] = f"cleared:{attempts.pop(key)}"
-    else:
-        summary["attempts"] = "absent"
+    summary["attempts"] = (
+        f"kept:{attempts[key]} (next launch is a{attempts[key] + 1})"
+        if key in attempts
+        else "absent"
+    )
     state["attempts"] = attempts
 
     current_seq = state.get("board_seq")
