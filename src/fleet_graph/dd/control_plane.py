@@ -163,6 +163,21 @@ def build_h0_handoff(
     }
 
 
+def _inherited_environment() -> dict[str, str]:
+    """What a launched run inherits from the control plane's own environment.
+
+    Only the bus token *file path* -- the gate needs a credential, and a path
+    in a transient unit's argv points at a 0600 file rather than being one.
+    A raw FLEET_GRAPH_BUS_TOKEN value is deliberately never forwarded:
+    `--setenv` travels through argv, and a token in argv is a token in
+    `/proc`. Production runs on the token file (findings §26).
+    """
+    import os
+
+    token_file = os.environ.get("FLEET_GRAPH_BUS_TOKEN_FILE")
+    return {"FLEET_GRAPH_BUS_TOKEN_FILE": token_file} if token_file else {}
+
+
 def _systemd_unit_is_active(unit: str) -> bool:
     proc = subprocess.run(
         ["systemctl", "--user", "is-active", unit], capture_output=True, text=True, check=False
@@ -284,7 +299,9 @@ class DdControlPlane:
         self.launcher = launcher if launcher is not None else TransientLauncher()
         self.unit_probe = unit_probe
         self._board_factory = board_factory if board_factory is not None else self._default_board
-        self.environment = dict(environment or {})
+        self.environment = (
+            dict(environment) if environment is not None else _inherited_environment()
+        )
         self.clock = clock
 
     # --- admission -------------------------------------------------------

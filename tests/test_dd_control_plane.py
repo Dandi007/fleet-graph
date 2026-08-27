@@ -519,3 +519,20 @@ class TestEvidence:
             "acceptance_rerun",
         ):
             assert by_name[name].ok, f"{name}: {by_name[name].detail}"
+
+
+class TestCredentialDiscipline:
+    def test_only_the_token_file_path_is_forwarded_to_the_unit(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A raw token value must never reach --setenv (argv is /proc-public);
+        the 0600 token file's *path* is what crosses the boundary."""
+        monkeypatch.setenv("FLEET_GRAPH_BUS_TOKEN", "secret-value")
+        monkeypatch.setenv("FLEET_GRAPH_BUS_TOKEN_FILE", "/data/agent-bus/tokens/fleet-graph.token")
+        plane = DdControlPlane(root=tmp_path / "dd", board_factory=lambda: None)
+        assert plane.environment == {
+            "FLEET_GRAPH_BUS_TOKEN_FILE": "/data/agent-bus/tokens/fleet-graph.token"
+        }
+        monkeypatch.delenv("FLEET_GRAPH_BUS_TOKEN_FILE")
+        bare = DdControlPlane(root=tmp_path / "dd", board_factory=lambda: None)
+        assert bare.environment == {}, "a raw token value is never forwarded"
