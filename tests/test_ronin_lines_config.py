@@ -39,6 +39,14 @@ BATCH_TWO = {
     "wf-9b5931",  # agent-runtime-model-switch
 }
 
+# 监督面 2026-08-27 依用户「都派出去」新开的两条线。刻意与 MIGRATED 分开：
+# 那个集合的含义是「P5 从 babysitter v28 迁过来的存量线」，把新开的线混进去
+# 会让它不再能回答「迁移做完了没有」。
+OPENED = {
+    "wf-a08949",  # P3 收尾：把 dev-dispatch 真正切到 fleet-graph 引擎
+    "wf-a87b04",  # work-folder 治理层健壮性（WORKTREE_DIRTY 活锁根修）
+}
+
 MIGRATED = {
     "wf-287e81",
     "wf-5664e5",
@@ -55,7 +63,7 @@ MIGRATED = {
 class TestTheShippedConfigLoads:
     def test_the_real_loader_accepts_it(self) -> None:
         config = SchedulerConfig.from_json(CONFIG)
-        assert {line.folder_id for line in config.lines} == MIGRATED
+        assert {line.folder_id for line in config.lines} == MIGRATED | OPENED
 
     def test_every_line_names_a_seat_and_an_alias(self) -> None:
         for line in SchedulerConfig.from_json(CONFIG).lines:
@@ -98,7 +106,7 @@ class TestTheShippedConfigLoads:
         enabled = {
             line.folder_id for line in SchedulerConfig.from_json(CONFIG).lines if line.enabled
         }
-        assert enabled == BATCH_TWO
+        assert enabled == BATCH_TWO | OPENED
 
     def test_the_canary_stays_on_through_later_batches(self) -> None:
         """放量是叠加不是替换。把金丝雀关掉换新线，会丢掉唯一一条已经有

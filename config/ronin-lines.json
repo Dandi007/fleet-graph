@@ -66,6 +66,20 @@
       "max_rounds": 9999,
       "alias": "ronin-model-switch",
       "enabled": true
+    },
+    {
+      "folder_id": "wf-a08949",
+      "seat": "opencode-gpt-terra",
+      "enabled": true,
+      "alias": "ronin-dd-cutover",
+      "max_rounds": 9999
+    },
+    {
+      "folder_id": "wf-a87b04",
+      "seat": "opencode-gpt-terra",
+      "enabled": true,
+      "alias": "ronin-wf-robust",
+      "max_rounds": 9999
     }
   ]
 }
