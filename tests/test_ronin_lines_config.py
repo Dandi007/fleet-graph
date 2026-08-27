@@ -45,6 +45,7 @@ BATCH_TWO = {
 OPENED = {
     "wf-a08949",  # P3 收尾：把 dev-dispatch 真正切到 fleet-graph 引擎
     "wf-a87b04",  # work-folder 治理层健壮性（WORKTREE_DIRTY 活锁根修）
+    "wf-197430",  # agent 权限声明式化（可配置 / 可审计 / 单点声明）
 }
 
 MIGRATED = {
