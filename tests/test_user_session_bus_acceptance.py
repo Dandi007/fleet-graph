@@ -27,7 +27,11 @@ def helper_environment(commands: Path) -> dict[str, str]:
 
 def test_degraded_manager_is_connected_and_records_raw_output(tmp_path: Path) -> None:
     fake_command(tmp_path, "systemctl", "printf 'degraded\\n'; exit 1")
-    fake_command(tmp_path, "make", "printf 'verification output\\n'; exit 0")
+    fake_command(
+        tmp_path,
+        "make",
+        "test \"$1\" = verify-core || exit 99; printf 'verification output\\n'; exit 0",
+    )
 
     done = subprocess.run(
         ["/bin/bash", str(HELPER)],

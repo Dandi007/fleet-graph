@@ -27,7 +27,7 @@ if [[ "$manager_state" != "running" && "$manager_state" != "degraded" ]]; then
 fi
 
 printf 'UTC=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-verify_output="$(make verify 2>&1)"
+verify_output="$(make verify-core 2>&1)"
 verify_exit=$?
 printf '%s\n' "$verify_output"
 printf 'make verify exit=%s\n' "$verify_exit"

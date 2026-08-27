@@ -1,4 +1,4 @@
-.PHONY: help sync lint fmt test verify acceptance clean
+.PHONY: help sync lint fmt test verify verify-core acceptance clean
 
 help:
 	@echo "sync    - install deps into .venv (uv)"
@@ -22,7 +22,9 @@ fmt:
 test:
 	uv run pytest
 
-verify: lint test
+verify: acceptance
+
+verify-core: lint test
 
 acceptance:
 	bash deploy/verify-user-session-bus.sh
