@@ -223,7 +223,21 @@ kill-restart 照旧**精确 re-adopt 在飞审计 run**，不重派、不重付�
   adopt-baseline**：游标落在当前 head，存量 pending 问题不回放（那是人已有的
   backlog，`fleet-graph inbox list` 看得到）。要回放，把 `board_seq` 改小。
 - 事件审完出 receipt（`/data/fleet-graph/supervisor/reports/<key>.json`），
-  同键永不再拉起。要重审：删对应 receipt 文件（尝试计数照旧生效）。
+  同键永不再拉起。**要重审，用文档化重置命令**（幂等，只动 supervisor 自己的
+  状态面）：
+
+  ```bash
+  fleet-graph supervisor reset e3-<run_id>          # 删 receipt + 清尝试计数
+  fleet-graph supervisor reset e1-<note_id>         # 另外机械回拨 board_seq 到该问题之前
+  fleet-graph supervisor reset e1-<note_id> --board-seq N   # 机械定位不了时显式指定
+  ```
+
+  三件套一次做完：删 receipt、清 cursor 里该键的 attempts、（仅 E1）回拨
+  `board_seq`——E2/E3/E4 每 tick 从 terminal/tick 结果重推导，无游标可回拨。
+  **不碰 checkpoint db**：重跑是新 attempt、新 thread，旧行天然惰性。
+  **不需要重启 fleet-graphd**：观察器每 tick 从盘上重载 cursor 文件；唯一
+  例外是 reset 恰与一个在飞 tick 竞态（该 tick 收尾覆写一次），重跑一遍
+  reset 或 `systemctl --user restart fleet-graphd` 兜底。
 
 ### 一次 supervisor turn 的形状
 

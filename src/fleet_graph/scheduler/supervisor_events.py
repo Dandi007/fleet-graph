@@ -405,6 +405,99 @@ class SupervisorObserver:
         return shlex.join(self._spec_for(event).argv())
 
 
+# --- documented reset -------------------------------------------------------
+
+
+def reset_supervisor_event(
+    key: str,
+    *,
+    state_root: Path,
+    cursor_path: Path,
+    board_seq: int | None = None,
+    bus: Any = None,
+) -> dict[str, Any]:
+    """Reset one event key's supervisor-side state so the observer re-fires it.
+
+    Replaces the four-step surgery of 2026-08-28 (delete receipt, sqlite rows,
+    cursor attempts, rewind board_seq, restart daemon) with the two steps that
+    are still real under attempt-in-thread-identity:
+
+    - delete the receipt (`reports/<key>.json`) -- the observer's "done" mark;
+    - clear the cursor's `attempts[<key>]` -- the lifetime launch budget.
+
+    The checkpoint db is deliberately untouched: the next launch is a new
+    attempt and therefore a fresh thread (`supervisor:{key}:a{n}`); the old
+    thread's rows are inert.
+
+    `board_seq` rewinding only matters for E1 (E2/E3 re-derive from terminals
+    every tick, E4 from tick results): an explicit value wins; otherwise an
+    `e1-<note_id>` key is located mechanically on the bus (message ->
+    channel_seq -> cursor lands just before it), and when neither is possible
+    the summary says so instead of guessing. The cursor is only ever moved
+    *backwards* on the mechanical path -- re-running the reset is a no-op.
+
+    Idempotent, and touches nothing but the supervisor's own state surface.
+    No daemon restart is required: the observer reloads the cursor file at the
+    start of every tick (`after_tick` -> `_load_state`).
+    """
+    summary: dict[str, Any] = {"key": key}
+
+    receipt = state_root / "reports" / f"{key}.json"
+    try:
+        receipt.unlink()
+        summary["receipt"] = f"deleted:{receipt}"
+    except FileNotFoundError:
+        summary["receipt"] = "absent"
+
+    try:
+        raw = json.loads(cursor_path.read_text(encoding="utf-8"))
+        state = raw if isinstance(raw, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    attempts = state.get("attempts")
+    if not isinstance(attempts, dict):
+        attempts = {}
+    if key in attempts:
+        summary["attempts"] = f"cleared:{attempts.pop(key)}"
+    else:
+        summary["attempts"] = "absent"
+    state["attempts"] = attempts
+
+    current_seq = state.get("board_seq")
+    if board_seq is not None:
+        state["board_seq"] = int(board_seq)
+        summary["board_seq"] = f"set:{int(board_seq)}"
+    elif not key.startswith("e1-"):
+        summary["board_seq"] = "not_applicable:terminal/cap events re-derive every tick"
+    elif bus is None:
+        summary["board_seq"] = "not_rewound:no bus client; pass --board-seq explicitly"
+    else:
+        question_note_id = key[len("e1-") :]
+        try:
+            message = bus.message(WORK_NOTES, question_note_id)
+        except Exception as exc:
+            message = None
+            summary["board_seq"] = (
+                f"not_rewound:bus lookup failed ({type(exc).__name__}); pass --board-seq"
+            )
+        if message is not None:
+            target = int(message["channel_seq"]) - 1
+            if isinstance(current_seq, int) and current_seq > target:
+                state["board_seq"] = target
+                summary["board_seq"] = f"rewound:{current_seq}->{target}"
+            else:
+                summary["board_seq"] = f"already_at_or_before:{current_seq}"
+        elif "board_seq" not in summary:
+            summary["board_seq"] = (
+                f"not_rewound:note {question_note_id!r} not found in {WORK_NOTES}; pass --board-seq"
+            )
+
+    cursor_path.parent.mkdir(parents=True, exist_ok=True)
+    cursor_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+    summary["cursor_path"] = str(cursor_path)
+    return summary
+
+
 __all__ = [
     "BOARD_PAGE_LIMIT",
     "DEFAULT_SUPERVISOR_STATE_ROOT",
@@ -412,4 +505,5 @@ __all__ = [
     "SupervisorLaunchSpec",
     "SupervisorObserver",
     "observer_environment",
+    "reset_supervisor_event",
 ]

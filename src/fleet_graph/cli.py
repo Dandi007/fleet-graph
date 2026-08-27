@@ -470,6 +470,50 @@ def _supervisor_run(args: argparse.Namespace) -> int:
     return 0 if result.get("receipt_path") else 1
 
 
+def _supervisor_reset(args: argparse.Namespace) -> int:
+    """Reset one event key's supervisor state so the observer re-fires it.
+
+    Idempotent; touches only the supervisor's own state surface (receipt +
+    cursor). The checkpoint db is untouched on purpose: re-runs are new
+    attempts and therefore fresh threads."""
+    import pathlib
+
+    from fleet_graph.scheduler.supervisor_events import reset_supervisor_event
+
+    cursor_path = (
+        pathlib.Path(args.cursor)
+        if args.cursor
+        else pathlib.Path(args.run_root) / ".scheduler" / "supervisor-cursor.json"
+    )
+
+    bus = None
+    if args.board_seq is None and args.key.startswith("e1-"):
+        try:
+            from fleet_graph.bus.client import BusClient
+
+            bus = BusClient(base_url=args.bus_url)
+        except Exception:
+            # No credential -> the summary records the degradation and points
+            # at --board-seq; resetting receipt + attempts still proceeds.
+            bus = None
+
+    summary = reset_supervisor_event(
+        args.key,
+        state_root=pathlib.Path(args.state_root),
+        cursor_path=cursor_path,
+        board_seq=args.board_seq,
+        bus=bus,
+    )
+    summary["daemon"] = (
+        "fleet-graphd reloads the cursor file at the start of every tick -- no "
+        "restart required; only a reset racing an in-flight tick can be "
+        "overwritten once (re-run this command, or restart to be certain)"
+    )
+    json.dump(summary, sys.stdout, ensure_ascii=False, indent=1)
+    sys.stdout.write("\n")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fleet-graph")
     parser.add_argument("--version", action="version", version=__version__)
@@ -726,6 +770,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-note", action="store_true", help="publish nothing; report to the state root only"
     )
     supervisor_run.set_defaults(func=_supervisor_run)
+
+    supervisor_reset = supervisor_sub.add_parser(
+        "reset",
+        help="reset one event key so the observer re-fires it: delete the "
+        "receipt, clear the cursor's attempts counter, and (E1 only) rewind "
+        "board_seq to just before the question. Idempotent; never touches the "
+        "checkpoint db -- a re-run is a new attempt and thus a fresh thread. "
+        "No daemon restart needed: the cursor is reloaded every tick",
+    )
+    supervisor_reset.add_argument("key", help="the event key, e.g. e3-<run_id> or e1-<note_id>")
+    supervisor_reset.add_argument(
+        "--state-root",
+        default="/data/fleet-graph/supervisor",
+        help="the supervisor's own root (holds reports/<key>.json)",
+    )
+    supervisor_reset.add_argument(
+        "--run-root",
+        default="/data/fleet-graph/runs",
+        help="the scheduler run root; the cursor lives at "
+        "<run-root>/.scheduler/supervisor-cursor.json unless --cursor is given",
+    )
+    supervisor_reset.add_argument(
+        "--cursor", default=None, help="explicit cursor file path (overrides --run-root derivation)"
+    )
+    supervisor_reset.add_argument(
+        "--board-seq",
+        type=int,
+        default=None,
+        help="explicit board_seq to set. Without it an e1-<note_id> key is "
+        "located mechanically on the bus and the cursor moves to just before "
+        "that message (never forwards); when the note cannot be located "
+        "(no credential, bus down, id not in the channel window) the summary "
+        "says so and this flag is the fallback. E2/E3/E4 need no rewind: "
+        "they re-derive from terminals/tick results every tick",
+    )
+    supervisor_reset.add_argument("--bus-url", default=DEFAULT_BUS_URL)
+    supervisor_reset.set_defaults(func=_supervisor_reset)
 
     supervise = subparsers.add_parser(
         "supervise", help="the supervision face (audits, no verdicts)"

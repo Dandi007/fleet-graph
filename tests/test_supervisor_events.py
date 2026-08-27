@@ -23,6 +23,7 @@ from fleet_graph.scheduler.supervisor_events import (
     SupervisorLaunchSpec,
     SupervisorObserver,
     observer_environment,
+    reset_supervisor_event,
 )
 from fleet_graph.supervise.events import line_fault_event, validate_event
 
@@ -92,6 +93,12 @@ class FakeBus:
         selected = [n for n in self.notes if n["channel_seq"] > after_seq][:limit]
         head = max((n["channel_seq"] for n in self.notes), default=0)
         return selected, head
+
+    def message(self, channel: str, message_id: str) -> dict[str, Any] | None:
+        for note in self.notes:
+            if note["message_id"] == message_id:
+                return note
+        return None
 
     def refs_to(self, entity_id: str) -> list[dict[str, Any]]:
         if entity_id in self.decisions:
@@ -381,6 +388,97 @@ class TestFailOpen:
         observer, _ = observer_for(tmp_path, bus=ExplodingBus())
         actions = tick(observer, {})
         assert any(a.get("source") == "board" and "error" in a for a in actions)
+
+
+class TestReset:
+    """`fleet-graph supervisor reset <key>`: the documented replacement for the
+    2026-08-28 four-step surgery. Idempotent, supervisor state surface only."""
+
+    def _paths(self, tmp_path: Path) -> tuple[Path, Path]:
+        state_root = tmp_path / "supervisor"
+        cursor = tmp_path / "runs" / ".scheduler" / "supervisor-cursor.json"
+        return state_root, cursor
+
+    def _seed(self, tmp_path: Path, key: str, *, board_seq: int | None = 9) -> tuple[Path, Path]:
+        state_root, cursor = self._paths(tmp_path)
+        reports = state_root / "reports"
+        reports.mkdir(parents=True, exist_ok=True)
+        (reports / f"{key}.json").write_text("{}")
+        cursor.parent.mkdir(parents=True, exist_ok=True)
+        cursor.write_text(json.dumps({"board_seq": board_seq, "attempts": {key: 2, "other": 1}}))
+        return state_root, cursor
+
+    def test_reset_clears_receipt_and_attempts_and_is_idempotent(self, tmp_path: Path) -> None:
+        key = "e3-run-1"
+        state_root, cursor = self._seed(tmp_path, key)
+        first = reset_supervisor_event(key, state_root=state_root, cursor_path=cursor)
+        assert first["receipt"].startswith("deleted:")
+        assert first["attempts"] == "cleared:2"
+        assert not (state_root / "reports" / f"{key}.json").exists()
+        state = json.loads(cursor.read_text())
+        assert state["attempts"] == {"other": 1}  # only this key's counter moved
+        assert state["board_seq"] == 9  # E3: nothing to rewind
+
+        second = reset_supervisor_event(key, state_root=state_root, cursor_path=cursor)
+        assert second["receipt"] == "absent"
+        assert second["attempts"] == "absent"
+        assert json.loads(cursor.read_text()) == state
+
+    def test_the_observer_refires_a_reset_terminal_event(self, tmp_path: Path) -> None:
+        """End to end against the real observer: exhaust the key, reset it,
+        and the very next tick launches again -- same observer object, no
+        restart, because the cursor is reloaded every tick."""
+        observer, launcher = observer_for(tmp_path, max_attempts=1)
+        folders = {"wf-a": terminal("fault", "run-1")}
+        tick(observer, folders)
+        reports = tmp_path / "supervisor" / "reports"
+        reports.mkdir(parents=True, exist_ok=True)
+        (reports / "e3-run-1.json").write_text("{}")  # the finished receipt
+        actions = tick(observer, folders)
+        assert any(a.get("action") == "skipped:receipt_exists" for a in actions)
+
+        state_root, cursor = self._paths(tmp_path)
+        reset_supervisor_event("e3-run-1", state_root=state_root, cursor_path=cursor)
+        tick(observer, folders)
+        assert len(launcher.events()) == 2
+        assert launcher.events()[-1]["attempt"] == 1  # a genuinely fresh budget
+
+    def test_e1_board_seq_rewinds_mechanically_and_never_forwards(self, tmp_path: Path) -> None:
+        key = "e1-msg_q1"
+        state_root, cursor = self._seed(tmp_path, key, board_seq=9)
+        bus = FakeBus()
+        bus.add_question("msg_q1", "card-1", seq=6)
+        first = reset_supervisor_event(key, state_root=state_root, cursor_path=cursor, bus=bus)
+        assert first["board_seq"] == "rewound:9->5"
+        assert json.loads(cursor.read_text())["board_seq"] == 5
+        second = reset_supervisor_event(key, state_root=state_root, cursor_path=cursor, bus=bus)
+        assert second["board_seq"].startswith("already_at_or_before")
+        assert json.loads(cursor.read_text())["board_seq"] == 5
+
+    def test_e1_without_a_locatable_note_says_so_and_takes_the_explicit_seq(
+        self, tmp_path: Path
+    ) -> None:
+        key = "e1-msg_gone"
+        state_root, cursor = self._seed(tmp_path, key, board_seq=9)
+        no_bus = reset_supervisor_event(key, state_root=state_root, cursor_path=cursor, bus=None)
+        assert no_bus["board_seq"].startswith("not_rewound:no bus client")
+        missing = reset_supervisor_event(
+            key, state_root=state_root, cursor_path=cursor, bus=FakeBus()
+        )
+        assert missing["board_seq"].startswith("not_rewound:note")
+        assert json.loads(cursor.read_text())["board_seq"] == 9  # untouched, not guessed
+        explicit = reset_supervisor_event(
+            key, state_root=state_root, cursor_path=cursor, board_seq=4
+        )
+        assert explicit["board_seq"] == "set:4"
+        assert json.loads(cursor.read_text())["board_seq"] == 4
+
+    def test_reset_survives_a_missing_cursor_file(self, tmp_path: Path) -> None:
+        state_root, cursor = self._paths(tmp_path)
+        summary = reset_supervisor_event("e3-run-x", state_root=state_root, cursor_path=cursor)
+        assert summary["receipt"] == "absent"
+        assert summary["attempts"] == "absent"
+        assert json.loads(cursor.read_text())["attempts"] == {}
 
 
 class TestLaunchSpec:
