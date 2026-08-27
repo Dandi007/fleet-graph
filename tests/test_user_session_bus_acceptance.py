@@ -38,7 +38,7 @@ def test_degraded_manager_is_connected_and_records_raw_output(tmp_path: Path) ->
     )
 
     assert done.returncode == 0, done.stderr
-    assert "UTC=" in done.stdout
+    assert done.stdout.count("UTC=") == 2
     assert "degraded" in done.stdout
     assert "systemctl --user is-system-running exit=1" in done.stdout
     assert "verification output" in done.stdout
@@ -58,5 +58,7 @@ def test_connection_failure_is_not_accepted_as_a_degraded_manager(tmp_path: Path
     )
 
     assert done.returncode == 1
+    assert done.stdout.count("UTC=") == 1
     assert "Failed to connect to bus" in done.stdout
+    assert "systemctl --user is-system-running exit=1" in done.stdout
     assert "must not run" not in done.stdout
