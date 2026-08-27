@@ -73,7 +73,9 @@ class TestPublishShape:
         client = FakeClient()
         publish(client)
         [record] = client.published
-        assert record["kind"] == "work.decision.v1"
+        # v2：注册的 v1 schema（additionalProperties:false）装不下
+        # gate_release 载荷；放行走 work.decision.v2 的 gate_release 变体。
+        assert record["kind"] == "work.decision.v2"
         assert record["payload"]["decision"] == APPROVE_DECISION
         assert record["payload"]["scope"] == SCOPE_MERGE_ONLY
         assert record["payload"]["kind"] == RELEASE_PAYLOAD_KIND
