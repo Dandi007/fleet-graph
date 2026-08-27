@@ -19,6 +19,7 @@ import pytest
 from fleet_graph.cli import build_parser
 
 UNIT = Path(__file__).resolve().parent.parent / "deploy" / "systemd" / "fleet-graphd.service"
+MAKEFILE = Path(__file__).resolve().parent.parent / "Makefile"
 
 
 def exec_start(text: str) -> list[str]:
@@ -28,6 +29,14 @@ def exec_start(text: str) -> list[str]:
         if line.startswith("ExecStart="):
             return line[len("ExecStart=") :].split()
     raise AssertionError("the unit has no ExecStart")
+
+
+class TestAcceptanceContract:
+    def test_make_verify_uses_the_isolated_user_systemd_harness(self) -> None:
+        """Acceptance must exercise systemd without requiring a host DBus session."""
+        makefile = MAKEFILE.read_text(encoding="utf-8")
+        assert "verify: lint test" in makefile
+        assert "bash deploy/verify-user-systemd.sh uv run pytest" in makefile
 
 
 class TestTheUnitRunsSomethingThatExists:
