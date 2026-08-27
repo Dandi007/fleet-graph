@@ -134,3 +134,64 @@ class TestGuardBDecision:
         )
         proc = run_guard(src)
         assert proc.returncode == 0, proc.stderr
+
+    def test_the_single_sanctioned_publisher_survives(self, tmp_path: Path) -> None:
+        """R4-3: decision_publisher.py is the one module allowed to publish."""
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/decision_publisher.py",
+            'client.publish("board:work-notes", "work.decision.v1", {}, "key")\n',
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 0, proc.stderr
+
+    def test_a_second_publisher_elsewhere_is_still_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/graphs/dd_actors.py",
+            'client.publish("board:work-notes", "work.decision.v1", {}, "key")\n',
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "decision_publisher" in proc.stderr
+
+
+class TestGuardCPublisherImports:
+    """Only the supervisor act node may reach the decision publisher."""
+
+    def test_import_from_executors_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/executors/agent_run.py",
+            "from fleet_graph.supervise.decision_publisher import publish_release_decision\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "decision publisher" in proc.stderr
+
+    def test_module_import_from_dd_graph_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/graphs/dd_pipeline.py",
+            "import fleet_graph.supervise.decision_publisher\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+
+    def test_package_level_smuggling_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/dd/control_plane.py",
+            "from fleet_graph.supervise import decision_publisher\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+
+    def test_the_supervisor_act_node_may_import(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/graphs/supervisor.py",
+            "from fleet_graph.supervise.decision_publisher import publish_release_decision\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 0, proc.stderr
