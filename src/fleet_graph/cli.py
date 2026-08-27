@@ -1,7 +1,7 @@
 """Thin CLI entrypoint.
 
-`version`, `hello`, `line run`, `dd run`, `scheduler run`, `inbox list`, and
-`supervise audit`.
+`version`, `hello`, `line run`, `research run`, `dd run`, `scheduler run`,
+`inbox list`, and `supervise audit`.
 """
 
 from __future__ import annotations
@@ -46,6 +46,29 @@ def _hello(args: argparse.Namespace) -> int:
     )
     sys.stdout.write("\n")
     return 0
+
+
+def _research_run(args: argparse.Namespace) -> int:
+    """Run one research ticket to termination, printing its terminal record."""
+    import pathlib
+
+    from fleet_graph.graphs.research_pipeline import derive_research_id
+    from fleet_graph.graphs.research_runner import ResearchConfig, run_research
+
+    config = ResearchConfig(
+        question=args.question,
+        run_root=pathlib.Path(
+            args.run_root or f"/data/fleet-graph/research/{derive_research_id(args.question)}"
+        ),
+        generation=args.generation,
+        max_clues=args.max_clues,
+        checkpoint_path=args.checkpoint,
+    )
+    result = run_research(config)
+    json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
+    sys.stdout.write("\n")
+    # 终态 ∈ {converged, capped, partial} 才算跑通；fault 非零退出（规格第 9 条）。
+    return 0 if result.get("terminal") in {"converged", "capped", "partial"} else 1
 
 
 def _line_run(args: argparse.Namespace) -> int:
@@ -562,6 +585,35 @@ def build_parser() -> argparse.ArgumentParser:
         "is acceptable; absence means the line records `not_declared`",
     )
     run.set_defaults(func=_line_run)
+
+    research = subparsers.add_parser("research", help="run a deep-research ticket")
+    research_sub = research.add_subparsers()
+    research_run = research_sub.add_parser("run", help="run one research ticket to termination")
+    research_run.add_argument("--question", required=True, help="the research question")
+    research_run.add_argument(
+        "--run-root",
+        default=None,
+        help="run root; defaults to /data/fleet-graph/research/<research_id>",
+    )
+    research_run.add_argument(
+        "--generation",
+        type=int,
+        default=1,
+        help="stable thread identity is research_id:g{generation}; a restart of the "
+        "same generation resumes its checkpoint and re-adopts in-flight runs",
+    )
+    research_run.add_argument(
+        "--max-clues",
+        type=int,
+        default=12,
+        help="clue board size bound; hitting it terminates the run as `capped`",
+    )
+    research_run.add_argument(
+        "--checkpoint",
+        default=None,
+        help="checkpoint sqlite path; defaults to <run-root>/checkpoint.sqlite3",
+    )
+    research_run.set_defaults(func=_research_run)
 
     dd = subparsers.add_parser("dd", help="run a dev-dispatch development")
     dd_sub = dd.add_subparsers()
