@@ -65,6 +65,21 @@ class TestCommand:
         assert argv[argv.index("--folder") + 1] == "wf-40fa8d"
         assert argv[argv.index("--seat") + 1] == "opencode-gpt-sol"
 
+    def test_generation_is_passed_down_to_the_line(self) -> None:
+        """thread_id is folder:g{generation}; a scheduler that restarts a line
+        without handing the generation down re-randomises nothing but still
+        changes the identity, and re-adopt silently stops working."""
+        spec = LaunchSpec(folder_id="wf-1", seat="s", generation=4)
+        argv = spec.argv()
+        assert argv[argv.index("--generation") + 1] == "4"
+
+    def test_checkpoint_is_explicit_and_lives_under_the_run_root(self, spec: LaunchSpec) -> None:
+        argv = spec.argv()
+        assert (
+            argv[argv.index("--checkpoint") + 1]
+            == "/data/fleet-graph/runs/wf-40fa8d/checkpoint.sqlite3"
+        )
+
     def test_environment_is_passed_through_setenv(self) -> None:
         spec = LaunchSpec(folder_id="wf-1", seat="s", environment={"AGENT_RUNTIME_ROOT": "/data/x"})
         assert "--setenv=AGENT_RUNTIME_ROOT=/data/x" in spec.argv()

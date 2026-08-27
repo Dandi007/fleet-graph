@@ -62,8 +62,8 @@ from typing import Any, Protocol
 
 from fleet_graph.scheduler.ignition import (
     DEFAULT_BACKOFF_CAP_SECONDS,
-    DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_CAP_WINDOW_SECONDS,
+    DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_TOTAL_CAP,
     IgnitionDecision,
     LineStatus,
@@ -268,16 +268,18 @@ class Scheduler:
         return self.config.run_root / ".scheduler" / f"{folder_id}.json"
 
     def stall_state(self, folder_id: str) -> dict[str, Any]:
+        empty = {"streak": 0, "accounted_run_id": None, "last_start_at": None, "generation": None}
         try:
             state = json.loads(self._stall_path(folder_id).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {"streak": 0, "accounted_run_id": None, "last_start_at": None}
+            return empty
         if not isinstance(state, dict):
-            return {"streak": 0, "accounted_run_id": None, "last_start_at": None}
+            return empty
         return {
             "streak": int(state.get("streak") or 0),
             "accounted_run_id": state.get("accounted_run_id"),
             "last_start_at": state.get("last_start_at"),
+            "generation": state.get("generation"),
         }
 
     def _write_stall_state(self, folder_id: str, state: dict[str, Any]) -> None:
@@ -289,7 +291,39 @@ class Scheduler:
             # Losing the counter costs an extra attempt, not correctness.
             pass
 
-    def account_last_run(self, folder_id: str) -> int:
+    def generation_of(self, line: LineSpec) -> int:
+        """The generation the next launch of this line must run as.
+
+        thread_id is `{folder_id}:g{generation}`, and a thread whose checkpoint
+        already terminated is spent: relaunching it routes straight to finalise
+        and the line never works again (pinned in
+        tests/test_line_restart.py). So each accounted terminal advances a
+        persisted per-line counter, and this returns it.
+
+        Persisted in the stall-state file for the same reason the streak is:
+        a counter that reset on deploy would relaunch a spent thread on every
+        release. `max` with the roster value so raising LineSpec.generation in
+        config still takes effect immediately.
+        """
+        value = self.stall_state(line.folder_id)["generation"]
+        try:
+            persisted = int(value)
+        except (TypeError, ValueError):
+            return line.generation
+        return max(persisted, line.generation)
+
+    def _next_generation(self, current: int, terminal: Any) -> int:
+        """One accounted terminal -> the generation the *next* launch needs.
+
+        `done` deliberately does not bump: a finished line never re-ignites
+        (Refusal.TERMINAL_DONE), so moving its counter would be bookkeeping
+        with no launch to serve. Every other terminal (blocked/bounds/fault/
+        killed) leaves a spent thread behind, and the next ignition needs a
+        fresh one.
+        """
+        return current if terminal == "done" else current + 1
+
+    def account_last_run(self, folder_id: str, *, base_generation: int = 1) -> int:
         """Fold the newest terminal into the stall streak, once.
 
         Persisted rather than kept in memory because the daemon restarts on
@@ -299,7 +333,9 @@ class Scheduler:
 
         A terminal is accounted at most once, keyed on the run id that wrote
         it, so re-reading the same file on every 60s tick does not inflate the
-        streak.
+        streak. The per-line generation advances on exactly the same event and
+        the same key: an accounted terminal means that thread is spent, so the
+        next launch needs `{folder}:g{n+1}` (see generation_of).
         """
         record = self.terminal_record(folder_id)
         if not self._stall_path(folder_id).exists():
@@ -317,9 +353,20 @@ class Scheduler:
             # streak, and a failure from before we were watching is not ours
             # to count.
             if record is not None and record.get("run_id") is not None:
+                # The baseline terminal still proves its thread is spent, so
+                # the generation is initialised *past* it -- without this, the
+                # runbook's "delete the counter file to retry now" would
+                # relaunch the spent thread and no-op straight to finalise.
                 self._write_stall_state(
                     folder_id,
-                    {"streak": 0, "accounted_run_id": record["run_id"], "last_start_at": None},
+                    {
+                        "streak": 0,
+                        "accounted_run_id": record["run_id"],
+                        "last_start_at": None,
+                        "generation": self._next_generation(
+                            base_generation, record.get("terminal")
+                        ),
+                    },
                 )
             return 0
 
@@ -333,12 +380,17 @@ class Scheduler:
         advanced = int(record.get("rounds") or 0) > 0
         finished = record.get("terminal") == "done"
         streak = 0 if (advanced or finished) else int(state["streak"]) + 1
+        try:
+            current_generation = max(int(state["generation"]), base_generation)
+        except (TypeError, ValueError):
+            current_generation = base_generation
         self._write_stall_state(
             folder_id,
             {
                 "streak": streak,
                 "accounted_run_id": run_id,
                 "last_start_at": state["last_start_at"],
+                "generation": self._next_generation(current_generation, record.get("terminal")),
             },
         )
         return streak
@@ -410,10 +462,15 @@ class Scheduler:
     # --- acting -----------------------------------------------------------
 
     def spec_for(self, line: LineSpec) -> LaunchSpec:
+        # The effective (persisted) generation, not the roster's static one.
+        # status_of probes is_active on this same spec's unit_name, so the
+        # liveness check and the ignition always speak of the same unit -- a
+        # probe on g1 while igniting g2 would miss a still-running previous
+        # generation and double-start the line.
         return LaunchSpec(
             folder_id=line.folder_id,
             seat=line.seat,
-            generation=line.generation,
+            generation=self.generation_of(line),
             max_rounds=line.max_rounds,
             run_root=self.config.run_root / line.folder_id,
             environment=self.line_environment(),
@@ -449,7 +506,9 @@ class Scheduler:
         launched_this_tick = 0
 
         for line in self.config.lines:
-            streak = self.account_last_run(line.folder_id)
+            # Accounting runs first: a terminal observed this tick must bump
+            # the generation before status_of probes and spec_for launches.
+            streak = self.account_last_run(line.folder_id, base_generation=line.generation)
             decision = decide(
                 self.status_of(line),
                 now=now,

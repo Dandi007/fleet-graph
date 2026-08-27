@@ -85,6 +85,16 @@ class LaunchSpec:
             str(self.max_rounds),
             "--run-root",
             str(run_root),
+            # The line derives every agent-run id from folder:g{generation};
+            # passing the generation down is what keeps that identity stable
+            # across a kill-restart, so in-flight runs are re-adopted.
+            "--generation",
+            str(self.generation),
+            # Explicit even though it matches the line's own default: the
+            # checkpoint being on disk is a contract the scheduler relies on
+            # (resume after restart), not an implementation detail to inherit.
+            "--checkpoint",
+            str(run_root / "checkpoint.sqlite3"),
         ]
         return argv
 
