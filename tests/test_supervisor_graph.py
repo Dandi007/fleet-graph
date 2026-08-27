@@ -441,7 +441,7 @@ def board_with_gate(preauth_payload: dict[str, Any] | None = None) -> FakeBus:
             {
                 "message_id": "msg-preauth-1",
                 "channel_seq": 3,
-                "kind": "work.decision.v1",
+                "kind": "work.decision.v2",
                 "payload": preauth_payload,
             }
         )
@@ -526,7 +526,7 @@ class TestPreauthReleaseEndToEnd:
         assert act["decision_published"] is True
 
         [decision] = decision_client.published
-        assert decision["kind"] == "work.decision.v1"
+        assert decision["kind"] == "work.decision.v2"
         assert decision["payload"]["decision"] == "APPROVE"
         assert decision["payload"]["scope"] == "merge_only"
         assert decision["payload"]["target_ref"] == "refs/heads/dd/dev-abc"
@@ -535,7 +535,7 @@ class TestPreauthReleaseEndToEnd:
         assert {"target_entity": "msg-preauth-1"} in decision["refs"]
 
         # 板 client 只发 evidence note，决策只经独立 client（凭证分离的图侧）。
-        assert all(r["kind"] != "work.decision.v1" for r in bus.published)
+        assert all(not r["kind"].startswith("work.decision") for r in bus.published)
         assert any(r["payload"].get("note_type") == "evidence" for r in bus.published)
 
         receipt = json.loads(Path(result["receipt_path"]).read_text())
@@ -629,7 +629,7 @@ class TestPreauthReleaseEndToEnd:
         assert "503" in act["decision_degraded"]
         # 板上没出现 decision，question 仍开着——失败模式是 needs_human，
         # 不是静默放行。
-        assert all(r["kind"] != "work.decision.v1" for r in bus.published)
+        assert all(not r["kind"].startswith("work.decision") for r in bus.published)
         assert Path(result["receipt_path"]).exists()
 
 

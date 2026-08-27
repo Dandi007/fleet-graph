@@ -1,4 +1,9 @@
-"""全仓唯一的 `work.decision.v1` 发布点。独立主体，独立凭证。
+"""全仓唯一的 decision 发布点（发 `work.decision.v2`）。独立主体，独立凭证。
+
+发布走 v2：bus 端注册的 v1 payload_schema 是 additionalProperties:false 的
+5 字段旧形状，gate_release 载荷发不出去（生产实测 VALIDATION_ERROR），而
+协议注册后不可变；v2 的 gate_release 变体与本模块构造的 payload 逐字段一致。
+v1 继续留给人工问答裁决，读径（bus/board.py `DECISION_KINDS`）两版兼收。
 
 bus/board.py 的标准规则（Board 没有发布 decision 的方法）原样成立；R4-3 在
 它旁边开出一条被三重结构约束的窄门，而不是给 Board 加方法：
@@ -29,7 +34,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fleet_graph.bus.board import DECISION_KIND, WORK_NOTES
+from fleet_graph.bus.board import DECISION_KIND_V2, WORK_NOTES
 from fleet_graph.bus.client import DEFAULT_BUS_URL, BusClient, PublishResult
 from fleet_graph.supervise.preauth import ReleaseEvaluation
 
@@ -112,7 +117,7 @@ def publish_release_decision(
         {"target_entity": question_note_id},
         {"target_entity": evaluation.preauth_message_id},
     ]
-    return client.publish(WORK_NOTES, DECISION_KIND, payload, idempotency_key, refs=refs)
+    return client.publish(WORK_NOTES, DECISION_KIND_V2, payload, idempotency_key, refs=refs)
 
 
 __all__ = [

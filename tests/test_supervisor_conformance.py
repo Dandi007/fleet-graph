@@ -82,7 +82,7 @@ class TestGuardAScheduler:
 
 
 class TestGuardBDecision:
-    """No call in the repo may carry work.decision.v1 as an argument."""
+    """No call in the repo may carry work.decision.v1/v2 as an argument."""
 
     def test_literal_decision_publish_is_caught(self, tmp_path: Path) -> None:
         src = sample_tree(
@@ -123,14 +123,46 @@ class TestGuardBDecision:
         proc = run_guard(src)
         assert proc.returncode == 1
 
+    def test_v2_literal_decision_publish_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/sneaky.py",
+            'client.publish("board:work-notes", "work.decision.v2", {}, "key")\n',
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "work.decision.v2" in proc.stderr
+
+    def test_v2_constant_name_publish_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/sneaky.py",
+            "from fleet_graph.bus.board import DECISION_KIND_V2\n"
+            'client.publish("c", DECISION_KIND_V2, {}, "key")\n',
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+
+    def test_v2_attribute_spelling_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/sneaky.py",
+            "import fleet_graph.bus.board as board\n"
+            'client.publish("c", board.DECISION_KIND_V2, {}, "key")\n',
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+
     def test_read_paths_survive(self, tmp_path: Path) -> None:
         """The constant's definition and comparisons are not publish paths."""
         src = sample_tree(
             tmp_path,
             "fleet_graph/reader.py",
             'DECISION_KIND = "work.decision.v1"\n'
+            'DECISION_KIND_V2 = "work.decision.v2"\n'
+            "DECISION_KINDS = (DECISION_KIND, DECISION_KIND_V2)\n"
             "def is_decision(m):\n"
-            '    return m.get("kind") == DECISION_KIND\n',
+            '    return m.get("kind") in DECISION_KINDS\n',
         )
         proc = run_guard(src)
         assert proc.returncode == 0, proc.stderr
@@ -141,6 +173,15 @@ class TestGuardBDecision:
             tmp_path,
             "fleet_graph/supervise/decision_publisher.py",
             'client.publish("board:work-notes", "work.decision.v1", {}, "key")\n',
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 0, proc.stderr
+
+    def test_the_single_sanctioned_publisher_survives_on_v2(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/decision_publisher.py",
+            'client.publish("board:work-notes", "work.decision.v2", {}, "key")\n',
         )
         proc = run_guard(src)
         assert proc.returncode == 0, proc.stderr

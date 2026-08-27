@@ -1,9 +1,10 @@
 """机械预授权（preauth）：第四道防代拍闸的协议对象与三要素判定。
 
-前三道闸原样不动：Board 没有发布 `work.decision.v1` 的方法（bus/board.py 的
+前三道闸原样不动：Board 没有发布 decision 的方法（bus/board.py 的
 标准规则）、gate resume 值被丢弃每次重读板、decision 只经 ref 图解析。这里
 加的是第四道：**独立主体 + 机械预授权 + 凭证分离**——人（或依全权委托代行、
-诚实署名）在板上发一条 payload `kind: "preauth"` 的 `work.decision.v1`，
+诚实署名）在板上发一条 payload `kind: "preauth"` 的 `work.decision.v2`
+（v1 的注册 schema 装不下 preauth 载荷，preauth 只存在于 v2 上），
 supervisor 图据此机械放行集成分支 gate；production promotion 在结构上不可能
 被这条路放行，因为校验层拒绝任何能覆盖 main/master/production/release 的
 allowlist 前缀（负例测试钉死）。
@@ -30,8 +31,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-#: work.decision.v1 的 payload.kind 值。preauth 与逐条裁决共用消息 kind，
-#: 靠 payload.kind 区分——机器可读字段，不是散文。
+#: work.decision.v2 preauth 变体的 payload.kind 值。preauth 与 gate_release
+#: 共用消息 kind，靠 payload.kind 区分——机器可读字段，不是散文。
 PREAUTH_PAYLOAD_KIND = "preauth"
 
 #: v1 preauth 只能预授权 approve。REJECT 不纳入：驳回只出建议（人看着

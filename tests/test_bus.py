@@ -15,6 +15,8 @@ import pytest
 from fleet_graph.bus.board import (
     CARD_KIND,
     DECISION_KIND,
+    DECISION_KIND_V2,
+    DECISION_KINDS,
     NOTE_KIND,
     Board,
     GateTicket,
@@ -303,6 +305,67 @@ class TestHumanGate:
         assert decision.decided_by == "human:operator"
         assert decision.message_id == "msg_d"
 
+    def test_v1_question_answer_decision_is_still_recognized(
+        self, board: Board, transport: RecordingTransport
+    ) -> None:
+        """兼收：v1 留给人工问答裁决，decision_for 必须继续认它。"""
+        transport.queue(200, {"refs": [{"message_id": "msg_d", "target_entity": "msg_q"}]})
+        transport.queue(
+            200,
+            {
+                "messages": [
+                    {
+                        "message_id": "msg_d",
+                        "kind": DECISION_KIND,
+                        "channel_seq": 5,
+                        "payload": {
+                            "card_entity_id": "card_1",
+                            "question": "merge?",
+                            "decision": "REJECT",
+                            "decided_by": "human:operator",
+                        },
+                    }
+                ],
+                "head_seq": 5,
+            },
+        )
+        decision = board.decision_for(GateTicket("msg_q", "card_1"))
+        assert decision is not None
+        assert decision.decision == "REJECT"
+
+    def test_v2_gate_release_decision_is_recognized_by_the_gate_read_path(
+        self, board: Board, transport: RecordingTransport
+    ) -> None:
+        """兼收：decision_publisher 发的 v2 gate_release 必须解锁 gate。"""
+        transport.queue(200, {"refs": [{"message_id": "msg_d", "target_entity": "msg_q"}]})
+        transport.queue(
+            200,
+            {
+                "messages": [
+                    {
+                        "message_id": "msg_d",
+                        "kind": DECISION_KIND_V2,
+                        "channel_seq": 7,
+                        "payload": {
+                            "kind": "gate_release",
+                            "decision": "APPROVE",
+                            "decided_by": "supervisor-graph (依预授权 msg-p-1 代行；非人逐条拍板)",
+                            "card_entity_id": "card_1",
+                            "question_note_id": "msg_q",
+                            "preauth_message_id": "msg-p-1",
+                            "target_ref": "refs/heads/dd/dev-abc",
+                            "scope": "merge_only",
+                        },
+                    }
+                ],
+                "head_seq": 7,
+            },
+        )
+        decision = board.decision_for(GateTicket("msg_q", "card_1"))
+        assert decision is not None
+        assert decision.decision == "APPROVE"
+        assert decision.message_id == "msg_d"
+
     def test_a_non_decision_reply_does_not_count_as_a_verdict(
         self, board: Board, transport: RecordingTransport
     ) -> None:
@@ -362,7 +425,7 @@ class TestHumanGate:
 
 
 class TestAgentMayNotDecide:
-    """plan.md: 裁决只认 work.decision.v1，agent 不得代拍.
+    """plan.md: 裁决只认 work.decision.v1/v2，agent 不得代拍.
 
     Enforced structurally -- the Board simply has no verdict-publishing method.
     """
@@ -383,7 +446,7 @@ class TestAgentMayNotDecide:
         board.observe({"event": "tick"}, "i7")
 
         kinds = {body.get("kind") for body in transport.published}
-        assert DECISION_KIND not in kinds
+        assert not kinds & set(DECISION_KINDS)
 
     def test_no_public_method_smells_like_deciding(self, board: Board) -> None:
         forbidden = ("decide", "verdict", "approve", "resolve_question")

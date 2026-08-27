@@ -43,7 +43,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from fleet_graph.bus.board import DECISION_KIND, NOTE_KIND, WORK_NOTES, Board, GateTicket
+from fleet_graph.bus.board import DECISION_KIND_V2, NOTE_KIND, WORK_NOTES, Board, GateTicket
 from fleet_graph.bus.client import DEFAULT_BUS_URL, BusClient
 from fleet_graph.executors.agent_run import (
     AgentRunLauncher,
@@ -399,10 +399,15 @@ def build_supervisor_graph(deps: SupervisorDeps) -> StateGraph:
                     # (the predicate node) -- an invalid candidate is a
                     # recorded rejection there, never an error here.
                     notes, _ = deps.bus.messages(WORK_NOTES, limit=1000)
+                    # Only v2: the registered v1 payload_schema
+                    # (additionalProperties:false, 5 fields) structurally
+                    # cannot carry a preauth payload -- the bus rejects it
+                    # with VALIDATION_ERROR -- so no v1 preauth can exist on
+                    # the board.
                     facts["preauth_candidates"] = [
                         m
                         for m in notes
-                        if m.get("kind") == DECISION_KIND
+                        if m.get("kind") == DECISION_KIND_V2
                         and (m.get("payload") or {}).get("kind") == PREAUTH_PAYLOAD_KIND
                     ]
                 except Exception as exc:  # facts, not guesses

@@ -1,7 +1,7 @@
 """The pending-verdict view: questions nobody has answered yet.
 
 Zero new storage on purpose. A question is pending exactly when
-`Board.decision_for()` finds no `work.decision.v1` referencing it -- the same
+`Board.decision_for()` finds no decision (v1 or v2) referencing it -- the same
 primitive the dd gate resumes on, so this view can never disagree with what a
 suspended pipeline would do. The old supervisor's sqlite Decision Inbox is the
 counter-example this replaces: a second copy of "pending" that nothing ever
