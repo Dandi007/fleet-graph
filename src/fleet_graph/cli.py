@@ -218,10 +218,19 @@ def _scheduler_run(args: argparse.Namespace) -> int:
 
     from fleet_graph.scheduler.daemon import Scheduler, SchedulerConfig
     from fleet_graph.scheduler.launcher import TransientLauncher
-    from fleet_graph.scheduler.probe import GatewayProber, HttpxProbeTransport
+    from fleet_graph.scheduler.probe import CliGatewayProber, GatewayProber, HttpxProbeTransport
     from fleet_graph.scheduler.wake import LiveWakeSignals
 
     config = SchedulerConfig.from_json(pathlib.Path(args.config))
+
+    # R3 step 2 canary switch: same check(seat) contract either way, so the
+    # Scheduler injection point is unchanged and rollback is config + restart.
+    if args.no_probe:
+        prober = None
+    elif config.probe_via_runtime:
+        prober = CliGatewayProber()
+    else:
+        prober = GatewayProber(HttpxProbeTransport())
 
     # The board question on parking is best-effort: a scheduler without a bus
     # credential still schedules, it just cannot escalate. Constructing the
@@ -237,7 +246,7 @@ def _scheduler_run(args: argparse.Namespace) -> int:
 
     scheduler = Scheduler(
         config,
-        prober=None if args.no_probe else GatewayProber(HttpxProbeTransport()),
+        prober=prober,
         launcher=TransientLauncher(dry_run=args.dry_run),
         observe=lambda result: print(json.dumps(result.as_dict(), ensure_ascii=False), flush=True),
         wake=LiveWakeSignals(),
