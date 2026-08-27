@@ -135,7 +135,14 @@ class RecordingArtifacts:
         return True
 
     def write_terminal(
-        self, *, terminal: str, rounds: int, reason: str | None = None, pump_fault: bool = False
+        self,
+        *,
+        terminal: str,
+        rounds: int,
+        reason: str | None = None,
+        pump_fault: bool = False,
+        waiting_on: str = "none",
+        waiting_on_declared: str | None = None,
     ) -> str:
         self.terminal = {"terminal": terminal, "rounds": rounds}
         return "terminal.json"

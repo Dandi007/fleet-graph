@@ -44,10 +44,18 @@ class ToolCaller(Protocol):
 
 
 class FastMCPCaller:
-    """Calls one tool per short-lived session, like the ronin-mcp backend."""
+    """Calls one tool per short-lived session, like the ronin-mcp backend.
 
-    def __init__(self, url: str = DEFAULT_WORK_FOLDER_MCP_URL) -> None:
+    `timeout` (seconds) bounds the HTTP layer when set. The scheduler's wake
+    probes need this: a hung MCP must cost a few seconds and fail open, not
+    stall the tick loop.
+    """
+
+    def __init__(
+        self, url: str = DEFAULT_WORK_FOLDER_MCP_URL, timeout: float | None = None
+    ) -> None:
         self.url = url
+        self.timeout = timeout
 
     def call(self, tool: str, arguments: dict[str, Any]) -> Any:
         return asyncio.run(self._call(tool, arguments))
@@ -56,9 +64,12 @@ class FastMCPCaller:
         from fastmcp import Client
         from fastmcp.client.transports import StreamableHttpTransport
 
-        client = Client(
-            StreamableHttpTransport(self.url, httpx_client_factory=_loopback_httpx_client)
-        )
+        def factory(**kwargs: Any) -> Any:
+            if self.timeout is not None:
+                kwargs["timeout"] = self.timeout
+            return _loopback_httpx_client(**kwargs)
+
+        client = Client(StreamableHttpTransport(self.url, httpx_client_factory=factory))
         try:
             async with client:
                 result = await client.call_tool(tool, arguments)
@@ -200,6 +211,15 @@ class WorkFolder:
                 "new_string": new_string,
             },
         )
+
+    def stat(self, filename: str) -> dict[str, Any]:
+        """fs_stat: size and content_revision without the content.
+
+        The scheduler's goal.md wake probe reads `content_revision` off this --
+        a changed revision since parking is the mechanical fact that someone
+        edited the goal, without this layer ever reading the prose.
+        """
+        return self._call("fs_stat", {"folder_id": self.folder_id, "filename": filename})
 
     def list(self, dirname: str = "") -> list[dict[str, Any]]:
         result = self._call("fs_list", {"folder_id": self.folder_id, "dirname": dirname})

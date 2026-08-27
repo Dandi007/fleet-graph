@@ -40,6 +40,7 @@ class Refusal(StrEnum):
     MAINTENANCE_STOP = "maintenance_stop"
     ALREADY_RUNNING = "already_running"
     TERMINAL_DONE = "terminal_done"
+    PARKED_AWAITING_DECISION = "parked_awaiting_decision"
     COOLING_DOWN = "cooling_down"
     TOTAL_CAP_REACHED = "total_cap_reached"
     GATEWAY_RED = "gateway_red"
@@ -95,6 +96,7 @@ def decide(
     gateway_healthy: bool | None,
     unproductive_recent: int,
     zero_progress_streak: int,
+    parked: bool = False,
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
     total_cap: int = DEFAULT_TOTAL_CAP,
     cap_window_seconds: float = DEFAULT_CAP_WINDOW_SECONDS,
@@ -135,6 +137,23 @@ def decide(
         # A finished line stays finished. Restarting it would re-run work that
         # already passed acceptance.
         return IgnitionDecision(False, Refusal.TERMINAL_DONE, f"{status.folder_id} terminated done")
+
+    if parked:
+        # Before the backoff branch on purpose. A line whose last terminal was
+        # blocked waiting on a *human decision* is not going to be unblocked by
+        # trying again on a timer: every backoff-paced relaunch re-derives the
+        # same blockage at full coordinator cost. The scheduler computes
+        # `parked` from mechanical facts only (terminal waiting_on=decision and
+        # no wake fact -- see daemon.py), and any failure to probe those facts
+        # comes in here as parked=False, falling through to plain backoff:
+        # parking saves money, it must never be able to lock a line shut.
+        return IgnitionDecision(
+            False,
+            Refusal.PARKED_AWAITING_DECISION,
+            f"{status.folder_id} is blocked waiting on a human decision; "
+            "parked until a wake fact appears (inbox message, goal.md change, "
+            "or the parked fields are cleared from its stall-state file)",
+        )
 
     wait = backoff_seconds(cooldown_seconds, zero_progress_streak, backoff_cap_seconds)
     if status.last_start_at is not None and now - status.last_start_at < wait:

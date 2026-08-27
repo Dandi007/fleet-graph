@@ -76,9 +76,22 @@ from fleet_graph.scheduler.probe import (
     MissingProbeCredential,
     UnknownSeat,
 )
+from fleet_graph.scheduler.wake import WakeSignals, parse_bus_timestamp
 
 DEFAULT_MAINTENANCE_STOP = Path("/data/fleet-graph/maintenance-stop")
 DEFAULT_INTERVAL_SECONDS = 60.0
+
+#: Parking bookkeeping, kept in the stall-state file. `park_considered_run_id`
+#: marks a terminal the parking logic already looked at, so an operator who
+#: clears the `parked_*` fields (the runbook escape hatch) is not re-parked on
+#: the very next tick by the same blocked terminal. The other three are the
+#: parking snapshot itself.
+_EMPTY_PARK_FIELDS: dict[str, Any] = {
+    "park_considered_run_id": None,
+    "parked_run_id": None,
+    "parked_at": None,
+    "parked_goal_revision": None,
+}
 
 
 @dataclass(frozen=True)
@@ -103,6 +116,18 @@ class TickResult:
     decision: IgnitionDecision
     launch: LaunchResult | None = None
     probe_detail: str | None = None
+    #: True on every tick the line is held parked (blocked waiting on a human
+    #: decision, no wake fact yet).
+    parked: bool = False
+    #: What the parking machinery did this tick, when anything happened:
+    #: "established", "woken:inbox", "woken:goal_revision", "woken:probe_failed".
+    park_event: str | None = None
+    #: The blocked terminal's reason, truncated. Display only -- an operator
+    #: scanning the log should see *what* the line is waiting on without
+    #: opening the run root. Never an input to any decision here (INV-3).
+    blocker: str | None = None
+    #: Outcome of the best-effort board question on the parking tick.
+    board_question: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -113,11 +138,29 @@ class TickResult:
         }
         if self.probe_detail is not None:
             record["probe_detail"] = self.probe_detail
+        if self.parked:
+            record["parked"] = True
+        if self.park_event is not None:
+            record["park_event"] = self.park_event
+        if self.blocker is not None:
+            record["blocker"] = self.blocker
+        if self.board_question is not None:
+            record["board_question"] = self.board_question
         if self.launch is not None:
             record["unit"] = self.launch.unit_name
             record["launched"] = self.launch.started
             record["launch_detail"] = self.launch.detail
         return record
+
+
+@dataclass(frozen=True)
+class ParkOutcome:
+    """What the parking machinery concluded about one line this tick."""
+
+    parked: bool = False
+    event: str | None = None
+    blocker: str | None = None
+    board_question: str | None = None
 
 
 class UnitProbe(Protocol):
@@ -189,6 +232,8 @@ class Scheduler:
         clock: Any = None,
         observe: Any = None,
         sleep: Any = None,
+        wake: WakeSignals | None = None,
+        board: Any = None,
     ) -> None:
         self.config = config
         self.prober = prober
@@ -197,6 +242,13 @@ class Scheduler:
         self.clock = clock or time.time
         self.observe = observe
         self.sleep = sleep or time.sleep
+        #: Wake facts for parking. None disables parking outright -- the same
+        #: fail-open reading as a probe failure: no way to observe wake facts
+        #: means no parking, and the line stays on plain backoff.
+        self.wake = wake
+        #: bus.board.Board for the best-effort question note on parking.
+        #: None means parking is log-visible only.
+        self.board = board
         self.total_started = 0
         #: Timestamps of launches that followed a run which advanced no round.
         #: The global cap counts these, not every launch -- see `decide`.
@@ -252,7 +304,30 @@ class Scheduler:
             "terminal": record.get("terminal"),
             "rounds": record.get("rounds"),
             "run_id": record.get("run_id"),
+            # Both written by this engine's own finalise, both mechanical:
+            # `waiting_on` is a normalised enum (never free text -- see
+            # normalize_waiting_on), `at` a timestamp. Parking reads them.
+            "waiting_on": record.get("waiting_on"),
+            "at": record.get("at"),
         }
+
+    def blocker_summary(self, folder_id: str) -> str | None:
+        """The blocked terminal's `reason`, truncated, for display only.
+
+        This is the one place the scheduler touches an agent's prose, and it
+        flows exclusively into the observe log and the board question -- a
+        human's eyes -- never into a decision. `decide` sees only the
+        mechanical `parked` bool.
+        """
+        path = self.config.run_root / folder_id / "terminal.json"
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        reason = record.get("reason") if isinstance(record, dict) else None
+        if not isinstance(reason, str) or not reason:
+            return None
+        return reason[:200]
 
     def terminal_of(self, folder_id: str) -> str | None:
         """What the line last wrote, or None if it never terminated."""
@@ -268,7 +343,13 @@ class Scheduler:
         return self.config.run_root / ".scheduler" / f"{folder_id}.json"
 
     def stall_state(self, folder_id: str) -> dict[str, Any]:
-        empty = {"streak": 0, "accounted_run_id": None, "last_start_at": None, "generation": None}
+        empty = {
+            "streak": 0,
+            "accounted_run_id": None,
+            "last_start_at": None,
+            "generation": None,
+            **_EMPTY_PARK_FIELDS,
+        }
         try:
             state = json.loads(self._stall_path(folder_id).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -280,6 +361,13 @@ class Scheduler:
             "accounted_run_id": state.get("accounted_run_id"),
             "last_start_at": state.get("last_start_at"),
             "generation": state.get("generation"),
+            # Parking lives in this same file, under this same discipline:
+            # it must survive a daemon restart, and deleting the file is the
+            # documented "retry now" escape hatch for parking too.
+            "park_considered_run_id": state.get("park_considered_run_id"),
+            "parked_run_id": state.get("parked_run_id"),
+            "parked_at": state.get("parked_at"),
+            "parked_goal_revision": state.get("parked_goal_revision"),
         }
 
     def _write_stall_state(self, folder_id: str, state: dict[str, Any]) -> None:
@@ -366,6 +454,11 @@ class Scheduler:
                         "generation": self._next_generation(
                             base_generation, record.get("terminal")
                         ),
+                        # An adopted terminal is marked park-considered without
+                        # parking it: "delete the counter file to retry now" is
+                        # the runbook hatch, and a delete that re-parked the
+                        # line on the next tick would make the hatch a no-op.
+                        **{**_EMPTY_PARK_FIELDS, "park_considered_run_id": record["run_id"]},
                     },
                 )
             return 0
@@ -391,6 +484,10 @@ class Scheduler:
                 "accounted_run_id": run_id,
                 "last_start_at": state["last_start_at"],
                 "generation": self._next_generation(current_generation, record.get("terminal")),
+                # A new terminal supersedes any parking of the previous run:
+                # its snapshot is cleared, and this run is not yet considered,
+                # so the parking logic gets to look at it exactly once.
+                **_EMPTY_PARK_FIELDS,
             },
         )
         return streak
@@ -430,6 +527,145 @@ class Scheduler:
         state = self.stall_state(folder_id)
         state["last_start_at"] = when
         self._write_stall_state(folder_id, state)
+
+    # --- parking ----------------------------------------------------------
+    #
+    # A line whose last terminal is `blocked` with `waiting_on: "decision"` is
+    # waiting for a human, and no amount of backoff-paced relaunching changes
+    # that -- each relaunch re-derives the same blockage at full coordinator
+    # cost. So the scheduler *parks* it: refuses ignition until a mechanical
+    # wake fact appears. Three wake sources, all facts and no prose:
+    #
+    #   1. a message arrived in the line's inbox after the blocked terminal;
+    #   2. goal.md's content_revision changed since the parking snapshot;
+    #   3. an operator cleared the `parked_*` fields from the stall-state file
+    #      (the runbook escape hatch -- `park_considered_run_id` stays behind
+    #      so the same terminal is not immediately re-parked).
+    #
+    # Failure discipline: parking is an optimisation, never a judgement. Any
+    # failure to observe a wake fact -- no bus token, MCP down, timeout --
+    # fails *open*: the line is treated as not parked and falls back to the
+    # ordinary backoff behaviour. A probe outage may cost money; it must never
+    # be able to lock a line shut.
+
+    def park_state(self, line: LineSpec, now: float) -> ParkOutcome:
+        """Is this line parked right now? Establishes, holds, or wakes."""
+        record = self.terminal_record(line.folder_id)
+        if (
+            record is None
+            or record.get("terminal") != "blocked"
+            or record.get("waiting_on") != "decision"
+            or record.get("run_id") is None
+        ):
+            return ParkOutcome()
+        run_id = record["run_id"]
+        state = self.stall_state(line.folder_id)
+
+        if state["parked_run_id"] == run_id and state["parked_at"] is not None:
+            return self._check_wake(line, record, state)
+
+        if state["park_considered_run_id"] == run_id:
+            # Considered once and not parked: probes failed open then, or the
+            # operator released it, or a wake already fired. Plain backoff.
+            return ParkOutcome()
+
+        return self._establish_park(line, record, state, now)
+
+    def _terminal_epoch(self, record: dict[str, Any]) -> float:
+        return parse_bus_timestamp(record.get("at"))
+
+    def _establish_park(
+        self, line: LineSpec, record: dict[str, Any], state: dict[str, Any], now: float
+    ) -> ParkOutcome:
+        run_id = record["run_id"]
+        # Considered exactly once, whatever happens next: fail-open and
+        # already-present wake facts must not be re-probed every tick forever.
+        state["park_considered_run_id"] = run_id
+        try:
+            if self.wake is None:
+                raise RuntimeError("scheduler has no wake signals configured")
+            if line.alias and self.wake.inbox_message_after(
+                line.alias, self._terminal_epoch(record)
+            ):
+                # The wake fact predates the parking: something already
+                # arrived for this line. Never park it -- backoff will pick
+                # the message up on its own schedule.
+                self._write_stall_state(line.folder_id, state)
+                return ParkOutcome(event="not_parked:inbox_already_has_mail")
+            revision = self.wake.goal_revision(line.folder_id)
+        except Exception as exc:  # fail open, by design
+            self._write_stall_state(line.folder_id, state)
+            return ParkOutcome(event=f"not_parked:probe_failed:{type(exc).__name__}")
+
+        state["parked_run_id"] = run_id
+        state["parked_at"] = now
+        state["parked_goal_revision"] = revision
+        self._write_stall_state(line.folder_id, state)
+
+        blocker = self.blocker_summary(line.folder_id)
+        return ParkOutcome(
+            parked=True,
+            event="established",
+            blocker=blocker,
+            board_question=self._ask_board(line, record, blocker),
+        )
+
+    def _check_wake(
+        self, line: LineSpec, record: dict[str, Any], state: dict[str, Any]
+    ) -> ParkOutcome:
+        try:
+            if self.wake is None:
+                raise RuntimeError("scheduler has no wake signals configured")
+            if line.alias and self.wake.inbox_message_after(
+                line.alias, self._terminal_epoch(record)
+            ):
+                return self._wake(line, state, "woken:inbox")
+            if self.wake.goal_revision(line.folder_id) != state["parked_goal_revision"]:
+                return self._wake(line, state, "woken:goal_revision")
+        except Exception as exc:  # fail open, by design
+            return self._wake(line, state, f"woken:probe_failed:{type(exc).__name__}")
+        return ParkOutcome(parked=True, blocker=self.blocker_summary(line.folder_id))
+
+    def _wake(self, line: LineSpec, state: dict[str, Any], event: str) -> ParkOutcome:
+        """Clear the parking snapshot; the normal decide order takes over.
+
+        `park_considered_run_id` deliberately survives: this terminal has had
+        its one parking, and re-parking it (with, say, a freshly snapshotted
+        goal revision) would swallow the very wake that just fired.
+        """
+        cleared = {
+            **state,
+            "parked_run_id": None,
+            "parked_at": None,
+            "parked_goal_revision": None,
+        }
+        self._write_stall_state(line.folder_id, cleared)
+        return ParkOutcome(parked=False, event=event)
+
+    def _ask_board(self, line: LineSpec, record: dict[str, Any], blocker: str | None) -> str | None:
+        """Best-effort question note on the work board, once per parking.
+
+        Known contract gap, deliberately not worked around: `work.note.v1`
+        requires a ref to an *existing* board entity, and a goal line has no
+        board card. The ask is attempted with the folder id and the bus is
+        left to accept or refuse it; a refusal degrades parking to
+        observe-log visibility only. Full escalation surfacing is R4's.
+        """
+        if self.board is None:
+            return None
+        question = (
+            f"line {line.folder_id} parked: blocked waiting on a human decision "
+            f"(run {record['run_id']}). blocker: {blocker or 'see terminal.json'}"
+        )
+        try:
+            ticket = self.board.ask(
+                card_entity_id=line.folder_id,
+                question=question,
+                idempotency_key=f"parked:{line.folder_id}:{record['run_id']}",
+            )
+            return f"question_sent:{ticket.question_note_id}"
+        except Exception as exc:  # telemetry must not bite
+            return f"question_failed:{type(exc).__name__}:{str(exc)[:160]}"
 
     def status_of(self, line: LineSpec) -> LineStatus:
         return LineStatus(
@@ -509,12 +745,16 @@ class Scheduler:
             # Accounting runs first: a terminal observed this tick must bump
             # the generation before status_of probes and spec_for launches.
             streak = self.account_last_run(line.folder_id, base_generation=line.generation)
+            # Disabled lines skip the parking probes: no point spending two
+            # network calls on a line decide would refuse anyway.
+            park = self.park_state(line, now) if line.enabled else ParkOutcome()
             decision = decide(
                 self.status_of(line),
                 now=now,
                 enabled=line.enabled,
                 maintenance_stop=stopped,
                 zero_progress_streak=streak,
+                parked=park.parked,
                 gateway_healthy=self.gateway_healthy(line.seat),
                 unproductive_recent=self.unproductive_recent(now),
                 cooldown_seconds=self.config.cooldown_seconds,
@@ -522,7 +762,14 @@ class Scheduler:
                 cap_window_seconds=self.config.cap_window_seconds,
                 backoff_cap_seconds=self.config.backoff_cap_seconds,
             )
-            result = TickResult(line.folder_id, decision)
+            result = TickResult(
+                line.folder_id,
+                decision,
+                parked=park.parked,
+                park_event=park.event,
+                blocker=park.blocker,
+                board_question=park.board_question,
+            )
             if decision.refusal is Refusal.NO_PROBE:
                 result.probe_detail = self.probe_reasons.get(line.seat)
             if decision.ignite:
@@ -577,6 +824,7 @@ __all__ = [
     "DEFAULT_INTERVAL_SECONDS",
     "DEFAULT_MAINTENANCE_STOP",
     "LineSpec",
+    "ParkOutcome",
     "Scheduler",
     "SchedulerConfig",
     "SystemdUnitProbe",

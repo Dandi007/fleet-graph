@@ -219,6 +219,13 @@ class TestEquivalenceWithTheRealPump:
         samples = sorted(self.RUNS_ROOT.glob(f"**/{name}"), key=lambda p: p.stat().st_mtime)
         return samples[-1] if samples else None
 
+    #: Fields fleet-graph added on top of the transcribed pump shape. The
+    #: legacy samples under /data/ronin/runs are from the retired pump and
+    #: will never grow them; the equivalence check below covers the
+    #: transcribed core, and additions here must be additive-only so
+    #: fleet-sentinel's reads of the old fields keep working.
+    FLEET_GRAPH_ADDITIONS = frozenset({"waiting_on", "waiting_on_declared"})
+
     @pytest.mark.parametrize(
         ("filename", "expected"),
         [("heartbeat.json", HEARTBEAT_FIELDS), ("terminal.json", TERMINAL_FIELDS)],
@@ -228,7 +235,56 @@ class TestEquivalenceWithTheRealPump:
         if sample is None:
             pytest.skip(f"no live {filename} available on this machine")
         real = set(json.loads(sample.read_text(encoding="utf-8")))
-        assert real == set(expected), (
+        core = set(expected) - self.FLEET_GRAPH_ADDITIONS
+        assert real == core, (
             f"{filename} drifted from the live pump: "
-            f"missing={sorted(real - set(expected))} extra={sorted(set(expected) - real)}"
+            f"missing={sorted(real - core)} extra={sorted(core - real)}"
         )
+
+
+class TestWaitingOnField:
+    """The parking machine field, always present so the field set stays exact."""
+
+    def test_defaults_to_none(self, artifacts: RunArtifacts) -> None:
+        artifacts.write_terminal(terminal="done", rounds=3)
+        event = read_json(artifacts.terminal_path)
+        assert event["waiting_on"] == "none"
+        assert event["waiting_on_declared"] is None
+
+    def test_written_when_declared(self, artifacts: RunArtifacts) -> None:
+        artifacts.write_terminal(
+            terminal="blocked",
+            rounds=5,
+            reason="needs a ruling",
+            waiting_on="decision",
+            waiting_on_declared="decision",
+        )
+        event = read_json(artifacts.terminal_path)
+        assert event["waiting_on"] == "decision"
+        assert event["waiting_on_declared"] == "decision"
+
+
+class TestNormalizeWaitingOn:
+    def test_absent_is_none_and_nothing_declared(self) -> None:
+        from fleet_graph.state.run_artifacts import normalize_waiting_on
+
+        assert normalize_waiting_on(None) == ("none", None)
+
+    @pytest.mark.parametrize("value", ["decision", "external", "none"])
+    def test_known_values_pass_through(self, value: str) -> None:
+        from fleet_graph.state.run_artifacts import normalize_waiting_on
+
+        assert normalize_waiting_on(value) == (value, value)
+
+    def test_case_and_whitespace_are_forgiven(self) -> None:
+        from fleet_graph.state.run_artifacts import normalize_waiting_on
+
+        assert normalize_waiting_on(" Decision ") == ("decision", " Decision ")
+
+    def test_unknown_values_normalise_to_none_but_are_kept(self) -> None:
+        """Parking is an optimisation: a coordinator inventing a value must
+        degrade to no parking, never to a fault."""
+        from fleet_graph.state.run_artifacts import normalize_waiting_on
+
+        assert normalize_waiting_on("human") == ("none", "human")
+        assert normalize_waiting_on(42) == ("none", "42")
