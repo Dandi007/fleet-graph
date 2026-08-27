@@ -210,9 +210,10 @@ class TestItReadsOnlyWhatItNeeds:
         This started as "only `terminal` is read". The stall guard needs
         `rounds` and `run_id` too; parking added `waiting_on` (a normalised
         enum the engine's own finalise writes -- never free text) and `at` (a
-        timestamp). Widening the assertion to admit those is not a loosening:
-        all five are counts, ids, enums and stamps this engine's own pump
-        writes. What must stay out of *decisions* is `reason` -- prose an
+        timestamp); the supervisor observer's E3 scan added `pump_fault`
+        (finalise's own bool). Widening the assertion to admit those is not a
+        loosening: all six are counts, ids, enums, bools and stamps this
+        engine's own pump writes. What must stay out of *decisions* is `reason` -- prose an
         agent wrote. A scheduler that keyed on that would be judging the work,
         and would also be wrong: the canary blocked twice on the same missing
         data source and reworded it to a bigram similarity of 0.28.
@@ -229,7 +230,8 @@ class TestItReadsOnlyWhatItNeeds:
 
         source = Path(daemon.__file__).read_text(encoding="utf-8")
         reads = set(re.findall(r'record\.get\("([a-z_]+)"\)', source))
-        assert reads - {"reason"} <= {"terminal", "rounds", "run_id", "waiting_on", "at"}, reads
+        allowed = {"terminal", "rounds", "run_id", "waiting_on", "at", "pump_fault"}
+        assert reads - {"reason"} <= allowed, reads
 
         display_only = inspect.getsource(daemon.Scheduler.blocker_summary)
         assert source.count('record.get("reason")') == display_only.count('record.get("reason")')

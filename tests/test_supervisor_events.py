@@ -1,0 +1,421 @@
+"""The supervisor event observer: four scans, two budgets, zero second loops.
+
+The retreat-verified trio the R4-2 ticket names:
+
+- E2 wiring: a blocked+waiting_on=decision terminal becomes exactly one
+  `supervisor run` launch with the right event JSON;
+- budgets: at most two launches per tick, at most three lifetime attempts per
+  event key, and neither is consumed by an audit already in flight;
+- fail-open: a broken scan or a dead bus costs observation, never the tick.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from fleet_graph.scheduler.daemon import LineSpec, Scheduler, SchedulerConfig, TickResult
+from fleet_graph.scheduler.ignition import IgnitionDecision, Refusal
+from fleet_graph.scheduler.supervisor_events import (
+    ObserverConfig,
+    SupervisorLaunchSpec,
+    SupervisorObserver,
+)
+from fleet_graph.supervise.events import line_fault_event
+
+
+class RecordingLauncher:
+    """Stands in for TransientLauncher; records specs, reports success."""
+
+    def __init__(self, *, start: bool = True) -> None:
+        self.specs: list[Any] = []
+        self.start = start
+
+    def launch(self, spec: Any):
+        self.specs.append(spec)
+
+        class _Result:
+            unit_name = spec.unit_name
+            started = self.start
+            detail = "recorded"
+
+        return _Result()
+
+    def events(self) -> list[dict[str, Any]]:
+        parsed = []
+        for spec in self.specs:
+            argv = spec.argv()
+            parsed.append(json.loads(argv[argv.index("--event-json") + 1]))
+        return parsed
+
+
+class StaticUnits:
+    def __init__(self, active: bool = False) -> None:
+        self.active = active
+
+    def is_active(self, unit_name: str) -> bool:
+        return self.active
+
+
+class FakeBus:
+    """messages/refs_to as the observer and Board use them."""
+
+    def __init__(self) -> None:
+        self.notes: list[dict[str, Any]] = []
+        self.decisions: dict[str, str] = {}  # question note id -> decision msg id
+
+    def add_question(self, message_id: str, card: str, seq: int) -> None:
+        self.notes.append(
+            {
+                "message_id": message_id,
+                "channel_seq": seq,
+                "kind": "work.note.v1",
+                "payload": {"note_type": "question", "card_entity_id": card, "note": "?"},
+            }
+        )
+
+    def add_decision_for(self, question_id: str, decision_id: str, seq: int) -> None:
+        self.decisions[question_id] = decision_id
+        self.notes.append(
+            {
+                "message_id": decision_id,
+                "channel_seq": seq,
+                "kind": "work.decision.v1",
+                "payload": {"decision": "APPROVE"},
+            }
+        )
+
+    def messages(self, channel: str, *, limit: int = 100, after_seq: int = 0):
+        selected = [n for n in self.notes if n["channel_seq"] > after_seq][:limit]
+        head = max((n["channel_seq"] for n in self.notes), default=0)
+        return selected, head
+
+    def refs_to(self, entity_id: str) -> list[dict[str, Any]]:
+        if entity_id in self.decisions:
+            return [{"message_id": self.decisions[entity_id]}]
+        return []
+
+
+def observer_for(
+    tmp_path: Path,
+    *,
+    bus: Any = None,
+    units: Any = None,
+    max_per_tick: int = 2,
+    max_attempts: int = 3,
+) -> tuple[SupervisorObserver, RecordingLauncher]:
+    launcher = RecordingLauncher()
+    observer = SupervisorObserver(
+        ObserverConfig(
+            run_root=tmp_path / "runs",
+            supervisor_state_root=tmp_path / "supervisor",
+            max_launches_per_tick=max_per_tick,
+            max_attempts_per_key=max_attempts,
+            cap_window_seconds=3600.0,
+        ),
+        launcher=launcher,  # type: ignore[arg-type]
+        bus=bus,
+        units=units,
+    )
+    return observer, launcher
+
+
+def terminal(
+    terminal_value: str, run_id: str, *, waiting_on: str | None = None, pump_fault: bool = False
+) -> dict[str, Any]:
+    return {
+        "terminal": terminal_value,
+        "rounds": 0,
+        "run_id": run_id,
+        "waiting_on": waiting_on,
+        "pump_fault": pump_fault,
+        "at": "2026-08-27T10:00:00Z",
+    }
+
+
+def tick(observer: SupervisorObserver, folders: dict[str, Any], results: list[Any] | None = None):
+    return observer.after_tick(
+        now=1_000_000.0,
+        folder_ids=list(folders),
+        terminal_reader=lambda folder: folders[folder],
+        tick_results=results or [],
+    )
+
+
+class TestTerminalEvents:
+    def test_e2_blocked_decision_launches_supervisor_run(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(tmp_path)
+        actions = tick(observer, {"wf-a": terminal("blocked", "run-1", waiting_on="decision")})
+        [event] = launcher.events()
+        assert event["type"] == "blocked_decision"
+        assert event["key"] == "e2-run-1"
+        assert event["payload"] == {"folder_id": "wf-a", "run_id": "run-1"}
+        assert any(a.get("action") == "launched" for a in actions)
+
+    def test_e2_ignores_blocked_waiting_on_external(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(tmp_path)
+        tick(observer, {"wf-a": terminal("blocked", "run-1", waiting_on="external")})
+        assert launcher.events() == []
+
+    def test_e3_fault_launches_line_fault_event(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(tmp_path)
+        tick(observer, {"wf-a": terminal("fault", "run-9")})
+        [event] = launcher.events()
+        assert event["type"] == "line_fault"
+        assert event["key"] == "e3-run-9"
+
+    def test_e3_pump_fault_alone_is_enough(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(tmp_path)
+        tick(observer, {"wf-a": terminal("blocked", "run-9", pump_fault=True)})
+        [event] = launcher.events()
+        assert event["type"] == "line_fault"
+
+    def test_done_and_running_lines_emit_nothing(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(tmp_path)
+        tick(observer, {"wf-a": terminal("done", "run-1"), "wf-b": None})
+        assert launcher.events() == []
+
+
+class TestCapEvents:
+    def _capped(self, folder: str) -> TickResult:
+        return TickResult(
+            folder,
+            IgnitionDecision(ignite=False, refusal=Refusal.TOTAL_CAP_REACHED, detail="cap"),
+        )
+
+    def test_e4_cap_refusal_launches_one_bucketed_event(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(tmp_path)
+        tick(observer, {}, results=[self._capped("wf-a"), self._capped("wf-b")])
+        [event] = launcher.events()
+        assert event["type"] == "cap_breaker"
+        assert event["key"] == "e4-cap-277"  # 1_000_000 // 3600
+        assert event["payload"]["folder_ids"] == ["wf-a", "wf-b"]
+
+    def test_other_refusals_do_not_trip_e4(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(tmp_path)
+        result = TickResult(
+            "wf-a", IgnitionDecision(ignite=False, refusal=Refusal.COOLING_DOWN, detail="")
+        )
+        tick(observer, {}, results=[result])
+        assert launcher.events() == []
+
+
+class TestBudgets:
+    def test_at_most_two_launches_per_tick(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(tmp_path)
+        folders = {
+            "wf-a": terminal("fault", "run-1"),
+            "wf-b": terminal("fault", "run-2"),
+            "wf-c": terminal("fault", "run-3"),
+        }
+        actions = tick(observer, folders)
+        assert len(launcher.events()) == 2
+        assert any(a.get("action") == "deferred:tick_budget" for a in actions)
+
+    def test_lifetime_attempts_cap_at_three(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(tmp_path)
+        folders = {"wf-a": terminal("fault", "run-1")}
+        for _ in range(5):
+            tick(observer, folders)
+        assert len(launcher.events()) == 3
+        actions = tick(observer, folders)
+        assert any("attempts_exhausted" in a.get("action", "") for a in actions)
+
+    def test_attempts_survive_a_restart(self, tmp_path: Path) -> None:
+        observer, _launcher = observer_for(tmp_path)
+        folders = {"wf-a": terminal("fault", "run-1")}
+        for _ in range(3):
+            tick(observer, folders)
+        # A fresh observer object stands in for a restarted daemon.
+        observer2, launcher2 = observer_for(tmp_path)
+        tick(observer2, folders)
+        assert launcher2.events() == []
+
+    def test_in_flight_audit_burns_no_attempt(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(tmp_path, units=StaticUnits(active=True))
+        folders = {"wf-a": terminal("fault", "run-1")}
+        actions = tick(observer, folders)
+        assert launcher.events() == []
+        assert any(a.get("action") == "skipped:audit_in_flight" for a in actions)
+        # The attempt counter did not move.
+        state = json.loads(
+            (tmp_path / "runs" / ".scheduler" / "supervisor-cursor.json").read_text()
+        )
+        assert state["attempts"] == {}
+
+    def test_receipt_ends_the_event_for_good(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(tmp_path)
+        reports = tmp_path / "supervisor" / "reports"
+        reports.mkdir(parents=True)
+        (reports / "e3-run-1.json").write_text("{}")
+        actions = tick(observer, {"wf-a": terminal("fault", "run-1")})
+        assert launcher.events() == []
+        assert any(a.get("action") == "skipped:receipt_exists" for a in actions)
+
+
+class TestBoardScan:
+    def test_first_run_adopts_head_and_processes_nothing(self, tmp_path: Path) -> None:
+        bus = FakeBus()
+        bus.add_question("msg_old", "card-1", seq=5)
+        observer, launcher = observer_for(tmp_path, bus=bus)
+        actions = tick(observer, {})
+        assert launcher.events() == []
+        assert any("cursor_adopted:head_seq=5" in a.get("action", "") for a in actions)
+
+    def test_new_undecided_question_becomes_e1(self, tmp_path: Path) -> None:
+        bus = FakeBus()
+        observer, launcher = observer_for(tmp_path, bus=bus)
+        tick(observer, {})  # adopt baseline
+        bus.add_question("msg_q1", "card-1", seq=6)
+        tick(observer, {})
+        [event] = launcher.events()
+        assert event["type"] == "board_question"
+        assert event["key"] == "e1-msg_q1"
+        assert event["payload"]["card_entity_id"] == "card-1"
+
+    def test_decided_question_is_skipped_and_cursor_advances(self, tmp_path: Path) -> None:
+        bus = FakeBus()
+        observer, launcher = observer_for(tmp_path, bus=bus)
+        tick(observer, {})
+        bus.add_question("msg_q1", "card-1", seq=6)
+        bus.add_decision_for("msg_q1", "msg_d1", seq=7)
+        tick(observer, {})
+        assert launcher.events() == []
+        # Cursor moved past both messages: the next tick re-reads nothing.
+        state = json.loads(
+            (tmp_path / "runs" / ".scheduler" / "supervisor-cursor.json").read_text()
+        )
+        assert state["board_seq"] == 7
+
+    def test_budget_deferral_leaves_cursor_before_the_question(self, tmp_path: Path) -> None:
+        bus = FakeBus()
+        observer, launcher = observer_for(tmp_path, bus=bus)
+        tick(observer, {})
+        # A non-question at seq 5 shows the cursor advancing *up to* -- and
+        # then stopping *before* -- the deferred question at seq 6.
+        bus.notes.append(
+            {
+                "message_id": "msg_p1",
+                "channel_seq": 5,
+                "kind": "work.note.v1",
+                "payload": {"note_type": "progress", "note": "…"},
+            }
+        )
+        bus.add_question("msg_q1", "card-1", seq=6)
+        # Two terminal events eat the whole tick budget.
+        folders = {
+            "wf-a": terminal("fault", "run-1"),
+            "wf-b": terminal("fault", "run-2"),
+        }
+        tick(observer, folders)
+        assert len(launcher.events()) == 2  # the terminals only
+        state = json.loads(
+            (tmp_path / "runs" / ".scheduler" / "supervisor-cursor.json").read_text()
+        )
+        assert state["board_seq"] == 5  # past the progress note, before msg_q1
+        # Next tick has budget again; the question gets its turn.
+        actions = tick(observer, {})
+        assert any(e["type"] == "board_question" for e in launcher.events()), actions
+
+    def test_no_bus_means_no_board_scan_and_no_crash(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(tmp_path, bus=None)
+        actions = tick(observer, {})
+        assert launcher.events() == []
+        assert not any("error" in a for a in actions)
+
+
+class TestFailOpen:
+    def test_broken_terminal_reader_is_an_action_not_a_crash(self, tmp_path: Path) -> None:
+        observer, _launcher = observer_for(tmp_path)
+
+        def reader(_folder: str) -> dict[str, Any]:
+            raise RuntimeError("disk on fire")
+
+        actions = observer.after_tick(
+            now=0.0, folder_ids=["wf-a"], terminal_reader=reader, tick_results=[]
+        )
+        assert any(a.get("source") == "terminals" and "error" in a for a in actions)
+
+    def test_broken_bus_is_an_action_not_a_crash(self, tmp_path: Path) -> None:
+        class ExplodingBus:
+            def messages(self, *a: Any, **kw: Any):
+                raise RuntimeError("bus down")
+
+        observer, _ = observer_for(tmp_path, bus=ExplodingBus())
+        actions = tick(observer, {})
+        assert any(a.get("source") == "board" and "error" in a for a in actions)
+
+
+class TestLaunchSpec:
+    def test_argv_targets_the_supervisor_cli(self, tmp_path: Path) -> None:
+        spec = SupervisorLaunchSpec(
+            event=line_fault_event("wf-a", "run-1"),
+            run_root=tmp_path / "runs",
+            state_root=tmp_path / "supervisor",
+            environment={"PATH": "/usr/bin", "FLEET_GRAPH_BUS_TOKEN_FILE": "/tok"},
+        )
+        argv = spec.argv()
+        assert argv[0] == "systemd-run"
+        assert "--unit" in argv
+        assert spec.unit_name == "fleet-graph-supervisor-e3-run-1"
+        joined = " ".join(argv)
+        assert "supervisor run --event-json" in joined
+        assert "--setenv=FLEET_GRAPH_BUS_TOKEN_FILE=/tok" in argv
+
+
+class TestSchedulerWiring:
+    def _scheduler(self, tmp_path: Path, supervisor: Any) -> Scheduler:
+        config = SchedulerConfig(
+            lines=[LineSpec(folder_id="wf-a", seat="seat-1")],
+            run_root=tmp_path / "runs",
+            maintenance_stop_path=tmp_path / "absent-stop",
+        )
+        return Scheduler(
+            config,
+            launcher=RecordingLauncher(),  # never launched: line disabled
+            units=StaticUnits(active=False),
+            clock=lambda: 1_000.0,
+            supervisor=supervisor,
+        )
+
+    def test_tick_hands_the_observer_results_and_terminals(self, tmp_path: Path) -> None:
+        calls: list[dict[str, Any]] = []
+
+        class Recorder:
+            def after_tick(self, **kwargs: Any) -> list[dict[str, Any]]:
+                calls.append(kwargs)
+                return []
+
+        scheduler = self._scheduler(tmp_path, Recorder())
+        scheduler.tick()
+        [call] = calls
+        assert call["folder_ids"] == ["wf-a"]
+        assert callable(call["terminal_reader"])
+        assert len(call["tick_results"]) == 1
+
+    def test_supervisor_config_flag_defaults_off(self, tmp_path: Path) -> None:
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps({"lines": []}))
+        assert SchedulerConfig.from_json(path).supervisor_events is False
+        path.write_text(json.dumps({"lines": [], "supervisor_events": True}))
+        assert SchedulerConfig.from_json(path).supervisor_events is True
+
+    def test_a_raising_observer_never_breaks_the_tick(self, tmp_path: Path) -> None:
+        class Exploding:
+            def after_tick(self, **kwargs: Any) -> None:
+                raise RuntimeError("observer on fire")
+
+        scheduler = self._scheduler(tmp_path, Exploding())
+        results = scheduler.tick()  # must not raise
+        assert len(results) == 1
+
+    def test_terminal_record_carries_pump_fault(self, tmp_path: Path) -> None:
+        scheduler = self._scheduler(tmp_path, None)
+        line_root = tmp_path / "runs" / "wf-a"
+        line_root.mkdir(parents=True)
+        (line_root / "terminal.json").write_text(
+            json.dumps({"terminal": "fault", "rounds": 1, "run_id": "r", "pump_fault": True})
+        )
+        record = scheduler.terminal_record("wf-a")
+        assert record is not None and record["pump_fault"] is True

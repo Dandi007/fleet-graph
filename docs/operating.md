@@ -175,3 +175,70 @@ journalctl --user -u fleet-graphd -f          # 每 60s 一批，每条线一行
 
 每行形如 `{"folder_id": ..., "ignited": false, "refusal": "line_disabled", ...}`。
 `refusal` 就是上面七道闸加名册的名字，一一对应。
+
+## 监督面：supervisor 图与事件泵（R4-2）
+
+值守的机械化：四类**机械事件**唤醒一次短跑审计，审计报告落板（evidence note）
+与 supervisor 自己的 run root。**本单不发任何 `work.decision.v1`——分类只有
+`needs_human` 与 `recommend_reject`，人仍拍板**；依预授权代拍是 R4-3 的第四道闸，
+现在的代码里那条分支是显式 `NotImplementedError`。
+
+### 开关
+
+名册 config 里 `"supervisor_events": true`（默认 **off**）。改法同
+`probe_via_runtime`：config PR → 发布 → 重启。观察器寄生 fleet-graphd 既有
+60s tick——**没有第二个常驻循环，没有第二个调度器**；supervisor 图本身是被
+`systemd-run` 拉起的又一种 transient unit（`fleet-graph-supervisor-<key>`）。
+
+### 四类事件（去重键 = thread identity）
+
+| 事件 | 机械信号 | 去重键 |
+|---|---|---|
+| E1 `board_question` | `board:work-notes` 上 question note 无 decision ref | `e1-<note_id>` |
+| E2 `blocked_decision` | terminal `blocked` + `waiting_on: "decision"` | `e2-<run_id>` |
+| E3 `line_fault` | terminal `fault` 或 `pump_fault: true` | `e3-<run_id>` |
+| E4 `cap_breaker` | `TickResult.refusal == total_cap_reached` | `e4-cap-<时间桶>` |
+
+thread_id = `supervisor:{key}`，checkpoint 在
+`/data/fleet-graph/supervisor/checkpoint.sqlite3`：同一事件 kill-restart 后
+**re-adopt 在飞审计 run**，不重派、不重付费（测试钉死）。E2 与 R0c 停牌**共存**：
+停牌照旧省钱，观察器只负责把事实递给审计。
+
+### 预算与游标
+
+- 每 tick 至多拉起 **2** 个 supervisor run；每事件键终身至多 **3** 次尝试
+  （纯计数，落盘防重启清零）；审计已在飞（unit active）不烧预算。
+- 板游标持久于 `<run_root>/.scheduler/supervisor-cursor.json`；**首次启用
+  adopt-baseline**：游标落在当前 head，存量 pending 问题不回放（那是人已有的
+  backlog，`fleet-graph inbox list` 看得到）。要回放，把 `board_seq` 改小。
+- 事件审完出 receipt（`/data/fleet-graph/supervisor/reports/<key>.json`），
+  同键永不再拉起。要重审：删对应 receipt 文件（尝试计数照旧生效）。
+
+### 一次 supervisor turn 的形状
+
+七节点：`intake → gather_evidence → rerun_acceptance → audit(llm) → classify
+→ act → receipt`。script 包夹唯一 llm 节点（`agent-run --role
+supervisor_auditor`，read-only、structured、每条断言强制 command +
+output_excerpt）；**分类闸门是 script 对机械谓词的判定**——llm 只建议，
+`recommend_reject` 必须有机械复现依据（精确报错原文 + 最小复现 argv + exit
+code），llm 喊 reject 而无机械红照样 `needs_human`。证据不全直接跳过 llm，
+以事实升报，不猜。
+
+goal 线无板卡时 evidence note 会被 bus 以 422 拒掉（既知契约缺口）——act 降级：
+报告只落本地 receipt，degraded 原因写进报告。审计产物**绝不写被监督线的
+work folder**（§38e 治理活锁的结构性消解）。
+
+### 现场怎么看
+
+```bash
+journalctl --user -u fleet-graphd -f | grep supervisor_observer   # 观察器动作
+ls /data/fleet-graph/supervisor/reports/                          # 审计 receipt
+cat /data/fleet-graph/logs/supervisor-<key>.log                   # 单次 run 日志
+# 手动补一次审计（事件词汇封闭，未知名字直接拒绝）：
+fleet-graph supervisor run --event-json \
+  '{"type":"line_fault","key":"e3-<run_id>","payload":{"folder_id":"wf-…","run_id":"<run_id>"}}'
+```
+
+守卫（`make conformance`，随 verify 跑）：supervisor 模块不 import
+`scheduler.ignition`/`scheduler.launcher`；全仓无 `work.decision.v1` 发布路径。
+两条都有 sabotage 自证测试。
