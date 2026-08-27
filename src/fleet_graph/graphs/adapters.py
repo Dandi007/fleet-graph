@@ -24,7 +24,6 @@ from fleet_graph.executors.agent_run import (
     derive_run_id,
     find_result,
 )
-
 from fleet_graph.executors.agent_session import AgentSessionSeat, SeatHandle
 from fleet_graph.state.run_artifacts import write_json_durable
 

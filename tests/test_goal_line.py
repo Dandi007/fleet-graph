@@ -433,9 +433,7 @@ class TestFailedAttemptIsNotReAdopted:
         failed_id = derive_run_id(thread, "coordinator-1", 1)
         root = launcher.session_root_for(failed_id) / "run"
         root.mkdir(parents=True)
-        (root / "result.json").write_text(
-            _json.dumps({"state": "failed", "exit_code": 91})
-        )
+        (root / "result.json").write_text(_json.dumps({"state": "failed", "exit_code": 91}))
 
         seen: list[str] = []
 
