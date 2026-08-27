@@ -9,14 +9,15 @@ that make up the supervisor graph (`graphs/supervisor.py` and everything under
 lives on the scheduler's side and holds the launcher -- that is the one
 sanctioned direction.
 
-Guard B -- **exactly one module may publish a `work.decision.v1`**:
-`supervise/decision_publisher.py`, the R4-3 preauth release path. Everywhere
-else, no call expression under `src/` may carry the literal
-``"work.decision.v1"`` or the ``DECISION_KIND`` name as an argument
-(bus/board.py's standing rule, made regression-loud; before R4-3 the
-exemption set was empty). Read paths survive: the constant's definition is an
-assignment, and `m.get("kind") == DECISION_KIND` is a comparison -- neither
-is a call argument.
+Guard B -- **exactly one module may publish a decision** (`work.decision.v1`
+or `work.decision.v2` alike): `supervise/decision_publisher.py`, the R4-3
+preauth release path. Everywhere else, no call expression under `src/` may
+carry the literal ``"work.decision.v1"``/``"work.decision.v2"`` or the
+``DECISION_KIND``/``DECISION_KIND_V2`` name as an argument (bus/board.py's
+standing rule, made regression-loud; before R4-3 the exemption set was
+empty). Read paths survive: the constant's definition is an assignment, and
+`m.get("kind") in DECISION_KINDS` is a comparison -- neither is a call
+argument.
 
 Guard C -- **the publish entry has exactly one caller**: only
 `graphs/supervisor.py` (whose `act` node is a script node) may import
@@ -47,8 +48,8 @@ FORBIDDEN_SCHEDULER_MODULES = (
 )
 FORBIDDEN_SCHEDULER_NAMES = frozenset({"ignition", "launcher"})
 
-DECISION_LITERAL = "work.decision.v1"
-DECISION_NAME = "DECISION_KIND"
+DECISION_LITERALS = frozenset({"work.decision.v1", "work.decision.v2"})
+DECISION_NAMES = frozenset({"DECISION_KIND", "DECISION_KIND_V2"})
 
 # Guard B exemption: the single sanctioned decision publisher (R4-3).
 DECISION_PUBLISHER_RELPATH = "fleet_graph/supervise/decision_publisher.py"
@@ -96,11 +97,11 @@ def check_no_scheduler_imports(path: Path, tree: ast.AST) -> list[str]:
 
 
 def _is_decision_reference(node: ast.expr) -> bool:
-    if isinstance(node, ast.Constant) and node.value == DECISION_LITERAL:
+    if isinstance(node, ast.Constant) and node.value in DECISION_LITERALS:
         return True
-    if isinstance(node, ast.Name) and node.id == DECISION_NAME:
+    if isinstance(node, ast.Name) and node.id in DECISION_NAMES:
         return True
-    return isinstance(node, ast.Attribute) and node.attr == DECISION_NAME
+    return isinstance(node, ast.Attribute) and node.attr in DECISION_NAMES
 
 
 def check_no_decision_publish(path: Path, tree: ast.AST) -> list[str]:
@@ -113,9 +114,9 @@ def check_no_decision_publish(path: Path, tree: ast.AST) -> list[str]:
             if _is_decision_reference(argument):
                 errors.append(
                     f"{path}:{node.lineno}: a call carries "
-                    f"{DECISION_LITERAL!r}/{DECISION_NAME} as an argument -- "
-                    "the only sanctioned decision publish path is "
-                    f"{DECISION_PUBLISHER_RELPATH}"
+                    f"{'/'.join(sorted(DECISION_LITERALS | DECISION_NAMES))} "
+                    "as an argument -- the only sanctioned decision publish "
+                    f"path is {DECISION_PUBLISHER_RELPATH}"
                 )
     return errors
 
