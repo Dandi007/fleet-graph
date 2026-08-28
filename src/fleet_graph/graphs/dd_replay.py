@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Any
 
 from fleet_graph.dd import chain_rules
+from fleet_graph.dd.bootstrap import INDEX_PATH
 from fleet_graph.dd.dispatch import derive_attempt_id
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
@@ -220,6 +221,19 @@ class ReceiptReplayer:
             if self._plan is None:
                 self._disabled = True
                 return None
+            if self._ends_at_implement(self._plan):
+                inherited = self._inherited_entries()
+                if inherited is not None and not chain_rules.new_attempt_is_legal(inherited):
+                    # Replaying a prefix that stops at implement is always
+                    # followed by a fresh continuous review -- a brand-new
+                    # attempt. When the inherited feedback chain did not end in
+                    # REJECT, the carrier refuses exactly that new attempt
+                    # (ORDER_VIOLATION), so replaying would only move the tree
+                    # and then fail. Fail-closed here instead: replay nothing,
+                    # so the divergent work is surfaced rather than silently
+                    # re-reviewed. (An unreadable index defers to the carrier.)
+                    self._disabled = True
+                    return None
             # The one mutation happens exactly once, on exactly the selected
             # candidate, before the first replayed step is returned. A refusal
             # here is fail-closed: nothing else is tried, nothing was moved.
@@ -311,6 +325,32 @@ class ReceiptReplayer:
             return candidate
         return None
 
+    def _ends_at_implement(self, plan: list[_Step]) -> bool:
+        """Whether the plan's last link is the implement stage (no reviews)."""
+        implement = implement_stage(self.lifecycle)
+        return bool(implement) and plan[-1].stage_id == implement
+
+    def _inherited_entries(self) -> list[dict[str, Any]] | None:
+        """The committed feedback index's review entries at HEAD, or None.
+
+        The carrier's ordering rule lives in the pinned plugin, but the index it
+        enforces is committed in the worktree at this path. Reading it lets the
+        replayer recognise -- before moving any tree -- that a partial prefix
+        ending at implement would be followed by a fresh continuous review the
+        carrier refuses as a new attempt lacking a prior REJECT. An unreadable
+        or malformed index returns None, which defers to the carrier rather than
+        guessing.
+        """
+        proc = run_git(self.workspace, "show", f"HEAD:{INDEX_PATH}")
+        if proc.returncode != 0:
+            return None
+        try:
+            index = json.loads(proc.stdout)
+        except ValueError:
+            return None
+        entries = index.get("entries") if isinstance(index, dict) else None
+        return entries if isinstance(entries, list) else None
+
     # --- walk one generation's receipts -----------------------------------
 
     def _walk(
@@ -394,11 +434,17 @@ class ReceiptReplayer:
                 return steps
 
             cr_intent = self._plugin_intent(root, cr)
-            if cr_intent is None:
-                # The Review sealer re-reads the Continuous intent when it
-                # seals a Final review; a replayed Continuous receipt whose
-                # frozen intent is missing is a chain nobody can continue, so
-                # it re-runs for real rather than replaying half a link.
+            if cr_intent is None and not self._final_replays(
+                root, source_generation, attempt, final_id, cr_raw, head
+            ):
+                # The Review sealer re-reads the Continuous intent only when it
+                # *seals* a Final review. When the Final review is itself
+                # replayed, nothing re-reads it, so a missing intent is harmless
+                # and the walk must continue rather than truncating to a
+                # [configure, implement] prefix that would force an illegal fresh
+                # continuous review (spec requirement 3). Only when the Final
+                # review must run for real is the missing intent an
+                # un-rechargeable link, so the walk then re-runs the review.
                 return steps
 
             steps.append(
@@ -408,7 +454,7 @@ class ReceiptReplayer:
                     receipt=cr,
                     output_commit=str(cr["output_commit"]),
                     raw=cr_raw,
-                    intent_raw=cr_intent[0],
+                    intent_raw=cr_intent[0] if cr_intent else b"",
                     mode=mode,
                 )
             )
@@ -456,6 +502,39 @@ class ReceiptReplayer:
             # re-measures, the gate re-asks, the merge re-decides.
             return steps
         return []
+
+    def _final_replays(
+        self,
+        root: Path,
+        source_generation: int,
+        attempt: int,
+        final_id: str,
+        cr_raw: bytes,
+        head: str,
+    ) -> bool:
+        """Whether the final review of `attempt` is itself replayable.
+
+        When the Continuous review's frozen intent is missing, the walk can
+        still continue -- replaying the Continuous link with an empty intent --
+        iff the Final review is also replayed rather than re-sealed, because
+        nothing re-reads the missing intent in that case. This is a read-only
+        probe; it does not advance the walk's rework edge (a REJECT final is not
+        replayable, so it reports False and the walk re-runs the review for
+        real, the conservative pre-existing behaviour).
+        """
+        if not final_id:
+            return False
+        loaded = self._plugin_receipt(root, source_generation, attempt, final_id)
+        if loaded is None:
+            return False
+        _fr_raw, fr = loaded
+        if not self._valid_review(fr, head) or fr.get(
+            "parent_handoff_receipt_digest"
+        ) != byte_digest(cr_raw):
+            return False
+        if str(fr.get("verdict") or "") != APPROVE:
+            return False
+        return self._plugin_intent(root, fr) is not None
 
     def _rework_implement(
         self,
