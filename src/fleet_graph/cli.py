@@ -77,6 +77,11 @@ def _line_run(args: argparse.Namespace) -> int:
 
     from fleet_graph.acceptance import AcceptanceSpec
     from fleet_graph.graphs.runner import LineConfig, run_line
+    from fleet_graph.state.work_folder import (
+        WorkFolderBroken,
+        WorkFolderError,
+        resume_verification,
+    )
 
     acceptance = None
     if args.acceptance_json:
@@ -86,6 +91,19 @@ def _line_run(args: argparse.Namespace) -> int:
             # A declaration we cannot read is an operator error worth stopping
             # on, not something to silently degrade to "not declared".
             raise SystemExit(f"--acceptance-json is not a valid declaration: {exc}") from exc
+
+    # E4a: the orchestration layer runs wf_resume at generation start and
+    # injects the mechanical result into every coordinator round. A BROKEN
+    # folder stops the line (the house rule); a transport/protocol failure is
+    # a missing fact, not a reason to kill the line -- the field is then
+    # simply absent and the N7 guard defaults conservatively.
+    resume_verification_facts = None
+    try:
+        resume_verification_facts = resume_verification(args.folder)
+    except WorkFolderBroken as exc:
+        raise SystemExit(f"line start refused: {exc}") from exc
+    except WorkFolderError:
+        resume_verification_facts = None
 
     config = LineConfig(
         folder_id=args.folder,
@@ -101,6 +119,7 @@ def _line_run(args: argparse.Namespace) -> int:
         # None -> durable default under run_root; ":memory:" must be asked for.
         checkpoint_path=args.checkpoint,
         acceptance=acceptance,
+        resume_verification=resume_verification_facts,
     )
     result = run_line(config, run_id=args.run_id)
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)

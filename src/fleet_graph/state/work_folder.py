@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
+
+from fleet_graph.state.run_artifacts import iso
 
 DEFAULT_WORK_FOLDER_MCP_URL = "http://127.0.0.1:5602/mcp/"
 
@@ -236,10 +239,95 @@ class WorkFolder:
         return result
 
 
+#: Per-line list keys of the wf_resume `verification` object. The compact
+#: summary the envelope carries is reduced from whichever of these the server
+#: answered with; nothing here reads the model's prose.
+_RESUME_VERIFICATION_LINE_KEYS = ("lines", "checks", "items", "results", "entries")
+
+#: Comma-free label/verdict keys a per-line entry may carry. A compact row keeps
+#: at most these two; anything else in the entry is server detail we drop.
+_RESUME_VERIFICATION_LABEL_KEYS = ("label", "name", "check", "path", "key", "id")
+_RESUME_VERIFICATION_VERDICT_KEYS = ("verdict", "status", "result", "state")
+
+
+def _compact_verification_lines(verification: dict[str, Any]) -> list[dict[str, str]]:
+    """Reduce the per-line verification verdicts to a compact summary.
+
+    ``verification`` is the ``verification`` object of a wf_resume result. The
+    compact form keeps each line's label and verdict and nothing else, so the
+    envelope carries the mechanical fact (per-line verdicts) without the
+    server's full detail. Any server shape without a recognised list key
+    yields ``[]`` -- absence is stated, never guessed.
+    """
+    for key in _RESUME_VERIFICATION_LINE_KEYS:
+        entries = verification.get(key)
+        if not isinstance(entries, list):
+            continue
+        compact: list[dict[str, str]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            label = next(
+                (
+                    str(entry[k])
+                    for k in _RESUME_VERIFICATION_LABEL_KEYS
+                    if entry.get(k) not in (None, "")
+                ),
+                "",
+            )
+            verdict = next(
+                (
+                    str(entry[k])
+                    for k in _RESUME_VERIFICATION_VERDICT_KEYS
+                    if entry.get(k) not in (None, "")
+                ),
+                "",
+            )
+            row: dict[str, str] = {}
+            if label:
+                row["label"] = label
+            if verdict:
+                row["verdict"] = verdict
+            if row:
+                compact.append(row)
+        if compact:
+            return compact
+    return []
+
+
+def resume_verification_from(raw: dict[str, Any], *, clock: Any = time.time) -> dict[str, Any]:
+    """The mechanical resume-verification fact the envelope carries.
+
+    Shape: ``{"overall": str, "lines": [...], "at": "<UTC ISO>"}``. This is
+    filled by the orchestration layer from the wf_resume result the line
+    runner executes at generation start -- the model cannot forge its source
+    because it never writes it.
+    """
+    verification = raw.get("verification") if isinstance(raw.get("verification"), dict) else {}
+    return {
+        "overall": str(verification.get("overall", "")),
+        "lines": _compact_verification_lines(verification),
+        "at": iso(clock()),
+    }
+
+
+def resume_verification(folder_id: str, *, caller: ToolCaller | None = None) -> dict[str, Any]:
+    """Run wf_resume and reduce it to the envelope's resume-verification fact.
+
+    Raises ``WorkFolderBroken`` when the folder reports BROKEN or blocked (the
+    house rule: stop and report, do not improvise). The returned dict is the
+    fact injected into every coordinator input.
+    """
+    _folder, report = WorkFolder.resume(folder_id, caller)
+    return resume_verification_from(report.raw)
+
+
 __all__ = [
     "DEFAULT_WORK_FOLDER_MCP_URL",
     "ResumeReport",
     "WorkFolder",
     "WorkFolderBroken",
     "WorkFolderError",
+    "resume_verification",
+    "resume_verification_from",
 ]

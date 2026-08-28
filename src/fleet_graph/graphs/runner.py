@@ -7,6 +7,7 @@ of the real collaborators.
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +56,15 @@ class LineConfig:
     #: /data/fleet-graph/logs in RunArtifacts). Recorded in the heartbeat and
     #: terminal so the run root names its own log.
     log_path: Path | None = None
+    #: The mechanical wf_resume verification facts captured at generation start
+    #: by the orchestration layer, injected into every coordinator input. None
+    #: means none were captured (the field is then absent from the envelope).
+    resume_verification: dict[str, Any] | None = None
+    #: The prior generation's terminal.json content, injected into the round-1
+    #: coordinator input when present. None lets build_line read the terminal
+    #: left on disk under run_root, which at generation start is the previous
+    #: generation's.
+    prior_terminal: dict[str, Any] | None = None
 
     @property
     def inbox_alias(self) -> str | None:
@@ -72,6 +82,17 @@ class LineConfig:
     @property
     def resolved_checkpoint_path(self) -> str:
         return self.checkpoint_path or str(self.run_root / "checkpoint.sqlite3")
+
+
+def _read_prior_terminal(run_root: Path) -> dict[str, Any] | None:
+    """Read the terminal.json already on disk, which at generation start is the
+    previous generation's. Absent or unparseable -> None, so round 1 simply
+    carries no prior_terminal rather than guessing."""
+    try:
+        data = json.loads((run_root / "terminal.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, LineDeps]:
@@ -133,6 +154,10 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         # Always constructed: an undeclared spec yields the explicit
         # `not_declared` fact instead of a silently absent step.
         acceptance=AcceptanceRunner(config.acceptance),
+        resume_verification=config.resume_verification,
+        prior_terminal=config.prior_terminal
+        if config.prior_terminal is not None
+        else _read_prior_terminal(config.run_root),
     )
     return build_goal_line_graph(deps), deps
 

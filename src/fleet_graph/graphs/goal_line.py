@@ -56,6 +56,46 @@ TERMINAL_BLOCKED = "blocked"
 TERMINAL_BOUNDS = "bounds"
 TERMINAL_FAULT = "fault"
 
+#: The one mechanical marker the resume verification's `overall` uses for a
+#: broken environment. Anything else ("MATCH", "OK", "") is simply non-BROKEN.
+RESUME_VERIFICATION_BROKEN = "BROKEN"
+
+#: Explicit code recorded on a round the N7 guard rejects: the coordinator
+#: self-reported a BROKEN recovery verification while the envelope's mechanical
+#: `resume_verification.overall` was not BROKEN. A mechanical mismatch marks
+#: the round invalid, so it retries instead of reaching park escalation.
+N7_INVALID_ROUND_CODE = "resume_verification_mismatch"
+
+
+def claims_resume_verification_broken(reason: str) -> bool:
+    """Does the coordinator's reason self-report a BROKEN recovery verification?
+
+    A token match, not a semantic reading (INV-3): the resume verification's
+    broken marker is the literal ``BROKEN`` token, so a coordinator repeating an
+    old BROKEN narrative trips this when that token appears next to a
+    resume/verification word. An unrelated ``"the build is broken"`` does not
+    qualify, because no resume/verification word ties it to the recovery check.
+    """
+    upper = reason.upper()
+    if RESUME_VERIFICATION_BROKEN not in upper:
+        return False
+    if "RESUME" in upper or "VERIFICATION" in upper:
+        return True
+    return "恢复" in reason or "验证" in reason
+
+
+def n7_rejects_blocked(reason: str, overall: str) -> bool:
+    """N7: reject a BLOCKED verdict whose self-report contradicts the envelope.
+
+    Fires when the coordinator claims the recovery verification is BROKEN while
+    the envelope's mechanical ``resume_verification.overall`` is not BROKEN.
+    Pure mechanical comparison: the orchestration layer never reads meaning out
+    of prose beyond this token check.
+    """
+    return (
+        claims_resume_verification_broken(reason) and overall.upper() != RESUME_VERIFICATION_BROKEN
+    )
+
 
 class Verdict(TypedDict, total=False):
     verdict: str
@@ -142,6 +182,14 @@ class LineDeps:
     #: None means no acceptance was declared for this line; the step still
     #: states that fact explicitly rather than staying silent.
     acceptance: AcceptancePort | None = None
+    #: The mechanical wf_resume verification facts captured at generation start
+    #: by the orchestration layer, injected into every coordinator input. None
+    #: means no resume verification was captured -- the field is then absent,
+    #: not guessed.
+    resume_verification: dict[str, Any] | None = None
+    #: The prior generation's terminal.json content, injected into the round-1
+    #: coordinator input when present. None means there was no prior terminal.
+    prior_terminal: dict[str, Any] | None = None
 
     def now(self) -> float | None:
         return self.clock() if self.clock is not None else None
@@ -184,6 +232,15 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             # step -- the persona instructs the coordinator to weigh these
             # above any self-report in the worker's prose.
             coord_input["last_acceptance"] = state["last_acceptance"]
+        if deps.resume_verification is not None:
+            # Mechanical fact, filled by the orchestration layer at generation
+            # start; carries into every round so the model never has to (or
+            # may) reconstruct it from progress narrative.
+            coord_input["resume_verification"] = deps.resume_verification
+        if round_no == 1 and deps.prior_terminal is not None:
+            # The prior generation's terminal, so round 1 does not need to
+            # rebuild the previous state from the progress narrative.
+            coord_input["prior_terminal"] = deps.prior_terminal
 
         # Must-deliver ordering: the messages land in the durable coordinator
         # input before anything is acked. See bus/inbox.py.
@@ -203,6 +260,27 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
                 "terminal_reason": str(result.get("reason", "")),
             }
         if verdict == TERMINAL_BLOCKED:
+            reason = str(result.get("reason", ""))
+            overall = str((coord_input.get("resume_verification") or {}).get("overall", ""))
+            if n7_rejects_blocked(reason, overall):
+                # N7: the model self-reports a BROKEN recovery verification the
+                # mechanical envelope contradicts. Reject the round as invalid
+                # and retry -- it must never park on a verdict the envelope's
+                # own fact disproves. The noop streak still counts it, so a
+                # serial fabricator hits the breaker rather than looping forever.
+                deps.guards.record_noop()
+                deps.artifacts.append_round(
+                    {
+                        "round": round_no,
+                        "verdict": "invalid",
+                        "reason": N7_INVALID_ROUND_CODE,
+                        "injected": False,
+                    }
+                )
+                return {
+                    "round_no": round_no + 1,
+                    "rounds_recorded": state.get("rounds_recorded", 0) + 1,
+                }
             # The one machine field read off a blocked verdict beyond the
             # verdict itself. Unknown values normalise to "none" and are
             # preserved verbatim -- a coordinator inventing a new value must
@@ -211,7 +289,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             waiting_on, declared = normalize_waiting_on(result.get("waiting_on"))
             update: LineState = {
                 "terminal": TERMINAL_BLOCKED,
-                "terminal_reason": str(result.get("reason", "")),
+                "terminal_reason": reason,
                 "waiting_on": waiting_on,
             }
             if declared is not None:
@@ -376,6 +454,8 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
 
 __all__ = [
     "COORDINATOR_ROLE",
+    "N7_INVALID_ROUND_CODE",
+    "RESUME_VERIFICATION_BROKEN",
     "TERMINAL_BLOCKED",
     "TERMINAL_BOUNDS",
     "TERMINAL_DONE",
@@ -384,4 +464,6 @@ __all__ = [
     "LineDeps",
     "LineState",
     "build_goal_line_graph",
+    "claims_resume_verification_broken",
+    "n7_rejects_blocked",
 ]
