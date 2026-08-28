@@ -32,6 +32,7 @@ from fleet_graph.graphs.dd_replay import (
     byte_digest,
     prior_generation_state_roots,
 )
+from fleet_graph.graphs.dd_scripts import RUN_CONFIG_PATH, AcceptanceStage
 from test_dd_pipeline import ContractActor, make_deps
 
 LIFECYCLE = Lifecycle.load()
@@ -429,3 +430,79 @@ class TestTheRunnerWiresReplayOnlyWhereItBelongs:
 
     def test_an_unrecognized_layout_replays_nothing(self) -> None:
         assert prior_generation_state_roots(Path("/somewhere/custom"), 3) == ()
+
+
+class TestAReconfiguredContextRewritesTheRunConfig:
+    """The reconfigure exit (R1-c) meets replay.
+
+    A legal `development_reconfigure` changes the acceptance context of a
+    development; the next generation replays the *sealed* prefix from the
+    previous one, and the replayed configure commit carries a stale
+    run-config. Acceptance must grade against the reconfigured declaration,
+    not the stale file (dev-fg-f8d98b92a6b0 g2: ACCEPTANCE_DECLARATION_MISMATCH
+    with an otherwise-correct `acceptance_env`)."""
+
+    def test_a_reconfigured_env_is_written_for_the_fresh_generation(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        g1 = G1(repo, tmp_path)
+        junk = g1.junk_configure()
+        declared = {
+            "acceptance_commands": [["true"]],
+            "setup_commands": [],
+            "acceptance_env": {"PYTHONPATH": "src"},
+        }
+        replayer = ReceiptReplayer(
+            workspace=g1.repo,
+            state_root=g1.dev_root / "g2" / "state",
+            prior_state_roots=((1, g1.state_root),),
+            development_id=DEVELOPMENT_ID,
+            generation=2,
+            lifecycle=LIFECYCLE,
+            run_config=declared,
+        )
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        scripts = {name: actor for name, stage in LIFECYCLE.stages.items() if not stage.is_llm}
+        scripts["acceptance"] = AcceptanceStage(
+            repo=repo,
+            declared=declared["acceptance_commands"],
+            setup=declared["setup_commands"],
+            env=declared["acceptance_env"],
+        )
+
+        state = run_generation_two(make_deps(actor=actor, scripts=scripts, replayer=replayer), junk)
+
+        assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
+        # The sealed prefix still replays; configure is not re-dispatched.
+        assert replayed_stages(state) == ["configure", "implement"]
+        # Configure's output now declares this generation's context, so the
+        # acceptance stage graded against the reconfigured env, not g1's empty
+        # one.
+        config = json.loads((repo / RUN_CONFIG_PATH).read_text(encoding="utf-8"))
+        assert config["acceptance_env"] == {"PYTHONPATH": "src"}
+        assert config["acceptance_commands"] == [["true"]]
+        assert config["generation"] == 2
+
+    def test_an_unchanged_context_leaves_the_replayed_tree_alone(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        g1 = G1(repo, tmp_path)
+        junk = g1.junk_configure()
+        # Same (empty) context as g1 configured: nothing to rewrite.
+        replayer = ReceiptReplayer(
+            workspace=g1.repo,
+            state_root=g1.dev_root / "g2" / "state",
+            prior_state_roots=((1, g1.state_root),),
+            development_id=DEVELOPMENT_ID,
+            generation=2,
+            lifecycle=LIFECYCLE,
+            run_config={"acceptance_commands": [], "setup_commands": [], "acceptance_env": {}},
+        )
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+
+        state = run_generation_two(make_deps(actor=actor, replayer=replayer), junk)
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert head(repo) == g1.implement
+        # g1's committed run-config still stands: it was not overwritten.
+        assert git(repo, "show", f"{g1.configure}:{RUN_CONFIG_PATH}").strip() == '{"generation": 1}'

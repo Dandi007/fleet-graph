@@ -130,6 +130,7 @@ def build_pipeline(
                 remote_url=config.remote_url,
                 remote_ref=config.remote_ref,
                 lifecycle=lifecycle,
+                run_config=dict(config.run_config or {}),
             )
 
     builder = StageDispatchBuilder(
