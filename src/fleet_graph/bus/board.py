@@ -12,6 +12,7 @@ revision, CAS-guarded on the entity head).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,6 +45,173 @@ class Decision:
     rationale: str
     card_entity_id: str
     raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class NormalizedVerdict:
+    """The canonical token plus the raw field and shell form it was read from.
+
+    `verdict` is always the exact ASCII bytes ``APPROVE`` or ``REJECT`` (never
+    a synonym or a sentence). `raw` is the decision field verbatim, so the
+    normalization can be replayed without trusting a prior run's parser.
+    `form` names which wrapper, if any, was removed.
+    """
+
+    verdict: str
+    raw: str
+    form: str
+
+
+FORM_BARE = "bare"
+FORM_QUOTE = "quote"
+FORM_INLINE_CODE = "inline_code"
+FORM_FENCED_CODE = "fenced_code"
+FORM_LABEL = "label"
+
+_ASCII_WS = " \t\r\n"
+_LABEL_RE = re.compile(r"^(?:decision|verdict):[ \t\r\n]+", re.IGNORECASE)
+
+
+def _ascii_trim(value: str) -> str:
+    return value.strip(_ASCII_WS)
+
+
+def _ascii_upper(value: str) -> str:
+    return "".join(chr(ord(ch) - 32) if "a" <= ch <= "z" else ch for ch in value)
+
+
+def _quote_line_content(line: str) -> str | None:
+    """The content under one Markdown quote prefix, or None.
+
+    The ``>`` may be followed by at most one space; a second ``>`` is a nested
+    blockquote level, so ``>>`` is not a single quote marker.
+    """
+    if not line.startswith(">"):
+        return None
+    if len(line) > 1 and line[1] == ">":
+        return None
+    rest = line[1:]
+    if rest.startswith(" "):
+        rest = rest[1:]
+        if rest.startswith(" "):
+            return None
+    return rest
+
+
+def _strip_markdown_quote(value: str) -> str | None:
+    """Remove one outer Markdown quote wrapper, or refuse mixed quoting.
+
+    Every non-empty line must carry exactly one quote prefix; a value that
+    quotes only some of its non-empty lines is invalid and yields None.
+    """
+    lines = value.split("\n")
+    out: list[str] = []
+    seen_quote = False
+    seen_plain = False
+    for line in lines:
+        if not line.strip(_ASCII_WS):
+            out.append("")
+            continue
+        content = _quote_line_content(line)
+        if content is None:
+            seen_plain = True
+            out.append(line)
+        else:
+            seen_quote = True
+            out.append(content)
+    if seen_quote and seen_plain:
+        return None
+    if not seen_quote:
+        return value
+    return "\n".join(out)
+
+
+def _strip_inline_code(value: str) -> str | None:
+    """Remove one single-backtick inline code shell, or None if broken.
+
+    A triple-backtick fence is *not* an inline shell; it is left for the fenced
+    step. Interior backticks inside a single-backtick shell are invalid.
+    """
+    if not value.startswith("`") or value.startswith("``"):
+        return value
+    if not value.endswith("`") or value.endswith("``"):
+        return value
+    interior = value[1:-1]
+    if "`" in interior:
+        return None
+    return interior
+
+
+def _strip_fenced_code(value: str) -> str | None:
+    """Remove one fenced-code shell, or None if it has extra content lines.
+
+    The opening and closing lines must be exactly three backticks with no info
+    string, and exactly one non-empty content line may sit between them.
+    """
+    fence = "```"
+    if not (value.startswith(fence + "\n") and value.endswith("\n" + fence)):
+        return value
+    inner = value[len(fence) + 1 : -(len(fence) + 1)]
+    if inner == "" or "\n" in inner:
+        return None
+    return inner
+
+
+def _strip_label(value: str) -> str:
+    """Remove one ASCII `decision:`/`verdict:` label prefix, case-insensitively."""
+    match = _LABEL_RE.match(value)
+    if match is None:
+        return value
+    return value[match.end() :]
+
+
+def normalize_decision(raw: Any) -> NormalizedVerdict | None:
+    """Normalize a raw gate decision field to a canonical verdict, or None.
+
+    Wide in input, strict in output: the exact bytes ``APPROVE`` or ``REJECT``
+    survive only after a strictly bounded sequence of wrapper removals. Every
+    other value -- prose, punctuation, a Unicode lookalike, a second token --
+    returns None and is refused upstream as ``GATE_VERDICT_UNRECOGNIZED``.
+    """
+    if not isinstance(raw, str):
+        return None
+
+    original = raw
+    value = _ascii_trim(raw)
+    if value == "":
+        return None
+    form = FORM_BARE
+
+    quoted = _strip_markdown_quote(value)
+    if quoted is None:
+        return None
+    if quoted != value:
+        form = FORM_QUOTE
+        value = _ascii_trim(quoted)
+
+    inlined = _strip_inline_code(value)
+    if inlined is None:
+        return None
+    if inlined != value:
+        form = FORM_INLINE_CODE
+        value = _ascii_trim(inlined)
+    else:
+        fenced = _strip_fenced_code(value)
+        if fenced is None:
+            return None
+        if fenced != value:
+            form = FORM_FENCED_CODE
+            value = _ascii_trim(fenced)
+
+    labelless = _strip_label(value)
+    if labelless != value:
+        form = FORM_LABEL
+        value = _ascii_trim(labelless)
+
+    verdict = _ascii_upper(_ascii_trim(value))
+    if verdict not in ("APPROVE", "REJECT"):
+        return None
+    return NormalizedVerdict(verdict=verdict, raw=original, form=form)
 
 
 @dataclass(frozen=True)
@@ -220,8 +388,15 @@ class Board:
 
 
 __all__ = [
+    "FORM_BARE",
+    "FORM_FENCED_CODE",
+    "FORM_INLINE_CODE",
+    "FORM_LABEL",
+    "FORM_QUOTE",
     "Board",
     "BusConflict",
     "Decision",
     "GateTicket",
+    "NormalizedVerdict",
+    "normalize_decision",
 ]

@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from fleet_graph.bus.board import Board, GateTicket
+from fleet_graph.bus.board import Board, GateTicket, normalize_decision
 from fleet_graph.dd.dispatch import derive_attempt_id
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.executors.agent_run import (
@@ -329,8 +329,8 @@ class BoardGate:
         if decision is None:
             raise GatePending(ticket.to_dict())
 
-        verdict = decision.decision.strip().upper()
-        if verdict not in self.allowed_decisions:
+        normalized = normalize_decision(decision.decision)
+        if normalized is None:
             # Not a refusal and not an approval. Refusing to map it onto either
             # is the point: a gate that rounds an unrecognised verdict towards
             # "proceed" is not a gate. It is resumable -- a malformed verdict is
@@ -343,6 +343,13 @@ class BoardGate:
                 resumable=True,
                 ticket=ticket.to_dict(),
             )
+        verdict = normalized.verdict
+        if verdict not in self.allowed_decisions:
+            raise StageRefused(
+                f"gate decision {verdict!r} is not one of "
+                f"{sorted(self.allowed_decisions)}; refusing to interpret it",
+                code="GATE_VERDICT_UNRECOGNIZED",
+            )
         if verdict != self.approve:
             operator = decision.decided_by or "an operator"
             raise StageRefused(f"gate decision {verdict} by {operator}", code="GATE_REJECTED")
@@ -350,6 +357,8 @@ class BoardGate:
         record = {
             "stage": stage.id,
             "decision": verdict,
+            "raw_decision": normalized.raw,
+            "normalization_form": normalized.form,
             "decided_by": decision.decided_by,
             "decision_message_id": decision.message_id,
             "question_note_id": ticket.question_note_id,
