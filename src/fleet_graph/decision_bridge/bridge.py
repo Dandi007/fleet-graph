@@ -1,0 +1,440 @@
+"""The decision bridge's resident loop: read verdicts, resolve, recover, seal.
+
+This is what `fleet-graph decision-bridge run` executes. One cycle reads the
+board forwards from the persisted cursor, and for each message either skips it
+(as not a decision, or a decision already terminally sealed) or drives it to a
+terminal disposition through the strict resolver and the owner source:
+
+    read after cursor -> (decision?) -> resolve -> record intent
+        -> owner.resume(action_key) -> seal terminal + advance cursor
+
+The crash-safety property is the ordering: the intent lands *before* the
+outward call, and the terminal seal (which also advances the cursor) lands only
+*after* the owner's answer is in hand. A SIGKILL in between replays to a
+durable finish with exactly one logical recovery, because the owner dedups on
+the action key.
+
+Every failure is a recorded fact, never a crash: a dead bus or an unreadable
+cursor costs observation (zero resume), a refuse or transport failure seals a
+terminal ``refused`` receipt, and a durability fault (an unreadable, unwritable,
+locked or corrupt database) fails closed -- the bridge refuses to resume rather
+than continuing on an in-memory cursor.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from fleet_graph.bus.board import DECISION_KIND, WORK_NOTES
+from fleet_graph.decision_bridge.owners import (
+    RESUME_ALREADY_RESUMED,
+    RESUME_REFUSED,
+    RESUME_RESUMED,
+    OwnerResult,
+    OwnerSource,
+    OwnerTarget,
+)
+from fleet_graph.decision_bridge.resolver import Resolution, action_key_for, resolve_decision
+from fleet_graph.decision_bridge.store import (
+    STATUS_INTENT_RECORDED,
+    STATUS_NOOP,
+    STATUS_REFUSED,
+    STATUS_RESUMED,
+    TERMINAL_STATUSES,
+    BridgeStore,
+    BridgeStoreError,
+)
+
+DEFAULT_STATE_DIR = Path("/data/fleet-graph/decision-bridge")
+DEFAULT_BOARD_PAGE_LIMIT = 200
+
+#: The channel this bridge reads, and the only channel the resolver accepts.
+READ_CHANNEL = WORK_NOTES
+
+#: The one decision kind the bridge maps. Read-only: nothing here publishes one,
+#: so the decision-publish credential is never needed (and must never be held).
+READ_KIND = DECISION_KIND
+
+
+@dataclass
+class DecisionBridgeConfig:
+    state_dir: Path = DEFAULT_STATE_DIR
+    poll_interval_seconds: float = 1.0
+    board_page_limit: int = DEFAULT_BOARD_PAGE_LIMIT
+    owner_url: str | None = None
+    dd_root: Path = Path("/data/fleet-graph/dd")
+    #: Test seam for the crash-window drill: write a sentinel at this path and
+    #: hold for ``kill_window_seconds`` after the owner's answer is in hand but
+    #: before the terminal seal. Off in production (None).
+    kill_window_file: Path | None = None
+    kill_window_seconds: float = 2.0
+
+
+@dataclass
+class _CycleRecord:
+    cursor_before: int | None = None
+    cursor_after: int | None = None
+    actions: list[dict[str, Any]] = field(default_factory=list)
+    owner_calls: int = 0
+    resumed: int = 0
+    bus: str = "available"
+    error: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "cursor_before": self.cursor_before,
+            "cursor_after": self.cursor_after,
+            "owner_calls": self.owner_calls,
+            "resumed": self.resumed,
+            "bus": self.bus,
+            "actions": self.actions,
+        }
+        if self.error is not None:
+            record["error"] = self.error
+        return record
+
+
+class DecisionBridge:
+    def __init__(
+        self,
+        config: DecisionBridgeConfig,
+        *,
+        bus: Any = None,
+        owner_source: OwnerSource | None = None,
+        store: BridgeStore | None = None,
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.config = config
+        self.bus = bus
+        self.owner_source = owner_source
+        self.store = store
+        self.clock = clock
+        self.sleep = sleep
+
+    # --- assembly helpers -------------------------------------------------
+
+    def _ensure_owner_source(self) -> OwnerSource:
+        if self.owner_source is not None:
+            return self.owner_source
+        if self.config.owner_url:
+            from fleet_graph.decision_bridge.owners import HttpOwnerSource
+
+            self.owner_source = HttpOwnerSource(self.config.owner_url)
+            return self.owner_source
+        from fleet_graph.decision_bridge.owners import DdOwnerSource
+
+        self.owner_source = DdOwnerSource(self.config.dd_root)
+        return self.owner_source
+
+    def _ensure_store(self) -> BridgeStore:
+        if self.store is None:
+            self.store = BridgeStore(self.config.state_dir).open()
+        return self.store
+
+    # --- the cycle --------------------------------------------------------
+
+    def run_once(self) -> dict[str, Any]:
+        """One poll-and-process cycle. Never raises; returns what it did."""
+        record = _CycleRecord()
+        try:
+            self._ensure_store()
+        except BridgeStoreError as exc:
+            record.error = str(exc)[:400]
+            return record.as_dict()  # fail closed: zero resume
+
+        try:
+            record.cursor_before = self._ensure_store().cursor()
+        except BridgeStoreError as exc:
+            record.error = f"cursor unreadable: {exc}"[:400]
+            return record.as_dict()
+
+        if self.bus is None:
+            record.bus = "unavailable"
+            record.actions.append({"action": "bus_unavailable", "source": "bridge"})
+            record.cursor_after = record.cursor_before
+            return record.as_dict()
+
+        try:
+            messages, _head = self.bus.messages(
+                READ_CHANNEL, after_seq=record.cursor_before, limit=self.config.board_page_limit
+            )
+        except Exception as exc:
+            record.bus = "error"
+            record.actions.append(
+                {"action": "bus_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
+            )
+            record.cursor_after = record.cursor_before
+            return record.as_dict()
+
+        for message in messages:
+            action = self._process_message(message)
+            record.actions.append(action)
+            record.owner_calls += int(action.get("owner_calls", 0))
+            if action.get("logical_resume"):
+                record.resumed += 1
+
+        try:
+            record.cursor_after = self._ensure_store().cursor()
+        except BridgeStoreError as exc:
+            record.error = f"cursor unreadable after cycle: {exc}"[:400]
+        return record.as_dict()
+
+    def run_forever(
+        self,
+        *,
+        observe: Callable[[dict[str, Any]], None] | None = None,
+        ticks: int | None = None,
+    ) -> None:
+        remaining = ticks
+        while remaining is None or remaining > 0:
+            record = self.run_once()
+            if observe is not None:
+                observe(record)
+            if remaining is not None:
+                remaining -= 1
+                if remaining == 0:
+                    return
+            self.sleep(self.config.poll_interval_seconds)
+
+    # --- one message ------------------------------------------------------
+
+    def _process_message(self, message: dict[str, Any]) -> dict[str, Any]:
+        seq = int(message.get("channel_seq") or 0)
+        source_message_id = str(message.get("message_id") or "")
+
+        if message.get("kind") != READ_KIND:
+            self._advance(seq)
+            return {"action": "skipped:not_a_decision", "seq": seq}
+
+        if not source_message_id:
+            self._advance(seq)
+            return {"action": "skipped:no_message_id", "seq": seq}
+
+        try:
+            existing = self._ensure_store().receipt(source_message_id)
+        except BridgeStoreError as exc:
+            # Fail closed: cannot read whether we already handled this decision,
+            # so we must not resume it (a blurry replay could double-apply).
+            return {
+                "action": "failed_closed:receipt_unreadable",
+                "seq": seq,
+                "error": str(exc)[:300],
+            }
+
+        if existing is not None and existing["status"] in TERMINAL_STATUSES:
+            self._advance(seq)
+            return {
+                "action": "skipped:terminal_receipt",
+                "seq": seq,
+                "status": existing["status"],
+            }
+
+        if existing is not None and existing["status"] == STATUS_INTENT_RECORDED:
+            return self._complete_intent(existing, seq, source_message_id)
+
+        return self._fresh_decision(message, seq, source_message_id)
+
+    def _advance(self, seq: int) -> None:
+        # Failing closed on a skip: the cursor does not move, so the same
+        # message is re-read next cycle. That is safe (skips are idempotent)
+        # and never advances past an unprocessed decision.
+        with contextlib.suppress(BridgeStoreError):
+            self._ensure_store().advance_cursor(seq)
+
+    def _fresh_decision(
+        self, message: dict[str, Any], seq: int, source_message_id: str
+    ) -> dict[str, Any]:
+        resolution = resolve_decision(message, self._ensure_owner_source(), channel_id=READ_CHANNEL)
+        if not resolution.ok:
+            self._seal_noop(resolution, seq, source_message_id, message)
+            return {
+                "action": f"noop:{resolution.category}",
+                "seq": seq,
+                "reason": resolution.reason[:300],
+            }
+
+        target = (
+            resolution.target
+            if resolution.target is not None
+            else OwnerTarget("", "", 1, "", "", "")
+        )
+        action_key = action_key_for(source_message_id, target.kind, target.id, target.generation)
+        self._ensure_store().record_intent(
+            {
+                "source_message_id": source_message_id,
+                "action_key": action_key,
+                "target_kind": target.kind,
+                "target_id": target.id,
+                "generation": target.generation,
+                "question_note_id": target.question_note_id,
+                "card_entity_id": target.card_entity_id,
+                "reason": "",
+                "source_event": message,
+            }
+        )
+
+        return self._resume_and_seal(
+            target, action_key, seq, source_message_id, message, recovery=False
+        )
+
+    def _complete_intent(
+        self, existing: dict[str, Any], seq: int, source_message_id: str
+    ) -> dict[str, Any]:
+        """Replay completion: the intent is on disk, the crash landed before the
+        terminal seal. Re-call the owner with the same action key; the owner's
+        durable dedup makes the replay exactly-once."""
+        target = OwnerTarget(
+            kind=str(existing.get("target_kind") or ""),
+            id=str(existing.get("target_id") or ""),
+            generation=int(existing.get("generation") or 1),
+            question_note_id=str(existing.get("question_note_id") or ""),
+            card_entity_id=str(existing.get("card_entity_id") or ""),
+            state="",
+        )
+        action_key = str(existing.get("action_key") or "")
+        return self._resume_and_seal(
+            target,
+            action_key,
+            seq,
+            source_message_id,
+            json.loads(existing["source_event"]),
+            recovery=True,
+        )
+
+    def _resume_and_seal(
+        self,
+        target: OwnerTarget,
+        action_key: str,
+        seq: int,
+        source_message_id: str,
+        source_event: dict[str, Any],
+        *,
+        recovery: bool,
+    ) -> dict[str, Any]:
+        try:
+            owner_result = self._ensure_owner_source().resume(target, action_key)
+        except Exception as exc:
+            owner_result = OwnerResult(RESUME_REFUSED, f"{type(exc).__name__}: {exc}")
+
+        status = (
+            STATUS_RESUMED
+            if owner_result.status in {RESUME_RESUMED, RESUME_ALREADY_RESUMED}
+            else STATUS_REFUSED
+        )
+        reason = (
+            ""
+            if owner_result.status == RESUME_RESUMED
+            else f"{owner_result.status}: {owner_result.detail}"[:300]
+        )
+
+        if self.config.kill_window_file is not None:
+            self._hold_kill_window(source_message_id)
+
+        self._seal_terminal(
+            source_message_id=source_message_id,
+            action_key=action_key,
+            target=target,
+            seq=seq,
+            source_event=source_event,
+            status=status,
+            reason=reason,
+        )
+        return {
+            "action": "completed" if status == STATUS_RESUMED else "refused",
+            "seq": seq,
+            "status": status,
+            "logical_resume": owner_result.logical,
+            "owner_calls": 1,
+            "recovery": recovery,
+            "action_key": action_key,
+        }
+
+    def _hold_kill_window(self, source_message_id: str) -> None:
+        sentinel = self.config.kill_window_file
+        if sentinel is None:
+            return
+        try:
+            sentinel.parent.mkdir(parents=True, exist_ok=True)
+            sentinel.write_text(
+                json.dumps({"source_message_id": source_message_id, "held": True}),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        self.sleep(self.config.kill_window_seconds)
+
+    def _seal_noop(
+        self,
+        resolution: Resolution,
+        seq: int,
+        source_message_id: str,
+        source_event: dict[str, Any],
+    ) -> None:
+        self._seal_terminal(
+            source_message_id=source_message_id,
+            action_key=None,
+            target=OwnerTarget("", "", 1, "", "", ""),
+            seq=seq,
+            source_event=source_event,
+            status=STATUS_NOOP,
+            reason=resolution.reason,
+        )
+
+    def _seal_terminal(
+        self,
+        *,
+        source_message_id: str,
+        action_key: str | None,
+        target: OwnerTarget,
+        seq: int,
+        source_event: dict[str, Any],
+        status: str,
+        reason: str,
+    ) -> None:
+        self._ensure_store().seal_terminal(
+            {
+                "source_message_id": source_message_id,
+                "action_key": action_key,
+                "target_kind": target.kind,
+                "target_id": target.id,
+                "generation": target.generation,
+                "question_note_id": target.question_note_id,
+                "card_entity_id": target.card_entity_id,
+                "status": status,
+                "reason": reason,
+                "source_event": source_event,
+            },
+            advance_seq=seq,
+        )
+
+
+def run_decision_bridge(
+    config: DecisionBridgeConfig,
+    *,
+    bus: Any = None,
+    owner_source: OwnerSource | None = None,
+    store: BridgeStore | None = None,
+    observe: Callable[[dict[str, Any]], None] | None = None,
+    ticks: int | None = None,
+) -> None:
+    """Run the bridge until told otherwise, streaming one JSON line per cycle."""
+    bridge = DecisionBridge(config, bus=bus, owner_source=owner_source, store=store)
+    bridge.run_forever(observe=observe, ticks=ticks)
+
+
+__all__ = [
+    "DEFAULT_BOARD_PAGE_LIMIT",
+    "DEFAULT_STATE_DIR",
+    "READ_CHANNEL",
+    "READ_KIND",
+    "DecisionBridge",
+    "DecisionBridgeConfig",
+    "run_decision_bridge",
+]
