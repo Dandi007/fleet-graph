@@ -1134,10 +1134,23 @@ class DdControlPlane:
         resume = (development_root / CHECKPOINT_FILE).is_file() and self._generation_launched(
             development_id, generation
         )
-        return self._launch(record, resume=resume, generation=generation)
+        # A dead unit on a previously-launched generation is the stale-running
+        # contradiction the recovery path exists to heal: the development was
+        # persisted as running, its recorded unit died, and this start resumes
+        # the same generation in place. That is a *resumed recovery*, distinct
+        # from a gate resume (whose result still carries an ``awaiting`` note)
+        # and from a terminal resolution -- mark it so callers can tell them
+        # apart.
+        recovered = resume and not bool((result or {}).get("awaiting"))
+        return self._launch(record, resume=resume, generation=generation, recovered=recovered)
 
     def _launch(
-        self, record: dict[str, Any], *, resume: bool, generation: int = 1
+        self,
+        record: dict[str, Any],
+        *,
+        resume: bool,
+        generation: int = 1,
+        recovered: bool = False,
     ) -> dict[str, Any]:
         development_id = str(record["development_id"])
         dev_root = self._dev_root(development_id)
@@ -1179,6 +1192,7 @@ class DdControlPlane:
             "unit": spec.unit_name,
             "mode": "resume" if resume else "fresh",
             "generation": generation,
+            "recovered": recovered,
             "at": iso(self.clock()),
             "started": launched.started,
             "detail": launched.detail,
@@ -1197,6 +1211,7 @@ class DdControlPlane:
             "already_running": False,
             "unit": spec.unit_name,
             "mode": entry["mode"],
+            "recovered": recovered,
             "generation": generation,
             "thread_id": f"{development_id}:g{generation}",
             "checkpoint": str(dev_root / CHECKPOINT_FILE),
