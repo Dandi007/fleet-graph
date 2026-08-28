@@ -62,6 +62,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from fleet_graph.acceptance import AcceptanceSpec
+from fleet_graph.scheduler.checkpoint_terminal import CheckpointTerminal
 from fleet_graph.scheduler.ignition import (
     DEFAULT_BACKOFF_CAP_SECONDS,
     DEFAULT_CAP_WINDOW_SECONDS,
@@ -277,6 +278,7 @@ class Scheduler:
         wake: WakeSignals | None = None,
         board: Any = None,
         supervisor: Any = None,
+        checkpoints: Any = None,
     ) -> None:
         self.config = config
         self.prober = prober
@@ -296,6 +298,15 @@ class Scheduler:
         #: parasitic on this tick. None means no supervision events -- the
         #: fleet schedules exactly as before. Duck-typed on `after_tick`.
         self.supervisor = supervisor
+        #: The durable checkpoint terminal reader (E3). None keeps the legacy
+        #: terminal.json decision path unchanged; non-None makes checkpoint
+        #: state authoritative for terminal/account/parking decisions.
+        self.checkpoints = checkpoints
+        #: Observability for checkpoint-read faults, keyed by folder: when a
+        #: checkpoint cannot be read the scheduler falls back to terminal.json
+        #: and records why, so the fault is not silently treated as "no
+        #: terminal" (which would read as a completed line).
+        self.checkpoint_fault_reasons: dict[str, str] = {}
         self.total_started = 0
         #: Timestamps of launches that followed a run which advanced no round.
         #: The global cap counts these, not every launch -- see `decide`.
@@ -334,12 +345,49 @@ class Scheduler:
         return float(self.clock())
 
     def terminal_record(self, folder_id: str) -> dict[str, Any] | None:
-        """The three mechanical fields of the last terminal, or None.
+        """The mechanical fields of the last terminal, or None.
 
         `terminal`, `rounds` and `run_id` only -- all three are written by this
         engine's own pump. `reason` is deliberately not read: it is an agent's
         prose, and a scheduler that acted on it would be judging the work.
+
+        E3: the durable checkpoint is the decision source. When a checkpoint
+        reader is configured, its `get_state` result is authoritative -- an
+        absent, stale, or conflicting terminal.json cannot change the answer.
+        `terminal.json` survives only as the fallback: a checkpoint that was
+        never written, or one that cannot be read (see
+        `checkpoint_fault_reason`).
         """
+        if self.checkpoints is not None:
+            reading = self._checkpoint_terminal_reading(folder_id)
+            if reading is not None:
+                if reading.record is not None:
+                    return reading.record
+                if reading.authoritative:
+                    # The checkpoint answered, but holds no terminal. The one
+                    # case where terminal.json still has the truth here is the
+                    # fault path: a crash escapes the graph before finalise, so
+                    # the checkpoint never records it, and write_fault_terminal
+                    # leaves the only trace (fault-path supplementation). Honour
+                    # that; otherwise a stale terminal.json must not stand in
+                    # for a line that is merely running, so report "no terminal".
+                    fallback = self._terminal_json_record(folder_id)
+                    if fallback is not None and (
+                        fallback.get("terminal") == "fault" or fallback.get("pump_fault")
+                    ):
+                        return fallback
+                    return None
+                if reading.fault is not None:
+                    # An actual checkpoint-read fault: fall back to the derived
+                    # terminal.json and keep the reason observable, never treat
+                    # an unreadable checkpoint as a completed terminal.
+                    self.checkpoint_fault_reasons[folder_id] = reading.fault
+                    return self._terminal_json_record(folder_id)
+                # No checkpoint for this generation: ordinary terminal.json.
+        return self._terminal_json_record(folder_id)
+
+    def _terminal_json_record(self, folder_id: str) -> dict[str, Any] | None:
+        """The derived terminal.json view (fault fallback / no-checkpoint path)."""
         path = self.config.run_root / folder_id / "terminal.json"
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
@@ -361,6 +409,40 @@ class Scheduler:
             # event costs no extra file read.
             "pump_fault": record.get("pump_fault"),
         }
+
+    def _line_for(self, folder_id: str) -> LineSpec | None:
+        for line in self.config.lines:
+            if line.folder_id == folder_id:
+                return line
+        return None
+
+    def _checkpoint_terminal_reading(self, folder_id: str) -> CheckpointTerminal | None:
+        """The checkpoint answer for the latest terminal, or None if unsourced.
+
+        Reads the current generation's thread first, then the one before it:
+        a non-`done` accounted terminal bumps the generation, so the terminal
+        it belongs to sits one generation back. A checkpoint that is present
+        but holds no terminal (the line is running) is authoritative and stops
+        the walk; a missing checkpoint falls through to the previous
+        generation, and finally to the terminal.json fallback.
+        """
+        line = self._line_for(folder_id)
+        if line is None or self.checkpoints is None:
+            return None
+        generation = self.generation_of(line)
+        for candidate in (generation, generation - 1):
+            if candidate < 1:
+                continue
+            reading = self.checkpoints.read(folder_id, candidate)
+            if reading.fault is not None:
+                return reading
+            if reading.authoritative:
+                return reading
+        return None
+
+    def checkpoint_fault_reason(self, folder_id: str) -> str | None:
+        """Why this line's checkpoint could not be read, when it happened."""
+        return self.checkpoint_fault_reasons.get(folder_id)
 
     def blocker_summary(self, folder_id: str) -> str | None:
         """The blocked terminal's `reason`, truncated, for display only.

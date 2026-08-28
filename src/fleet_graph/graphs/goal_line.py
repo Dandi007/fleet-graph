@@ -187,6 +187,12 @@ class LineState(TypedDict, total=False):
     round_no: int
     last_turn_output: str
     last_turn_status: dict[str, Any]
+    #: The process run id that owns this line's on-disk artifacts. Carried in
+    #: the checkpoint (E3) so the scheduler can read terminal state through
+    #: ``get_state`` and key account/parking decisions on the same run id that
+    #: ``terminal.json`` records -- without which a stale terminal.json could
+    #: re-key the accounting of a checkpoint-authoritative terminal.
+    run_id: str
     terminal: str
     terminal_reason: str
     #: Set only on a blocked terminal from the coordinator's declared verdict.
@@ -267,6 +273,10 @@ class LineDeps:
     #: The prior generation's terminal.json content, injected into the round-1
     #: coordinator input when present. None means there was no prior terminal.
     prior_terminal: dict[str, Any] | None = None
+    #: The process run id that names this line's RunArtifacts. Recorded into
+    #: the checkpoint terminal state (E3) so the scheduler can read it through
+    #: ``get_state`` instead of ``terminal.json``.
+    run_id: str = ""
     #: The E2 decision-interrupt port. None keeps the line on the legacy
     #: ``blocked + waiting_on=decision`` parking path unchanged; non-None routes
     #: a human-decision wait through a durable in-graph interrupt instead.
@@ -352,6 +362,10 @@ def _verdict_update(
             "terminal": TERMINAL_BLOCKED,
             "terminal_reason": reason,
             "waiting_on": waiting_on,
+            # E3: the blocked terminal is read back from the checkpoint, so the
+            # run id must ride along in state -- the interrupt path suspends
+            # before finalise and the scheduler parks off this exact checkpoint.
+            "run_id": deps.run_id,
         }
         if declared is not None:
             update["waiting_on_declared"] = declared
@@ -637,7 +651,11 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             waiting_on=state.get("waiting_on") or WAITING_ON_DEFAULT,
             waiting_on_declared=state.get("waiting_on_declared"),
         )
-        return {}
+        # E3: the terminal is authoritative through the checkpoint, so the run
+        # id that terminal.json attributes is recorded into state too -- the
+        # scheduler reads it via get_state rather than re-deriving it from the
+        # derived terminal.json view.
+        return {"run_id": deps.run_id}
 
     def after_bounds(state: LineState) -> str:
         return "finalise" if state.get("terminal") else "coordinator_turn"

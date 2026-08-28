@@ -199,6 +199,7 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         # opened still starts, but loses the interrupt routing rather than the
         # whole run -- parking remains the fallback.
         interrupt=_build_interrupt(config, run_id=run_id),
+        run_id=run_id,
     )
     return build_goal_line_graph(deps), deps
 
