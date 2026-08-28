@@ -1,0 +1,14 @@
+{
+ "development_id": "dev-fg-cf2bf262c635",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
