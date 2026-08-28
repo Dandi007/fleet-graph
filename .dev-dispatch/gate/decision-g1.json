@@ -1,0 +1,11 @@
+{
+ "development_id": "dev-fg-6808b0d75c7b",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "uther-tui（监督面代行，用户 /loop 端到端授权）",
+ "decision_message_id": "msg_01M14YEFNK1R8WJX62PT6JJ1RZ",
+ "question_note_id": "msg_01M14YB96G8HXHXBRHV7RHCYA4",
+ "card_entity_id": "msg_01M14WB5BY394Q25G096ZKNZ7T",
+ "output_commit": "047eace1f72e6696aa20bfbe255d066c642f2b70"
+}
