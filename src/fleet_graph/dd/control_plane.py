@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import Any
 
 from fleet_graph.dd.adoption import (
+    ADOPTION_MECHANISM,
     AdoptionError,
     AdoptionLedger,
     AdoptionRecord,
@@ -78,12 +79,26 @@ from fleet_graph.dd.bootstrap import (
     committed_target_base,
     digest_of,
 )
+from fleet_graph.dd.evidence import (
+    KIND_ADOPTION,
+    KIND_HUMAN_RECOVERY,
+    KIND_SCOPE,
+    EvidenceChain,
+    EvidenceLink,
+)
 from fleet_graph.dd.git import run_git
-from fleet_graph.dd.recovery import HumanRecoveryExit, RecoveryDecision, RecoveryError
+from fleet_graph.dd.recovery import (
+    RECOVERY_MECHANISM,
+    HumanRecoveryExit,
+    RecoveryDecision,
+    RecoveryError,
+)
 from fleet_graph.dd.scope import (
+    RULE_ID,
     ScopeBoundary,
     ScopeViolationError,
     default_boundary,
+    evaluate_text,
     require_scope,
 )
 from fleet_graph.dd.upstream_constants import ATTEMPT_CONTEXT_CONTRACT_VERSION
@@ -557,8 +572,9 @@ class DdControlPlane:
         spec = self._read_spec(spec_text, spec_path)
         # B1: admit nothing that actively crosses the declared scope boundary.
         # The refusal names the scope rule, so a crossing is a scope decision
-        # rather than whatever downstream failure happened to fire first.
-        self._require_scope(spec.decode("utf-8", errors="replace"))
+        # rather than whatever downstream failure happened to fire first. The
+        # admitted verdict is persisted on the record as the B3 scope evidence.
+        scope_verdict = self._require_scope(spec.decode("utf-8", errors="replace"))
         base = self._default_target_base(repo, target_base)
         spec_digest = digest_of(spec)
         development_id = derive_development_id(repo, spec_digest, base)
@@ -613,6 +629,7 @@ class DdControlPlane:
             "target_base_commit": base,
             "spec_digest": spec_digest,
             "spec_size_bytes": len(spec),
+            "scope_verdict": scope_verdict,
             "bootstrap_commit": bootstrap_commit,
             "root_handoff_digest": root_handoff_digest,
             "acceptance_commands": acceptance_commands,
@@ -692,17 +709,36 @@ class DdControlPlane:
             raise ControlPlaneError("SPEC_EMPTY", "the approved spec is empty")
         return spec
 
-    def _require_scope(self, text: str) -> None:
+    def _require_scope(self, text: str) -> dict[str, Any]:
         """Refuse a spec whose active content crosses the B1-B3 boundary (B1).
 
         The scope rule is the authority, and the refusal is attributable to it:
         ``SCOPE_BOUNDARY_VIOLATION`` carries the boundary's own id and each
-        observed crossing, never a bare "something failed downstream".
+        observed crossing, never a bare "something failed downstream". On a
+        clean admit, the verdict is returned so the caller can persist it as
+        the B3 scope-evidence artifact.
         """
         try:
-            require_scope(text, self.scope_boundary)
+            verdict = require_scope(text, self.scope_boundary)
         except ScopeViolationError as exc:
             raise ControlPlaneError("SCOPE_BOUNDARY_VIOLATION", str(exc)) from exc
+        return verdict.as_dict()
+
+    def _scope_crossings(self, text: str) -> list[dict[str, Any]]:
+        """List the active border crossings in a handoff/receipt body, if any.
+
+        A handoff that only *mentions* B4 in a deferral context is not a
+        crossing; one that actively adds a phase or revives katana work is.
+        The returned entries carry the boundary's own reference and label, so a
+        quarantined artifact is attributable rather than a bare "looked weird".
+        """
+        verdict = evaluate_text(text, self.scope_boundary)
+        if verdict.admitted:
+            return []
+        return [
+            {"reference": v.reference, "label": v.label, "excerpt": v.excerpt}
+            for v in verdict.violations
+        ]
 
     def _default_target_base(self, repo: Path, target_base: str | None) -> str:
         """Explicit base -> committed identity -> HEAD, in that order.
@@ -1486,6 +1522,7 @@ class DdControlPlane:
             "state": self.rebuild_status(development_id)["state"],
             "generation": current,
             "evidence": entries,
+            "b3_evidence_chain": self.b3_evidence_chain(development_id),
         }
 
     def _h0(self, development_id: str) -> dict[str, Any] | None:
@@ -1622,6 +1659,9 @@ class DdControlPlane:
                 except ValueError:
                     receipt = None
                 if receipt is not None:
+                    crossings = self._scope_crossings(raw.decode("utf-8", errors="replace"))
+                    if crossings:
+                        receipt["scope_violations"] = crossings
                     return (
                         receipt,
                         str(receipt.get("parent_handoff_receipt_digest") or ""),
@@ -1642,6 +1682,9 @@ class DdControlPlane:
                     payload = None
                 if payload is not None:
                     receipt = dict(payload)
+                    crossings = self._scope_crossings(found.stdout)
+                    if crossings:
+                        receipt["scope_violations"] = crossings
                     if stage == "acceptance":
                         # The subject is the tree that carries the frozen
                         # record; the audit checks it out and re-runs exactly
@@ -1695,6 +1738,7 @@ class DdControlPlane:
                         target_ref=str(raw.get("target_ref") or ""),
                         digest=str(raw.get("digest") or ""),
                         sequence=int(raw.get("sequence") or 0),
+                        mechanism=str(raw.get("mechanism") or ADOPTION_MECHANISM),
                     )
                 )
         return AdoptionLedger(records)
@@ -1715,6 +1759,7 @@ class DdControlPlane:
                         question_note_id=str(raw.get("question_note_id") or ""),
                         at=str(raw.get("at") or ""),
                         digest=str(raw.get("digest") or ""),
+                        mechanism=str(raw.get("mechanism") or RECOVERY_MECHANISM),
                     )
                 )
         # The exit's own authenticator is the fail-closed floor; the *real*
@@ -1724,36 +1769,54 @@ class DdControlPlane:
     def adopt(
         self,
         development_id: str,
-        *,
-        signature: str = "",
-        kind: str = "",
-        source: str = "",
-        target_ref: str = "",
+        discoveries: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
-        """Adopt one discovered in-flight/recoverable work item (B2).
+        """Adopt the discovered in-flight/recoverable work automatically (B2).
 
-        Idempotent by signature: adopting the same discovery twice returns the
-        same sealed record and appends nothing -- a replayed discovery cannot
-        duplicate adopted work or fork its history. The trail is append-only,
-        and every record carries its own digest.
+        ``discoveries`` is a batch of discoveries the caller found in flight:
+        ``{signature, kind, source, target_ref}``. The not-yet-adopted subset
+        is picked out by ``AdoptionLedger.discover`` and adopted; items already
+        on the trail are skipped unchanged. That discovery-then-adopt split is
+        the whole "automatic rather than manual bookkeeping" property, and it
+        is idempotent: replaying the same batch yields the same sealed records
+        and appends nothing -- a replayed discovery cannot duplicate adopted
+        work or fork its history.
         """
         self._record(development_id)  # refuses unknown ids before anything else
-        discovery = Discovery(signature=signature, kind=kind, source=source)
         ledger = self._load_adoption_ledger(development_id)
-        already = ledger.is_adopted(signature)
-        try:
-            record = ledger.adopt(discovery, target_ref)
-        except AdoptionError as exc:
-            raise ControlPlaneError("ADOPTION_INVALID", str(exc)) from exc
-
-        if not already:
+        seen: dict[str, tuple[Discovery, str]] = {}
+        for item in discoveries or []:
+            signature = str(item.get("signature") or "")
+            if not signature or signature in seen:
+                continue
+            seen[signature] = (
+                Discovery(
+                    signature=signature,
+                    kind=str(item.get("kind") or ""),
+                    source=str(item.get("source") or ""),
+                ),
+                str(item.get("target_ref") or ""),
+            )
+        pending = ledger.discover(discovery for discovery, _ in seen.values())
+        adopted: list[dict[str, Any]] = []
+        for discovery in pending:
+            _, target_ref = seen[discovery.signature]
+            try:
+                record = ledger.adopt(discovery, target_ref)
+            except AdoptionError as exc:
+                raise ControlPlaneError("ADOPTION_INVALID", str(exc)) from exc
+            adopted.append(record.as_dict())
+        if adopted:
             with self._adoption_path(development_id).open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record.as_dict(), ensure_ascii=False) + "\n")
+                for record in adopted:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         self.rebuild_status(development_id)
+        adopted_signatures = {record["signature"] for record in adopted}
+        skipped = [signature for signature in seen if signature not in adopted_signatures]
         return {
             "development_id": development_id,
-            "adopted": record.as_dict(),
-            "already_adopted": already,
+            "adopted": adopted,
+            "skipped": skipped,
         }
 
     def _head_commit(self, record: dict[str, Any]) -> str:
@@ -1854,6 +1917,78 @@ class DdControlPlane:
             "development_id": development_id,
             "adoptions": [
                 record.as_dict() for record in self._load_adoption_ledger(development_id).records()
+            ],
+        }
+
+    def b3_evidence_chain(self, development_id: str) -> dict[str, Any]:
+        """Assemble and validate the B3 phenomenon->mechanism->evidence chain.
+
+        The links are built from the real artifacts the behaviours produced --
+        the persisted scope verdict, the adoption trail, and the recovery trail
+        -- not from re-typed claims. Each link's ``evidence_mechanism`` is read
+        off the artifact itself (its recorded ``mechanism`` / ``rule_id``), so
+        a substituted unrelated event is a mismatch the validator names, rather
+        than something a test author could satisfy by spelling the same literal
+        twice.
+        """
+        from fleet_graph.dd.upstream_constants import compute_json_digest
+
+        record = self._record(development_id)
+        links: list[EvidenceLink] = []
+
+        scope_verdict = record.get("scope_verdict") or {}
+        if scope_verdict.get("admitted"):
+            links.append(
+                EvidenceLink(
+                    kind=KIND_SCOPE,
+                    phenomenon="a spec that actively crosses the boundary is refused",
+                    mechanism=RULE_ID,
+                    evidence_mechanism=str(scope_verdict.get("rule_id") or ""),
+                    subject_ref=str(record.get("spec_digest") or ""),
+                    digest=compute_json_digest(scope_verdict),
+                )
+            )
+
+        for adopted in self._load_adoption_ledger(development_id).records():
+            links.append(
+                EvidenceLink(
+                    kind=KIND_ADOPTION,
+                    phenomenon="replaying the same discovery yields one adopted record",
+                    mechanism=ADOPTION_MECHANISM,
+                    evidence_mechanism=adopted.mechanism,
+                    subject_ref=adopted.target_ref,
+                    digest=adopted.digest,
+                )
+            )
+
+        for recovery in self._load_recovery_exit(development_id).records():
+            links.append(
+                EvidenceLink(
+                    kind=KIND_HUMAN_RECOVERY,
+                    phenomenon="suspended work resumes only from a recorded decision",
+                    mechanism=RECOVERY_MECHANISM,
+                    evidence_mechanism=recovery.mechanism,
+                    subject_ref=recovery.target_ref,
+                    digest=recovery.digest,
+                )
+            )
+
+        chain = EvidenceChain(tuple(links))
+        reasons = chain.validate()
+        return {
+            "development_id": development_id,
+            "valid": not reasons,
+            "reasons": list(reasons),
+            "links": [
+                {
+                    "kind": link.kind,
+                    "phenomenon": link.phenomenon,
+                    "mechanism": link.mechanism,
+                    "evidence_mechanism": link.evidence_mechanism,
+                    "subject_ref": link.subject_ref,
+                    "digest": link.digest,
+                }
+                for link in chain.links
             ],
         }
 

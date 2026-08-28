@@ -49,6 +49,8 @@ ALL_TOOLS = {
     "development_steer",
     "development_reconfigure",
     "development_relock",
+    "development_adopt",
+    "development_recover",
 }
 
 # Arguments that satisfy each legacy-only tool's schema, so the refusal we
@@ -127,6 +129,12 @@ class FakeControlPlane:
     def reconfigure(self, **kwargs: object) -> dict[str, object]:
         return self._record("reconfigure", **kwargs)
 
+    def adopt(self, **kwargs: object) -> dict[str, object]:
+        return self._record("adopt", **kwargs)
+
+    def recover(self, **kwargs: object) -> dict[str, object]:
+        return self._record("recover", **kwargs)
+
 
 def test_selected_port_is_free_and_not_a_legacy_port() -> None:
     assert DEFAULT_PORT == 5610
@@ -161,6 +169,8 @@ def test_the_surface_split_is_exactly_the_ruling() -> None:
         "development_start",
         "development_gate",
         "development_reconfigure",
+        "development_adopt",
+        "development_recover",
     } == SUPPORTED_TOOLS
     assert {
         "development_steer",
@@ -277,6 +287,28 @@ def test_every_supported_tool_drives_the_control_plane_over_the_running_endpoint
                 "acceptance_env": {"CI": "1"},
             },
         ),
+        (
+            "development_adopt",
+            {
+                "development_id": "dev-1",
+                "discoveries": [
+                    {
+                        "signature": "dev-1:g1",
+                        "kind": "in_flight",
+                        "source": "runner",
+                        "target_ref": "abc123",
+                    }
+                ],
+            },
+        ),
+        (
+            "development_recover",
+            {
+                "development_id": "dev-1",
+                "target_ref": "abc123",
+                "question_note_id": "note-1",
+            },
+        ),
     ]
     assert {name for name, _ in calls} == set(SUPPORTED_TOOLS)
 
@@ -315,6 +347,28 @@ def test_every_supported_tool_drives_the_control_plane_over_the_running_endpoint
                 "acceptance_argv": ["make verify"],
                 "setup": ["npm ci"],
                 "acceptance_env": {"CI": "1"},
+            },
+        ),
+        (
+            "adopt",
+            {
+                "development_id": "dev-1",
+                "discoveries": [
+                    {
+                        "signature": "dev-1:g1",
+                        "kind": "in_flight",
+                        "source": "runner",
+                        "target_ref": "abc123",
+                    }
+                ],
+            },
+        ),
+        (
+            "recover",
+            {
+                "development_id": "dev-1",
+                "target_ref": "abc123",
+                "question_note_id": "note-1",
             },
         ),
     ]
@@ -370,7 +424,18 @@ def test_the_fake_control_plane_mirrors_the_real_surface() -> None:
     method it fakes exists on DdControlPlane with the same parameters."""
     from fleet_graph.dd.control_plane import DdControlPlane
 
-    for method in ("create", "start", "get", "list", "events", "evidence", "gate", "reconfigure"):
+    for method in (
+        "create",
+        "start",
+        "get",
+        "list",
+        "events",
+        "evidence",
+        "gate",
+        "reconfigure",
+        "adopt",
+        "recover",
+    ):
         assert hasattr(DdControlPlane, method), method
     real = {
         name

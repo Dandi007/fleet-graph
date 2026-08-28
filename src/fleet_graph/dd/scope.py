@@ -50,6 +50,13 @@ _DEFERRAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Sentence-ending punctuation, followed by whitespace or end-of-text. A
+#: deferral phrase governs the whole sentence it sits in, so a forbidden
+#: reference anywhere in that sentence -- including the later items of a
+#: "must not reuse, continue, or depend on X or Y" list separated by one
+#: wrap -- is read as the boundary speaking, not the boundary being crossed.
+_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+
 
 class ScopeViolationError(RuntimeError):
     """A work item crosses the declared boundary; the refusal is attributable."""
@@ -124,13 +131,21 @@ def default_boundary() -> ScopeBoundary:
 def _deferred(text: str, start: int, end: int) -> bool:
     """Whether the forbidden reference sits in a deferral / out-of-scope context.
 
-    Only the immediate neighbourhood counts: the boundary is a hard edge, not a
-    free-text classifier, and a word half a page away says nothing about this
-    reference.
+    A deferral phrase governs the sentence it sits in, not just a fixed few
+    characters around the match, so "must not reuse, continue, or depend on
+    `katana#150` or `katana#151`" -- where the second item is a line-wrap past
+    a naive window -- still reads as the boundary speaking, not as a revival.
     """
-    before = text[max(0, start - DEFERRAL_WINDOW) : start]
-    after = text[end : min(len(text), end + DEFERRAL_WINDOW)]
-    return bool(_DEFERRAL_RE.search(before) or _DEFERRAL_RE.search(after))
+    left = 0
+    right = len(text)
+    for match in _SENTENCE_END.finditer(text):
+        if match.end() <= start:
+            left = match.end()
+        elif match.start() >= end:
+            right = match.end()
+            break
+    sentence = text[left:right]
+    return bool(_DEFERRAL_RE.search(sentence))
 
 
 def _excerpt(text: str, start: int, end: int) -> str:

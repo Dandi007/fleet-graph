@@ -7,7 +7,12 @@ decision with no immutable target reference.
 
 from __future__ import annotations
 
-from fleet_graph.dd.adoption import KIND_RECOVERABLE, AdoptionLedger, Discovery
+from fleet_graph.dd.adoption import (
+    ADOPTION_MECHANISM,
+    KIND_RECOVERABLE,
+    AdoptionLedger,
+    Discovery,
+)
 from fleet_graph.dd.evidence import (
     KIND_ADOPTION,
     KIND_HUMAN_RECOVERY,
@@ -15,8 +20,8 @@ from fleet_graph.dd.evidence import (
     EvidenceChain,
     EvidenceLink,
 )
-from fleet_graph.dd.recovery import HumanRecoveryExit
-from fleet_graph.dd.scope import evaluate_text
+from fleet_graph.dd.recovery import RECOVERY_MECHANISM, HumanRecoveryExit
+from fleet_graph.dd.scope import RULE_ID, evaluate_text
 from fleet_graph.dd.upstream_constants import compute_digest
 
 
@@ -29,7 +34,10 @@ def build_chain() -> EvidenceChain:
     """The three B1/B2 behaviours, each linked phenomenon->mechanism->evidence.
 
     The subject of every link is bound by digest -- not log text, not a mocked
-    success flag -- and the evidence mechanism is asserted to equal the rule.
+    success flag -- and the evidence mechanism is read off the artifact the
+    behaviour actually produced, so a substituted unrelated event is a mismatch
+    the validator names rather than something satisfied by spelling the same
+    literal twice.
     """
     scope_verdict = evaluate_text("Implement B4 as the next phase.")
     scope_subject = compute_digest("Implement B4 as the next phase.")
@@ -47,8 +55,8 @@ def build_chain() -> EvidenceChain:
             EvidenceLink(
                 kind=KIND_SCOPE,
                 phenomenon="a spec declaring B4 is refused",
-                mechanism="b1-scope-boundary active-forbidden refusal",
-                evidence_mechanism="b1-scope-boundary active-forbidden refusal",
+                mechanism=RULE_ID,
+                evidence_mechanism=scope_verdict.rule_id,
                 subject_ref=scope_subject,
                 digest=compute_digest(
                     f"{scope_verdict.rule_id}:{[v.reference for v in scope_verdict.violations]}"
@@ -57,16 +65,16 @@ def build_chain() -> EvidenceChain:
             EvidenceLink(
                 kind=KIND_ADOPTION,
                 phenomenon="replaying the same discovery yields one adopted record",
-                mechanism="AdoptionLedger.adopt idempotent by signature",
-                evidence_mechanism="AdoptionLedger.adopt idempotent by signature",
+                mechanism=ADOPTION_MECHANISM,
+                evidence_mechanism=adoption.mechanism,
                 subject_ref=adoption.target_ref,
                 digest=adoption.digest,
             ),
             EvidenceLink(
                 kind=KIND_HUMAN_RECOVERY,
                 phenomenon="suspended work resumes only from a recorded decision",
-                mechanism="HumanRecoveryExit.resume gated on recorded_for",
-                evidence_mechanism="HumanRecoveryExit.resume gated on recorded_for",
+                mechanism=RECOVERY_MECHANISM,
+                evidence_mechanism=recovery.mechanism,
                 subject_ref=recovery.target_ref,
                 digest=recovery.digest,
             ),
@@ -146,6 +154,24 @@ class TestSubstitutionFails:
             digest="d",
         )
         assert EvidenceChain((link,)).validate() == ()
+
+    def test_an_adoption_link_bound_to_a_recovery_artifact_is_named(self) -> None:
+        """The mechanism field is read off the artifact, so swapping in a
+        recovery decision where an adoption is claimed is a real substitution,
+        not a match-by-construction."""
+        exit_ = HumanRecoveryExit(authenticate=lambda a, n: bool(a) and bool(n))
+        recovery = exit_.record(
+            target_ref="ref1", decision="resume", decided_by="alice", question_note_id="n1"
+        )
+        link = EvidenceLink(
+            kind=KIND_ADOPTION,
+            phenomenon="adoption",
+            mechanism=ADOPTION_MECHANISM,
+            evidence_mechanism=recovery.mechanism,
+            subject_ref=recovery.target_ref,
+            digest=recovery.digest,
+        )
+        assert "substituted an unrelated event" in reasons(EvidenceChain((link,)))
 
 
 class TestHumanRecoveryTarget:

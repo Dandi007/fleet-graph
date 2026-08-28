@@ -207,6 +207,15 @@ class TestItRefusesRatherThanGuesses:
         with pytest.raises(DispatchError, match="cannot read committed refs"):
             make_builder(repo).build(walker_dispatch(repo))
 
+    def test_a_spec_that_actively_crosses_the_scope_boundary_is_refused(self, repo: Path) -> None:
+        """The dispatch path re-checks the committed spec, not just admission:
+        a handoff that rewrites the frozen spec to add B4 is refused by name."""
+        (repo / SPEC_PATH).write_text("implement B4 as the next phase\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "rewrite spec to add B4")
+        with pytest.raises(DispatchError, match="scope boundary refused"):
+            make_builder(repo).build(walker_dispatch(repo))
+
     def test_a_feedback_index_for_another_development_is_refused(self, repo: Path) -> None:
         """Otherwise the whole chain quietly re-points at someone else's work."""
         write_index(repo, entries=[], development_id="dev-someone-else")

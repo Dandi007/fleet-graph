@@ -28,6 +28,11 @@ from typing import Any
 
 from fleet_graph.dd.upstream_constants import compute_json_digest
 
+#: What produced a recovery decision. Stored on the record itself (and bound by
+#: its digest) so a downstream evidence link can assert the artifact was produced
+#: by this exact mechanism rather than re-typing the name at the assertion site.
+RECOVERY_MECHANISM = "HumanRecoveryExit.record"
+
 
 class RecoveryError(RuntimeError):
     """A recovery cannot proceed. Refuse rather than guess."""
@@ -43,6 +48,7 @@ class RecoveryDecision:
     question_note_id: str = ""
     at: str = ""
     digest: str = ""
+    mechanism: str = RECOVERY_MECHANISM
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -52,11 +58,18 @@ class RecoveryDecision:
             "question_note_id": self.question_note_id,
             "at": self.at,
             "digest": self.digest,
+            "mechanism": self.mechanism,
         }
 
 
 def decision_digest(
-    *, target_ref: str, decision: str, decided_by: str, question_note_id: str, at: str
+    *,
+    target_ref: str,
+    decision: str,
+    decided_by: str,
+    question_note_id: str,
+    at: str,
+    mechanism: str = RECOVERY_MECHANISM,
 ) -> str:
     return compute_json_digest(
         {
@@ -65,6 +78,7 @@ def decision_digest(
             "decided_by": decided_by,
             "question_note_id": question_note_id,
             "at": at,
+            "mechanism": mechanism,
         }
     )
 
@@ -132,6 +146,7 @@ class HumanRecoveryExit:
                 decided_by=decided_by,
                 question_note_id=question_note_id,
                 at=at,
+                mechanism=RECOVERY_MECHANISM,
             ),
         )
         self._records.append(record)
@@ -169,6 +184,7 @@ class HumanRecoveryExit:
 
 
 __all__ = [
+    "RECOVERY_MECHANISM",
     "HumanRecoveryExit",
     "RecoveryDecision",
     "RecoveryError",

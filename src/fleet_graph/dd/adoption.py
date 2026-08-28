@@ -28,6 +28,11 @@ KIND_IN_FLIGHT = "in_flight"
 KIND_RECOVERABLE = "recoverable"
 KINDS = frozenset({KIND_IN_FLIGHT, KIND_RECOVERABLE})
 
+#: What produced an adoption record. Stored on the record itself (and bound by
+#: its digest) so a downstream evidence link can assert the artifact was produced
+#: by this exact mechanism rather than re-typing the name at the assertion site.
+ADOPTION_MECHANISM = "AdoptionLedger.adopt"
+
 
 class AdoptionError(RuntimeError):
     """A discovery cannot be adopted as asked. Nothing is guessed."""
@@ -51,8 +56,10 @@ class Discovery:
 class AdoptionRecord:
     """One adopted work item, sealed by digest.
 
-    The digest is computed over (signature, kind, source, target_ref) -- the
-    adopted facts, not the sequence -- so a replay hashes identically.
+    The digest is computed over (signature, kind, source, target_ref,
+    mechanism) -- the adopted facts, not the sequence -- so a replay hashes
+    identically. ``mechanism`` names what produced the record; it is stored on
+    the artifact itself so an evidence link reads it instead of re-typing it.
     """
 
     signature: str
@@ -61,6 +68,7 @@ class AdoptionRecord:
     target_ref: str
     digest: str
     sequence: int
+    mechanism: str = ADOPTION_MECHANISM
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -70,12 +78,21 @@ class AdoptionRecord:
             "target_ref": self.target_ref,
             "digest": self.digest,
             "sequence": self.sequence,
+            "mechanism": self.mechanism,
         }
 
 
-def record_digest(signature: str, kind: str, source: str, target_ref: str) -> str:
+def record_digest(
+    signature: str, kind: str, source: str, target_ref: str, mechanism: str = ADOPTION_MECHANISM
+) -> str:
     return compute_json_digest(
-        {"signature": signature, "kind": kind, "source": source, "target_ref": target_ref}
+        {
+            "signature": signature,
+            "kind": kind,
+            "source": source,
+            "target_ref": target_ref,
+            "mechanism": mechanism,
+        }
     )
 
 
@@ -118,7 +135,13 @@ class AdoptionLedger:
             kind=discovery.kind,
             source=discovery.source,
             target_ref=target_ref,
-            digest=record_digest(discovery.signature, discovery.kind, discovery.source, target_ref),
+            digest=record_digest(
+                discovery.signature,
+                discovery.kind,
+                discovery.source,
+                target_ref,
+                ADOPTION_MECHANISM,
+            ),
             sequence=len(self._order) + 1,
         )
         self._by_signature[record.signature] = record
@@ -136,6 +159,7 @@ class AdoptionLedger:
 
 
 __all__ = [
+    "ADOPTION_MECHANISM",
     "KINDS",
     "KIND_IN_FLIGHT",
     "KIND_RECOVERABLE",
