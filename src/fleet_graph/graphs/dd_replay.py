@@ -193,11 +193,15 @@ class ReceiptReplayer:
             # serves only the untouched start of a fresh generation.
             self._disabled = True
             return None
-        try:
+        if self._plan is None:
+            try:
+                candidates = self._candidate_plans()
+            except Exception:
+                candidates = []
+            self._plan = self._select(candidates, stage)
             if self._plan is None:
-                self._plan = self._build_plan()
-        except Exception:
-            self._plan = []
+                self._disabled = True
+                return None
         if self._index >= len(self._plan):
             self._disabled = True
             return None
@@ -208,14 +212,6 @@ class ReceiptReplayer:
             # and, the index still being 0, nothing has been mutated.
             self._disabled = True
             return None
-        if self._index == 0:
-            try:
-                prepared = self._prepare(self._plan)
-            except Exception:
-                prepared = False
-            if not prepared:
-                self._disabled = True
-                return None
         self._index += 1
         return Replayed(
             event=step.event,
@@ -226,7 +222,26 @@ class ReceiptReplayer:
 
     # --- plan construction (read-only) ------------------------------------
 
-    def _build_plan(self) -> list[_Step]:
+    def _candidate_plans(self) -> list[list[_Step]]:
+        """The replays worth trying, best first.
+
+        A restarted generation replays the receipt-sealed prefix of the
+        previous one. A prior generation that crashed mid-review (configure +
+        implement sealed, the review never sealed) leaves only a *partial*
+        prefix ending at implement; replaying that partial prefix and then
+        materialising a fresh continuous review hands the feedback carrier a
+        brand-new attempt, whose ordering rule refuses without a preceding
+        REJECT (ORDER_VIOLATION). When an earlier generation already holds the
+        review-bearing prefix for the same development, it is a stronger
+        candidate: the replayed candidate continues through its continuous and
+        final review stages instead of opening a new attempt. Candidates are
+        therefore ordered review-depth-first, newest generation first within a
+        depth. The order is only a preference -- `_select` still falls back to
+        a less-reviewed candidate when `_prepare` refuses the stronger one (for
+        example on product drift), because replaying a partial prefix beats
+        re-dispatching a fresh implement actor against work already in the
+        tree.
+        """
         implement_id = implement_stage(self.lifecycle)
         configure_id = self._spine_predecessor(implement_id)
         if not implement_id or not configure_id:
@@ -241,21 +256,46 @@ class ReceiptReplayer:
                 plans.append(plan)
         if not plans:
             return []
-        # A restarted generation replays the receipt-sealed prefix, but a prior
-        # generation that crashed mid-review (configure + implement sealed, the
-        # review never sealed) leaves only a *partial* prefix ending at
-        # implement. Replaying that partial prefix and then materialising a
-        # fresh continuous review would hand the feedback carrier a brand-new
-        # attempt whose ordering rule refuses without a preceding REJECT
-        # (ORDER_VIOLATION). When an earlier generation holds the review-bearing
-        # prefix for the same development, replay that instead: the replayed
-        # candidate continues through its continuous and final review stages
-        # rather than opening a new attempt. Ties resolve to the newest
-        # generation (the walk order), and `_prepare` still fail-closes on
-        # product drift, so preferring the more-reviewing prefix can never cut
-        # work an earlier generation did not already seal.
         review_ids = set(review_stages(self.lifecycle))
-        return max(plans, key=lambda plan: sum(1 for step in plan if step.stage_id in review_ids))
+
+        def _review_depth(plan: list[_Step]) -> int:
+            return sum(1 for step in plan if step.stage_id in review_ids)
+
+        # `sorted` is stable, so the newest-generation-first walk order is
+        # preserved among plans of equal review depth; the key only moves the
+        # deeper (more-reviewing) prefixes forward.
+        return sorted(plans, key=_review_depth, reverse=True)
+
+    def _select(self, candidates: list[list[_Step]], stage: Stage) -> list[_Step] | None:
+        """The first candidate that applies to `stage` and can actually be
+        prepared. A candidate whose first step is not `stage` never applies
+        (that is a mid-walk resume, not the prefix). A candidate whose
+        `_prepare` refuses -- product drift above its tip, a vanished remote
+        head -- falls back to the next, because replay is a prefix and a
+        shorter, preparable prefix is still the sealed chain: re-dispatching a
+        fresh implement against a tree that already carries the work is the
+        F4 BLOCKED jam, not correctness."""
+        for candidate in candidates:
+            if not candidate or candidate[0].stage_id != stage.id:
+                continue
+            try:
+                prepared = self._prepare(candidate)
+            except Exception:
+                prepared = False
+            if prepared:
+                return candidate
+        return None
+
+    # ---- backward-compatible single-plan accessor ------------------------
+
+    def _build_plan(self) -> list[_Step]:
+        """The strongest candidate, for callers and tests that need one plan.
+
+        Selection and `_prepare` still happen lazily in `replay`; this is the
+        read-only "what would we prefer" answer.
+        """
+        candidates = self._candidate_plans()
+        return candidates[0] if candidates else []
 
     def _walk(
         self,
