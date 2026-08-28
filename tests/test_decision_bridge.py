@@ -641,6 +641,16 @@ class TestLineOwner:
         assert source.discover("q-other") == []
         assert source.discover("not-parked-question") == []
 
+    def test_discover_accepts_roster_dict_entries(self, tmp_path: Path) -> None:
+        """Production loads the roster from config/ronin-lines.json, whose lines
+        are dicts -- the owner must read ``folder_id`` from a dict, not treat the
+        dict itself as the id."""
+        run_root = tmp_path / "runs"
+        self._parked(run_root)
+        source = LineOwnerSource(run_root, [{"folder_id": "wf-1", "seat": "s", "generation": 2}])
+        targets = source.discover("q-1")
+        assert [t.id for t in targets] == ["wf-1"]
+
     def test_resume_wakes_once_and_dedups(self, tmp_path: Path) -> None:
         run_root = tmp_path / "runs"
         stall = self._parked(run_root)

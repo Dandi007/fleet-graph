@@ -225,6 +225,8 @@ class LineOwnerSource:
 
     @staticmethod
     def _folder_id(line: Any) -> str:
+        if isinstance(line, dict):
+            return str(line.get("folder_id") or "")
         return str(getattr(line, "folder_id", line))
 
     def _stall_path(self, folder_id: str) -> Path:
@@ -238,8 +240,9 @@ class LineOwnerSource:
         return raw if isinstance(raw, dict) else {}
 
     def _generation(self, state: dict[str, Any], line: Any) -> int:
+        base = line.get("generation") if isinstance(line, dict) else getattr(line, "generation", 1)
         try:
-            return int(state.get("generation") or getattr(line, "generation", 1) or 1)
+            return int(state.get("generation") or base or 1)
         except (TypeError, ValueError):
             return 1
 
