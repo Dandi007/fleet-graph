@@ -167,19 +167,22 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         # path with a durable graph interrupt"). A line whose store cannot be
         # opened still starts, but loses the interrupt routing rather than the
         # whole run -- parking remains the fallback.
-        interrupt=_build_interrupt(config),
+        interrupt=_build_interrupt(config, run_id=run_id),
     )
     return build_goal_line_graph(deps), deps
 
 
-def _build_interrupt(config: LineConfig) -> LineInterruptPort | None:
+def _build_interrupt(config: LineConfig, *, run_id: str = "") -> LineInterruptPort | None:
     """The production E2 interrupt port for one line.
 
     Opens the line's durable ``GoalInterruptStore`` (under ``run_root``) and, when
     a bus credential is present, a ``Board`` for materialising the question and
-    card. A missing credential degrades to a deterministic question id rather
-    than failing the line start; a store that cannot be opened degrades to
-    ``None`` (legacy parking stays the path) rather than bricking the run.
+    card. The line's ``run_id`` is threaded through so ``ask`` reuses the
+    scheduler's escalation question idempotency key (``parked:<folder>:<run_id>``)
+    -- the one question a human answers, resuming the same interrupt. A missing
+    credential degrades to a deterministic question id rather than failing the
+    line start; a store that cannot be opened degrades to ``None`` (legacy
+    parking stays the path) rather than bricking the run.
     """
     try:
         store = GoalInterruptStore(config.run_root).open()
@@ -198,6 +201,7 @@ def _build_interrupt(config: LineConfig) -> LineInterruptPort | None:
         generation=config.generation,
         store=store,
         board=board,
+        run_id=run_id,
     )
 
 

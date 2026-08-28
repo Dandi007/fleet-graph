@@ -199,6 +199,36 @@ class GoalInterruptStore:
             ) from exc
         return dict(row) if row is not None else None
 
+    def checkpoint_for_round(
+        self, folder_id: str, generation: int, round_id: int
+    ) -> dict[str, Any] | None:
+        """The already-persisted interrupt for one ``(folder, generation, round)``.
+
+        A resume re-execution of the interrupt node re-asks the question; this is
+        the stable lookup that makes that re-ask return the *same* persisted
+        question note and card entity instead of publishing a second note. It is
+        keyed on the stable ``(folder_id, generation, round_id)`` triple rather
+        than the ``resume_key`` (which embeds the question note id and is thus not
+        known before the question exists).
+        """
+        conn = self._require_conn()
+        try:
+            row = conn.execute(
+                """
+                SELECT * FROM interrupts
+                WHERE folder_id = ? AND generation = ? AND round_id = ?
+                ORDER BY created_at, resume_key
+                LIMIT 1
+                """,
+                (str(folder_id), int(generation), int(round_id)),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise GoalInterruptStoreError(
+                f"goal-interrupt checkpoint unreadable for "
+                f"{folder_id!r}/g{generation}/round {round_id}: {exc}"
+            ) from exc
+        return dict(row) if row is not None else None
+
     def interrupts(self) -> list[dict[str, Any]]:
         conn = self._require_conn()
         try:

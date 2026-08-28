@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -80,7 +81,9 @@ class ScriptedCoordinator:
         self.acknowledge = acknowledge
         self.calls: list[tuple[int, dict[str, Any]]] = []
 
-    def turn(self, round_no: int, coord_input: dict[str, Any]) -> dict[str, Any]:
+    def turn(
+        self, round_no: int, coord_input: dict[str, Any], *, resume: bool = False
+    ) -> dict[str, Any]:
         self.calls.append((round_no, dict(coord_input)))
         has_decision = "decision" in coord_input
         if round_no == 1 and not has_decision:
@@ -309,6 +312,86 @@ class TestStore:
         store.advance_cursor(5)
         store.advance_cursor(3)
         assert store.cursor() == 5
+        store.close()
+
+
+class FakeBoard:
+    """A board seam over ``publish_card``/``ask`` idempotency.
+
+    Idempotency keys resolve to stable entities, mirroring the real bus: asking
+    twice under the same key returns the same card / question note."""
+
+    def __init__(self) -> None:
+        self.cards: dict[str, Any] = {}
+        self.questions: dict[str, Any] = {}
+        self.publishes: list[str] = []
+
+    def publish_card(self, payload: dict[str, Any], idempotency_key: str) -> Any:
+        if idempotency_key not in self.cards:
+            self.cards[idempotency_key] = SimpleNamespace(
+                entity_id=f"card-{idempotency_key}", payload=payload
+            )
+        self.publishes.append("card")
+        return self.cards[idempotency_key]
+
+    def ask(self, *, card_entity_id: str, question: str, idempotency_key: str) -> Any:
+        if idempotency_key not in self.questions:
+            self.questions[idempotency_key] = SimpleNamespace(
+                question_note_id=f"note-{idempotency_key}", card_entity_id=card_entity_id
+            )
+        self.publishes.append("question")
+        return self.questions[idempotency_key]
+
+
+class TestLineInterruptPortAsk:
+    def test_ask_reuses_the_scheduler_escalation_keys(self, tmp_path: Path) -> None:
+        """One question for one human-decision wait (spec item 1 + 5): the line's
+        own ask and the scheduler's parking escalation must converge on the same
+        card and question note, otherwise a human answering the escalation note
+        cannot resume the interrupt."""
+        store = GoalInterruptStore(tmp_path / "gi").open()
+        board = FakeBoard()
+        port = LineInterruptPort(
+            folder_id="wf-1", generation=1, store=store, board=board, run_id="run-1"
+        )
+
+        question_note_id, card_entity_id = port.ask(1, "blocker")
+
+        assert question_note_id == "note-parked:wf-1:run-1"
+        assert card_entity_id == "card-goal-line-card:wf-1"
+        assert "goal-line-card:wf-1" in board.cards
+        assert "parked:wf-1:run-1" in board.questions
+        store.close()
+
+    def test_ask_is_stable_across_a_resume_reexecution(self, tmp_path: Path) -> None:
+        """A resume re-execution of the interrupt node re-asks but must not
+        publish a second note: the persisted checkpoint is re-found by
+        ``(folder_id, generation, round_id)``."""
+        store = GoalInterruptStore(tmp_path / "gi").open()
+        board = FakeBoard()
+        port = LineInterruptPort(
+            folder_id="wf-1", generation=1, store=store, board=board, run_id="run-1"
+        )
+
+        first_qid, first_card = port.ask(1, "blocker")
+        port.persist(
+            InterruptCheckpoint(
+                folder_id="wf-1",
+                generation=1,
+                round_id=1,
+                question_note_id=first_qid,
+                card_entity_id=first_card,
+                prior_terminal_digest="d",
+                resume_key=resume_key_for("wf-1", 1, first_qid),
+            )
+        )
+
+        second_qid, second_card = port.ask(1, "blocker")
+
+        assert second_qid == first_qid
+        assert second_card == first_card
+        # The re-ask published nothing: same card, same question, one wake path.
+        assert board.publishes == ["card", "question"]
         store.close()
 
 

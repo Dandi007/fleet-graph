@@ -208,7 +208,9 @@ class LineState(TypedDict, total=False):
 class Coordinator(Protocol):
     """Runs one coordinator turn and returns its declared result."""
 
-    def turn(self, round_no: int, coord_input: dict[str, Any]) -> Verdict: ...
+    def turn(
+        self, round_no: int, coord_input: dict[str, Any], *, resume: bool = False
+    ) -> Verdict: ...
 
 
 class Worker(Protocol):
@@ -515,7 +517,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         turn_id = f"{resume_key}:turn:{round_no}"
         claimed = deps.interrupt.claim_turn(turn_id)
         if claimed:
-            result = deps.coordinator.turn(round_no, coord_input)
+            result = deps.coordinator.turn(round_no, coord_input, resume=True)
         else:
             result = deps.interrupt.turn_result(turn_id)
         if result is None:
@@ -523,7 +525,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             # back. Re-adopt the same turn: the coordinator re-adopts its
             # in-flight run (never a new model invocation), and the charge
             # ledger stays capped at one.
-            result = deps.coordinator.turn(round_no, coord_input)
+            result = deps.coordinator.turn(round_no, coord_input, resume=True)
         deps.interrupt.record_turn_result(turn_id, result)
         verdict = str(result.get("verdict", "")).strip().lower()
         if verdict == TERMINAL_BLOCKED:

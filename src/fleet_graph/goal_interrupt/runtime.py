@@ -49,23 +49,46 @@ class LineInterruptPort:
         store: GoalInterruptStore,
         board: Any = None,
         card_entity_id: str = "",
+        run_id: str = "",
     ) -> None:
         self.folder_id = folder_id
         self._generation = int(generation)
         self.store = store
         self.board = board
         self.card_entity_id = card_entity_id
+        self.run_id = run_id
 
     def generation(self) -> int:
         return self._generation
 
     def ask(self, round_no: int, blocker: str) -> tuple[str, str]:
-        """Materialise the question, idempotently across a resume re-execution."""
-        idempotency_key = f"e2-question:{self.folder_id}:{self._generation}:{round_no}"
+        """Materialise the question, idempotently across a resume re-execution.
+
+        A resume re-execution of the interrupt node re-enters ``ask``; it must
+        answer with the *same* question note it persisted at suspension rather
+        than publishing a second one. The stable lookup is the already-persisted
+        interrupt checkpoint for ``(folder_id, generation, round_no)``.
+
+        When a board is present the card and question reuse the scheduler's
+        escalation idempotency keys (``goal-line-card:<folder>`` and
+        ``parked:<folder>:<run_id>``) so the line's own question and the
+        scheduler's parking escalation converge on one note -- a human answering
+        it resumes the very interrupt that asked (spec items 1 and 5, and the
+        one-resume-per-question property the otherwise-double question breaks).
+        """
+        existing = self.store.checkpoint_for_round(self.folder_id, self._generation, round_no)
+        if existing is not None and existing.get("question_note_id"):
+            card_entity_id = str(existing.get("card_entity_id") or "")
+            if card_entity_id:
+                self.card_entity_id = card_entity_id
+            return str(existing["question_note_id"]), self.card_entity_id
+
         if self.board is None:
             # No board surface: derive a deterministic, stable question id from
             # the resume identity so tests and offline resumes stay reproducible.
+            idempotency_key = f"e2-question:{self.folder_id}:{self._generation}:{round_no}"
             return f"{idempotency_key}:q", self.card_entity_id
+
         card_entity_id = self.card_entity_id
         if not card_entity_id:
             card = self.board.publish_card(
@@ -73,15 +96,27 @@ class LineInterruptPort:
                     "title": self.folder_id,
                     "status": "doing",
                     "intent": f"goal-line decision interrupt for {self.folder_id}",
+                    "work_folder_id": self.folder_id,
                 },
-                idempotency_key=f"e2-card:{self.folder_id}",
+                idempotency_key=f"goal-line-card:{self.folder_id}",
             )
             card_entity_id = card.entity_id
             self.card_entity_id = card_entity_id
+
+        # The scheduler's escalation key: ``parked:<folder_id>:<run_id>``. When
+        # this line's run id is threaded through (production), the line's own ask
+        # and the scheduler's later escalation share one question note. A line
+        # whose run id is unknown (tests, offline) keeps the stable
+        # generation/round key so the re-ask still idempotently re-finds itself.
+        question_key = (
+            f"parked:{self.folder_id}:{self.run_id}"
+            if self.run_id
+            else f"e2-question:{self.folder_id}:{self._generation}:{round_no}"
+        )
         ticket = self.board.ask(
             card_entity_id=card_entity_id,
             question=f"line {self.folder_id} waiting on a human decision (round {round_no}).",
-            idempotency_key=idempotency_key,
+            idempotency_key=question_key,
         )
         return ticket.question_note_id, card_entity_id
 

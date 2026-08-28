@@ -106,7 +106,9 @@ class Coordinator:
     def __init__(self) -> None:
         self.calls: list[tuple[int, dict[str, Any]]] = []
 
-    def turn(self, round_no: int, coord_input: dict[str, Any]) -> dict[str, Any]:
+    def turn(
+        self, round_no: int, coord_input: dict[str, Any], *, resume: bool = False
+    ) -> dict[str, Any]:
         self.calls.append((round_no, dict(coord_input)))
         if round_no == 1 and "decision" not in coord_input:
             return {"verdict": "blocked", "waiting_on": "decision", "reason": "need human"}
@@ -451,7 +453,7 @@ class Coordinator:
     def __init__(self, root):
         self.root = root
         self.release = root / "release"
-    def turn(self, round_no, coord_input):
+    def turn(self, round_no, coord_input, *, resume=False):
         if round_no == 1 and "decision" not in coord_input:
             return {{"verdict": "blocked", "waiting_on": "decision", "reason": "need human"}}
         import os, time
