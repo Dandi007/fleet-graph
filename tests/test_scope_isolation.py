@@ -77,6 +77,35 @@ class TestFreeTextDetection:
         verdict = evaluate_text("Do not migrate, repair, or extend katana#151.")
         assert verdict.admitted
 
+    def test_a_rejection_description_is_not_a_crossing(self) -> None:
+        """Describing what the boundary rejects (the rule's own wording) is the
+        boundary speaking, not the boundary being crossed."""
+        verdict = evaluate_text(
+            "The system must reject or quarantine work that attempts to add B4 "
+            "or revive katana#150/katana#151."
+        )
+        assert verdict.admitted
+        assert not verdict.violations
+
+    def test_a_deferral_elsewhere_does_not_mask_a_later_active_crossing(self) -> None:
+        verdict = evaluate_text(
+            "B4 is explicitly deferred and must not be implemented. Implement B4 as the next phase."
+        )
+        assert not verdict.admitted
+        assert [violation.reference for violation in verdict.violations] == ["B4"]
+
+    def test_a_deferred_revival_elsewhere_does_not_mask_a_later_active_revival(self) -> None:
+        verdict = evaluate_text(
+            "Do not migrate, repair, or extend katana#150. re-open katana#150 work."
+        )
+        assert not verdict.admitted
+        assert [violation.reference for violation in verdict.violations] == ["katana#150"]
+
+    def test_repeated_active_crossings_of_the_same_phase_are_deduplicated(self) -> None:
+        verdict = evaluate_text("Implement B4 and then implement B4 again.")
+        assert not verdict.admitted
+        assert [violation.reference for violation in verdict.violations] == ["B4"]
+
     def test_require_scope_raises_the_attributed_error(self) -> None:
         with pytest.raises(ScopeViolationError) as excinfo:
             require_scope("implement B4")

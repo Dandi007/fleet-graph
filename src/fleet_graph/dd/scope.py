@@ -46,7 +46,8 @@ DEFERRAL_WINDOW = 48
 #: to one of these is the boundary *speaking*, not the boundary being crossed.
 _DEFERRAL_RE = re.compile(
     r"(?:defer|out of scope|non-?goals?|excluded|forbidden|"
-    r"must not|do not|does not|will not|shall not|not in scope)",
+    r"must not|do not|does not|will not|shall not|not in scope|"
+    r"reject|quarantine|refuse)",
     re.IGNORECASE,
 )
 
@@ -195,7 +196,9 @@ def evaluate_text(text: str, boundary: ScopeBoundary | None = None) -> ScopeVerd
 
     A forbidden reference only counts when it is *active*: "B4 is deferred,
     must not be implemented" respects the boundary and is admitted; "implement
-    B4" crosses it and is refused. The verdict always names the rule id.
+    B4" crosses it and is refused. Each occurrence is judged on its own, so a
+    reference that is deferred in one sentence but actively added in another is
+    still refused. The verdict always names the rule id.
     """
     boundary = boundary or default_boundary()
     observed_phases: list[str] = []
@@ -204,33 +207,37 @@ def evaluate_text(text: str, boundary: ScopeBoundary | None = None) -> ScopeVerd
 
     for match in _PHASE_RE.finditer(text):
         phase = f"B{match.group('n')}"
-        if phase in observed_phases:
+        if phase not in observed_phases:
+            observed_phases.append(phase)
+        if phase in boundary.phases or _deferred(text, match.start(), match.end()):
             continue
-        observed_phases.append(phase)
-        if phase not in boundary.phases and not _deferred(text, match.start(), match.end()):
-            violations.append(
-                ScopeViolation(
-                    reference=phase,
-                    label=f"adds phase {phase} outside {boundary.label}",
-                    excerpt=_excerpt(text, match.start(), match.end()),
-                )
+        if any(violation.reference == phase for violation in violations):
+            continue
+        violations.append(
+            ScopeViolation(
+                reference=phase,
+                label=f"adds phase {phase} outside {boundary.label}",
+                excerpt=_excerpt(text, match.start(), match.end()),
             )
+        )
 
     for match in _REVIVAL_RE.finditer(text):
         revived = f"katana#{match.group('n')}"
-        if revived in observed_revivals:
-            continue
-        observed_revivals.append(revived)
-        if revived in boundary.forbidden_revivals and not _deferred(
+        if revived not in observed_revivals:
+            observed_revivals.append(revived)
+        if revived not in boundary.forbidden_revivals or _deferred(
             text, match.start(), match.end()
         ):
-            violations.append(
-                ScopeViolation(
-                    reference=revived,
-                    label=f"revives {revived}, forbidden by {boundary.label}",
-                    excerpt=_excerpt(text, match.start(), match.end()),
-                )
+            continue
+        if any(violation.reference == revived for violation in violations):
+            continue
+        violations.append(
+            ScopeViolation(
+                reference=revived,
+                label=f"revives {revived}, forbidden by {boundary.label}",
+                excerpt=_excerpt(text, match.start(), match.end()),
             )
+        )
 
     return ScopeVerdict(
         admitted=not violations,
