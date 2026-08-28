@@ -304,6 +304,37 @@ fleet-graph supervisor run --event-json \
 `graphs/supervisor.py`（act script 节点），llm 执行路径（executors/、dd 图）
 结构上够不到发布入口。三条都有 sabotage 自证测试。
 
+## A2 只读仲裁（wf-7cd0a7 re-scope：只分诊只建议，永不裁决）
+
+A2 arbiter（`src/fleet_graph/arbiter/`）是消费者/编排层的一次性分诊组件，
+不是 agent-bus 传输层的东西。它读板上的不可变事实（open question note 及
+其 refs、blocked/非终态 development 卡、显式 @arbiter 咨询），经
+`executors/text_node`（进程内、只读、纯文本）调一次推理角色，产出
+**recommendation envelope**（`subject_id`/`recommendation`/`evidence_refs`/
+`consequence`/`needs_human`——输出契约**不用** decision/verdict/approve/reject/
+gate_release 字段名）。
+
+- **发布面构造受限**：唯一可写是 `arbiter/publisher.py`，只发 `work.note.v1`
+  + `note_type ∈ {finding, progress}`，note 正文带 `[A2 suggestion — not a
+  decision]` 前缀并 ref 指向 subject card/question。没有通用 publish 方法。
+- **幂等**：idempotency key = subject identity + source revision；读到已引用
+  该 subject 的 A2 note 即抑制重发（replay/restart 不重复建议）。
+- **默认 dry-run**：`fleet-graph arbiter run` 只读板、只落建议到 stdout；
+  显式 `--publish` 才落板。本 development 不在生产启用发布。
+- **审计面**：`fleet_graph.arbiter.audit` 列出一轮 A2 发出的每条消息的
+  kind / note_type / marker / message id / subject refs，零 decision 断言
+  用真实 `work.decision.v1` fixture 做已知负例，证明它能区分裁决而非空板。
+- **人闸不动**：A2 建议只是 `work.note.v1`，`Board.decision_for` 只认
+  `work.decision.*`，故建议永不满足 gate / `wait_for_decision` / decision
+  publisher——该等 decision 的仍等。
+
+现场用法：
+
+```bash
+fleet-graph arbiter run --bus-url http://127.0.0.1:7490        # dry-run
+fleet-graph arbiter run --alias arbiter --publish               # 显式发布
+```
+
 ## dd 控制面（R1-b：MCP 服务即控制面）
 
 `fleet-graph dd serve`（`:5610`，unit 模板 `deploy/systemd/fleet-graph-dd-mcp.service`）
