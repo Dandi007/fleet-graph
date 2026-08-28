@@ -10,6 +10,9 @@ the same contract on both sides:
   question note right now?", re-reading the owner's card / question /
   generation / current state from its own authoritative source (the dd
   admission record for a development, the parked line state for a line).
+- :meth:`OwnerSource.discover_all` lists every currently-waiting owner, which
+  is what the resolver needs: the real bus refs endpoint is reverse-only, so
+  a decision's question is found by checking each waiting question in reverse.
 - :meth:`OwnerSource.resume` performs the recovery through the owner's
   controlled entry and passes the action key through untouched. The owner is
   responsible for the durable action-key + generation unique constraint, so a
@@ -74,6 +77,8 @@ class OwnerResult:
 class OwnerSource(Protocol):
     def discover(self, question_note_id: str) -> list[OwnerTarget]: ...
 
+    def discover_all(self) -> list[OwnerTarget]: ...
+
     def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult: ...
 
 
@@ -96,6 +101,11 @@ class DdOwnerSource:
         return DdControlPlane(root=self.dd_root)
 
     def discover(self, question_note_id: str) -> list[OwnerTarget]:
+        return [
+            target for target in self.discover_all() if target.question_note_id == question_note_id
+        ]
+
+    def discover_all(self) -> list[OwnerTarget]:
         # A control-plane read failure *raises* rather than reading as "no
         # owner": the resolver turns that into a structured discovery-failure
         # no-op, so a control-plane outage is distinguishable from a genuine
@@ -105,7 +115,8 @@ class DdOwnerSource:
         targets: list[OwnerTarget] = []
         for row in rows:
             awaiting = row.get("awaiting") or {}
-            if str(awaiting.get("question_note_id") or "") != question_note_id:
+            question_note_id = str(awaiting.get("question_note_id") or "")
+            if not question_note_id:
                 continue
             card_entity_id = str(awaiting.get("card_entity_id") or "")
             if not card_entity_id:
@@ -165,22 +176,29 @@ class HttpOwnerSource:
 
         return httpx.Client(base_url=self.base_url, timeout=10.0, trust_env=False)
 
+    def _to_target(self, owner: dict[str, Any], question_note_id: str) -> OwnerTarget:
+        return OwnerTarget(
+            kind=str(owner.get("kind") or OWNER_KIND_HTTP),
+            id=str(owner.get("id") or ""),
+            generation=int(owner.get("generation") or 1),
+            question_note_id=str(owner.get("question_note_id") or question_note_id),
+            card_entity_id=str(owner.get("card_entity_id") or ""),
+            state=str(owner.get("state") or ""),
+        )
+
     def discover(self, question_note_id: str) -> list[OwnerTarget]:
         with self._client() as client:
             response = client.get("/owners", params={"question_note_id": question_note_id})
         response.raise_for_status()
         owners = (response.json() or {}).get("owners", []) or []
-        return [
-            OwnerTarget(
-                kind=str(o.get("kind") or OWNER_KIND_HTTP),
-                id=str(o.get("id") or ""),
-                generation=int(o.get("generation") or 1),
-                question_note_id=str(o.get("question_note_id") or question_note_id),
-                card_entity_id=str(o.get("card_entity_id") or ""),
-                state=str(o.get("state") or ""),
-            )
-            for o in owners
-        ]
+        return [self._to_target(o, question_note_id) for o in owners]
+
+    def discover_all(self) -> list[OwnerTarget]:
+        with self._client() as client:
+            response = client.get("/owners")
+        response.raise_for_status()
+        owners = (response.json() or {}).get("owners", []) or []
+        return [self._to_target(o, "") for o in owners]
 
     def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
         body = {
@@ -247,20 +265,23 @@ class LineOwnerSource:
             return 1
 
     def discover(self, question_note_id: str) -> list[OwnerTarget]:
+        return [
+            target for target in self.discover_all() if target.question_note_id == question_note_id
+        ]
+
+    def discover_all(self) -> list[OwnerTarget]:
         targets: list[OwnerTarget] = []
         for line in self.lines:
             folder_id = self._folder_id(line)
             state = self._read_state(folder_id)
             if not state.get("parked_run_id") or state.get("parked_at") is None:
                 continue
-            if str(state.get("board_question_note_id") or "") != question_note_id:
-                continue
             targets.append(
                 OwnerTarget(
                     kind=OWNER_KIND_LINE,
                     id=folder_id,
                     generation=self._generation(state, line),
-                    question_note_id=question_note_id,
+                    question_note_id=str(state.get("board_question_note_id") or ""),
                     card_entity_id=str(state.get("board_card_entity_id") or ""),
                     state=_LINE_PARKED_STATE,
                 )
@@ -363,6 +384,12 @@ class CompositeOwnerSource:
         targets: list[OwnerTarget] = []
         for source in self.sources:
             targets.extend(source.discover(question_note_id))
+        return targets
+
+    def discover_all(self) -> list[OwnerTarget]:
+        targets: list[OwnerTarget] = []
+        for source in self.sources:
+            targets.extend(source.discover_all())
         return targets
 
     def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:

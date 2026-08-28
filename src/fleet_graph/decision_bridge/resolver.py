@@ -7,6 +7,15 @@ cursor still advances past it, because the decision has been conclusively
 considered. Only a decision validated end-to-end and mapped to exactly one
 still-waiting owner yields an ``ok`` resolution.
 
+The question a decision answers is established through the real bus refs
+endpoint, never from an inline ``refs`` field: agent-bus indexes a forward
+reference on its *target*, so ``GET /v1/entities/<question>/refs`` returns the
+messages that reference that question as ``{"refs": [{"message_id",
+"target_entity"}]}``. The resolver therefore enumerates the currently-waiting
+owners and checks, in reverse, which of their question notes this decision
+references. ``refs_to`` is a seam so the same resolver runs against the real
+bus client in production and against a routed fake bus in tests.
+
 The action key is defined once, here, because its exact shape is part of the
 owner-dedup contract:
 
@@ -16,6 +25,7 @@ owner-dedup contract:
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,37 +69,14 @@ def action_key_for(
     return f"e1:{source_message_id}:{target_kind}:{target_id}:{generation}"
 
 
-def _question_refs(message: dict[str, Any]) -> list[str]:
-    """The question-note entities this decision references, from its refs.
-
-    A ``work.decision.v1`` answering a gate references the question note via its
-    ``refs``. Messages the fake bus serves carry ``refs`` inline; when absent
-    we accept a ``payload.question_note_id`` as a fallback for decision
-    shapes that carry the question inline. Unknown/missing -> empty.
-    """
-    refs = message.get("refs")
-    ids: list[str] = []
-    if isinstance(refs, list):
-        for ref in refs:
-            if isinstance(ref, dict) and ref.get("target_entity"):
-                ids.append(str(ref["target_entity"]))
-    if not ids:
-        payload = message.get("payload") or {}
-        if payload.get("question_note_id"):
-            ids.append(str(payload["question_note_id"]))
-    seen: list[str] = []
-    for value in ids:
-        if value not in seen:
-            seen.append(value)
-    return seen
-
-
 def _validate(message: dict[str, Any]) -> str | None:
     """A refusal reason when the message is not a valid v1 decision, else None.
 
     Mirrors the gate's unresolved predicate, read-only: channel + exact kind +
-    a non-empty decision payload + at least one ref. Nothing is published, so
-    this never needs the decision-publish credential (and must never hold it).
+    a non-empty decision payload. Nothing is published, so this never needs the
+    decision-publish credential (and must never hold it). The question the
+    decision references is established separately, through the real refs
+    endpoint, because the real bus does not inline refs on served messages.
     """
     if message.get("kind") != DECISION_KIND:
         return f"kind {message.get('kind')!r} is not {DECISION_KIND!r}"
@@ -98,24 +85,58 @@ def _validate(message: dict[str, Any]) -> str | None:
         return "payload is not an object"
     if not _DECISION_RE.search(str(payload.get("decision") or "")):
         return "payload.decision is empty"
-    if not _question_refs(message):
-        return "decision references no question note (refs empty)"
     return None
+
+
+def _referenced_questions(
+    message_id: str,
+    candidate_question_ids: list[str],
+    refs_to: Callable[[str], list[dict[str, Any]]] | None,
+) -> set[str]:
+    """Which candidate question notes this decision references.
+
+    The real bus stores a forward reference on its *target* entity: a decision
+    that references question ``q`` is returned by ``refs_to(q)`` as
+    ``{"message_id": <decision>, "target_entity": "q"}``. Forward reference
+    discovery is therefore a reverse look-up over the currently-waiting
+    questions. A question is never established from an inline
+    ``payload.question_note_id``: the real bus does not inline refs, so
+    treating an inline field as an answer would let a decision resolve an owner
+    without ever touching the refs endpoint the resolver exists to adopt.
+    """
+    referenced: set[str] = set()
+    if refs_to is None:
+        return referenced
+    for question_id in candidate_question_ids:
+        try:
+            refs = refs_to(question_id)
+        except Exception:  # fail open on the read side: resolve nothing
+            continue
+        if not isinstance(refs, list):
+            continue
+        for ref in refs:
+            if isinstance(ref, dict) and str(ref.get("message_id") or "") == message_id:
+                referenced.add(question_id)
+                break
+    return referenced
 
 
 def resolve_decision(
     message: dict[str, Any],
     owner_source: OwnerSource,
     *,
+    refs_to: Callable[[str], list[dict[str, Any]]] | None = None,
     channel_id: str | None = None,
 ) -> Resolution:
     """Map one board message to at most one waiting owner.
 
     ``channel_id`` (when the caller knows it) adds the channel-allowlist check:
     the bridge only ever reads ``board:work-notes``, and the resolver re-states
-    that rather than trusting the poller. Validation failures, zero/multiple
-    matches, and stale owners are all terminal no-op categories with a
-    structured reason.
+    that rather than trusting the poller. ``refs_to`` supplies the real bus refs
+    endpoint (the reverse look-up surface); when absent the resolver cannot
+    establish references and resolves nothing. Validation failures,
+    zero/multiple matches, and stale owners are all terminal no-op categories
+    with a structured reason.
     """
     if channel_id is not None and channel_id != WORK_NOTES:
         return Resolution(
@@ -127,15 +148,24 @@ def resolve_decision(
     if invalid is not None:
         return Resolution(CATEGORY_INVALID, f"invalid decision: {invalid}")
 
-    question_ids = _question_refs(message)
+    message_id = str(message.get("message_id") or "")
 
-    matches: list[OwnerTarget] = []
-    discovery_errors: list[str] = []
-    for question_note_id in question_ids:
-        try:
-            matches.extend(owner_source.discover(question_note_id))
-        except Exception as exc:  # fail open on the *read* side: resolve nothing
-            discovery_errors.append(f"{type(exc).__name__}: {exc}")
+    try:
+        waiting = owner_source.discover_all()
+    except Exception as exc:  # fail open on the *read* side: resolve nothing
+        return Resolution(
+            CATEGORY_NO_WAITING_OWNER,
+            "no waiting owner resolved the decision"
+            f" (discovery failures: {type(exc).__name__}: {exc})",
+        )
+
+    referenced = _referenced_questions(
+        message_id,
+        list({target.question_note_id for target in waiting}),
+        refs_to,
+    )
+
+    matches = [target for target in waiting if target.question_note_id in referenced]
 
     # Dedup on (kind, id, generation): a decision can only recover one owner
     # once, so the *same* owner surfaced for two of its refs is one owner.
@@ -145,12 +175,6 @@ def resolve_decision(
     matches = list(unique.values())
 
     if not matches:
-        if discovery_errors:
-            return Resolution(
-                CATEGORY_NO_WAITING_OWNER,
-                "no waiting owner resolved the decision"
-                f" (discovery failures: {'; '.join(discovery_errors)[:300]})",
-            )
         return Resolution(CATEGORY_NO_WAITING_OWNER, "no waiting owner references this question")
 
     if len(matches) > 1:
@@ -161,7 +185,7 @@ def resolve_decision(
         )
 
     target = matches[0]
-    stale_reason = _stale_reason(target, message)
+    stale_reason = _stale_reason(target, message, referenced)
     if stale_reason is not None:
         return Resolution(CATEGORY_STALE, stale_reason, target=target)
 
@@ -174,7 +198,7 @@ def resolve_decision(
     )
 
 
-def _stale_reason(target: OwnerTarget, message: dict[str, Any]) -> str | None:
+def _stale_reason(target: OwnerTarget, message: dict[str, Any], referenced: set[str]) -> str | None:
     """Why this owner is stale, or None when it is still waiting.
 
     Re-checks the facts the gate itself holds: the owner's expected waiting
@@ -191,7 +215,7 @@ def _stale_reason(target: OwnerTarget, message: dict[str, Any]) -> str | None:
     payload_card = str(payload.get("card_entity_id") or "")
     if payload_card and target.card_entity_id and payload_card != target.card_entity_id:
         return f"decision card {payload_card!r} does not match owner card {target.card_entity_id!r}"
-    if target.question_note_id not in _question_refs(message):
+    if target.question_note_id not in referenced:
         return f"owner question {target.question_note_id!r} is not referenced by the decision"
     return None
 

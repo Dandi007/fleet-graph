@@ -276,10 +276,28 @@ class DecisionBridge:
         with contextlib.suppress(BridgeStoreError):
             self._ensure_store().advance_cursor(seq)
 
+    def _refs_to(self, entity_id: str) -> list[dict[str, Any]]:
+        """The real bus reverse-refs surface, or [] when the bus is unavailable.
+
+        agent-bus stores a forward reference on its *target* entity, so the
+        bridge asks ``GET /v1/entities/<entity>/refs`` for the messages that
+        reference it. A missing bus, or a client that predates ``refs_to``,
+        fails open to "no references" (resolve nothing) -- never a crash.
+        """
+        refs_to = getattr(self.bus, "refs_to", None)
+        if refs_to is None:
+            return []
+        return refs_to(entity_id)
+
     def _fresh_decision(
         self, message: dict[str, Any], seq: int, source_message_id: str
     ) -> dict[str, Any]:
-        resolution = resolve_decision(message, self._ensure_owner_source(), channel_id=READ_CHANNEL)
+        resolution = resolve_decision(
+            message,
+            self._ensure_owner_source(),
+            refs_to=self._refs_to,
+            channel_id=READ_CHANNEL,
+        )
         if not resolution.ok:
             self._seal_noop(resolution, seq, source_message_id, message)
             return {

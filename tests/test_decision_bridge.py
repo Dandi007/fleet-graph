@@ -72,6 +72,9 @@ class FakeOwner(OwnerSource):
     def discover(self, question_note_id: str) -> list[OwnerTarget]:
         return list(self.targets.get(question_note_id, []))
 
+    def discover_all(self) -> list[OwnerTarget]:
+        return [target for targets in self.targets.values() for target in targets]
+
     def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
         self.calls.append((target, action_key))
         if action_key in self.seen:
@@ -88,25 +91,50 @@ class FakeOwner(OwnerSource):
 
 
 class FakeBus:
-    """messages() as the bridge reads it; decisions carry inline refs."""
+    """messages() + refs_to() as the real bus serves them: no inline refs.
 
-    def __init__(self, messages: list[dict[str, Any]] | None = None) -> None:
+    The real bus indexes a forward reference on its target entity, so a decision
+    references a question through the reverse ``refs_to`` surface (``GET
+    /v1/entities/<question>/refs``), never through an inline ``refs`` field on
+    the served message.
+    """
+
+    def __init__(
+        self,
+        messages: list[dict[str, Any]] | None = None,
+        *,
+        refs: dict[str, list[str]] | None = None,
+    ) -> None:
         self.notes: list[dict[str, Any]] = messages or []
+        self.refs: dict[str, list[str]] = dict(refs or {})
 
     def messages(self, channel: str, *, limit: int = 100, after_seq: int = 0):
         selected = [m for m in self.notes if int(m["channel_seq"]) > after_seq][:limit]
         head = max((int(m["channel_seq"]) for m in self.notes), default=0)
         return selected, head
 
+    def refs_to(self, entity_id: str) -> list[dict[str, Any]]:
+        return [
+            {"message_id": mid, "target_entity": entity_id} for mid in self.refs.get(entity_id, [])
+        ]
 
-def decision(message_id: str, seq: int, *, question: str, card: str, kind: str = DECISION_KIND):
+
+def decision(message_id: str, seq: int, *, card: str, kind: str = DECISION_KIND):
     return {
         "message_id": message_id,
         "channel_seq": seq,
         "kind": kind,
         "payload": {"decision": "APPROVE", "card_entity_id": card},
-        "refs": [{"target_entity": question}],
     }
+
+
+def refs_to(refs: dict[str, list[str]]):
+    """A ``refs_to`` seam whose response shape matches the real endpoint."""
+
+    def _refs_to(entity_id: str) -> list[dict[str, Any]]:
+        return [{"message_id": mid, "target_entity": entity_id} for mid in refs.get(entity_id, [])]
+
+    return _refs_to
 
 
 def owner(question: str = "q-1", *, state: str = "awaiting_gate") -> OwnerTarget:
@@ -257,60 +285,92 @@ class TestResolver:
     def test_a_single_waiting_owner_resolves(self) -> None:
         o = FakeOwner()
         o.add(owner())
-        resolution = resolve_decision(decision("d-1", 1, question="q-1", card="card-1"), o)
+        resolution = resolve_decision(
+            decision("d-1", 1, card="card-1"), o, refs_to=refs_to({"q-1": ["d-1"]})
+        )
         assert resolution.ok
         assert resolution.target == owner()
+
+    def test_refs_are_resolved_through_the_real_endpoint(self) -> None:
+        """The question comes from the reverse-refs endpoint, not an inline
+        ``refs`` field: a decision referencing a different question than the
+        one an owner is waiting on resolves nobody."""
+        o = FakeOwner()
+        o.add(owner())  # waiting on q-1
+        resolution = resolve_decision(
+            decision("d-1", 1, card="card-1"), o, refs_to=refs_to({"q-2": ["d-1"]})
+        )
+        assert resolution.category == CATEGORY_NO_WAITING_OWNER and not resolution.ok
+
+    def test_inline_question_note_id_is_not_trusted(self) -> None:
+        """A decision carrying ``payload.question_note_id`` inline does not
+        resolve an owner on its own: the question is established only through
+        the reverse-refs endpoint. An inline field, even matching a waiting
+        owner's question, resolves nothing when the refs endpoint does not name
+        this decision for that question."""
+        o = FakeOwner()
+        o.add(owner())  # waiting on q-1
+        msg = decision("d-1", 1, card="card-1")
+        msg["payload"]["question_note_id"] = "q-1"
+        resolution = resolve_decision(msg, o, refs_to=refs_to({}))
+        assert resolution.category == CATEGORY_NO_WAITING_OWNER and not resolution.ok
 
     def test_channel_outside_allowlist_is_invalid(self) -> None:
         o = FakeOwner()
         o.add(owner())
         resolution = resolve_decision(
-            decision("d-1", 1, question="q-1", card="card-1"), o, channel_id="board:other"
+            decision("d-1", 1, card="card-1"), o, channel_id="board:other"
         )
         assert resolution.category == CATEGORY_INVALID and not resolution.ok
 
     def test_wrong_kind_is_invalid(self) -> None:
         o = FakeOwner()
         o.add(owner())
-        resolution = resolve_decision(
-            decision("d-1", 1, question="q-1", card="card-1", kind="work.note.v1"), o
-        )
+        resolution = resolve_decision(decision("d-1", 1, card="card-1", kind="work.note.v1"), o)
         assert resolution.category == CATEGORY_INVALID
 
     def test_empty_decision_payload_is_invalid(self) -> None:
         o = FakeOwner()
-        msg = decision("d-1", 1, question="q-1", card="card-1")
+        msg = decision("d-1", 1, card="card-1")
         msg["payload"]["decision"] = ""
         assert resolve_decision(msg, o).category == CATEGORY_INVALID
 
-    def test_no_refs_is_invalid(self) -> None:
+    def test_a_decision_referencing_no_question_is_a_noop(self) -> None:
         o = FakeOwner()
-        msg = decision("d-1", 1, question="q-1", card="card-1")
-        msg["refs"] = []
-        assert resolve_decision(msg, o).category == CATEGORY_INVALID
+        o.add(owner())
+        resolution = resolve_decision(decision("d-1", 1, card="card-1"), o, refs_to=refs_to({}))
+        assert resolution.category == CATEGORY_NO_WAITING_OWNER and not resolution.ok
 
     def test_zero_owners_is_a_noop(self) -> None:
         o = FakeOwner()  # no targets registered
-        resolution = resolve_decision(decision("d-1", 1, question="q-1", card="card-1"), o)
+        resolution = resolve_decision(
+            decision("d-1", 1, card="card-1"), o, refs_to=refs_to({"q-1": ["d-1"]})
+        )
         assert resolution.category == CATEGORY_NO_WAITING_OWNER and not resolution.ok
 
     def test_multiple_owners_is_ambiguous(self) -> None:
         o = FakeOwner()
         o.add(owner(question="q-1"))
         o.add(OwnerTarget("dd", "dev-xyz", 1, "q-1", "card-2", "awaiting_gate"))
-        resolution = resolve_decision(decision("d-1", 1, question="q-1", card="card-1"), o)
+        resolution = resolve_decision(
+            decision("d-1", 1, card="card-1"), o, refs_to=refs_to({"q-1": ["d-1"]})
+        )
         assert resolution.category == CATEGORY_AMBIGUOUS
 
     def test_a_stale_owner_is_a_noop(self) -> None:
         o = FakeOwner()
         o.add(owner(state="complete"))
-        resolution = resolve_decision(decision("d-1", 1, question="q-1", card="card-1"), o)
+        resolution = resolve_decision(
+            decision("d-1", 1, card="card-1"), o, refs_to=refs_to({"q-1": ["d-1"]})
+        )
         assert resolution.category == CATEGORY_STALE
 
     def test_a_mismatched_card_is_stale(self) -> None:
         o = FakeOwner()
         o.add(owner())
-        resolution = resolve_decision(decision("d-1", 1, question="q-1", card="card-999"), o)
+        resolution = resolve_decision(
+            decision("d-1", 1, card="card-999"), o, refs_to=refs_to({"q-1": ["d-1"]})
+        )
         assert resolution.category == CATEGORY_STALE
 
     def test_a_discovery_failure_is_a_structured_noop(self) -> None:
@@ -322,12 +382,13 @@ class TestResolver:
             def discover(self, question_note_id: str) -> list[OwnerTarget]:
                 raise RuntimeError("control plane down")
 
+            def discover_all(self) -> list[OwnerTarget]:
+                raise RuntimeError("control plane down")
+
             def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
                 return OwnerResult("refused", "unreachable")
 
-        resolution = resolve_decision(
-            decision("d-1", 1, question="q-1", card="card-1"), ExplodingOwner()
-        )
+        resolution = resolve_decision(decision("d-1", 1, card="card-1"), ExplodingOwner())
         assert resolution.category == CATEGORY_NO_WAITING_OWNER
         assert "discovery failures" in resolution.reason
         assert "control plane down" in resolution.reason
@@ -352,7 +413,7 @@ class TestBridgeLoop:
     def test_a_fresh_decision_resumes_and_advances(self, tmp_path: Path) -> None:
         o = FakeOwner()
         o.add(owner())
-        b = bridge(tmp_path, FakeBus([decision("d-1", 1, question="q-1", card="card-1")]), o)
+        b = bridge(tmp_path, FakeBus([decision("d-1", 1, card="card-1")], refs={"q-1": ["d-1"]}), o)
         record = b.run_once()
         assert record["resumed"] == 1
         assert record["cursor_after"] == 1
@@ -362,7 +423,7 @@ class TestBridgeLoop:
     def test_a_duplicate_owner_call_returns_same_logical_success(self, tmp_path: Path) -> None:
         o = FakeOwner()
         o.add(owner())
-        b = bridge(tmp_path, FakeBus([decision("d-1", 1, question="q-1", card="card-1")]), o)
+        b = bridge(tmp_path, FakeBus([decision("d-1", 1, card="card-1")], refs={"q-1": ["d-1"]}), o)
         b.run_once()
         first = o.logical_resumes
         # The owner sees the same action key again (a duplicate transport call):
@@ -372,7 +433,7 @@ class TestBridgeLoop:
 
     def test_a_noop_decision_still_advances_the_cursor(self, tmp_path: Path) -> None:
         o = FakeOwner()  # nothing waiting
-        b = bridge(tmp_path, FakeBus([decision("d-1", 1, question="q-1", card="card-1")]), o)
+        b = bridge(tmp_path, FakeBus([decision("d-1", 1, card="card-1")], refs={"q-1": ["d-1"]}), o)
         record = b.run_once()
         assert record["resumed"] == 0
         assert o.logical_resumes == 0
@@ -401,7 +462,10 @@ class TestBridgeLoop:
         # Simulate the same decision being re-presented (a cursor rewind).
         store._require_conn().execute("UPDATE cursor SET board_seq = 0 WHERE id = 1")
         b = bridge(
-            tmp_path, FakeBus([decision("d-1", 1, question="q-1", card="card-1")]), o, store=store
+            tmp_path,
+            FakeBus([decision("d-1", 1, card="card-1")], refs={"q-1": ["d-1"]}),
+            o,
+            store=store,
         )
         record = b.run_once()
         assert record["resumed"] == 0
@@ -418,7 +482,7 @@ class TestBridgeLoop:
 
         b = bridge(
             tmp_path,
-            FakeBus([decision("d-1", 1, question="q-1", card="card-1")]),
+            FakeBus([decision("d-1", 1, card="card-1")], refs={"q-1": ["d-1"]}),
             o,
             store=BridgeStore(tmp_path / "bridge").open(),
         )
@@ -457,7 +521,7 @@ class TestBridgeLoop:
         db = tmp_path / "bridge" / "bridge.sqlite3"
         db.parent.mkdir(parents=True)
         db.write_bytes(b"corrupt, not a database")
-        b = bridge(tmp_path, FakeBus([decision("d-1", 1, question="q-1", card="card-1")]), o)
+        b = bridge(tmp_path, FakeBus([decision("d-1", 1, card="card-1")], refs={"q-1": ["d-1"]}), o)
         record = b.run_once()
         assert record["resumed"] == 0
         assert o.logical_resumes == 0
@@ -476,10 +540,10 @@ class TestBridgeLoop:
 
         store.record_intent = boom  # type: ignore[method-assign]
         messages = [
-            decision("d-1", 1, question="q-1", card="card-1"),
-            decision("d-2", 2, question="q-1", card="card-1"),
+            decision("d-1", 1, card="card-1"),
+            decision("d-2", 2, card="card-1"),
         ]
-        b = bridge(tmp_path, FakeBus(messages), o, store=store)
+        b = bridge(tmp_path, FakeBus(messages, refs={"q-1": ["d-1", "d-2"]}), o, store=store)
         record = b.run_once()  # must not raise
         assert record["resumed"] == 0
         assert o.logical_resumes == 0
@@ -504,10 +568,10 @@ class TestBridgeLoop:
 
         store.receipt = boom  # type: ignore[method-assign]
         messages = [
-            decision("d-1", 1, question="q-1", card="card-1"),
-            decision("d-2", 2, question="q-1", card="card-1"),
+            decision("d-1", 1, card="card-1"),
+            decision("d-2", 2, card="card-1"),
         ]
-        b = bridge(tmp_path, FakeBus(messages), o, store=store)
+        b = bridge(tmp_path, FakeBus(messages, refs={"q-1": ["d-1", "d-2"]}), o, store=store)
         record = b.run_once()  # must not raise
         assert record["resumed"] == 0
         assert o.logical_resumes == 0
@@ -784,6 +848,9 @@ class TestCompositeOwner:
 
         class NoopDd(OwnerSource):
             def discover(self, question_note_id: str) -> list[OwnerTarget]:
+                return []
+
+            def discover_all(self) -> list[OwnerTarget]:
                 return []
 
             def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
