@@ -850,7 +850,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--board-seq",
         type=int,
         default=None,
-        help="explicit board_seq to set. Without it an e1-<note_id> key is "
+        help="explicit board_seq to set (clamped: never moves the cursor "
+        "forward). Without it an e1-<note_id> key is "
         "located mechanically on the bus and the cursor moves to just before "
         "that message (never forwards); when the note cannot be located "
         "(no credential, bus down, id not in the channel window) the summary "
