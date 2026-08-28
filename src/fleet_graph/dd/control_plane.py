@@ -64,6 +64,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.dd.adoption import (
+    AdoptionError,
+    AdoptionLedger,
+    AdoptionRecord,
+    Discovery,
+)
 from fleet_graph.dd.bootstrap import (
     DEVELOPMENT_PATH,
     IdentityChanged,
@@ -73,6 +79,13 @@ from fleet_graph.dd.bootstrap import (
     digest_of,
 )
 from fleet_graph.dd.git import run_git
+from fleet_graph.dd.recovery import HumanRecoveryExit, RecoveryDecision, RecoveryError
+from fleet_graph.dd.scope import (
+    ScopeBoundary,
+    ScopeViolationError,
+    default_boundary,
+    require_scope,
+)
 from fleet_graph.dd.upstream_constants import ATTEMPT_CONTEXT_CONTRACT_VERSION
 from fleet_graph.graphs.dd_runner import EVENTS_FILE, RESULT_FILE
 from fleet_graph.state.run_artifacts import iso, write_json_durable
@@ -91,6 +104,11 @@ H0_FILE = "h0-handoff.json"
 LAUNCHES_FILE = "launches.jsonl"
 CHECKPOINT_FILE = "checkpoint.sqlite3"
 LOG_FILE = "dd.log"
+#: B2 append-only trails: adopted work and human recovery decisions, one sealed
+#: record per line. Each record carries its own digest, so replay is idempotent
+#: (adoption) and the decision is tamper-evident (recovery).
+ADOPTIONS_FILE = "adoptions.jsonl"
+RECOVERIES_FILE = "recoveries.jsonl"
 
 UNIT_PREFIX = "fleet-graph-dd"
 
@@ -499,6 +517,7 @@ class DdControlPlane:
         board_factory: Callable[[], Any] | None = None,
         environment: dict[str, str] | None = None,
         stage_models: dict[str, str] | None = None,
+        scope_boundary: ScopeBoundary | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         from fleet_graph.scheduler.launcher import TransientLauncher
@@ -515,6 +534,9 @@ class DdControlPlane:
             dict(environment) if environment is not None else _inherited_environment()
         )
         self.stage_models = dict(stage_models or {})
+        #: The scope boundary admission refuses against (B1). Data, not a literal
+        #: scattered across call sites -- a rescope edits this, not the checks.
+        self.scope_boundary = scope_boundary if scope_boundary is not None else default_boundary()
         self.clock = clock
 
     # --- admission -------------------------------------------------------
@@ -533,6 +555,10 @@ class DdControlPlane:
         """
         repo = self._admit_repo(repo_path)
         spec = self._read_spec(spec_text, spec_path)
+        # B1: admit nothing that actively crosses the declared scope boundary.
+        # The refusal names the scope rule, so a crossing is a scope decision
+        # rather than whatever downstream failure happened to fire first.
+        self._require_scope(spec.decode("utf-8", errors="replace"))
         base = self._default_target_base(repo, target_base)
         spec_digest = digest_of(spec)
         development_id = derive_development_id(repo, spec_digest, base)
@@ -665,6 +691,18 @@ class DdControlPlane:
         if not spec.strip():
             raise ControlPlaneError("SPEC_EMPTY", "the approved spec is empty")
         return spec
+
+    def _require_scope(self, text: str) -> None:
+        """Refuse a spec whose active content crosses the B1-B3 boundary (B1).
+
+        The scope rule is the authority, and the refusal is attributable to it:
+        ``SCOPE_BOUNDARY_VIOLATION`` carries the boundary's own id and each
+        observed crossing, never a bare "something failed downstream".
+        """
+        try:
+            require_scope(text, self.scope_boundary)
+        except ScopeViolationError as exc:
+            raise ControlPlaneError("SCOPE_BOUNDARY_VIOLATION", str(exc)) from exc
 
     def _default_target_base(self, repo: Path, target_base: str | None) -> str:
         """Explicit base -> committed identity -> HEAD, in that order.
@@ -1258,6 +1296,14 @@ class DdControlPlane:
             "reconfigures": record.get("reconfigures", []),
             "card_entity_id": record.get("card_entity_id", ""),
             "created_at": record.get("created_at", ""),
+            "adoptions": [
+                adopted.as_dict()
+                for adopted in self._load_adoption_ledger(development_id).records()
+            ],
+            "recoveries": [
+                recovery.as_dict()
+                for recovery in self._load_recovery_exit(development_id).records()
+            ],
         }
 
     def list(
@@ -1624,6 +1670,192 @@ class DdControlPlane:
             check=False,
         )
         return proc.stdout if proc.returncode == 0 else b""
+
+    # --- B2: automatic adoption and MCP human recovery ---------------------
+
+    def _adoption_path(self, development_id: str) -> Path:
+        return self._dev_root(development_id) / ADOPTIONS_FILE
+
+    def _recoveries_path(self, development_id: str) -> Path:
+        return self._dev_root(development_id) / RECOVERIES_FILE
+
+    def _load_adoption_ledger(self, development_id: str) -> AdoptionLedger:
+        path = self._adoption_path(development_id)
+        records: list[AdoptionRecord] = []
+        if path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                raw = json.loads(line)
+                records.append(
+                    AdoptionRecord(
+                        signature=str(raw.get("signature") or ""),
+                        kind=str(raw.get("kind") or ""),
+                        source=str(raw.get("source") or ""),
+                        target_ref=str(raw.get("target_ref") or ""),
+                        digest=str(raw.get("digest") or ""),
+                        sequence=int(raw.get("sequence") or 0),
+                    )
+                )
+        return AdoptionLedger(records)
+
+    def _load_recovery_exit(self, development_id: str) -> HumanRecoveryExit:
+        path = self._recoveries_path(development_id)
+        records: list[RecoveryDecision] = []
+        if path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                raw = json.loads(line)
+                records.append(
+                    RecoveryDecision(
+                        target_ref=str(raw.get("target_ref") or ""),
+                        decision=str(raw.get("decision") or ""),
+                        decided_by=str(raw.get("decided_by") or ""),
+                        question_note_id=str(raw.get("question_note_id") or ""),
+                        at=str(raw.get("at") or ""),
+                        digest=str(raw.get("digest") or ""),
+                    )
+                )
+        # The exit's own authenticator is the fail-closed floor; the *real*
+        # governance check -- a human decision on the board -- runs in `recover`.
+        return HumanRecoveryExit(records=records)
+
+    def adopt(
+        self,
+        development_id: str,
+        *,
+        signature: str = "",
+        kind: str = "",
+        source: str = "",
+        target_ref: str = "",
+    ) -> dict[str, Any]:
+        """Adopt one discovered in-flight/recoverable work item (B2).
+
+        Idempotent by signature: adopting the same discovery twice returns the
+        same sealed record and appends nothing -- a replayed discovery cannot
+        duplicate adopted work or fork its history. The trail is append-only,
+        and every record carries its own digest.
+        """
+        self._record(development_id)  # refuses unknown ids before anything else
+        discovery = Discovery(signature=signature, kind=kind, source=source)
+        ledger = self._load_adoption_ledger(development_id)
+        already = ledger.is_adopted(signature)
+        try:
+            record = ledger.adopt(discovery, target_ref)
+        except AdoptionError as exc:
+            raise ControlPlaneError("ADOPTION_INVALID", str(exc)) from exc
+
+        if not already:
+            with self._adoption_path(development_id).open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record.as_dict(), ensure_ascii=False) + "\n")
+        self.rebuild_status(development_id)
+        return {
+            "development_id": development_id,
+            "adopted": record.as_dict(),
+            "already_adopted": already,
+        }
+
+    def _head_commit(self, record: dict[str, Any]) -> str:
+        proc = run_git(Path(str(record["repo_path"])), "rev-parse", "HEAD")
+        if proc.returncode != 0:
+            raise ControlPlaneError(
+                "HEAD_UNRESOLVED",
+                f"cannot resolve HEAD in {record['repo_path']}: {proc.stderr.strip()[:200]}",
+            )
+        return proc.stdout.strip()
+
+    def _governance_decision(self, record: dict[str, Any], question_note_id: str) -> Any:
+        """The human decision on the board for one question note, or None.
+
+        This is the governance path the recovery exit delegates authentication
+        to: the exit never casts a decision, it reads the one a human already
+        put on the board. No board -> no decision -> refuse.
+        """
+        from fleet_graph.bus.board import GateTicket
+
+        board = self._board_factory()
+        if board is None:
+            return None
+        try:
+            ticket = GateTicket(
+                question_note_id=question_note_id,
+                card_entity_id=str(record.get("card_entity_id") or ""),
+            )
+            return board.decision_for(ticket)
+        except Exception:
+            return None
+
+    def recover(
+        self,
+        development_id: str,
+        *,
+        target_ref: str = "",
+        question_note_id: str = "",
+    ) -> dict[str, Any]:
+        """Record a human recovery decision and resume only from it (B2).
+
+        The MCP surface carries *no verdict*: this tool takes a target and the
+        question note, reads the human's decision off the board (the governance
+        path), seals it -- with its immutable target reference and a digest --
+        into the append-only recovery trail, and then resumes the suspended
+        work from that recorded decision alone. No board decision -> refuse,
+        so the recovery can never become a bypass around the gate.
+        """
+        record = self._record(development_id)
+        if not target_ref:
+            target_ref = self._head_commit(record)
+
+        decision = self._governance_decision(record, question_note_id)
+        if decision is None:
+            raise ControlPlaneError(
+                "HUMAN_DECISION_MISSING",
+                "human recovery needs the decision for this question note on the "
+                "board (work.decision.v1); the exit cannot cast a decision itself",
+            )
+
+        exit_ = self._load_recovery_exit(development_id)
+        try:
+            sealed = exit_.record(
+                target_ref=target_ref,
+                decision=str(getattr(decision, "decision", "") or ""),
+                decided_by=str(getattr(decision, "decided_by", "") or ""),
+                question_note_id=question_note_id,
+                at=iso(self.clock()),
+            )
+        except RecoveryError as exc:
+            raise ControlPlaneError("RECOVERY_REFUSED", str(exc)) from exc
+
+        with self._recoveries_path(development_id).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(sealed.as_dict(), ensure_ascii=False) + "\n")
+
+        resumed = exit_.resume(target_ref=target_ref)
+        self.rebuild_status(development_id)
+        return {
+            "development_id": development_id,
+            "recovery": sealed.as_dict(),
+            "resume": resumed,
+        }
+
+    def recoveries(self, development_id: str) -> dict[str, Any]:
+        """The sealed recovery decisions on record for one development."""
+        self._record(development_id)
+        return {
+            "development_id": development_id,
+            "recoveries": [
+                record.as_dict() for record in self._load_recovery_exit(development_id).records()
+            ],
+        }
+
+    def adoptions(self, development_id: str) -> dict[str, Any]:
+        """The adopted work items on record for one development."""
+        self._record(development_id)
+        return {
+            "development_id": development_id,
+            "adoptions": [
+                record.as_dict() for record in self._load_adoption_ledger(development_id).records()
+            ],
+        }
 
 
 __all__ = [
