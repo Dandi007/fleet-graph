@@ -299,19 +299,29 @@ class LineOwnerSource:
         return True
 
     def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
-        if not self._claim(target.id, target.generation, action_key):
-            return OwnerResult(
-                RESUME_ALREADY_RESUMED,
-                "durable action-key dedup: this line generation already recovered",
-            )
+        claimed = self._claim(target.id, target.generation, action_key)
         state = self._read_state(target.id)
         if not state.get("parked_run_id"):
+            # The line is no longer parked: either the recovery completed (the
+            # stall snapshot was cleared and the claim already existed, so this
+            # is the same logical success, not a second one) or there was never
+            # anything parked to recover.
+            if not claimed:
+                return OwnerResult(
+                    RESUME_ALREADY_RESUMED,
+                    "durable action-key dedup: this line generation already recovered",
+                )
             return OwnerResult(RESUME_REFUSED, "line is not parked")
         if str(state.get("board_question_note_id") or "") != target.question_note_id:
             return OwnerResult(
                 RESUME_REFUSED,
                 f"line is no longer parked on question {target.question_note_id!r}",
             )
+        # ``claimed`` is True here or the interrupted-recovery replay path: if a
+        # previous attempt claimed but the line is still parked, it died before
+        # waking the line. Wake it now so the receipt is honest about a recovery
+        # that actually happened, rather than reporting a finished one it never
+        # performed.
         self._wake(target.id, state)
         return OwnerResult(
             RESUME_RESUMED, f"woke line {target.id} parked run {state.get('parked_run_id')}"

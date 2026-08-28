@@ -488,6 +488,34 @@ class TestBridgeLoop:
         # past the still-unprocessed first decision.
         assert record["cursor_after"] == 0
 
+    def test_a_receipt_read_fault_mid_cycle_stops_the_loop(self, tmp_path: Path) -> None:
+        """The sibling of ``test_a_store_fault_mid_cycle_never_raises_and_stops``:
+        a durability fault *reading* the receipt for the current decision must
+        also stop the loop, so a later message's seal cannot advance the cursor
+        past the decision whose receipt could not be read. (A receipt read that
+        returns instead of raising would let the next message seal seq N+1 and
+        drop this human verdict forever.)"""
+        o = FakeOwner()
+        o.add(owner())
+        store = BridgeStore(tmp_path / "bridge").open()
+
+        def boom(source_message_id: str) -> dict[str, Any] | None:
+            raise BridgeStoreError("receipt unreadable: database is locked")
+
+        store.receipt = boom  # type: ignore[method-assign]
+        messages = [
+            decision("d-1", 1, question="q-1", card="card-1"),
+            decision("d-2", 2, question="q-1", card="card-1"),
+        ]
+        b = bridge(tmp_path, FakeBus(messages), o, store=store)
+        record = b.run_once()  # must not raise
+        assert record["resumed"] == 0
+        assert o.logical_resumes == 0
+        # The first decision's receipt could not be read, so the bridge must
+        # refuse to resume and, crucially, must not advance the cursor past it.
+        assert record.get("error")
+        assert record["cursor_after"] == 0
+
 
 # --- owner-side action-key dedup (spec item 4) ------------------------------
 
@@ -599,6 +627,22 @@ class TestDdOwnerSideDedup:
         replay = source.resume(target, action_key)
         assert replay.status == RESUME_ALREADY_RESUMED
 
+    def test_an_interrupted_claim_without_launch_is_completed(self, tmp_path: Path) -> None:
+        """A crash in the claim/act window leaves a claim file but no launch
+        entry; the gate must carry out the recovery then instead of reporting
+        ``already_resumed`` for a recovery that never ran."""
+        plane, launcher = self._plane(tmp_path)
+        self._suspended(plane, "dev-abc", tmp_path)
+        action_key = "e1:d-1:dd:dev-abc:1"
+
+        # The durable claim exists, but no launch was ever recorded.
+        assert plane._claim_resume_action("dev-abc", 1, action_key) is True
+
+        result = plane.gate("dev-abc", resume=True, action_key=action_key)
+        assert not result.get("already_resumed")
+        assert result["resume"]["mode"] == "resume"
+        assert len(launcher.specs) == 1  # the interrupted recovery completed once
+
 
 class TestLineOwner:
     """The line resume owner: discovery over the scheduler's parked stall-state
@@ -674,6 +718,25 @@ class TestLineOwner:
         source = LineOwnerSource(run_root, ["wf-1"])
         stale = OwnerTarget(OWNER_KIND_LINE, "wf-1", 2, "q-other", "card-1", "parked")
         assert source.resume(stale, "e1:d-9:line:wf-1:2").status == RESUME_REFUSED
+
+    def test_resume_completes_an_interrupted_claim(self, tmp_path: Path) -> None:
+        """A crash between the durable claim and the wake leaves a claim file
+        while the line is still parked; a replay must wake it then rather than
+        report ``already_resumed`` for a recovery that never happened."""
+        run_root = tmp_path / "runs"
+        stall = self._parked(run_root)
+        source = LineOwnerSource(run_root, ["wf-1"])
+        target = source.discover("q-1")[0]
+        action_key = "e1:d-9:line:wf-1:2"
+
+        # The durable claim exists, but the line is still parked (no wake ran).
+        assert source._claim("wf-1", target.generation, action_key) is True
+
+        result = source.resume(target, action_key)
+        assert result.status == RESUME_RESUMED
+        after = json.loads(stall.read_text(encoding="utf-8"))
+        assert after["parked_run_id"] is None
+        assert after["parked_at"] is None
 
 
 class TestCompositeOwner:
