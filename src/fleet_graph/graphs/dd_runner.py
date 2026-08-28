@@ -352,6 +352,9 @@ def run_pipeline(
         # Which question is holding the line. Without it the operator knows
         # only that something suspended, not what to answer.
         "awaiting": awaiting_decision(state),
+        # A resumable refusal is a suspension with a reason: the gate refuses to
+        # interpret the board's answer, and stays resumable rather than ending.
+        "gate_refused": gate_refusal(state),
         "history": state.get("history", []),
     }
     write_json_durable(config.run_root / RESULT_FILE, {**result, "written_at": iso(now())})
@@ -367,6 +370,21 @@ def awaiting_decision(state: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def gate_refusal(state: dict[str, Any]) -> dict[str, Any] | None:
+    """The gate's fail-closed refusal, if the graph suspended on one.
+
+    A resumable refusal (the gate refusing to interpret an unrecognized
+    verdict) suspends with this payload beside the awaiting ticket. It never
+    proceeds and never ends: the reason and the one mechanical code travel here
+    so the read side can say "refused, still waiting" rather than only "waiting".
+    """
+    for interrupt in state.get("__interrupt__") or ():
+        value = getattr(interrupt, "value", None)
+        if isinstance(value, dict) and "refused" in value:
+            return dict(value["refused"])
+    return None
+
+
 __all__ = [
     "EVENTS_FILE",
     "RESULT_FILE",
@@ -374,6 +392,7 @@ __all__ = [
     "DevelopmentConfig",
     "awaiting_decision",
     "build_pipeline",
+    "gate_refusal",
     "lifecycle_gate_stage",
     "run_pipeline",
     "stage_producing",

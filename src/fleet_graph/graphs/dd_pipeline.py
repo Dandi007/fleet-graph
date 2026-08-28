@@ -107,11 +107,28 @@ class StageRefused(RuntimeError):
     `code` names the one mechanical cause of the refusal (one code, one
     cause -- the m-1e94ea lesson). The raiser that knows why it refused says
     so here; a refusal without a code classifies by its raw text alone.
+
+    `resumable` marks a refusal that is not a terminal answer but a fail-closed
+    "the input is not yet usable": the gate's unrecognized verdict. Such a
+    refusal suspends the graph instead of ending it, so a later resume re-reads
+    the board and the gate can still be answered properly. `ticket` carries the
+    gate's awaiting ticket so the suspended state still reports which question
+    note is holding the line; a resumable refusal without a ticket degrades to
+    a plain suspension.
     """
 
-    def __init__(self, message: str, *, code: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "",
+        resumable: bool = False,
+        ticket: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.resumable = resumable
+        self.ticket = ticket
 
 
 @dataclass(frozen=True)
@@ -296,6 +313,12 @@ def _act_or_wait(actor: Actor, stage: Stage, dispatch: Dispatch) -> StageOutcome
     deliberately discarded -- whoever resumes the graph must not be able to
     cast the vote by resuming it.
 
+    A resumable `StageRefused` -- the gate's refusal to interpret an
+    unrecognized verdict -- suspends the same way, carrying the refusal beside
+    the awaiting ticket. It never proceeds, and it never ends the run: the
+    board can still be answered properly, and a resume re-reads it. A
+    non-resumable refusal propagates, and is terminal.
+
     Nothing is checkpointed about the open question here on purpose. The gate
     actor asks with an idempotency key, so a process that dies mid-wait and
     re-asks lands on the same note rather than a duplicate one; the key is the
@@ -306,6 +329,18 @@ def _act_or_wait(actor: Actor, stage: Stage, dispatch: Dispatch) -> StageOutcome
             return actor.act(stage, dispatch)
         except GatePending as pending:
             interrupt({"awaiting_decision": pending.ticket})
+        except StageRefused as refused:
+            if refused.resumable:
+                payload: dict[str, Any] = {
+                    "refused": {"reason": str(refused), "code": refused.code}
+                }
+                if refused.ticket:
+                    # The gate already asked; keep the question note visible so
+                    # the suspended state still reports what is holding the
+                    # line (the refusal sits beside it, not instead of it).
+                    payload["awaiting_decision"] = refused.ticket
+                interrupt(payload)
+            raise
     raise PipelineFault(
         f"{stage.id} re-checked the board {MAX_GATE_RECHECKS} times without suspending; "
         "the resume value is being replayed"

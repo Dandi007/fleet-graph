@@ -919,6 +919,7 @@ class DdControlPlane:
         terminal_reason = ""
         head_commit = ""
         awaiting: dict[str, Any] | None = None
+        gate_refused: dict[str, Any] | None = None
         if result is not None:
             stage = str(result.get("stage") or "")
             terminal = str(result.get("terminal") or "")
@@ -926,6 +927,8 @@ class DdControlPlane:
             head_commit = str(result.get("head_commit") or "")
             raw_awaiting = result.get("awaiting")
             awaiting = dict(raw_awaiting) if isinstance(raw_awaiting, dict) else None
+            raw_gate_refused = result.get("gate_refused")
+            gate_refused = dict(raw_gate_refused) if isinstance(raw_gate_refused, dict) else None
 
         if active_unit:
             state = STATE_RUNNING
@@ -955,6 +958,11 @@ class DdControlPlane:
             # which of the three exits is open. Derived, never stored twice.
             "failure": self._failure_of(result),
             "awaiting": awaiting,
+            # A resumable gate refusal: the gate saw a verdict it could not
+            # interpret, suspended rather than ended, and is still waiting for
+            # a proper one. Surfaced so the operator sees why an otherwise
+            # "awaiting_gate" development is not progressing.
+            "gate_refused": gate_refused,
             "active_unit": active_unit or "",
             "launches": len(self._launches(development_id)),
         }
@@ -1181,12 +1189,18 @@ class DdControlPlane:
         generation = self._generation(record)
 
         decision = self._committed_gate_decision(record, generation)
+        gate_refused = status.get("gate_refused") or None
         gate_report: dict[str, Any] = {
             "development_id": development_id,
             "state": status["state"],
             "pending": bool(awaiting) and decision is None,
             "awaiting": awaiting,
             "decision": decision,
+            # A resumable refusal: the gate saw a verdict it could not
+            # interpret and is still waiting for a proper one -- reported so
+            # the operator knows a malformed verdict, not an absent one, is
+            # what is holding the line.
+            "gate_refused": gate_refused,
             "ruling": "decisions travel only as work.decision.v1 on the board; "
             "this tool carries none",
         }

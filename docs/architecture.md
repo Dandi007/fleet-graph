@@ -198,6 +198,8 @@ LangGraph interrupt → agent-bus 发 question note → 等 work.decision.v1 →
 
 放行之后，裁决被封进产品树：`.dev-dispatch/gate/decision-g{n}.json`，带 verdict、`decided_by`、裁决消息 id、**以及它回答的那张 question note id**。前两项说明「放行了、谁放的」，后两项才让人能从产物一路查回板上。**REJECT 不写文件**——那个 stage 根本没产出 `gate_decision`，写一份「被拒绝的 gate_decision」是在编造契约里不存在的产物。
 
+**裁决输入归一化（E4b）：宽进严出。** gate 只认机械去壳后恰好等于精确字节 `APPROVE` / `REJECT` 的输入。人可以带上少量惰性外壳——裸词、Markdown 引文（每非空行一个 `>`）、单反引号内联码、三反引号单行围栏、大小写不敏感的 `decision:` / `verdict:` 标签——每种外壳至多去一次，之后 ASCII 大写。任何其他输入（整句叙事、第二个词、标点、Unicode 形似字、混合引文、多余围栏行）一律 fail-closed 成 `GATE_VERDICT_UNRECOGNIZED`。审批 sealing 额外保留 `raw_decision`（原样字段）与 `normalization_form`（`bare` / `quote` / `inline_code` / `fenced_code` / `label`）；`decision` 字段是规范大写 token，从不把转换后的 token 当原始值持久化。
+
 ### 6.3 网关探针必须探真实依赖面
 
 一个「面」= **endpoint + 凭证 lane**，两者都不能错：
