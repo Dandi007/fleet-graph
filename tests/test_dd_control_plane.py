@@ -434,6 +434,62 @@ class TestFrozenTargetBaseForwarding:
         assert refused.value.code == "IDENTITY_EDITED"
 
 
+class TestDispatchedByForwarding:
+    """The `dispatched_by` provenance the spec (DoD 3) requires reaches the
+    runner: recorded at admission, forwarded through the launch argv as
+    `--dispatched-by`, and from there into the runner's `DevelopmentConfig`.
+    """
+
+    def test_create_records_dispatched_by(self, scratch: Path, tmp_path: Path) -> None:
+        launcher = RecordingLauncher()
+        plane = make_plane(tmp_path, launcher=launcher)
+        dev = plane.create(str(scratch), spec_text=SPEC, dispatched_by="ronin-model-switch")[
+            "development_id"
+        ]
+        record = json.loads((plane.root / dev / RECORD_FILE).read_text())
+        assert record["dispatched_by"] == "ronin-model-switch"
+
+    def test_start_forwards_dispatched_by_into_the_argv(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        launcher = RecordingLauncher()
+        plane = make_plane(tmp_path, launcher=launcher)
+        dev = plane.create(str(scratch), spec_text=SPEC, dispatched_by="ronin-model-switch")[
+            "development_id"
+        ]
+        plane.start(dev)
+        argv = launcher.specs[0].argv()
+        assert argv[argv.index("--dispatched-by") + 1] == "ronin-model-switch"
+
+    def test_the_spec_emits_no_flag_without_provenance(self, tmp_path: Path) -> None:
+        spec = DdLaunchSpec(
+            development_id="dev-x",
+            dev_root=tmp_path / "dd" / "dev-x",
+            workspace=tmp_path / "w",
+            plugin_binding=tmp_path / "b.json",
+            remote_url="u",
+            remote_ref="refs/heads/main",
+            root_digest="sha256:" + "a" * 64,
+            target_base_commit="86f929e8640b2008ae18130ba83ee91df428fc71",
+        )
+        assert "--dispatched-by" not in spec.argv()
+
+    def test_the_spec_emits_the_recorded_principal_verbatim(self, tmp_path: Path) -> None:
+        spec = DdLaunchSpec(
+            development_id="dev-x",
+            dev_root=tmp_path / "dd" / "dev-x",
+            workspace=tmp_path / "w",
+            plugin_binding=tmp_path / "b.json",
+            remote_url="u",
+            remote_ref="refs/heads/main",
+            root_digest="sha256:" + "a" * 64,
+            target_base_commit="86f929e8640b2008ae18130ba83ee91df428fc71",
+            dispatched_by="wf-goal-line",
+        )
+        argv = spec.argv()
+        assert argv[argv.index("--dispatched-by") + 1] == "wf-goal-line"
+
+
 class TestGate:
     def _suspended(self, plane: DdControlPlane, scratch: Path) -> str:
         dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]

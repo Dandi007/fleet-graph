@@ -204,7 +204,13 @@ def test_the_create_tool_admits_only_the_derivation_inputs() -> None:
     server = build_mcp_server(FakeControlPlane())
     tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
     schema = tools["development_create"].parameters
-    assert set(schema["properties"]) == {"repo_path", "target_base", "spec_text", "spec_path"}
+    assert set(schema["properties"]) == {
+        "repo_path",
+        "target_base",
+        "spec_text",
+        "spec_path",
+        "dispatched_by",
+    }
     assert schema["required"] == ["repo_path"]
 
 
@@ -304,6 +310,7 @@ def test_every_supported_tool_drives_the_control_plane_over_the_running_endpoint
                 "target_base": "refs/remotes/origin/main",
                 "spec_text": "# spec",
                 "spec_path": None,
+                "dispatched_by": "",
             },
         ),
         ("start", {"development_id": "dev-1"}),
@@ -377,7 +384,7 @@ def test_the_fake_control_plane_mirrors_the_real_surface() -> None:
         for name, _ in inspect.signature(DdControlPlane.create).parameters.items()
         if name != "self"
     }
-    assert real == {"repo_path", "target_base", "spec_text", "spec_path"}
+    assert real == {"repo_path", "target_base", "spec_text", "spec_path", "dispatched_by"}
     gate = {
         name
         for name, _ in inspect.signature(DdControlPlane.gate).parameters.items()

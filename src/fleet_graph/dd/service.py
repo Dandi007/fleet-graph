@@ -326,16 +326,19 @@ def build_mcp_server(plane: DdControlPlane | None = None) -> Any:
         target_base: str | None = None,
         spec_text: str | None = None,
         spec_path: str | None = None,
+        dispatched_by: str = "",
     ) -> dict[str, Any]:
         """Admit one development. Everything else is derived server-side.
 
         Takes a dedicated git worktree (or clone) path, an optional target
-        base (defaults to the repo's HEAD), and the approved spec as text or
-        as a path. The server derives the development id, freezes the spec
-        and target base into the bootstrap commit, computes the H0 handoff
-        and its chain-root digest, derives the durable ref and the acceptance
-        argv (from the spec's ```dd-acceptance block), and publishes the work
-        board card. Idempotent for the same (repo, spec, base).
+        base (defaults to the repo's HEAD), the approved spec as text or
+        as a path, and the bounded principal that dispatched the development
+        (a line folder or a human subject) as `dispatched_by`. The server
+        derives the development id, freezes the spec and target base into the
+        bootstrap commit, computes the H0 handoff and its chain-root digest,
+        derives the durable ref and the acceptance argv (from the spec's
+        ```dd-acceptance block), and publishes the work board card. Idempotent
+        for the same (repo, spec, base).
         """
         return call(
             "create",
@@ -343,6 +346,7 @@ def build_mcp_server(plane: DdControlPlane | None = None) -> Any:
             target_base=target_base,
             spec_text=spec_text,
             spec_path=spec_path,
+            dispatched_by=dispatched_by,
         )
 
     @mcp.tool()

@@ -244,6 +244,10 @@ def _dd_run(args: argparse.Namespace) -> int:
         publish_merge=args.publish_merge,
         cost_obs_dir=args.cost_obs_dir or "",
         management_cost=management_cost,
+        # The bounded principal that dispatched this development (a line folder
+        # or a human subject), threaded to the stage run labels as
+        # `dispatched_by`. Absent, the actor falls back to the dispatcher.
+        dispatched_by=args.dispatched_by,
     )
 
     board = None
@@ -850,6 +854,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="KEY=VALUE overlaid on setup and acceptance commands; repeatable",
     )
     dd_run.add_argument("--board-card", default=None, help="card entity id; enables the gate")
+    dd_run.add_argument(
+        "--dispatched-by",
+        default="",
+        help="bounded principal that dispatched this development (a line folder "
+        "or a human subject), recorded as the `dispatched_by` label on every "
+        "dd-worker run; never a run_id/uuid. Empty falls back to the dispatcher",
+    )
     dd_run.add_argument(
         "--resume",
         action="store_true",
