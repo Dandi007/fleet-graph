@@ -253,3 +253,25 @@ class TestAcceptancePassing:
         """The line tells `not declared` apart from `declared empty` by the
         flag's absence; passing an empty one would erase that distinction."""
         assert "--acceptance-json" not in spec.argv()
+
+
+class TestBoundsForwarding:
+    """The roster declares optional streak-breaker bounds; the launcher forwards
+    them only when present, so a bound that was never reviewed is never passed
+    down to override the runner's own defaults."""
+
+    def test_bounds_are_forwarded_when_present(self) -> None:
+        spec = LaunchSpec(folder_id="wf-1", seat="s", noop_limit=5, timeout_limit=7)
+        argv = spec.argv()
+        assert argv[argv.index("--noop-limit") + 1] == "5"
+        assert argv[argv.index("--timeout-limit") + 1] == "7"
+
+    def test_bounds_are_omitted_when_absent(self, spec: LaunchSpec) -> None:
+        assert "--noop-limit" not in spec.argv()
+        assert "--timeout-limit" not in spec.argv()
+
+    def test_a_single_bound_forwards_alone(self) -> None:
+        spec = LaunchSpec(folder_id="wf-1", seat="s", noop_limit=9)
+        argv = spec.argv()
+        assert argv[argv.index("--noop-limit") + 1] == "9"
+        assert "--timeout-limit" not in argv

@@ -123,6 +123,12 @@ class LineSpec:
     acceptance_cwd: str | None = None
     #: Per command, not for the batch.
     acceptance_timeout_seconds: int = 300
+    #: Optional streak-breaker bounds, forwarded to the line as
+    #: `--noop-limit` / `--timeout-limit` only when the roster declares them.
+    #: None means absent; the line then keeps its own defaults, so a bound that
+    #: was never reviewed is never passed down.
+    noop_limit: int | None = None
+    timeout_limit: int | None = None
 
 
 @dataclass
@@ -836,6 +842,8 @@ class Scheduler:
             run_root=self.config.run_root / line.folder_id,
             environment=self.line_environment(),
             acceptance_json=self.acceptance_json_for(line),
+            noop_limit=line.noop_limit,
+            timeout_limit=line.timeout_limit,
         )
 
     def acceptance_json_for(self, line: LineSpec) -> str | None:

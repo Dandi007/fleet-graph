@@ -194,6 +194,62 @@ class TestTerminal:
             artifacts.write_terminal(terminal="done", rounds=1)
 
 
+class TestFaultTerminal:
+    """The exception boundary's counterpart: a crash writes terminal: fault,
+    with the exception class, a one-line message and a truncated traceback."""
+
+    def test_records_class_message_and_traceback(self, artifacts: RunArtifacts) -> None:
+        try:
+            raise ValueError("boom\non two lines")
+        except ValueError as exc:
+            artifacts.write_fault_terminal(exception=exc)
+        event = read_json(artifacts.terminal_path)
+        assert event["terminal"] == "fault"
+        assert event["pump_fault"] is True
+        assert event["exception_class"] == "ValueError"
+        assert event["message"] == "boom on two lines"
+        assert "ValueError" in event["traceback"]
+
+    def test_the_traceback_summary_is_truncated(self, artifacts: RunArtifacts) -> None:
+        from fleet_graph.state.run_artifacts import TRACEBACK_SUMMARY_LIMIT
+
+        try:
+            raise RuntimeError("x" * (TRACEBACK_SUMMARY_LIMIT + 10_000))
+        except RuntimeError as exc:
+            artifacts.write_fault_terminal(exception=exc)
+        event = read_json(artifacts.terminal_path)
+        assert len(event["traceback"]) <= TRACEBACK_SUMMARY_LIMIT
+
+    def test_a_fault_terminal_names_the_log(self, artifacts: RunArtifacts) -> None:
+        try:
+            raise RuntimeError("kaboom")
+        except RuntimeError as exc:
+            artifacts.write_fault_terminal(exception=exc)
+        assert read_json(artifacts.terminal_path)["log_path"].endswith("wf-3f30cd.log")
+
+
+class TestLogPath:
+    """The run root is self-describing: heartbeat and terminal name the log."""
+
+    def test_heartbeat_carries_the_log_path(self, artifacts: RunArtifacts) -> None:
+        artifacts.heartbeat(1, "coordinator")
+        assert read_json(artifacts.heartbeat_path)["log_path"].endswith("wf-3f30cd.log")
+
+    def test_terminal_carries_the_log_path(self, artifacts: RunArtifacts) -> None:
+        artifacts.write_terminal(terminal="done", rounds=1)
+        assert read_json(artifacts.terminal_path)["log_path"].endswith("wf-3f30cd.log")
+
+    def test_defaults_from_the_folder_id(self, tmp_path: Path) -> None:
+        artifacts = RunArtifacts(tmp_path / "run", run_id="r", folder_id="wf-abc123")
+        assert artifacts.log_path == "/data/fleet-graph/logs/wf-abc123.log"
+
+    def test_is_overridable(self, tmp_path: Path) -> None:
+        artifacts = RunArtifacts(
+            tmp_path / "run", run_id="r", folder_id="wf-x", log_path="/tmp/custom.log"
+        )
+        assert artifacts.log_path == "/tmp/custom.log"
+
+
 class TestSignalNames:
     def test_known_signal(self) -> None:
         assert signal_terminal_name(15) == "SIGTERM"
@@ -224,7 +280,7 @@ class TestEquivalenceWithTheRealPump:
     #: will never grow them; the equivalence check below covers the
     #: transcribed core, and additions here must be additive-only so
     #: fleet-sentinel's reads of the old fields keep working.
-    FLEET_GRAPH_ADDITIONS = frozenset({"waiting_on", "waiting_on_declared"})
+    FLEET_GRAPH_ADDITIONS = frozenset({"waiting_on", "waiting_on_declared", "log_path"})
 
     @pytest.mark.parametrize(
         ("filename", "expected"),

@@ -971,3 +971,16 @@ class TestAcceptanceDeclaration:
         )
         assert spec.acceptance_json is not None
         assert json.loads(spec.acceptance_json)["cwd"] is None
+
+    def test_spec_for_forwards_declared_bounds(self, tmp_path: Path) -> None:
+        spec = make(tmp_path).spec_for(
+            LineSpec(folder_id="wf-1", seat="s", enabled=True, noop_limit=4, timeout_limit=9)
+        )
+        argv = spec.argv()
+        assert argv[argv.index("--noop-limit") + 1] == "4"
+        assert argv[argv.index("--timeout-limit") + 1] == "9"
+
+    def test_undeclared_bounds_pass_no_flags(self, tmp_path: Path) -> None:
+        spec = make(tmp_path).spec_for(LineSpec(folder_id="wf-1", seat="s", enabled=True))
+        assert "--noop-limit" not in spec.argv()
+        assert "--timeout-limit" not in spec.argv()
