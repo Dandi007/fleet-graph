@@ -1,0 +1,17 @@
+{
+ "development_id": "dev-fg-eb1bb7655316",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
