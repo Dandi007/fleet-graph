@@ -62,7 +62,13 @@ from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.dd.upstream_constants import compute_json_digest
 from fleet_graph.dd.vendor import plugin_adapter
 from fleet_graph.graphs.dd_actors import implement_stage, review_stages
-from fleet_graph.graphs.dd_pipeline import MODE_INITIAL, SPINE_EVENT, Dispatch, Replayed
+from fleet_graph.graphs.dd_pipeline import (
+    MODE_INITIAL,
+    MODE_REWORK,
+    SPINE_EVENT,
+    Dispatch,
+    Replayed,
+)
 from fleet_graph.graphs.dd_scripts import RUN_CONFIG_PATH, write_json
 
 # The sealed receipt file per plugin-sealed stage, under
@@ -118,6 +124,16 @@ class _Step:
     # alongside the receipt so a later real seal can re-read it. Empty for the
     # reconstructed configure link and for a receipt whose intent is absent.
     intent_raw: bytes = b""
+    # The dispatch mode this step was sealed under -- `initial` for attempt 1,
+    # `rework` for every later attempt (the lifecycle's REJECT edge always
+    # bumps attempt and sets mode together). Carried forward on the Replayed
+    # object so the first real stage after a rework prefix dispatches as
+    # `rework`, matching the frozen Continuous intent a Final sealer re-reads
+    # (against `dispatch["mode"]`). Without it the final review of replayed
+    # rework would dispatch `initial` and the sealer raises BINDING_MISMATCH
+    # "persisted Continuous intent dispatch_mode does not match its
+    # authoritative binding" (dev-fg-6e4f9345b320 g7).
+    mode: str = MODE_INITIAL
 
 
 def byte_digest(raw: bytes) -> str:
@@ -184,13 +200,15 @@ class ReceiptReplayer:
     def replay(self, stage: Stage, dispatch: Dispatch) -> Replayed | None:
         if self._disabled:
             return None
-        if (
-            int(dispatch.get("attempt", 1)) != 1
-            or int(dispatch.get("retry", 0)) != 0
-            or str(dispatch.get("mode", "")) != MODE_INITIAL
-        ):
+        if int(dispatch.get("attempt", 1)) != 1 or int(dispatch.get("retry", 0)) != 0:
             # Rework and retries are real work with real feedback; replay
-            # serves only the untouched start of a fresh generation.
+            # serves only the untouched start of a fresh generation. `mode` is
+            # deliberately not checked here: a reworked prefix replays under a
+            # later attempt, which has already bumped `attempt`, so it is
+            # caught by the attempt guard. And after a rework prefix is
+            # replayed, the walker's own mode advances to `rework` for the
+            # stages that follow it -- that is the *desired* inheritance, not a
+            # fresh-generation start to reject.
             self._disabled = True
             return None
         try:
@@ -222,6 +240,7 @@ class ReceiptReplayer:
             receipt=dict(step.receipt),
             output_commit=step.output_commit,
             attempt_id=str(step.receipt.get("attempt_id") or ""),
+            mode=step.mode,
         )
 
     # --- plan construction (read-only) ------------------------------------
@@ -265,6 +284,14 @@ class ReceiptReplayer:
 
         attempt = 1
         while attempt <= MAX_WALK_ATTEMPTS:
+            # The dispatch mode of this attempt's sealed prefix. The lifecycle's
+            # REJECT edge bumps attempt and sets mode together, so attempt 1 is
+            # `initial` and every later attempt is `rework`. This mirrors the
+            # `dispatch_mode` the plugin froze into each sealed intent; carrying
+            # it forward is what lets a real Final review of reworked work
+            # dispatch as `rework` and close the sealer's binding instead of
+            # raising a false dispatch-mode mismatch.
+            mode = MODE_REWORK if attempt > 1 else MODE_INITIAL
             # The implement intent is carried over when present but is not
             # required to replay: no downstream sealer re-reads it (the Review
             # sealer binds to the implement receipt and its committed artifact),
@@ -280,6 +307,7 @@ class ReceiptReplayer:
                     output_commit=str(imp["output_commit"]),
                     raw=imp_raw,
                     intent_raw=imp_intent[0] if imp_intent else b"",
+                    mode=mode,
                 ),
             ]
             if not continuous_id:
@@ -327,6 +355,7 @@ class ReceiptReplayer:
                     output_commit=str(cr["output_commit"]),
                     raw=cr_raw,
                     intent_raw=cr_intent[0],
+                    mode=mode,
                 )
             )
             if not final_id:
@@ -366,6 +395,7 @@ class ReceiptReplayer:
                     output_commit=str(fr["output_commit"]),
                     raw=fr_raw,
                     intent_raw=fr_intent[0],
+                    mode=mode,
                 )
             )
             # Acceptance and everything after it always re-runs: acceptance
