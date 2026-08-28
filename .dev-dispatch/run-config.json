@@ -1,0 +1,75 @@
+{
+ "development_id": "dev-fg-b5479a961625",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_line_restart.py",
+   "-q"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_goal_interrupt.py",
+   "-q"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e2_goal_interrupt_acceptance.py",
+   "--scenario",
+   "decision-content-injected"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e2_goal_interrupt_acceptance.py",
+   "--scenario",
+   "legacy-owner-fallback"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e2_goal_interrupt_acceptance.py",
+   "--scenario",
+   "cursor-compensation"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e2_goal_interrupt_acceptance.py",
+   "--scenario",
+   "kill-restart-no-replay",
+   "--kill-after",
+   "turn_claimed"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e2_goal_interrupt_acceptance.py",
+   "--scenario",
+   "suspend-24h-then-bridge-resume",
+   "--suspend-seconds",
+   "86400"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
