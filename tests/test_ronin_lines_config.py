@@ -64,8 +64,14 @@ CONVERGED = {
 # wf-7cd0a7（agent-bus 通信层重设计，wf-7cd0a7/goal.md 2026-08-28 re-scope），
 # seat opencode-gpt-sol——该座位首次跑 goal line。与 MIGRATED/OPENED 分开：
 # 它既不是 babysitter 存量迁移，也不是 08-27「都派出去」那批新开线。
+# 2026-08-28 第三波入编：用户 18:22 拍板「按 w-577103 方向对引擎/goal-driven/dd
+# 深度重构，自举开发」。wf-d002a6 是事件化重构线（E1 决议事件桥 / E2 等待收敛
+# 进图 / E3 terminal 视图化 / E4 协议收敛 / E5 开线 MCP 面），改造对象就是本
+# 引擎自己——goal 线跑在 fleet-graph 上、改 fleet-graph 的代码、经 fleet-graph
+# 的 dd 管线交付。方向 SSoT：wiki w-577103；执行卷：work folder wf-d002a6。
 ENROLLED = {
     "wf-7cd0a7",
+    "wf-d002a6",
 }
 
 MIGRATED = {
