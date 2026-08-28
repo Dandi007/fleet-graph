@@ -506,6 +506,12 @@ class TestAReviewedChainContinuesThroughItsReviews:
             "final_review",
         ]
         assert [stage for stage, _ in actor.calls] == ["acceptance", "human_gate", "merger"]
+        # The continuous- and final-review handoffs materialise alongside the
+        # replayed configure/implement: their sealed receipt bytes are installed
+        # under the identity they were sealed with, so the walk continues into
+        # acceptance without a fresh review (no new attempt is created).
+        assert g1.installed("continuous-review-receipt.json").read_bytes() == cr_raw
+        assert g1.installed("final-review-receipt.json").exists()
 
     def test_the_review_bearing_prefix_is_preferred_over_a_partial_one(
         self, repo: Path, tmp_path: Path
@@ -551,27 +557,29 @@ class TestAReviewedChainContinuesThroughItsReviews:
             generation=3,
             lifecycle=LIFECYCLE,
         )
-        plan = replayer._build_plan()
-        assert [step.stage_id for step in plan] == [
+        plans = replayer._candidate_plans()
+        assert [step.stage_id for step in plans[0]] == [
             "configure",
             "implement",
             "continuous_review",
             "final_review",
         ]
 
-    def test_preferring_the_reviewed_prefix_falls_back_to_a_partial_prefix(
+    def test_a_divergent_unreviewed_generation_refuses_replay(
         self, repo: Path, tmp_path: Path
     ) -> None:
-        """Preferring the review-bearing prefix must not disable replay.
+        """Product drift above the reviewed tip refuses replay outright.
 
         gen 1 sealed a fully reviewed, approved chain. gen 2 then re-ran
         configure + implement and sealed a real (product-touching) implement
         above gen 1's tip before crashing, so its review never sealed. gen 3's
         strongest candidate -- gen 1's four-step prefix -- cannot be prepared
-        because `product.py` above its tip is product drift. Replay must fall
-        back to gen 2's `[configure, implement]` prefix instead of disabling
-        itself outright (the F4 BLOCKED jam: a fresh implement actor handed a
-        tree that already carries the work).
+        because `product.py` above its tip is product drift. The replayer must
+        not fall back to gen 2's `[configure, implement]` prefix: replaying
+        that divergent, unreviewed prefix would hand the feedback carrier a
+        fresh continuous review of work whose inherited chain did not end in
+        REJECT (ORDER_VIOLATION). It fails closed -- no replay, no trim -- so
+        the divergent work is surfaced rather than silently re-reviewed.
         """
         g1 = G1(repo, tmp_path)
         rc = commit_file(
@@ -624,9 +632,9 @@ class TestAReviewedChainContinuesThroughItsReviews:
             config={"recursion_limit": 200},
         )
 
-        assert state["terminal"] == TERMINAL_COMPLETE
-        assert replayed_stages(state) == ["configure", "implement"]
-        assert next(stage for stage, _ in actor.calls) == "continuous_review"
+        assert replayed_stages(state) == []
+        assert next(stage for stage, _ in actor.calls) == "configure"
+        assert head(repo) == g2_implement
 
     def test_a_rework_still_returns_a_derived_identity(self, repo: Path, tmp_path: Path) -> None:
         """The complementary boundary: a genuine new attempt (a rework after a
