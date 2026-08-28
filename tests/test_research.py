@@ -61,26 +61,63 @@ class FakeTextNode:
         )
 
 
-def worker_result(findings: list[str], new_clues: list[str]) -> dict[str, Any]:
-    """agent-run 成功信封：structured_result 携带 findings 与子线索。"""
+def worker_payload(claims: list[str], proposed: list[str]) -> dict[str, Any]:
+    """research-worker.result.v1 形状的结构化结果（roles 侧 schema 为 SSoT）。"""
+    return {
+        "clue_id": "c-fake",
+        "verdict": "found" if claims else "not_found",
+        "findings": [
+            {"claim": c, "source": "wiki", "quote": c, "locator": f"fake.md:{i + 1}"}
+            for i, c in enumerate(claims)
+        ],
+        "proposed_clues": [{"text": t, "rationale": "测试线索"} for t in proposed],
+    }
+
+
+def worker_result(claims: list[str], proposed: list[str]) -> dict[str, Any]:
+    """agent-run 成功信封：structured_result 携带契约形状的 findings 与子线索。"""
     return {
         "state": "succeeded",
         "exit_code": 0,
-        "structured_result": {"findings": findings, "new_clues": new_clues},
+        "structured_result": worker_payload(claims, proposed),
+    }
+
+
+def blocked_worker_result() -> dict[str, Any]:
+    """verdict=blocked 的成功信封：run 成功但取证被工具面挡住。"""
+    return {
+        "state": "succeeded",
+        "exit_code": 0,
+        "structured_result": {
+            "clue_id": "c-fake",
+            "verdict": "blocked",
+            "findings": [],
+            "proposed_clues": [],
+            "notes": "wiki mcp 不可达",
+        },
     }
 
 
 def synthesis_result(report: str) -> dict[str, Any]:
-    return {"state": "succeeded", "exit_code": 0, "structured_result": {"report": report}}
+    """research-synth.result.v1 形状的成功信封。"""
+    return {
+        "state": "succeeded",
+        "exit_code": 0,
+        "structured_result": {
+            "report_markdown": report,
+            "coverage_summary": "全部 clue 有证据支撑",
+            "unresolved": [],
+        },
+    }
 
 
-def legacy_worker_result(findings: list[str], new_clues: list[str]) -> dict[str, Any]:
+def legacy_worker_result(claims: list[str], proposed: list[str]) -> dict[str, Any]:
     """旧信封：结果藏在 `result` 键（而不是 `structured_result`），只有
     parse_envelope 能拆出来——harvest 不得手搓 `.get("structured_result")`。"""
     return {
         "state": "succeeded",
         "exit_code": 0,
-        "result": {"findings": findings, "new_clues": new_clues},
+        "result": worker_payload(claims, proposed),
     }
 
 
@@ -102,10 +139,12 @@ class FakeLauncher:
         self.synthesis = synthesis
         self.boom = boom
         self.dispatched: list[str] = []
+        self.specs: dict[str, Any] = {}
         self._roles: dict[str, str] = {}
 
     def launch(self, spec: Any, run_id: str) -> RunTicket:
         self._roles[run_id] = spec.role
+        self.specs[run_id] = spec
         self.dispatched.append(run_id)
         return RunTicket(run_id, f"/tmp/fake/{run_id}", None)
 
@@ -218,12 +257,14 @@ class TestEndToEnd:
         assert result["terminal"] == TERMINAL_CONVERGED
         assert result["rounds"] == 2
 
-        # evidence.jsonl 逐条落盘（规格第 7 条：findings 只落盘不进 state）。
+        # evidence.jsonl 逐条落盘（规格第 7 条：findings 只落盘不进 state），
+        # 每条保留契约的结构化对象（claim/source/quote/locator），不 str() 压平。
         evidence = read_jsonl(tmp_path / "run" / "evidence.jsonl")
-        assert [e["finding"] for e in evidence] == [
+        assert [e["finding"]["claim"] for e in evidence] == [
             "每轮 tick 检查所有 line",
             "systemd timer 唤醒",
         ]
+        assert all(e["finding"]["locator"] for e in evidence)
         assert all(e["clue_id"] for e in evidence)
 
         # report.md 由 synthesis 产出（规格：报告正文落 run root 文件）。
@@ -352,6 +393,66 @@ class TestHarvestEnvelope:
             derive_run_id(thread, f"worker/{parent}", 1),
             derive_run_id(thread, f"worker/{child}", 1),
         ]
+
+
+class TestInputContract:
+    """roles 声明 protocol.input 后 agent-run 强制 --input：spec 必须带 input_path。"""
+
+    def test_worker_and_synthesis_runs_carry_input_files(self, tmp_path: Path) -> None:
+        question = "fleet-graph 的调度器如何工作?"
+        seed = FakeTextNode(json.dumps(["scheduler 的基本循环"]))
+        launcher = FakeLauncher([worker_result(["f1"], [])], synthesis_result("report"))
+        config = ResearchConfig(question=question, run_root=tmp_path / "run")
+
+        result = run_research(config, text_node=seed, launcher=launcher)
+        assert result["terminal"] == TERMINAL_CONVERGED
+
+        # worker：input 文件存在且是 research-worker.input.v1 形状。
+        clue = derive_clue_id("scheduler 的基本循环")
+        worker_spec = launcher.specs[derive_run_id(config.thread_id, f"worker/{clue}", 1)]
+        assert worker_spec.input_path, "缺 --input 会被 agent-run 判 CONTRACT_ERROR"
+        payload = json.loads(Path(worker_spec.input_path).read_text(encoding="utf-8"))
+        assert payload == {"clue_id": clue, "clue_text": "scheduler 的基本循环"}
+
+        # synthesis：input 只携带题面 manifest（research-synth.input.v1）。
+        synth_spec = launcher.specs[derive_run_id(config.thread_id, "synthesis", 1)]
+        assert synth_spec.input_path
+        manifest = json.loads(Path(synth_spec.input_path).read_text(encoding="utf-8"))
+        assert manifest["question"] == question
+        assert manifest["clue_ids"] == [clue]
+
+    def test_each_retry_dispatch_writes_its_own_input_file(self, tmp_path: Path) -> None:
+        seed = FakeTextNode(json.dumps(["clue one"]))
+        launcher = FakeLauncher(["fail", worker_result(["f1"], [])], synthesis_result("report"))
+        config = ResearchConfig(question="q", run_root=tmp_path / "run")
+
+        result = run_research(config, text_node=seed, launcher=launcher)
+        assert result["terminal"] == TERMINAL_CONVERGED
+
+        clue = derive_clue_id("clue one")
+        first = launcher.specs[derive_run_id(config.thread_id, f"worker/{clue}", 1)]
+        second = launcher.specs[derive_run_id(config.thread_id, f"worker/{clue}", 2)]
+        assert first.input_path.endswith(f"worker-{clue}-r0.json")
+        assert second.input_path.endswith(f"worker-{clue}-r1.json")
+        for spec in (first, second):
+            assert json.loads(Path(spec.input_path).read_text(encoding="utf-8"))["clue_id"] == clue
+
+
+class TestBlockedVerdict:
+    def test_blocked_verdict_retries_then_blocks_instead_of_done(self, tmp_path: Path) -> None:
+        # 契约 verdict=blocked（工具面不可用）不是调查完成：走 clue 失败路径
+        # （retry -> blocked -> 终态 partial），不得计入 done/coverage。
+        seed = FakeTextNode(json.dumps(["clue one"]))
+        launcher = FakeLauncher(
+            [blocked_worker_result(), blocked_worker_result()],
+            synthesis_result("report"),
+        )
+        config = ResearchConfig(question="q", run_root=tmp_path / "run")
+
+        result = run_research(config, text_node=seed, launcher=launcher)
+
+        assert result["terminal"] == TERMINAL_PARTIAL
+        assert not (tmp_path / "run" / "evidence.jsonl").exists()
 
 
 class TestResume:
