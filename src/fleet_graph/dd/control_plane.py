@@ -1978,48 +1978,111 @@ class DdControlPlane:
         target_ref: str = "",
         question_note_id: str = "",
     ) -> dict[str, Any]:
-        """Record a human recovery decision and resume only from it (B2).
+        """Record a human recovery decision and actually resume only from it (B2).
 
         The MCP surface carries *no verdict*: this tool takes a target and the
         question note, reads the human's decision off the board (the governance
         path), seals it -- with its immutable target reference and a digest --
-        into the append-only recovery trail, and then resumes the suspended
-        work from that recorded decision alone. No board decision -> refuse,
-        so the recovery can never become a bypass around the gate.
+        into the append-only recovery trail, and then *actually* relaunches or
+        re-enters the suspended thread from that recorded decision alone. No
+        board decision -> refuse, so the recovery can never become a bypass
+        around the gate.
+
+        The resume is truthful: it reports whether a launch occurred (or the
+        thread was already running and mechanically identified), and any raw
+        launch failure -- it never fabricates ``resumed=true``. A re-invocation
+        for an already-recorded target re-uses the existing sealed record and
+        does not create a duplicate live thread.
         """
         record = self._record(development_id)
         if not target_ref:
             target_ref = self._head_commit(record)
 
-        decision = self._governance_decision(record, question_note_id)
-        if decision is None:
-            raise ControlPlaneError(
-                "HUMAN_DECISION_MISSING",
-                "human recovery needs the decision for this question note on the "
-                "board (work.decision.v1); the exit cannot cast a decision itself",
-            )
-
         exit_ = self._load_recovery_exit(development_id)
-        try:
-            sealed = exit_.record(
-                target_ref=target_ref,
-                decision=str(getattr(decision, "decision", "") or ""),
-                decided_by=str(getattr(decision, "decided_by", "") or ""),
-                question_note_id=question_note_id,
-                at=iso(self.clock()),
-            )
-        except RecoveryError as exc:
-            raise ControlPlaneError("RECOVERY_REFUSED", str(exc)) from exc
+        existing = exit_.recorded_for(target_ref)
+        if existing is None:
+            decision = self._governance_decision(record, question_note_id)
+            if decision is None:
+                raise ControlPlaneError(
+                    "HUMAN_DECISION_MISSING",
+                    "human recovery needs the decision for this question note on the "
+                    "board (work.decision.v1); the exit cannot cast a decision itself",
+                )
+            try:
+                sealed = exit_.record(
+                    target_ref=target_ref,
+                    decision=str(getattr(decision, "decision", "") or ""),
+                    decided_by=str(getattr(decision, "decided_by", "") or ""),
+                    question_note_id=question_note_id,
+                    at=iso(self.clock()),
+                )
+            except RecoveryError as exc:
+                raise ControlPlaneError("RECOVERY_REFUSED", str(exc)) from exc
+            with self._recoveries_path(development_id).open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(sealed.as_dict(), ensure_ascii=False) + "\n")
+        else:
+            # Replayed recovery: the immutable record already attests to this
+            # decision, so it is re-used rather than re-sealed. Sealing twice
+            # would fork the trail; launching again would duplicate a live thread.
+            sealed = existing
 
-        with self._recoveries_path(development_id).open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(sealed.as_dict(), ensure_ascii=False) + "\n")
-
-        resumed = exit_.resume(target_ref=target_ref)
+        resume = self._resume_recovery(record, target_ref)
         self.rebuild_status(development_id)
         return {
             "development_id": development_id,
             "recovery": sealed.as_dict(),
-            "resume": resumed,
+            "resume": resume,
+        }
+
+    def _resume_recovery(self, record: dict[str, Any], target_ref: str) -> dict[str, Any]:
+        """Actually relaunch/re-enter the suspended thread; truthful fields only.
+
+        ``record`` must already carry an authenticated, target-bound recovery
+        record for ``target_ref`` (the caller seals or re-reads one before
+        calling here). ``resumed`` is True only when a real launch occurred or
+        the same thread is already running and mechanically identified; a
+        launch failure is returned as ``resumed=False`` with the raw detail,
+        never dressed up as success.
+        """
+        development_id = str(record["development_id"])
+        generation = self._generation(record)
+        thread_id = f"{development_id}:g{generation}"
+        checkpoint = str(self._dev_root(development_id) / CHECKPOINT_FILE)
+
+        active = self._unit_active(development_id)
+        if active:
+            return {
+                "resumed": True,
+                "launched": False,
+                "already_running": True,
+                "unit": active,
+                "thread_id": thread_id,
+                "generation": generation,
+                "checkpoint": checkpoint,
+            }
+        try:
+            launched = self._launch(record, resume=True, generation=generation)
+        except ControlPlaneError as exc:
+            if exc.code == "LAUNCH_FAILED":
+                return {
+                    "resumed": False,
+                    "launched": False,
+                    "already_running": False,
+                    "thread_id": thread_id,
+                    "generation": generation,
+                    "checkpoint": checkpoint,
+                    "launch_failure": exc.detail,
+                }
+            raise
+        return {
+            "resumed": bool(launched["started"]),
+            "launched": bool(launched["started"]),
+            "already_running": bool(launched.get("already_running")),
+            "unit": launched["unit"],
+            "thread_id": launched["thread_id"],
+            "generation": launched["generation"],
+            "checkpoint": launched["checkpoint"],
+            "mode": launched["mode"],
         }
 
     def recoveries(self, development_id: str) -> dict[str, Any]:
