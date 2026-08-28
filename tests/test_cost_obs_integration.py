@@ -280,8 +280,10 @@ class TestTheRulesReadTheWiredFacts:
     def test_all_four_lifecycle_rules_are_nonempty_after_a_settle(self, tmp_path: Path) -> None:
         plane = CostDataPlane()
         run_settle(plane, tmp_path, "dev-1")
-        plane.record_execution_cost(attribution="management", tokens=1, event_id="e")
-        plane.record_execution_cost(attribution="launch", tokens=1, event_id="e")
+        plane.record_execution_cost(
+            attribution="management", order_id="dev-1", tokens=1, event_id="e"
+        )
+        plane.record_execution_cost(attribution="launch", order_id="dev-1", tokens=1, event_id="e")
 
         for rule in RECORDING_RULES:
             assert query(rule.expr, plane.samples()), rule.name
@@ -375,6 +377,32 @@ class TestDevelopmentsAccumulateInOneExpositionDirectory:
     def test_the_filename_is_derived_and_sanitized(self) -> None:
         assert exposition_filename_for("dev-fg-6e4f9345b320") == "cost-obs-dev-fg-6e4f9345b320.prom"
         assert exposition_filename_for("a b/c") == "cost-obs-a-b-c.prom"
+
+    def test_the_cost_metric_carries_an_order_id_so_it_accumulates(self, tmp_path: Path) -> None:
+        """Two developments emitting management spend must be distinct series
+        (per-order, not byte-identical `{attribution="management"}`), or
+        node_exporter drops the duplicate at gather time and rule 1's
+        numerator under-counts fleet-wide."""
+        plane_a = build_cost_plane(exposition_dir=tmp_path, development_id="dev-a")
+        plane_b = build_cost_plane(exposition_dir=tmp_path, development_id="dev-b")
+        assert plane_a is not None and plane_b is not None
+        plane_a.record_execution_cost(
+            attribution="management", order_id="dev-a", tokens=10.0, event_id="m:a"
+        )
+        plane_b.record_execution_cost(
+            attribution="management", order_id="dev-b", tokens=30.0, event_id="m:b"
+        )
+        plane_a.write_exposition()
+        plane_b.write_exposition()
+
+        management = [
+            sample
+            for path in tmp_path.glob("*.prom")
+            for sample in parse(path.read_text(encoding="utf-8"))
+            if sample.name == COST_METRIC and sample.label_map().get("attribution") == "management"
+        ]
+        assert {s.label_map()["order_id"] for s in management} == {"dev-a", "dev-b"}
+        assert sum(s.value for s in management) == 40.0
 
 
 class TestExecutionCostComesFromTheDispatcher:

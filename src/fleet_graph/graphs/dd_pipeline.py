@@ -349,6 +349,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             if deps.management_cost is not None:
                 deps.cost_plane.record_execution_cost(
                     attribution=MANAGEMENT,
+                    order_id=order_id,
                     tokens=float(deps.management_cost(order_id)),
                     event_id=f"management:{order_id}",
                 )

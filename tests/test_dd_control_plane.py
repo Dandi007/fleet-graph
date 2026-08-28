@@ -542,6 +542,18 @@ class TestCredentialDiscipline:
         bare = DdControlPlane(root=tmp_path / "dd", board_factory=lambda: None)
         assert set(bare.environment) == {"PATH"}, "a raw token value is never forwarded"
 
+    def test_cost_observability_site_config_is_forwarded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The launched dd run collects only if its env carries the cost-obs
+        wiring; the control plane's whitelist is where that site config crosses
+        into the transient unit (the launch argv passes no --cost-obs-dir)."""
+        monkeypatch.setenv("FLEET_GRAPH_COST_OBS_DIR", "/var/lib/node_exporter/textfile")
+        monkeypatch.setenv("FLEET_GRAPH_MANAGEMENT_COST", "0.5")
+        plane = DdControlPlane(root=tmp_path / "dd", board_factory=lambda: None)
+        assert plane.environment["FLEET_GRAPH_COST_OBS_DIR"] == "/var/lib/node_exporter/textfile"
+        assert plane.environment["FLEET_GRAPH_MANAGEMENT_COST"] == "0.5"
+
 
 class TestStageModelPolicy:
     def test_server_side_stage_models_reach_the_launched_run(

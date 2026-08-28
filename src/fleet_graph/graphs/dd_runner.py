@@ -344,7 +344,17 @@ def run_pipeline(
     # launch/review facts. Re-read this development's own scrape file so the
     # final render keeps those pre-suspension facts instead of overwriting
     # them with promotion + settlement + management alone.
-    if resume and deps.cost_plane is not None:
+    #
+    # A restarted generation (control plane's normal exit from a non-complete
+    # terminal) rebuilds the pipeline too, and its replayer enters every
+    # receipt-sealed stage with "no actor runs" -- so implement and review
+    # never re-emit launch/review there either. Rehydrate for that path as
+    # well: a generation n+1 run whose build installed a receipt replayer must
+    # keep generation n's launch/review facts, or it overwrites the shared
+    # `cost-obs-<development>.prom` with promotion + settlement + management
+    # alone. Idempotent in both directions: a rehydrated fact re-emitted on a
+    # later terminal is a no-op by stable identity.
+    if deps.cost_plane is not None and (resume or deps.replayer is not None):
         deps.cost_plane.rehydrate_from_file()
 
     with SqliteSaver.from_conn_string(config.checkpoint_path) as saver:

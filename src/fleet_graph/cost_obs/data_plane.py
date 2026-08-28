@@ -171,24 +171,37 @@ class CostDataPlane:
         self._fact_lifecycles.setdefault(order_id, set()).add(SETTLEMENT)
         return emitted
 
-    def record_execution_cost(self, *, attribution: str, tokens: float, event_id: str) -> bool:
+    def record_execution_cost(
+        self, *, attribution: str, order_id: str, tokens: float, event_id: str
+    ) -> bool:
         """Emit one token spend batch, bucketed by attribution class.
 
         `attribution` is a known class or `unknown`; a genuinely unattributed
         batch is emitted under `unknown` by the caller, never guessed here.
+
+        `order_id` names the order (development) whose lifecycle spent the
+        tokens. Every other source fact carries `order_id`, and the cost
+        metric must too: each development renders its own `cost-obs-*.prom`
+        into one shared node_exporter textfile directory, so a cost series
+        bucketed only by `attribution` would be byte-identical across files
+        and dropped (or the scrape rejected) at gather time. Carrying the
+        order id keeps it a distinct per-order series that accumulates
+        fleet-wide under `sum(...)`, exactly like the launch/review facts.
         """
         if attribution not in KNOWN_CLASSES and attribution != UNKNOWN:
             raise ValueError(f"attribution must be a known class or 'unknown', got {attribution!r}")
         return self._emit(
             COST_METRIC,
-            {"attribution": attribution},
+            {"attribution": attribution, "order_id": order_id},
             float(tokens),
             key=f"cost:{event_id}:{attribution}",
         )
 
-    def record_unknown_cost(self, *, tokens: float, event_id: str) -> bool:
+    def record_unknown_cost(self, *, order_id: str, tokens: float, event_id: str) -> bool:
         """Emit a token batch that nothing attributes to a lifecycle class."""
-        return self.record_execution_cost(attribution=UNKNOWN, tokens=tokens, event_id=event_id)
+        return self.record_execution_cost(
+            attribution=UNKNOWN, order_id=order_id, tokens=tokens, event_id=event_id
+        )
 
     def mark_absent(self, *, order_id: str, lifecycle: str) -> None:
         """Explicitly account a lifecycle class whose producer emitted nothing.
@@ -226,9 +239,10 @@ class CostDataPlane:
 
         Before returning, facts sharing a metric name and label set are
         merged by summing their values. The cost metric is a counter bucketed
-        only by `attribution`, so two batches with the same attribution (e.g.
-        two orders' management spend) are one series, not a duplicate that a
-        scrape would reject.
+        by `attribution` and `order_id`, so two spend batches for the *same*
+        order and class merge into one series, while two *different* orders'
+        spend stay distinct series that a shared node_exporter textfile
+        directory accumulates instead of dropping as duplicates.
         """
         result = self._dedup_sum(self._samples.values())
         orders = set(self._fact_lifecycles) | set(self._absent)
@@ -303,20 +317,15 @@ class CostDataPlane:
         a replayed emission is still a no-op -- while the derived presence
         series is skipped and re-derived from the merged facts.
 
-        The cost metric carries only an ``attribution`` label, so a spent-batch
-        sample does not name its order. The walker, however, emits management
+        The cost metric carries an ``order_id`` label now, so a spent-batch
+        sample names its order directly. The walker, however, emits management
         spend under the stable identity ``management:<order_id>`` on every
         terminal, so the resumed run would re-emit it unless the rehydrated
-        sample is re-keyed to that exact identity. Because this plane lives in
-        one per-development file, its facts share a single order id; recover it
-        from any sample that carries one so the management re-emission on resume
-        stays a no-op instead of double-counting.
+        sample is re-keyed to that exact identity; the order id for that
+        re-keying now comes from the sample's own label rather than being
+        inferred from a sibling fact.
         """
         materialized = list(samples)
-        order_ids = {s.label_map().get("order_id") for s in materialized}
-        order_ids.discard(None)
-        order_ids.discard("")
-        plane_order_id = next(iter(order_ids), "")
         review_attempt: dict[tuple[str, str], int] = {}
         for sample in materialized:
             name = sample.name
@@ -357,12 +366,12 @@ class CostDataPlane:
                     self._fact_lifecycles.setdefault(order_id, set()).add(REVIEW)
             elif name == COST_METRIC:
                 attribution = labels.get("attribution", "")
-                if attribution == MANAGEMENT and plane_order_id:
+                if attribution == MANAGEMENT and order_id:
                     # The walker re-emits management under this exact identity
                     # on a later resume, so re-keying it here keeps that a no-op.
-                    key = f"cost:management:{plane_order_id}:{attribution}"
+                    key = f"cost:management:{order_id}:{attribution}"
                 else:
-                    key = f"cost:rehydrated:{plane_order_id}:{attribution}"
+                    key = f"cost:rehydrated:{order_id}:{attribution}"
                 self._samples[key] = sample
                 self._seen.add(key)
 

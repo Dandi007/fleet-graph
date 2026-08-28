@@ -170,7 +170,7 @@ class TestDataPlane:
         plane = CostDataPlane()
         plane.record_launch(order_id="o", development_id="d")
         plane.record_settlement(order_id="o")
-        plane.record_unknown_cost(tokens=7, event_id="e")
+        plane.record_unknown_cost(order_id="o", tokens=7, event_id="e")
         plane.mark_absent(order_id="o", lifecycle="promotion")
 
         samples = plane.samples()
@@ -193,12 +193,22 @@ class TestDataPlane:
         plane.record_review(order_id="o", phase="final", verdict="approve")
         plane.record_promotion(order_id="o", target_ref="refs/heads/main")
         plane.record_settlement(order_id="o")
-        plane.record_execution_cost(attribution="management", tokens=1, event_id="e:mgmt")
-        plane.record_execution_cost(attribution="launch", tokens=1, event_id="e:launch")
-        plane.record_execution_cost(attribution="review", tokens=1, event_id="e:review")
-        plane.record_execution_cost(attribution="promotion", tokens=1, event_id="e:promo")
-        plane.record_execution_cost(attribution="settlement", tokens=1, event_id="e:settle")
-        plane.record_unknown_cost(tokens=1, event_id="e:unknown")
+        plane.record_execution_cost(
+            attribution="management", order_id="o", tokens=1, event_id="e:mgmt"
+        )
+        plane.record_execution_cost(
+            attribution="launch", order_id="o", tokens=1, event_id="e:launch"
+        )
+        plane.record_execution_cost(
+            attribution="review", order_id="o", tokens=1, event_id="e:review"
+        )
+        plane.record_execution_cost(
+            attribution="promotion", order_id="o", tokens=1, event_id="e:promo"
+        )
+        plane.record_execution_cost(
+            attribution="settlement", order_id="o", tokens=1, event_id="e:settle"
+        )
+        plane.record_unknown_cost(order_id="o", tokens=1, event_id="e:unknown")
 
         for rule in RECORDING_RULES:
             assert query(rule.expr, plane.samples()), rule.name
@@ -264,14 +274,16 @@ class TestDataPlane:
         """
         first = CostDataPlane(exposition_dir=tmp_path)
         first.record_launch(order_id="o", development_id="d")
-        first.record_execution_cost(attribution="management", tokens=10.0, event_id="management:o")
+        first.record_execution_cost(
+            attribution="management", order_id="o", tokens=10.0, event_id="management:o"
+        )
         first.write_exposition()
 
         resumed = CostDataPlane(exposition_dir=tmp_path)
         assert resumed.rehydrate_from_file() is True
         # The resumed walker reaches its terminal and re-emits the same spend.
         resumed.record_execution_cost(
-            attribution="management", tokens=10.0, event_id="management:o"
+            attribution="management", order_id="o", tokens=10.0, event_id="management:o"
         )
 
         costs = [

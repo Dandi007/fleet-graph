@@ -334,7 +334,7 @@ class AgentRunStageActor:
             )
             if tokens > 0:
                 self.cost_plane.record_execution_cost(
-                    attribution=LAUNCH, tokens=tokens, event_id=run_id
+                    attribution=LAUNCH, order_id=order_id, tokens=tokens, event_id=run_id
                 )
             return
         reviews = review_stages(self.lifecycle)
@@ -348,7 +348,7 @@ class AgentRunStageActor:
             )
             if tokens > 0:
                 self.cost_plane.record_execution_cost(
-                    attribution=REVIEW, tokens=tokens, event_id=run_id
+                    attribution=REVIEW, order_id=order_id, tokens=tokens, event_id=run_id
                 )
 
     def _record_unknown_spend(self, run_id: str, *, envelope: dict[str, Any] | None) -> None:
@@ -365,7 +365,9 @@ class AgentRunStageActor:
             return
         tokens = _usage_tokens(envelope)
         if tokens > 0:
-            self.cost_plane.record_unknown_cost(tokens=tokens, event_id=run_id)
+            self.cost_plane.record_unknown_cost(
+                order_id=self.development_id, tokens=tokens, event_id=run_id
+            )
 
     def _outcome_from(self, stage: Stage, declared: dict[str, Any]) -> StageOutcome:
         """The declared result, passed on as it stands.
