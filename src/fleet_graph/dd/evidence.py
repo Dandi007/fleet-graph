@@ -33,6 +33,11 @@ KIND_ADOPTION = "adoption"
 KIND_HUMAN_RECOVERY = "human_recovery"
 KINDS = frozenset({KIND_SCOPE, KIND_ADOPTION, KIND_HUMAN_RECOVERY})
 
+#: The minimum link set a complete B3 chain must carry: one link per B1/B2
+#: behaviour. A chain missing any of these is invalid whatever its individual
+#: links say, and an empty link tuple is never valid.
+REQUIRED_KINDS = frozenset({KIND_SCOPE, KIND_ADOPTION, KIND_HUMAN_RECOVERY})
+
 
 @dataclass(frozen=True)
 class EvidenceLink:
@@ -60,14 +65,23 @@ class EvidenceChain:
 
     links: tuple[EvidenceLink, ...]
 
-    def validate(self) -> tuple[str, ...]:
+    def validate(
+        self, required_kinds: frozenset[str] | tuple[str, ...] = REQUIRED_KINDS
+    ) -> tuple[str, ...]:
         """The reasons this chain is not acceptable; empty means it is.
 
         Each reason is attributable to the exact link it names, so a failing
         chain tells you *which* link was removed, substituted, or left without
         an immutable target -- never just "invalid".
+
+        ``required_kinds`` is the minimum required link set (one link per
+        B1/B2 behaviour): an empty chain, or any chain missing a required
+        kind, is reported as a deterministic missing-link reason. A caller
+        that only wants per-link integrity can pass an empty set.
         """
         reasons: list[str] = []
+        if not self.links:
+            reasons.append("evidence chain is empty -- no links to attest to any behaviour")
         for index, link in enumerate(self.links):
             where = f"link[{index}] ({link.kind})"
             if link.kind not in KINDS:
@@ -91,6 +105,10 @@ class EvidenceChain:
                 )
             elif not link.subject_ref:
                 reasons.append(f"{where}: evidence has no immutable subject reference")
+        present = {link.kind for link in self.links}
+        for kind in sorted(required_kinds):
+            if kind not in present:
+                reasons.append(f"required link missing: {kind}")
         return tuple(reasons)
 
 
@@ -103,6 +121,7 @@ __all__ = [
     "KIND_ADOPTION",
     "KIND_HUMAN_RECOVERY",
     "KIND_SCOPE",
+    "REQUIRED_KINDS",
     "EvidenceChain",
     "EvidenceLink",
     "chain",
