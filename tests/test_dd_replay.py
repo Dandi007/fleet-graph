@@ -14,6 +14,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from conftest import DEVELOPMENT_ID, git, head
 from fleet_graph.dd import chain_rules
 from fleet_graph.dd.dispatch import derive_attempt_id
@@ -257,6 +259,82 @@ def run_generation_two(deps: Any, head_commit: str) -> dict[str, Any]:
 
 def replayed_stages(state: dict[str, Any]) -> list[str]:
     return [e["stage"] for e in state["history"] if e.get("replayed")]
+
+
+class OrderViolation(AssertionError):
+    """The feedback carrier's ordering refusal, as an assertion failure."""
+
+
+def carrier_append(
+    entries: list[dict[str, Any]],
+    *,
+    review_id: str,
+    phase: str,
+    verdict: str,
+    attempt_id: str,
+    subject: str,
+    implementation_subject: str,
+) -> list[dict[str, Any]]:
+    """Append a review entry the way the plugin's feedback carrier does, then
+    enforce the carrier's ordering rule.
+
+    This is the deterministic append + `check_chain_order` from the pinned
+    plugin's `attempt-context.py`, restated so the replay tests assert against
+    the ordering rule itself rather than a proxy: a fresh `continuous` review
+    is a *new attempt*, legal only as the very first entry or the entry right
+    after a REJECT. `final` needs the same attempt's continuous APPROVE.
+    """
+    entries = [dict(entry) for entry in entries]
+    if phase == "continuous":
+        attempt = 1 if not entries else entries[-1]["attempt"] + 1
+    else:
+        if not entries:
+            raise OrderViolation("final review requires a materialized continuous APPROVE")
+        previous = entries[-1]
+        if (
+            previous["review_phase"] != "continuous"
+            or previous["verdict"] != "APPROVE"
+            or previous["attempt_id"] != attempt_id
+        ):
+            raise OrderViolation("final review requires the same-attempt continuous APPROVE")
+        attempt = previous["attempt"]
+
+    entry = {
+        "attempt": attempt,
+        "attempt_id": attempt_id,
+        "review_id": review_id,
+        "review_phase": phase,
+        "verdict": verdict,
+        "subject_commit": subject,
+        "implementation_subject_commit": implementation_subject,
+    }
+    entries.append(entry)
+
+    previous: dict[str, Any] | None = None
+    for position, current in enumerate(entries):
+        if previous is None:
+            if current["attempt"] != 1 or current["review_phase"] != "continuous":
+                raise OrderViolation(
+                    f"entry {position}: chain must start with attempt 1 continuous"
+                )
+        elif current["review_phase"] == "continuous":
+            if previous["verdict"] != "REJECT":
+                raise OrderViolation(f"entry {position}: a new attempt requires a prior REJECT")
+            if current["attempt"] != previous["attempt"] + 1:
+                raise OrderViolation(
+                    f"entry {position}: continuous review must advance the attempt by exactly one"
+                )
+        else:
+            if (
+                previous["attempt"] != current["attempt"]
+                or previous["review_phase"] != "continuous"
+                or previous["verdict"] != "APPROVE"
+            ):
+                raise OrderViolation(
+                    f"entry {position}: final review requires the same-attempt continuous APPROVE"
+                )
+        previous = current
+    return entries
 
 
 class TestASealedPrefixReplays:
@@ -760,6 +838,75 @@ class TestAReviewedChainContinuesThroughItsReviews:
             "final_review",
         ]
 
+    def test_preferring_the_reviewed_prefix_falls_back_to_a_partial_prefix(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """Preferring the review-bearing prefix must not disable replay.
+
+        gen 1 sealed a fully reviewed, approved chain. gen 2 then re-ran
+        configure + implement and sealed a real (product-touching) implement
+        above gen 1's tip before crashing, so its review never sealed. gen 3's
+        strongest candidate -- gen 1's four-step prefix -- cannot be prepared
+        because `product.py` above its tip is product drift. Replay must fall
+        back to gen 2's `[configure, implement]` prefix instead of disabling
+        itself outright (the F4 BLOCKED jam: a fresh implement actor handed a
+        tree that already carries the work).
+        """
+        g1 = G1(repo, tmp_path)
+        rc = commit_file(
+            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
+        )
+        cr = review_receipt(
+            parent_digest=byte_digest(g1.raw),
+            subject=g1.implement,
+            output=rc,
+            verdict="APPROVE",
+        )
+        cr_raw = write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
+        write_intent(g1.state_root, cr)
+        rf = commit_file(repo, ".dev-dispatch/reviews/final/g1-a1.json", '{"verdict": "APPROVE"}')
+        fr = review_receipt(
+            parent_digest=byte_digest(cr_raw),
+            subject=rc,
+            output=rf,
+            verdict="APPROVE",
+            phase="final",
+        )
+        write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr)
+        write_intent(g1.state_root, fr)
+
+        g2_state = tmp_path / "dd" / "g2" / "state"
+        g2_configure = commit_file(repo, ".dev-dispatch/run-config.json", '{"generation": 2}')
+        g2_implement = commit_file(repo, "product.py", "print('g2')\n")
+        g2_imp = implement_receipt(rf, g2_configure, g2_implement)
+        g2_imp["attempt_id"] = derive_attempt_id(DEVELOPMENT_ID, 2, 1)
+        write_receipt(g2_state, 2, 1, "implement-receipt.json", g2_imp)
+
+        replayer = ReceiptReplayer(
+            workspace=repo,
+            state_root=tmp_path / "dd" / "g3" / "state",
+            prior_state_roots=((2, g2_state), (1, g1.state_root)),
+            development_id=DEVELOPMENT_ID,
+            generation=3,
+            lifecycle=LIFECYCLE,
+        )
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        graph = build_dd_pipeline_graph(make_deps(actor=actor, replayer=replayer)).compile()
+        state = graph.invoke(
+            initial_state(
+                development_id=DEVELOPMENT_ID,
+                stage="configure",
+                head_commit=g2_implement,
+                artifacts={"spec": g2_implement},
+                generation=3,
+            ),
+            config={"recursion_limit": 200},
+        )
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert replayed_stages(state) == ["configure", "implement"]
+        assert next(stage for stage, _ in actor.calls) == "continuous_review"
+
     def test_a_rework_still_returns_a_derived_identity(self, repo: Path, tmp_path: Path) -> None:
         """The complementary boundary: a genuine new attempt (a rework after a
         REJECT) is new work under its own derived identity, not a continuation
@@ -782,6 +929,76 @@ class TestAReviewedChainContinuesThroughItsReviews:
         sealed_identity = g1.receipt["attempt_id"]
         assert ("continuous_review", sealed_identity) in seen
         assert ("implement", "") in seen, "the rework implement must not inherit the pin"
+
+
+class TestTheFeedbackCarrierOrdering:
+    """The carrier's ordering rule, and why replay must not open a fresh
+    continuous review after an inherited APPROVE-final chain.
+
+    The rule is the pinned plugin's, not ours: a fresh `continuous` entry is a
+    *new attempt*, legal only as the very first entry or the entry right after
+    a REJECT. Replaying configure + implement of already-reviewed work must
+    therefore replay the reviews, not hand the carrier a new attempt. The
+    complementary side is asserted here directly: a genuine new attempt with
+    no prior REJECT stays rejected -- so the ordering rule is not weakened
+    globally (spec requirement 1 and 4).
+    """
+
+    @staticmethod
+    def _approved_chain() -> list[dict[str, Any]]:
+        return [
+            {
+                "attempt": 1,
+                "attempt_id": "a1",
+                "review_id": "rc-a1",
+                "review_phase": "continuous",
+                "verdict": "APPROVE",
+                "subject_commit": "s1",
+                "implementation_subject_commit": "s1",
+            },
+            {
+                "attempt": 1,
+                "attempt_id": "a1",
+                "review_id": "rf-a1",
+                "review_phase": "final",
+                "verdict": "APPROVE",
+                "subject_commit": "s2",
+                "implementation_subject_commit": "s1",
+            },
+        ]
+
+    def test_a_genuine_new_attempt_without_a_prior_reject_is_rejected(self) -> None:
+        """A fresh continuous review after an APPROVE-final chain is a new
+        attempt with no preceding REJECT -- the carrier must refuse it. This is
+        the exact ORDER_VIOLATION the replayed candidate must not produce."""
+        with pytest.raises(OrderViolation, match="a new attempt requires a prior REJECT"):
+            carrier_append(
+                self._approved_chain(),
+                review_id="rc-a2",
+                phase="continuous",
+                verdict="APPROVE",
+                attempt_id="a2",
+                subject="s3",
+                implementation_subject="s3",
+            )
+
+    def test_a_new_attempt_after_a_reject_is_legal(self) -> None:
+        """The complementary side: when the inherited chain ends in REJECT, the
+        same fresh continuous review is a legal next attempt. This pins that
+        the rule was not weakened -- a rework still advances the attempt by
+        exactly one."""
+        inherited = self._approved_chain()
+        inherited[-1]["verdict"] = "REJECT"
+        entries = carrier_append(
+            inherited,
+            review_id="rc-a2",
+            phase="continuous",
+            verdict="APPROVE",
+            attempt_id="a2",
+            subject="s3",
+            implementation_subject="s3",
+        )
+        assert entries[-1]["attempt"] == 2
 
 
 class TestTheReplayedIdentityBindsTheRealReview:
