@@ -228,16 +228,19 @@ class ReceiptReplayer:
                 ):
                     # Replaying a prefix that stops at implement is always
                     # followed by a fresh continuous review -- a brand-new
-                    # attempt. The legality of that attempt is judged against
-                    # this generation's own chain: historical entries from older
-                    # generations do not impose a prior-REJECT requirement on a
-                    # fresh attempt (spec requirement 3 / dev-fg-31b963659d16).
-                    # When this generation's inherited chain did not end in
-                    # REJECT, the carrier refuses exactly that new attempt
-                    # (ORDER_VIOLATION), so replaying would only move the tree
-                    # and then fail. Fail-closed here instead: replay nothing,
-                    # so the divergent work is surfaced rather than silently
-                    # re-reviewed. (An unreadable index defers to the carrier.)
+                    # attempt. Its legality is judged against this generation's
+                    # own chain by the same generation-aware rule the review
+                    # materializer enforces at seal time (dd/chain_rules.py):
+                    # historical entries from older generations do not impose a
+                    # prior-REJECT requirement on a fresh attempt (spec
+                    # requirement 3 / dev-fg-31b963659d16), while a genuinely
+                    # new attempt within the same chain still owes its prior
+                    # REJECT. When this generation's inherited chain did not end
+                    # in REJECT, replaying would move the tree only for the
+                    # materializer to refuse that new attempt (ORDER_VIOLATION).
+                    # Fail-closed here instead: replay nothing, so the divergent
+                    # work is surfaced rather than silently re-reviewed. (An
+                    # unreadable index defers to the materializer.)
                     self._disabled = True
                     return None
             # The one mutation happens exactly once, on exactly the selected

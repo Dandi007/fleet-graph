@@ -52,6 +52,40 @@ class TestConfigure:
         assert written["acceptance_commands"] == [["true"]]
         assert outcome.produced == CONFIGURE.produced_artifacts
 
+    def test_a_fresh_generation_resets_the_feedback_index(self, repo: Path) -> None:
+        """A later generation whose configure runs for real starts its own
+        attempt chain: the feedback index is reset to empty (the historical
+        entries stay in the prior generation's commits), so the pinned carrier's
+        flat ordering check sees the fresh continuous review as attempt 1 rather
+        than a new attempt after an inherited APPROVE (dev-fg-31b963659d16)."""
+        from conftest import write_index
+        from fleet_graph.dd.bootstrap import INDEX_PATH
+
+        write_index(repo, entries=[{"attempt": 1, "review_phase": "continuous"}])
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "carry historical index")
+
+        ConfigureStage(repo=repo, run_config={}).act(CONFIGURE, dispatch(generation=2))
+
+        index = json.loads((repo / INDEX_PATH).read_text(encoding="utf-8"))
+        assert index["entries"] == []
+        assert index["development_id"] == "dev-001"
+
+    def test_generation_one_leaves_the_feedback_index_alone(self, repo: Path) -> None:
+        """Generation 1 already carries the bootstrap's empty index; configure
+        must not rewrite it."""
+        from conftest import write_index
+        from fleet_graph.dd.bootstrap import INDEX_PATH
+
+        write_index(repo, entries=[{"attempt": 1, "review_phase": "continuous"}])
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "an inherited index")
+
+        ConfigureStage(repo=repo, run_config={}).act(CONFIGURE, dispatch(generation=1))
+
+        index = json.loads((repo / INDEX_PATH).read_text(encoding="utf-8"))
+        assert index["entries"] == [{"attempt": 1, "review_phase": "continuous"}]
+
 
 class TestAcceptance:
     def _configure(self, repo: Path, commands: list[list[str]]) -> None:

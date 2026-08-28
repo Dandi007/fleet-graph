@@ -36,8 +36,14 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.dd import chain_rules
 from fleet_graph.dd.capability import CONTRACTS_DIR
-from fleet_graph.dd.dispatch import DispatchError, StageDispatchBuilder, derive_attempt_id
+from fleet_graph.dd.dispatch import (
+    DispatchError,
+    StageDispatchBuilder,
+    derive_attempt_id,
+    read_committed_refs,
+)
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.dd.vendor import plugin_adapter
 from fleet_graph.graphs.dd_actors import (
@@ -252,6 +258,55 @@ class PluginMaterializer:
     def serves(self, stage: Stage) -> bool:
         return stage.id in self.sealed_stages and self.builder.serves(stage.id)
 
+    def _continuous_ordering_guard(self, stage: Stage) -> bool:
+        """Whether `stage` is the fresh continuous review that opens an attempt.
+
+        Both review stages run through this materializer, but only the
+        continuous review is a brand-new attempt: the final review always binds
+        to a same-attempt continuous APPROVE and is not subject to the
+        new-attempt ordering rule (spec requirement 3 / dev-fg-31b963659d16).
+        """
+        reviews = self.review_stages
+        return bool(reviews) and stage.id == reviews[0]
+
+    def _enforce_continuous_order(self, stage: Stage, dispatch: Dispatch) -> None:
+        """Enforce the generation-aware ordering rule at the materialization
+        boundary, not merely as a replayer pre-check.
+
+        A fresh continuous review is a new attempt, legal only as the first
+        entry of its generation's chain or the entry right after a same-chain
+        REJECT. The rule is generation-aware (see ``dd.chain_rules``): entries
+        whose durable attempt identity belongs to an older generation are
+        immutable history and impose no prior-REJECT requirement on the current
+        generation, while a genuinely new attempt within the same chain still
+        owes its prior REJECT. Refusing here produces a structured
+        ``ORDER_VIOLATION`` at materialization instead of a silent pass-through
+        that the pinned carrier would then reject with the identical error.
+        """
+        if not self._continuous_ordering_guard(stage):
+            return
+        try:
+            refs = read_committed_refs(
+                self.builder.chain.workspace_path,
+                str(dispatch.get("input_commit") or ""),
+                self.builder.chain.development_id,
+                spec_path=self.builder.spec_path,
+                index_path=self.builder.index_path,
+            )
+        except DispatchError as exc:
+            raise MaterializationFailed("INVALID_HANDOFF_SCHEMA", str(exc)) from exc
+        generation = int(dispatch.get("generation", 1))
+        if not chain_rules.new_attempt_is_legal(
+            list(refs.entries),
+            generation=generation,
+            development_id=self.builder.chain.development_id,
+        ):
+            raise MaterializationFailed(
+                "ORDER_VIOLATION",
+                "a fresh continuous review is a new attempt in this chain and "
+                "requires a prior REJECT",
+            )
+
     def request(self, stage: Stage, dispatch: Dispatch, outcome: StageOutcome) -> dict[str, Any]:
         """Assemble the frozen materialization request. Deterministic per attempt."""
         if not self.serves(stage):
@@ -259,6 +314,7 @@ class PluginMaterializer:
 
         declared = dict(outcome.receipt or {})
         try:
+            self._enforce_continuous_order(stage, dispatch)
             stage_dispatch = self.builder.build(
                 dispatch,
                 parent_receipt=dispatch.get("parent_receipt") or None,

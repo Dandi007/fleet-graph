@@ -21,7 +21,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.dd.bootstrap import INDEX_PATH, canonical_bytes
 from fleet_graph.dd.git import run_git
+from fleet_graph.dd.upstream_constants import ATTEMPT_CONTEXT_CONTRACT_VERSION
 from fleet_graph.dd.vendor import git_ops
 from fleet_graph.graphs.dd_pipeline import (
     Dispatch,
@@ -133,7 +135,36 @@ class ConfigureStage:
                 **self.run_config,
             },
         )
+        self._reset_feedback_index(dispatch)
         return StageOutcome(produced=tuple(stage.produced_artifacts))
+
+    def _reset_feedback_index(self, dispatch: Dispatch) -> None:
+        """Start a fresh generation with an empty feedback index.
+
+        Generation 1 already has the bootstrap's empty index. A later
+        generation whose configure runs for real (the replayer failed closed on
+        product drift rather than replaying the previous generation's reviewed
+        prefix) needs the feedback index scoped to its own attempt chain: the
+        attempt identity is derived from ``(development_id, generation,
+        attempt)``, so a fresh generation's first continuous review is attempt 1
+        of its own chain, not a continuation of the previous generation's
+        attempt numbering. Without the reset the pinned carrier's flat
+        ``check_chain_order`` misreads the inherited APPROVE-ended history as
+        "a new attempt requires a prior REJECT" (ORDER_VIOLATION,
+        dev-fg-31b963659d16). The historical entries are preserved immutably in
+        the prior generation's commits; only the current generation's index
+        starts clean.
+        """
+        if int(dispatch.get("generation", 1)) <= 1:
+            return
+        index = {
+            "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
+            "development_id": dispatch.get("development_id", ""),
+            "entries": [],
+        }
+        path = self.repo / INDEX_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(canonical_bytes(index))
 
 
 @dataclass

@@ -97,6 +97,11 @@ class DevelopmentChain:
 class CommittedRefs:
     spec: dict[str, Any]
     feedback: dict[str, Any]
+    #: The feedback index's committed review entries, in committed order. Kept
+    #: separately from `feedback` because `feedback_ref`'s schema admits only
+    #: `path/blob_oid/digest/entry_count` (additionalProperties: false); the
+    #: generation-aware ordering guard needs the entries themselves.
+    entries: tuple[dict[str, Any], ...] = ()
 
 
 def read_committed_refs(
@@ -141,7 +146,11 @@ def read_committed_refs(
     if not isinstance(entries, list):
         raise DispatchError(f"{index_path} entries must be an array")
 
-    return CommittedRefs(spec=spec, feedback={**feedback, "entry_count": len(entries)})
+    return CommittedRefs(
+        spec=spec,
+        feedback={**feedback, "entry_count": len(entries)},
+        entries=tuple(entries),
+    )
 
 
 class StageDispatchBuilder:

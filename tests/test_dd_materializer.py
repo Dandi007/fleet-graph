@@ -7,8 +7,9 @@ from typing import Any
 
 import pytest
 
-from conftest import DEVELOPMENT_ID, head
-from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder
+from conftest import DEVELOPMENT_ID, git, head, write_index
+from fleet_graph.dd.chain_rules import new_attempt_is_legal
+from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder, derive_attempt_id
 from fleet_graph.dd.lifecycle import Lifecycle
 from fleet_graph.dd.upstream_constants import canonical_json
 from fleet_graph.dd.vendor import plugin_adapter
@@ -456,6 +457,107 @@ class TestTheParentReceiptIsTheOneTheContractNames:
 
         for name in set(PARENT_RECEIPT_FILE.values()):
             assert f'"{name}"' in source, name
+
+
+class TestTheOrderingRuleIsEnforcedAtMaterialization:
+    """The generation-aware ordering rule must hold at the materialization
+    boundary, not only as a replayer pre-check (dev-fg-31b963659d16). A fresh
+    continuous review is a new attempt: legal only as the first entry of its
+    generation's chain or after a same-chain REJECT. Entries whose durable
+    attempt identity belongs to an older generation are immutable history and
+    impose no prior-REJECT requirement on the current generation."""
+
+    def _entry(self, generation: int, attempt: int, phase: str, verdict: str) -> dict[str, Any]:
+        return {
+            "attempt": attempt,
+            "attempt_id": derive_attempt_id(DEVELOPMENT_ID, generation, attempt),
+            "review_id": f"r-{phase}-g{generation}-a{attempt}",
+            "review_phase": phase,
+            "subject_commit": "0" * 40,
+            "implementation_subject_commit": "0" * 40,
+            "verdict": verdict,
+            "artifact_path": ".dev-dispatch/reviews/x.json",
+            "artifact_blob_oid": "0" * 40,
+            "artifact_digest": "sha256:" + "0" * 64,
+        }
+
+    def _commit_index(self, repo: Path, entries: list[dict[str, Any]]) -> None:
+        write_index(repo, entries=entries, development_id=DEVELOPMENT_ID)
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "index")
+
+    def test_a_cross_generation_continuous_review_is_legal(self, repo: Path) -> None:
+        """A later generation inherits the previous generation's committed
+        feedback index, but its fresh continuous review is the first attempt of
+        its own chain: the older generation's accepted history must not be read
+        as a prior attempt lacking a REJECT (spec requirement 3)."""
+        self._commit_index(
+            repo,
+            [
+                self._entry(1, 1, "continuous", "APPROVE"),
+                self._entry(1, 1, "final", "APPROVE"),
+            ],
+        )
+        dispatch = dispatch_for(repo, "continuous_review")
+        dispatch["generation"] = 2
+        seal_implement_receipt(repo, derive_attempt_id(DEVELOPMENT_ID, 2, 1))
+
+        request = make_materializer(repo).request(
+            REVIEW, dispatch, StageOutcome(receipt=review_receipt())
+        )
+        assert request["dispatch"]["attempt_id"] == derive_attempt_id(DEVELOPMENT_ID, 2, 1)
+
+    def test_a_same_chain_new_attempt_without_a_prior_reject_is_refused(self, repo: Path) -> None:
+        """A genuinely new attempt within the same generation's chain still owes
+        its prior REJECT: an APPROVE-ended predecessor makes the fresh
+        continuous review illegal and it is refused at materialization, not
+        silently passed through (spec requirements 2 and 5)."""
+        self._commit_index(
+            repo,
+            [
+                self._entry(1, 1, "continuous", "APPROVE"),
+                self._entry(1, 1, "final", "APPROVE"),
+            ],
+        )
+        dispatch = dispatch_for(repo, "continuous_review")
+
+        with pytest.raises(MaterializationFailed, match="ORDER_VIOLATION"):
+            make_materializer(repo).request(
+                REVIEW, dispatch, StageOutcome(receipt=review_receipt())
+            )
+
+    def test_a_same_chain_new_attempt_after_a_reject_is_legal(self, repo: Path) -> None:
+        self._commit_index(
+            repo,
+            [
+                self._entry(1, 1, "continuous", "APPROVE"),
+                self._entry(1, 1, "final", "REJECT"),
+            ],
+        )
+        dispatch = dispatch_for(repo, "continuous_review", attempt=2)
+        seal_implement_receipt(repo, derive_attempt_id(DEVELOPMENT_ID, 1, 2))
+
+        request = make_materializer(repo).request(
+            REVIEW, dispatch, StageOutcome(receipt=review_receipt())
+        )
+        assert request["dispatch"]["attempt_id"] == derive_attempt_id(DEVELOPMENT_ID, 1, 2)
+
+    def test_the_guard_mirrors_the_shared_rule(self, repo: Path) -> None:
+        """The materializer's guard is the same generation-aware source the
+        replayer shares, so the pre-check and the seal-time check cannot drift."""
+        accepted_history = [
+            self._entry(1, 1, "continuous", "APPROVE"),
+            self._entry(1, 1, "final", "APPROVE"),
+        ]
+        assert new_attempt_is_legal(accepted_history, generation=2, development_id=DEVELOPMENT_ID)
+        assert not new_attempt_is_legal(
+            [
+                self._entry(2, 1, "continuous", "APPROVE"),
+                self._entry(2, 1, "final", "APPROVE"),
+            ],
+            generation=2,
+            development_id=DEVELOPMENT_ID,
+        )
 
 
 class TestUnservedStagesRefuse:
