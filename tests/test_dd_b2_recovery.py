@@ -56,12 +56,13 @@ class BoardDouble:
 class Recorder:
     dry_run = False
 
-    def __init__(self) -> None:
+    def __init__(self, *, started: bool = True) -> None:
         self.specs: list[Any] = []
+        self.started = started
 
     def launch(self, spec: Any) -> LaunchResult:
         self.specs.append(spec)
-        return LaunchResult(spec.unit_name, False, "recorded")
+        return LaunchResult(spec.unit_name, self.started, "recorded")
 
 
 @pytest.fixture
@@ -78,7 +79,13 @@ def repo(tmp_path: Path) -> Path:
     return work
 
 
-def make_plane(tmp_path: Path, board: BoardDouble) -> DdControlPlane:
+def make_plane(
+    tmp_path: Path,
+    board: BoardDouble,
+    *,
+    launcher: Any = None,
+    unit_probe: Any = None,
+) -> DdControlPlane:
     binding = tmp_path / "plugin-binding.json"
     if not binding.exists():
         binding.write_text('{"plugin_producer": {}}', encoding="utf-8")
@@ -88,8 +95,8 @@ def make_plane(tmp_path: Path, board: BoardDouble) -> DdControlPlane:
         worktree_roots=(str(tmp_path),),
         working_directory=str(tmp_path),
         executable="/usr/local/bin/fleet-graph",
-        launcher=Recorder(),
-        unit_probe=lambda unit: False,
+        launcher=launcher if launcher is not None else Recorder(),
+        unit_probe=unit_probe if unit_probe is not None else (lambda unit: False),
         board_factory=lambda: board,
         clock=lambda: 1_700_000_000.0,
     )
@@ -214,15 +221,17 @@ class TestMCPHumanRecovery:
     def test_recovery_requires_the_board_decision_and_resumes_only_then(
         self, repo: Path, tmp_path: Path
     ) -> None:
+        launcher = Recorder()
         board = BoardDouble()
-        plane = make_plane(tmp_path, board)
+        plane = make_plane(tmp_path, board, launcher=launcher)
         dev = plane.create(str(repo), spec_text=SPEC)["development_id"]
         target = head(repo)
 
-        # No human decision on the board -> the exit refuses, no bypass.
+        # No human decision on the board -> the exit refuses, no launch, no bypass.
         with pytest.raises(ControlPlaneError) as refused:
             plane.recover(dev, target_ref=target, question_note_id="note-1")
         assert refused.value.code == "HUMAN_DECISION_MISSING"
+        assert launcher.specs == []
 
         board.decision = Decision(
             message_id="msg-1",
@@ -235,7 +244,11 @@ class TestMCPHumanRecovery:
         )
         recovered = plane.recover(dev, target_ref=target, question_note_id="note-1")
         assert recovered["resume"]["resumed"] is True
+        assert recovered["resume"]["launched"] is True
+        assert recovered["resume"]["thread_id"] == f"{dev}:g1"
         assert recovered["recovery"]["target_ref"] == target
+        argv = launcher.specs[-1].argv()
+        assert "--resume" in argv
 
         trail = plane._recoveries_path(dev).read_text(encoding="utf-8")
         assert len(trail.splitlines()) == 1
@@ -316,6 +329,97 @@ class TestMCPHumanRecovery:
         assert len(plane.recoveries(dev)["recoveries"]) == 1
 
 
+def _alice_decision() -> Decision:
+    return Decision(
+        message_id="msg-1",
+        decision="resume",
+        decided_by="alice",
+        question="",
+        rationale="",
+        card_entity_id="ent-dd-card",
+        raw={},
+    )
+
+
+class TestRecoveryReentry:
+    """The real recovery entrypoint: `recover` must actually relaunch/re-enter
+    the suspended thread, gate the launch on the record, and never fabricate
+    success."""
+
+    def test_a_suspended_thread_is_actually_relaunched(self, repo: Path, tmp_path: Path) -> None:
+        board = BoardDouble()
+        board.decision = _alice_decision()
+        launcher = Recorder()
+        plane = make_plane(tmp_path, board, launcher=launcher)
+        dev = plane.create(str(repo), spec_text=SPEC)["development_id"]
+        target = head(repo)
+
+        recovered = plane.recover(dev, target_ref=target, question_note_id="note-1")
+
+        resume = recovered["resume"]
+        assert resume["resumed"] is True
+        assert resume["launched"] is True
+        assert resume["already_running"] is False
+        assert resume["thread_id"] == f"{dev}:g1"
+        assert resume["generation"] == 1
+        assert resume["unit"]
+        argv = launcher.specs[-1].argv()
+        assert "--resume" in argv
+        assert len(plane.recoveries(dev)["recoveries"]) == 1
+
+    def test_missing_record_does_not_launch(self, repo: Path, tmp_path: Path) -> None:
+        launcher = Recorder()
+        board = BoardDouble()  # no decision on the board -> no record can be sealed
+        plane = make_plane(tmp_path, board, launcher=launcher)
+        dev = plane.create(str(repo), spec_text=SPEC)["development_id"]
+
+        with pytest.raises(ControlPlaneError) as refused:
+            plane.recover(dev, target_ref=head(repo), question_note_id="note-1")
+        assert refused.value.code == "HUMAN_DECISION_MISSING"
+        assert launcher.specs == []
+        assert not plane._recoveries_path(dev).exists()
+
+    def test_duplicate_invocation_is_idempotent_and_does_not_duplicate_the_thread(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        board = BoardDouble()
+        board.decision = _alice_decision()
+        launcher = Recorder()
+        active: set[str] = set()
+        plane = make_plane(
+            tmp_path, board, launcher=launcher, unit_probe=lambda unit: unit in active
+        )
+        dev = plane.create(str(repo), spec_text=SPEC)["development_id"]
+        target = head(repo)
+
+        first = plane.recover(dev, target_ref=target, question_note_id="note-1")
+        assert first["resume"]["launched"] is True
+        active.add(first["resume"]["unit"])
+
+        second = plane.recover(dev, target_ref=target, question_note_id="note-1")
+        assert second["resume"]["already_running"] is True
+        assert second["resume"]["launched"] is False
+
+        assert len(launcher.specs) == 1
+        assert len(plane.recoveries(dev)["recoveries"]) == 1
+
+    def test_launch_failure_is_surfaced_as_failure_not_resumed(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        board = BoardDouble()
+        board.decision = _alice_decision()
+        launcher = Recorder(started=False)
+        plane = make_plane(tmp_path, board, launcher=launcher)
+        dev = plane.create(str(repo), spec_text=SPEC)["development_id"]
+        target = head(repo)
+
+        recovered = plane.recover(dev, target_ref=target, question_note_id="note-1")
+        resume = recovered["resume"]
+        assert resume["resumed"] is False
+        assert resume["launched"] is False
+        assert resume["launch_failure"]
+
+
 class TestB3EvidenceChainIsBoundToTheTrail:
     def test_the_chain_is_assembled_from_the_real_artifacts(
         self, repo: Path, tmp_path: Path
@@ -362,8 +466,12 @@ class TestB3EvidenceChainIsBoundToTheTrail:
         dev = plane.create(str(repo), spec_text=SPEC)["development_id"]
 
         chain = plane.evidence(dev)["b3_evidence_chain"]
-        assert chain["valid"] is True
+        # A freshly-created development has only the scope link -- the adoption
+        # and human-recovery links are required and their absence is reported.
+        assert chain["valid"] is False
         assert any(link["kind"] == "scope" for link in chain["links"])
+        assert "required link missing: adoption" in chain["reasons"]
+        assert "required link missing: human_recovery" in chain["reasons"]
 
 
 class TestScopeQuarantinesTheHandoffPath:
