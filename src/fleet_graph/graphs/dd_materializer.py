@@ -36,8 +36,14 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.dd import chain_rules
 from fleet_graph.dd.capability import CONTRACTS_DIR
-from fleet_graph.dd.dispatch import DispatchError, StageDispatchBuilder, derive_attempt_id
+from fleet_graph.dd.dispatch import (
+    DispatchError,
+    StageDispatchBuilder,
+    derive_attempt_id,
+    read_committed_refs,
+)
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.dd.vendor import plugin_adapter
 from fleet_graph.graphs.dd_actors import (
@@ -252,6 +258,58 @@ class PluginMaterializer:
     def serves(self, stage: Stage) -> bool:
         return stage.id in self.sealed_stages and self.builder.serves(stage.id)
 
+    def _continuous_ordering_guard(self, stage: Stage) -> bool:
+        """Whether `stage` is the fresh continuous review that opens an attempt.
+
+        Both review stages run through this materializer, but only the
+        continuous review is a brand-new attempt: the final review always binds
+        to a same-attempt continuous APPROVE and is not subject to the
+        new-attempt ordering rule (spec requirement 3 / dev-fg-31b963659d16).
+        """
+        reviews = self.review_stages
+        return bool(reviews) and stage.id == reviews[0]
+
+    def _enforce_continuous_order(self, stage: Stage, dispatch: Dispatch) -> None:
+        """Enforce the pinned carrier's ordering rule at the materialization
+        boundary, as a structured refusal instead of the non-JSON shell error
+        the carrier produces when it applies the same rule.
+
+        A fresh continuous review is a new attempt, legal within its own chain
+        only as the very first entry or the entry right after a REJECT
+        (``attempt-context.py: check_chain_order``). This guard applies exactly
+        that flat rule over the committed index the carrier itself reads, so a
+        refusal here is a faithful structured mirror of what the carrier would
+        otherwise reject as non-JSON output.
+
+        The cross-generation permit is *not* this guard's job: it is delivered
+        upstream by configure (``dd.feedback_scope``), which scopes the
+        committed index to the current generation's chain and archives the older
+        generation's entries as immutable history. By the time a fresh
+        generation's continuous review reaches this seal, the index the carrier
+        reads is the new chain's empty seed, so the flat rule admits its first
+        attempt. The same flat rule still refuses a genuinely new attempt that
+        follows an APPROVE-ended chain within the current generation (spec
+        requirements 2, 3 and 5 / dev-fg-31b963659d16).
+        """
+        if not self._continuous_ordering_guard(stage):
+            return
+        try:
+            refs = read_committed_refs(
+                self.builder.chain.workspace_path,
+                str(dispatch.get("input_commit") or ""),
+                self.builder.chain.development_id,
+                spec_path=self.builder.spec_path,
+                index_path=self.builder.index_path,
+            )
+        except DispatchError as exc:
+            raise MaterializationFailed("INVALID_HANDOFF_SCHEMA", str(exc)) from exc
+        if not chain_rules.new_attempt_is_legal(list(refs.entries)):
+            raise MaterializationFailed(
+                "ORDER_VIOLATION",
+                "a fresh continuous review is a new attempt in this chain and "
+                "requires a prior REJECT",
+            )
+
     def request(self, stage: Stage, dispatch: Dispatch, outcome: StageOutcome) -> dict[str, Any]:
         """Assemble the frozen materialization request. Deterministic per attempt."""
         if not self.serves(stage):
@@ -259,6 +317,7 @@ class PluginMaterializer:
 
         declared = dict(outcome.receipt or {})
         try:
+            self._enforce_continuous_order(stage, dispatch)
             stage_dispatch = self.builder.build(
                 dispatch,
                 parent_receipt=dispatch.get("parent_receipt") or None,

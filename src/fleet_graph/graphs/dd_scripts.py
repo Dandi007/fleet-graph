@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from fleet_graph.cost_obs import CostDataPlane
+from fleet_graph.dd.feedback_scope import scope_index_for_generation
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.vendor import git_ops
 from fleet_graph.graphs.dd_pipeline import (
@@ -133,6 +134,18 @@ class ConfigureStage:
                 "generation": dispatch.get("generation", 1),
                 **self.run_config,
             },
+        )
+        # A fresh generation starts a new attempt chain. The committed feedback
+        # index the carrier validates must therefore be scoped to that chain --
+        # older-generation entries are archived (never erased), and the live
+        # index is re-seeded empty so a later generation's continuous review is
+        # not misread as a new attempt in the previous generation's chain
+        # (dev-fg-31b963659d16). Generation 1 already carries the bootstrap's
+        # empty index, so this is a no-op there.
+        scope_index_for_generation(
+            self.repo,
+            generation=int(dispatch.get("generation", 1)),
+            development_id=str(dispatch.get("development_id", "")),
         )
         return StageOutcome(produced=tuple(stage.produced_artifacts))
 

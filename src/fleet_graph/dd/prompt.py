@@ -27,6 +27,7 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
+from fleet_graph.dd.bootstrap import HISTORY_PATH
 from fleet_graph.dd.upstream_constants import ReviewPhase
 
 # The contract's own review_phase vocabulary, keyed by dd stage id.
@@ -223,9 +224,12 @@ metadata-only materialization is compliant, not a finding.
 Review the product changes at `{product_commit}` (carried unchanged into
 `{subject_commit}`) against the approved spec at `{spec_path}`, in the worktree
 `{worktree_path}`. Read the committed feedback index at `{index_path}` and
-every review artifact it references; that index is the only feedback history.
-Do not modify anything: this is a read-only review, and a reviewer that writes
-to the subject workspace has its verdict discarded.
+every review artifact it references; together with the immutable cross-generation
+feedback archive at `{history_path}` (older generations' entries, never erased)
+they are the complete feedback history. The live index is scoped to the current
+generation's attempt chain, so earlier-generation records appear in the archive,
+not in the index. Do not modify anything: this is a read-only review, and a
+reviewer that writes to the subject workspace has its verdict discarded.
 
 ## Your verdict
 
@@ -305,6 +309,7 @@ def render_review_prompt(
     spec_path: str,
     index_path: str,
     product_commit: str = "",
+    history_path: str = HISTORY_PATH,
 ) -> str:
     """Our own review prompt, not the bundle's workflow.
 
@@ -320,6 +325,7 @@ def render_review_prompt(
         subject_commit=stage_dispatch["input_commit"],
         spec_path=spec_path,
         index_path=index_path,
+        history_path=history_path,
         worktree_path=worktree_path,
         contract_version=stage_dispatch["contract_version"],
         review_id=derive_review_id(stage_dispatch["attempt_id"], phase),

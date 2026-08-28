@@ -35,6 +35,11 @@ from fleet_graph.dd.upstream_constants import ATTEMPT_CONTEXT_CONTRACT_VERSION
 SPEC_PATH = ".dev-dispatch/spec/approved.md"
 SPEC_MANIFEST_PATH = ".dev-dispatch/spec/manifest.json"
 INDEX_PATH = ".dev-dispatch/feedback/index.json"
+# The append-only cross-generation feedback archive. The live index is scoped to
+# the current generation's attempt chain (what the carrier's generation-unaware
+# ordering rule validates); entries that belong to an older generation are moved
+# here, never dropped, so the complete feedback history stays readable.
+HISTORY_PATH = ".dev-dispatch/feedback/history.json"
 DEVELOPMENT_PATH = ".dev-dispatch/development.json"
 
 DEVELOPMENT_FIELDS = frozenset(
@@ -215,6 +220,7 @@ def build_attempt_context(
 __all__ = [
     "DEVELOPMENT_FIELDS",
     "DEVELOPMENT_PATH",
+    "HISTORY_PATH",
     "INDEX_FIELDS",
     "INDEX_PATH",
     "SPEC_MANIFEST_FIELDS",

@@ -203,6 +203,27 @@ def committed_index(repo: Path, entries: list[dict[str, Any]], message: str = "s
     )
 
 
+def index_entry(generation: int, attempt: int, phase: str, verdict: str) -> dict[str, Any]:
+    """A feedback entry carrying the durable attempt identity for one generation.
+
+    The ordering rule is generation-aware: an entry from an older generation is
+    immutable history and must not steer the current generation's attempt order,
+    which is what the derived ``attempt_id`` lets the replayer recognise.
+    """
+    return {
+        "attempt": attempt,
+        "attempt_id": derive_attempt_id(DEVELOPMENT_ID, generation, attempt),
+        "review_id": f"r-{phase}-g{generation}-a{attempt}",
+        "review_phase": phase,
+        "subject_commit": "0" * 40,
+        "implementation_subject_commit": "0" * 40,
+        "verdict": verdict,
+        "artifact_path": ".dev-dispatch/reviews/x.json",
+        "artifact_blob_oid": "0" * 40,
+        "artifact_digest": "sha256:" + "0" * 64,
+    }
+
+
 class TestASealedPrefixReplays:
     def test_the_implement_prefix_replays_and_the_review_runs_real(
         self, repo: Path, tmp_path: Path
@@ -657,11 +678,14 @@ class TestAReviewedChainContinuesThroughItsReviews:
 class TestAPartialPrefixRespectsTheInheritedChain:
     """A replayed prefix that stops at implement is always followed by a fresh
     continuous review -- a brand-new attempt. The replayer reads the inherited
-    feedback index and only replays that partial prefix when the fresh review
-    would be legal (the inherited chain ends in REJECT). Otherwise it fails
-    closed, so the carrier -- not the replayer -- stays the authority that
-    rejects a genuine new attempt without a prior REJECT (spec requirements 1,
-    2 and 4)."""
+    feedback index and only replays that partial prefix when the committed
+    index that fresh attempt would follow is empty or already REJECT-terminated
+    (the flat carrier rule). An APPROVE-ended inherited index is refused
+    fail-closed -- in particular a previous generation's accepted history,
+    because replaying it would trim that record away. The generation-aware
+    permit of an inherited older generation's chain is the materializer's job
+    (see test_dd_materializer), never the replayer's, and never by erasing the
+    history (spec requirements 1, 2 and 4)."""
 
     def test_the_new_attempt_rule_mirrors_the_carrier(self) -> None:
         assert chain_rules.new_attempt_is_legal([]) is True
@@ -683,6 +707,44 @@ class TestAPartialPrefixRespectsTheInheritedChain:
             is False
         )
 
+    def test_the_rule_is_generation_aware(self) -> None:
+        """Historical entries from an older generation do not impose a prior
+        REJECT on the current generation's fresh attempt; entries from the same
+        generation still do (spec requirements 1, 2 and 3)."""
+        accepted_history = [
+            index_entry(1, 1, "continuous", "APPROVE"),
+            index_entry(1, 1, "final", "APPROVE"),
+        ]
+        assert (
+            chain_rules.new_attempt_is_legal(
+                accepted_history, generation=2, development_id=DEVELOPMENT_ID
+            )
+            is True
+        ), "an older generation's accepted history must not block a fresh generation"
+        # Same generation: a fresh attempt after an APPROVE chain is illegal.
+        assert (
+            chain_rules.new_attempt_is_legal(
+                [
+                    index_entry(2, 1, "continuous", "APPROVE"),
+                    index_entry(2, 1, "final", "APPROVE"),
+                ],
+                generation=2,
+                development_id=DEVELOPMENT_ID,
+            )
+            is False
+        )
+        assert (
+            chain_rules.new_attempt_is_legal(
+                [
+                    index_entry(2, 1, "continuous", "APPROVE"),
+                    index_entry(2, 1, "final", "REJECT"),
+                ],
+                generation=2,
+                development_id=DEVELOPMENT_ID,
+            )
+            is True
+        )
+
     def test_a_partial_prefix_is_declined_when_the_inherited_chain_did_not_end_in_reject(
         self, repo: Path, tmp_path: Path
     ) -> None:
@@ -690,8 +752,8 @@ class TestAPartialPrefixRespectsTheInheritedChain:
         committed_index(
             repo,
             [
-                {"review_phase": "continuous", "verdict": "APPROVE"},
-                {"review_phase": "final", "verdict": "APPROVE"},
+                index_entry(2, 1, "continuous", "APPROVE"),
+                index_entry(2, 1, "final", "APPROVE"),
             ],
         )
         junk = g1.junk_configure()
@@ -710,8 +772,8 @@ class TestAPartialPrefixRespectsTheInheritedChain:
         committed_index(
             repo,
             [
-                {"review_phase": "continuous", "verdict": "APPROVE"},
-                {"review_phase": "final", "verdict": "REJECT"},
+                index_entry(2, 1, "continuous", "APPROVE"),
+                index_entry(2, 1, "final", "REJECT"),
             ],
         )
         junk = g1.junk_configure()
@@ -723,6 +785,37 @@ class TestAPartialPrefixRespectsTheInheritedChain:
         assert replayed_stages(state) == ["configure", "implement"]
         assert next(stage for stage, _ in actor.calls) == "continuous_review"
         assert head(repo) == g1.implement
+
+    def test_a_cross_generation_history_fails_closed_without_erasing(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """The reported defect (dev-fg-31b963659d16): generation 1 ran
+        attempt 1 (continuous APPROVE, final REJECT) then attempt 2 (continuous
+        APPROVE, final APPROVE, accepted), and a later generation inherited that
+        committed feedback index. When only a [configure, implement] partial
+        prefix's receipts are re-discoverable, the replayer must fail closed --
+        no replay, no trim -- because replaying would trim away the inherited
+        APPROVE-ended index, erasing history the spec requires preserved. The
+        generation-aware permit of that inherited history belongs to the
+        materializer's guard (see test_dd_materializer), not to the replayer."""
+        g1 = G1(repo, tmp_path)
+        committed_index(
+            repo,
+            [
+                index_entry(1, 1, "continuous", "APPROVE"),
+                index_entry(1, 1, "final", "REJECT"),
+                index_entry(1, 2, "continuous", "APPROVE"),
+                index_entry(1, 2, "final", "APPROVE"),
+            ],
+        )
+        junk = g1.junk_configure()
+
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+
+        assert replayed_stages(state) == []
+        assert next(stage for stage, _ in actor.calls) == "configure"
+        assert head(repo) == junk, "a refused replay must not trim the inherited index"
 
 
 class TestTheReplayedIdentityBindsTheRealReview:

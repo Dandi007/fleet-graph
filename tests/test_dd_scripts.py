@@ -52,6 +52,101 @@ class TestConfigure:
         assert written["acceptance_commands"] == [["true"]]
         assert outcome.produced == CONFIGURE.produced_artifacts
 
+    def test_a_later_generation_scopes_the_index_and_archives_the_history(self, repo: Path) -> None:
+        """Configure scopes a fresh generation's feedback index without erasing.
+
+        The committed index is the chain the carrier's generation-unaware
+        ordering rule validates; a later generation must therefore start from an
+        empty index, or its fresh continuous review is misread as a new attempt
+        in the previous generation's chain (dev-fg-31b963659d16). The older
+        generation's entries are preserved -- not deleted -- by moving them into
+        the append-only archive (spec requirements 1 and 3)."""
+        from conftest import write_index
+        from fleet_graph.dd.bootstrap import HISTORY_PATH, INDEX_PATH
+        from fleet_graph.dd.dispatch import derive_attempt_id
+
+        def entry(attempt: int, phase: str, verdict: str) -> dict[str, Any]:
+            return {
+                "attempt": attempt,
+                "attempt_id": derive_attempt_id("dev-001", 1, attempt),
+                "review_id": f"{'rc' if phase == 'continuous' else 'rf'}-g1-a{attempt}",
+                "review_phase": phase,
+                "subject_commit": "0" * 40,
+                "implementation_subject_commit": "0" * 40,
+                "verdict": verdict,
+                "artifact_path": ".dev-dispatch/reviews/x.json",
+                "artifact_blob_oid": "0" * 40,
+                "artifact_digest": "sha256:" + "0" * 64,
+            }
+
+        historical = [
+            entry(1, "continuous", "APPROVE"),
+            entry(1, "final", "REJECT"),
+            entry(2, "continuous", "APPROVE"),
+            entry(2, "final", "APPROVE"),
+        ]
+        write_index(repo, entries=historical)
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "carry historical index")
+
+        ConfigureStage(repo=repo, run_config={}).act(CONFIGURE, dispatch(generation=2))
+
+        index = json.loads((repo / INDEX_PATH).read_text(encoding="utf-8"))
+        assert index["entries"] == []
+        assert index["development_id"] == "dev-001"
+
+        history = json.loads((repo / HISTORY_PATH).read_text(encoding="utf-8"))
+        assert history["development_id"] == "dev-001"
+        assert [e["review_id"] for e in history["entries"]] == [e["review_id"] for e in historical]
+
+    def test_a_later_generation_with_no_older_entries_leaves_the_index_alone(
+        self, repo: Path
+    ) -> None:
+        """An index already scoped to the current generation is a no-op: no
+        archive is written and the index bytes are untouched (idempotent)."""
+        from conftest import write_index
+        from fleet_graph.dd.bootstrap import HISTORY_PATH, INDEX_PATH
+        from fleet_graph.dd.dispatch import derive_attempt_id
+
+        own = [
+            {
+                "attempt": 1,
+                "attempt_id": derive_attempt_id("dev-001", 2, 1),
+                "review_id": "rc-g2-a1",
+                "review_phase": "continuous",
+                "subject_commit": "0" * 40,
+                "implementation_subject_commit": "0" * 40,
+                "verdict": "APPROVE",
+                "artifact_path": ".dev-dispatch/reviews/x.json",
+                "artifact_blob_oid": "0" * 40,
+                "artifact_digest": "sha256:" + "0" * 64,
+            }
+        ]
+        write_index(repo, entries=own)
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "already scoped")
+
+        ConfigureStage(repo=repo, run_config={}).act(CONFIGURE, dispatch(generation=2))
+
+        index = json.loads((repo / INDEX_PATH).read_text(encoding="utf-8"))
+        assert index["entries"] == own
+        assert not (repo / HISTORY_PATH).exists()
+
+    def test_generation_one_leaves_the_feedback_index_alone(self, repo: Path) -> None:
+        """Generation 1 already carries the bootstrap's empty index; configure
+        must not rewrite it."""
+        from conftest import write_index
+        from fleet_graph.dd.bootstrap import INDEX_PATH
+
+        write_index(repo, entries=[{"attempt": 1, "review_phase": "continuous"}])
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "an inherited index")
+
+        ConfigureStage(repo=repo, run_config={}).act(CONFIGURE, dispatch(generation=1))
+
+        index = json.loads((repo / INDEX_PATH).read_text(encoding="utf-8"))
+        assert index["entries"] == [{"attempt": 1, "review_phase": "continuous"}]
+
 
 class TestAcceptance:
     def _configure(self, repo: Path, commands: list[list[str]]) -> None:

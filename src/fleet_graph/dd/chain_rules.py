@@ -20,12 +20,19 @@ from __future__ import annotations
 
 from typing import Any
 
+from fleet_graph.dd.dispatch import derive_attempt_id
 from fleet_graph.dd.upstream_constants import compute_json_digest
 
 #: The verdict that steers a chain into its rework edge. The lifecycle
 #: contract's REJECT transitions are the only edges that re-enter implement,
 #: so a link whose predecessor ended REJECT is a rework link by construction.
 REJECT = "REJECT"
+
+#: Local mirror of `dd_replay.MAX_WALK_ATTEMPTS`. The attempt identity a review
+#: entry carries is uuid5 (one-way), so recognising which generation a committed
+#: entry was sealed for is a bounded forward search, not a reverse of the
+#: derivation.
+_MAX_ATTEMPTS = 64
 
 
 def is_rework_link(previous_verdict: str) -> bool:
@@ -39,15 +46,70 @@ def rework_link_parent(rejecting_receipt: dict[str, Any]) -> str:
     return compute_json_digest(dict(rejecting_receipt))
 
 
-def new_attempt_is_legal(entries: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> bool:
+def entry_generation(entry: dict[str, Any], development_id: str, generation: int) -> bool:
+    """Whether `entry`'s attempt identity was derived for `generation`.
+
+    A committed feedback entry carries the durable `attempt_id` the engine
+    derived from `(development_id, generation, attempt)`. Because that id is a
+    uuid5, membership is a bounded forward search over attempts, never a reverse
+    of the derivation, and an entry that names no recognisable id (or none at
+    all) simply does not belong to `generation`.
+    """
+    attempt_id = entry.get("attempt_id")
+    if not isinstance(attempt_id, str) or not attempt_id:
+        return False
+    return any(
+        derive_attempt_id(development_id, generation, attempt) == attempt_id
+        for attempt in range(1, _MAX_ATTEMPTS + 1)
+    )
+
+
+def split_entries(
+    entries: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    *,
+    generation: int,
+    development_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Partition `entries` into (current generation, older generation).
+
+    The durable `attempt_id` each entry carries is the engine's own derivation
+    of `(development_id, generation, attempt)`, so an entry either belongs to
+    `generation` or it is immutable history from an older generation. This is
+    the single source the new-generation index scoping
+    (``dd.feedback_scope``) uses to move older entries out of the live index
+    without rewriting or discarding them.
+    """
+    own: list[dict[str, Any]] = []
+    inherited: list[dict[str, Any]] = []
+    for entry in entries:
+        (own if entry_generation(entry, development_id, generation) else inherited).append(entry)
+    return own, inherited
+
+
+def new_attempt_is_legal(
+    entries: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    *,
+    generation: int | None = None,
+    development_id: str | None = None,
+) -> bool:
     """Whether a fresh continuous review -- a brand-new attempt -- may follow `entries`.
 
     Mirrors the pinned plugin's ordering rule (`attempt-context.py:
-    check_chain_order` / `protocol_review_attempt`): a fresh continuous entry is
-    a *new attempt*, legal only as the very first entry or the entry right after
-    a REJECT. Any other predecessor -- in particular a final APPROVE, an accepted
-    chain that did not end in REJECT -- makes a fresh continuous review illegal
-    (ORDER_VIOLATION "a new attempt requires a prior REJECT").
+    check_chain_order` / `protocol_review_attempt`): within a single attempt
+    chain, a fresh continuous entry is a *new attempt*, legal only as the very
+    first entry or the entry right after a REJECT. Any other predecessor -- in
+    particular a final APPROVE, an accepted chain that did not end in REJECT --
+    makes a fresh continuous review illegal (ORDER_VIOLATION "a new attempt
+    requires a prior REJECT").
+
+    The rule is generation-aware. When `generation` and `development_id` are
+    both supplied, only the entries whose durable attempt identity was derived
+    for *that* generation count; entries from an older generation are immutable
+    history and must not be misread as the current generation's attempt order.
+    A fresh attempt in a new generation therefore has no same-generation
+    predecessor to satisfy, and is legal: the historical records are preserved
+    unchanged, and the rejection requirement for a genuinely new attempt still
+    holds *within* one chain.
 
     The replayer consults this before replaying a prefix that stops at implement:
     such a replay is always followed by a fresh continuous review, so it is only
@@ -57,7 +119,20 @@ def new_attempt_is_legal(entries: list[dict[str, Any]] | tuple[dict[str, Any], .
     """
     if not entries:
         return True
+    if generation is not None and development_id:
+        entries = [
+            entry for entry in entries if entry_generation(entry, development_id, generation)
+        ]
+        if not entries:
+            return True
     return entries[-1].get("verdict") == REJECT
 
 
-__all__ = ["REJECT", "is_rework_link", "new_attempt_is_legal", "rework_link_parent"]
+__all__ = [
+    "REJECT",
+    "entry_generation",
+    "is_rework_link",
+    "new_attempt_is_legal",
+    "rework_link_parent",
+    "split_entries",
+]
