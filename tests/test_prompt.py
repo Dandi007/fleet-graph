@@ -287,14 +287,39 @@ class TestTheReviewPrompt:
         assert "continuous" in self._rendered("continuous")
         assert "final" in self._rendered("final")
 
-    def test_it_supplies_the_three_commits_the_persona_checks(self) -> None:
-        """The persona asks the reviewer to verify `input_commit`,
-        `subject_commit` and `implementation_subject_commit` agree before
-        reviewing. A prompt that never names `input_commit` leaves it checking
-        a value it was not given."""
+    def test_it_names_every_commit_the_review_mentions(self) -> None:
+        """`input_commit`, `subject_commit`, `implementation_subject_commit`
+        and the product commit (`work_head_commit`) are all supplied, not
+        discovered -- a prompt that never names one leaves the reviewer
+        comparing a value it was not given."""
         rendered = self._rendered()
         for name in ("input_commit", "subject_commit", "implementation_subject_commit"):
             assert f"`{name}`" in rendered, name
+        assert "work_head_commit" in rendered
+
+    def test_the_check_is_product_path_tree_equality_not_sha_equality(self) -> None:
+        """The verified incident: a metadata-only materialization commit makes
+        the review's `subject_commit` differ from the product commit by SHA,
+        and a reviewer told to check the three agree rejects every
+        correctly-behaving development. The prompt must record both commits and
+        define the procedural check as product-path tree equality."""
+        rendered = self._rendered()
+        assert "not by SHA equality" in rendered or "SHA equality" in rendered
+        assert "git diff --exit-code" in rendered
+        assert ":(exclude).dev-dispatch" in rendered
+        assert "metadata-only" in rendered
+
+    def test_a_metadata_only_commit_is_not_a_finding(self) -> None:
+        rendered = self._rendered()
+        assert "compliant, not a finding" in rendered
+
+    def test_a_genuine_product_mismatch_is_still_rejected(self) -> None:
+        """Do not weaken the binding into prose: a materialization commit that
+        actually changed a product file must still be a `blocker` REJECT."""
+        rendered = self._rendered()
+        assert "blocker" in rendered
+        assert "REJECT" in rendered
+        assert "actually" in rendered
 
     def test_a_failed_precondition_must_still_produce_a_verdict(self) -> None:
         """A review that stops without a verdict is indistinguishable from one
@@ -339,6 +364,79 @@ class TestTheReviewPrompt:
         source = PluginPromptSource(binding=None, builder=None, worktree_path="/w")
         assert source.for_stage("acceptance", {}, run_id="r", actor_job_id="j") is None
         assert source.for_stage("merger", {}, run_id="r", actor_job_id="j") is None
+
+
+class TestTheReviewSubjectBinding:
+    """The incident shape: the implement materializer stacks a metadata-only
+    commit on top of the product commit, so the review's `subject_commit` (the
+    sealed output) and the product commit differ by SHA while their product
+    trees are identical. The reviewer input must carry the product commit as
+    its subject, not the metadata commit stacked on it."""
+
+    class _Builder:
+        spec_path = ".dev-dispatch/spec/approved.md"
+        index_path = ".dev-dispatch/feedback/index.json"
+
+        def build(
+            self, dispatch: dict[str, Any], parent_receipt: dict[str, Any] | None = None
+        ) -> dict[str, Any]:
+            return {
+                "attempt_id": "att-1",
+                "contract_version": "dev-dispatch.attempt-context/v1",
+                "input_commit": dispatch.get("input_commit", "a" * 40),
+                "spec_ref": {"digest": "sha256:" + "b" * 64},
+            }
+
+    def _source(self) -> Any:
+        from fleet_graph.dd.prompt import PluginPromptSource
+
+        return PluginPromptSource(binding=None, builder=self._Builder(), worktree_path="/w")
+
+    def test_implement_product_commit_reads_the_parent_receipt(self) -> None:
+        from fleet_graph.dd.prompt import implement_product_commit
+
+        assert implement_product_commit({}, implementation_subject_commit="a" * 40) == "a" * 40
+        assert (
+            implement_product_commit(
+                {"parent_receipt": {"work_head_commit": "e" * 40}},
+                implementation_subject_commit="a" * 40,
+            )
+            == "e" * 40
+        )
+
+    def test_the_product_commit_wins_over_the_metadata_commit(self) -> None:
+        """Regression reproducing the incident shape: implement product commit
+        + metadata-only materialization commit on top -> reviewer input carries
+        the product commit as its subject, and the metadata commit is still
+        recorded alongside it."""
+        product = "e" * 40
+        metadata = "a" * 40
+        dispatch = {
+            "input_commit": metadata,
+            "artifact_commits": {"implementation_evidence": metadata},
+            "parent_receipt": {"work_head_commit": product, "output_commit": metadata},
+        }
+        rendered = self._source().for_stage(
+            "continuous_review", dispatch, run_id="r", actor_job_id="j"
+        )
+        assert rendered is not None
+        assert product in rendered, "the review must be bound to the product commit"
+        assert metadata in rendered, "the sealed output is recorded too"
+        assert f"git diff --exit-code {product}" in rendered
+
+    def test_final_review_anchors_on_the_sealed_implement_output(self) -> None:
+        """The final review's parent is the continuous review receipt, which
+        has no `work_head_commit`; it anchors on the implement's sealed output,
+        itself metadata-only with respect to the same product tree."""
+        metadata = "a" * 40
+        dispatch = {
+            "input_commit": metadata,
+            "artifact_commits": {"implementation_evidence": metadata},
+            "parent_receipt": {"implementation_subject_commit": metadata},
+        }
+        rendered = self._source().for_stage("final_review", dispatch, run_id="r", actor_job_id="j")
+        assert rendered is not None
+        assert metadata in rendered
 
 
 class TestTheBundleShipsMoreThanWeReproduce:
