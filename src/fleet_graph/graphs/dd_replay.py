@@ -29,6 +29,13 @@ rejected work's reviews) is never replayed -- only the success/APPROVE prefix
 is. Rework stays what it always was: the in-graph feedback loop, reached
 through real transitions, never through replay.
 
+**A replayed receipt carries its frozen intent too.** The plugin's sealer
+freezes each sealed receipt's immutable intent beside the receipt under
+`<state_root>/intents/<intent_id>.json`, and the Review sealer re-reads the
+Continuous intent when it seals a Final review. Replay therefore re-installs
+that intent with its receipt; a review receipt whose intent the source
+generation no longer holds is an un-rechargeable link and re-runs for real.
+
 **Replay may trim dead weight, and only dead weight.** A pre-F4 restart left
 junk commits above the sealed tip (a fresh generation's `configure` re-seal,
 an acceptance record of a run that then failed). The plugin sealer requires
@@ -68,6 +75,14 @@ RECEIPT_FILES = {
     "final_review": "final-review-receipt.json",
 }
 
+# Where the plugin's sealer freezes the immutable materialization intent that
+# accompanies each sealed receipt, under `<state_root>/intents/<intent_id>.json`.
+# The Review sealer re-reads the Continuous intent when it seals a Final review;
+# a replayed Continuous receipt whose intent was not carried over is a chain the
+# Final sealer cannot continue (measured: RECEIPT_CONFLICT "Continuous
+# materialization intent is unreadable").
+INTENTS_DIR = "intents"
+
 APPROVE = "APPROVE"
 # The rework-edge rules live in dd/chain_rules.py -- one source, shared with
 # supervise/audit.py's chain check, so the topology cannot drift between the
@@ -98,6 +113,11 @@ class _Step:
     # receipts directory so a later real seal chains on the same byte digest.
     # Empty for a reconstructed WorkspaceSealer receipt, which has no file.
     raw: bytes = b""
+    # The frozen materialization intent bytes that accompany the receipt, if
+    # the receipt names one and the source generation still holds it. Installed
+    # alongside the receipt so a later real seal can re-read it. Empty for the
+    # reconstructed configure link and for a receipt whose intent is absent.
+    intent_raw: bytes = b""
 
 
 def byte_digest(raw: bytes) -> str:
@@ -245,6 +265,12 @@ class ReceiptReplayer:
 
         attempt = 1
         while attempt <= MAX_WALK_ATTEMPTS:
+            # The implement intent is carried over when present but is not
+            # required to replay: no downstream sealer re-reads it (the Review
+            # sealer binds to the implement receipt and its committed artifact),
+            # so treating its absence as a chain break would turn a curable
+            # implement replay back into a fresh-agent re-dispatch.
+            imp_intent = self._plugin_intent(root, imp)
             steps = [
                 configure_step,
                 _Step(
@@ -253,6 +279,7 @@ class ReceiptReplayer:
                     receipt=imp,
                     output_commit=str(imp["output_commit"]),
                     raw=imp_raw,
+                    intent_raw=imp_intent[0] if imp_intent else b"",
                 ),
             ]
             if not continuous_id:
@@ -284,6 +311,14 @@ class ReceiptReplayer:
             if verdict != APPROVE:
                 return steps
 
+            cr_intent = self._plugin_intent(root, cr)
+            if cr_intent is None:
+                # The Review sealer re-reads the Continuous intent when it
+                # seals a Final review; a replayed Continuous receipt whose
+                # frozen intent is missing is a chain nobody can continue, so
+                # it re-runs for real rather than replaying half a link.
+                return steps
+
             steps.append(
                 _Step(
                     stage_id=continuous_id,
@@ -291,6 +326,7 @@ class ReceiptReplayer:
                     receipt=cr,
                     output_commit=str(cr["output_commit"]),
                     raw=cr_raw,
+                    intent_raw=cr_intent[0],
                 )
             )
             if not final_id:
@@ -318,6 +354,10 @@ class ReceiptReplayer:
             if verdict != APPROVE:
                 return steps
 
+            fr_intent = self._plugin_intent(root, fr)
+            if fr_intent is None:
+                return steps
+
             steps.append(
                 _Step(
                     stage_id=final_id,
@@ -325,6 +365,7 @@ class ReceiptReplayer:
                     receipt=fr,
                     output_commit=str(fr["output_commit"]),
                     raw=fr_raw,
+                    intent_raw=fr_intent[0],
                 )
             )
             # Acceptance and everything after it always re-runs: acceptance
@@ -417,6 +458,37 @@ class ReceiptReplayer:
             return None
         return raw, receipt
 
+    def _plugin_intent(
+        self, root: Path, receipt: dict[str, Any]
+    ) -> tuple[bytes, dict[str, Any]] | None:
+        """The frozen materialization intent a receipt was sealed with, if present.
+
+        The plugin freezes each sealed receipt's intent alongside the receipt
+        under `<state_root>/intents/<intent_id>.json`. It is read back here --
+        and later re-installed -- so a replay carries the whole sealed record,
+        not just the receipt a later materialization re-reads. A receipt that
+        names an intent the source generation no longer holds, or one whose
+        stored identity disagrees with the receipt's, is not a link whose
+        intent can be reinstated, so it reads as a miss.
+        """
+        intent_id = str(receipt.get("materialization_intent_id") or "")
+        if not intent_id:
+            return None
+        path = root / INTENTS_DIR / f"{intent_id}.json"
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return None
+        try:
+            intent = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(intent, dict):
+            return None
+        if str(intent.get("materialization_intent_id") or "") != intent_id:
+            return None
+        return raw, intent
+
     def _valid_implement(self, receipt: dict[str, Any], head: str) -> bool:
         """An applied implement receipt, complete and on the current chain."""
         if set(receipt) != plugin_adapter.IMPLEMENT_RECEIPT_FIELDS:
@@ -480,6 +552,12 @@ class ReceiptReplayer:
             target = self.state_root / "receipts" / attempt_id
             target.mkdir(parents=True, exist_ok=True)
             (target / filename).write_bytes(step.raw)
+            if step.intent_raw:
+                intent_id = str(step.receipt.get("materialization_intent_id") or "")
+                if intent_id:
+                    intent_dir = self.state_root / INTENTS_DIR
+                    intent_dir.mkdir(parents=True, exist_ok=True)
+                    (intent_dir / f"{intent_id}.json").write_bytes(step.intent_raw)
         if self.run_config is not None:
             self._rewrite_run_config(plan[0].output_commit)
         return True
@@ -572,6 +650,7 @@ def prior_generation_state_roots(run_root: Path, generation: int) -> tuple[tuple
 
 __all__ = [
     "APPROVE",
+    "INTENTS_DIR",
     "MAX_WALK_ATTEMPTS",
     "RECEIPT_FILES",
     "REJECT",

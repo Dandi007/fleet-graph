@@ -105,6 +105,21 @@ def write_receipt(
     return raw
 
 
+def write_intent(state_root: Path, receipt: dict[str, Any]) -> bytes:
+    """The frozen materialization intent a receipt was sealed with, at the
+    plugin's `intents/<intent_id>.json` layout."""
+    intent_id = str(receipt.get("materialization_intent_id") or "")
+    assert intent_id
+    raw = json.dumps(
+        {"materialization_intent_id": intent_id, "kind": "review_materialization_intent"},
+        sort_keys=True,
+    ).encode("utf-8")
+    directory = state_root / "intents"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{intent_id}.json").write_bytes(raw)
+    return raw
+
+
 class G1:
     """One previous generation: configure and implement sealed on a real repo."""
 
@@ -140,6 +155,9 @@ class G1:
         # be the receipt's own.
         attempt_id = derive_attempt_id(DEVELOPMENT_ID, 1, 1)
         return self.dev_root / "g2" / "state" / "receipts" / attempt_id / filename
+
+    def installed_intent(self, intent_id: str) -> Path:
+        return self.dev_root / "g2" / "state" / "intents" / f"{intent_id}.json"
 
 
 def run_generation_two(deps: Any, head_commit: str) -> dict[str, Any]:
@@ -209,7 +227,66 @@ class TestASealedPrefixReplays:
         review_commit = commit_file(
             repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
         )
-        raw = write_receipt(
+        receipt = review_receipt(
+            parent_digest=byte_digest(g1.raw),
+            subject=g1.implement,
+            output=review_commit,
+            verdict="APPROVE",
+        )
+        raw = write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", receipt)
+        write_intent(g1.state_root, receipt)
+        junk = g1.junk_configure()
+
+        actor = ContractActor({"final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
+        assert next(stage for stage, _ in actor.calls) == "final_review"
+        assert head(repo) == review_commit
+        assert g1.installed("continuous-review-receipt.json").read_bytes() == raw
+
+    def test_the_replayed_review_carries_its_frozen_intent(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """The RECEIPT_CONFLICT root fix: the Review sealer re-reads the
+        Continuous intent to seal a Final review, so replay must install it
+        beside the receipt -- and, here, the whole line still progresses
+        through final review to a terminal (and merge) seal."""
+        g1 = G1(repo, tmp_path)
+        review_commit = commit_file(
+            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
+        )
+        receipt = review_receipt(
+            parent_digest=byte_digest(g1.raw),
+            subject=g1.implement,
+            output=review_commit,
+            verdict="APPROVE",
+        )
+        write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", receipt)
+        intent_raw = write_intent(g1.state_root, receipt)
+        junk = g1.junk_configure()
+
+        actor = ContractActor({"final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
+        installed = g1.installed_intent(receipt["materialization_intent_id"])
+        assert installed.read_bytes() == intent_raw
+        assert byte_digest(installed.read_bytes()) == byte_digest(intent_raw)
+
+    def test_a_review_whose_intent_is_missing_reruns_for_real(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """A replayed review whose frozen intent the source generation no
+        longer holds is an un-rechargeable link: it re-runs for real rather
+        than replaying half a link the next materialization cannot continue."""
+        g1 = G1(repo, tmp_path)
+        review_commit = commit_file(
+            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
+        )
+        write_receipt(
             g1.state_root,
             1,
             1,
@@ -223,14 +300,12 @@ class TestASealedPrefixReplays:
         )
         junk = g1.junk_configure()
 
-        actor = ContractActor({"final_review": ["APPROVE"]})
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
         state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
 
         assert state["terminal"] == TERMINAL_COMPLETE
-        assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
-        assert next(stage for stage, _ in actor.calls) == "final_review"
-        assert head(repo) == review_commit
-        assert g1.installed("continuous-review-receipt.json").read_bytes() == raw
+        assert replayed_stages(state) == ["configure", "implement"]
+        assert next(stage for stage, _ in actor.calls) == "continuous_review"
 
 
 class TestABrokenChainRunsRealFromTheBreak:
