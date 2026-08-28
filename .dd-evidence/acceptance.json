@@ -1,0 +1,119 @@
+{
+ "development_id": "dev-fg-b5479a961625",
+ "attempt": 4,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "uv",
+    "sync",
+    "--frozen"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": "Checked 100 packages in 1ms\n"
+  },
+  {
+   "command": [
+    "make",
+    "verify"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "uv run ruff check .\nAll checks passed!\nuv run ruff format --check .\n153 files already formatted\nuv run pytest\n........................................................................ [  4%]\n........................................................................ [  9%]\n........................................................................ [ 14%]\n........................................................................ [ 19%]\n........................................................................ [ 24%]\n........................................................................ [ 29%]\n..............................................................s......... [ 34%]\n........................................................................ [ 39%]\n........................................................................ [ 44%]\n........................................................................ [ 49%]\n........................................................................ [ 54%]\n........................................................................ [ 59%]\n........................................................................ [ 64%]\n........................................................................ [ 69%]\n........................................................................ [ 74%]\n........................................................................ [ 79%]\n........................................................................ [ 84%]\n........................................................................ [ 89%]\n........................................................................ [ 94%]\n........................................................................ [ 98%]\n...............                                                          [100%]\n1454 passed, 1 skipped in 41.26s\nuv run python scripts/check_supervisor_conformance.py\nsupervisor conformance: clean\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "pytest",
+    "tests/test_line_restart.py",
+    "-q"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "...........                                                              [100%]\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "pytest",
+    "tests/test_goal_interrupt.py",
+    "-q"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "..................................                                       [100%]\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/e2_goal_interrupt_acceptance.py",
+    "--scenario",
+    "decision-content-injected"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "{\n  \"acknowledged\": true,\n  \"checkpoint_fields\": [\n    \"card_entity_id\",\n    \"created_at\",\n    \"folder_id\",\n    \"generation\",\n    \"prior_terminal_digest\",\n    \"question_note_id\",\n    \"resume_key\",\n    \"round_id\",\n    \"updated_at\"\n  ],\n  \"exit_code\": 0,\n  \"pass\": true,\n  \"resume_key\": \"e2:wf-1:1:e2-question:wf-1:1:1:q\",\n  \"resumed_envelope_fields\": [\n    \"card_entity_id\",\n    \"channel_seq\",\n    \"decided_at\",\n    \"decided_by\",\n    \"decision\",\n    \"message_id\",\n    \"question_note_id\",\n    \"rationale\",\n    \"refs\",\n    \"resume_key\"\n  ],\n  \"scenario\": \"decision-content-injected\",\n  \"status\": \"resumed\",\n  \"suspended\": true,\n  \"terminal\": \"done\",\n  \"utc_timestamp\": \"2026-08-28T23:08:34Z\"\n}\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/e2_goal_interrupt_acceptance.py",
+    "--scenario",
+    "legacy-owner-fallback"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "{\n  \"ambiguous_outcome\": \"legacy_owner_ambiguous\",\n  \"ambiguous_resumed\": 0,\n  \"ambiguous_status\": \"noop\",\n  \"exit_code\": 0,\n  \"pass\": true,\n  \"scenario\": \"legacy-owner-fallback\",\n  \"unique_outcome\": \"resumed\",\n  \"unique_reason\": \"legacy_owner_resolution\",\n  \"unique_status\": \"resumed\",\n  \"unique_target\": \"wf-abc\",\n  \"utc_timestamp\": \"2026-08-28T23:08:34Z\"\n}\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/e2_goal_interrupt_acceptance.py",
+    "--scenario",
+    "cursor-compensation"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "{\n  \"compensation_last\": \"d-missed\",\n  \"cursor\": 10,\n  \"cursor_before\": 10,\n  \"exit_code\": 0,\n  \"pass\": true,\n  \"recovered\": [\n    \"d-missed\"\n  ],\n  \"resumed\": 1,\n  \"scenario\": \"cursor-compensation\",\n  \"utc_timestamp\": \"2026-08-28T23:08:35Z\"\n}\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/e2_goal_interrupt_acceptance.py",
+    "--scenario",
+    "kill-restart-no-replay",
+    "--kill-after",
+    "turn_claimed"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "{\n  \"claimed_before_kill\": true,\n  \"exit_code\": 0,\n  \"kill_after\": \"turn_claimed\",\n  \"pass\": true,\n  \"phase2_status\": \"resumed\",\n  \"phase2_terminal\": \"done\",\n  \"scenario\": \"kill-restart-no-replay\",\n  \"stderr\": \"\",\n  \"turn_charges\": 1,\n  \"utc_timestamp\": \"2026-08-28T23:08:37Z\"\n}\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/e2_goal_interrupt_acceptance.py",
+    "--scenario",
+    "suspend-24h-then-bridge-resume",
+    "--suspend-seconds",
+    "86400"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "{\n  \"elapsed_seconds\": 86400.0,\n  \"exit_code\": 0,\n  \"pass\": true,\n  \"resumes\": 1,\n  \"round_no\": 2,\n  \"scenario\": \"suspend-24h-then-bridge-resume\",\n  \"second_pass_resumed\": 0,\n  \"suspend_seconds\": 86400.0,\n  \"terminal\": \"done\",\n  \"turn_charges\": 1,\n  \"utc_timestamp\": \"2026-08-28T23:08:38Z\"\n}\n",
+   "stderr_tail": ""
+  }
+ ]
+}
