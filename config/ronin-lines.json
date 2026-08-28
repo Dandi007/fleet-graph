@@ -1,7 +1,7 @@
 {
   "_comment": "浪人存量线的新引擎配置（P5 配置面迁移）。同一 work folder 继续用，不建新 folder。",
   "_provenance": "取自 /data/ronin/babysitter-20260822.sh v28 的 FOLDERS/seat()/maxrounds()；逐条与该脚本取值核对",
-  "_rollout": "P7 分批放量。第一批金丝雀 wf-40fa8d 已实证引擎全链（25 轮无重复推进、dd 四阶段封存、真实产品 diff、在授权边界正确停住）。第二批 +5 条（可观测/额度类，改面板与配置，不动核心服务），由 agent 依用户 2026-08-27 02:0x 全权委托代行监督面裁定。第三批 = 余下 3 条。enabled 是唯一放行开关；紧急停机口见 docs/operating.md。2026-08-28 监督面收编三线：wf-a08949（dd 切换目标已达成、老引擎退役由监督面亲自执行）、wf-40fa8d（terminal=done，C1/C2/C3 五件套验收通过）、wf-7bc4d1（terminal=done，真机全量验收通过）——均 enabled=false。",
+  "_rollout": "P7 分批放量。第一批金丝雀 wf-40fa8d 已实证引擎全链（25 轮无重复推进、dd 四阶段封存、真实产品 diff、在授权边界正确停住）。第二批 +5 条（可观测/额度类，改面板与配置，不动核心服务），由 agent 依用户 2026-08-27 02:0x 全权委托代行监督面裁定。第三批 = 余下 3 条。enabled 是唯一放行开关；紧急停机口见 docs/operating.md。2026-08-28 监督面收编三线：wf-a08949（dd 切换目标已达成、老引擎退役由监督面亲自执行）、wf-40fa8d（terminal=done，C1/C2/C3 五件套验收通过）、wf-7bc4d1（terminal=done，真机全量验收通过）——均 enabled=false。2026-08-28 监督面第二波收编：9 候选 8 close/fold、1 enroll——唯一入编 wf-7cd0a7（agent-bus 通信层重设计），seat opencode-gpt-sol 首次跑 goal line。",
   "run_root": "/data/fleet-graph/runs",
   "probe_via_runtime": true,
   "supervisor_events": true,
@@ -68,6 +68,13 @@
       "max_rounds": 9999,
       "alias": "ronin-usage-dash",
       "enabled": false
+    },
+    {
+      "folder_id": "wf-7cd0a7",
+      "seat": "opencode-gpt-sol",
+      "alias": "ronin-bus-redesign",
+      "max_rounds": 9999,
+      "enabled": true
     },
     {
       "folder_id": "wf-9b5931",

@@ -60,6 +60,14 @@ CONVERGED = {
     "wf-7bc4d1",
 }
 
+# 2026-08-28 监督面第二波扩编收编：9 候选 8 close/fold、1 enroll。唯一入编
+# wf-7cd0a7（agent-bus 通信层重设计，wf-7cd0a7/goal.md 2026-08-28 re-scope），
+# seat opencode-gpt-sol——该座位首次跑 goal line。与 MIGRATED/OPENED 分开：
+# 它既不是 babysitter 存量迁移，也不是 08-27「都派出去」那批新开线。
+ENROLLED = {
+    "wf-7cd0a7",
+}
+
 MIGRATED = {
     "wf-287e81",
     "wf-5664e5",
@@ -76,7 +84,7 @@ MIGRATED = {
 class TestTheShippedConfigLoads:
     def test_the_real_loader_accepts_it(self) -> None:
         config = SchedulerConfig.from_json(CONFIG)
-        assert {line.folder_id for line in config.lines} == MIGRATED | OPENED
+        assert {line.folder_id for line in config.lines} == MIGRATED | OPENED | ENROLLED
 
     def test_every_line_names_a_seat_and_an_alias(self) -> None:
         for line in SchedulerConfig.from_json(CONFIG).lines:
@@ -119,7 +127,7 @@ class TestTheShippedConfigLoads:
         enabled = {
             line.folder_id for line in SchedulerConfig.from_json(CONFIG).lines if line.enabled
         }
-        assert enabled == (BATCH_TWO | OPENED) - CONVERGED
+        assert enabled == (BATCH_TWO | OPENED | ENROLLED) - CONVERGED
 
     def test_the_converged_lines_stay_in_the_roster_but_off(self) -> None:
         """收编（2026-08-28）不是删除：金丝雀 wf-40fa8d 等三线 terminal=done /
