@@ -142,6 +142,89 @@ class TestTheDdSubcommand:
         assert config.head_commit == head(workspace), "the walk still starts at HEAD"
         assert config.target_base_commit != config.head_commit
 
+    def test_explicit_target_base_bypasses_the_false_edit_anchor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The incident shape: an older ancestor metadata commit rewrote the
+        identity file in place, so `--diff-filter=A` misreads an untouched
+        bootstrap as edited. The forwarded `--target-base` skips that anchor,
+        so the run starts and claims the frozen admission target."""
+        from conftest import git, head
+        from fleet_graph.cli import _dd_run
+        from fleet_graph.dd import vendor
+        from fleet_graph.dd.bootstrap import (
+            IdentityChanged,
+            build_attempt_context,
+            committed_target_base,
+        )
+        from fleet_graph.graphs import dd_runner
+
+        workspace = tmp_path / "work"
+        workspace.mkdir()
+        git(workspace, "init", "-q", "-b", "main")
+        (workspace / "seed.txt").write_text("x\n", encoding="utf-8")
+        git(workspace, "add", "-A")
+        git(workspace, "commit", "-q", "-m", "seed")
+        base = head(workspace)
+
+        # The older ancestor metadata commit: introduced the identity file with
+        # no frozen base, so a later bootstrap re-writes it in place (an M, not
+        # an A) and the --diff-filter=A anchor keeps pointing at this commit.
+        (workspace / ".dev-dispatch").mkdir(exist_ok=True)
+        (workspace / ".dev-dispatch" / "development.json").write_text(
+            json.dumps(
+                {"contract_version": "dev-dispatch.attempt-context/v1", "target_base_commit": ""}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        git(workspace, "add", "-A")
+        git(workspace, "commit", "-q", "-m", "legacy: metadata with no frozen base")
+
+        build_attempt_context(development_id="d", spec=b"# spec\n", target_base_commit=base).write(
+            workspace
+        )
+        git(workspace, "add", "-A")
+        git(workspace, "commit", "-q", "-m", "bootstrap")
+
+        # The untouched bootstrap still trips the native anchor -- that is the
+        # false positive the forwarded base exists to sidestep.
+        with pytest.raises(IdentityChanged, match="edited since bootstrap"):
+            committed_target_base(workspace)
+
+        seen: dict[str, Any] = {}
+        monkeypatch.setattr(vendor.plugin_adapter, "load_plugin_binding", lambda config: object())
+        monkeypatch.setattr(
+            dd_runner,
+            "run_pipeline",
+            lambda config, **kwargs: seen.update(config=config) or {"terminal": "complete"},
+        )
+        binding = tmp_path / "b.json"
+        binding.write_text("{}", encoding="utf-8")
+
+        args = build_parser().parse_args(
+            [
+                "dd",
+                "run",
+                "--development",
+                "d",
+                "--workspace",
+                str(workspace),
+                "--plugin-binding",
+                str(binding),
+                "--remote-url",
+                "u",
+                "--remote-ref",
+                "refs/heads/main",
+                "--root-digest",
+                "sha256:" + "a" * 64,
+                "--target-base",
+                base,
+            ]
+        )
+        assert _dd_run(args) == 0
+        assert seen["config"].target_base_commit == base
+
     def test_stage_model_overrides_accumulate(self) -> None:
         args = build_parser().parse_args(
             [

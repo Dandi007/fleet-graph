@@ -369,6 +369,14 @@ class DdLaunchSpec:
     remote_url: str
     remote_ref: str
     root_digest: str
+    #: The frozen admission target, carried straight from the record. The
+    #: runner must receive it as an explicit `--target-base` rather than
+    #: re-inferring it from `.dev-dispatch/development.json`: on a worktree
+    #: whose lineage already contains an older metadata commit (a prior
+    #: development re-writing the same file), the `--diff-filter=A` anchor
+    #: points at someone else's introduction and misreports an untouched
+    #: identity as edited (the false `IDENTITY_EDITED` startup refusal).
+    target_base_commit: str
     acceptance_commands: list[list[str]] = field(default_factory=list)
     #: The reconfigurable acceptance context (R1-c): setup commands run before
     #: acceptance, and an env overlay for both.
@@ -433,6 +441,14 @@ class DdLaunchSpec:
             self.remote_ref,
             "--root-digest",
             self.root_digest,
+            # The admitted, persisted target base is forwarded verbatim so the
+            # runner never has to infer it from the worktree's `.dev-dispatch`
+            # history (which is both fragile and, post-bootstrap, writable by
+            # the graded party). A genuine metadata mutation is still caught by
+            # the admission and audit checks, and by the review sealer's
+            # committed-identity-versus-dispatch binding.
+            "--target-base",
+            self.target_base_commit,
             "--run-root",
             str(self.run_root or self.dev_root),
             # The generation names the thread ({dev}:g{n}); run ids and the
@@ -1018,6 +1034,7 @@ class DdControlPlane:
             remote_url=str(record["remote_url"]),
             remote_ref=str(record["remote_ref"]),
             root_digest=str(record["root_handoff_digest"]),
+            target_base_commit=str(record["target_base_commit"]),
             acceptance_commands=[list(c) for c in record.get("acceptance_commands") or []],
             setup_commands=[list(c) for c in record.get("setup_commands") or []],
             acceptance_env=dict(record.get("acceptance_env") or {}),
