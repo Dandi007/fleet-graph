@@ -560,9 +560,11 @@ def _decision_bridge_run(args: argparse.Namespace) -> int:
     """The resident decision bridge: read verdicts, resolve, recover, seal.
 
     Read-only against the bus (``GET .../messages`` only); the recovery call
-    goes through the owner's controlled entry (dd gate resume, or an HTTP owner
-    for the isolated drill). One JSON line per cycle on stdout.
+    goes through the owner's controlled entry (dd gate resume, a registered
+    line entry, or an HTTP owner for the isolated drill). One JSON line per
+    cycle on stdout.
     """
+    import json as _json
     import pathlib
 
     from fleet_graph.decision_bridge.bridge import DecisionBridge, DecisionBridgeConfig
@@ -572,6 +574,22 @@ def _decision_bridge_run(args: argparse.Namespace) -> int:
     if args.owner_url:
         owner_source = HttpOwnerSource(args.owner_url)
 
+    line_owners: list[object] = []
+    line_run_root = pathlib.Path("/data/fleet-graph/runs")
+    if args.lines_config:
+        with open(args.lines_config, encoding="utf-8") as handle:
+            raw = _json.load(handle)
+        entries = raw.get("lines") if isinstance(raw, dict) else None
+        if isinstance(entries, list):
+            line_owners = [
+                {k: v for k, v in entry.items() if not str(k).startswith("_")}
+                if isinstance(entry, dict)
+                else entry
+                for entry in entries
+            ]
+        if isinstance(raw, dict) and raw.get("run_root"):
+            line_run_root = pathlib.Path(str(raw["run_root"]))
+
     bridge = DecisionBridge(
         DecisionBridgeConfig(
             state_dir=pathlib.Path(args.state_dir),
@@ -579,6 +597,8 @@ def _decision_bridge_run(args: argparse.Namespace) -> int:
             board_page_limit=args.page_limit,
             owner_url=args.owner_url,
             dd_root=pathlib.Path(args.dd_root),
+            line_owners=line_owners,
+            line_run_root=line_run_root,
             kill_window_file=pathlib.Path(args.kill_window_file) if args.kill_window_file else None,
             kill_window_seconds=args.kill_window_seconds,
         ),
@@ -920,6 +940,13 @@ def build_parser() -> argparse.ArgumentParser:
         "(the isolated drill's fake owner)",
     )
     bridge_run.add_argument("--dd-root", default="/data/fleet-graph/dd")
+    bridge_run.add_argument(
+        "--lines-config",
+        default=None,
+        help="JSON config listing the goal-line roster (a `lines` array plus an "
+        "optional `run_root`). When set, the bridge also discovers and recovers "
+        "parked lines through their registered control entry",
+    )
     bridge_run.add_argument(
         "--kill-window-file",
         default=None,

@@ -69,6 +69,12 @@ class DecisionBridgeConfig:
     board_page_limit: int = DEFAULT_BOARD_PAGE_LIMIT
     owner_url: str | None = None
     dd_root: Path = Path("/data/fleet-graph/dd")
+    #: The line roster the production bridge may recover parked goal lines
+    #: from. Empty (the default) means the bridge recovers dd developments
+    #: only; populated, the bridge also discovers/resumes parked lines through
+    #: their registered control entry (the scheduler's stall-state files).
+    line_owners: list[Any] = field(default_factory=list)
+    line_run_root: Path = Path("/data/fleet-graph/runs")
     #: Test seam for the crash-window drill: write a sentinel at this path and
     #: hold for ``kill_window_seconds`` after the owner's answer is in hand but
     #: before the terminal seal. Off in production (None).
@@ -130,7 +136,16 @@ class DecisionBridge:
             return self.owner_source
         from fleet_graph.decision_bridge.owners import DdOwnerSource
 
-        self.owner_source = DdOwnerSource(self.config.dd_root)
+        dd_source = DdOwnerSource(self.config.dd_root)
+        if not self.config.line_owners:
+            self.owner_source = dd_source
+            return self.owner_source
+        from fleet_graph.decision_bridge.owners import CompositeOwnerSource, LineOwnerSource
+
+        line_source = LineOwnerSource(self.config.line_run_root, self.config.line_owners)
+        self.owner_source = CompositeOwnerSource(
+            [dd_source, line_source], kinds={"dd": dd_source, "line": line_source}
+        )
         return self.owner_source
 
     def _ensure_store(self) -> BridgeStore:
@@ -174,7 +189,19 @@ class DecisionBridge:
             return record.as_dict()
 
         for message in messages:
-            action = self._process_message(message)
+            try:
+                action = self._process_message(message)
+            except BridgeStoreError as exc:
+                # Fail closed, never a crash: a durability fault mid-decision
+                # must not escape ``run_once`` (which promises to never raise),
+                # and it must stop the loop rather than continue to a later
+                # message that could seal and advance the cursor past this
+                # still-unprocessed decision.
+                record.actions.append(
+                    {"action": "failed_closed:store_error", "error": str(exc)[:300]}
+                )
+                record.error = f"store error mid-cycle: {exc}"[:400]
+                break
             record.actions.append(action)
             record.owner_calls += int(action.get("owner_calls", 0))
             if action.get("logical_resume"):

@@ -257,7 +257,9 @@ class BridgeStore:
         The one and only statement that moves ``board_seq``. A terminal no-op
         receipt (zero/multiple/stale/invalid) also flows through here, so the
         cursor advances for a conclusively-considered decision exactly as it
-        does for a resumed one. Status must be terminal.
+        does for a resumed one. The cursor update is monotonic (``MAX``), so a
+        seal can never move it backwards past a decision another seal already
+        advanced it over. Status must be terminal.
         """
         status = str(receipt["status"])
         if status not in TERMINAL_STATUSES:
@@ -308,7 +310,8 @@ class BridgeStore:
             conn.execute(
                 """
                 INSERT INTO cursor (id, board_seq, updated_at) VALUES (1, ?, ?)
-                ON CONFLICT (id) DO UPDATE SET board_seq = excluded.board_seq,
+                ON CONFLICT (id) DO UPDATE SET
+                    board_seq = MAX(cursor.board_seq, excluded.board_seq),
                     updated_at = excluded.updated_at
                 """,
                 (int(advance_seq), now),

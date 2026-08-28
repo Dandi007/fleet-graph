@@ -383,7 +383,7 @@ def test_the_fake_control_plane_mirrors_the_real_surface() -> None:
         for name, _ in inspect.signature(DdControlPlane.gate).parameters.items()
         if name != "self"
     }
-    assert gate == {"development_id", "resume"}
+    assert gate == {"development_id", "resume", "action_key"}
     reconfigure = {
         name
         for name, _ in inspect.signature(DdControlPlane.reconfigure).parameters.items()

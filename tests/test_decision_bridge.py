@@ -18,6 +18,7 @@ code paths in-process with fakes.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,18 @@ import pytest
 
 from fleet_graph.bus.board import DECISION_KIND
 from fleet_graph.decision_bridge.bridge import DecisionBridge, DecisionBridgeConfig
-from fleet_graph.decision_bridge.owners import OwnerResult, OwnerSource, OwnerTarget
+from fleet_graph.decision_bridge.owners import (
+    OWNER_KIND_LINE,
+    RESUME_ALREADY_RESUMED,
+    RESUME_REFUSED,
+    RESUME_RESUMED,
+    CompositeOwnerSource,
+    DdOwnerSource,
+    LineOwnerSource,
+    OwnerResult,
+    OwnerSource,
+    OwnerTarget,
+)
 from fleet_graph.decision_bridge.resolver import (
     CATEGORY_AMBIGUOUS,
     CATEGORY_INVALID,
@@ -192,6 +204,20 @@ class TestStore:
         with pytest.raises(BridgeStoreError):
             store.cursor()
 
+    def test_seal_cursor_is_monotonic_never_backwards(self, tmp_path: Path) -> None:
+        """A later seal must not move the cursor back past a position an earlier
+        seal already advanced it over -- otherwise a skipped/mis-sealed decision
+        would be silently re-skipped. ``seal_terminal`` and ``advance_cursor``
+        both use ``MAX``, so the cursor is monotonic."""
+        store = BridgeStore(tmp_path / "db").open()
+        store.seal_terminal(_receipt("d-1", 1), advance_seq=5)
+        assert store.cursor() == 5
+        # A decision with a *lower* seq sealing after a higher one must not
+        # rewind the cursor.
+        store.seal_terminal(_receipt("d-0", 0), advance_seq=3)
+        assert store.cursor() == 5
+        store.close()
+
 
 TOMBSTONE_INTENT = {
     "source_message_id": "d-1",
@@ -204,6 +230,21 @@ TOMBSTONE_INTENT = {
     "reason": "",
     "source_event": {},
 }
+
+
+def _receipt(message_id: str, seq: int) -> dict[str, Any]:
+    return {
+        "source_message_id": message_id,
+        "action_key": f"e1:{message_id}:dd:dev-abc:1",
+        "target_kind": "dd",
+        "target_id": "dev-abc",
+        "generation": 1,
+        "question_note_id": "q-1",
+        "card_entity_id": "card-1",
+        "status": STATUS_RESUMED,
+        "reason": "",
+        "source_event": {"message_id": message_id, "channel_seq": seq},
+    }
 
 
 # --- resolver ---------------------------------------------------------------
@@ -271,6 +312,37 @@ class TestResolver:
         o.add(owner())
         resolution = resolve_decision(decision("d-1", 1, question="q-1", card="card-999"), o)
         assert resolution.category == CATEGORY_STALE
+
+    def test_a_discovery_failure_is_a_structured_noop(self) -> None:
+        """A control-plane read failure during discovery must be a *structured*
+        no-op (discovery failures named in the reason), not silently read as
+        "no waiting owner" and not a crash."""
+
+        class ExplodingOwner(OwnerSource):
+            def discover(self, question_note_id: str) -> list[OwnerTarget]:
+                raise RuntimeError("control plane down")
+
+            def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
+                return OwnerResult("refused", "unreachable")
+
+        resolution = resolve_decision(
+            decision("d-1", 1, question="q-1", card="card-1"), ExplodingOwner()
+        )
+        assert resolution.category == CATEGORY_NO_WAITING_OWNER
+        assert "discovery failures" in resolution.reason
+        assert "control plane down" in resolution.reason
+
+    def test_dd_owner_discover_re_raises_control_plane_failure(self, tmp_path: Path) -> None:
+        """DdOwnerSource must not swallow a control-plane read failure: it is a
+        discovered fact for the resolver to record, not "zero owners"."""
+        source = DdOwnerSource(tmp_path / "dd")
+
+        def failing() -> Any:
+            raise RuntimeError("control plane down")
+
+        source._control_plane = failing  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError):
+            source.discover("q-1")
 
 
 # --- bridge loop ------------------------------------------------------------
@@ -390,6 +462,242 @@ class TestBridgeLoop:
         assert record["resumed"] == 0
         assert o.logical_resumes == 0
         assert record.get("error")  # fail closed, recorded
+
+    def test_a_store_fault_mid_cycle_never_raises_and_stops(self, tmp_path: Path) -> None:
+        """A durability fault deciding one message must a) not escape
+        ``run_once`` (its contract is "never raises") and b) stop the loop, so a
+        later message's seal cannot advance the cursor past the unprocessed one."""
+        o = FakeOwner()
+        o.add(owner())
+        store = BridgeStore(tmp_path / "bridge").open()
+
+        def boom(receipt: dict[str, Any]) -> None:
+            raise BridgeStoreError("disk full")
+
+        store.record_intent = boom  # type: ignore[method-assign]
+        messages = [
+            decision("d-1", 1, question="q-1", card="card-1"),
+            decision("d-2", 2, question="q-1", card="card-1"),
+        ]
+        b = bridge(tmp_path, FakeBus(messages), o, store=store)
+        record = b.run_once()  # must not raise
+        assert record["resumed"] == 0
+        assert o.logical_resumes == 0
+        assert record.get("error")
+        # The second message was never attempted, so the cursor did not advance
+        # past the still-unprocessed first decision.
+        assert record["cursor_after"] == 0
+
+
+# --- owner-side action-key dedup (spec item 4) ------------------------------
+
+
+class TestDdOwnerSideDedup:
+    """The production dd path enforces the same durable (action_key,
+    generation) uniqueness the bridge's own receipts index enforces, so a
+    SIGKILL replay of a resume cannot launch a second recovery.
+
+    These drive the *real* ``DdControlPlane.gate`` against a recording launcher
+    -- not a mock gate -- which is the path the acceptance process drill's fake
+    owner cannot reach.
+    """
+
+    def _plane(self, tmp_path: Path) -> tuple[Any, Any]:
+        from fleet_graph.dd.control_plane import DdControlPlane
+        from fleet_graph.scheduler.launcher import LaunchResult
+
+        class RecordingLauncher:
+            dry_run = False
+
+            def __init__(self) -> None:
+                self.specs: list[Any] = []
+
+            def launch(self, spec: Any) -> Any:
+                self.specs.append(spec)
+                return LaunchResult(spec.unit_name, True, "recorded")
+
+        launcher = RecordingLauncher()
+        binding = tmp_path / "plugin-binding.json"
+        binding.write_text('{"plugin_producer": {}}', encoding="utf-8")
+        plane = DdControlPlane(
+            root=tmp_path / "dd",
+            plugin_binding=binding,
+            worktree_roots=(str(tmp_path),),
+            working_directory=str(tmp_path),
+            executable="/usr/local/bin/fleet-graph",
+            launcher=launcher,
+            unit_probe=lambda unit: False,
+            board_factory=lambda: None,
+            clock=lambda: 1_700_000_000.0,
+        )
+        return plane, launcher
+
+    def _suspended(self, plane: Any, dev: str, tmp_path: Path) -> None:
+        from fleet_graph.dd.control_plane import CHECKPOINT_FILE, RECORD_FILE, RESULT_FILE
+
+        dev_root = plane.root / dev
+        dev_root.mkdir(parents=True, exist_ok=True)
+        (dev_root / RECORD_FILE).write_text(
+            json.dumps(
+                {
+                    "development_id": dev,
+                    "generation": 1,
+                    "repo_path": str(tmp_path),
+                    "remote_url": "file:///dev/null",
+                    "remote_ref": "refs/heads/dd/dev-abc",
+                    "root_handoff_digest": "sha256:root",
+                    "target_base_commit": "0" * 40,
+                    "plugin_binding_path": str(tmp_path / "plugin-binding.json"),
+                    "card_entity_id": "card-1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (dev_root / RESULT_FILE).write_text(
+            json.dumps(
+                {
+                    "development_id": dev,
+                    "terminal": None,
+                    "awaiting": {"question_note_id": "q-1", "card_entity_id": "card-1"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (dev_root / CHECKPOINT_FILE).touch()
+
+    def test_a_duplicate_resume_claim_does_not_launch_again(self, tmp_path: Path) -> None:
+        plane, launcher = self._plane(tmp_path)
+        self._suspended(plane, "dev-abc", tmp_path)
+        action_key = "e1:d-1:dd:dev-abc:1"
+
+        first = plane.gate("dev-abc", resume=True, action_key=action_key)
+        assert first["resume"]["mode"] == "resume"
+        assert not first.get("already_resumed")
+
+        second = plane.gate("dev-abc", resume=True, action_key=action_key)
+        assert second["resume"]["already_resumed"] is True
+        assert second["already_resumed"] is True
+
+        assert len(launcher.specs) == 1  # one launch, not two
+
+    def test_distinct_action_keys_still_resume(self, tmp_path: Path) -> None:
+        plane, launcher = self._plane(tmp_path)
+        self._suspended(plane, "dev-abc", tmp_path)
+        plane.gate("dev-abc", resume=True, action_key="e1:d-1:dd:dev-abc:1")
+        third = plane.gate("dev-abc", resume=True, action_key="e1:d-2:dd:dev-abc:1")
+        assert "already_resumed" not in third.get("resume", {})
+        assert len(launcher.specs) == 2
+
+    def test_dd_owner_resume_passes_the_action_key_through(self, tmp_path: Path) -> None:
+        plane, _ = self._plane(tmp_path)
+        self._suspended(plane, "dev-abc", tmp_path)
+        source = DdOwnerSource(tmp_path / "dd")
+        target = OwnerTarget("dd", "dev-abc", 1, "q-1", "card-1", "awaiting_gate")
+        action_key = "e1:d-1:dd:dev-abc:1"
+
+        assert source.resume(target, action_key).status == RESUME_RESUMED
+        replay = source.resume(target, action_key)
+        assert replay.status == RESUME_ALREADY_RESUMED
+
+
+class TestLineOwner:
+    """The line resume owner: discovery over the scheduler's parked stall-state
+    and recovery through the registered control entry, with durable dedup."""
+
+    def _parked(self, run_root: Path, *, question: str = "q-1") -> Path:
+        stall = run_root / ".scheduler" / "wf-1.json"
+        stall.parent.mkdir(parents=True, exist_ok=True)
+        stall.write_text(
+            json.dumps(
+                {
+                    "generation": 2,
+                    "board_card_entity_id": "card-1",
+                    "board_question_note_id": question,
+                    "parked_run_id": "run-1",
+                    "parked_at": 1_700_000_000.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return stall
+
+    def test_discover_maps_a_parked_line(self, tmp_path: Path) -> None:
+        run_root = tmp_path / "runs"
+        self._parked(run_root)
+        source = LineOwnerSource(run_root, ["wf-1"])
+        targets = source.discover("q-1")
+        assert len(targets) == 1
+        target = targets[0]
+        assert target.kind == OWNER_KIND_LINE
+        assert target.id == "wf-1"
+        assert target.generation == 2
+        assert target.card_entity_id == "card-1"
+        assert target.state == "parked"
+
+    def test_discover_ignores_non_parked_or_other_question(self, tmp_path: Path) -> None:
+        run_root = tmp_path / "runs"
+        self._parked(run_root)
+        source = LineOwnerSource(run_root, ["wf-1"])
+        assert source.discover("q-other") == []
+        assert source.discover("not-parked-question") == []
+
+    def test_resume_wakes_once_and_dedups(self, tmp_path: Path) -> None:
+        run_root = tmp_path / "runs"
+        stall = self._parked(run_root)
+        source = LineOwnerSource(run_root, ["wf-1"])
+        target = source.discover("q-1")[0]
+        action_key = "e1:d-9:line:wf-1:2"
+
+        first = source.resume(target, action_key)
+        assert first.status == RESUME_RESUMED
+
+        after = json.loads(stall.read_text(encoding="utf-8"))
+        assert after["parked_run_id"] is None
+        assert after["parked_at"] is None
+
+        replay = source.resume(target, action_key)
+        assert replay.status == RESUME_ALREADY_RESUMED
+
+    def test_resume_refuses_a_stale_question(self, tmp_path: Path) -> None:
+        run_root = tmp_path / "runs"
+        self._parked(run_root, question="q-1")
+        source = LineOwnerSource(run_root, ["wf-1"])
+        stale = OwnerTarget(OWNER_KIND_LINE, "wf-1", 2, "q-other", "card-1", "parked")
+        assert source.resume(stale, "e1:d-9:line:wf-1:2").status == RESUME_REFUSED
+
+
+class TestCompositeOwner:
+    def test_discover_fans_out_and_resume_routes_by_kind(self, tmp_path: Path) -> None:
+        run_root = tmp_path / "runs"
+        stall = run_root / ".scheduler" / "wf-1.json"
+        stall.parent.mkdir(parents=True, exist_ok=True)
+        stall.write_text(
+            json.dumps(
+                {
+                    "generation": 1,
+                    "board_card_entity_id": "card-1",
+                    "board_question_note_id": "q-1",
+                    "parked_run_id": "run-1",
+                    "parked_at": 1_700_000_000.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        line = LineOwnerSource(run_root, ["wf-1"])
+
+        class NoopDd(OwnerSource):
+            def discover(self, question_note_id: str) -> list[OwnerTarget]:
+                return []
+
+            def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
+                return OwnerResult(RESUME_RESUMED, "ok")
+
+        dd = NoopDd()
+        composite = CompositeOwnerSource([dd, line], kinds={"dd": dd, "line": line})
+        targets = composite.discover("q-1")
+        assert [t.kind for t in targets] == ["line"]
+        result = composite.resume(targets[0], "e1:d-9:line:wf-1:1")
+        assert result.status == RESUME_RESUMED
 
 
 # --- the old polling fallback survives --------------------------------------
