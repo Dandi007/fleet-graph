@@ -1,0 +1,46 @@
+# systemd *user* unit for the E1 decision event bridge.
+#
+# This is the resume side of the human gate, deliberately a standalone unit:
+# it is NOT linked to fleet-graphd.service by Requires=, PartOf= or process
+# affinity, so it can be started/stopped/restarted/masked independently and a
+# fault here does not take the resident scheduler down with it (and vice
+# versa). Restart=on-failure, not always: a clean stop stays stopped (mask it
+# to disable the bridge), a fault respawns so a decision that landed while the
+# process was down is recovered by the next replay.
+#
+# Credential separation (spec item 5): this unit reads its configuration from
+# its *own* env file, not the shared `env` the scheduler and dd MCP read from.
+# The bridge only ever needs a read credential for `board:work-notes`; it must
+# never obtain FLEET_GRAPH_DECISION_TOKEN_FILE (the decision-publish credential
+# belongs to the supervisor act node alone). A token value never appears here
+# or in argv -- only a path to a 0600 file.
+#
+# `decision-bridge run` is a real subcommand, checked by
+# tests/test_decision_bridge.py the same way fleet-graphd.service is checked:
+# an invented subcommand plus Restart=on-failure would otherwise crash-loop in
+# the dark.
+[Unit]
+Description=fleet-graph E1 decision event bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/apps/fleet-graph/current
+ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph decision-bridge run \
+    --state-dir /data/fleet-graph/decision-bridge \
+    --lines-config /data/apps/fleet-graph/current/config/ronin-lines.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+# The bridge's own environment file -- not the shared one -- so the decision
+# publish credential can never leak into the resume side. Optional (`-` after
+# the `=`) so a missing env file makes the bridge record "bus unavailable"
+# instead of failing to start.
+EnvironmentFile=-%h/.config/fleet-graph/decision-bridge.env
+# The bridge execs no bun/opencode child, but it still needs the python entry on
+# a predictable PATH under the systemd user manager.
+Environment=PATH=%h/.bun/bin:%h/.local/bin:%h/.opencode/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=default.target

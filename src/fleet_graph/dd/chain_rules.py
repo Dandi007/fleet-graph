@@ -39,4 +39,25 @@ def rework_link_parent(rejecting_receipt: dict[str, Any]) -> str:
     return compute_json_digest(dict(rejecting_receipt))
 
 
-__all__ = ["REJECT", "is_rework_link", "rework_link_parent"]
+def new_attempt_is_legal(entries: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> bool:
+    """Whether a fresh continuous review -- a brand-new attempt -- may follow `entries`.
+
+    Mirrors the pinned plugin's ordering rule (`attempt-context.py:
+    check_chain_order` / `protocol_review_attempt`): a fresh continuous entry is
+    a *new attempt*, legal only as the very first entry or the entry right after
+    a REJECT. Any other predecessor -- in particular a final APPROVE, an accepted
+    chain that did not end in REJECT -- makes a fresh continuous review illegal
+    (ORDER_VIOLATION "a new attempt requires a prior REJECT").
+
+    The replayer consults this before replaying a prefix that stops at implement:
+    such a replay is always followed by a fresh continuous review, so it is only
+    safe when that review is a legal new attempt. This is deliberately the same
+    single source `supervise/audit.py`'s chain check shares, so the replay side
+    and the audit side cannot drift apart.
+    """
+    if not entries:
+        return True
+    return entries[-1].get("verdict") == REJECT
+
+
+__all__ = ["REJECT", "is_rework_link", "new_attempt_is_legal", "rework_link_parent"]
