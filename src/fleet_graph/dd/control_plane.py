@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -1176,12 +1177,23 @@ class DdControlPlane:
             "are untouchable by construction",
         }
 
-    def gate(self, development_id: str, resume: bool = False) -> dict[str, Any]:
+    def gate(
+        self,
+        development_id: str,
+        resume: bool = False,
+        action_key: str | None = None,
+    ) -> dict[str, Any]:
         """The gate's state, and -- on request -- a valueless resume.
 
         There is deliberately no decision input anywhere on this path.
         Verdicts travel only as `work.decision.v1` on the board, published by
         a human; on resume the graph re-reads the board itself.
+
+        ``action_key`` is the decision bridge's durable exactly-once claim.
+        When supplied, the gate persists a ``(action_key, generation)``
+        uniqueness constraint *before* launching, so a duplicate transport call
+        (the bridge replaying a SIGKILLed resume) returns ``already_resumed``
+        instead of launching a second real recovery for the same decision.
         """
         record = self._record(development_id)
         status = self.rebuild_status(development_id)
@@ -1218,8 +1230,52 @@ class DdControlPlane:
                 "CHECKPOINT_MISSING",
                 f"{development_id} has no durable checkpoint; there is no thread to resume",
             )
+        if action_key and not self._claim_resume_action(development_id, generation, action_key):
+            # A previous resume already claimed this exact (action_key,
+            # generation): the recovery is already in effect and must not be
+            # launched a second time.
+            gate_report["resume"] = {
+                "development_id": development_id,
+                "generation": generation,
+                "already_resumed": True,
+            }
+            gate_report["already_resumed"] = True
+            return gate_report
         gate_report["resume"] = self._launch(record, resume=True, generation=generation)
         return gate_report
+
+    def _resume_claim_path(self, development_id: str, generation: int, action_key: str) -> Path:
+        digest = hashlib.sha256(action_key.encode("utf-8")).hexdigest()
+        return (
+            self._dev_root(development_id) / "resume-claims" / f"g{generation}" / f"{digest}.json"
+        )
+
+    def _claim_resume_action(self, development_id: str, generation: int, action_key: str) -> bool:
+        """Atomically claim ``(action_key, generation)``; False when already claimed.
+
+        ``O_EXCL`` is the persistent unique constraint: two concurrent resumes of
+        the same decision cannot both claim, and the claim survives a restart, so
+        the decision bridge's SIGKILL replay can distinguish "already recovered"
+        from "recover now" without launching twice.
+        """
+        path = self._resume_claim_path(development_id, generation, action_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return False
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "development_id": development_id,
+                    "generation": generation,
+                    "action_key": action_key,
+                    "at": iso(self.clock()),
+                },
+                handle,
+                sort_keys=True,
+            )
+        return True
 
     def _committed_gate_decision(
         self, record: dict[str, Any], generation: int = 1

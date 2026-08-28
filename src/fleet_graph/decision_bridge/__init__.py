@@ -30,10 +30,13 @@ Four properties make the bridge trustworthy, and each is pinned by tests:
   or an invalid decision each seal a structured terminal no-op receipt --
   never a fuzzy guess, never an arbitrary URL/target.
 - **Owner-side action-key dedup.** The action key is exactly
-  ``e1:<source_message_id>:<target_kind>:<target_id>:<generation>``. The store
-  enforces a unique index on it, the adapter passes it through to the owner,
-  and a duplicate transport call returns the same logical success instead of
-  accepting or recovering twice.
+  ``e1:<source_message_id>:<target_kind>:<target_id>:<generation>``. The
+  bridge's store enforces a unique index on it, and the *owner* also enforces
+  the same ``(action_key, generation)`` uniqueness on its own durable surface:
+  the dd gate claims each action key before launching a resume, and the line
+  entry claims it before waking a parked run. The adapter passes the action key
+  through untouched, so a duplicate transport call returns the same logical
+  success instead of accepting or recovering twice.
 
 The bridge process is a standalone user unit
 (`fleet-graph-decision-bridge.service`), independent of `fleet-graphd.service`
@@ -49,8 +52,10 @@ from fleet_graph.decision_bridge.bridge import (
     run_decision_bridge,
 )
 from fleet_graph.decision_bridge.owners import (
+    CompositeOwnerSource,
     DdOwnerSource,
     HttpOwnerSource,
+    LineOwnerSource,
     OwnerResult,
     OwnerTarget,
 )
@@ -76,10 +81,12 @@ __all__ = [
     "TERMINAL_STATUSES",
     "BridgeStore",
     "BridgeStoreError",
+    "CompositeOwnerSource",
     "DdOwnerSource",
     "DecisionBridge",
     "DecisionBridgeConfig",
     "HttpOwnerSource",
+    "LineOwnerSource",
     "OwnerResult",
     "OwnerTarget",
     "action_key_for",

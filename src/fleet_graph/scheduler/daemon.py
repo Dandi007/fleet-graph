@@ -400,6 +400,7 @@ class Scheduler:
             "last_start_at": None,
             "generation": None,
             "board_card_entity_id": None,
+            "board_question_note_id": None,
             **_EMPTY_PARK_FIELDS,
         }
         try:
@@ -426,6 +427,11 @@ class Scheduler:
             # it survives new terminals and re-parkings, so later question
             # notes ref the same entity instead of re-publishing the card.
             "board_card_entity_id": state.get("board_card_entity_id"),
+            # The question note the line's last escalation published on the
+            # board (``work.note.v1`` question). Persisted per line, like the
+            # card, so the decision event bridge can map a ``work.decision.v1``
+            # back to the exact parked line that asked it.
+            "board_question_note_id": state.get("board_question_note_id"),
         }
 
     def _write_stall_state(self, folder_id: str, state: dict[str, Any]) -> None:
@@ -794,6 +800,8 @@ class Scheduler:
                 question=question,
                 idempotency_key=f"parked:{line.folder_id}:{record['run_id']}",
             )
+            state["board_question_note_id"] = ticket.question_note_id
+            self._write_stall_state(line.folder_id, state)
             return f"question_sent:{ticket.question_note_id}"
         except Exception as exc:  # telemetry must not bite
             return f"question_failed:{type(exc).__name__}:{str(exc)[:160]}"

@@ -22,7 +22,10 @@ never a crash, never a guess.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -93,14 +96,12 @@ class DdOwnerSource:
         return DdControlPlane(root=self.dd_root)
 
     def discover(self, question_note_id: str) -> list[OwnerTarget]:
-        try:
-            rows = (
-                self._control_plane()
-                .list(state="awaiting_gate", limit=1000)
-                .get("developments", [])
-            )
-        except Exception:
-            return []
+        # A control-plane read failure *raises* rather than reading as "no
+        # owner": the resolver turns that into a structured discovery-failure
+        # no-op, so a control-plane outage is distinguishable from a genuine
+        # zero-owner decision instead of silently sealing a no-waiting-owner
+        # receipt and advancing the cursor.
+        rows = self._control_plane().list(state="awaiting_gate", limit=1000).get("developments", [])
         targets: list[OwnerTarget] = []
         for row in rows:
             awaiting = row.get("awaiting") or {}
@@ -126,12 +127,20 @@ class DdOwnerSource:
         from fleet_graph.dd.control_plane import ControlPlaneError
 
         try:
-            result = self._control_plane().gate(target.id, resume=True)
+            result = self._control_plane().gate(target.id, resume=True, action_key=action_key)
         except ControlPlaneError as exc:
             if exc.code == "ALREADY_RUNNING":
                 # The gate is already advancing; the decision is in effect.
                 return OwnerResult(RESUME_ALREADY_RESUMED, f"{exc.code}: {exc.detail}")
             return OwnerResult(RESUME_REFUSED, f"{exc.code}: {exc.detail}")
+        if result.get("already_resumed"):
+            # The owner's durable (action_key, generation) unique constraint
+            # already fired: this recovery is already in effect for this
+            # generation, so it is the same logical success, not a second one.
+            return OwnerResult(
+                RESUME_ALREADY_RESUMED,
+                "durable action-key dedup: recovery already in effect for this generation",
+            )
         if not result.get("resume"):
             return OwnerResult(
                 RESUME_ALREADY_RESUMED, json.dumps(result, ensure_ascii=False, sort_keys=True)
@@ -190,6 +199,166 @@ class HttpOwnerSource:
         return OwnerResult(status=status, detail=str(payload.get("detail") or ""))
 
 
+#: A parked line's waiting state, mirroring resolver.WAITING_LINE_STATE. Kept as
+#: a literal here so the resolver (which imports this module) stays the single
+#: owner of that vocabulary.
+_LINE_PARKED_STATE = "parked"
+
+
+class LineOwnerSource:
+    """Recovery of a parked goal line through its registered control entry.
+
+    A line waiting on a human decision is parked by the scheduler (``blocked``
+    + ``waiting_on: "decision"``) and its first escalation asks the board a
+    question. That question note id and the parked run identity are persisted in
+    the line's stall-state file, so ``discover`` re-reads the *same* authoritative
+    state the scheduler writes -- the parked run, the waiting generation and the
+    card -- instead of guessing. ``resume`` wakes exactly that parked run through
+    the registered entry (the scheduler's stall-state file), gated on the waiting
+    run id and a durable ``(action_key, generation)`` claim, so a duplicate
+    transport call is the same logical success, never a second recovery.
+    """
+
+    def __init__(self, run_root: str | Path, lines: list[Any]) -> None:
+        self.run_root = Path(run_root)
+        self.lines = list(lines)
+
+    @staticmethod
+    def _folder_id(line: Any) -> str:
+        return str(getattr(line, "folder_id", line))
+
+    def _stall_path(self, folder_id: str) -> Path:
+        return self.run_root / ".scheduler" / f"{folder_id}.json"
+
+    def _read_state(self, folder_id: str) -> dict[str, Any]:
+        try:
+            raw = json.loads(self._stall_path(folder_id).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _generation(self, state: dict[str, Any], line: Any) -> int:
+        try:
+            return int(state.get("generation") or getattr(line, "generation", 1) or 1)
+        except (TypeError, ValueError):
+            return 1
+
+    def discover(self, question_note_id: str) -> list[OwnerTarget]:
+        targets: list[OwnerTarget] = []
+        for line in self.lines:
+            folder_id = self._folder_id(line)
+            state = self._read_state(folder_id)
+            if not state.get("parked_run_id") or state.get("parked_at") is None:
+                continue
+            if str(state.get("board_question_note_id") or "") != question_note_id:
+                continue
+            targets.append(
+                OwnerTarget(
+                    kind=OWNER_KIND_LINE,
+                    id=folder_id,
+                    generation=self._generation(state, line),
+                    question_note_id=question_note_id,
+                    card_entity_id=str(state.get("board_card_entity_id") or ""),
+                    state=_LINE_PARKED_STATE,
+                )
+            )
+        return targets
+
+    def _claim_path(self, folder_id: str, generation: int, action_key: str) -> Path:
+        digest = hashlib.sha256(action_key.encode("utf-8")).hexdigest()
+        return (
+            self.run_root
+            / ".decision-bridge"
+            / "resume-claims"
+            / folder_id
+            / f"g{generation}"
+            / f"{digest}.json"
+        )
+
+    def _claim(self, folder_id: str, generation: int, action_key: str) -> bool:
+        path = self._claim_path(folder_id, generation, action_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return False
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "action_key": action_key,
+                    "folder_id": folder_id,
+                    "generation": generation,
+                    "at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                },
+                handle,
+                sort_keys=True,
+            )
+        return True
+
+    def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
+        if not self._claim(target.id, target.generation, action_key):
+            return OwnerResult(
+                RESUME_ALREADY_RESUMED,
+                "durable action-key dedup: this line generation already recovered",
+            )
+        state = self._read_state(target.id)
+        if not state.get("parked_run_id"):
+            return OwnerResult(RESUME_REFUSED, "line is not parked")
+        if str(state.get("board_question_note_id") or "") != target.question_note_id:
+            return OwnerResult(
+                RESUME_REFUSED,
+                f"line is no longer parked on question {target.question_note_id!r}",
+            )
+        self._wake(target.id, state)
+        return OwnerResult(
+            RESUME_RESUMED, f"woke line {target.id} parked run {state.get('parked_run_id')}"
+        )
+
+    def _wake(self, folder_id: str, state: dict[str, Any]) -> None:
+        """Clear the parked snapshot through the registered entry: the normal
+        decide order takes over on the next scheduler tick. The ``park_considered``
+        marker survives so the same terminal is not immediately re-parked."""
+        cleared = {
+            **state,
+            "parked_run_id": None,
+            "parked_at": None,
+            "parked_goal_revision": None,
+            "parked_inbox_available": None,
+        }
+        path = self._stall_path(folder_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cleared, sort_keys=True), encoding="utf-8")
+
+
+class CompositeOwnerSource:
+    """Fan a discovery out to several owners and dispatch a resume by kind.
+
+    Production runs the dd owner and the line owner together: one decision note
+    can name a dd development *or* a parked line, and the bridge must resolve
+    whichever is waiting without guessing the other kind. ``resume`` routes on
+    the target's kind, so a dd target never reaches the line entry and vice
+    versa.
+    """
+
+    def __init__(
+        self, sources: list[OwnerSource], *, kinds: dict[str, OwnerSource] | None = None
+    ) -> None:
+        self.sources = list(sources)
+        self.kinds = dict(kinds or {})
+
+    def discover(self, question_note_id: str) -> list[OwnerTarget]:
+        targets: list[OwnerTarget] = []
+        for source in self.sources:
+            targets.extend(source.discover(question_note_id))
+        return targets
+
+    def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
+        source = self.kinds.get(target.kind)
+        if source is None:
+            return OwnerResult(RESUME_REFUSED, f"no owner source for kind {target.kind!r}")
+        return source.resume(target, action_key)
+
+
 __all__ = [
     "OWNER_KIND_DD",
     "OWNER_KIND_HTTP",
@@ -197,8 +366,10 @@ __all__ = [
     "RESUME_ALREADY_RESUMED",
     "RESUME_REFUSED",
     "RESUME_RESUMED",
+    "CompositeOwnerSource",
     "DdOwnerSource",
     "HttpOwnerSource",
+    "LineOwnerSource",
     "OwnerResult",
     "OwnerSource",
     "OwnerTarget",
