@@ -25,7 +25,9 @@ from conftest import git, head
 from fleet_graph.dd.bootstrap import (
     DEVELOPMENT_PATH,
     SPEC_PATH,
+    IdentityChanged,
     canonical_bytes,
+    committed_target_base,
     digest_of,
 )
 from fleet_graph.dd.control_plane import (
@@ -35,6 +37,7 @@ from fleet_graph.dd.control_plane import (
     STATUS_FILE,
     ControlPlaneError,
     DdControlPlane,
+    DdLaunchSpec,
     derive_acceptance_commands,
     derive_development_id,
 )
@@ -293,6 +296,142 @@ class TestStartAndReAdopt:
         second = plane.start(dev)
         assert second["already_running"] is True
         assert len(launcher.specs) == 1
+
+
+class TestFrozenTargetBaseForwarding:
+    """The admitted, persisted `target_base_commit` crosses into the runner's
+    argv as an explicit `--target-base`, never re-inferred from the worktree.
+
+    A worktree whose lineage already carries an older metadata commit -- a
+    previous development re-writing `.dev-dispatch/development.json` in place
+    -- makes `committed_target_base`'s `--diff-filter=A` anchor point at
+    someone else's introduction, so an untouched bootstrap blobs reads as
+    edited. Forwarding the frozen admission target sidesteps that entirely,
+    while a genuine post-bootstrap mutation is still refused.
+    """
+
+    def _legacy_metadata_repo(self, tmp_path: Path) -> Path:
+        """seed base -> a commit that introduced the identity file without a
+        frozen base (the older ancestor metadata commit, an A for the path)."""
+        repo = tmp_path / "legacy"
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        (repo / "greet.py").write_text('def greet():\n    return "hello"\n', encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "seed")
+        (repo / DEVELOPMENT_PATH).parent.mkdir(parents=True, exist_ok=True)
+        (repo / DEVELOPMENT_PATH).write_text(
+            json.dumps(
+                {
+                    "contract_version": "dev-dispatch.attempt-context/v1",
+                    "target_base_commit": "",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "legacy: metadata with no frozen base")
+        bare = tmp_path / "legacy-origin.git"
+        git(repo, "init", "-q", "--bare", str(bare))
+        git(repo, "remote", "add", "origin", str(bare))
+        return repo
+
+    def test_the_recorded_target_base_is_forwarded_as_an_explicit_arg(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        """`start` passes `--target-base <frozen>` into the generated argv, so
+        the runner gets the admission target verbatim instead of inferring it."""
+        launcher = RecordingLauncher()
+        plane = make_plane(tmp_path, launcher=launcher)
+        dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
+        record = json.loads((plane.root / dev / RECORD_FILE).read_text())
+        frozen = record["target_base_commit"]
+
+        plane.start(dev)
+        argv = launcher.specs[0].argv()
+        assert argv[argv.index("--target-base") + 1] == frozen
+        # The forwarded value is the frozen admission target, not HEAD (which
+        # has moved past it by the bootstrap commit).
+        assert frozen != head(scratch)
+
+    def test_an_older_ancestor_metadata_commit_does_not_trip_start(self, tmp_path: Path) -> None:
+        """The incident shape: a frozen admission target, untouched bootstrap
+        metadata, and an older ancestor metadata commit. The `--diff-filter=A`
+        anchor misreads the untouched bootstrap as edited -- but `start` still
+        forwards the frozen base, so the runner never touches that anchor."""
+        repo = self._legacy_metadata_repo(tmp_path)
+        freezing = head(repo)  # the seed base, frozen as the admission target
+
+        launcher = RecordingLauncher()
+        plane = make_plane(tmp_path, launcher=launcher)
+        dev = plane.create(str(repo), target_base=freezing, spec_text=SPEC)["development_id"]
+        record = json.loads((plane.root / dev / RECORD_FILE).read_text())
+        assert record["target_base_commit"] == freezing
+
+        # Reproduce the false positive the runner used to hit: the identity
+        # file is untouched since bootstrap, yet the native anchor sees an edit.
+        with pytest.raises(IdentityChanged, match="edited since bootstrap"):
+            committed_target_base(repo)
+
+        # The forward sidesteps it: start emits the frozen base as --target-base
+        # and no IDENTITY_EDITED refusal appears anywhere in its argv.
+        started = plane.start(dev)
+        assert started["started"] is True
+        argv = launcher.specs[0].argv()
+        assert "--target-base" in argv
+        assert argv[argv.index("--target-base") + 1] == freezing
+        assert all("IDENTITY_EDITED" not in a for a in argv)
+
+    def test_the_launcher_spec_emits_the_recorded_base_verbatim(self, tmp_path: Path) -> None:
+        """The argv seam: whatever the recorded admission froze is forwarded
+        verbatim, so the exact frozen id survives the systemd-run boundary."""
+        spec = DdLaunchSpec(
+            development_id="dev-x",
+            dev_root=tmp_path / "dd" / "dev-x",
+            workspace=tmp_path / "w",
+            plugin_binding=tmp_path / "b.json",
+            remote_url="u",
+            remote_ref="refs/heads/main",
+            root_digest="sha256:" + "a" * 64,
+            target_base_commit="86f929e8640b2008ae18130ba83ee91df428fc71",
+        )
+        argv = spec.argv()
+        assert argv[argv.index("--target-base") + 1] == "86f929e8640b2008ae18130ba83ee91df428fc71"
+
+    def test_a_genuine_post_bootstrap_edit_is_still_refused(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        """Forwarding must not soften immutability: a worktree whose identity
+        the graded party actually rewrote is refused, not guessed around."""
+        plane = make_plane(tmp_path)
+        plane.create(str(scratch), spec_text=SPEC)
+
+        identity = json.loads((scratch / DEVELOPMENT_PATH).read_text())
+        identity["target_base_commit"] = "d" * 40
+        (scratch / DEVELOPMENT_PATH).write_text(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        git(scratch, "add", "-A")
+        git(scratch, "commit", "-q", "-m", "feat: rewrite the identity")
+
+        # A fresh plane (no admission record to hide behind) re-derives the
+        # admission and refuses the edited identity rather than forwarding it.
+        fresh = DdControlPlane(
+            root=tmp_path / "dd-fresh",
+            plugin_binding=tmp_path / "plugin-binding.json",
+            worktree_roots=(str(tmp_path),),
+            working_directory=str(tmp_path),
+            executable="/usr/local/bin/fleet-graph",
+            launcher=RecordingLauncher(),
+            unit_probe=lambda unit: False,
+            board_factory=lambda: None,
+            clock=lambda: 1_700_000_000.0,
+        )
+        with pytest.raises(ControlPlaneError) as refused:
+            fresh.create(str(scratch), spec_text=SPEC)
+        assert refused.value.code == "IDENTITY_EDITED"
 
 
 class TestGate:
