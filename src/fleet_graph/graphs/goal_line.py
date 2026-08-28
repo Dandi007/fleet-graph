@@ -31,8 +31,15 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 
 from fleet_graph.acceptance import STATUS_ERROR, STATUS_NOT_DECLARED
+from fleet_graph.goal_interrupt.contract import (
+    DecisionInput,
+    InterruptCheckpoint,
+    prior_terminal_digest,
+    resume_key_for,
+)
 from fleet_graph.graphs.guards import LineGuards, PromptVerdict
 from fleet_graph.state.run_artifacts import WAITING_ON_DEFAULT, normalize_waiting_on
 
@@ -95,6 +102,54 @@ def n7_rejects_blocked(reason: str, overall: str) -> bool:
     return (
         claims_resume_verification_broken(reason) and overall.upper() != RESUME_VERIFICATION_BROKEN
     )
+
+
+def acknowledges_decision(result: dict[str, Any], message_id: str) -> bool:
+    """Did a just-resumed coordinator structured result acknowledge the decision?
+
+    The E2 coordinator contract (spec item 3): a resume injects a ``DecisionInput``
+    and the coordinator's *structured* result must acknowledge ``message_id`` so
+    the orchestration layer can tell "weighed this decision" from "repeated the
+    old blocker". The acknowledgement is a machine field -- never prose -- so a
+    resume that does not name the decision id is mechanically distinguishable.
+    """
+    for key in ("acknowledged_message_id", "decision_message_id"):
+        if str(result.get(key) or "") == message_id:
+            return True
+    return False
+
+
+def n7_rejects_round_zero_repark(
+    result: dict[str, Any], *, decision_message_id: str, waiting_on: str
+) -> bool:
+    """N7 (E2): reject a resume that immediately re-parks on the same blocker.
+
+    A coordinator that answers a freshly injected decision by re-declaring the
+    call's old ``blocked`` + ``waiting_on: decision`` verdict *without*
+    acknowledging the decision is repeating the prior blocker rather than
+    weighing the new contradictory mechanical fact. That is the round-zero
+    re-park the spec forbids: reject the verdict as invalid and retry, rather
+    than suspending again on facts the decision just contradicted.
+    """
+    if waiting_on != "decision":
+        return False
+    return not acknowledges_decision(result, decision_message_id)
+
+
+class DecisionInterruptPort(Protocol):
+    """The E2 side of a line: ask a question, persist the suspension, and read
+    the persisted decision back on resume. Optional -- ``None`` keeps a line on
+    the legacy parking path unchanged."""
+
+    def generation(self) -> int: ...
+
+    def ask(self, round_no: int, blocker: str) -> tuple[str, str]: ...
+
+    def persist(self, checkpoint: InterruptCheckpoint) -> None: ...
+
+    def load_resume(self, resume_key: str) -> DecisionInput | None: ...
+
+    def claim_turn(self, turn_id: str) -> bool: ...
 
 
 class Verdict(TypedDict, total=False):
@@ -190,9 +245,136 @@ class LineDeps:
     #: The prior generation's terminal.json content, injected into the round-1
     #: coordinator input when present. None means there was no prior terminal.
     prior_terminal: dict[str, Any] | None = None
+    #: The E2 decision-interrupt port. None keeps the line on the legacy
+    #: ``blocked + waiting_on=decision`` parking path unchanged; non-None routes
+    #: a human-decision wait through a durable in-graph interrupt instead.
+    interrupt: DecisionInterruptPort | None = None
 
     def now(self) -> float | None:
         return self.clock() if self.clock is not None else None
+
+
+def _coordinator_input(
+    deps: LineDeps,
+    state: LineState,
+    round_no: int,
+    *,
+    decision: DecisionInput | None = None,
+) -> dict[str, Any]:
+    """The coordinator's input for one turn, with an optional injected decision.
+
+    Shared by the normal turn and the E2 resume turn so the injected decision
+    travels through exactly the same envelope the round's facts already do. The
+    decision is the one field the resume adds: ``decision`` (the immutable
+    ``DecisionInput`` dict) plus ``resume_key``, so the coordinator can
+    acknowledge ``message_id`` and the envelope names the resume that produced it.
+    """
+    coord_input: dict[str, Any] = {
+        "folder_id": deps.folder_id,
+        "round": round_no,
+        "last_turn_output": state.get("last_turn_output", ""),
+        "bounds_remaining": {
+            "rounds_left": deps.guards.bounds.max_rounds - round_no + 1,
+            "deadline_at": deps.guards.bounds.deadline_at,
+        },
+        "inbox_messages": [],
+        "inbox_framing": INBOX_FRAMING,
+    }
+    if state.get("last_turn_status"):
+        coord_input["last_turn_status"] = state["last_turn_status"]
+    if state.get("last_acceptance"):
+        coord_input["last_acceptance"] = state["last_acceptance"]
+    if deps.resume_verification is not None:
+        coord_input["resume_verification"] = deps.resume_verification
+    if round_no == 1 and deps.prior_terminal is not None:
+        coord_input["prior_terminal"] = deps.prior_terminal
+    if decision is not None:
+        coord_input["decision"] = decision.as_dict()
+        coord_input["resume_key"] = decision.resume_key
+    return coord_input
+
+
+def _verdict_update(
+    deps: LineDeps, state: LineState, round_no: int, result: dict[str, Any]
+) -> LineState:
+    """Map a coordinator verdict to the next state, for any turn that runs one.
+
+    Shared by the normal coordinator turn and the E2 resume turn: both ask the
+    coordinator for a structured result and both must read only the declared
+    verdict (done / blocked / continue) plus the mechanical fields, never prose.
+    """
+    verdict = str(result.get("verdict", "")).strip().lower()
+
+    if verdict == TERMINAL_DONE:
+        return {"terminal": TERMINAL_DONE, "terminal_reason": str(result.get("reason", ""))}
+
+    if verdict == TERMINAL_BLOCKED:
+        reason = str(result.get("reason", ""))
+        overall = str((deps.resume_verification or {}).get("overall", ""))
+        if n7_rejects_blocked(reason, overall):
+            deps.guards.record_noop()
+            deps.artifacts.append_round(
+                {
+                    "round": round_no,
+                    "verdict": "invalid",
+                    "reason": N7_INVALID_ROUND_CODE,
+                    "injected": False,
+                }
+            )
+            return {
+                "round_no": round_no + 1,
+                "rounds_recorded": state.get("rounds_recorded", 0) + 1,
+            }
+        waiting_on, declared = normalize_waiting_on(result.get("waiting_on"))
+        update: LineState = {
+            "terminal": TERMINAL_BLOCKED,
+            "terminal_reason": reason,
+            "waiting_on": waiting_on,
+        }
+        if declared is not None:
+            update["waiting_on_declared"] = declared
+        return update
+
+    if verdict != "continue":
+        return {
+            "terminal": TERMINAL_FAULT,
+            "terminal_reason": f"unrecognised verdict {verdict!r}",
+            "pump_fault": True,
+        }
+
+    prompt = str(result.get("next_prompt", ""))
+    if not prompt.strip():
+        return {
+            "terminal": TERMINAL_FAULT,
+            "terminal_reason": "coordinator returned continue with an empty next_prompt",
+            "pump_fault": True,
+        }
+
+    check = deps.guards.check_prompt(prompt, round_no)
+    if check.verdict is not PromptVerdict.FRESH:
+        deps.guards.record_noop()
+        deps.artifacts.append_round(
+            {
+                "round": round_no,
+                "verdict": "continue",
+                "reason": check.verdict.value,
+                "prompt_sha256": check.sha256,
+                "similarity": check.similarity,
+                "injected": False,
+            }
+        )
+        return {
+            "round_no": round_no + 1,
+            "rounds_recorded": state.get("rounds_recorded", 0) + 1,
+        }
+
+    if bool(result.get("no_progress")):
+        deps.guards.record_noop()
+    else:
+        deps.guards.record_progress()
+
+    deps.guards.accept_prompt(check, prompt, round_no)
+    return {"pending_prompt": prompt, "pending_sha": check.sha256}
 
 
 def build_goal_line_graph(deps: LineDeps) -> StateGraph:
@@ -214,33 +396,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         round_no = state.get("round_no", 1)
         deps.artifacts.heartbeat(round_no, "coordinator")
 
-        coord_input: dict[str, Any] = {
-            "folder_id": deps.folder_id,
-            "round": round_no,
-            "last_turn_output": state.get("last_turn_output", ""),
-            "bounds_remaining": {
-                "rounds_left": deps.guards.bounds.max_rounds - round_no + 1,
-                "deadline_at": deps.guards.bounds.deadline_at,
-            },
-            "inbox_messages": [],
-            "inbox_framing": INBOX_FRAMING,
-        }
-        if state.get("last_turn_status"):
-            coord_input["last_turn_status"] = state["last_turn_status"]
-        if state.get("last_acceptance"):
-            # Mechanical facts from the orchestration layer's own acceptance
-            # step -- the persona instructs the coordinator to weigh these
-            # above any self-report in the worker's prose.
-            coord_input["last_acceptance"] = state["last_acceptance"]
-        if deps.resume_verification is not None:
-            # Mechanical fact, filled by the orchestration layer at generation
-            # start; carries into every round so the model never has to (or
-            # may) reconstruct it from progress narrative.
-            coord_input["resume_verification"] = deps.resume_verification
-        if round_no == 1 and deps.prior_terminal is not None:
-            # The prior generation's terminal, so round 1 does not need to
-            # rebuild the previous state from the progress narrative.
-            coord_input["prior_terminal"] = deps.prior_terminal
+        coord_input = _coordinator_input(deps, state, round_no)
 
         # Must-deliver ordering: the messages land in the durable coordinator
         # input before anything is acked. See bus/inbox.py.
@@ -252,22 +408,79 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         deps.inbox.drain_then_ack(persist)
 
         result = deps.coordinator.turn(round_no, coord_input)
-        verdict = str(result.get("verdict", "")).strip().lower()
+        return _verdict_update(deps, state, round_no, result)
 
-        if verdict == TERMINAL_DONE:
-            return {
-                "terminal": TERMINAL_DONE,
-                "terminal_reason": str(result.get("reason", "")),
-            }
+    def decision_interrupt(state: LineState) -> LineState:
+        """E2: park an open human question as a durable in-graph interrupt.
+
+        Reached only when ``deps.interrupt`` is set and the coordinator declared
+        ``blocked`` with ``waiting_on: "decision"``. It atomically persists the
+        interrupt checkpoint (spec item 1), then suspends with ``interrupt(payload)``.
+
+        On resume the *same* node re-executes: ``interrupt(payload)`` returns the
+        resume marker instead of raising, the persisted ``DecisionInput`` is read
+        back, injected into a fresh coordinator envelope (spec item 3), and the
+        coordinator is re-invoked on the same ``round_no`` -- no new round, no
+        generation bump, no re-park unless the decision is genuinely stale.
+        """
+        round_no = state.get("round_no", 1)
+        blocker = state.get("terminal_reason", "")
+        assert deps.interrupt is not None
+
+        question_note_id, card_entity_id = deps.interrupt.ask(round_no, blocker)
+        generation = deps.interrupt.generation()
+        resume_key = resume_key_for(deps.folder_id, generation, question_note_id)
+        checkpoint = InterruptCheckpoint(
+            folder_id=deps.folder_id,
+            generation=generation,
+            round_id=round_no,
+            question_note_id=question_note_id,
+            card_entity_id=card_entity_id,
+            prior_terminal_digest=prior_terminal_digest(deps.prior_terminal),
+            resume_key=resume_key,
+        )
+        deps.interrupt.persist(checkpoint)
+
+        # First execution suspends here; a resume returns the marker and falls
+        # through to the decision-injection path below.
+        interrupt({"interrupt": checkpoint.as_dict()})
+
+        decision = deps.interrupt.load_resume(resume_key)
+        if decision is None:
+            # Resumed without a recorded decision: nothing to inject, so the
+            # suspension is re-entered rather than continuing on stale facts.
+            interrupt({"interrupt": checkpoint.as_dict()})
+
+        coord_input = _coordinator_input(deps, state, round_no, decision=decision)
+        if deps.persist_coord_input is not None:
+            deps.persist_coord_input(round_no, coord_input)
+
+        # The turn charge is claimed exactly once per (resume_key, round): the
+        # resume's model invocation is the one charge, and a crash-then-restart
+        # re-executes this node to a False claim (re-adopt, not a second charge).
+        deps.interrupt.claim_turn(f"{resume_key}:turn:{round_no}")
+
+        result = deps.coordinator.turn(round_no, coord_input)
+        verdict = str(result.get("verdict", "")).strip().lower()
+        # The pre-resume blocked verdict is still sitting in the checkpoint's
+        # state; anything the resume node returns that means "keep going" must
+        # clear it, or after_coordinator re-reads the stale terminal and routes
+        # straight back into the interrupt.
+        cleared: LineState = {
+            "terminal": None,
+            "terminal_reason": None,
+            "waiting_on": None,
+            "waiting_on_declared": None,
+        }
         if verdict == TERMINAL_BLOCKED:
-            reason = str(result.get("reason", ""))
-            overall = str((coord_input.get("resume_verification") or {}).get("overall", ""))
-            if n7_rejects_blocked(reason, overall):
-                # N7: the model self-reports a BROKEN recovery verification the
-                # mechanical envelope contradicts. Reject the round as invalid
-                # and retry -- it must never park on a verdict the envelope's
-                # own fact disproves. The noop streak still counts it, so a
-                # serial fabricator hits the breaker rather than looping forever.
+            waiting_on, _ = normalize_waiting_on(result.get("waiting_on"))
+            if n7_rejects_round_zero_repark(
+                result, decision_message_id=decision.message_id, waiting_on=waiting_on
+            ):
+                # N7: the coordinator re-declared the same old blocked+decision
+                # verdict without acknowledging the decision just injected. The
+                # new contradictory mechanical fact is being ignored -- reject
+                # the round rather than suspending again on facts it contradicted.
                 deps.guards.record_noop()
                 deps.artifacts.append_round(
                     {
@@ -278,68 +491,11 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
                     }
                 )
                 return {
+                    **cleared,
                     "round_no": round_no + 1,
                     "rounds_recorded": state.get("rounds_recorded", 0) + 1,
                 }
-            # The one machine field read off a blocked verdict beyond the
-            # verdict itself. Unknown values normalise to "none" and are
-            # preserved verbatim -- a coordinator inventing a new value must
-            # not fault the line, because parking is an optimisation the
-            # scheduler may skip, never a judgement on the work.
-            waiting_on, declared = normalize_waiting_on(result.get("waiting_on"))
-            update: LineState = {
-                "terminal": TERMINAL_BLOCKED,
-                "terminal_reason": reason,
-                "waiting_on": waiting_on,
-            }
-            if declared is not None:
-                update["waiting_on_declared"] = declared
-            return update
-        if verdict != "continue":
-            # An unrecognised verdict is a coordinator fault, not something to
-            # interpret. Guessing here would be exactly the INV-3 violation
-            # this layer exists to avoid.
-            return {
-                "terminal": TERMINAL_FAULT,
-                "terminal_reason": f"unrecognised verdict {verdict!r}",
-                "pump_fault": True,
-            }
-
-        prompt = str(result.get("next_prompt", ""))
-        if not prompt.strip():
-            return {
-                "terminal": TERMINAL_FAULT,
-                "terminal_reason": "coordinator returned continue with an empty next_prompt",
-                "pump_fault": True,
-            }
-
-        check = deps.guards.check_prompt(prompt, round_no)
-        if check.verdict is not PromptVerdict.FRESH:
-            # Refuse to inject, count it as a no-op round, and let the streak
-            # limit decide whether the line is going anywhere.
-            deps.guards.record_noop()
-            deps.artifacts.append_round(
-                {
-                    "round": round_no,
-                    "verdict": "continue",
-                    "reason": check.verdict.value,
-                    "prompt_sha256": check.sha256,
-                    "similarity": check.similarity,
-                    "injected": False,
-                }
-            )
-            return {
-                "round_no": round_no + 1,
-                "rounds_recorded": state.get("rounds_recorded", 0) + 1,
-            }
-
-        if bool(result.get("no_progress")):
-            deps.guards.record_noop()
-        else:
-            deps.guards.record_progress()
-
-        deps.guards.accept_prompt(check, prompt, round_no)
-        return {"pending_prompt": prompt, "pending_sha": check.sha256}
+        return {**cleared, **_verdict_update(deps, state, round_no, result)}
 
     def worker_turn(state: LineState) -> LineState:
         round_no = state.get("round_no", 1)
@@ -418,7 +574,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             rounds=state.get("rounds_recorded", 0),
             reason=state.get("terminal_reason") or None,
             pump_fault=bool(state.get("pump_fault", False)),
-            waiting_on=state.get("waiting_on", WAITING_ON_DEFAULT),
+            waiting_on=state.get("waiting_on") or WAITING_ON_DEFAULT,
             waiting_on_declared=state.get("waiting_on_declared"),
         )
         return {}
@@ -428,6 +584,15 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
 
     def after_coordinator(state: LineState) -> str:
         if state.get("terminal"):
+            if (
+                deps.interrupt is not None
+                and state.get("terminal") == TERMINAL_BLOCKED
+                and state.get("waiting_on") == "decision"
+            ):
+                # A human-decision wait routes through the E2 interrupt rather
+                # than the legacy parking terminal; without the port the line
+                # keeps its unchanged blocked+parked path.
+                return "decision_interrupt"
             return "finalise"
         if state.get("pending_prompt"):
             return "worker_turn"
@@ -440,10 +605,14 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     graph.add_node("worker_turn", worker_turn)
     graph.add_node("acceptance_step", acceptance_step)
     graph.add_node("finalise", finalise)
+    graph.add_node("decision_interrupt", decision_interrupt)
 
     graph.add_edge(START, "check_bounds")
     graph.add_conditional_edges("check_bounds", after_bounds)
     graph.add_conditional_edges("coordinator_turn", after_coordinator)
+    # The interrupt node resumes into the same round's coordinator result, so it
+    # routes exactly like a coordinator turn.
+    graph.add_conditional_edges("decision_interrupt", after_coordinator)
     # Unconditional: the facts are gathered even after a worker timeout --
     # they are cheap, and the coordinator judging a timeout deserves them too.
     graph.add_edge("worker_turn", "acceptance_step")
@@ -461,9 +630,12 @@ __all__ = [
     "TERMINAL_DONE",
     "TERMINAL_FAULT",
     "AcceptancePort",
+    "DecisionInterruptPort",
     "LineDeps",
     "LineState",
+    "acknowledges_decision",
     "build_goal_line_graph",
     "claims_resume_verification_broken",
     "n7_rejects_blocked",
+    "n7_rejects_round_zero_repark",
 ]
