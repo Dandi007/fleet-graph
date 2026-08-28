@@ -556,6 +556,73 @@ def _supervisor_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _decision_bridge_run(args: argparse.Namespace) -> int:
+    """The resident decision bridge: read verdicts, resolve, recover, seal.
+
+    Read-only against the bus (``GET .../messages`` only); the recovery call
+    goes through the owner's controlled entry (dd gate resume, or an HTTP owner
+    for the isolated drill). One JSON line per cycle on stdout.
+    """
+    import pathlib
+
+    from fleet_graph.decision_bridge.bridge import DecisionBridge, DecisionBridgeConfig
+    from fleet_graph.decision_bridge.owners import HttpOwnerSource
+
+    owner_source = None
+    if args.owner_url:
+        owner_source = HttpOwnerSource(args.owner_url)
+
+    bridge = DecisionBridge(
+        DecisionBridgeConfig(
+            state_dir=pathlib.Path(args.state_dir),
+            poll_interval_seconds=args.poll_interval,
+            board_page_limit=args.page_limit,
+            owner_url=args.owner_url,
+            dd_root=pathlib.Path(args.dd_root),
+            kill_window_file=pathlib.Path(args.kill_window_file) if args.kill_window_file else None,
+            kill_window_seconds=args.kill_window_seconds,
+        ),
+        bus=_build_bridge_bus(args),
+        owner_source=owner_source,
+    )
+    bridge.run_forever(
+        observe=lambda record: print(
+            json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True
+        ),
+        ticks=args.ticks,
+    )
+    return 0
+
+
+def _build_bridge_bus(args: argparse.Namespace):
+    """The read-only bus client for the bridge. None on missing credential --
+    observation is optional, recovery discipline is not."""
+    try:
+        from fleet_graph.bus.client import BusClient
+
+        return BusClient(base_url=args.bus_url)
+    except Exception:
+        return None
+
+
+def _decision_bridge_status(args: argparse.Namespace) -> int:
+    """Dump the bridge's durable state: cursor plus one receipt per source."""
+    import pathlib
+
+    from fleet_graph.decision_bridge.store import BridgeStore, BridgeStoreError
+
+    try:
+        store = BridgeStore(pathlib.Path(args.state_dir)).open()
+        payload = {"cursor": store.cursor(), "receipts": store.receipts()}
+        store.close()
+    except BridgeStoreError as exc:
+        print(f"decision-bridge store unusable: {exc}", file=sys.stderr)
+        return 1
+    json.dump(payload, sys.stdout, ensure_ascii=False, indent=1)
+    sys.stdout.write("\n")
+    return 0
+
+
 def _arbiter_run(args: argparse.Namespace) -> int:
     """One A2 tick: triage, reason, and (only with --publish) post suggestions.
 
@@ -829,6 +896,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="publish suggestions to the board (off by default: dry-run)",
     )
     arbiter_run.set_defaults(func=_arbiter_run)
+
+    decision_bridge = subparsers.add_parser(
+        "decision-bridge",
+        help="the E1 decision event bridge (read verdicts, recover waiting owners)",
+    )
+    decision_bridge_sub = decision_bridge.add_subparsers()
+    bridge_run = decision_bridge_sub.add_parser(
+        "run", help="poll the board and recover owners, one JSON line per cycle"
+    )
+    bridge_run.add_argument("--bus-url", default=DEFAULT_BUS_URL)
+    bridge_run.add_argument(
+        "--state-dir",
+        default="/data/fleet-graph/decision-bridge",
+        help="the bridge's own durable state root (holds bridge.sqlite3)",
+    )
+    bridge_run.add_argument("--poll-interval", type=float, default=1.0)
+    bridge_run.add_argument("--page-limit", type=int, default=200)
+    bridge_run.add_argument(
+        "--owner-url",
+        default=None,
+        help="recover through this HTTP owner instead of the dd control plane "
+        "(the isolated drill's fake owner)",
+    )
+    bridge_run.add_argument("--dd-root", default="/data/fleet-graph/dd")
+    bridge_run.add_argument(
+        "--kill-window-file",
+        default=None,
+        help="test seam: write a sentinel here and hold after the owner answers "
+        "but before the terminal seal (crash-window drill)",
+    )
+    bridge_run.add_argument("--kill-window-seconds", type=float, default=2.0)
+    bridge_run.add_argument(
+        "--ticks",
+        type=int,
+        default=None,
+        help="run this many cycles then exit (default: forever)",
+    )
+    bridge_run.set_defaults(func=_decision_bridge_run)
+
+    bridge_status = decision_bridge_sub.add_parser(
+        "status", help="dump the bridge's cursor and receipts as JSON"
+    )
+    bridge_status.add_argument("--state-dir", default="/data/fleet-graph/decision-bridge")
+    bridge_status.set_defaults(func=_decision_bridge_status)
 
     supervisor = subparsers.add_parser(
         "supervisor", help="the event-triggered supervisor graph (audits, no verdicts)"
