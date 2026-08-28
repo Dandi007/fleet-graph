@@ -254,7 +254,6 @@ def scenario_legacy_owner_fallback(work_dir: Path) -> dict[str, Any]:
         referenced_question_ids=["q-1"],
         question_texts={"q-1": "line wf-abc needs a decision"},
         legacy_owners=[unique],
-        generation=2,
     )
     unique_ok = (
         resolved.outcome == LEGACY_OUTCOME_RESOLVED
@@ -270,7 +269,6 @@ def scenario_legacy_owner_fallback(work_dir: Path) -> dict[str, Any]:
             OwnerTarget("line", "wf-abc", 2, "", "card-1", "parked"),
             OwnerTarget("line", "wf-abc", 3, "", "card-1", "parked"),
         ],
-        generation=2,
     )
     ambiguous_ok = ambiguous.outcome == LEGACY_OUTCOME_AMBIGUOUS and ambiguous.target is None
 
@@ -299,10 +297,13 @@ def scenario_cursor_compensation(work_dir: Path) -> dict[str, Any]:
             "prior_terminal_digest": "d",
         }
     )
-    # The decision is served only through the reverse refs -- the cursor has
-    # already paged past it. Recovery must come from the chain, not the cursor.
+    # The decision is served only through the reverse refs, and the cursor has
+    # already paged past its position (seq 9): recovery comes from the chain,
+    # never by rolling the cursor back.
     bus = FakeBus([decision_message("d-missed", 9)])
     bus.link(QUESTION_ID, "d-missed")
+    store.advance_cursor(10)
+    cursor_before = store.cursor()
 
     resumes: list[DecisionInput] = []
     bridge = GoalInterruptBridge(
@@ -310,7 +311,6 @@ def scenario_cursor_compensation(work_dir: Path) -> dict[str, Any]:
     )
     record = bridge.run_once()
     compensation = store.compensation_receipt(RESUME_KEY)
-    cursor_before = store.cursor()
 
     passed = bool(
         record["resumed"] == 1
@@ -326,6 +326,7 @@ def scenario_cursor_compensation(work_dir: Path) -> dict[str, Any]:
         resumed=record["resumed"],
         recovered=[d.message_id for d in resumes],
         compensation_last=compensation["last_decision_message_id"] if compensation else None,
+        cursor_before=cursor_before,
         cursor=store.cursor(),
     )
 

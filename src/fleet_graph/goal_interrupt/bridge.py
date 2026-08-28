@@ -23,16 +23,14 @@ invocation: the resume receipt and the per-turn usage ledger dedup both.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from fleet_graph.bus.board import DECISION_KINDS
-from fleet_graph.goal_interrupt.resolver import (
-    compensate_decision,
-    decision_input_from_message,
-)
+from fleet_graph.goal_interrupt.resolver import decision_input_from_message
 from fleet_graph.goal_interrupt.store import GoalInterruptStore
 
 DEFAULT_BOARD_PAGE_LIMIT = 200
@@ -105,22 +103,29 @@ class GoalInterruptBridge:
             if isinstance(ref, dict)
         ]
 
-    def _resume_question(self, interrupt: dict[str, Any], decision: dict[str, Any]) -> str:
+    def _cursor(self) -> int:
+        try:
+            return self.store.cursor()
+        except Exception:
+            return 0
+
+    def _board_head(self) -> int:
+        if self.bus is None:
+            return 0
+        try:
+            _messages, head = self.bus.messages(WORK_NOTES, limit=self.config.board_page_limit)
+            return int(head or 0)
+        except Exception:
+            return 0
+
+    def _resume_question(
+        self, interrupt: dict[str, Any], decision: dict[str, Any], *, prior_cursor: int
+    ) -> str:
         question_note_id = str(interrupt["question_note_id"])
         resume_key = str(interrupt["resume_key"])
-        compensation = self.store.compensation_receipt(resume_key)
-        last_message_id = (
-            str(compensation["last_decision_message_id"]) if compensation is not None else ""
-        )
-        _newest, needs_compensation = compensate_decision(
-            [decision], last_decision_message_id=last_message_id
-        )
-        if needs_compensation:
-            self.store.record_compensation(
-                resume_key,
-                str(decision.get("message_id") or ""),
-                int(decision.get("channel_seq") or 0),
-            )
+        seq = int(decision.get("channel_seq") or 0)
+        message_id = str(decision.get("message_id") or "")
+
         decision_input = decision_input_from_message(
             decision,
             resume_key=resume_key,
@@ -128,6 +133,16 @@ class GoalInterruptBridge:
             card_entity_id=str(interrupt.get("card_entity_id") or ""),
             references=self._references(question_note_id),
         )
+
+        # Cursor compensation (spec item 7): a decision sitting at or behind the
+        # cursor position this cycle started from is one the cursor has already
+        # paged past -- an event-page or restart gap -- so a local receipt is
+        # recorded. A decision ahead of the cursor is observed in order and is
+        # not a compensation. The receipt is forward-monotonic, so a replayed
+        # decision can never roll it back or duplicate it.
+        if seq <= prior_cursor:
+            self.store.record_compensation(resume_key, message_id, seq)
+
         return self.resumer(decision_input)
 
     # --- the cycle ----------------------------------------------------------
@@ -139,6 +154,12 @@ class GoalInterruptBridge:
         except Exception as exc:  # fail closed: durable state unreadable
             record["error"] = f"{type(exc).__name__}: {exc}"[:400]
             return record
+
+        # Cursor compensation bookkeeping: remember the cursor position the
+        # cycle started from so a decision behind it is a recoverable gap, and
+        # drive the cursor forward (monotonic, never backwards) after processing.
+        prior_cursor = self._cursor()
+        head = self._board_head()
 
         for interrupt in interrupts:
             if self.store.resume_receipt(str(interrupt["resume_key"])) is not None:
@@ -153,7 +174,7 @@ class GoalInterruptBridge:
                 )
                 continue
             try:
-                status = self._resume_question(interrupt, chain[0])
+                status = self._resume_question(interrupt, chain[0], prior_cursor=prior_cursor)
             except Exception as exc:  # never crash, never a second invoke
                 record["actions"].append(
                     {
@@ -167,6 +188,10 @@ class GoalInterruptBridge:
                 {"resume_key": interrupt["resume_key"], "action": f"resumed:{status}"}
             )
             record["resumed"] += 1
+
+        # Cursor evidence is never worth crashing the cycle.
+        with contextlib.suppress(Exception):
+            self.store.advance_cursor(head)
         return record
 
     def run_forever(

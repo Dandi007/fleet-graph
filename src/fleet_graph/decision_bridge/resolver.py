@@ -56,6 +56,11 @@ class Resolution:
     target: OwnerTarget | None = None
     question_note_id: str = ""
     card_entity_id: str = ""
+    #: True when this resolution came from the bounded legacy-owner fallback
+    #: (spec item 6). The bridge records ``legacy_owner_resolution`` durably on
+    #: the receipt so an operator can tell a legacy recovery apart from the
+    #: normal question-id path.
+    legacy: bool = False
 
     @property
     def ok(self) -> bool:
@@ -127,6 +132,7 @@ def resolve_decision(
     *,
     refs_to: Callable[[str], list[dict[str, Any]]] | None = None,
     channel_id: str | None = None,
+    question_texts: dict[str, str] | None = None,
 ) -> Resolution:
     """Map one board message to at most one waiting owner.
 
@@ -137,6 +143,15 @@ def resolve_decision(
     establish references and resolves nothing. Validation failures,
     zero/multiple matches, and stale owners are all terminal no-op categories
     with a structured reason.
+
+    ``question_texts`` (optional) opens the bounded legacy-owner fallback (spec
+    item 6): a map of question-note id -> immutable note text the caller has
+    read from the board. When a decision finds no waiting owner through the
+    normal question-id path but there are legacy parked owners with no persisted
+    question id, the resolver falls back to matching one decision ref to one
+    question whose text carries the exact ``folder_id`` of exactly one
+    non-terminal legacy owner. Zero/multiple matches stay a safe
+    ``legacy_owner_ambiguous`` no-resume; no question id is ever fabricated.
     """
     if channel_id is not None and channel_id != WORK_NOTES:
         return Resolution(
@@ -159,11 +174,11 @@ def resolve_decision(
             f" (discovery failures: {type(exc).__name__}: {exc})",
         )
 
-    referenced = _referenced_questions(
-        message_id,
-        list({target.question_note_id for target in waiting}),
-        refs_to,
-    )
+    candidate_ids = list({target.question_note_id for target in waiting if target.question_note_id})
+    if question_texts:
+        candidate_ids = list(dict.fromkeys(candidate_ids + list(question_texts)))
+
+    referenced = _referenced_questions(message_id, candidate_ids, refs_to)
 
     matches = [target for target in waiting if target.question_note_id in referenced]
 
@@ -175,6 +190,9 @@ def resolve_decision(
     matches = list(unique.values())
 
     if not matches:
+        legacy = _legacy_resolve(waiting, referenced, refs_to, question_texts)
+        if legacy is not None:
+            return legacy
         return Resolution(CATEGORY_NO_WAITING_OWNER, "no waiting owner references this question")
 
     if len(matches) > 1:
@@ -195,6 +213,60 @@ def resolve_decision(
         target=target,
         question_note_id=target.question_note_id,
         card_entity_id=target.card_entity_id,
+    )
+
+
+def _legacy_resolve(
+    waiting: list[OwnerTarget],
+    referenced: set[str],
+    refs_to: Callable[[str], list[dict[str, Any]]] | None,
+    question_texts: dict[str, str] | None,
+) -> Resolution | None:
+    """The bounded legacy-owner fallback (spec item 6), or None.
+
+    Only fires when the normal question-id path found no owner. Legacy owners are
+    parked lines whose ``question_note_id`` was never persisted; the fallback
+    re-finds them by matching a referenced question's immutable text against the
+    owner's own folder id. ``None`` means "not applicable" (no legacy owner, no
+    question text, or no reverse ref), which the caller turns into the normal
+    no-waiting-owner no-op.
+    """
+    if not question_texts or refs_to is None:
+        return None
+    legacy_owners = [t for t in waiting if not t.question_note_id]
+    if not legacy_owners:
+        return None
+    from fleet_graph.goal_interrupt.resolver import (
+        LEGACY_OUTCOME_AMBIGUOUS,
+        legacy_owner_fallback,
+    )
+
+    resolved: list[tuple[OwnerTarget, str]] = []
+    for folder_id in sorted({t.id for t in legacy_owners if t.id}):
+        outcome = legacy_owner_fallback(
+            folder_id=folder_id,
+            referenced_question_ids=list(referenced),
+            question_texts=question_texts,
+            legacy_owners=legacy_owners,
+        )
+        if outcome.resolved and outcome.target is not None:
+            resolved.append((outcome.target, outcome.question_note_id))
+
+    if len(resolved) != 1:
+        return Resolution(
+            CATEGORY_NO_WAITING_OWNER,
+            LEGACY_OUTCOME_AMBIGUOUS,
+            legacy=True,
+        )
+
+    target, question_note_id = resolved[0]
+    return Resolution(
+        CATEGORY_OK,
+        "legacy_owner_resolution",
+        target=target,
+        question_note_id=question_note_id,
+        card_entity_id=target.card_entity_id,
+        legacy=True,
     )
 
 

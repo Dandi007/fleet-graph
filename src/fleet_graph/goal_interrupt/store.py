@@ -72,6 +72,12 @@ CREATE TABLE IF NOT EXISTS turn_usage (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS turn_results (
+    turn_id TEXT PRIMARY KEY,
+    result TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS cursor (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     board_seq INTEGER NOT NULL,
@@ -359,6 +365,56 @@ class GoalInterruptStore:
         except sqlite3.Error as exc:
             raise GoalInterruptStoreError(f"goal-interrupt turn usage unreadable: {exc}") from exc
         return int(row["model_invocations"]) if row is not None else 0
+
+    def record_turn_result(self, turn_id: str, result: dict[str, Any]) -> None:
+        """Persist one coordinator turn's result, keyed by ``turn_id``.
+
+        This is the durable half of the no-second-invocation guard: once a turn
+        is claimed and its coordinator result is in hand, the result is written
+        back so a duplicate delivery or a crash-and-restart that re-enters the
+        interrupt node can re-adopt the same result instead of invoking the
+        coordinator (and the model) a second time. Re-recording the same
+        ``turn_id`` is idempotent (an UPSERT), never a second charge.
+        """
+        now = _iso(self._clock())
+        conn = self._require_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO turn_results (turn_id, result, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (turn_id) DO UPDATE SET
+                    result = excluded.result,
+                    updated_at = excluded.updated_at
+                """,
+                (str(turn_id), json.dumps(result, sort_keys=True), now, now),
+            )
+            conn.execute("COMMIT")
+        except (sqlite3.Error, OSError) as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            raise GoalInterruptStoreError(
+                f"goal-interrupt turn result write failed: {exc}"
+            ) from exc
+
+    def turn_result(self, turn_id: str) -> dict[str, Any] | None:
+        conn = self._require_conn()
+        try:
+            row = conn.execute(
+                "SELECT result FROM turn_results WHERE turn_id = ?", (turn_id,)
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise GoalInterruptStoreError(
+                f"goal-interrupt turn result unreadable for {turn_id}: {exc}"
+            ) from exc
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["result"])
+        except (ValueError, TypeError):
+            return None
+        return payload if isinstance(payload, dict) else None
 
     # --- board cursor -----------------------------------------------------
 

@@ -340,7 +340,6 @@ class TestResolver:
             referenced_question_ids=["q-1"],
             question_texts={"q-1": "line wf-abc needs a human decision"},
             legacy_owners=[owner],
-            generation=2,
         )
         assert resolution.outcome == LEGACY_OUTCOME_RESOLVED
         assert resolution.target is not None and resolution.target.id == "wf-abc"
@@ -356,7 +355,6 @@ class TestResolver:
             referenced_question_ids=["q-1"],
             question_texts={"q-1": "line wf-abc question"},
             legacy_owners=owners,
-            generation=2,
         )
         assert resolution.outcome == LEGACY_OUTCOME_AMBIGUOUS
         assert resolution.target is None
@@ -369,7 +367,6 @@ class TestResolver:
             referenced_question_ids=["q-1"],
             question_texts={"q-1": "some other line's question"},
             legacy_owners=[owner],
-            generation=2,
         )
         assert resolution.outcome == LEGACY_OUTCOME_AMBIGUOUS
 
@@ -380,7 +377,6 @@ class TestResolver:
             referenced_question_ids=["q-1"],
             question_texts={"q-1": "line wf-abc question"},
             legacy_owners=[owner],
-            generation=2,
         )
         assert resolution.outcome == LEGACY_OUTCOME_AMBIGUOUS
 
@@ -492,7 +488,7 @@ class TestRuntimeDedup:
 
 
 class TestBridge:
-    def test_bridge_resumes_a_suspended_question_and_records_compensation(
+    def test_bridge_records_compensation_for_a_decision_behind_the_cursor(
         self, tmp_path: Path
     ) -> None:
         store = GoalInterruptStore(tmp_path / "gi").open()
@@ -507,6 +503,9 @@ class TestBridge:
                 "prior_terminal_digest": "d",
             }
         )
+        # The cursor has already paged past the decision's position (a restart
+        # or event-page gap), so recovering it records a compensation receipt.
+        store.advance_cursor(5)
         bus = FakeBus([decision("d-1", 1)])
         bus.link(QUESTION_ID, "d-1")
 
@@ -526,6 +525,42 @@ class TestBridge:
         assert async_resumes[0].message_id == "d-1"
         assert async_resumes[0].resume_key == RESUME_KEY
         assert store.compensation_receipt(RESUME_KEY)["last_decision_message_id"] == "d-1"
+        assert store.cursor() >= 5  # never rolled back
+
+    def test_bridge_does_not_record_compensation_when_observed_in_order(
+        self, tmp_path: Path
+    ) -> None:
+        """A decision still ahead of the cursor is an ordinary in-order resume,
+        not a compensated gap: no cursor_compensation receipt is recorded."""
+        store = GoalInterruptStore(tmp_path / "gi").open()
+        store.put_interrupt(
+            {
+                "resume_key": RESUME_KEY,
+                "folder_id": "wf-1",
+                "generation": 1,
+                "round_id": 1,
+                "question_note_id": QUESTION_ID,
+                "card_entity_id": "card-1",
+                "prior_terminal_digest": "d",
+            }
+        )
+        bus = FakeBus([decision("d-1", 1)])
+        bus.link(QUESTION_ID, "d-1")
+
+        resumes: list[str] = []
+
+        def resumer(decision_input: DecisionInput) -> str:
+            resumes.append(decision_input.message_id)
+            return "resumed"
+
+        bridge = GoalInterruptBridge(
+            GoalInterruptBridgeConfig(), store=store, bus=bus, resumer=resumer
+        )
+        record = bridge.run_once()
+
+        assert record["resumed"] == 1
+        assert resumes == ["d-1"]
+        assert store.compensation_receipt(RESUME_KEY) is None
 
     def test_bridge_recovers_a_decision_the_cursor_missed(self, tmp_path: Path) -> None:
         """Cursor compensation: the decision is served only through the reverse
@@ -543,6 +578,9 @@ class TestBridge:
                 "prior_terminal_digest": "d",
             }
         )
+        # The cursor is already past seq 9; the decision at 9 is recovered from
+        # the chain (never by rolling the cursor back).
+        store.advance_cursor(10)
         bus = FakeBus([decision("d-missed", 9)])
         bus.link(QUESTION_ID, "d-missed")
 
@@ -559,6 +597,7 @@ class TestBridge:
 
         assert resumes == ["d-missed"]
         assert store.compensation_receipt(RESUME_KEY)["last_decision_message_id"] == "d-missed"
+        assert store.cursor() >= 10  # never rolled back
 
     def test_bridge_skips_an_already_resumed_question(self, tmp_path: Path) -> None:
         store = GoalInterruptStore(tmp_path / "gi").open()

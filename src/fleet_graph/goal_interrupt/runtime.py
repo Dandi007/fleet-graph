@@ -88,6 +88,12 @@ class LineInterruptPort:
     def persist(self, checkpoint: InterruptCheckpoint) -> None:
         self.store.put_interrupt(checkpoint.as_dict())
 
+    def record_turn_result(self, turn_id: str, result: dict[str, Any]) -> None:
+        self.store.record_turn_result(turn_id, result)
+
+    def turn_result(self, turn_id: str) -> dict[str, Any] | None:
+        return self.store.turn_result(turn_id)
+
     def load_resume(self, resume_key: str) -> DecisionInput | None:
         receipt = self.store.resume_receipt(resume_key)
         if receipt is None:

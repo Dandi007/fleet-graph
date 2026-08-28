@@ -120,7 +120,12 @@ def acknowledges_decision(result: dict[str, Any], message_id: str) -> bool:
 
 
 def n7_rejects_round_zero_repark(
-    result: dict[str, Any], *, decision_message_id: str, waiting_on: str
+    result: dict[str, Any],
+    *,
+    decision_message_id: str,
+    waiting_on: str,
+    prior_terminal_digest: str | None = None,
+    current_prior_terminal_digest: str | None = None,
 ) -> bool:
     """N7 (E2): reject a resume that immediately re-parks on the same blocker.
 
@@ -130,10 +135,21 @@ def n7_rejects_round_zero_repark(
     weighing the new contradictory mechanical fact. That is the round-zero
     re-park the spec forbids: reject the verdict as invalid and retry, rather
     than suspending again on facts the decision just contradicted.
+
+    The blocker being the *same* prior terminal is not trusted to prose: when
+    the caller supplies both the persisted ``prior_terminal_digest`` from the
+    interrupt checkpoint and the current ``prior_terminal_digest`` of the
+    injected prior terminal, the rejection also requires the two digests to
+    match. A digest that changed means the resume re-parked on a genuinely new
+    blocker, not the round-zero repetition this guard exists to reject.
     """
     if waiting_on != "decision":
         return False
-    return not acknowledges_decision(result, decision_message_id)
+    if acknowledges_decision(result, decision_message_id):
+        return False
+    if prior_terminal_digest is not None and current_prior_terminal_digest is not None:
+        return prior_terminal_digest == current_prior_terminal_digest
+    return True
 
 
 class DecisionInterruptPort(Protocol):
@@ -150,6 +166,10 @@ class DecisionInterruptPort(Protocol):
     def load_resume(self, resume_key: str) -> DecisionInput | None: ...
 
     def claim_turn(self, turn_id: str) -> bool: ...
+
+    def record_turn_result(self, turn_id: str, result: dict[str, Any]) -> None: ...
+
+    def turn_result(self, turn_id: str) -> dict[str, Any] | None: ...
 
 
 class Verdict(TypedDict, total=False):
@@ -446,22 +466,6 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         interrupt({"interrupt": checkpoint.as_dict()})
 
         decision = deps.interrupt.load_resume(resume_key)
-        if decision is None:
-            # Resumed without a recorded decision: nothing to inject, so the
-            # suspension is re-entered rather than continuing on stale facts.
-            interrupt({"interrupt": checkpoint.as_dict()})
-
-        coord_input = _coordinator_input(deps, state, round_no, decision=decision)
-        if deps.persist_coord_input is not None:
-            deps.persist_coord_input(round_no, coord_input)
-
-        # The turn charge is claimed exactly once per (resume_key, round): the
-        # resume's model invocation is the one charge, and a crash-then-restart
-        # re-executes this node to a False claim (re-adopt, not a second charge).
-        deps.interrupt.claim_turn(f"{resume_key}:turn:{round_no}")
-
-        result = deps.coordinator.turn(round_no, coord_input)
-        verdict = str(result.get("verdict", "")).strip().lower()
         # The pre-resume blocked verdict is still sitting in the checkpoint's
         # state; anything the resume node returns that means "keep going" must
         # clear it, or after_coordinator re-reads the stale terminal and routes
@@ -472,10 +476,47 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             "waiting_on": None,
             "waiting_on_declared": None,
         }
+        if decision is None:
+            # Resumed without a recorded decision: nothing to inject, so the
+            # suspension is re-entered rather than continuing on stale facts.
+            # `interrupt` raises (suspends) while no resume value is pending;
+            # the cleared return guards the degenerate case where a stray second
+            # resume reaches here with no decision recorded, so a missing
+            # decision never falls through to a `decision.message_id` read.
+            interrupt({"interrupt": checkpoint.as_dict()})
+            return dict(cleared)
+
+        coord_input = _coordinator_input(deps, state, round_no, decision=decision)
+        if deps.persist_coord_input is not None:
+            deps.persist_coord_input(round_no, coord_input)
+
+        # The turn charge is claimed exactly once per (resume_key, round): the
+        # resume's model invocation is the one charge. A duplicate delivery or a
+        # crash-then-restart re-executes this node to a False claim and must
+        # re-adopt the already-charged turn's result rather than invoke the
+        # coordinator (and the model) a second time.
+        turn_id = f"{resume_key}:turn:{round_no}"
+        claimed = deps.interrupt.claim_turn(turn_id)
+        if claimed:
+            result = deps.coordinator.turn(round_no, coord_input)
+        else:
+            result = deps.interrupt.turn_result(turn_id)
+        if result is None:
+            # A crash landed after the claim but before the result was written
+            # back. Re-adopt the same turn: the coordinator re-adopts its
+            # in-flight run (never a new model invocation), and the charge
+            # ledger stays capped at one.
+            result = deps.coordinator.turn(round_no, coord_input)
+        deps.interrupt.record_turn_result(turn_id, result)
+        verdict = str(result.get("verdict", "")).strip().lower()
         if verdict == TERMINAL_BLOCKED:
             waiting_on, _ = normalize_waiting_on(result.get("waiting_on"))
             if n7_rejects_round_zero_repark(
-                result, decision_message_id=decision.message_id, waiting_on=waiting_on
+                result,
+                decision_message_id=decision.message_id,
+                waiting_on=waiting_on,
+                prior_terminal_digest=checkpoint.prior_terminal_digest,
+                current_prior_terminal_digest=prior_terminal_digest(deps.prior_terminal),
             ):
                 # N7: the coordinator re-declared the same old blocked+decision
                 # verdict without acknowledging the decision just injected. The

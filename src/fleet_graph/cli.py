@@ -12,6 +12,7 @@ import os
 import pathlib
 import shlex
 import sys
+import time
 from typing import Any
 
 from fleet_graph import __version__
@@ -704,6 +705,84 @@ def _decision_bridge_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _goal_interrupt_run(args: argparse.Namespace) -> int:
+    """The resident E2 goal-interrupt bridge: recover suspended lines.
+
+    Read-only against the bus. For every still-suspended question it queries the
+    authoritative decision chain and drives a validated ``DecisionInput`` back
+    through the same ``resume_key`` that suspended the line. One JSON line per
+    cycle on stdout. This is the production side of the E2 interrupt that
+    ``build_line`` opens up in the line process itself: together they make the
+    in-graph decision interrupt the real path for a human-decision wait.
+    """
+    import pathlib
+
+    from fleet_graph.goal_interrupt.bridge import GoalInterruptBridge, GoalInterruptBridgeConfig
+    from fleet_graph.goal_interrupt.store import GoalInterruptStore
+    from fleet_graph.graphs.runner import LineConfig, resume_goal_line
+
+    lines, line_run_root = _load_line_roster(args.lines_config)
+    if args.run_root:
+        line_run_root = pathlib.Path(args.run_root)
+
+    def _field(line: object, key: str, default: Any = "") -> Any:
+        return line.get(key, default) if isinstance(line, dict) else getattr(line, key, default)
+
+    def resumer_for(store: GoalInterruptStore, line: object) -> Any:
+        folder_id = str(_field(line, "folder_id"))
+        seat = str(_field(line, "seat"))
+        alias = _field(line, "alias", None)
+
+        def resumer(decision: Any) -> str:
+            record = store.interrupt(decision.resume_key)
+            generation = int(record["generation"]) if record else 1
+            config = LineConfig(
+                folder_id=folder_id,
+                seat=seat,
+                run_root=line_run_root / folder_id,
+                generation=generation,
+                alias=alias,
+            )
+            _state, status = resume_goal_line(config, decision)
+            return status
+
+        return resumer
+
+    bus = _build_bridge_bus(args)
+    bridges: list[GoalInterruptBridge] = []
+    for line in lines:
+        folder_id = str(_field(line, "folder_id"))
+        if not folder_id:
+            continue
+        store = GoalInterruptStore(line_run_root / folder_id).open()
+        bridges.append(
+            GoalInterruptBridge(
+                GoalInterruptBridgeConfig(
+                    poll_interval_seconds=args.poll_interval,
+                    board_page_limit=args.page_limit,
+                ),
+                store=store,
+                bus=bus,
+                resumer=resumer_for(store, line),
+            )
+        )
+
+    if not bridges:
+        print("goal-interrupt: no lines in the roster; nothing to bridge", file=sys.stderr)
+
+    remaining = args.ticks
+    while remaining is None or remaining > 0:
+        for bridge in bridges:
+            print(json.dumps(bridge.run_once(), ensure_ascii=False, sort_keys=True), flush=True)
+        if remaining is not None:
+            remaining -= 1
+            if remaining == 0:
+                break
+        if args.poll_interval > 0:
+            time.sleep(args.poll_interval)
+    return 0
+
+
 def _arbiter_run(args: argparse.Namespace) -> int:
     """One A2 tick: triage, reason, and (only with --publish) post suggestions.
 
@@ -1043,6 +1122,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bridge_status.add_argument("--state-dir", default="/data/fleet-graph/decision-bridge")
     bridge_status.set_defaults(func=_decision_bridge_status)
+
+    goal_interrupt = subparsers.add_parser(
+        "goal-interrupt",
+        help="the E2 in-graph goal-interrupt bridge (resume suspended lines)",
+    )
+    goal_interrupt_sub = goal_interrupt.add_subparsers()
+    goal_interrupt_run = goal_interrupt_sub.add_parser(
+        "run", help="poll held interrupts and resume them, one JSON line per cycle"
+    )
+    goal_interrupt_run.add_argument("--bus-url", default=DEFAULT_BUS_URL)
+    goal_interrupt_run.add_argument(
+        "--lines-config",
+        default=None,
+        help="JSON config listing the goal-line roster (a `lines` array plus an "
+        "optional `run_root`). Each line's interrupt store lives under "
+        "<run_root>/<folder_id>/goal-interrupt.sqlite3",
+    )
+    goal_interrupt_run.add_argument(
+        "--run-root",
+        default=None,
+        help="override the roster's run root (default the roster's, else /data/fleet-graph/runs)",
+    )
+    goal_interrupt_run.add_argument("--poll-interval", type=float, default=1.0)
+    goal_interrupt_run.add_argument("--page-limit", type=int, default=200)
+    goal_interrupt_run.add_argument(
+        "--ticks",
+        type=int,
+        default=None,
+        help="run this many cycles then exit (default: forever)",
+    )
+    goal_interrupt_run.set_defaults(func=_goal_interrupt_run)
 
     supervisor = subparsers.add_parser(
         "supervisor", help="the event-triggered supervisor graph (audits, no verdicts)"

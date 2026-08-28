@@ -112,7 +112,6 @@ def legacy_owner_fallback(
     referenced_question_ids: list[str],
     question_texts: dict[str, str],
     legacy_owners: list[OwnerTarget],
-    generation: int,
 ) -> LegacyResolution:
     """Bounded fallback for a legacy parked owner with no persisted question id.
 

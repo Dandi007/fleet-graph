@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from fleet_graph.bus.board import DECISION_KIND, WORK_NOTES
+from fleet_graph.bus.board import DECISION_KIND, NOTE_KIND, WORK_NOTES
 from fleet_graph.decision_bridge.owners import (
     RESUME_ALREADY_RESUMED,
     RESUME_REFUSED,
@@ -123,6 +123,7 @@ class DecisionBridge:
         self.store = store
         self.clock = clock
         self.sleep = sleep
+        self._question_texts_cache: dict[str, str] | None = None
 
     # --- assembly helpers -------------------------------------------------
 
@@ -289,6 +290,36 @@ class DecisionBridge:
             return []
         return refs_to(entity_id)
 
+    def _question_texts(self) -> dict[str, str]:
+        """Question note id -> immutable text, for the legacy-owner fallback.
+
+        The bounded legacy fallback (spec item 6) matches a decision ref to a
+        question whose immutable text carries the exact ``folder_id``. The
+        reverse-refs surface cannot list a decision's forward refs, so the
+        resolver needs the candidate question texts supplied by the caller.
+        Built here, once, read-only against the board channel; a missing bus or
+        an unreadable channel degrades to an empty map (no legacy recovery).
+        """
+        if self._question_texts_cache is not None:
+            return self._question_texts_cache
+        texts: dict[str, str] = {}
+        if self.bus is None:
+            self._question_texts_cache = texts
+            return texts
+        try:
+            messages, _head = self.bus.messages(READ_CHANNEL, limit=self.config.board_page_limit)
+        except Exception:
+            messages = []
+        for message in messages:
+            if message.get("kind") != NOTE_KIND:
+                continue
+            payload = message.get("payload") or {}
+            if payload.get("note_type") != "question":
+                continue
+            texts[str(message.get("message_id") or "")] = str(payload.get("note") or "")
+        self._question_texts_cache = texts
+        return texts
+
     def _fresh_decision(
         self, message: dict[str, Any], seq: int, source_message_id: str
     ) -> dict[str, Any]:
@@ -297,6 +328,7 @@ class DecisionBridge:
             self._ensure_owner_source(),
             refs_to=self._refs_to,
             channel_id=READ_CHANNEL,
+            question_texts=self._question_texts(),
         )
         if not resolution.ok:
             self._seal_noop(resolution, seq, source_message_id, message)
@@ -312,6 +344,9 @@ class DecisionBridge:
             else OwnerTarget("", "", 1, "", "", "")
         )
         action_key = action_key_for(source_message_id, target.kind, target.id, target.generation)
+        # A legacy-owner resolution (spec item 6) is recorded durably so an
+        # operator can tell a fallback recovery apart from the normal path.
+        origin = "legacy_owner_resolution" if resolution.legacy else None
         self._ensure_store().record_intent(
             {
                 "source_message_id": source_message_id,
@@ -321,13 +356,13 @@ class DecisionBridge:
                 "generation": target.generation,
                 "question_note_id": target.question_note_id,
                 "card_entity_id": target.card_entity_id,
-                "reason": "",
+                "reason": origin or "",
                 "source_event": message,
             }
         )
 
         return self._resume_and_seal(
-            target, action_key, seq, source_message_id, message, recovery=False
+            target, action_key, seq, source_message_id, message, recovery=False, origin=origin
         )
 
     def _complete_intent(
@@ -363,6 +398,7 @@ class DecisionBridge:
         source_event: dict[str, Any],
         *,
         recovery: bool,
+        origin: str | None = None,
     ) -> dict[str, Any]:
         try:
             owner_result = self._ensure_owner_source().resume(target, action_key)
@@ -379,6 +415,8 @@ class DecisionBridge:
             if owner_result.status == RESUME_RESUMED
             else f"{owner_result.status}: {owner_result.detail}"[:300]
         )
+        if origin and not reason:
+            reason = origin
 
         if self.config.kill_window_file is not None:
             self._hold_kill_window(source_message_id)
