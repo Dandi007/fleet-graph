@@ -246,14 +246,15 @@ class DecisionBridge:
 
         try:
             existing = self._ensure_store().receipt(source_message_id)
-        except BridgeStoreError as exc:
-            # Fail closed: cannot read whether we already handled this decision,
-            # so we must not resume it (a blurry replay could double-apply).
-            return {
-                "action": "failed_closed:receipt_unreadable",
-                "seq": seq,
-                "error": str(exc)[:300],
-            }
+        except BridgeStoreError:
+            # Fail closed: we cannot read whether we already handled this
+            # decision, so we must not resume it (a blurry replay could
+            # double-apply). This must *stop* the message loop rather than
+            # return an action the loop would record and move past: a later
+            # message in the same page could seal and advance the cursor past
+            # this still-unread decision, silently dropping its human verdict.
+            # ``run_once`` catches the error, records it, and breaks.
+            raise
 
         if existing is not None and existing["status"] in TERMINAL_STATUSES:
             self._advance(seq)

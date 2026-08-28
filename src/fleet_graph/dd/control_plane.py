@@ -1230,10 +1230,20 @@ class DdControlPlane:
                 "CHECKPOINT_MISSING",
                 f"{development_id} has no durable checkpoint; there is no thread to resume",
             )
-        if action_key and not self._claim_resume_action(development_id, generation, action_key):
-            # A previous resume already claimed this exact (action_key,
-            # generation): the recovery is already in effect and must not be
-            # launched a second time.
+        # A previous resume already claimed this exact (action_key, generation).
+        # If the recovery it guards actually launched, this is a duplicate
+        # transport call and the same logical success, not a second launch. If
+        # it has *not* yet launched, the earlier attempt crashed in the
+        # claim/act window: the claim file exists but no launch entry was ever
+        # written. Reporting ``already_resumed`` then would assert a recovery
+        # that never ran, so carry it out now instead -- the interrupted
+        # recovery completes exactly once. (``_claim_resume_action`` runs inside
+        # this condition: it must claim before a fresh launch below.)
+        if (
+            action_key
+            and not self._claim_resume_action(development_id, generation, action_key)
+            and self._generation_launched(development_id, generation)
+        ):
             gate_report["resume"] = {
                 "development_id": development_id,
                 "generation": generation,
