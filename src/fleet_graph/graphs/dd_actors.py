@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from fleet_graph.bus.board import Board, GateTicket
+from fleet_graph.cost_obs import CostDataPlane
 from fleet_graph.dd.dispatch import derive_attempt_id
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.executors.agent_run import (
@@ -126,6 +127,12 @@ class AgentRunStageActor:
     default_timeout_seconds: int = 3600
     poll_interval: float = 2.0
     extra_labels: dict[str, str] = field(default_factory=dict)
+    # When wired, this actor is the responsible producer of the launch (the
+    # implement stage it dispatches) and review (the continuous/final review
+    # stages) lifecycle facts the cost-observability recording rules consume.
+    # None means the data plane is not collecting -- the DD dispatch still
+    # runs, it just does not emit the facts.
+    cost_plane: CostDataPlane | None = None
 
     def writes(self, stage: Stage) -> bool:
         """Only the stage the contract says produces product code.
@@ -255,7 +262,39 @@ class AgentRunStageActor:
                 detail=str(fault),
             )
 
-        return self._outcome_from(stage, declared)
+        outcome = self._outcome_from(stage, declared)
+        self._record_cost_obs(stage, dispatch, outcome)
+        return outcome
+
+    def _record_cost_obs(self, stage: Stage, dispatch: Dispatch, outcome: StageOutcome) -> None:
+        """Emit the lifecycle fact this stage owns, when the data plane is wired.
+
+        The walker reaches nothing outside its ports and places no opinion here;
+        this actor is the component that actually owns the launch and review
+        lifecycles, so this is where they are emitted. Idempotency is the data
+        plane's: a replayed launch or a second review of the same phase is a
+        no-op by stable identity key, so a retry or rework cannot double-count.
+        """
+        if self.cost_plane is None:
+            return
+        order_id = self.development_id
+        if stage.id == implement_stage(self.lifecycle):
+            self.cost_plane.record_launch(
+                order_id=order_id,
+                development_id=order_id,
+                generation=int(dispatch.get("generation", 1)),
+                seat=stage_role(stage, self.roles),
+                model=str(self.models.get(stage.id) or ""),
+            )
+            return
+        reviews = review_stages(self.lifecycle)
+        if stage.id in reviews and outcome.event not in (FAILURE_EVENT, SPINE_EVENT):
+            phase = "continuous" if stage.id == reviews[0] else "final"
+            self.cost_plane.record_review(
+                order_id=order_id,
+                phase=phase,
+                verdict=str(outcome.event).lower(),
+            )
 
     def _outcome_from(self, stage: Stage, declared: dict[str, Any]) -> StageOutcome:
         """The declared result, passed on as it stands.

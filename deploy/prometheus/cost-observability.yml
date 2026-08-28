@@ -1,0 +1,30 @@
+# Scrape-side wiring for the cost-observability data plane.
+#
+# The producers live in fleet-graph (src/fleet_graph/cost_obs + dd/cost_obs.py):
+# the dev-dispatch run renders `cost-obs.prom` -- Prometheus text exposition --
+# into the node_exporter textfile directory named by FLEET_GRAPH_COST_OBS_DIR
+# (and pointed at by `dd run --cost-obs-dir`). This fragment is the other half:
+# it tells node_exporter to re-expose that directory, tells Prometheus to
+# scrape node_exporter once a minute, and loads the recording rules that turn
+# the source facts into the five `cost-observability` series.
+#
+# Fold into the site's prometheus.yml and node_exporter service definition;
+# the exact path below must match the value the fleet-graph run writes to.
+
+# --- node_exporter side ------------------------------------------------
+# node_exporter must be started with the textfile collector pointing at the
+# same directory fleet-graph renders into, e.g.:
+#
+#   node_exporter --collector.textfile.directory=/data/apps/fleet-graph/current/cost-obs
+#
+# Everything matching *.prom under that directory is re-exposed as-is, so the
+# fleet-graph run writes `cost-obs.prom` there and node_exporter serves it.
+
+# --- prometheus side ---------------------------------------------------
+scrape_configs:
+  - job_name: node-cost-observability
+    static_configs:
+      - targets: ["localhost:9100"]  # node_exporter, textfile collector enabled
+
+rule_files:
+  - /etc/prometheus/rules/cost-observability.rules.yml

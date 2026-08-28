@@ -191,6 +191,7 @@ def _dd_run(args: argparse.Namespace) -> int:
         },
         models=dict(pair.split("=", 1) for pair in args.stage_model),
         publish_merge=args.publish_merge,
+        cost_obs_dir=args.cost_obs_dir or "",
     )
 
     board = None
@@ -676,6 +677,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--publish-merge",
         action="store_true",
         help="push the durable ref. Off by default: it is the one step here that cannot be undone",
+    )
+    dd_run.add_argument(
+        "--cost-obs-dir",
+        default=None,
+        help="node_exporter textfile directory for the cost-observability exposition; "
+        "unset means the run does not collect (FLEET_GRAPH_COST_OBS_DIR is the env fallback)",
     )
     dd_run.set_defaults(func=_dd_run)
 

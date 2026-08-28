@@ -23,6 +23,7 @@ from typing import Any
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from fleet_graph.dd.capability import CapabilityLock
+from fleet_graph.dd.cost_obs import build_cost_plane
 from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder
 from fleet_graph.dd.lifecycle import Lifecycle
 from fleet_graph.dd.prompt import PluginPromptSource
@@ -90,6 +91,11 @@ class DevelopmentConfig:
     verify_worktree_head: bool = True
     run_config: dict[str, Any] = field(default_factory=dict)
     acceptance_timeout_seconds: int = 1800
+    # The node_exporter textfile directory the cost-observability data plane
+    # renders its `cost-obs.prom` into, so the recording rules the
+    # `deploy/prometheus` scrape config declares have source facts to read.
+    # Empty means "not wired" -- the dispatch runs, it just does not collect.
+    cost_obs_dir: str = ""
     # Pushing to a durable ref is the one step here that cannot be undone.
     publish_merge: bool = False
 
@@ -141,6 +147,12 @@ def build_pipeline(
         )
     )
 
+    # The one data plane the whole run shares. Its facts come from the actors
+    # and scripts that own each lifecycle; constructing it once here means
+    # launch, review, promotion and settlement all land in the same exposition
+    # file the scrape config reads.
+    cost_plane = build_cost_plane(config.cost_obs_dir or None)
+
     dispatcher = AgentRunStageActor(
         launcher=launcher or AgentRunLauncher(state_root=str(config.run_root / "agent-runs")),
         development_id=config.development_id,
@@ -149,6 +161,9 @@ def build_pipeline(
         roles=config.roles,
         timeouts=config.timeouts,
         models=config.models,
+        # The launch and review lifecycle facts are emitted by this actor; its
+        # data plane is wired in for the stage producing each one.
+        cost_plane=cost_plane,
         # The stage's prompt comes from the bundle the capability check
         # admitted, not from the role's own persona. See dd/prompt.py.
         prompts=PluginPromptSource(
@@ -194,6 +209,8 @@ def build_pipeline(
             remote_url=config.remote_url,
             target_ref=config.remote_ref,
             publish=config.publish_merge,
+            # The promotion (merge) lifecycle fact is emitted by this stage.
+            cost_plane=cost_plane,
         ),
     }
     if board is not None and gate_card_entity_id:
@@ -237,6 +254,9 @@ def build_pipeline(
         ),
         capability=capability if capability is not None else CapabilityLock.load(),
         observe=observe,
+        # The settlement fact and the absent-lifecycle accounting the walker
+        # owns; launch/review/promotion are emitted by their actors.
+        cost_plane=cost_plane,
         bounds=PipelineBounds(
             max_steps=config.max_steps,
             max_rework=config.max_rework,
@@ -300,7 +320,7 @@ def run_pipeline(
             # Observability must not fail the work it observes.
             pass
 
-    graph, _deps = build_pipeline(
+    graph, deps = build_pipeline(
         config,
         scripts=scripts,
         materializers=materializers,
@@ -333,6 +353,12 @@ def run_pipeline(
                 "recursion_limit": config.max_steps * 4 + 20,
             },
         )
+
+    # The order is settled (or accounted absent) inside the walk; render the
+    # exposition only now, once, so the scrape file reflects the finished run
+    # rather than each intermediate stage.
+    if deps.cost_plane is not None and deps.cost_plane.exposition_dir is not None:
+        deps.cost_plane.write_exposition()
 
     result = {
         "development_id": config.development_id,

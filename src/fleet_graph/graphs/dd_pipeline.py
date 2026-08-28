@@ -255,6 +255,13 @@ class PipelineDeps:
     capability: CapabilityLock | None = None
     bounds: PipelineBounds = field(default_factory=PipelineBounds)
     observe: Any = None
+    # The cost-observability data plane, when the DD lifecycle should emit the
+    # launch/review/promotion/settlement source facts its recording rules
+    # consume. The launch, review and promotion facts are emitted by their own
+    # responsible actors (dd_actors, dd_scripts); the walker's only job is the
+    # order's settlement (on completion) and its explicit absence accounting
+    # (on a non-complete terminal). None means no collection.
+    cost_plane: Any = None
     # Stamped once per attempt, never per step. The sealer puts this in the
     # commit it writes, so a retry that re-stamped would produce a different
     # commit for the same work -- and the forward chain would stop matching.
@@ -363,8 +370,15 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
     def _refused(
         state: PipelineState, stage_id: str, step: str, refused: StageRefused, steps: int
     ) -> PipelineState:
-        """A stage ended on purpose. Recorded and observed like any other step."""
+        """A stage ended on purpose. Recorded and observed like any other step.
+
+        The order launched but never completed, so the lifecycles that never
+        produced a fact are accounted absent -- a bounded 0, distinguishable
+        from `unknown` attribution -- rather than silently absent.
+        """
         code = getattr(refused, "code", "")
+        if deps.cost_plane is not None and state.get("development_id"):
+            deps.cost_plane.mark_absent_if_missing(order_id=str(state.get("development_id")))
         return {
             **_terminal(TERMINAL_REFUSED, str(refused), code=code),
             "steps": steps,
@@ -553,6 +567,8 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         failure_code = str(state.get("last_failure_code", ""))
 
         if lifecycle.is_terminal(stage_id):
+            if deps.cost_plane is not None and state.get("development_id"):
+                deps.cost_plane.record_settlement(order_id=str(state.get("development_id")))
             return _terminal(TERMINAL_COMPLETE, f"{stage_id} is the last declared stage")
 
         exit_ = lifecycle.failure_transition(stage_id, event)

@@ -1,0 +1,23 @@
+# The five `cost-observability` recording rules, for the Prometheus rule
+# evaluator (promtool check rules <file>).
+#
+# This file is the scrape-side mirror of src/fleet_graph/cost_obs/rules.py:
+# the data plane emits the source facts, node_exporter's textfile collector
+# re-exposes them from the directory FLEET_GRAPH_COST_OBS_DIR points at, and
+# these rules turn those facts into the five statistical outputs the fleet's
+# dashboards read. The two sides must agree; promtool check rules verifies the
+# expressions below parse, and tests/test_cost_observability.py pins the same
+# expressions on the query engine side.
+groups:
+  - name: cost-observability
+    rules:
+      - record: cost_obs:management_execution:ratio
+        expr: sum(cost_obs_execution_cost_total{attribution="management"}) / sum(cost_obs_execution_cost_total)
+      - record: cost_obs:launch_lifecycle:total
+        expr: sum(cost_obs_launch_total)
+      - record: cost_obs:review_lifecycle:total
+        expr: sum(cost_obs_review_total{phase=~"continuous|final"})
+      - record: cost_obs:promotion_lifecycle:total
+        expr: sum(cost_obs_promotion_total)
+      - record: cost_obs:settlement_reconciliation:ratio
+        expr: sum(cost_obs_settlement_total{status="settled"}) by (order_id) / on(order_id) sum(cost_obs_launch_total) by (order_id)

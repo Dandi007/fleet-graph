@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.cost_obs import CostDataPlane
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.vendor import git_ops
 from fleet_graph.graphs.dd_pipeline import (
@@ -275,6 +276,10 @@ class MergeStage:
     remote_url: str
     target_ref: str
     publish: bool = False
+    # When wired, this stage is the responsible producer of the promotion
+    # (merge) lifecycle fact the cost-observability rules consume. None means
+    # no collection -- the merge still happens, it just does not emit.
+    cost_plane: CostDataPlane | None = None
 
     def act(self, stage: Any, dispatch: Dispatch) -> StageOutcome:
         result = MERGED if self.publish else PREPARED
@@ -293,6 +298,12 @@ class MergeStage:
                 **detail,
             },
         )
+        if self.cost_plane is not None:
+            self.cost_plane.record_promotion(
+                order_id=str(dispatch.get("development_id", "")),
+                target_ref=self.target_ref,
+                via="merge",
+            )
         return StageOutcome(produced=tuple(stage.produced_artifacts))
 
     def _fast_forward(self, dispatch: Dispatch) -> dict[str, Any]:

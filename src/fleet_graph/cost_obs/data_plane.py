@@ -181,6 +181,20 @@ class CostDataPlane:
             raise ValueError(f"lifecycle must be one of {LIFECYCLES}, got {lifecycle!r}")
         self._absent.setdefault(order_id, set()).add(lifecycle)
 
+    def mark_absent_if_missing(self, order_id: str) -> None:
+        """Account every lifecycle whose producer never emitted for this order.
+
+        This is the caller-friendly form of `mark_absent`: handed a closed
+        order, the data plane itself decides which of the four lifecycles are
+        absent (no fact) rather than asking the caller to know, one by one,
+        which producers stayed silent. The result is the same bounded-zero
+        presence series, and marking is idempotent.
+        """
+        facts = self._fact_lifecycles.get(order_id, set())
+        for lifecycle in LIFECYCLES:
+            if lifecycle not in facts:
+                self._absent.setdefault(order_id, set()).add(lifecycle)
+
     # --- reads ------------------------------------------------------------
 
     def samples(self) -> list[Sample]:
