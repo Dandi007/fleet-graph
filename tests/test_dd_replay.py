@@ -199,6 +199,27 @@ def committed_index(repo: Path, entries: list[dict[str, Any]], message: str = "s
     )
 
 
+def index_entry(generation: int, attempt: int, phase: str, verdict: str) -> dict[str, Any]:
+    """A feedback entry carrying the durable attempt identity for one generation.
+
+    The ordering rule is generation-aware: an entry from an older generation is
+    immutable history and must not steer the current generation's attempt order,
+    which is what the derived ``attempt_id`` lets the replayer recognise.
+    """
+    return {
+        "attempt": attempt,
+        "attempt_id": derive_attempt_id(DEVELOPMENT_ID, generation, attempt),
+        "review_id": f"r-{phase}-g{generation}-a{attempt}",
+        "review_phase": phase,
+        "subject_commit": "0" * 40,
+        "implementation_subject_commit": "0" * 40,
+        "verdict": verdict,
+        "artifact_path": ".dev-dispatch/reviews/x.json",
+        "artifact_blob_oid": "0" * 40,
+        "artifact_digest": "sha256:" + "0" * 64,
+    }
+
+
 class TestASealedPrefixReplays:
     def test_the_implement_prefix_replays_and_the_review_runs_real(
         self, repo: Path, tmp_path: Path
@@ -679,6 +700,44 @@ class TestAPartialPrefixRespectsTheInheritedChain:
             is False
         )
 
+    def test_the_rule_is_generation_aware(self) -> None:
+        """Historical entries from an older generation do not impose a prior
+        REJECT on the current generation's fresh attempt; entries from the same
+        generation still do (spec requirements 1, 2 and 3)."""
+        accepted_history = [
+            index_entry(1, 1, "continuous", "APPROVE"),
+            index_entry(1, 1, "final", "APPROVE"),
+        ]
+        assert (
+            chain_rules.new_attempt_is_legal(
+                accepted_history, generation=2, development_id=DEVELOPMENT_ID
+            )
+            is True
+        ), "an older generation's accepted history must not block a fresh generation"
+        # Same generation: a fresh attempt after an APPROVE chain is illegal.
+        assert (
+            chain_rules.new_attempt_is_legal(
+                [
+                    index_entry(2, 1, "continuous", "APPROVE"),
+                    index_entry(2, 1, "final", "APPROVE"),
+                ],
+                generation=2,
+                development_id=DEVELOPMENT_ID,
+            )
+            is False
+        )
+        assert (
+            chain_rules.new_attempt_is_legal(
+                [
+                    index_entry(2, 1, "continuous", "APPROVE"),
+                    index_entry(2, 1, "final", "REJECT"),
+                ],
+                generation=2,
+                development_id=DEVELOPMENT_ID,
+            )
+            is True
+        )
+
     def test_a_partial_prefix_is_declined_when_the_inherited_chain_did_not_end_in_reject(
         self, repo: Path, tmp_path: Path
     ) -> None:
@@ -686,8 +745,8 @@ class TestAPartialPrefixRespectsTheInheritedChain:
         committed_index(
             repo,
             [
-                {"review_phase": "continuous", "verdict": "APPROVE"},
-                {"review_phase": "final", "verdict": "APPROVE"},
+                index_entry(2, 1, "continuous", "APPROVE"),
+                index_entry(2, 1, "final", "APPROVE"),
             ],
         )
         junk = g1.junk_configure()
@@ -706,8 +765,8 @@ class TestAPartialPrefixRespectsTheInheritedChain:
         committed_index(
             repo,
             [
-                {"review_phase": "continuous", "verdict": "APPROVE"},
-                {"review_phase": "final", "verdict": "REJECT"},
+                index_entry(2, 1, "continuous", "APPROVE"),
+                index_entry(2, 1, "final", "REJECT"),
             ],
         )
         junk = g1.junk_configure()
@@ -717,6 +776,40 @@ class TestAPartialPrefixRespectsTheInheritedChain:
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert replayed_stages(state) == ["configure", "implement"]
+        assert next(stage for stage, _ in actor.calls) == "continuous_review"
+        assert head(repo) == g1.implement
+
+    def test_a_cross_generation_history_still_materializes_its_continuous_review(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """The reported defect (dev-fg-31b963659d16): generation 1 ran
+        attempt 1 (continuous APPROVE, final REJECT) then attempt 2 (continuous
+        APPROVE, final APPROVE, accepted), and a later generation inherited that
+        committed feedback index but only a [configure, implement] prefix's
+        receipts were re-discoverable. The fresh generation's continuous review
+        must still materialise -- its attempt is a legal first entry of its own
+        chain, not a new attempt inside generation 1's (spec requirement 4)."""
+        g1 = G1(repo, tmp_path)
+        committed_index(
+            repo,
+            [
+                index_entry(1, 1, "continuous", "APPROVE"),
+                index_entry(1, 1, "final", "REJECT"),
+                index_entry(1, 2, "continuous", "APPROVE"),
+                index_entry(1, 2, "final", "APPROVE"),
+            ],
+        )
+        junk = g1.junk_configure()
+
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert replayed_stages(state) == ["configure", "implement"]
+        # The materialised continuous review is the first real stage: the
+        # partial prefix replayed, the trim moved the tree to the sealed tip,
+        # and no fresh review was declined (structured result, not a shell
+        # error's absence).
         assert next(stage for stage, _ in actor.calls) == "continuous_review"
         assert head(repo) == g1.implement
 

@@ -223,10 +223,16 @@ class ReceiptReplayer:
                 return None
             if self._ends_at_implement(self._plan):
                 inherited = self._inherited_entries()
-                if inherited is not None and not chain_rules.new_attempt_is_legal(inherited):
+                if inherited is not None and not chain_rules.new_attempt_is_legal(
+                    inherited, generation=self.generation, development_id=self.development_id
+                ):
                     # Replaying a prefix that stops at implement is always
                     # followed by a fresh continuous review -- a brand-new
-                    # attempt. When the inherited feedback chain did not end in
+                    # attempt. The legality of that attempt is judged against
+                    # this generation's own chain: historical entries from older
+                    # generations do not impose a prior-REJECT requirement on a
+                    # fresh attempt (spec requirement 3 / dev-fg-31b963659d16).
+                    # When this generation's inherited chain did not end in
                     # REJECT, the carrier refuses exactly that new attempt
                     # (ORDER_VIOLATION), so replaying would only move the tree
                     # and then fail. Fail-closed here instead: replay nothing,
