@@ -72,6 +72,16 @@ CONVERGED = {
 ENROLLED = {
     "wf-7cd0a7",
     "wf-d002a6",
+    # 2026-08-29 第四波（用户「Deep research，chat group…重构开始」+ /loop 端到
+    # 端授权）：chatgroup-daemon 重构实施线复活入编，GLM 智能位（家族分流令）。
+    "wf-e313be",
+}
+
+# 2026-08-29 复活：曾在 MIGRATED 里 enabled=false 停摆的线被用户令重新点亮。
+# 与 ENROLLED 分开——它们不是新线，folder 与考卷都是存量，只是驱动引擎从
+# ronin pump 换成本引擎、座位按家族分流令改派。
+REVIVED = {
+    "wf-3f87f3",  # deep-research 平台化收口（C1-C6），DS 智能位
 }
 
 MIGRATED = {
@@ -90,7 +100,7 @@ MIGRATED = {
 class TestTheShippedConfigLoads:
     def test_the_real_loader_accepts_it(self) -> None:
         config = SchedulerConfig.from_json(CONFIG)
-        assert {line.folder_id for line in config.lines} == MIGRATED | OPENED | ENROLLED
+        assert {line.folder_id for line in config.lines} == MIGRATED | OPENED | ENROLLED | REVIVED
 
     def test_every_line_names_a_seat_and_an_alias(self) -> None:
         for line in SchedulerConfig.from_json(CONFIG).lines:
@@ -133,7 +143,7 @@ class TestTheShippedConfigLoads:
         enabled = {
             line.folder_id for line in SchedulerConfig.from_json(CONFIG).lines if line.enabled
         }
-        assert enabled == (BATCH_TWO | OPENED | ENROLLED) - CONVERGED
+        assert enabled == (BATCH_TWO | OPENED | ENROLLED | REVIVED) - CONVERGED
 
     def test_the_converged_lines_stay_in_the_roster_but_off(self) -> None:
         """收编（2026-08-28）不是删除：金丝雀 wf-40fa8d 等三线 terminal=done /

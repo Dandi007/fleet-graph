@@ -1,14 +1,14 @@
 {
   "_comment": "浪人存量线的新引擎配置（P5 配置面迁移）。同一 work folder 继续用，不建新 folder。",
   "_provenance": "取自 /data/ronin/babysitter-20260822.sh v28 的 FOLDERS/seat()/maxrounds()；逐条与该脚本取值核对",
-  "_rollout": "P7 分批放量。第一批金丝雀 wf-40fa8d 已实证引擎全链（25 轮无重复推进、dd 四阶段封存、真实产品 diff、在授权边界正确停住）。第二批 +5 条（可观测/额度类，改面板与配置，不动核心服务），由 agent 依用户 2026-08-27 02:0x 全权委托代行监督面裁定。第三批 = 余下 3 条。enabled 是唯一放行开关；紧急停机口见 docs/operating.md。2026-08-28 监督面收编三线：wf-a08949（dd 切换目标已达成、老引擎退役由监督面亲自执行）、wf-40fa8d（terminal=done，C1/C2/C3 五件套验收通过）、wf-7bc4d1（terminal=done，真机全量验收通过）——均 enabled=false。2026-08-28 监督面第二波收编：9 候选 8 close/fold、1 enroll——唯一入编 wf-7cd0a7（agent-bus 通信层重设计），seat opencode-gpt-sol 首次跑 goal line。",
+  "_rollout": "P7 分批放量。第一批金丝雀 wf-40fa8d 已实证引擎全链（25 轮无重复推进、dd 四阶段封存、真实产品 diff、在授权边界正确停住）。第二批 +5 条（可观测/额度类，改面板与配置，不动核心服务），由 agent 依用户 2026-08-27 02:0x 全权委托代行监督面裁定。第三批 = 余下 3 条。enabled 是唯一放行开关；紧急停机口见 docs/operating.md。2026-08-28 监督面收编三线：wf-a08949（dd 切换目标已达成、老引擎退役由监督面亲自执行）、wf-40fa8d（terminal=done，C1/C2/C3 五件套验收通过）、wf-7bc4d1（terminal=done，真机全量验收通过）——均 enabled=false。2026-08-28 监督面第二波收编：9 候选 8 close/fold、1 enroll——唯一入编 wf-7cd0a7（agent-bus 通信层重设计），seat opencode-gpt-sol 首次跑 goal line。2026-08-29 家族分流+两线复活（用户令：GPT/DS/GLM 三家族分开用防单订阅撑爆；GLM 只用 5.3/5.3-flash、DS 用 pro/flash，各一个智能一个写代码）：座位再平衡 terra=d002a6+5664e5（5664e5 的 DoD 需 katana-memory-mcp、仅 terra 座有）、sol=7cd0a7+a87b04、glm53=386b2f+6475fd+e313be、dsv4pro=9b5931+197430+3f87f3；复活入编 wf-e313be（chatgroup 重构实施线）、恢复 wf-3f87f3（deep-research 平台化收口线）。写码位 flash 档待 dd 每线模型策略增量落地后启用。",
   "run_root": "/data/fleet-graph/runs",
   "probe_via_runtime": true,
   "supervisor_events": true,
   "lines": [
     {
       "folder_id": "wf-197430",
-      "seat": "opencode-gpt-terra",
+      "seat": "opencode-dsv4pro",
       "alias": "ronin-perm-decl",
       "max_rounds": 9999,
       "enabled": true
@@ -22,17 +22,18 @@
     },
     {
       "folder_id": "wf-386b2f",
-      "seat": "opencode-gpt-terra",
+      "seat": "opencode-glm53",
       "max_rounds": 9999,
       "alias": "ronin-cost-observ",
       "enabled": true
     },
     {
       "folder_id": "wf-3f87f3",
-      "seat": "opencode-gpt-terra",
+      "seat": "opencode-dsv4pro",
       "max_rounds": 9999,
       "alias": "ronin-platform",
-      "enabled": false
+      "enabled": true,
+      "_provenance": "2026-08-29 复活（用户令「Deep research…重构开始」+ /loop 端到端授权）：接盘 goal.md C1–C6（部署契约/入口统一/失败语义基座/契约单源化/冷启动终验/宪法归档），DS 智能位。Phase 0 刷新见 folder golden-order 2026-08-29 节。"
     },
     {
       "folder_id": "wf-40fa8d",
@@ -57,7 +58,7 @@
     },
     {
       "folder_id": "wf-6475fd",
-      "seat": "opencode-gpt-terra",
+      "seat": "opencode-glm53",
       "max_rounds": 9999,
       "alias": "ronin-observ",
       "enabled": true
@@ -78,7 +79,7 @@
     },
     {
       "folder_id": "wf-9b5931",
-      "seat": "opencode-gpt-terra",
+      "seat": "opencode-dsv4pro",
       "max_rounds": 9999,
       "alias": "ronin-model-switch",
       "enabled": true
@@ -93,7 +94,7 @@
     },
     {
       "folder_id": "wf-a87b04",
-      "seat": "opencode-gpt-terra",
+      "seat": "opencode-gpt-sol",
       "enabled": true,
       "alias": "ronin-wf-robust",
       "max_rounds": 9999
@@ -105,6 +106,14 @@
       "max_rounds": 9999,
       "enabled": true,
       "_provenance": "2026-08-28 用户拍板开线：按 wiki w-577103（fleet-graph 控制面第一性再审）方向对引擎/goal-driven/dd 做事件化重构，自举开发（E1 决议事件桥→E2 等待收敛进图→E3 terminal 视图化 ∥ E4 协议收敛 ∥ E5 开线 MCP 面）。监督面=用户授权的人类监督者代行。alias token 已供给（agent:ronin-eventify）。"
+    },
+    {
+      "folder_id": "wf-e313be",
+      "seat": "opencode-glm53",
+      "alias": "ronin-cgspec",
+      "max_rounds": 9999,
+      "enabled": true,
+      "_provenance": "2026-08-29 复活入编（用户令「chat group…重构开始」+ /loop 端到端授权）：chatgroup-daemon 重构实施线（pre-P0→P4→promotion 就绪），GLM 智能位（覆盖 08-22 opus5 点名，代行裁决见 folder golden-order 2026-08-29 节）。P0-net loopback 绑定修复编入最高优先级。"
     }
   ],
   "line_environment": {

@@ -198,6 +198,13 @@ class TestSeatAwareProbes:
         assert spec.path == "/v1/chat/completions"
         assert spec.body["model"] == "deepseek-v4-pro"
 
+    def test_glm_seat_uses_the_openai_face(self) -> None:
+        """glm-5.3 goes through the gateway's OpenAI face like the DS leg;
+        the responses face is subscription-channel-only (GPT legs)."""
+        spec = probe_for("opencode-glm53")
+        assert spec.path == "/v1/chat/completions"
+        assert spec.body["model"] == "glm-5.3"
+
     def test_subscription_seats_use_the_responses_face(self) -> None:
         for seat in ("opencode-gpt-terra", "opencode-gpt-sol"):
             assert probe_for(seat).path == "/v1/responses"
