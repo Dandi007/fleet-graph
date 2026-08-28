@@ -64,6 +64,28 @@ def entry_generation(entry: dict[str, Any], development_id: str, generation: int
     )
 
 
+def split_entries(
+    entries: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    *,
+    generation: int,
+    development_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Partition `entries` into (current generation, older generation).
+
+    The durable `attempt_id` each entry carries is the engine's own derivation
+    of `(development_id, generation, attempt)`, so an entry either belongs to
+    `generation` or it is immutable history from an older generation. This is
+    the single source the new-generation index scoping
+    (``dd.feedback_scope``) uses to move older entries out of the live index
+    without rewriting or discarding them.
+    """
+    own: list[dict[str, Any]] = []
+    inherited: list[dict[str, Any]] = []
+    for entry in entries:
+        (own if entry_generation(entry, development_id, generation) else inherited).append(entry)
+    return own, inherited
+
+
 def new_attempt_is_legal(
     entries: list[dict[str, Any]] | tuple[dict[str, Any], ...],
     *,
@@ -112,4 +134,5 @@ __all__ = [
     "is_rework_link",
     "new_attempt_is_legal",
     "rework_link_parent",
+    "split_entries",
 ]

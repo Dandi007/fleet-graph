@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from conftest import DEVELOPMENT_ID, git, head, write_index
-from fleet_graph.dd.chain_rules import new_attempt_is_legal
+from fleet_graph.dd.bootstrap import HISTORY_PATH
+from fleet_graph.dd.chain_rules import new_attempt_is_legal, split_entries
 from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder, derive_attempt_id
+from fleet_graph.dd.feedback_scope import scope_index_for_generation
 from fleet_graph.dd.lifecycle import Lifecycle
 from fleet_graph.dd.upstream_constants import canonical_json
 from fleet_graph.dd.vendor import plugin_adapter
@@ -466,16 +469,21 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
 
     A fresh continuous review is a new attempt: legal within its own chain
     only as the very first entry or the entry right after a REJECT
-    (``attempt-context.py: check_chain_order``). The guard applies that rule
-    generation-aware, over the committed index the carrier itself reads: each
-    entry's durable ``attempt_id`` marks which generation sealed it, so an
-    older generation's APPROVE-ended history is immutable context, not a
-    prior-REJECT demand on the current generation's fresh attempt.
+    (``attempt-context.py: check_chain_order``). The guard applies exactly that
+    flat rule over the committed index the carrier itself reads, so a refusal
+    here is a faithful structured mirror of what the carrier would otherwise
+    reject as non-JSON output.
 
-    The regressions assert the structured ``materialize()`` result -- the
-    sealed commit and receipt a carrier produces for a legal fresh attempt,
-    and the structured ``ORDER_VIOLATION`` the guard raises for an illegal one
-    -- not merely that no shell error surfaced."""
+    The cross-generation permit is not the guard's doing: configure scopes the
+    committed index to the current generation's chain and archives the older
+    generation's entries (``dd.feedback_scope``). The regression therefore
+    commits the reported four-entry history, runs that scoping, and then proves
+    the fresh generation's continuous review materializes with the scoped index
+    -- and that the history was preserved, not erased.
+
+    The regressions assert the structured ``materialize()`` result and the
+    scoped committed index the carrier reads, not merely that no shell error
+    surfaced (spec requirements 1, 3, 4, 5 and 6)."""
 
     def _entry(self, generation: int, attempt: int, phase: str, verdict: str) -> dict[str, Any]:
         return {
@@ -496,19 +504,55 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
         git(repo, "add", "-A")
         git(repo, "commit", "-q", "-m", "index")
 
-    def _seal_via_carrier(self, monkeypatch: Any) -> dict[str, Any]:
-        """Monkeypatch the pinned carrier to seal a structured review receipt.
+    def _scope_and_commit(self, repo: Path, generation: int) -> None:
+        """What configure does for a fresh generation, then committed."""
+        assert scope_index_for_generation(
+            repo, generation=generation, development_id=DEVELOPMENT_ID
+        )
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "scope index")
+
+    @staticmethod
+    def _committed_entries(repo: Path, commit: str) -> list[dict[str, Any]]:
+        raw = git(repo, "show", f"{commit}:.dev-dispatch/feedback/index.json")
+        return list(json.loads(raw)["entries"])
+
+    def _seal_via_carrier(self, monkeypatch: Any) -> None:
+        """A faithful stand-in for the pinned carrier's ordering rule.
 
         The real carrier lives in the pinned plugin and cannot run in a unit
-        test; the ordering it enforces is mirrored by the guard this test
-        exercises, so the stand-in returns the structured receipt shape the
-        plugin's ``review-handoff-receipt`` admits and ``materialize()`` runs
-        its full path -- the guard, then the carrier -- returning the
-        structured ``Sealed`` the caller asserts.
+        test. This stand-in performs the one thing the carrier performs that
+        decides the outcome: it reads the committed index at the dispatch's
+        ``input_commit`` and refuses a fresh continuous review whose committed
+        predecessor did not end in REJECT (``check_chain_order``). On success it
+        actually commits the review artifact and returns a structured receipt
+        whose ``output_commit`` is that real commit -- not a pre-baked literal.
+        A cross-generation history that had not been scoped would therefore make
+        it refuse, exactly as the carrier would.
         """
-        receipt: dict[str, Any] = {"output_commit": SEALED_COMMIT, "verdict": "APPROVE"}
-        monkeypatch.setattr(plugin_adapter, "invoke_review_materializer", lambda *a, **k: receipt)
-        return receipt
+
+        def seal(
+            binding: Any, request: dict[str, Any], verify_worktree_head: bool = True
+        ) -> dict[str, Any]:
+            worktree = Path(request["worktree"])
+            input_commit = request["dispatch"]["input_commit"]
+            if not new_attempt_is_legal(self._committed_entries(worktree, input_commit)):
+                return {
+                    "verified": False,
+                    "failure_code": "ORDER_VIOLATION",
+                    "retryable": False,
+                    "detail": "a new attempt requires a prior REJECT",
+                }
+            artifact_dir = (
+                worktree / ".dev-dispatch" / "reviews" / request["dispatch"]["attempt_id"]
+            )
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            (artifact_dir / "review.json").write_text('{"verdict": "APPROVE"}\n', encoding="utf-8")
+            git(worktree, "add", "-A")
+            git(worktree, "commit", "-q", "-m", "review seal")
+            return {"output_commit": head(worktree), "verdict": "APPROVE"}
+
+        monkeypatch.setattr(plugin_adapter, "invoke_review_materializer", seal)
 
     def test_a_cross_generation_continuous_review_materializes(
         self, repo: Path, monkeypatch: Any
@@ -516,16 +560,15 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
         """The reported dev-fg-31b963659d16 history, end to end at the seal.
 
         Generation 1 ran attempt 1 (continuous APPROVE, final REJECT) then
-        attempt 2 (continuous APPROVE, final APPROVE, accepted); that committed
-        index is immutable history that is still present, committed, when the
-        later generation's continuous review reaches the seal (the replayer did
-        not -- and must not -- erase it). The generation-aware guard recognises
-        those entries as older-generation history, so the fresh generation's
-        continuous review is the first attempt of its own chain, not a new
-        attempt inside generation 1's. The assertion is on the structured
-        materialization result -- the sealed commit and receipt the carrier
-        produced -- not on a request payload field (spec requirements 3, 4 and
-        6)."""
+        attempt 2 (continuous APPROVE, final APPROVE, accepted). That four-entry
+        index is committed and inherited. A fresh generation's configure scopes
+        the index to its own chain (empty) and archives the four entries -- the
+        history is preserved, not erased -- so the carrier's flat rule, applied
+        to the committed index that reaches it, admits the fresh continuous
+        review as the new chain's first attempt. The assertion is on the
+        structured materialization result -- the sealed commit the carrier
+        actually produced -- plus the scoped index and the preserved archive
+        (spec requirements 1, 3, 4 and 6)."""
         self._commit_index(
             repo,
             [
@@ -535,17 +578,31 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
                 self._entry(1, 2, "final", "APPROVE"),
             ],
         )
+        self._scope_and_commit(repo, generation=2)
+
+        # The index the carrier reads is now the new chain's empty seed, and the
+        # inherited entries survive in the archive -- history is not erased.
+        assert self._committed_entries(repo, head(repo)) == []
+        archived = json.loads(git(repo, "show", f"HEAD:{HISTORY_PATH}"))["entries"]
+        assert [e["review_id"] for e in archived] == [
+            "r-continuous-g1-a1",
+            "r-final-g1-a1",
+            "r-continuous-g1-a2",
+            "r-final-g1-a2",
+        ]
+
         dispatch = dispatch_for(repo, "continuous_review")
         dispatch["generation"] = 2
         seal_implement_receipt(repo, derive_attempt_id(DEVELOPMENT_ID, 2, 1))
-        expected = self._seal_via_carrier(monkeypatch)
+        self._seal_via_carrier(monkeypatch)
 
         sealed = make_materializer(repo).materialize(
             REVIEW, dispatch, StageOutcome(receipt=review_receipt())
         )
 
-        assert sealed.commit == SEALED_COMMIT
-        assert sealed.receipt == expected
+        assert sealed.commit == head(repo)
+        assert sealed.commit not in (SEALED_COMMIT, "0" * 40)
+        assert sealed.receipt is not None and sealed.receipt["verdict"] == "APPROVE"
 
     def test_a_same_chain_new_attempt_without_a_prior_reject_is_refused(
         self, repo: Path, monkeypatch: Any
@@ -587,21 +644,20 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
         )
         dispatch = dispatch_for(repo, "continuous_review", attempt=2)
         seal_implement_receipt(repo, derive_attempt_id(DEVELOPMENT_ID, 1, 2))
-        expected = self._seal_via_carrier(monkeypatch)
+        self._seal_via_carrier(monkeypatch)
 
         sealed = make_materializer(repo).materialize(
             REVIEW, dispatch, StageOutcome(receipt=review_receipt())
         )
-        assert sealed.commit == SEALED_COMMIT
-        assert sealed.receipt == expected
+        assert sealed.commit == head(repo)
+        assert sealed.receipt is not None and sealed.receipt["verdict"] == "APPROVE"
 
-    def test_the_guard_is_generation_aware(self) -> None:
-        """The guard applies the ordering rule generation-aware: an inherited
-        older generation's accepted history does not impose a prior-REJECT on
-        the current generation's fresh attempt, while a same-generation
-        APPROVE-ended chain still refuses it. The flat (generation-less) rule
-        still mirrors the flattened carrier rule exactly (spec requirements
-        1, 2 and 3)."""
+    def test_the_guard_mirrors_the_flat_carrier_rule(self) -> None:
+        """The guard applies exactly the flat carrier rule: an APPROVE-ended
+        predecessor refuses a fresh attempt, a REJECT-ended or empty chain does
+        not. The generation-aware permit lives in the scoping (``split_entries``
+        keyed on the durable attempt identity), never in the guard (spec
+        requirements 1, 2 and 3)."""
         assert new_attempt_is_legal([]) is True
         assert new_attempt_is_legal([{"review_phase": "final", "verdict": "REJECT"}]) is True
         assert new_attempt_is_legal([{"review_phase": "continuous", "verdict": "APPROVE"}]) is False
@@ -609,36 +665,23 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
             self._entry(1, 1, "continuous", "APPROVE"),
             self._entry(1, 1, "final", "APPROVE"),
         ]
-        # Flat: an APPROVE-ended history refuses a fresh attempt.
         assert new_attempt_is_legal(accepted_history) is False
-        # Generation-aware: an older generation's accepted history is immutable.
-        assert (
-            new_attempt_is_legal(accepted_history, generation=2, development_id=DEVELOPMENT_ID)
-            is True
+
+        own, inherited = split_entries(
+            accepted_history, generation=2, development_id=DEVELOPMENT_ID
         )
-        # Same generation: a fresh attempt after an APPROVE chain is illegal.
-        assert (
-            new_attempt_is_legal(
-                [
-                    self._entry(2, 1, "continuous", "APPROVE"),
-                    self._entry(2, 1, "final", "APPROVE"),
-                ],
-                generation=2,
-                development_id=DEVELOPMENT_ID,
-            )
-            is False
-        )
-        assert (
-            new_attempt_is_legal(
-                [
-                    self._entry(2, 1, "continuous", "APPROVE"),
-                    self._entry(2, 1, "final", "REJECT"),
-                ],
-                generation=2,
-                development_id=DEVELOPMENT_ID,
-            )
-            is True
-        )
+        assert own == [] and [e["review_id"] for e in inherited] == [
+            "r-continuous-g1-a1",
+            "r-final-g1-a1",
+        ]
+        same_chain = [
+            self._entry(2, 1, "continuous", "APPROVE"),
+            self._entry(2, 1, "final", "APPROVE"),
+        ]
+        own, inherited = split_entries(same_chain, generation=2, development_id=DEVELOPMENT_ID)
+        assert [e["review_id"] for e in own] == ["r-continuous-g2-a1", "r-final-g2-a1"]
+        assert inherited == []
+        assert new_attempt_is_legal(own) is False
 
 
 class TestUnservedStagesRefuse:
