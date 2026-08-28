@@ -227,6 +227,8 @@ SUPPORTED_TOOLS: frozenset[str] = frozenset(
         "development_start",
         "development_gate",
         "development_reconfigure",
+        "development_adopt",
+        "development_recover",
     }
 )
 
@@ -377,6 +379,38 @@ def build_mcp_server(plane: DdControlPlane | None = None) -> Any:
         `refs=[{"target_entity": <question_note_id>}]`.
         """
         return call("gate", development_id=development_id, resume=resume)
+
+    @mcp.tool()
+    def development_adopt(development_id: str, discoveries: list[dict[str, str]]) -> dict[str, Any]:
+        """Adopt discovered in-flight/recoverable work into the governed workflow.
+
+        Each discovery is ``{signature, kind, source, target_ref}``. The
+        not-yet-adopted subset is adopted and the rest is skipped; replaying the
+        same batch is idempotent, so a replayed discovery cannot duplicate
+        adopted work or fork its history.
+        """
+        return call("adopt", development_id=development_id, discoveries=discoveries)
+
+    @mcp.tool()
+    def development_recover(
+        development_id: str,
+        target_ref: str = "",
+        question_note_id: str = "",
+    ) -> dict[str, Any]:
+        """Record a human recovery decision and resume suspended work only from it.
+
+        The tool carries no verdict: it reads the human's decision for the
+        question note off the board (the governance path), seals it with its
+        immutable target reference into the recovery trail, and resumes the
+        suspended work from that recorded decision alone. No board decision
+        means no recovery, so this never becomes a bypass around the gate.
+        """
+        return call(
+            "recover",
+            development_id=development_id,
+            target_ref=target_ref,
+            question_note_id=question_note_id,
+        )
 
     @mcp.tool()
     def development_steer(

@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from fleet_graph.dd.capability import CONTRACTS_DIR
+from fleet_graph.dd.scope import ScopeViolationError, default_boundary, require_scope
 from fleet_graph.dd.upstream_constants import (
     ATTEMPT_CONTEXT_CONTRACT_VERSION,
     compute_json_digest,
@@ -65,6 +66,18 @@ FEEDBACK_INDEX_FIELDS = frozenset({"contract_version", "development_id", "entrie
 
 class DispatchError(RuntimeError):
     """The dispatch cannot be built as declared. Nothing is guessed."""
+
+
+def _require_spec_in_scope(spec_bytes: str) -> None:
+    """Refuse a spec whose committed bytes actively cross the B1-B3 boundary.
+
+    The scope boundary is the authority; the refusal carries its rule id, so a
+    crossing handoff is a scope decision rather than an incidental failure.
+    """
+    try:
+        require_scope(spec_bytes, default_boundary())
+    except ScopeViolationError as exc:
+        raise DispatchError(f"scope boundary refused: {exc}") from exc
 
 
 def derive_attempt_id(development_id: str, generation: int, attempt: int) -> str:
@@ -124,6 +137,14 @@ def read_committed_refs(
         raw = git_ops._command_text(
             "cat-file", "blob", feedback["blob_oid"], worktree=workspace_path
         )
+        # B1: the dispatch path re-checks the committed spec bytes against the
+        # scope boundary, so a rework handoff that rewrote the frozen spec to
+        # add B4 or revive katana#150/katana#151 is refused here too, not only
+        # at admission. The refusal names the scope rule, not the read failure.
+        spec_raw = git_ops._command_text(
+            "cat-file", "blob", spec["blob_oid"], worktree=workspace_path
+        )
+        _require_spec_in_scope(spec_raw)
     except git_ops.ExactWorkspaceError as exc:
         raise DispatchError(f"cannot read committed refs at {input_commit}: {exc}") from exc
 
