@@ -591,6 +591,8 @@ class TestAReworkedPrefixReplaysAsRework:
         assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
         assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
         assert modes[:1] == [("final_review", MODE_INITIAL)], modes
+
+
 class TestANewAttemptWithoutARejectLinkIsNeverReplayed:
     def test_a_rework_that_does_not_name_its_rejecting_review_is_not_a_link(
         self, repo: Path, tmp_path: Path
