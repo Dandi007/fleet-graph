@@ -460,18 +460,17 @@ class TestTheParentReceiptIsTheOneTheContractNames:
 
 
 class TestTheOrderingRuleIsEnforcedAtMaterialization:
-    """The pinned carrier's flat ordering rule holds at the materialization
+    """The pinned carrier's ordering rule holds at the materialization
     boundary as a structured refusal, instead of the non-JSON shell error the
     carrier produces when it applies the same rule (dev-fg-31b963659d16).
 
-    A fresh continuous review is a new attempt: legal only as the very first
-    entry of the committed chain or the entry right after a REJECT
-    (``attempt-context.py: check_chain_order``). The guard mirrors that flat
-    rule deliberately -- the generation-aware scoping that lets a later
-    generation inherit an APPROVE-ended history is the replayer's job (see
-    test_dd_replay), so by the time a review reaches this seal the committed
-    index a fresh attempt follows is already the generation's empty seed or a
-    REJECT-terminated rework prefix.
+    A fresh continuous review is a new attempt: legal within its own chain
+    only as the very first entry or the entry right after a REJECT
+    (``attempt-context.py: check_chain_order``). The guard applies that rule
+    generation-aware, over the committed index the carrier itself reads: each
+    entry's durable ``attempt_id`` marks which generation sealed it, so an
+    older generation's APPROVE-ended history is immutable context, not a
+    prior-REJECT demand on the current generation's fresh attempt.
 
     The regressions assert the structured ``materialize()`` result -- the
     sealed commit and receipt a carrier produces for a legal fresh attempt,
@@ -518,13 +517,15 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
 
         Generation 1 ran attempt 1 (continuous APPROVE, final REJECT) then
         attempt 2 (continuous APPROVE, final APPROVE, accepted); that committed
-        index is immutable history. A later generation's replayer scopes the
-        tree to its own chain -- the committed index at its implement tip is the
-        fresh generation's empty seed -- so its fresh continuous review is the
-        first attempt of its own chain, not a new attempt inside generation 1's.
-        The assertion is on the structured materialization result -- the sealed
-        commit and receipt the carrier produced -- not on a request payload
-        field (spec requirements 3 and 6)."""
+        index is immutable history that is still present, committed, when the
+        later generation's continuous review reaches the seal (the replayer did
+        not -- and must not -- erase it). The generation-aware guard recognises
+        those entries as older-generation history, so the fresh generation's
+        continuous review is the first attempt of its own chain, not a new
+        attempt inside generation 1's. The assertion is on the structured
+        materialization result -- the sealed commit and receipt the carrier
+        produced -- not on a request payload field (spec requirements 3, 4 and
+        6)."""
         self._commit_index(
             repo,
             [
@@ -534,9 +535,6 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
                 self._entry(1, 2, "final", "APPROVE"),
             ],
         )
-        # The replayer already scoped the fresh generation's chain: its own
-        # empty seed replaces the inherited history in the live index.
-        self._commit_index(repo, [])
         dispatch = dispatch_for(repo, "continuous_review")
         dispatch["generation"] = 2
         seal_implement_receipt(repo, derive_attempt_id(DEVELOPMENT_ID, 2, 1))
@@ -597,29 +595,47 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
         assert sealed.commit == SEALED_COMMIT
         assert sealed.receipt == expected
 
-    def test_the_guard_mirrors_the_flat_carrier_rule(self) -> None:
-        """The guard restates the carrier's flat rule exactly: a fresh attempt
-        is legal only on an empty chain or after a REJECT, never after an
-        APPROVE. The generation-aware scoping that the replayer performs is a
-        separate concern, and this mirror must not drift from it."""
+    def test_the_guard_is_generation_aware(self) -> None:
+        """The guard applies the ordering rule generation-aware: an inherited
+        older generation's accepted history does not impose a prior-REJECT on
+        the current generation's fresh attempt, while a same-generation
+        APPROVE-ended chain still refuses it. The flat (generation-less) rule
+        still mirrors the flattened carrier rule exactly (spec requirements
+        1, 2 and 3)."""
         assert new_attempt_is_legal([]) is True
         assert new_attempt_is_legal([{"review_phase": "final", "verdict": "REJECT"}]) is True
         assert new_attempt_is_legal([{"review_phase": "continuous", "verdict": "APPROVE"}]) is False
+        accepted_history = [
+            self._entry(1, 1, "continuous", "APPROVE"),
+            self._entry(1, 1, "final", "APPROVE"),
+        ]
+        # Flat: an APPROVE-ended history refuses a fresh attempt.
+        assert new_attempt_is_legal(accepted_history) is False
+        # Generation-aware: an older generation's accepted history is immutable.
+        assert (
+            new_attempt_is_legal(accepted_history, generation=2, development_id=DEVELOPMENT_ID)
+            is True
+        )
+        # Same generation: a fresh attempt after an APPROVE chain is illegal.
         assert (
             new_attempt_is_legal(
                 [
-                    self._entry(1, 1, "continuous", "APPROVE"),
-                    self._entry(1, 1, "final", "APPROVE"),
-                ]
+                    self._entry(2, 1, "continuous", "APPROVE"),
+                    self._entry(2, 1, "final", "APPROVE"),
+                ],
+                generation=2,
+                development_id=DEVELOPMENT_ID,
             )
             is False
         )
         assert (
             new_attempt_is_legal(
                 [
-                    self._entry(1, 1, "continuous", "APPROVE"),
-                    self._entry(1, 1, "final", "REJECT"),
-                ]
+                    self._entry(2, 1, "continuous", "APPROVE"),
+                    self._entry(2, 1, "final", "REJECT"),
+                ],
+                generation=2,
+                development_id=DEVELOPMENT_ID,
             )
             is True
         )

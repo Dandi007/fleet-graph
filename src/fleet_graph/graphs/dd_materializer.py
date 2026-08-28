@@ -274,18 +274,26 @@ class PluginMaterializer:
         boundary, as a structured refusal instead of the non-JSON shell error
         the carrier produces when it applies the same rule.
 
-        A fresh continuous review is a new attempt, legal only as the very
-        first entry of the committed chain or the entry right after a REJECT
-        (``attempt-context.py: check_chain_order``). This guard mirrors that
-        flat rule -- deliberately *not* the generation-aware rule the replayer
-        consults (``dd.chain_rules``) -- because it runs over the committed
-        index the carrier itself reads: by the time a review reaches this seal,
-        the replayer has already scoped the tree to the current generation's
-        own chain, so the committed index a fresh attempt follows is either the
-        generation's empty seed or a REJECT-terminated rework prefix. A
-        materialization that would hand the carrier an APPROVE-ended
-        predecessor is refused here with the same ``ORDER_VIOLATION`` code,
-        only as a structured failure instead of the raw plugin stderr.
+        A fresh continuous review is a new attempt, legal within its own chain
+        only as the very first entry or the entry right after a REJECT
+        (``attempt-context.py: check_chain_order``). This guard applies that
+        rule generation-aware (``dd.chain_rules``), over the committed index
+        the carrier itself reads: every entry carries the durable
+        ``attempt_id`` the engine derived from
+        ``(development_id, generation, attempt)``, so entries belonging to an
+        older generation are recognised as immutable history and do not impose
+        a prior-REJECT requirement on the current generation's fresh attempt,
+        while a genuinely new attempt within the same chain still owes its
+        REJECT.
+
+        This is deliberately *not* the replayer's conservative flat scoping:
+        a review can reach this seal with the inherited index still committed
+        -- the replayer fails closed on product drift and when no prior
+        receipts are discoverable, leaving the tree unscoped. The
+        generation-aware rule is what permits a valid later generation to
+        materialise its continuous review *after* inherited historical reviews
+        (spec requirement 3 / dev-fg-31b963659d16), without rewriting or
+        erasing those records.
         """
         if not self._continuous_ordering_guard(stage):
             return
@@ -299,7 +307,12 @@ class PluginMaterializer:
             )
         except DispatchError as exc:
             raise MaterializationFailed("INVALID_HANDOFF_SCHEMA", str(exc)) from exc
-        if not chain_rules.new_attempt_is_legal(list(refs.entries)):
+        generation = int(dispatch.get("generation", 1))
+        if not chain_rules.new_attempt_is_legal(
+            list(refs.entries),
+            generation=generation,
+            development_id=self.builder.chain.development_id,
+        ):
             raise MaterializationFailed(
                 "ORDER_VIOLATION",
                 "a fresh continuous review is a new attempt in this chain and "

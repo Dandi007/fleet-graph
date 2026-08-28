@@ -223,35 +223,23 @@ class ReceiptReplayer:
                 return None
             if self._ends_at_implement(self._plan):
                 inherited = self._inherited_entries()
-                if inherited is not None and not chain_rules.new_attempt_is_legal(
-                    inherited, generation=self.generation, development_id=self.development_id
-                ):
+                if inherited is not None and not chain_rules.new_attempt_is_legal(inherited):
                     # Replaying a prefix that stops at implement is always
                     # followed by a fresh continuous review -- a brand-new
-                    # attempt. Its legality is judged against this generation's
-                    # own chain by the generation-aware rule (dd/chain_rules.py):
-                    # historical entries from older generations do not impose a
-                    # prior-REJECT requirement on a fresh attempt (spec
-                    # requirement 3 / dev-fg-31b963659d16), while a genuinely
-                    # new attempt within the same chain still owes its prior
-                    # REJECT. When this generation's inherited chain did not end
-                    # in REJECT, replaying would move the tree only for the
-                    # materializer to refuse that new attempt (ORDER_VIOLATION).
-                    # Fail-closed here instead: replay nothing, so the divergent
-                    # work is surfaced rather than silently re-reviewed. (An
-                    # unreadable index defers to the materializer.)
-                    #
-                    # When the rule *allows* the replay -- the cross-generation
-                    # case and the after-REJECT case -- the carrier converges on
-                    # the same answer rather than re-raising ORDER_VIOLATION:
-                    # `_prepare` trims to an implement commit whose committed
-                    # index is either the generation's own seed (empty) or a
-                    # REJECT-terminated rework prefix, so the materializer's
-                    # flat guard -- and the pinned carrier's flat
-                    # ``check_chain_order`` it mirrors -- read a chain a fresh
-                    # attempt may legally follow. The generation-aware pre-check
-                    # and the flat carrier cannot diverge into "move the tree,
-                    # then fail at the seal".
+                    # attempt. The replayer is deliberately conservative here:
+                    # it replays such a partial prefix only when the committed
+                    # index that fresh attempt would follow is empty or already
+                    # REJECT-terminated, i.e. the flat carrier rule
+                    # ``check_chain_order`` accepts it. An APPROVE-ended
+                    # inherited index is refused -- in particular a previous
+                    # generation's accepted history, because replaying it would
+                    # move the tree only to trim that inherited record away,
+                    # erasing history the spec requires preserved. The
+                    # generation-aware permit of an older generation's inherited
+                    # chain is the materializer's job (``dd_materializer``),
+                    # which reads the committed entries at the seal -- never the
+                    # replayer's, and never by deleting records. (An unreadable
+                    # index defers to the materializer.)
                     self._disabled = True
                     return None
             # The one mutation happens exactly once, on exactly the selected

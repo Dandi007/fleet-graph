@@ -674,11 +674,14 @@ class TestAReviewedChainContinuesThroughItsReviews:
 class TestAPartialPrefixRespectsTheInheritedChain:
     """A replayed prefix that stops at implement is always followed by a fresh
     continuous review -- a brand-new attempt. The replayer reads the inherited
-    feedback index and only replays that partial prefix when the fresh review
-    would be legal (the inherited chain ends in REJECT). Otherwise it fails
-    closed, so the carrier -- not the replayer -- stays the authority that
-    rejects a genuine new attempt without a prior REJECT (spec requirements 1,
-    2 and 4)."""
+    feedback index and only replays that partial prefix when the committed
+    index that fresh attempt would follow is empty or already REJECT-terminated
+    (the flat carrier rule). An APPROVE-ended inherited index is refused
+    fail-closed -- in particular a previous generation's accepted history,
+    because replaying it would trim that record away. The generation-aware
+    permit of an inherited older generation's chain is the materializer's job
+    (see test_dd_materializer), never the replayer's, and never by erasing the
+    history (spec requirements 1, 2 and 4)."""
 
     def test_the_new_attempt_rule_mirrors_the_carrier(self) -> None:
         assert chain_rules.new_attempt_is_legal([]) is True
@@ -779,16 +782,18 @@ class TestAPartialPrefixRespectsTheInheritedChain:
         assert next(stage for stage, _ in actor.calls) == "continuous_review"
         assert head(repo) == g1.implement
 
-    def test_a_cross_generation_history_still_materializes_its_continuous_review(
+    def test_a_cross_generation_history_fails_closed_without_erasing(
         self, repo: Path, tmp_path: Path
     ) -> None:
         """The reported defect (dev-fg-31b963659d16): generation 1 ran
         attempt 1 (continuous APPROVE, final REJECT) then attempt 2 (continuous
         APPROVE, final APPROVE, accepted), and a later generation inherited that
-        committed feedback index but only a [configure, implement] prefix's
-        receipts were re-discoverable. The fresh generation's continuous review
-        must still materialise -- its attempt is a legal first entry of its own
-        chain, not a new attempt inside generation 1's (spec requirement 4)."""
+        committed feedback index. When only a [configure, implement] partial
+        prefix's receipts are re-discoverable, the replayer must fail closed --
+        no replay, no trim -- because replaying would trim away the inherited
+        APPROVE-ended index, erasing history the spec requires preserved. The
+        generation-aware permit of that inherited history belongs to the
+        materializer's guard (see test_dd_materializer), not to the replayer."""
         g1 = G1(repo, tmp_path)
         committed_index(
             repo,
@@ -804,14 +809,9 @@ class TestAPartialPrefixRespectsTheInheritedChain:
         actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
         state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
 
-        assert state["terminal"] == TERMINAL_COMPLETE
-        assert replayed_stages(state) == ["configure", "implement"]
-        # The materialised continuous review is the first real stage: the
-        # partial prefix replayed, the trim moved the tree to the sealed tip,
-        # and no fresh review was declined (structured result, not a shell
-        # error's absence).
-        assert next(stage for stage, _ in actor.calls) == "continuous_review"
-        assert head(repo) == g1.implement
+        assert replayed_stages(state) == []
+        assert next(stage for stage, _ in actor.calls) == "configure"
+        assert head(repo) == junk, "a refused replay must not trim the inherited index"
 
 
 class TestTheReplayedIdentityBindsTheRealReview:
