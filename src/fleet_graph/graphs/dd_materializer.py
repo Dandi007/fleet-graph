@@ -270,18 +270,22 @@ class PluginMaterializer:
         return bool(reviews) and stage.id == reviews[0]
 
     def _enforce_continuous_order(self, stage: Stage, dispatch: Dispatch) -> None:
-        """Enforce the generation-aware ordering rule at the materialization
-        boundary, not merely as a replayer pre-check.
+        """Enforce the pinned carrier's ordering rule at the materialization
+        boundary, as a structured refusal instead of the non-JSON shell error
+        the carrier produces when it applies the same rule.
 
-        A fresh continuous review is a new attempt, legal only as the first
-        entry of its generation's chain or the entry right after a same-chain
-        REJECT. The rule is generation-aware (see ``dd.chain_rules``): entries
-        whose durable attempt identity belongs to an older generation are
-        immutable history and impose no prior-REJECT requirement on the current
-        generation, while a genuinely new attempt within the same chain still
-        owes its prior REJECT. Refusing here produces a structured
-        ``ORDER_VIOLATION`` at materialization instead of a silent pass-through
-        that the pinned carrier would then reject with the identical error.
+        A fresh continuous review is a new attempt, legal only as the very
+        first entry of the committed chain or the entry right after a REJECT
+        (``attempt-context.py: check_chain_order``). This guard mirrors that
+        flat rule -- deliberately *not* the generation-aware rule the replayer
+        consults (``dd.chain_rules``) -- because it runs over the committed
+        index the carrier itself reads: by the time a review reaches this seal,
+        the replayer has already scoped the tree to the current generation's
+        own chain, so the committed index a fresh attempt follows is either the
+        generation's empty seed or a REJECT-terminated rework prefix. A
+        materialization that would hand the carrier an APPROVE-ended
+        predecessor is refused here with the same ``ORDER_VIOLATION`` code,
+        only as a structured failure instead of the raw plugin stderr.
         """
         if not self._continuous_ordering_guard(stage):
             return
@@ -295,12 +299,7 @@ class PluginMaterializer:
             )
         except DispatchError as exc:
             raise MaterializationFailed("INVALID_HANDOFF_SCHEMA", str(exc)) from exc
-        generation = int(dispatch.get("generation", 1))
-        if not chain_rules.new_attempt_is_legal(
-            list(refs.entries),
-            generation=generation,
-            development_id=self.builder.chain.development_id,
-        ):
+        if not chain_rules.new_attempt_is_legal(list(refs.entries)):
             raise MaterializationFailed(
                 "ORDER_VIOLATION",
                 "a fresh continuous review is a new attempt in this chain and "

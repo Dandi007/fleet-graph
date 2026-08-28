@@ -229,8 +229,7 @@ class ReceiptReplayer:
                     # Replaying a prefix that stops at implement is always
                     # followed by a fresh continuous review -- a brand-new
                     # attempt. Its legality is judged against this generation's
-                    # own chain by the same generation-aware rule the review
-                    # materializer enforces at seal time (dd/chain_rules.py):
+                    # own chain by the generation-aware rule (dd/chain_rules.py):
                     # historical entries from older generations do not impose a
                     # prior-REJECT requirement on a fresh attempt (spec
                     # requirement 3 / dev-fg-31b963659d16), while a genuinely
@@ -247,10 +246,12 @@ class ReceiptReplayer:
                     # the same answer rather than re-raising ORDER_VIOLATION:
                     # `_prepare` trims to an implement commit whose committed
                     # index is either the generation's own seed (empty) or a
-                    # REJECT-terminated rework prefix, so the pinned carrier's
-                    # flat ``check_chain_order`` reads a chain a fresh attempt
-                    # may legally follow. The pre-check and the carrier cannot
-                    # diverge into "move the tree, then fail at the seal".
+                    # REJECT-terminated rework prefix, so the materializer's
+                    # flat guard -- and the pinned carrier's flat
+                    # ``check_chain_order`` it mirrors -- read a chain a fresh
+                    # attempt may legally follow. The generation-aware pre-check
+                    # and the flat carrier cannot diverge into "move the tree,
+                    # then fail at the seal".
                     self._disabled = True
                     return None
             # The one mutation happens exactly once, on exactly the selected

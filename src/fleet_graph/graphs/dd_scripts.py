@@ -21,9 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from fleet_graph.dd.bootstrap import INDEX_PATH, canonical_bytes
 from fleet_graph.dd.git import run_git
-from fleet_graph.dd.upstream_constants import ATTEMPT_CONTEXT_CONTRACT_VERSION
 from fleet_graph.dd.vendor import git_ops
 from fleet_graph.graphs.dd_pipeline import (
     Dispatch,
@@ -135,44 +133,7 @@ class ConfigureStage:
                 **self.run_config,
             },
         )
-        self._scope_feedback_index(dispatch)
         return StageOutcome(produced=tuple(stage.produced_artifacts))
-
-    def _scope_feedback_index(self, dispatch: Dispatch) -> None:
-        """Seed the current generation's own, empty feedback index.
-
-        The feedback index tracks *one generation's* attempt chain: its
-        ``attempt_id`` values are derived from ``(development_id, generation,
-        attempt)``, so a fresh generation's first continuous review is attempt 1
-        of its own chain -- never a continuation of the previous generation's
-        attempt numbering. Generation 1 already carries the bootstrap's empty
-        index, so only a later generation needs the file re-seeded.
-
-        This re-scoping is not an erasure of history. Every review the previous
-        generation committed remains immutably recorded in that generation's own
-        commits (and its sealed receipts under its state root); the pinned
-        carrier validates them there, exactly as it did when that generation ran.
-        What changes is only which chain the *current* generation is ordered
-        against: scoping the index lets the pinned carrier's flat
-        ``check_chain_order`` read the fresh generation's empty chain instead of
-        misreading the inherited APPROVE-ended history as "a new attempt
-        requires a prior REJECT" (ORDER_VIOLATION, dev-fg-31b963659d16).
-
-        The replayer handles the replayed path the same way: a replayed prefix
-        ends at an implement commit whose committed index is already the
-        generation's own seed or a REJECT-terminated rework prefix, so no
-        inherited APPROVE tail ever reaches the carrier there.
-        """
-        if int(dispatch.get("generation", 1)) <= 1:
-            return
-        index = {
-            "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
-            "development_id": dispatch.get("development_id", ""),
-            "entries": [],
-        }
-        path = self.repo / INDEX_PATH
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(canonical_bytes(index))
 
 
 @dataclass

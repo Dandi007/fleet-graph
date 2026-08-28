@@ -52,31 +52,42 @@ class TestConfigure:
         assert written["acceptance_commands"] == [["true"]]
         assert outcome.produced == CONFIGURE.produced_artifacts
 
-    def test_a_fresh_generation_scopes_the_feedback_index(self, repo: Path) -> None:
-        """A later generation's configure re-seeds its own, empty feedback index
-        (the attempt identity is derived per generation), while the previous
-        generation's committed reviews stay immutably recorded in that
-        generation's commits. The pinned carrier's flat ordering check reads the
-        fresh generation's empty chain, not the inherited APPROVE-ended history
-        (dev-fg-31b963659d16)."""
+    def test_a_later_generation_preserves_the_inherited_feedback_index(self, repo: Path) -> None:
+        """Configure never erases or rewrites the committed feedback index.
+
+        Requirement 1/7 of dev-fg-31b963659d16 forbids treating historical
+        review records as disposable: the committed index is the only feedback
+        history, so a later generation's configure must leave the inherited
+        entries byte-for-byte intact. Scoping the fresh generation's chain is
+        the replayer's job (it trims to a commit whose committed index is
+        already the generation's own), never configure's -- and never by
+        deleting the inherited history."""
         from conftest import write_index
         from fleet_graph.dd.bootstrap import INDEX_PATH
 
-        historical = [{"attempt": 1, "review_id": "rc-old", "review_phase": "continuous"}]
+        historical = [
+            {
+                "attempt": 1,
+                "attempt_id": "a" * 36,
+                "review_id": "rc-old",
+                "review_phase": "continuous",
+                "subject_commit": "0" * 40,
+                "implementation_subject_commit": "0" * 40,
+                "verdict": "APPROVE",
+                "artifact_path": ".dev-dispatch/reviews/x.json",
+                "artifact_blob_oid": "0" * 40,
+                "artifact_digest": "sha256:" + "0" * 64,
+            }
+        ]
         write_index(repo, entries=historical)
         git(repo, "add", "-A")
         git(repo, "commit", "-q", "-m", "carry historical index")
-        inherited = head(repo)
 
         ConfigureStage(repo=repo, run_config={}).act(CONFIGURE, dispatch(generation=2))
 
         index = json.loads((repo / INDEX_PATH).read_text(encoding="utf-8"))
-        assert index["entries"] == []
+        assert index["entries"] == historical
         assert index["development_id"] == "dev-001"
-        # The re-scoping never rewrites history: the inherited index stays what
-        # its own generation committed it to be.
-        preserved = git(repo, "show", f"{inherited}:{INDEX_PATH}")
-        assert json.loads(preserved)["entries"] == historical
 
     def test_generation_one_leaves_the_feedback_index_alone(self, repo: Path) -> None:
         """Generation 1 already carries the bootstrap's empty index; configure
