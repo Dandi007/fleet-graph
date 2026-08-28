@@ -3,7 +3,7 @@
 The surface is the control plane: every real tool drives the in-process
 `DdControlPlane` -- there is no graph-API forwarding tier any more. Tool-surface
 shape follows the wf-a08949 2026-08-27 use-case-family ruling: the full
-13-name legacy surface stays reachable, only the consumed family
+15-name surface stays reachable, only the consumed family
 (list/get/events/evidence/create/start/gate) does work, and every legacy-only
 name refuses with an explicit NOT_SUPPORTED structure and zero control-plane
 calls.
@@ -145,14 +145,14 @@ def test_selected_port_is_free_and_not_a_legacy_port() -> None:
         pytest.skip("port 5610 is already being served on this host")
 
 
-def test_all_thirteen_tools_are_reachable() -> None:
+def test_all_fifteen_tools_are_reachable() -> None:
     server = build_mcp_server(FakeControlPlane())
     tools = asyncio.run(server.list_tools())
     assert {tool.name for tool in tools} == ALL_TOOLS
 
 
 def test_the_surface_split_is_exactly_the_ruling() -> None:
-    """Supported + refused partitions the 13 names, with no overlap.
+    """Supported + refused partitions the 15 names, with no overlap.
 
     R1-c moved `development_reconfigure` from the refused side to the real
     side (the environment/contract failure exit); steer / relock / control /
