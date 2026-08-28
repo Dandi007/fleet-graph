@@ -234,11 +234,28 @@ class ReceiptReplayer:
         head = self._rev_parse("HEAD")
         if not head:
             return []
+        plans: list[list[_Step]] = []
         for generation, root in self.prior_state_roots:
             plan = self._walk(int(generation), Path(root), head, configure_id, implement_id)
             if plan:
-                return plan
-        return []
+                plans.append(plan)
+        if not plans:
+            return []
+        # A restarted generation replays the receipt-sealed prefix, but a prior
+        # generation that crashed mid-review (configure + implement sealed, the
+        # review never sealed) leaves only a *partial* prefix ending at
+        # implement. Replaying that partial prefix and then materialising a
+        # fresh continuous review would hand the feedback carrier a brand-new
+        # attempt whose ordering rule refuses without a preceding REJECT
+        # (ORDER_VIOLATION). When an earlier generation holds the review-bearing
+        # prefix for the same development, replay that instead: the replayed
+        # candidate continues through its continuous and final review stages
+        # rather than opening a new attempt. Ties resolve to the newest
+        # generation (the walk order), and `_prepare` still fail-closes on
+        # product drift, so preferring the more-reviewing prefix can never cut
+        # work an earlier generation did not already seal.
+        review_ids = set(review_stages(self.lifecycle))
+        return max(plans, key=lambda plan: sum(1 for step in plan if step.stage_id in review_ids))
 
     def _walk(
         self,

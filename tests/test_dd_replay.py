@@ -379,6 +379,132 @@ class TestARejectionIsNeverReplayed:
         assert head(repo) == g1.implement, "the rejected review's seal is dead weight"
 
 
+class TestAReviewedChainContinuesThroughItsReviews:
+    """The ORDER_VIOLATION lesson: a replayed implementation is not a new
+    implementation attempt. A restarted generation that reuses configure and
+    implement must carry its sealed reviews along -- replay them, not
+    materialise a fresh continuous review the feedback carrier would reject as
+    "a new attempt requiring a prior REJECT"."""
+
+    def test_a_fully_reviewed_chain_replays_through_to_acceptance(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """An accepted/reviewed chain is replayed into a later generation: the
+        replayed configure and implement are reused, the continuous-review
+        handoff materialises alongside them, and the walk reaches acceptance
+        with no fresh review -- hence no illegal new attempt."""
+        g1 = G1(repo, tmp_path)
+        rc = commit_file(
+            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
+        )
+        cr = review_receipt(
+            parent_digest=byte_digest(g1.raw),
+            subject=g1.implement,
+            output=rc,
+            verdict="APPROVE",
+        )
+        cr_raw = write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
+        write_intent(g1.state_root, cr)
+        rf = commit_file(repo, ".dev-dispatch/reviews/final/g1-a1.json", '{"verdict": "APPROVE"}')
+        fr = review_receipt(
+            parent_digest=byte_digest(cr_raw),
+            subject=rc,
+            output=rf,
+            verdict="APPROVE",
+            phase="final",
+        )
+        write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr)
+        write_intent(g1.state_root, fr)
+        junk = g1.junk_configure()
+
+        actor = ContractActor()
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert replayed_stages(state) == [
+            "configure",
+            "implement",
+            "continuous_review",
+            "final_review",
+        ]
+        assert [stage for stage, _ in actor.calls] == ["acceptance", "human_gate", "merger"]
+
+    def test_the_review_bearing_prefix_is_preferred_over_a_partial_one(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """A generation that crashed mid-review sealed only implement. A later
+        generation must still replay the reviews the earlier one sealed, not
+        materialise a brand-new review of a prefix that stops at implement."""
+        g1 = G1(repo, tmp_path)
+        rc = commit_file(
+            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
+        )
+        cr = review_receipt(
+            parent_digest=byte_digest(g1.raw),
+            subject=g1.implement,
+            output=rc,
+            verdict="APPROVE",
+        )
+        cr_raw = write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
+        write_intent(g1.state_root, cr)
+        rf = commit_file(repo, ".dev-dispatch/reviews/final/g1-a1.json", '{"verdict": "APPROVE"}')
+        fr = review_receipt(
+            parent_digest=byte_digest(cr_raw),
+            subject=rc,
+            output=rf,
+            verdict="APPROVE",
+            phase="final",
+        )
+        write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr)
+        write_intent(g1.state_root, fr)
+
+        g2_state = tmp_path / "dd" / "g2" / "state"
+        g2_configure = commit_file(repo, ".dev-dispatch/run-config.json", '{"generation": 2}')
+        g2_implement = commit_file(repo, "product.py", "print('g2')\n")
+        g2_imp = implement_receipt(rf, g2_configure, g2_implement)
+        g2_imp["attempt_id"] = derive_attempt_id(DEVELOPMENT_ID, 2, 1)
+        write_receipt(g2_state, 2, 1, "implement-receipt.json", g2_imp)
+
+        replayer = ReceiptReplayer(
+            workspace=repo,
+            state_root=tmp_path / "dd" / "g3" / "state",
+            prior_state_roots=((2, g2_state), (1, g1.state_root)),
+            development_id=DEVELOPMENT_ID,
+            generation=3,
+            lifecycle=LIFECYCLE,
+        )
+        plan = replayer._build_plan()
+        assert [step.stage_id for step in plan] == [
+            "configure",
+            "implement",
+            "continuous_review",
+            "final_review",
+        ]
+
+    def test_a_rework_still_returns_a_derived_identity(self, repo: Path, tmp_path: Path) -> None:
+        """The complementary boundary: a genuine new attempt (a rework after a
+        REJECT) is new work under its own derived identity, not a continuation
+        of the replayed prefix. Replaying configure and implement must not
+        pretend a rework never happened."""
+        g1 = G1(repo, tmp_path)
+        seen: list[tuple[str, str]] = []
+
+        class Recorder(ContractActor):
+            def act(self, stage: Any, dispatch: dict[str, Any]) -> Any:
+                seen.append((stage.id, str(dispatch.get("pinned_attempt_id") or "")))
+                return super().act(stage, dispatch)
+
+        actor = Recorder({"continuous_review": ["REJECT", "APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(
+            make_deps(actor=actor, replayer=g1.replayer()), g1.junk_configure()
+        )
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        sealed_identity = g1.receipt["attempt_id"]
+        assert ("continuous_review", sealed_identity) in seen
+        assert ("implement", "") in seen, "the rework implement must not inherit the pin"
+
+
 class TestTheReplayedIdentityBindsTheRealReview:
     """The g4 lesson: the review of replayed work must dispatch under the
     identity the implement receipt was sealed with, or the plugin refuses
