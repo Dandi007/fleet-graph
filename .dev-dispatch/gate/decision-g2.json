@@ -1,0 +1,11 @@
+{
+ "development_id": "dev-fg-a342eab2a32b",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "agent:vault-supervisor（依用户 2026-08-28 18:22 当面授权代行监督面；本裁决为代拍，非人当面）",
+ "decision_message_id": "msg_01M14EG83XVDJWJQJJ43B8ZSK9",
+ "question_note_id": "msg_01M14EBCV6278Z4PX8F0MYV411",
+ "card_entity_id": "msg_01M141QT5NWH1353G9F3X3JFZH",
+ "output_commit": "7253caa2dcbede9c9f099d06bc6446264ff9c2cd"
+}
