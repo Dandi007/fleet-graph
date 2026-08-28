@@ -85,7 +85,9 @@ class AgentRunCoordinator:
     #: one, and a re-adopted run keeps the label it was first dispatched with.
     launch_id: str = ""
 
-    def turn(self, round_no: int, coord_input: dict[str, Any]) -> dict[str, Any]:
+    def turn(
+        self, round_no: int, coord_input: dict[str, Any], *, resume: bool = False
+    ) -> dict[str, Any]:
         input_path = write_json_durable(
             self.run_root / "coord" / f"round-{round_no}-input.json", coord_input
         )
@@ -110,6 +112,18 @@ class AgentRunCoordinator:
             timeout_seconds=self.timeout_seconds,
             labels=labels,
         )
+        # The node a turn derives its run id from. A *resume* turn must be a
+        # genuinely new run rather than a re-adoption of the round's original
+        # coordinator run: the pre-suspension run already wrote a succeeded
+        # result.json (the ``blocked + waiting_on=decision`` verdict), and
+        # re-adopting it would replay that stale verdict with no
+        # ``acknowledged_message_id`` -- the injected decision would be
+        # silently dropped (E2 spec item 3). A distinct node name gives the
+        # resume its own derived run id, deterministically, so a crash after
+        # the resume launches still re-adopts the resume run (never a second
+        # model invocation) instead of colliding with the pre-suspension one.
+        node = f"coordinator-resume-{round_no}" if resume else f"coordinator-{round_no}"
+
         # A failed prior attempt must not be re-adopted: its run id is already
         # registered on the bus lifecycle with that attempt's intent, and
         # re-dispatching the same id gets a 409 IDEMPOTENCY_CONFLICT -> exit 91
@@ -119,7 +133,7 @@ class AgentRunCoordinator:
         # that fails MAX_COORDINATOR_ATTEMPTS times is a fault, not a loop.
         run_id = ""
         for attempt in range(1, MAX_COORDINATOR_ATTEMPTS + 1):
-            run_id = derive_run_id(self.thread_id, f"coordinator-{round_no}", attempt)
+            run_id = derive_run_id(self.thread_id, node, attempt)
             prior = find_result(self.launcher.session_root_for(run_id))
             if prior is not None and _classify(prior).state == "failed":
                 continue

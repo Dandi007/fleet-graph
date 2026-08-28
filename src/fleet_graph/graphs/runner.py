@@ -25,6 +25,9 @@ from fleet_graph.executors.agent_session import (
     SeatSpec,
     derive_seat_key,
 )
+from fleet_graph.goal_interrupt.contract import DecisionInput
+from fleet_graph.goal_interrupt.runtime import LineInterruptPort, resume_line
+from fleet_graph.goal_interrupt.store import GoalInterruptStore
 from fleet_graph.graphs.adapters import AgentRunCoordinator, AgentSessionWorker
 from fleet_graph.graphs.goal_line import LineDeps, build_goal_line_graph
 from fleet_graph.graphs.guards import LineBounds, LineGuards
@@ -189,8 +192,48 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         prior_terminal=config.prior_terminal
         if config.prior_terminal is not None
         else _read_prior_terminal(config.run_root),
+        # The E2 in-graph interrupt port. Wired here so a human-decision wait
+        # on a real line routes through the durable interrupt instead of the
+        # legacy parking terminal (spec: "replace the normal goal-line parking
+        # path with a durable graph interrupt"). A line whose store cannot be
+        # opened still starts, but loses the interrupt routing rather than the
+        # whole run -- parking remains the fallback.
+        interrupt=_build_interrupt(config, run_id=run_id),
     )
     return build_goal_line_graph(deps), deps
+
+
+def _build_interrupt(config: LineConfig, *, run_id: str = "") -> LineInterruptPort | None:
+    """The production E2 interrupt port for one line.
+
+    Opens the line's durable ``GoalInterruptStore`` (under ``run_root``) and, when
+    a bus credential is present, a ``Board`` for materialising the question and
+    card. The line's ``run_id`` is threaded through so ``ask`` reuses the
+    scheduler's escalation question idempotency key (``parked:<folder>:<run_id>``)
+    -- the one question a human answers, resuming the same interrupt. A missing
+    credential degrades to a deterministic question id rather than failing the
+    line start; a store that cannot be opened degrades to ``None`` (legacy
+    parking stays the path) rather than bricking the run.
+    """
+    try:
+        store = GoalInterruptStore(config.run_root).open()
+    except Exception:
+        return None
+    board = None
+    try:
+        from fleet_graph.bus.board import Board
+        from fleet_graph.bus.client import BusClient
+
+        board = Board(BusClient())
+    except Exception:
+        board = None
+    return LineInterruptPort(
+        folder_id=config.folder_id,
+        generation=config.generation,
+        store=store,
+        board=board,
+        run_id=run_id,
+    )
 
 
 class _NullInbox:
@@ -259,4 +302,35 @@ def run_line(config: LineConfig, *, run_id: str | None = None) -> dict[str, Any]
     }
 
 
-__all__ = ["LineConfig", "build_line", "resume_start", "run_line"]
+def resume_goal_line(config: LineConfig, decision: DecisionInput) -> tuple[dict[str, Any], str]:
+    """Re-enter a suspended goal line's interrupt with a validated decision.
+
+    The production twin of ``resume_line``: it rebuilds the line's graph from the
+    *same* ``LineConfig`` that first suspended it (so thread_id, checkpoint path,
+    coordinator/worker wiring and the interrupt store all match), then injects
+    the validated ``DecisionInput`` through the resume key. This is what the
+    resident ``goal-interrupt`` bridge calls for each recovered decision, so a
+    human verdict in production actually resumes the same generation and
+    continuation instead of parking.
+    """
+    store = GoalInterruptStore(config.run_root).open()
+    try:
+        graph, _deps = build_line(config)
+        invoke_config: dict[str, Any] = {
+            "configurable": {"thread_id": config.thread_id},
+            "recursion_limit": config.max_rounds * 8 + 20,
+        }
+        with SqliteSaver.from_conn_string(config.resolved_checkpoint_path) as saver:
+            compiled = graph.compile(checkpointer=saver)
+            return resume_line(compiled, config=invoke_config, decision=decision, store=store)
+    finally:
+        store.close()
+
+
+__all__ = [
+    "LineConfig",
+    "build_line",
+    "resume_goal_line",
+    "resume_start",
+    "run_line",
+]

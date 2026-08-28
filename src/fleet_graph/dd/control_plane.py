@@ -65,6 +65,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.dd.adoption import (
+    ADOPTION_MECHANISM,
+    AdoptionError,
+    AdoptionLedger,
+    AdoptionRecord,
+    Discovery,
+)
 from fleet_graph.dd.bootstrap import (
     DEVELOPMENT_PATH,
     IdentityChanged,
@@ -73,7 +80,28 @@ from fleet_graph.dd.bootstrap import (
     committed_target_base,
     digest_of,
 )
+from fleet_graph.dd.evidence import (
+    KIND_ADOPTION,
+    KIND_HUMAN_RECOVERY,
+    KIND_SCOPE,
+    EvidenceChain,
+    EvidenceLink,
+)
 from fleet_graph.dd.git import run_git
+from fleet_graph.dd.recovery import (
+    RECOVERY_MECHANISM,
+    HumanRecoveryExit,
+    RecoveryDecision,
+    RecoveryError,
+)
+from fleet_graph.dd.scope import (
+    RULE_ID,
+    ScopeBoundary,
+    ScopeViolationError,
+    default_boundary,
+    evaluate_text,
+    require_scope,
+)
 from fleet_graph.dd.upstream_constants import ATTEMPT_CONTEXT_CONTRACT_VERSION
 from fleet_graph.graphs.dd_runner import EVENTS_FILE, RESULT_FILE
 from fleet_graph.state.run_artifacts import iso, write_json_durable
@@ -92,6 +120,11 @@ H0_FILE = "h0-handoff.json"
 LAUNCHES_FILE = "launches.jsonl"
 CHECKPOINT_FILE = "checkpoint.sqlite3"
 LOG_FILE = "dd.log"
+#: B2 append-only trails: adopted work and human recovery decisions, one sealed
+#: record per line. Each record carries its own digest, so replay is idempotent
+#: (adoption) and the decision is tamper-evident (recovery).
+ADOPTIONS_FILE = "adoptions.jsonl"
+RECOVERIES_FILE = "recoveries.jsonl"
 
 UNIT_PREFIX = "fleet-graph-dd"
 
@@ -517,6 +550,7 @@ class DdControlPlane:
         board_factory: Callable[[], Any] | None = None,
         environment: dict[str, str] | None = None,
         stage_models: dict[str, str] | None = None,
+        scope_boundary: ScopeBoundary | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         from fleet_graph.scheduler.launcher import TransientLauncher
@@ -533,6 +567,9 @@ class DdControlPlane:
             dict(environment) if environment is not None else _inherited_environment()
         )
         self.stage_models = dict(stage_models or {})
+        #: The scope boundary admission refuses against (B1). Data, not a literal
+        #: scattered across call sites -- a rescope edits this, not the checks.
+        self.scope_boundary = scope_boundary if scope_boundary is not None else default_boundary()
         self.clock = clock
 
     # --- admission -------------------------------------------------------
@@ -557,6 +594,11 @@ class DdControlPlane:
         """
         repo = self._admit_repo(repo_path)
         spec = self._read_spec(spec_text, spec_path)
+        # B1: admit nothing that actively crosses the declared scope boundary.
+        # The refusal names the scope rule, so a crossing is a scope decision
+        # rather than whatever downstream failure happened to fire first. The
+        # admitted verdict is persisted on the record as the B3 scope evidence.
+        scope_verdict = self._require_scope(spec.decode("utf-8", errors="replace"))
         base = self._default_target_base(repo, target_base)
         spec_digest = digest_of(spec)
         development_id = derive_development_id(repo, spec_digest, base)
@@ -612,6 +654,7 @@ class DdControlPlane:
             "target_base_commit": base,
             "spec_digest": spec_digest,
             "spec_size_bytes": len(spec),
+            "scope_verdict": scope_verdict,
             "bootstrap_commit": bootstrap_commit,
             "root_handoff_digest": root_handoff_digest,
             "acceptance_commands": acceptance_commands,
@@ -691,6 +734,37 @@ class DdControlPlane:
         if not spec.strip():
             raise ControlPlaneError("SPEC_EMPTY", "the approved spec is empty")
         return spec
+
+    def _require_scope(self, text: str) -> dict[str, Any]:
+        """Refuse a spec whose active content crosses the B1-B3 boundary (B1).
+
+        The scope rule is the authority, and the refusal is attributable to it:
+        ``SCOPE_BOUNDARY_VIOLATION`` carries the boundary's own id and each
+        observed crossing, never a bare "something failed downstream". On a
+        clean admit, the verdict is returned so the caller can persist it as
+        the B3 scope-evidence artifact.
+        """
+        try:
+            verdict = require_scope(text, self.scope_boundary)
+        except ScopeViolationError as exc:
+            raise ControlPlaneError("SCOPE_BOUNDARY_VIOLATION", str(exc)) from exc
+        return verdict.as_dict()
+
+    def _scope_crossings(self, text: str) -> list[dict[str, Any]]:
+        """List the active border crossings in a handoff/receipt body, if any.
+
+        A handoff that only *mentions* B4 in a deferral context is not a
+        crossing; one that actively adds a phase or revives katana work is.
+        The returned entries carry the boundary's own reference and label, so a
+        quarantined artifact is attributable rather than a bare "looked weird".
+        """
+        verdict = evaluate_text(text, self.scope_boundary)
+        if verdict.admitted:
+            return []
+        return [
+            {"reference": v.reference, "label": v.label, "excerpt": v.excerpt}
+            for v in verdict.violations
+        ]
 
     def _default_target_base(self, repo: Path, target_base: str | None) -> str:
         """Explicit base -> committed identity -> HEAD, in that order.
@@ -1380,6 +1454,14 @@ class DdControlPlane:
             "reconfigures": record.get("reconfigures", []),
             "card_entity_id": record.get("card_entity_id", ""),
             "created_at": record.get("created_at", ""),
+            "adoptions": [
+                adopted.as_dict()
+                for adopted in self._load_adoption_ledger(development_id).records()
+            ],
+            "recoveries": [
+                recovery.as_dict()
+                for recovery in self._load_recovery_exit(development_id).records()
+            ],
         }
 
     def list(
@@ -1562,6 +1644,7 @@ class DdControlPlane:
             "state": self.rebuild_status(development_id)["state"],
             "generation": current,
             "evidence": entries,
+            "b3_evidence_chain": self.b3_evidence_chain(development_id),
         }
 
     def _h0(self, development_id: str) -> dict[str, Any] | None:
@@ -1698,6 +1781,9 @@ class DdControlPlane:
                 except ValueError:
                     receipt = None
                 if receipt is not None:
+                    crossings = self._scope_crossings(raw.decode("utf-8", errors="replace"))
+                    if crossings:
+                        receipt["scope_violations"] = crossings
                     return (
                         receipt,
                         str(receipt.get("parent_handoff_receipt_digest") or ""),
@@ -1718,6 +1804,9 @@ class DdControlPlane:
                     payload = None
                 if payload is not None:
                     receipt = dict(payload)
+                    crossings = self._scope_crossings(found.stdout)
+                    if crossings:
+                        receipt["scope_violations"] = crossings
                     if stage == "acceptance":
                         # The subject is the tree that carries the frozen
                         # record; the audit checks it out and re-runs exactly
@@ -1746,6 +1835,284 @@ class DdControlPlane:
             check=False,
         )
         return proc.stdout if proc.returncode == 0 else b""
+
+    # --- B2: automatic adoption and MCP human recovery ---------------------
+
+    def _adoption_path(self, development_id: str) -> Path:
+        return self._dev_root(development_id) / ADOPTIONS_FILE
+
+    def _recoveries_path(self, development_id: str) -> Path:
+        return self._dev_root(development_id) / RECOVERIES_FILE
+
+    def _load_adoption_ledger(self, development_id: str) -> AdoptionLedger:
+        path = self._adoption_path(development_id)
+        records: list[AdoptionRecord] = []
+        if path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                raw = json.loads(line)
+                records.append(
+                    AdoptionRecord(
+                        signature=str(raw.get("signature") or ""),
+                        kind=str(raw.get("kind") or ""),
+                        source=str(raw.get("source") or ""),
+                        target_ref=str(raw.get("target_ref") or ""),
+                        digest=str(raw.get("digest") or ""),
+                        sequence=int(raw.get("sequence") or 0),
+                        mechanism=str(raw.get("mechanism") or ADOPTION_MECHANISM),
+                    )
+                )
+        return AdoptionLedger(records)
+
+    def _load_recovery_exit(self, development_id: str) -> HumanRecoveryExit:
+        path = self._recoveries_path(development_id)
+        records: list[RecoveryDecision] = []
+        if path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                raw = json.loads(line)
+                records.append(
+                    RecoveryDecision(
+                        target_ref=str(raw.get("target_ref") or ""),
+                        decision=str(raw.get("decision") or ""),
+                        decided_by=str(raw.get("decided_by") or ""),
+                        question_note_id=str(raw.get("question_note_id") or ""),
+                        at=str(raw.get("at") or ""),
+                        digest=str(raw.get("digest") or ""),
+                        mechanism=str(raw.get("mechanism") or RECOVERY_MECHANISM),
+                    )
+                )
+        # The exit's own authenticator is the fail-closed floor; the *real*
+        # governance check -- a human decision on the board -- runs in `recover`.
+        return HumanRecoveryExit(records=records)
+
+    def adopt(
+        self,
+        development_id: str,
+        discoveries: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Adopt the discovered in-flight/recoverable work automatically (B2).
+
+        ``discoveries`` is a batch of discoveries the caller found in flight:
+        ``{signature, kind, source, target_ref}``. The not-yet-adopted subset
+        is picked out by ``AdoptionLedger.discover`` and adopted; items already
+        on the trail are skipped unchanged. That discovery-then-adopt split is
+        the whole "automatic rather than manual bookkeeping" property, and it
+        is idempotent: replaying the same batch yields the same sealed records
+        and appends nothing -- a replayed discovery cannot duplicate adopted
+        work or fork its history.
+        """
+        self._record(development_id)  # refuses unknown ids before anything else
+        ledger = self._load_adoption_ledger(development_id)
+        seen: dict[str, tuple[Discovery, str]] = {}
+        for item in discoveries or []:
+            signature = str(item.get("signature") or "")
+            if not signature or signature in seen:
+                continue
+            seen[signature] = (
+                Discovery(
+                    signature=signature,
+                    kind=str(item.get("kind") or ""),
+                    source=str(item.get("source") or ""),
+                ),
+                str(item.get("target_ref") or ""),
+            )
+        pending = ledger.discover(discovery for discovery, _ in seen.values())
+        adopted: list[dict[str, Any]] = []
+        for discovery in pending:
+            _, target_ref = seen[discovery.signature]
+            try:
+                record = ledger.adopt(discovery, target_ref)
+            except AdoptionError as exc:
+                raise ControlPlaneError("ADOPTION_INVALID", str(exc)) from exc
+            adopted.append(record.as_dict())
+        if adopted:
+            with self._adoption_path(development_id).open("a", encoding="utf-8") as handle:
+                for record in adopted:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.rebuild_status(development_id)
+        adopted_signatures = {record["signature"] for record in adopted}
+        skipped = [signature for signature in seen if signature not in adopted_signatures]
+        return {
+            "development_id": development_id,
+            "adopted": adopted,
+            "skipped": skipped,
+        }
+
+    def _head_commit(self, record: dict[str, Any]) -> str:
+        proc = run_git(Path(str(record["repo_path"])), "rev-parse", "HEAD")
+        if proc.returncode != 0:
+            raise ControlPlaneError(
+                "HEAD_UNRESOLVED",
+                f"cannot resolve HEAD in {record['repo_path']}: {proc.stderr.strip()[:200]}",
+            )
+        return proc.stdout.strip()
+
+    def _governance_decision(self, record: dict[str, Any], question_note_id: str) -> Any:
+        """The human decision on the board for one question note, or None.
+
+        This is the governance path the recovery exit delegates authentication
+        to: the exit never casts a decision, it reads the one a human already
+        put on the board. No board -> no decision -> refuse.
+        """
+        from fleet_graph.bus.board import GateTicket
+
+        board = self._board_factory()
+        if board is None:
+            return None
+        try:
+            ticket = GateTicket(
+                question_note_id=question_note_id,
+                card_entity_id=str(record.get("card_entity_id") or ""),
+            )
+            return board.decision_for(ticket)
+        except Exception:
+            return None
+
+    def recover(
+        self,
+        development_id: str,
+        *,
+        target_ref: str = "",
+        question_note_id: str = "",
+    ) -> dict[str, Any]:
+        """Record a human recovery decision and resume only from it (B2).
+
+        The MCP surface carries *no verdict*: this tool takes a target and the
+        question note, reads the human's decision off the board (the governance
+        path), seals it -- with its immutable target reference and a digest --
+        into the append-only recovery trail, and then resumes the suspended
+        work from that recorded decision alone. No board decision -> refuse,
+        so the recovery can never become a bypass around the gate.
+        """
+        record = self._record(development_id)
+        if not target_ref:
+            target_ref = self._head_commit(record)
+
+        decision = self._governance_decision(record, question_note_id)
+        if decision is None:
+            raise ControlPlaneError(
+                "HUMAN_DECISION_MISSING",
+                "human recovery needs the decision for this question note on the "
+                "board (work.decision.v1); the exit cannot cast a decision itself",
+            )
+
+        exit_ = self._load_recovery_exit(development_id)
+        try:
+            sealed = exit_.record(
+                target_ref=target_ref,
+                decision=str(getattr(decision, "decision", "") or ""),
+                decided_by=str(getattr(decision, "decided_by", "") or ""),
+                question_note_id=question_note_id,
+                at=iso(self.clock()),
+            )
+        except RecoveryError as exc:
+            raise ControlPlaneError("RECOVERY_REFUSED", str(exc)) from exc
+
+        with self._recoveries_path(development_id).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(sealed.as_dict(), ensure_ascii=False) + "\n")
+
+        resumed = exit_.resume(target_ref=target_ref)
+        self.rebuild_status(development_id)
+        return {
+            "development_id": development_id,
+            "recovery": sealed.as_dict(),
+            "resume": resumed,
+        }
+
+    def recoveries(self, development_id: str) -> dict[str, Any]:
+        """The sealed recovery decisions on record for one development."""
+        self._record(development_id)
+        return {
+            "development_id": development_id,
+            "recoveries": [
+                record.as_dict() for record in self._load_recovery_exit(development_id).records()
+            ],
+        }
+
+    def adoptions(self, development_id: str) -> dict[str, Any]:
+        """The adopted work items on record for one development."""
+        self._record(development_id)
+        return {
+            "development_id": development_id,
+            "adoptions": [
+                record.as_dict() for record in self._load_adoption_ledger(development_id).records()
+            ],
+        }
+
+    def b3_evidence_chain(self, development_id: str) -> dict[str, Any]:
+        """Assemble and validate the B3 phenomenon->mechanism->evidence chain.
+
+        The links are built from the real artifacts the behaviours produced --
+        the persisted scope verdict, the adoption trail, and the recovery trail
+        -- not from re-typed claims. Each link's ``evidence_mechanism`` is read
+        off the artifact itself (its recorded ``mechanism`` / ``rule_id``), so
+        a substituted unrelated event is a mismatch the validator names, rather
+        than something a test author could satisfy by spelling the same literal
+        twice.
+        """
+        from fleet_graph.dd.upstream_constants import compute_json_digest
+
+        record = self._record(development_id)
+        links: list[EvidenceLink] = []
+
+        scope_verdict = record.get("scope_verdict") or {}
+        if scope_verdict.get("admitted"):
+            links.append(
+                EvidenceLink(
+                    kind=KIND_SCOPE,
+                    phenomenon="a spec that actively crosses the boundary is refused",
+                    mechanism=RULE_ID,
+                    evidence_mechanism=str(scope_verdict.get("rule_id") or ""),
+                    subject_ref=str(record.get("spec_digest") or ""),
+                    digest=compute_json_digest(scope_verdict),
+                )
+            )
+
+        for adopted in self._load_adoption_ledger(development_id).records():
+            links.append(
+                EvidenceLink(
+                    kind=KIND_ADOPTION,
+                    phenomenon="replaying the same discovery yields one adopted record",
+                    mechanism=ADOPTION_MECHANISM,
+                    evidence_mechanism=adopted.mechanism,
+                    subject_ref=adopted.target_ref,
+                    digest=adopted.digest,
+                )
+            )
+
+        for recovery in self._load_recovery_exit(development_id).records():
+            links.append(
+                EvidenceLink(
+                    kind=KIND_HUMAN_RECOVERY,
+                    phenomenon="suspended work resumes only from a recorded decision",
+                    mechanism=RECOVERY_MECHANISM,
+                    evidence_mechanism=recovery.mechanism,
+                    subject_ref=recovery.target_ref,
+                    digest=recovery.digest,
+                )
+            )
+
+        chain = EvidenceChain(tuple(links))
+        reasons = chain.validate()
+        return {
+            "development_id": development_id,
+            "valid": not reasons,
+            "reasons": list(reasons),
+            "links": [
+                {
+                    "kind": link.kind,
+                    "phenomenon": link.phenomenon,
+                    "mechanism": link.mechanism,
+                    "evidence_mechanism": link.evidence_mechanism,
+                    "subject_ref": link.subject_ref,
+                    "digest": link.digest,
+                }
+                for link in chain.links
+            ],
+        }
 
 
 __all__ = [
