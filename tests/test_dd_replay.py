@@ -379,6 +379,76 @@ class TestARejectionIsNeverReplayed:
         assert head(repo) == g1.implement, "the rejected review's seal is dead weight"
 
 
+class TestANewAttemptWithoutARejectLinkIsNeverReplayed:
+    def test_a_rework_that_does_not_name_its_rejecting_review_is_not_a_link(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """The ORDER_VIOLATION-adjacent guard lives on the replay side: a new
+        attempt (rework implement) that does not name the rejecting review as
+        its parent has no REJECT predecessor, so it must not be replayed as a
+        sealed link -- the replayer declines it and the review re-runs for real
+        (where the plugin's attempt-context guard may then reject it)."""
+        g1 = G1(repo, tmp_path)
+        # attempt 1: continuous APPROVE, final REJECT (a real rework steer).
+        cr_commit = commit_file(
+            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
+        )
+        cr = review_receipt(
+            parent_digest=byte_digest(g1.raw),
+            subject=g1.implement,
+            output=cr_commit,
+            verdict="APPROVE",
+        )
+        write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
+        fr_commit = commit_file(
+            repo, ".dev-dispatch/reviews/final/g1-a1.json", '{"verdict": "REJECT"}'
+        )
+        fr = review_receipt(
+            parent_digest=byte_digest(
+                (
+                    g1.state_root
+                    / "receipts"
+                    / derive_attempt_id(DEVELOPMENT_ID, 1, 1)
+                    / "continuous-review-receipt.json"
+                ).read_bytes()
+            ),
+            subject=g1.implement,
+            output=fr_commit,
+            verdict="REJECT",
+            phase="final",
+        )
+        write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr)
+
+        rework_commit = commit_file(repo, ".dd-evidence/rework.json", '{"attempt": 2}')
+        # A rework implement that does NOT name the rejecting review: a "new
+        # attempt" with no REJECT predecessor, so it is not a rework link.
+        rework = {
+            "actor_job_id": "job-2",
+            "artifacts": [],
+            "attempt_id": derive_attempt_id(DEVELOPMENT_ID, 1, 2),
+            "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
+            "development_id": DEVELOPMENT_ID,
+            "feedback_digest": "sha256:" + "0" * 64,
+            "input_commit": fr_commit,
+            "materialization_intent_id": "intent-rework",
+            "output_commit": rework_commit,
+            "parent_handoff_receipt_digest": "sha256:" + "f" * 64,
+            "spec_digest": "sha256:" + "1" * 64,
+            "verification_record": {"verification_commands": []},
+            "work_head_commit": rework_commit,
+        }
+        assert set(rework) == plugin_adapter.IMPLEMENT_RECEIPT_FIELDS
+        write_receipt(g1.state_root, 1, 2, "implement-receipt.json", rework)
+
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), head(repo))
+
+        # Only the pre-rejection prefix replays: the rework attempt is not a
+        # closeable link, so it is declined and the review re-runs for real.
+        assert replayed_stages(state) == ["configure", "implement"]
+        assert next(stage for stage, _ in actor.calls) == "continuous_review"
+
+
 class TestTheReplayedIdentityBindsTheRealReview:
     """The g4 lesson: the review of replayed work must dispatch under the
     identity the implement receipt was sealed with, or the plugin refuses

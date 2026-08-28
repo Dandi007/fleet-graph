@@ -475,6 +475,63 @@ class TestWaitingOnAHumanAndComingBack:
         assert "REJECT" in result["terminal_reason"]
         assert result["fault"] is False
 
+    def test_an_unrecognized_verdict_suspends_and_resumes_to_completion(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        """A malformed gate verdict is a resumable refusal, not a dead end: the
+        gate suspends (fail-closed), and once a proper APPROVE lands a resume
+        re-reads the board and pushes through to the merger -- without
+        re-materializing any already-sealed attempt-context stage."""
+        board = FakeBoard()
+        config = self._config(repo, tmp_path)
+        self._run(config, board)
+
+        board.decision = Decision(
+            message_id="msg-bad",
+            decision="needs a second look",
+            decided_by="青林",
+            question="",
+            rationale="",
+            card_entity_id="card-1",
+            raw={},
+        )
+        refused = self._run(config, board, resume=True)
+        # Fail-closed: not terminal, but also not gone -- the gate is waiting
+        # for a decision it can interpret, and says so.
+        assert refused["terminal"] is None, refused["terminal_reason"]
+        assert refused["gate_refused"] == {
+            "reason": "gate decision 'needs a second look' is not one of "
+            "['APPROVE', 'REJECT']; refusing to interpret it",
+            "code": "GATE_VERDICT_UNRECOGNIZED",
+        }
+        assert refused["awaiting"] == {"question_note_id": "note-1", "card_entity_id": "card-1"}
+
+        board.decision = Decision(
+            message_id="msg-good",
+            decision="APPROVE",
+            decided_by="青林",
+            question="",
+            rationale="",
+            card_entity_id="card-1",
+            raw={},
+        )
+
+        # A resume must re-read the board -- never re-dispatch the sealed
+        # attempt-context stages (implement / continuous_review / final_review).
+        launcher = AgentRunStub()
+        result = run_pipeline(
+            config,
+            board=board,
+            gate_card_entity_id="card-1",
+            launcher=launcher,
+            resume=True,
+        )
+        assert launcher.dispatched == [], "a resume must not re-dispatch a sealed stage"
+        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        assert result["gate_refused"] is None
+        sealed = json.loads((repo / GATE_PATH.format(generation=1)).read_text(encoding="utf-8"))
+        assert sealed["decision"] == "APPROVE"
+
 
 class TestTheRunLeavesArtifactsBehind:
     """The control plane's read side assembles get/events from these files

@@ -333,11 +333,15 @@ class BoardGate:
         if verdict not in self.allowed_decisions:
             # Not a refusal and not an approval. Refusing to map it onto either
             # is the point: a gate that rounds an unrecognised verdict towards
-            # "proceed" is not a gate.
+            # "proceed" is not a gate. It is resumable -- a malformed verdict is
+            # a fixable input, not a decision -- so the graph suspends and a
+            # later resume re-reads the board for a proper verdict.
             raise StageRefused(
                 f"gate decision {decision.decision!r} is not one of "
                 f"{sorted(self.allowed_decisions)}; refusing to interpret it",
                 code="GATE_VERDICT_UNRECOGNIZED",
+                resumable=True,
+                ticket=ticket.to_dict(),
             )
         if verdict != self.approve:
             operator = decision.decided_by or "an operator"
