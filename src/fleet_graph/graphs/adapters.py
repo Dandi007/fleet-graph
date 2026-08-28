@@ -80,13 +80,25 @@ class AgentRunCoordinator:
     timeout_seconds: int = 2700
     poll_interval: float = 2.0
     extra_labels: dict[str, str] | None = None
+    #: The per-process launch identity minted at line generation start. One
+    #: value for every round of this process; a process restart mints a new
+    #: one, and a re-adopted run keeps the label it was first dispatched with.
+    launch_id: str = ""
 
     def turn(self, round_no: int, coord_input: dict[str, Any]) -> dict[str, Any]:
         input_path = write_json_durable(
             self.run_root / "coord" / f"round-{round_no}-input.json", coord_input
         )
 
-        labels = {"work_folder": self.folder_id, "dispatcher": DISPATCHER}
+        labels = {
+            "work_folder": self.folder_id,
+            "dispatcher": DISPATCHER,
+            "role": "supervisor",
+            "goal": self.folder_id,
+            "round": str(round_no),
+        }
+        if self.launch_id:
+            labels["launch"] = self.launch_id
         labels.update(self.extra_labels or {})
 
         spec = AgentRunSpec(

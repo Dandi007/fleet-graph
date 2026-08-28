@@ -8,6 +8,7 @@ of the real collaborators.
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,6 +66,11 @@ class LineConfig:
     #: left on disk under run_root, which at generation start is the previous
     #: generation's.
     prior_terminal: dict[str, Any] | None = None
+    #: The per-process launch identity (D4). None lets build_line mint one from
+    #: a wall-clock start timestamp, so a process restart is a new launch and a
+    #: re-adopted run keeps the first dispatch's label (the launcher never
+    #: rewrites argv.json for an adopted session root).
+    launch_id: str | None = None
 
     @property
     def inbox_alias(self) -> str | None:
@@ -95,6 +101,19 @@ def _read_prior_terminal(run_root: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def mint_launch_id(folder_id: str, generation: int, start_ts: int) -> str:
+    """Mint the per-process launch identity (D4).
+
+    Stable and readable within one process: ``launch-<folder>-g<generation>-<start-ts>``.
+    The wall-clock start timestamp is what makes a process restart a new
+    launch -- the same generation re-built in a fresh process stamps a
+    different second, so a new launch id. A re-adopted agent run keeps the
+    label it was first dispatched with: the launcher is idempotent per run id
+    and never rewrites argv.json for an adopted session root.
+    """
+    return f"launch-{folder_id}-g{generation}-{start_ts}"
+
+
 def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, LineDeps]:
     """Wire a line. Returns the compiled graph and the deps it holds."""
     # run_id names this process's RunArtifacts (heartbeat/terminal attribution)
@@ -114,20 +133,32 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
     if config.agent_run_bin:
         launcher_kwargs["bin_path"] = config.agent_run_bin
     launcher = AgentRunLauncher(**launcher_kwargs)
+    launch_id = config.launch_id or mint_launch_id(
+        config.folder_id, config.generation, int(time.time())
+    )
     coordinator = AgentRunCoordinator(
         launcher=launcher,
         folder_id=config.folder_id,
         thread_id=thread_id,
         run_root=config.run_root,
         timeout_seconds=config.coordinator_timeout_seconds,
+        launch_id=launch_id,
     )
 
     seat = AgentSessionSeat(state_root=str(config.run_root / "seats"))
+    seat_labels: dict[str, str] = {
+        "work_folder": config.folder_id,
+        "dispatcher": "fleet-graph",
+        "role": "worker",
+        "goal": config.folder_id,
+    }
+    if launch_id:
+        seat_labels["launch"] = launch_id
     worker = AgentSessionWorker(
         seat=seat,
         seat_spec=SeatSpec(
             agent=config.seat,
-            labels={"work_folder": config.folder_id, "dispatcher": "fleet-graph"},
+            labels=seat_labels,
         ),
         seat_key=derive_seat_key(thread_id, "worker"),
         turn_timeout_seconds=config.turn_timeout_seconds,

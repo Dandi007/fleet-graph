@@ -78,6 +78,34 @@ class TestThreadIdentity:
         assert explicit.resolved_checkpoint_path == ":memory:"
 
 
+class TestLifecycleLabels:
+    """role/goal/launch/round label injection at line assembly (spec DoD 1-2)."""
+
+    def test_build_line_mints_a_stable_per_process_launch_id(self, tmp_path: Path) -> None:
+        config = LineConfig(folder_id="wf-labels", seat="s", run_root=tmp_path, generation=2)
+        _, deps = build_line(config)
+
+        launch_id = deps.coordinator.launch_id
+        assert launch_id.startswith("launch-wf-labels-g2-")
+        assert deps.coordinator.launch_id == launch_id
+
+    def test_a_caller_supplied_launch_id_is_used_verbatim(self, tmp_path: Path) -> None:
+        _, deps = build_line(
+            LineConfig(folder_id="wf-labels", seat="s", run_root=tmp_path, launch_id="launch-fixed")
+        )
+        assert deps.coordinator.launch_id == "launch-fixed"
+
+    def test_seat_labels_carry_role_goal_and_launch(self, tmp_path: Path) -> None:
+        _, deps = build_line(
+            LineConfig(folder_id="wf-labels", seat="s", run_root=tmp_path, launch_id="launch-fixed")
+        )
+        labels = deps.worker.seat_spec.labels
+        assert labels["role"] == "worker"
+        assert labels["goal"] == "wf-labels"
+        assert labels["launch"] == "launch-fixed"
+        assert labels["work_folder"] == "wf-labels"
+
+
 # --- resume semantics, measured against a real SqliteSaver -----------------
 
 

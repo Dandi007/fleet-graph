@@ -220,6 +220,33 @@ class TestDispatchingAnLlmStage:
         assert spec.labels["dispatcher"] == "fleet-graph"
         assert spec.structured is True
 
+    def test_the_stage_labels_carry_role_order_attempt_and_dispatched_by(
+        self, tmp_path: Path
+    ) -> None:
+        """role/order/attempt/dispatched_by are the upstream observability
+        contract labels for a dd-spawned worker run; `development` stays
+        (INV-2) and `attempt` is the stage's own attempt ordinal."""
+        launcher = RecordingLauncher()
+        actor = make_actor(tmp_path, launcher)
+        actor.dispatched_by = "ronin-model-switch"
+        actor.act(IMPLEMENT, dispatch_for(IMPLEMENT, attempt=2))
+
+        spec, _ = launcher.launched[0]
+        assert spec.labels["role"] == "dd-worker"
+        assert spec.labels["order"] == "dev-1"
+        assert spec.labels["development"] == "dev-1"
+        assert spec.labels["attempt"] == "2"
+        assert spec.labels["dispatched_by"] == "ronin-model-switch"
+
+    def test_dispatched_by_defaults_to_the_bounded_dispatcher(self, tmp_path: Path) -> None:
+        """Without recorded provenance the label falls back to the one bounded
+        system subject, never a run_id/uuid."""
+        launcher = RecordingLauncher()
+        make_actor(tmp_path, launcher).act(IMPLEMENT, dispatch_for(IMPLEMENT))
+
+        spec, _ = launcher.launched[0]
+        assert spec.labels["dispatched_by"] == "fleet-graph"
+
     def test_the_same_attempt_always_names_the_same_run(self, tmp_path: Path) -> None:
         """Derived ids are what let a restarted graph adopt instead of re-pay."""
         launcher = RecordingLauncher()
