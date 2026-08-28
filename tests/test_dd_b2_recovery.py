@@ -152,6 +152,63 @@ class TestAutomaticAdoption:
         assert [record["signature"] for record in mixed["adopted"]] == ["b"]
         assert mixed["skipped"] == ["a"]
 
+    def test_mcp_adoption_replays_idempotently_over_the_surface(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """B2's idempotent replay, exercised through the registered tool itself
+        -- the governed surface, not the control-plane stub."""
+        import asyncio
+        import json as _json
+
+        from fastmcp import Client
+
+        from fleet_graph.dd.service import build_mcp_server
+        from test_dd_service import running_server
+
+        board = BoardDouble()
+        plane = make_plane(tmp_path, board)
+        dev = plane.create(str(repo), spec_text=SPEC)["development_id"]
+        batch = [
+            {
+                "signature": "dev-1:g1",
+                "kind": "in_flight",
+                "source": "runner",
+                "target_ref": head(repo),
+            }
+        ]
+
+        async def adopt(url: str) -> list[dict[str, Any]]:
+            async with Client(url) as client:
+                results: list[dict[str, Any]] = []
+                for _ in range(2):
+                    result = await client.call_tool(
+                        "development_adopt",
+                        {"development_id": dev, "discoveries": batch},
+                    )
+                    data = getattr(result, "structured_content", None) or getattr(
+                        result, "data", None
+                    )
+                    if isinstance(data, dict):
+                        results.append(data)
+                        continue
+                    content = getattr(result, "content", None)
+                    if content:
+                        results.append(_json.loads(getattr(content[0], "text", None)))
+                    else:
+                        results.append(result)  # type: ignore[arg-type]
+                return results
+
+        with running_server(build_mcp_server(plane)) as url:
+            first, replay = asyncio.run(adopt(url))
+
+        assert [record["signature"] for record in first["adopted"]] == ["dev-1:g1"]
+        assert replay["adopted"] == []
+        assert replay["skipped"] == ["dev-1:g1"]
+
+        trail = plane._adoption_path(dev).read_text(encoding="utf-8")
+        assert len(trail.splitlines()) == 1
+        assert len(plane.adoptions(dev)["adoptions"]) == 1
+
 
 class TestMCPHumanRecovery:
     def test_recovery_requires_the_board_decision_and_resumes_only_then(
