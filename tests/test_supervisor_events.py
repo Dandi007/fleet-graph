@@ -367,6 +367,76 @@ class TestBoardScan:
         assert launcher.events() == []
         assert not any("error" in a for a in actions)
 
+    def test_repeated_ticks_do_not_duplicate_the_same_e1(self, tmp_path: Path) -> None:
+        bus = FakeBus()
+        observer, launcher = observer_for(tmp_path, bus=bus)
+        tick(observer, {})  # adopt baseline
+        bus.add_question("msg_q1", "card-1", seq=6)
+        tick(observer, {})  # launches the one E1 audit
+        assert len(launcher.events()) == 1
+        # The cursor already advanced past the question, so the same observer
+        # re-scanning on later ticks produces no second launch.
+        tick(observer, {})
+        tick(observer, {})
+        assert len(launcher.events()) == 1
+
+    def test_a_restarted_observer_produces_no_second_e1_unit(self, tmp_path: Path) -> None:
+        bus = FakeBus()
+        observer, launcher = observer_for(tmp_path, bus=bus)
+        tick(observer, {})  # adopt baseline
+        bus.add_question("msg_q1", "card-1", seq=6)
+        tick(observer, {})
+        assert len(launcher.events()) == 1
+        # A fresh observer object over the same state root stands in for a
+        # restarted daemon: the persisted cursor (already past the question)
+        # and the persisted attempt mean the audit is not launched again.
+        observer2, launcher2 = observer_for(tmp_path, bus=bus)
+        tick(observer2, {})
+        assert launcher2.events() == []
+
+    def test_e1_receipt_suppression_survives_restart(self, tmp_path: Path) -> None:
+        bus = FakeBus()
+        observer, launcher = observer_for(tmp_path, bus=bus)
+        tick(observer, {})  # adopt baseline
+        bus.add_question("msg_q1", "card-1", seq=6)
+        tick(observer, {})
+        assert len(launcher.events()) == 1
+        # The completed audit writes its receipt; rewind the cursor so the
+        # question is re-presented to a restarted observer and confirm the
+        # receipt -- not the attempt counter -- is what suppresses the relaunch.
+        reports = tmp_path / "supervisor" / "reports"
+        reports.mkdir(parents=True, exist_ok=True)
+        (reports / "e1-msg_q1.json").write_text("{}")
+        cursor = tmp_path / "runs" / ".scheduler" / "supervisor-cursor.json"
+        state = json.loads(cursor.read_text())
+        state["board_seq"] = 5
+        cursor.write_text(json.dumps(state))
+        observer2, launcher2 = observer_for(tmp_path, bus=bus)
+        actions = tick(observer2, {})
+        assert launcher2.events() == []
+        assert any(a.get("action") == "skipped:receipt_exists" for a in actions)
+
+    def test_e1_inflight_audit_is_readopted_not_relaunched(self, tmp_path: Path) -> None:
+        bus = FakeBus()
+        observer, launcher = observer_for(tmp_path, bus=bus)
+        tick(observer, {})  # adopt baseline
+        bus.add_question("msg_q1", "card-1", seq=6)
+        tick(observer, {})  # launch attempt 1; cursor advances past seq 6
+        assert len(launcher.events()) == 1
+        # Rewind the cursor to before the question (a reset-style rewind) and
+        # restart with the audit still in flight: the active unit is re-adopted
+        # (`skipped:audit_in_flight`), no second unit is created, and the
+        # persisted attempt counter is not consumed.
+        cursor = tmp_path / "runs" / ".scheduler" / "supervisor-cursor.json"
+        state = json.loads(cursor.read_text())
+        state["board_seq"] = 5
+        cursor.write_text(json.dumps(state))
+        observer2, launcher2 = observer_for(tmp_path, bus=bus, units=StaticUnits(active=True))
+        actions = tick(observer2, {})
+        assert launcher2.events() == []
+        assert any(a.get("action") == "skipped:audit_in_flight" for a in actions)
+        assert json.loads(cursor.read_text())["attempts"]["e1-msg_q1"] == 1
+
 
 class TestFailOpen:
     def test_broken_terminal_reader_is_an_action_not_a_crash(self, tmp_path: Path) -> None:
