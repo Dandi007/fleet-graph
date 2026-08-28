@@ -99,7 +99,8 @@ class DevelopmentConfig:
     cost_obs_dir: str = ""
     # The management execution cost of one order, `(order_id) -> float`, the
     # walker emits under the `management` attribution. None means manager spend
-    # is not measured and it is rendered as a bounded zero.
+    # is not measured and is accounted absent -- never faked as a measured zero,
+    # so the management/execution ratio reports absence rather than a definite 0%.
     management_cost: Any = None
     # Pushing to a durable ref is the one step here that cannot be undone.
     publish_merge: bool = False
@@ -336,6 +337,15 @@ def run_pipeline(
         clock=clock,
         observe=persist_event,
     )
+
+    # A resume rebuilds the pipeline and therefore a fresh in-memory data
+    # plane; the checkpointer replays only the interrupted gate node, so the
+    # implement and review stages -- already sealed -- never re-emit their
+    # launch/review facts. Re-read this development's own scrape file so the
+    # final render keeps those pre-suspension facts instead of overwriting
+    # them with promotion + settlement + management alone.
+    if resume and deps.cost_plane is not None:
+        deps.cost_plane.rehydrate_from_file()
 
     with SqliteSaver.from_conn_string(config.checkpoint_path) as saver:
         compiled = graph.compile(checkpointer=saver)

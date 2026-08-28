@@ -267,8 +267,9 @@ class PipelineDeps:
     # ``(order_id) -> float``. The walker emits this under the `management`
     # attribution on every terminal, so recording rule
     # `cost_obs:management_execution:ratio` has a real numerator rather than
-    # staying silent. None means manager spend is not measured and defaults to
-    # 0.0 -- a bounded zero, still distinguishable from an absent fact.
+    # staying silent. None means manager spend is not measured and is accounted
+    # absent -- never faked as a measured 0.0 -- so unmeasured spend stays
+    # distinguishable from a genuine zero measurement.
     management_cost: Any = None
     # Stamped once per attempt, never per step. The sealer puts this in the
     # commit it writes, so a retry that re-stamped would produce a different
@@ -336,19 +337,21 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
           fact are accounted *absent* (a bounded 0) instead of silently absent
           -- the `missing` half of the unknown/missing distinction, for the
           `failed`, `bounds` and `fault` exits as well as `refused`.
-        - Every managed order emits its management execution cost under the
-          `management` attribution, so rule 1 has a real numerator.
+        - A managed order emits its management execution cost under the
+          `management` attribution, so rule 1 has a real numerator -- but only
+          when it is actually measured. An unwired `management_cost` leaves the
+          fact absent rather than minting a measured-looking 0.
         """
         order_id = str(state.get("development_id") or "")
         if deps.cost_plane is not None and order_id:
             if state_kind != TERMINAL_COMPLETE:
                 deps.cost_plane.mark_absent_if_missing(order_id=order_id)
-            management = deps.management_cost(order_id) if deps.management_cost is not None else 0.0
-            deps.cost_plane.record_execution_cost(
-                attribution=MANAGEMENT,
-                tokens=float(management),
-                event_id=f"management:{order_id}",
-            )
+            if deps.management_cost is not None:
+                deps.cost_plane.record_execution_cost(
+                    attribution=MANAGEMENT,
+                    tokens=float(deps.management_cost(order_id)),
+                    event_id=f"management:{order_id}",
+                )
         return {
             "terminal": state_kind,
             "terminal_reason": reason,

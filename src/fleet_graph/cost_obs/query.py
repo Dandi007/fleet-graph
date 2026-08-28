@@ -290,7 +290,7 @@ class _Eval:
         left_scalar = len(left) == 1 and not left[0].labels
         right_scalar = len(right) == 1 and not right[0].labels
         if left_scalar and right_scalar:
-            return [Sample(name="", labels=(), value=left[0].value / right[0].value)]
+            return [Sample(name="", labels=(), value=_divide(left[0].value, right[0].value))]
         result: list[Sample] = []
         for l_sample in left:
             for r_sample in right:
@@ -300,7 +300,7 @@ class _Eval:
                         merged.setdefault(k, v)
                     key = tuple(sorted(merged.items()))
                     result.append(
-                        Sample(name="", labels=key, value=l_sample.value / r_sample.value)
+                        Sample(name="", labels=key, value=_divide(l_sample.value, r_sample.value))
                     )
         return result
 
@@ -332,3 +332,22 @@ def query(expr: str, samples: Iterable[Sample]) -> list[Sample]:
 
 
 __all__ = ["PromQLError", "query"]
+
+
+def _divide(left: float, right: float) -> float:
+    """Prometheus binary ``/`` semantics, including the degenerate divisions.
+
+    Prometheus yields ``NaN`` for ``0 / 0`` (and for any ``NaN`` operand) and
+    ``+Inf``/``-Inf`` for a finite non-zero numerator over a zero denominator.
+    A Python ``/`` would raise ``ZeroDivisionError`` on the same inputs, which
+    would crash the evaluation of a rule whose source facts are the most likely
+    degenerate shape (management unwired, no token spend) -- exactly the shape
+    Prometheus answers with ``NaN`` instead.
+    """
+    if left != left or right != right:  # NaN operand -> NaN
+        return float("nan")
+    if right != 0.0:
+        return left / right
+    if left == 0.0:
+        return float("nan")
+    return float("inf") if left > 0 else float("-inf")

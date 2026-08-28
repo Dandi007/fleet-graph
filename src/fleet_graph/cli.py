@@ -136,6 +136,36 @@ def _env_pairs(pairs: list[str]) -> dict[str, str]:
     return env
 
 
+#: env fallback for the fixed per-order management execution cost, mirroring
+#: how ``FLEET_GRAPH_COST_OBS_DIR`` wires the exposition directory.
+MANAGEMENT_COST_ENV = "FLEET_GRAPH_MANAGEMENT_COST"
+
+
+def _management_cost(args: argparse.Namespace) -> Any | None:
+    """The ``(order_id) -> float`` management cost, or None when unmeasured.
+
+    The flag wins; the environment variable is the fallback a launched unit
+    inherits. An unparsable value is a refusal, not a silent zero -- manager
+    spend that is not measured must stay absent rather than faked as 0.
+    """
+    raw = args.management_cost
+    source = "--management-cost"
+    if raw is None:
+        raw = os.environ.get(MANAGEMENT_COST_ENV)
+        source = MANAGEMENT_COST_ENV
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"{source} is not a number: {raw!r}") from exc
+    return lambda _order_id: value
+
+
 def _dd_run(args: argparse.Namespace) -> int:
     """Run one development through the dd pipeline to termination."""
     import pathlib
@@ -167,6 +197,7 @@ def _dd_run(args: argparse.Namespace) -> int:
             raise SystemExit(str(changed)) from changed
 
     run_root = pathlib.Path(args.run_root or f"/data/fleet-graph/dd/{args.development}")
+    management_cost = _management_cost(args)
     config = DevelopmentConfig(
         development_id=args.development,
         workspace_path=workspace,
@@ -192,6 +223,7 @@ def _dd_run(args: argparse.Namespace) -> int:
         models=dict(pair.split("=", 1) for pair in args.stage_model),
         publish_merge=args.publish_merge,
         cost_obs_dir=args.cost_obs_dir or "",
+        management_cost=management_cost,
     )
 
     board = None
@@ -683,6 +715,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="node_exporter textfile directory for the cost-observability exposition; "
         "unset means the run does not collect (FLEET_GRAPH_COST_OBS_DIR is the env fallback)",
+    )
+    dd_run.add_argument(
+        "--management-cost",
+        type=float,
+        default=None,
+        help="fixed management execution cost per order, emitted under the "
+        "management attribution (rule 1 numerator). Unset means manager spend "
+        "is not measured and is accounted absent, never faked as a measured "
+        "zero (FLEET_GRAPH_MANAGEMENT_COST is the env fallback)",
     )
     dd_run.set_defaults(func=_dd_run)
 

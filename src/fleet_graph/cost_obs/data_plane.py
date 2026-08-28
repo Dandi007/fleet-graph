@@ -39,12 +39,13 @@ from pathlib import Path
 from fleet_graph.cost_obs.classify import (
     KNOWN_CLASSES,
     LAUNCH,
+    MANAGEMENT,
     PROMOTION,
     REVIEW,
     SETTLEMENT,
     UNKNOWN,
 )
-from fleet_graph.cost_obs.exposition import Sample, render
+from fleet_graph.cost_obs.exposition import Sample, parse, render
 from fleet_graph.cost_obs.query import query
 from fleet_graph.cost_obs.rules import (
     COST_METRIC,
@@ -291,6 +292,81 @@ class CostDataPlane:
         path = self.exposition_dir / (filename or self.exposition_filename)
         _atomic_write_text(path, render(self.samples()))
         return path
+
+    def rehydrate(self, samples: Iterable[Sample]) -> None:
+        """Merge facts previously rendered to the scrape file back into the plane.
+
+        The resume path builds a fresh in-process plane and calls this with the
+        parse of its own ``*.prom`` file, so the final render keeps the launch
+        and review facts the pre-suspension process wrote and the checkpointer
+        does not replay. Source facts are re-keyed to their stable identities --
+        a replayed emission is still a no-op -- while the derived presence
+        series is skipped and re-derived from the merged facts.
+        """
+        review_attempt: dict[tuple[str, str], int] = {}
+        for sample in samples:
+            name = sample.name
+            labels = sample.label_map()
+            order_id = labels.get("order_id", "")
+            if name == PRESENCE_METRIC:
+                if order_id and sample.value == 0.0:
+                    lifecycle = labels.get("lifecycle")
+                    if lifecycle in LIFECYCLES:
+                        self._absent.setdefault(order_id, set()).add(lifecycle)
+                continue
+            if name == LAUNCH_METRIC:
+                key = f"launch:{order_id}"
+                self._samples[key] = sample
+                self._seen.add(key)
+                if order_id:
+                    self._fact_lifecycles.setdefault(order_id, set()).add(LAUNCH)
+            elif name == PROMOTION_METRIC:
+                key = f"promotion:{order_id}"
+                self._samples[key] = sample
+                self._seen.add(key)
+                if order_id:
+                    self._fact_lifecycles.setdefault(order_id, set()).add(PROMOTION)
+            elif name == SETTLEMENT_METRIC:
+                key = f"settlement:{order_id}"
+                self._samples[key] = sample
+                self._seen.add(key)
+                if order_id:
+                    self._fact_lifecycles.setdefault(order_id, set()).add(SETTLEMENT)
+            elif name == REVIEW_METRIC:
+                phase = labels.get("phase", "continuous")
+                attempt = review_attempt.get((order_id, phase), 0) + 1
+                review_attempt[(order_id, phase)] = attempt
+                key = f"review:{order_id}:{phase}:{attempt}"
+                self._samples[key] = sample
+                self._seen.add(key)
+                if order_id:
+                    self._fact_lifecycles.setdefault(order_id, set()).add(REVIEW)
+            elif name == COST_METRIC:
+                attribution = labels.get("attribution", "")
+                if attribution == MANAGEMENT and order_id:
+                    # The walker re-emits management under this exact identity
+                    # on a later resume, so re-keying it here keeps that a no-op.
+                    key = f"cost:management:{order_id}:{attribution}"
+                else:
+                    key = f"cost:rehydrated:{order_id}:{attribution}"
+                self._samples[key] = sample
+                self._seen.add(key)
+
+    def rehydrate_from_file(self) -> bool:
+        """Re-read this plane's own exposition file, when one was already written.
+
+        Returns True when a previous render existed and was merged back; False
+        when there is nothing to rehydrate (no directory, or no file yet).
+        """
+        if self.exposition_dir is None:
+            return False
+        path = self.exposition_dir / self.exposition_filename
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        self.rehydrate(parse(text))
+        return True
 
     def reconcile(self) -> ReconcileReport:
         """Correlate launches to settlements and assert exact-once.

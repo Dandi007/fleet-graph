@@ -453,7 +453,7 @@ class TestTheManagementCostIsEmittedByTheWalker:
         ]
         assert [s.value for s in management] == [10.0]
 
-    def test_management_defaults_to_a_bounded_zero(self, tmp_path: Path) -> None:
+    def test_unmeasured_management_is_absent_not_a_measured_zero(self, tmp_path: Path) -> None:
         plane = CostDataPlane()
         state = run_settle(plane, tmp_path, "dev-1")
 
@@ -463,7 +463,9 @@ class TestTheManagementCostIsEmittedByTheWalker:
             for s in plane.samples()
             if s.name == COST_METRIC and s.label_map()["attribution"] == "management"
         ]
-        assert [s.value for s in management] == [0.0]
+        # Unmeasured manager spend is accounted absent -- distinguishable from
+        # a genuine zero measurement -- rather than faked as a definite 0.
+        assert management == []
 
 
 class TestAbsenceAccountingOnNonCompleteTerminals:

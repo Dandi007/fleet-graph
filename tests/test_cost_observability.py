@@ -8,6 +8,7 @@ second time (the acceptance fixture owns the end-to-end cycle).
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
@@ -126,6 +127,25 @@ class TestQuery:
     def test_non_existent_metric_is_empty(self) -> None:
         assert query("sum(cost_obs_launch_total)", []) == []
 
+    def test_zero_over_zero_yields_nan_like_prometheus(self) -> None:
+        samples = [Sample("cost_obs_execution_cost_total", (("attribution", "management"),), 0.0)]
+        result = query(
+            'sum(cost_obs_execution_cost_total{attribution="management"})'
+            " / sum(cost_obs_execution_cost_total)",
+            samples,
+        )
+        assert len(result) == 1
+        assert math.isnan(result[0].value)
+
+    def test_finite_numerator_over_zero_yields_inf_like_prometheus(self) -> None:
+        samples = [
+            Sample("m", (("a", "x"),), 5.0),
+            Sample("m", (("a", "y"),), 0.0),
+        ]
+        result = query('sum(m{a="x"}) / sum(m{a="y"})', samples)
+        assert len(result) == 1
+        assert result[0].value == float("inf")
+
 
 class TestDataPlane:
     def test_emission_is_idempotent_across_replays(self) -> None:
@@ -211,3 +231,23 @@ class TestDataPlane:
         assert path.name == "cost-obs.prom"
         scraped = parse(path.read_text(encoding="utf-8"))
         assert [s.value for s in query("sum(cost_obs_launch_total)", scraped)] == [1.0]
+
+    def test_rehydrate_merges_previous_facts_and_stays_idempotent(self, tmp_path: Path) -> None:
+        first = CostDataPlane(exposition_dir=tmp_path)
+        first.record_launch(order_id="o", development_id="d")
+        first.record_review(order_id="o", phase="continuous", verdict="approve")
+        first.write_exposition()
+
+        # A fresh plane, as a resumed process builds: nothing in memory yet.
+        resumed = CostDataPlane(exposition_dir=tmp_path)
+        assert resumed.rehydrate_from_file() is True
+        resumed.record_promotion(order_id="o", target_ref="refs/heads/main")
+        resumed.write_exposition()
+
+        names = {s.name for s in resumed.samples()}
+        assert {"cost_obs_launch_total", "cost_obs_review_total", "cost_obs_promotion_total"} <= (
+            names
+        )
+        # The rehydrated launch keeps its stable identity, so a replay is a no-op.
+        assert resumed.record_launch(order_id="o", development_id="d") is False
+        assert resumed.reconcile().orders["o"]["launch"] == 1
