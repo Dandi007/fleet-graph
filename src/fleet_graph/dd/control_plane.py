@@ -330,6 +330,11 @@ def _inherited_environment() -> dict[str, str]:
       A raw FLEET_GRAPH_BUS_TOKEN value is deliberately never forwarded:
       `--setenv` travels through argv, and a token in argv is a token in
       `/proc`. Production runs on the token file (findings §26).
+    - FLEET_GRAPH_COST_OBS_DIR / FLEET_GRAPH_MANAGEMENT_COST: the
+      cost-observability wiring the launched run needs to collect. Both are
+      non-secret site config (a textfile directory and a per-order float);
+      forwarding them here is what lets an operator turn the data plane on
+      via the MCP unit's env file instead of editing the launch argv.
 
     This is a whitelist, which is itself load-bearing for R4-3's credential
     separation: FLEET_GRAPH_DECISION_TOKEN_FILE (the decision publisher's
@@ -343,6 +348,10 @@ def _inherited_environment() -> dict[str, str]:
     token_file = os.environ.get("FLEET_GRAPH_BUS_TOKEN_FILE")
     if token_file:
         env["FLEET_GRAPH_BUS_TOKEN_FILE"] = token_file
+    for key in ("FLEET_GRAPH_COST_OBS_DIR", "FLEET_GRAPH_MANAGEMENT_COST"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
     return env
 
 

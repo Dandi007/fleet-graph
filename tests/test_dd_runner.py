@@ -532,6 +532,146 @@ class TestWaitingOnAHumanAndComingBack:
         sealed = json.loads((repo / GATE_PATH.format(generation=1)).read_text(encoding="utf-8"))
         assert sealed["decision"] == "APPROVE"
 
+    def test_resume_preserves_the_pre_suspension_cost_facts(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        """A suspended development, resumed to settlement, must not lose the
+        launch and review facts the pre-suspension process already rendered.
+
+        The resume rebuilds the pipeline and therefore a fresh empty data
+        plane; without rehydration the final scrape file would hold promotion +
+        settlement + management only, breaking every fleet aggregate and the
+        settlement reconciliation. This pins the cross-process resume the real
+        lifecycle uses -- the in-process idempotency tests do not cover it.
+        """
+        from fleet_graph.cost_obs import query
+        from fleet_graph.cost_obs.exposition import parse
+        from fleet_graph.cost_obs.rules import (
+            LAUNCH_METRIC,
+            PROMOTION_METRIC,
+            REVIEW_METRIC,
+            SETTLEMENT_METRIC,
+        )
+
+        board = FakeBoard()
+        config = self._config(repo, tmp_path)
+        config.cost_obs_dir = str(tmp_path / "textfile")
+        first = self._run(config, board)
+        assert first["awaiting"] is not None
+
+        board.decision = Decision(
+            message_id="msg-1",
+            decision="APPROVE",
+            decided_by="青林",
+            question="",
+            rationale="",
+            card_entity_id="card-1",
+            raw={},
+        )
+        result = self._run(config, board, resume=True)
+        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+
+        scraped = parse(
+            (tmp_path / "textfile" / "cost-obs-dev-001.prom").read_text(encoding="utf-8")
+        )
+        names = {s.name for s in scraped}
+        assert {LAUNCH_METRIC, REVIEW_METRIC, PROMOTION_METRIC, SETTLEMENT_METRIC} <= names
+        # The pre-suspension launch survives, and the settlement still correlates.
+        assert [s.value for s in query(f"sum({LAUNCH_METRIC})", scraped)] == [1.0]
+        reviews = query(f'sum({REVIEW_METRIC}{{phase=~"continuous|final"}})', scraped)
+        assert [s.value for s in reviews] == [2.0]
+        reconciliation = query(
+            f'sum({SETTLEMENT_METRIC}{{status="settled"}}) by (order_id)'
+            f" / on(order_id) sum({LAUNCH_METRIC}) by (order_id)",
+            scraped,
+        )
+        assert [s.value for s in reconciliation] == [1.0]
+
+
+class TestARestartedGenerationKeepsItsCostFacts:
+    """A restarted generation -- the control plane's normal exit from a
+    non-complete terminal -- rebuilds the pipeline, so it gets a fresh empty
+    data plane and enters the receipt-sealed prefix with "no actor runs": the
+    implement and review actors never re-emit their launch/review facts. The
+    resume path rehydrates the development's own scrape file; this pins the
+    same requirement on the generation n+1 path, where a receipt replayer is
+    installed instead of a resume."""
+
+    def _config(self, repo: Path, tmp_path: Path, *, generation: int) -> DevelopmentConfig:
+        dev_root = tmp_path / "runs"
+        run_root = dev_root if generation <= 1 else dev_root / f"g{generation}"
+        return DevelopmentConfig(
+            development_id=DEVELOPMENT_ID,
+            workspace_path=repo,
+            state_root=run_root / "state",
+            run_root=run_root,
+            remote_url="",
+            remote_ref="refs/heads/dev-001",
+            target_base_commit="b" * 40,
+            root_handoff_digest="sha256:" + "c" * 64,
+            plugin_binding=object(),
+            head_commit=head(repo),
+            generation=generation,
+            cost_obs_dir=str(tmp_path / "textfile"),
+            run_config={"acceptance_commands": [["true"]]},
+        )
+
+    def test_generation_two_rehydrates_the_previous_scrape_file(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        from fleet_graph.cost_obs import query
+        from fleet_graph.cost_obs.exposition import parse
+        from fleet_graph.cost_obs.rules import (
+            LAUNCH_METRIC,
+            REVIEW_METRIC,
+            SETTLEMENT_METRIC,
+        )
+        from fleet_graph.dd.cost_obs import build_cost_plane
+
+        textfile = tmp_path / "textfile"
+        # Generation 1 already rendered its launch and review facts into the
+        # per-development scrape file before a later stage failed.
+        prior = build_cost_plane(exposition_dir=textfile, development_id=DEVELOPMENT_ID)
+        assert prior is not None
+        prior.record_launch(order_id=DEVELOPMENT_ID, development_id=DEVELOPMENT_ID)
+        prior.record_review(order_id=DEVELOPMENT_ID, phase="continuous", verdict="approve")
+        prior.record_review(order_id=DEVELOPMENT_ID, phase="final", verdict="approve")
+        prior.write_exposition()
+
+        board = FakeBoard()
+        board.decision = Decision(
+            message_id="msg-1",
+            decision="APPROVE",
+            decided_by="青林",
+            question="",
+            rationale="",
+            card_entity_id="card-1",
+            raw={},
+        )
+        result = run_pipeline(
+            self._config(repo, tmp_path, generation=2),
+            board=board,
+            gate_card_entity_id="card-1",
+            launcher=AgentRunStub({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}),
+        )
+        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+
+        scraped = parse((textfile / "cost-obs-dev-001.prom").read_text(encoding="utf-8"))
+        # launch and both reviews survive the fresh generation's overwrite; the
+        # settlement still reconciles exactly-once against the surviving launch.
+        assert [s.value for s in query(f"sum({LAUNCH_METRIC})", scraped)] == [1.0]
+        assert [
+            s.value for s in query(f'sum({REVIEW_METRIC}{{phase=~"continuous|final"}})', scraped)
+        ] == [2.0]
+        assert [
+            s.value
+            for s in query(
+                f'sum({SETTLEMENT_METRIC}{{status="settled"}}) by (order_id)'
+                f" / on(order_id) sum({LAUNCH_METRIC}) by (order_id)",
+                scraped,
+            )
+        ] == [1.0]
+
 
 class TestTheRunLeavesArtifactsBehind:
     """The control plane's read side assembles get/events from these files
