@@ -537,6 +537,31 @@ def _supervisor_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _arbiter_run(args: argparse.Namespace) -> int:
+    """One A2 tick: triage, reason, and (only with --publish) post suggestions.
+
+    Defaults to dry-run/offline: the arbiter reads the board and records what
+    it would publish, but writes nothing. Publication requires the explicit
+    --publish flag; this development never enables it in production.
+    """
+    from fleet_graph.arbiter.a2 import TextReasoner, run_arbiter
+    from fleet_graph.bus.client import BusClient
+
+    client = BusClient(base_url=args.bus_url)
+    reasoner = TextReasoner(model=args.model)
+    result = run_arbiter(client=client, reasoner=reasoner, publish=args.publish, alias=args.alias)
+    payload = {
+        "dry_run": result.dry_run,
+        "emitted": [message.as_dict() for message in result.emitted],
+        "suppressed": result.suppressed,
+        "refused": result.refused,
+        "audit": result.audit().as_dict(),
+    }
+    json.dump(payload, sys.stdout, ensure_ascii=False, indent=1)
+    sys.stdout.write("\n")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fleet-graph")
     parser.add_argument("--version", action="version", version=__version__)
@@ -764,6 +789,27 @@ def build_parser() -> argparse.ArgumentParser:
     inbox_list.add_argument("--json", action="store_true")
     inbox_list.add_argument("--bus-url", default=DEFAULT_BUS_URL)
     inbox_list.set_defaults(func=_inbox_list)
+
+    from fleet_graph.arbiter.a2 import DEFAULT_REASONING_MODEL
+
+    arbiter = subparsers.add_parser(
+        "arbiter", help="A2 read-only fleet arbiter (triage and suggest, never decide)"
+    )
+    arbiter_sub = arbiter.add_subparsers()
+    arbiter_run = arbiter_sub.add_parser(
+        "run", help="one tick: triage, reason, and (with --publish) post suggestions"
+    )
+    arbiter_run.add_argument("--bus-url", default=DEFAULT_BUS_URL)
+    arbiter_run.add_argument(
+        "--alias", default=None, help="arbiter inbox alias for consultation messages"
+    )
+    arbiter_run.add_argument("--model", default=DEFAULT_REASONING_MODEL)
+    arbiter_run.add_argument(
+        "--publish",
+        action="store_true",
+        help="publish suggestions to the board (off by default: dry-run)",
+    )
+    arbiter_run.set_defaults(func=_arbiter_run)
 
     supervisor = subparsers.add_parser(
         "supervisor", help="the event-triggered supervisor graph (audits, no verdicts)"
