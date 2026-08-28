@@ -46,6 +46,7 @@ from fleet_graph.bus.client import BusClient
 from fleet_graph.scheduler.ignition import DEFAULT_CAP_WINDOW_SECONDS, Refusal
 from fleet_graph.scheduler.launcher import TransientLauncher
 from fleet_graph.supervise.events import (
+    EVENT_BOARD_QUESTION,
     SupervisorEvent,
     blocked_decision_event,
     board_question_event,
@@ -391,6 +392,16 @@ class SupervisorObserver:
         }
 
     def _spec_for(self, event: SupervisorEvent) -> SupervisorLaunchSpec:
+        # The decision credential rides into the config environment once, for
+        # every event (cli.py/observer_environment). E1's board_question is the
+        # one event type whose transient unit can reach the decision publisher,
+        # and the spec makes it observation-only: it must not publish a
+        # decision, so it must not hold the credential (E1 receives no decision
+        # credential). Strip it here, per event, rather than letting it into
+        # any board_question unit's --setenv.
+        environment = dict(self.config.environment)
+        if event.type == EVENT_BOARD_QUESTION:
+            environment.pop(DECISION_TOKEN_ENV, None)
         return SupervisorLaunchSpec(
             event=event,
             run_root=self.config.run_root,
@@ -398,7 +409,7 @@ class SupervisorObserver:
             unit_prefix=self.config.unit_prefix,
             working_directory=self.config.working_directory,
             executable=self.config.executable,
-            environment=dict(self.config.environment),
+            environment=environment,
         )
 
     def describe(self, event: SupervisorEvent) -> str:
@@ -440,7 +451,10 @@ def reset_supervisor_event(
     `e1-<note_id>` key is located mechanically on the bus (message ->
     channel_seq -> cursor lands just before it), and when neither is possible
     the summary says so instead of guessing. The cursor is only ever moved
-    *backwards* on the mechanical path -- re-running the reset is a no-op.
+    *backwards* -- both on the mechanical path and on the explicit
+    `--board-seq` path, where a higher value is clamped to the current cursor
+    instead of skipping unprocessed questions. Re-running the reset is a
+    no-op.
 
     Idempotent, and touches nothing but the supervisor's own state surface.
     No daemon restart is required: the observer reloads the cursor file at the
@@ -472,8 +486,19 @@ def reset_supervisor_event(
 
     current_seq = state.get("board_seq")
     if board_seq is not None:
-        state["board_seq"] = int(board_seq)
-        summary["board_seq"] = f"set:{int(board_seq)}"
+        target = int(board_seq)
+        if isinstance(current_seq, int) and target > current_seq:
+            # Never move the cursor forward: an operator-supplied value past
+            # the current cursor would skip unprocessed questions. The explicit
+            # path follows the same discipline as the mechanical path (which
+            # only ever moves backwards).
+            state["board_seq"] = current_seq
+            summary["board_seq"] = (
+                f"not_moved_forward:{current_seq} (explicit --board-seq {target} is higher)"
+            )
+        else:
+            state["board_seq"] = target
+            summary["board_seq"] = f"set:{target}"
     elif not key.startswith("e1-"):
         summary["board_seq"] = "not_applicable:terminal/cap events re-derive every tick"
     elif bus is None:
