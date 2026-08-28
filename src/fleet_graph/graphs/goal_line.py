@@ -461,6 +461,23 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         )
         deps.interrupt.persist(checkpoint)
 
+        # The graph stops at the interrupt, so a suspension never reaches
+        # ``finalise`` and the normal ``blocked + waiting_on=decision`` terminal
+        # would never be written. Without it the scheduler's park_state cannot
+        # see the line and re-launches it on every cooldown for the whole
+        # suspension. Record that terminal once, on the *suspending* entry, so
+        # parking still holds the line; the resume re-execution (where
+        # ``load_resume`` is already non-None) skips this write, and ``finalise``
+        # later supersedes it with the real resumed outcome.
+        if deps.interrupt.load_resume(resume_key) is None:
+            deps.artifacts.write_terminal(
+                terminal=TERMINAL_BLOCKED,
+                rounds=state.get("rounds_recorded", 0),
+                reason=blocker,
+                waiting_on="decision",
+                waiting_on_declared=state.get("waiting_on_declared"),
+            )
+
         # First execution suspends here; a resume returns the marker and falls
         # through to the decision-injection path below.
         interrupt({"interrupt": checkpoint.as_dict()})

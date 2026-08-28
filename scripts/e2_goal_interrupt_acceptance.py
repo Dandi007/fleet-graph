@@ -41,7 +41,7 @@ from typing import Any
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from fleet_graph.decision_bridge.owners import OwnerTarget
+from fleet_graph.decision_bridge.owners import OwnerResult, OwnerTarget
 from fleet_graph.goal_interrupt.bridge import GoalInterruptBridge, GoalInterruptBridgeConfig
 from fleet_graph.goal_interrupt.contract import (
     DecisionInput,
@@ -50,8 +50,6 @@ from fleet_graph.goal_interrupt.contract import (
 )
 from fleet_graph.goal_interrupt.resolver import (
     LEGACY_OUTCOME_AMBIGUOUS,
-    LEGACY_OUTCOME_RESOLVED,
-    legacy_owner_fallback,
 )
 from fleet_graph.goal_interrupt.runtime import LineInterruptPort, resume_line
 from fleet_graph.goal_interrupt.store import GoalInterruptStore
@@ -143,6 +141,24 @@ class FakeBus:
         return [
             {"message_id": mid, "target_entity": entity_id} for mid in self.refs.get(entity_id, [])
         ]
+
+
+class _LegacyOwners:
+    """A seam owner source returning exactly the legacy owners a scenario staged."""
+
+    def __init__(self, owners: list[OwnerTarget]) -> None:
+        self.owners = owners
+        self.resumed: list[tuple[str, str]] = []
+
+    def discover(self, question_note_id: str) -> list[OwnerTarget]:
+        return [t for t in self.owners if t.question_note_id == question_note_id]
+
+    def discover_all(self) -> list[OwnerTarget]:
+        return list(self.owners)
+
+    def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
+        self.resumed.append((target.id, action_key))
+        return OwnerResult("resumed", "ok")
 
 
 def decision_message(message_id: str, seq: int) -> dict[str, Any]:
@@ -248,37 +264,104 @@ def scenario_decision_content_injected(work_dir: Path) -> dict[str, Any]:
 
 
 def scenario_legacy_owner_fallback(work_dir: Path) -> dict[str, Any]:
-    unique = OwnerTarget("line", "wf-abc", 2, "", "card-1", "parked")
-    resolved = legacy_owner_fallback(
-        folder_id="wf-abc",
-        referenced_question_ids=["q-1"],
-        question_texts={"q-1": "line wf-abc needs a decision"},
-        legacy_owners=[unique],
-    )
-    unique_ok = (
-        resolved.outcome == LEGACY_OUTCOME_RESOLVED
-        and resolved.target is not None
-        and resolved.target.id == "wf-abc"
-    )
+    from fleet_graph.decision_bridge.bridge import DecisionBridge, DecisionBridgeConfig
+    from fleet_graph.decision_bridge.owners import LineOwnerSource
+    from fleet_graph.decision_bridge.store import BridgeStore
 
-    ambiguous = legacy_owner_fallback(
-        folder_id="wf-abc",
-        referenced_question_ids=["q-1"],
-        question_texts={"q-1": "line wf-abc needs a decision"},
-        legacy_owners=[
+    root = work_dir / "lo"
+    root.mkdir(parents=True, exist_ok=True)
+    run_root = root / "runs"
+
+    def legacy_source(folder_id: str, generation: int) -> LineOwnerSource:
+        stall = run_root / ".scheduler" / f"{folder_id}.json"
+        stall.parent.mkdir(parents=True, exist_ok=True)
+        stall.write_text(
+            json.dumps(
+                {
+                    "generation": generation,
+                    "parked_run_id": f"run-{folder_id}",
+                    "parked_at": 1699999999.0,
+                    "board_card_entity_id": "card-1",
+                    "board_question_note_id": "",
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        return LineOwnerSource(run_root, lines=[{"folder_id": folder_id, "generation": 1}])
+
+    def question_note(message_id: str, text: str) -> dict[str, Any]:
+        return {
+            "message_id": message_id,
+            "channel_seq": 1,
+            "kind": "work.note.v1",
+            "created_at": "2026-08-29T00:00:00Z",
+            "payload": {"note": text, "note_type": "question", "card_entity_id": "card-1"},
+        }
+
+    # Unique legacy owner: the real bridge resolves it, records
+    # legacy_owner_resolution, and resumes exactly that parked line.
+    bus = FakeBus(
+        [question_note("q-1", "line wf-abc needs a decision"), decision_message("d-1", 2)]
+    )
+    bus.link("q-1", "d-1")
+    store = BridgeStore(root / "bridge").open()
+    bridge = DecisionBridge(
+        DecisionBridgeConfig(state_dir=root / "bridge"),
+        bus=bus,
+        owner_source=legacy_source("wf-abc", 2),
+        store=store,
+    )
+    record = bridge.run_once()
+    receipt = store.receipt("d-1")
+    unique_ok = bool(
+        record["resumed"] == 1
+        and receipt is not None
+        and receipt["status"] == "resumed"
+        and receipt["reason"] == "legacy_owner_resolution"
+        and receipt["target_id"] == "wf-abc"
+    )
+    store.close()
+
+    # Ambiguity: two same-folder legacy owners -> safe no-resume, fallback active.
+    owners = _LegacyOwners(
+        [
             OwnerTarget("line", "wf-abc", 2, "", "card-1", "parked"),
             OwnerTarget("line", "wf-abc", 3, "", "card-1", "parked"),
-        ],
+        ]
     )
-    ambiguous_ok = ambiguous.outcome == LEGACY_OUTCOME_AMBIGUOUS and ambiguous.target is None
+    bus2 = FakeBus(
+        [question_note("q-2", "line wf-abc needs a decision"), decision_message("d-2", 2)]
+    )
+    bus2.link("q-2", "d-2")
+    store2 = BridgeStore(root / "bridge2").open()
+    bridge2 = DecisionBridge(
+        DecisionBridgeConfig(state_dir=root / "bridge2"),
+        bus=bus2,
+        owner_source=owners,
+        store=store2,
+    )
+    record2 = bridge2.run_once()
+    receipt2 = store2.receipt("d-2")
+    ambiguous_ok = bool(
+        record2["resumed"] == 0
+        and owners.resumed == []
+        and receipt2 is not None
+        and receipt2["status"] == "noop"
+        and receipt2["reason"] == LEGACY_OUTCOME_AMBIGUOUS
+    )
+    store2.close()
 
     return evidence(
         "legacy-owner-fallback",
         bool(unique_ok and ambiguous_ok),
-        unique_outcome=resolved.outcome,
-        unique_target=resolved.target.id if resolved.target else None,
-        ambiguous_outcome=ambiguous.outcome,
-        ambiguous_reason=ambiguous.reason,
+        unique_outcome="resumed",
+        unique_target="wf-abc",
+        unique_reason=receipt["reason"] if receipt is not None else None,
+        unique_status=receipt["status"] if receipt is not None else None,
+        ambiguous_outcome=LEGACY_OUTCOME_AMBIGUOUS,
+        ambiguous_status=receipt2["status"] if receipt2 is not None else None,
+        ambiguous_resumed=record2["resumed"],
     )
 
 

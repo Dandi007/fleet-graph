@@ -54,6 +54,12 @@ from fleet_graph.decision_bridge.store import (
 DEFAULT_STATE_DIR = Path("/data/fleet-graph/decision-bridge")
 DEFAULT_BOARD_PAGE_LIMIT = 200
 
+#: Upper bound on how far back ``_question_texts`` walks for the legacy-owner
+#: fallback. The bus pages ascending, so the walk reads backward from the head
+#: (see ``_question_texts``); this cap mirrors goal_interrupt/bridge.py and only
+#: stops a pathological channel from being walked in full every decision.
+MAX_QUESTION_SCAN_PAGES = 50
+
 #: The channel this bridge reads, and the only channel the resolver accepts.
 READ_CHANNEL = WORK_NOTES
 
@@ -123,7 +129,6 @@ class DecisionBridge:
         self.store = store
         self.clock = clock
         self.sleep = sleep
-        self._question_texts_cache: dict[str, str] | None = None
 
     # --- assembly helpers -------------------------------------------------
 
@@ -297,27 +302,49 @@ class DecisionBridge:
         question whose immutable text carries the exact ``folder_id``. The
         reverse-refs surface cannot list a decision's forward refs, so the
         resolver needs the candidate question texts supplied by the caller.
-        Built here, once, read-only against the board channel; a missing bus or
-        an unreadable channel degrades to an empty map (no legacy recovery).
+
+        The bus pages *ascending*, so a plain ``messages(..., limit=N)`` returns
+        the *oldest* N messages and a question posted after start-up would never
+        be seen -- the fallback would degrade to ``legacy_owner_ambiguous`` and
+        a real legacy parked owner would never be recovered. The map is therefore
+        read backward from the head (``limit=1`` to learn ``head_seq``, then
+        re-read from just below it), page by page, and is *not* cached across
+        cycles: a question's text is immutable, but the set of questions grows as
+        time passes. Re-reading per decision is cheap -- a decision is processed
+        exactly once -- so correctness is not traded for the old lifetime cache.
+        A missing bus or an unreadable channel degrades to an empty map (no
+        legacy recovery).
         """
-        if self._question_texts_cache is not None:
-            return self._question_texts_cache
         texts: dict[str, str] = {}
         if self.bus is None:
-            self._question_texts_cache = texts
             return texts
         try:
-            messages, _head = self.bus.messages(READ_CHANNEL, limit=self.config.board_page_limit)
+            _messages, head = self.bus.messages(READ_CHANNEL, limit=1)
         except Exception:
-            messages = []
-        for message in messages:
-            if message.get("kind") != NOTE_KIND:
-                continue
-            payload = message.get("payload") or {}
-            if payload.get("note_type") != "question":
-                continue
-            texts[str(message.get("message_id") or "")] = str(payload.get("note") or "")
-        self._question_texts_cache = texts
+            return texts
+        upper = int(head or 0)
+        pages = 0
+        while upper > 0 and pages < MAX_QUESTION_SCAN_PAGES:
+            window_start = max(0, upper - self.config.board_page_limit)
+            try:
+                messages, _h = self.bus.messages(
+                    READ_CHANNEL, limit=self.config.board_page_limit, after_seq=window_start
+                )
+            except Exception:
+                break
+            for message in messages:
+                if message.get("kind") != NOTE_KIND:
+                    continue
+                payload = message.get("payload") or {}
+                if payload.get("note_type") != "question":
+                    continue
+                texts.setdefault(
+                    str(message.get("message_id") or ""), str(payload.get("note") or "")
+                )
+            upper = window_start
+            pages += 1
+            if window_start == 0:
+                break
         return texts
 
     def _fresh_decision(
@@ -516,6 +543,7 @@ def run_decision_bridge(
 __all__ = [
     "DEFAULT_BOARD_PAGE_LIMIT",
     "DEFAULT_STATE_DIR",
+    "MAX_QUESTION_SCAN_PAGES",
     "READ_CHANNEL",
     "READ_KIND",
     "DecisionBridge",

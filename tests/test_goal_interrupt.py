@@ -20,6 +20,7 @@ durable surfaces -- a real SQLite checkpointer, a real ``GoalInterruptStore``
 
 from __future__ import annotations
 
+import json
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,14 @@ from typing import Any
 import pytest
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from fleet_graph.decision_bridge.owners import OwnerTarget
+from fleet_graph.decision_bridge.bridge import DecisionBridge, DecisionBridgeConfig
+from fleet_graph.decision_bridge.owners import (
+    RESUME_RESUMED,
+    LineOwnerSource,
+    OwnerResult,
+    OwnerTarget,
+)
+from fleet_graph.decision_bridge.store import BridgeStore
 from fleet_graph.goal_interrupt.bridge import GoalInterruptBridge, GoalInterruptBridgeConfig
 from fleet_graph.goal_interrupt.contract import (
     NO_PRIOR_TERMINAL_DIGEST,
@@ -488,6 +496,48 @@ class TestRuntimeDedup:
 
 
 class TestBridge:
+    def test_bridge_finds_a_decision_on_a_board_longer_than_the_page(self, tmp_path: Path) -> None:
+        """The bus pages ascending, so a plain ``limit=200`` call returns the
+        *oldest* 200 messages and a decision at the new end of a 251-message
+        board would be missed. The chain must be read backward from the head."""
+        store = GoalInterruptStore(tmp_path / "gi").open()
+        store.put_interrupt(
+            {
+                "resume_key": RESUME_KEY,
+                "folder_id": "wf-1",
+                "generation": 1,
+                "round_id": 1,
+                "question_note_id": QUESTION_ID,
+                "card_entity_id": "card-1",
+                "prior_terminal_digest": "d",
+            }
+        )
+        messages = [
+            {
+                "message_id": f"n-{i}",
+                "channel_seq": i,
+                "kind": "work.note.v1",
+                "created_at": "2026-08-29T00:00:00Z",
+                "payload": {"note": "filler", "note_type": "progress"},
+            }
+            for i in range(1, 251)
+        ]
+        messages.append(decision("d-1", 251))
+        bus = FakeBus(messages)
+        bus.link(QUESTION_ID, "d-1")
+
+        resumes: list[str] = []
+        bridge = GoalInterruptBridge(
+            GoalInterruptBridgeConfig(),
+            store=store,
+            bus=bus,
+            resumer=lambda d: resumes.append(d.message_id) or "resumed",
+        )
+        record = bridge.run_once()
+        assert record["resumed"] == 1
+        assert resumes == ["d-1"]
+        store.close()
+
     def test_bridge_records_compensation_for_a_decision_behind_the_cursor(
         self, tmp_path: Path
     ) -> None:
@@ -626,3 +676,164 @@ class TestBridge:
         record = bridge.run_once()
         assert record["resumed"] == 0
         assert resumes == []
+
+
+# --- legacy-owner fallback, on the real decision bridge ---------------------
+#
+# Spec item 6 and the test requirements demand proof that the *wired* path
+# resolves a legacy parked owner, not the pure ``legacy_owner_fallback`` helper
+# in isolation. These tests drive the real ``DecisionBridge`` -- real
+# ``_question_texts`` bus scan, the real ``resolve_decision`` with its
+# ``_legacy_resolve`` branch, the real ``BridgeStore`` intent/receipt -- over a
+# legacy owner (a parked line whose ``question_note_id`` was never persisted).
+
+
+def _question_note(message_id: str, seq: int, *, text: str) -> dict[str, Any]:
+    return {
+        "message_id": message_id,
+        "channel_seq": seq,
+        "kind": "work.note.v1",
+        "created_at": "2026-08-29T00:00:00Z",
+        "payload": {"note": text, "note_type": "question", "card_entity_id": "card-1"},
+    }
+
+
+def _legacy_line_source(tmp_path: Path, *, folder_id: str, generation: int) -> LineOwnerSource:
+    """A real ``LineOwnerSource`` over a parked line whose ``board_question_note_id``
+    was never persisted -- the legacy gap the fallback exists to close."""
+    run_root = tmp_path / "runs"
+    stall = run_root / ".scheduler" / f"{folder_id}.json"
+    stall.parent.mkdir(parents=True, exist_ok=True)
+    stall.write_text(
+        json.dumps(
+            {
+                "generation": generation,
+                "parked_run_id": f"run-{folder_id}",
+                "parked_at": 1699999999.0,
+                "board_card_entity_id": "card-1",
+                "board_question_note_id": "",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return LineOwnerSource(run_root, lines=[{"folder_id": folder_id, "generation": 1}])
+
+
+class _FakeLegacyOwners:
+    """A seam owner source returning the exact legacy owners a test staged."""
+
+    def __init__(self, owners: list[OwnerTarget]) -> None:
+        self.owners = owners
+        self.resumed: list[tuple[str, str]] = []
+
+    def discover(self, question_note_id: str) -> list[OwnerTarget]:
+        return [t for t in self.owners if t.question_note_id == question_note_id]
+
+    def discover_all(self) -> list[OwnerTarget]:
+        return list(self.owners)
+
+    def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
+        self.resumed.append((target.id, action_key))
+        return OwnerResult(RESUME_RESUMED, "ok")
+
+
+class TestLegacyOwnerBridge:
+    def _bridge(self, tmp_path: Path, *, owner_source: Any) -> tuple[DecisionBridge, BridgeStore]:
+        bus = FakeBus(
+            [
+                _question_note("q-1", 1, text="line wf-abc needs a human decision"),
+                decision("d-1", 2),
+            ]
+        )
+        bus.link("q-1", "d-1")
+        store = BridgeStore(tmp_path / "bridge").open()
+        bridge = DecisionBridge(
+            DecisionBridgeConfig(state_dir=tmp_path / "bridge"),
+            bus=bus,
+            owner_source=owner_source,
+            store=store,
+        )
+        return bridge, store
+
+    def test_unique_legacy_owner_resumes_through_the_real_bridge(self, tmp_path: Path) -> None:
+        # The wired path: _question_texts -> resolve_decision -> _legacy_resolve
+        # -> legacy_owner_resolution intent -> LineOwnerSource.resume (wake).
+        source = _legacy_line_source(tmp_path, folder_id="wf-abc", generation=2)
+        bridge, store = self._bridge(tmp_path, owner_source=source)
+
+        record = bridge.run_once()
+        receipt = store.receipt("d-1")
+
+        assert record["resumed"] == 1
+        assert receipt is not None
+        assert receipt["status"] == "resumed"
+        assert receipt["reason"] == "legacy_owner_resolution"
+        assert receipt["target_kind"] == "line"
+        assert receipt["target_id"] == "wf-abc"
+        # The real resume woke the parked line: the stall snapshot was cleared.
+        stall = json.loads(
+            (tmp_path / "runs" / ".scheduler" / "wf-abc.json").read_text(encoding="utf-8")
+        )
+        assert stall.get("parked_run_id") is None
+        store.close()
+
+    def test_ambiguous_legacy_owner_performs_no_resume(self, tmp_path: Path) -> None:
+        owners = _FakeLegacyOwners(
+            [
+                OwnerTarget("line", "wf-abc", 2, "", "card-1", "parked"),
+                OwnerTarget("line", "wf-abc", 3, "", "card-1", "parked"),
+            ]
+        )
+        bridge, store = self._bridge(tmp_path, owner_source=owners)
+
+        record = bridge.run_once()
+        receipt = store.receipt("d-1")
+
+        assert record["resumed"] == 0
+        assert owners.resumed == []
+        assert receipt is not None
+        assert receipt["status"] == "noop"
+        assert receipt["reason"] == LEGACY_OUTCOME_AMBIGUOUS
+        store.close()
+
+    def test_question_texts_pages_past_the_oldest_window(self, tmp_path: Path) -> None:
+        """A question note posted after 250 older work-notes messages must still
+        be seen by ``_question_texts``: the old ascending-page read would miss it
+        and degrade to ``legacy_owner_ambiguous``."""
+        source = _legacy_line_source(tmp_path, folder_id="wf-abc", generation=2)
+        messages = [
+            {
+                "message_id": f"n-{i}",
+                "channel_seq": i,
+                "kind": "work.note.v1",
+                "created_at": "2026-08-29T00:00:00Z",
+                "payload": {"note": "filler", "note_type": "progress"},
+            }
+            for i in range(1, 251)
+        ]
+        messages.extend(
+            [
+                _question_note("q-late", 251, text="line wf-abc needs a human decision"),
+                decision("d-late", 252),
+            ]
+        )
+        bus = FakeBus(messages)
+        bus.link("q-late", "d-late")
+        store = BridgeStore(tmp_path / "bridge").open()
+        bridge = DecisionBridge(
+            DecisionBridgeConfig(state_dir=tmp_path / "bridge"),
+            bus=bus,
+            owner_source=source,
+            store=store,
+        )
+
+        bridge.run_once()  # first cycle reads the 250 filler notes and advances the cursor
+        record = bridge.run_once()  # second cycle reaches the question + decision
+        receipt = store.receipt("d-late")
+
+        assert record["resumed"] == 1
+        assert receipt is not None
+        assert receipt["status"] == "resumed"
+        assert receipt["reason"] == "legacy_owner_resolution"
+        store.close()

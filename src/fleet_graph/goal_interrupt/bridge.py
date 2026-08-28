@@ -35,6 +35,15 @@ from fleet_graph.goal_interrupt.store import GoalInterruptStore
 
 DEFAULT_BOARD_PAGE_LIMIT = 200
 
+#: Upper bound on how far back the decision-chain walk goes for a still-
+#: suspended question. The bus pages ascending and a plain ``messages(...,
+#: limit=N)`` returns the *oldest* N messages, so the chain must be read
+#: backward from the head (see ``_decision_chain``). A suspended question's
+#: decision sits near the new end, so a generous window covers every realistic
+#: board; the cap only keeps a permanently-unanswered question from turning
+#: each bridge cycle into an unbounded walk of a very long channel.
+MAX_CHAIN_SCAN_PAGES = 50
+
 #: Board channels the bridge reads decisions from. Same read surface as E1.
 WORK_NOTES = "board:work-notes"
 
@@ -63,8 +72,30 @@ class GoalInterruptBridge:
 
     # --- decision chain ----------------------------------------------------
 
+    def _head(self) -> int:
+        """The channel's head seq. ``limit=1`` still reports ``head_seq``, which
+        is all we need to page backward from the new end of the channel."""
+        if self.bus is None:
+            return 0
+        try:
+            _messages, head = self.bus.messages(WORK_NOTES, limit=1)
+        except Exception:
+            return 0
+        return int(head or 0)
+
     def _decision_chain(self, question_note_id: str) -> list[dict[str, Any]]:
-        """The authoritative decisions answering one question, newest first."""
+        """The authoritative decisions answering one question, newest first.
+
+        The bus pages *ascending*: a plain ``messages(..., limit=N)`` returns
+        the *oldest* N messages, so on a long-lived channel the decision that
+        answers a suspended question -- which sits at the new end -- would never
+        be in the fetched page and the line would stay suspended forever. The
+        chain is therefore read backward from the head (the client's documented
+        recipe: learn ``head_seq`` with ``limit=1``, then re-read from just
+        below it), page by page, and stops at the first page that holds a
+        candidate decision. Pages are newest-first, so that decision is the
+        newest one by ``(channel_seq, message_id)``.
+        """
         if self.bus is None:
             return []
         refs_to = getattr(self.bus, "refs_to", None)
@@ -77,17 +108,28 @@ class GoalInterruptBridge:
         candidate_ids = {str(ref.get("message_id") or "") for ref in refs if isinstance(ref, dict)}
         if not candidate_ids:
             return []
-        messages: list[dict[str, Any]] = []
-        try:
-            messages, _head = self.bus.messages(WORK_NOTES, limit=self.config.board_page_limit)
-        except Exception:
-            return []
-        decisions = [message for message in messages if strategy(message, candidate_ids)]
-        return sorted(
-            decisions,
-            key=lambda m: (int(m.get("channel_seq") or 0), str(m.get("message_id") or "")),
-            reverse=True,
-        )
+        upper = self._head()
+        pages = 0
+        while upper > 0 and pages < MAX_CHAIN_SCAN_PAGES:
+            window_start = max(0, upper - self.config.board_page_limit)
+            try:
+                messages, _head = self.bus.messages(
+                    WORK_NOTES, limit=self.config.board_page_limit, after_seq=window_start
+                )
+            except Exception:
+                return []
+            decisions = [message for message in messages if strategy(message, candidate_ids)]
+            if decisions:
+                return sorted(
+                    decisions,
+                    key=lambda m: (int(m.get("channel_seq") or 0), str(m.get("message_id") or "")),
+                    reverse=True,
+                )
+            upper = window_start
+            pages += 1
+            if window_start == 0:
+                break
+        return []
 
     def _references(self, question_note_id: str) -> list[dict[str, str]]:
         refs_to = getattr(self.bus, "refs_to", None)
@@ -110,13 +152,7 @@ class GoalInterruptBridge:
             return 0
 
     def _board_head(self) -> int:
-        if self.bus is None:
-            return 0
-        try:
-            _messages, head = self.bus.messages(WORK_NOTES, limit=self.config.board_page_limit)
-            return int(head or 0)
-        except Exception:
-            return 0
+        return self._head()
 
     def _resume_question(
         self, interrupt: dict[str, Any], decision: dict[str, Any], *, prior_cursor: int
@@ -222,6 +258,7 @@ def strategy(message: dict[str, Any], candidate_ids: set[str]) -> bool:
 
 __all__ = [
     "DEFAULT_BOARD_PAGE_LIMIT",
+    "MAX_CHAIN_SCAN_PAGES",
     "GoalInterruptBridge",
     "GoalInterruptBridgeConfig",
     "strategy",
