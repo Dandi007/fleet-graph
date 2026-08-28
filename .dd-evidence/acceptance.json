@@ -1,0 +1,70 @@
+{
+ "development_id": "dev-fg-0b84e2836b6b",
+ "attempt": 4,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "uv",
+    "sync",
+    "--frozen"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": "Checked 100 packages in 0.80ms\n"
+  },
+  {
+   "command": [
+    "make",
+    "verify"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "uv run ruff check .\nAll checks passed!\nuv run ruff format --check .\n131 files already formatted\nuv run pytest\n........................................................................ [  5%]\n........................................................................ [ 10%]\n........................................................................ [ 16%]\n........................................................................ [ 21%]\n........................................................................ [ 26%]\n........................................................................ [ 32%]\ns....................................................................... [ 37%]\n........................................................................ [ 42%]\n........................................................................ [ 48%]\n........................................................................ [ 53%]\n........................................................................ [ 59%]\n........................................................................ [ 64%]\n........................................................................ [ 69%]\n........................................................................ [ 75%]\n........................................................................ [ 80%]\n........................................................................ [ 85%]\n........................................................................ [ 91%]\n........................................................................ [ 96%]\n..............................................                           [100%]\n1341 passed, 1 skipped in 35.83s\nuv run python scripts/check_supervisor_conformance.py\nsupervisor conformance: clean\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "pytest",
+    "tests/test_decision_bridge.py",
+    "-q"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "...................................................                      [100%]\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/e1_decision_bridge_acceptance.py",
+    "--scenario",
+    "resume-under-5s",
+    "--max-latency-seconds",
+    "5"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "{\n  \"action_key\": \"e1:d-1:dd:dev-abc:1\",\n  \"cursor_after\": 1,\n  \"cursor_before\": 0,\n  \"exit_code\": 0,\n  \"generation\": 1,\n  \"latency_seconds\": 0.0563,\n  \"logical_resumes\": 1,\n  \"max_latency_seconds\": 5.0,\n  \"owner_calls\": 1,\n  \"pass\": true,\n  \"receipt_status\": \"resumed\",\n  \"scenario\": \"resume-under-5s\",\n  \"source_message_id\": \"d-1\",\n  \"target_id\": \"dev-abc\",\n  \"target_kind\": \"dd\",\n  \"utc_timestamp\": \"2026-08-28T15:47:19Z\"\n}\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/e1_decision_bridge_acceptance.py",
+    "--scenario",
+    "kill-restart-exactly-once",
+    "--kill-after",
+    "intent_recorded",
+    "--max-recovery-seconds",
+    "5"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "{\n  \"action_key\": \"e1:d-1:dd:dev-abc:1\",\n  \"crashed_before_seal\": true,\n  \"cursor_after\": 1,\n  \"cursor_before\": 0,\n  \"exit_code\": 0,\n  \"generation\": 1,\n  \"logical_resumes\": 1,\n  \"max_recovery_seconds\": 5.0,\n  \"owner_calls\": 2,\n  \"pass\": true,\n  \"receipt_count\": 1,\n  \"receipt_status\": \"resumed\",\n  \"recovery_seconds\": 0.1264,\n  \"scenario\": \"kill-restart-exactly-once\",\n  \"source_message_id\": \"d-1\",\n  \"target_id\": \"dev-abc\",\n  \"target_kind\": \"dd\",\n  \"utc_timestamp\": \"2026-08-28T15:47:20Z\"\n}\n",
+   "stderr_tail": ""
+  }
+ ]
+}
