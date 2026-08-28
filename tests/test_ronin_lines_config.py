@@ -48,6 +48,18 @@ OPENED = {
     "wf-197430",  # agent 权限声明式化（可配置 / 可审计 / 单点声明）
 }
 
+# 2026-08-28 监督面收编：三线使命完成，enabled=false 但留在名册里
+# （名册是编成史实，收编靠开关不靠删行）。
+# - wf-a08949：dd 切换目标已达成，老引擎退役由监督面亲自执行，线使命完成；
+#   其基于 :7455/:7460 的 acceptance 判据随老引擎退役失效，整段删除。
+# - wf-40fa8d：terminal=done（C1/C2/C3 五件套验收通过）。
+# - wf-7bc4d1：terminal=done（真机全量验收通过）。
+CONVERGED = {
+    "wf-a08949",
+    "wf-40fa8d",
+    "wf-7bc4d1",
+}
+
 MIGRATED = {
     "wf-287e81",
     "wf-5664e5",
@@ -107,15 +119,16 @@ class TestTheShippedConfigLoads:
         enabled = {
             line.folder_id for line in SchedulerConfig.from_json(CONFIG).lines if line.enabled
         }
-        assert enabled == BATCH_TWO | OPENED
+        assert enabled == (BATCH_TWO | OPENED) - CONVERGED
 
-    def test_the_canary_stays_on_through_later_batches(self) -> None:
-        """放量是叠加不是替换。把金丝雀关掉换新线，会丢掉唯一一条已经有
-        真机证据的线。"""
-        enabled = {
-            line.folder_id for line in SchedulerConfig.from_json(CONFIG).lines if line.enabled
-        }
-        assert CANARY in enabled
+    def test_the_converged_lines_stay_in_the_roster_but_off(self) -> None:
+        """收编（2026-08-28）不是删除：金丝雀 wf-40fa8d 等三线 terminal=done /
+        使命完成后 enabled=false，但留在名册里——名册同时是编成史实。原
+        「金丝雀在后续批次保持在线」的断言随金丝雀本身收编而退役。"""
+        lines = {line.folder_id: line for line in SchedulerConfig.from_json(CONFIG).lines}
+        for folder_id in CONVERGED:
+            assert folder_id in lines, folder_id
+            assert not lines[folder_id].enabled, folder_id
 
     def test_the_archived_lines_stay_out(self) -> None:
         """wf-d726aa / wf-8c8ae3 已归档（题目对象随 loop-engine 退役，或诉求
@@ -171,20 +184,18 @@ class TestTheRunbookMatchesTheCode:
         assert CANARY in self.RUNBOOK.read_text(encoding="utf-8")
 
 
-class TestTheAcceptanceCanary:
-    """R0d 首批声明：wf-a08949 一条线。目的是让 last_acceptance 事实链首次在
-    真机跑通，不是替线做完整验收——两条命令都是该线 goal.md A4 观察窗/第一纪律
-    的只读机械判据（:7455 老引擎端口在听、:7460 loop-engine dd 面在听）。第二条
-    原是 systemctl --user is-active，但验收命令在 transient unit 里没有 DBUS
-    环境、恒 exit 1（g2 round-5 事实链实测），改为同构端口探测。"""
+class TestTheAcceptanceDeclarations:
+    """R0d 首批声明曾是 wf-a08949 一条线（:7455/:7460 端口探测，目的是让
+    last_acceptance 事实链首次真机跑通）。2026-08-28 老引擎退役、端口释放，
+    `grep -c` 匹配 0 行 exit 1，该判据恒失败——随线收编整段删除。此后名册里
+    不该再有任何线携带指向老引擎端口的判据。"""
 
-    def test_the_canary_declares_two_read_only_probes(self) -> None:
+    def test_the_retired_probes_are_gone(self) -> None:
         line = {c.folder_id: c for c in SchedulerConfig.from_json(CONFIG).lines}["wf-a08949"]
-        assert line.acceptance == [
-            ["bash", "-lc", "ss -ltn | grep -c ':7455'"],
-            ["bash", "-lc", "ss -ltn | grep -c ':7460'"],
-        ]
-        assert line.acceptance_cwd == "/tmp", "cwd 是声明的一部分，缺了整个声明只会 skipped:no_cwd"
+        assert not line.acceptance
+        raw = CONFIG.read_text(encoding="utf-8")
+        assert ":7455" not in raw
+        assert ":7460" not in raw
 
     def test_every_declared_line_also_declares_a_cwd(self) -> None:
         for line in SchedulerConfig.from_json(CONFIG).lines:
@@ -193,8 +204,8 @@ class TestTheAcceptanceCanary:
                 for argv in line.acceptance:
                     assert argv and all(isinstance(part, str) for part in argv)
 
-    def test_no_other_line_is_in_the_canary_batch(self) -> None:
+    def test_no_line_currently_declares_acceptance(self) -> None:
         declared = {
             line.folder_id for line in SchedulerConfig.from_json(CONFIG).lines if line.acceptance
         }
-        assert declared == {"wf-a08949"}
+        assert declared == set()
