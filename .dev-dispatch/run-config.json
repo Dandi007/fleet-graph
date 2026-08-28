@@ -1,0 +1,26 @@
+{
+ "development_id": "dev-fg-8af1460b39b6",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_supervisor_events.py",
+   "-q",
+   "-k",
+   "BoardScan or attempts_survive_a_restart"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
