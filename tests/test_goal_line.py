@@ -239,6 +239,31 @@ class TestBreakers:
         assert "timeouts" in artifacts.terminal["reason"]
         assert any(r["reason"] == "worker_turn_timeout" for r in artifacts.rounds)
 
+    def test_a_typed_session_timeout_reaches_the_same_timeout_path(self) -> None:
+        """AgentSessionTimeout inherits TimeoutError, so the in-band TURN_TIMEOUT
+        the seat reports must hit the graceful path -- not crash the line."""
+        from fleet_graph.executors.agent_session import AgentSessionTimeout
+
+        worker = FakeWorker(raises=AgentSessionTimeout("turn exceeded 3000s"))
+        script = [
+            {"verdict": "continue", "next_prompt": f"attempt number {i} at the task"}
+            for i in range(6)
+        ]
+        artifacts, _ = run_line(script, worker=worker, bounds=LineBounds(max_rounds=20))
+        assert artifacts.terminal["terminal"] == TERMINAL_BLOCKED
+        assert "timeouts" in artifacts.terminal["reason"]
+        assert any(r["reason"] == "worker_turn_timeout" for r in artifacts.rounds)
+
+    def test_a_non_timeout_session_error_still_propagates(self) -> None:
+        """A seat failure that is not a timeout must keep crashing, not be
+        silently absorbed as a no-op round."""
+        from fleet_graph.executors.agent_session import AgentSessionError
+
+        worker = FakeWorker(raises=AgentSessionError("seat exploded"))
+        script = [{"verdict": "continue", "next_prompt": "do the thing"}]
+        with pytest.raises(AgentSessionError):
+            run_line(script, worker=worker)
+
 
 class TestFaults:
     def test_unrecognised_verdict_is_a_fault_not_a_guess(self) -> None:

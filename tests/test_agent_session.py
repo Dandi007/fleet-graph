@@ -13,6 +13,7 @@ import pytest
 from fleet_graph.executors.agent_session import (
     AgentSessionError,
     AgentSessionSeat,
+    AgentSessionTimeout,
     SeatHandle,
     SeatSpec,
     _envelope,
@@ -170,6 +171,50 @@ class TestEnvelope:
     def test_no_envelope_raises(self) -> None:
         with pytest.raises(AgentSessionError, match="no JSON envelope"):
             _envelope("just logs\n", context="c")
+
+
+class TestTypedTimeout:
+    """TURN_TIMEOUT is a timeout, not a generic seat failure.
+
+    The goal_line worker-turn guard catches TimeoutError; a TURN_TIMEOUT raised
+    as a bare AgentSessionError (RuntimeError) would sail past it and crash the
+    line, which is exactly the incident this tests against. The typed
+    `AgentSessionTimeout` must be both an AgentSessionError (so seat callers
+    keep catching it) and a TimeoutError (so the timeout path runs).
+    """
+
+    def test_turn_timeout_envelope_raises_the_typed_timeout(self) -> None:
+        payload = '{"ok": false, "error": {"code": "TURN_TIMEOUT", "message": "exceeded"}}'
+        with pytest.raises(AgentSessionTimeout):
+            _envelope(payload, context="c")
+
+    def test_the_typed_timeout_is_a_timeout_error(self) -> None:
+        payload = '{"ok": false, "error": {"code": "TURN_TIMEOUT", "message": "exceeded"}}'
+        with pytest.raises(TimeoutError):
+            _envelope(payload, context="c")
+
+    def test_the_typed_timeout_is_still_a_session_error(self) -> None:
+        assert issubclass(AgentSessionTimeout, AgentSessionError)
+
+    def test_a_non_timeout_error_is_not_the_typed_timeout(self) -> None:
+        payload = '{"ok": false, "error": {"code": "TURN_FAILED", "message": "boom"}}'
+        with pytest.raises(AgentSessionError) as caught:
+            _envelope(payload, context="c")
+        assert not isinstance(caught.value, AgentSessionTimeout)
+
+    def test_subprocess_timeout_is_mapped_to_the_typed_timeout(
+        self, seat: AgentSessionSeat, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """subprocess.TimeoutExpired is not a TimeoutError either; map it too."""
+        import subprocess as sp
+
+        def boom(*_args, **_kwargs):
+            raise sp.TimeoutExpired(cmd="agent-session", timeout=360)
+
+        monkeypatch.setattr("fleet_graph.executors.agent_session.subprocess.run", boom)
+        handle = SeatHandle("key", "sess", "/root")
+        with pytest.raises(AgentSessionTimeout):
+            seat.send(handle, "hi")
 
 
 class TestHandle:

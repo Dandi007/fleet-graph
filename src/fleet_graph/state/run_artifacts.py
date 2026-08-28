@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import time
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
@@ -54,6 +55,7 @@ HEARTBEAT_FIELDS = frozenset(
         "started_at",
         "phase_started_at",
         "updated_at",
+        "log_path",
     }
 )
 
@@ -69,6 +71,7 @@ TERMINAL_FIELDS = frozenset(
         "pid",
         "waiting_on",
         "waiting_on_declared",
+        "log_path",
     }
 )
 
@@ -78,6 +81,22 @@ TERMINAL_FIELDS = frozenset(
 #: must never fault a line (R0c ruling).
 WAITING_ON_VALUES = frozenset({"decision", "external", "none"})
 WAITING_ON_DEFAULT = "none"
+
+#: Where the launcher sends a line's stdout/stderr (scheduler/launcher.py
+#: `log_file`, defaulting to /data/fleet-graph/logs/{folder_id}.log). The run
+#: root records it so the on-disk state names its own log instead of forcing an
+#: operator to know a parallel path by heart.
+LOG_ROOT = Path("/data/fleet-graph/logs")
+
+#: The fault terminal keeps a traceback summary for a human, not forever: a
+#: single badly-behaved agent can produce a multi-megabyte exception. The first
+#: frames and the message are the useful part.
+TRACEBACK_SUMMARY_LIMIT = 4000
+
+
+def _one_line(message: str) -> str:
+    """Collapse an exception message to a single line, bounded in length."""
+    return " ".join(message.split())[:2000]
 
 
 def normalize_waiting_on(raw: Any) -> tuple[str, str | None]:
@@ -106,6 +125,7 @@ class RunArtifacts:
         started_at: float | None = None,
         clock: Callable[[], float] = time.time,
         pid: int | None = None,
+        log_path: str | Path | None = None,
     ) -> None:
         self.run_root = Path(run_root)
         self.run_id = run_id
@@ -113,6 +133,9 @@ class RunArtifacts:
         self._clock = clock
         self._pid = pid if pid is not None else os.getpid()
         self.started_at = started_at if started_at is not None else clock()
+        self.log_path = (
+            str(log_path) if log_path is not None else str(LOG_ROOT / f"{folder_id}.log")
+        )
 
         self._rounds_path = self.run_root / "rounds.jsonl"
         self._heartbeat_path = self.run_root / "heartbeat.json"
@@ -156,6 +179,7 @@ class RunArtifacts:
             "started_at": iso(self.started_at),
             "phase_started_at": iso(self._hb_phase_started_at),
             "updated_at": iso(now),
+            "log_path": self.log_path,
         }
         try:
             with self._heartbeat_path.open("w", encoding="utf-8") as handle:
@@ -230,6 +254,44 @@ class RunArtifacts:
             "pid": self._pid,
             "waiting_on": waiting_on,
             "waiting_on_declared": waiting_on_declared,
+            "log_path": self.log_path,
+        }
+        with self._terminal_path.open("w", encoding="utf-8") as handle:
+            json.dump(event, handle, ensure_ascii=False, indent=2)
+        return self._terminal_path
+
+    # --- fault terminal --------------------------------------------------
+
+    def write_fault_terminal(self, *, exception: BaseException, rounds: int = 0) -> Path:
+        """Record a crash that escaped the graph as a `fault` terminal.
+
+        The `finalise` node only ever runs on a well-formed terminal, so an
+        unexpected node exception otherwise leaves no terminal.json at all --
+        and any stale terminal from a previous generation then masquerades as
+        the current state. This is the exception boundary's counterpart: it
+        writes `terminal: "fault"` plus the exception class, a one-line message
+        and a truncated traceback, so a crash is distinguishable from a clean
+        stop and from a line that simply vanished.
+        """
+        message = str(exception).strip() or type(exception).__name__
+        summary = "".join(
+            traceback.format_exception(type(exception), exception, exception.__traceback__)
+        )
+        event = {
+            "run_id": self.run_id,
+            "folder_id": self.folder_id,
+            "terminal": "fault",
+            "pump_fault": True,
+            "rounds": rounds,
+            "reason": _one_line(message),
+            "at": iso(self._clock()),
+            "pid": self._pid,
+            "waiting_on": WAITING_ON_DEFAULT,
+            "waiting_on_declared": None,
+            "log_path": self.log_path,
+            "exception_class": type(exception).__name__,
+            "message": _one_line(message),
+            "traceback": summary[:TRACEBACK_SUMMARY_LIMIT],
         }
         with self._terminal_path.open("w", encoding="utf-8") as handle:
             json.dump(event, handle, ensure_ascii=False, indent=2)

@@ -51,6 +51,10 @@ class LineConfig:
     #: What the roster declared for the acceptance step (R0d). None still gets
     #: the step -- it states `not_declared` rather than staying silent.
     acceptance: AcceptanceSpec | None = None
+    #: Where this line's stdout/stderr lands (defaults under
+    #: /data/fleet-graph/logs in RunArtifacts). Recorded in the heartbeat and
+    #: terminal so the run root names its own log.
+    log_path: Path | None = None
 
     @property
     def inbox_alias(self) -> str | None:
@@ -78,7 +82,12 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
     run_id = run_id or str(uuid.uuid4())
     thread_id = config.thread_id
 
-    artifacts = RunArtifacts(config.run_root, run_id=run_id, folder_id=config.folder_id)
+    artifacts = RunArtifacts(
+        config.run_root,
+        run_id=run_id,
+        folder_id=config.folder_id,
+        log_path=config.log_path,
+    )
 
     launcher_kwargs: dict[str, Any] = {"state_root": str(config.run_root / "agent-runs")}
     if config.agent_run_bin:
@@ -165,7 +174,7 @@ def resume_start(compiled: Any, invoke_config: dict[str, Any]) -> dict[str, Any]
 
 
 def run_line(config: LineConfig, *, run_id: str | None = None) -> dict[str, Any]:
-    graph, _deps = build_line(config, run_id=run_id)
+    graph, deps = build_line(config, run_id=run_id)
     invoke_config: dict[str, Any] = {
         "configurable": {"thread_id": config.thread_id},
         # Each round is several graph steps; the bounds check is the
@@ -173,9 +182,18 @@ def run_line(config: LineConfig, *, run_id: str | None = None) -> dict[str, Any]
         "recursion_limit": config.max_rounds * 8 + 20,
     }
 
-    with SqliteSaver.from_conn_string(config.resolved_checkpoint_path) as saver:
-        compiled = graph.compile(checkpointer=saver)
-        state = compiled.invoke(resume_start(compiled, invoke_config), config=invoke_config)
+    try:
+        with SqliteSaver.from_conn_string(config.resolved_checkpoint_path) as saver:
+            compiled = graph.compile(checkpointer=saver)
+            state = compiled.invoke(resume_start(compiled, invoke_config), config=invoke_config)
+    except Exception as exc:
+        # The exception boundary. `finalise` only runs on a well-formed
+        # terminal, so an unexpected node exception would otherwise leave a
+        # stale previous-generation terminal.json as the freshest signal.
+        # Write a `fault` terminal so the crash is visible, then let the
+        # exception propagate to a non-zero exit.
+        deps.artifacts.write_fault_terminal(exception=exc)
+        raise
     return {
         "folder_id": config.folder_id,
         "terminal": state.get("terminal"),
