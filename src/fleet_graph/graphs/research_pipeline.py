@@ -38,6 +38,18 @@ from fleet_graph.state.run_artifacts import iso, write_json_durable
 WORKER_ROLE = "research_worker_local"
 SYNTHESIS_ROLE = "research_synth"
 
+# roles 侧 protocol 契约（agent-runtime profiles/roles/schemas/，SSoT 在 roles 仓）：
+# - worker input  research-worker.input.v1：{clue_id, clue_text[, source, context]}
+# - worker result research-worker.result.v1：{clue_id, verdict, findings[{claim,
+#   source, quote, locator}], proposed_clues[{text, rationale}][, notes]}
+# - synth input   research-synth.input.v1：{question[, clue_ids, corpus_note]}
+# - synth result  research-synth.result.v1：{report_markdown, coverage_summary,
+#   unresolved}
+# role 声明 protocol.input 后 agent-run 强制要求 --input，缺了直接 CONTRACT_ERROR，
+# 所以 dispatch/synthesis 必须为每个 run 落 input 文件并传 spec.input_path。
+#: worker verdict 中视为「调查完成」的两个值；blocked 走 clue 失败路径（retry/block）。
+WORKER_VERDICTS_DONE = frozenset({"found", "not_found"})
+
 DISPATCHER_LABEL = "fleet-graph"
 
 # clue 状态机（规格第 7 条）：open -> dispatched -> done | blocked。
@@ -72,10 +84,8 @@ SEED_SYSTEM = (
 )
 SEED_PROMPT = "为研究问题生成初始调查线索（仅返回 JSON 数组）：{question}"
 
-WORKER_SYSTEM = (
-    "You investigate one clue of a deep-research question. Return a JSON object "
-    'with {"findings": [...], "new_clues": [...]}.'
-)
+# worker 的输出契约由 role 侧 protocol.output（research-worker.result.v1）钉死，
+# 这里不再随 prompt 复述 schema——prompt 只投递题面与线索。
 WORKER_PROMPT = (
     "研究问题：{question}\n\n调查线索：{clue}\n\n"
     "围绕该线索收集事实 findings，并给出可继续深挖的子线索 new_clues。"
@@ -235,6 +245,16 @@ def _result_path(run_root: Path, clue_id: str) -> Path:
     return run_root / "clues" / f"{clue_id}-result.json"
 
 
+def _worker_input_path(run_root: Path, clue_id: str, retry: int) -> Path:
+    """worker 的 --input 文件（research-worker.input.v1）。按 retry 区分：
+    retry 重派是一个新 run，input 文件与 run 一一对应，续跑时可整体复核。"""
+    return run_root / "inputs" / f"worker-{clue_id}-r{retry}.json"
+
+
+def _synthesis_input_path(run_root: Path) -> Path:
+    return run_root / "inputs" / "synthesis.json"
+
+
 def _write_clue_file(run_root: Path, clue_id: str, query: str, *, depth: int) -> None:
     # 线索正文落在文件里而不是 state 里：state 只装 id/status/depth/retry（规格第 7 条）。
     write_json_durable(
@@ -246,8 +266,11 @@ def _read_clue_query(run_root: Path, clue_id: str) -> str:
     return json.loads(_clue_file_path(run_root, clue_id).read_text(encoding="utf-8"))["query"]
 
 
-def _append_evidence(run_root: Path, clue_id: str, depth: int, finding: str, now: float) -> None:
-    """逐条 append 一条 evidence（规格第 7 条）：findings 只落盘，不进 state。"""
+def _append_evidence(run_root: Path, clue_id: str, depth: int, finding: Any, now: float) -> None:
+    """逐条 append 一条 evidence（规格第 7 条）：findings 只落盘，不进 state。
+
+    finding 是契约里的结构化对象 {claim, source, quote, locator}，原样落盘
+    （不 str() 压平——synthesis 语料与人工复核都要 locator/quote 原文）。"""
     entry = {"at": iso(now), "clue_id": clue_id, "depth": depth, "finding": finding}
     with (run_root / EVIDENCE_FILE).open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -335,6 +358,12 @@ def _dispatch_node(deps: ResearchDeps):
         prompt_path = _prompt_path(deps.run_root, clue_id)
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
         prompt_path.write_text(prompt, encoding="utf-8")
+        # role 声明了 protocol.input（research-worker.input.v1），agent-run 强制
+        # --input：每个 run 落一份 input 文件，collect 侧经 spec.input_path 投递。
+        write_json_durable(
+            _worker_input_path(deps.run_root, clue_id, clue["retry"]),
+            {"clue_id": clue_id, "clue_text": query},
+        )
 
         _observe(deps, {"event": "dispatch", "clue_id": clue_id, "retry": clue["retry"]})
         return {
@@ -364,6 +393,7 @@ def _collect_node(deps: ResearchDeps):
         spec = AgentRunSpec(
             prompt="",
             role=deps.worker_role,
+            input_path=str(_worker_input_path(deps.run_root, clue_id, clue["retry"])),
             prompt_file=str(_prompt_path(deps.run_root, clue_id)),
             structured=True,
             write=False,
@@ -398,11 +428,18 @@ def _collect_node(deps: ResearchDeps):
         # run 结果落盘（harvest 据此提取新线索，resume 后也能重读）。
         write_json_durable(_result_path(deps.run_root, clue_id), status.result or {})
 
+        # 消费契约 research-worker.result.v1：verdict ∈ {found, not_found} 才算
+        # 调查完成；verdict=blocked（工具面不可用）与信封解析失败一样走 clue
+        # 失败路径（retry/block），绝不 fault 整图。
         declared: dict[str, Any] | None = None
         if status.ok and status.result is not None:
             try:
                 parsed = parse_envelope(status.result)
-                if isinstance(parsed, dict) and isinstance(parsed.get("findings"), list):
+                if (
+                    isinstance(parsed, dict)
+                    and parsed.get("verdict") in WORKER_VERDICTS_DONE
+                    and isinstance(parsed.get("findings"), list)
+                ):
                     declared = parsed
             except Exception:
                 # 信封解析失败按 clue 失败处理（retry/block），绝不 fault 整图。
@@ -410,7 +447,7 @@ def _collect_node(deps: ResearchDeps):
 
         if declared is not None:
             for finding in declared["findings"]:
-                _append_evidence(deps.run_root, clue_id, clue["depth"], str(finding), deps.now())
+                _append_evidence(deps.run_root, clue_id, clue["depth"], finding, deps.now())
             new_clues = _set_clue(clues, clue_id, status=CLUE_DONE)
         else:
             retry = clue["retry"] + 1
@@ -443,8 +480,11 @@ def _harvest_node(deps: ResearchDeps):
                 # collect 已判定 done 说明信封本可解析；这里解不出就按无子线索继续，
                 # 绝不 fault 整图（与 collect 的降级同义，保续跑健壮性）。
                 structured = {}
-            new_clues = structured.get("new_clues", []) if isinstance(structured, dict) else []
-            for text in new_clues:
+            # 契约字段是 proposed_clues[{text, rationale}]（research-worker.result.v1），
+            # 不是旧设想的 new_clues 字符串数组。
+            proposed = structured.get("proposed_clues", []) if isinstance(structured, dict) else []
+            for item in proposed:
+                text = item.get("text") if isinstance(item, dict) else None
                 if not isinstance(text, str) or not text.strip():
                     continue
                 child_id = derive_clue_id(text.strip())
@@ -513,11 +553,21 @@ def _synthesis_node(deps: ResearchDeps):
         corpus_path = deps.run_root / "synthesis-prompt.md"
         corpus_path.parent.mkdir(parents=True, exist_ok=True)
         corpus_path.write_text("\n".join(corpus), encoding="utf-8")
+        # research-synth.input.v1：--input 只携带题面 manifest（question + done
+        # clue 清单）；语料本体照旧经 --prompt-file 投递。
+        write_json_durable(
+            _synthesis_input_path(deps.run_root),
+            {
+                "question": question,
+                "clue_ids": [c["id"] for c in state.get("clues", []) if c["status"] == CLUE_DONE],
+            },
+        )
 
         run_id = synthesis_run_id(deps.thread_id)
         spec = AgentRunSpec(
             prompt="",
             role=deps.synthesis_role,
+            input_path=str(_synthesis_input_path(deps.run_root)),
             prompt_file=str(corpus_path),
             structured=True,
             write=False,
@@ -539,11 +589,15 @@ def _synthesis_node(deps: ResearchDeps):
             }
         try:
             declared = parse_envelope(status.result)
-            report = declared.get("report") if isinstance(declared, dict) else None
+            # 契约字段是 report_markdown（research-synth.result.v1），不是旧设想的 report。
+            report = declared.get("report_markdown") if isinstance(declared, dict) else None
         except Exception as exc:
             return {"terminal": TERMINAL_FAULT, "terminal_reason": f"synthesis 信封不可解析：{exc}"}
-        if not isinstance(report, str):
-            return {"terminal": TERMINAL_FAULT, "terminal_reason": "synthesis 未返回 report 正文"}
+        if not isinstance(report, str) or not report:
+            return {
+                "terminal": TERMINAL_FAULT,
+                "terminal_reason": "synthesis 未返回 report_markdown 正文",
+            }
 
         (deps.run_root / REPORT_FILE).write_text(report, encoding="utf-8")
         _observe(deps, {"event": "synthesis", "run_id": run_id})
@@ -620,6 +674,7 @@ __all__ = [
     "TERMINAL_FAULT",
     "TERMINAL_PARTIAL",
     "WORKER_ROLE",
+    "WORKER_VERDICTS_DONE",
     "ResearchBounds",
     "ResearchDeps",
     "ResearchState",
