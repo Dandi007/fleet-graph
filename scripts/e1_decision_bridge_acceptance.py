@@ -56,10 +56,17 @@ def free_port() -> int:
 
 
 class FakeBusState:
-    """The board: only ever read by the bridge via GET /v1/channels/.../messages."""
+    """The board: read by the bridge via messages and the reverse-refs endpoint.
+
+    The real bus does not inline refs on served messages; a decision's question
+    is discovered through ``GET /v1/entities/<question>/refs``. The fake mirrors
+    that: ``accept_decision`` records the message, and the decision's reference
+    to the question is served from a reverse index.
+    """
 
     def __init__(self) -> None:
         self.messages: list[dict] = []
+        self.refs: dict[str, list[str]] = {}
         self.lock = threading.Lock()
         self.accepted_monotonic: float | None = None
         self.poll_count = 0
@@ -72,10 +79,17 @@ class FakeBusState:
                     "channel_seq": DECISION_SEQ,
                     "kind": DECISION_KIND,
                     "payload": {"decision": "APPROVE", "card_entity_id": CARD_ID},
-                    "refs": [{"target_entity": QUESTION_ID}],
                 }
             )
+            self.refs[QUESTION_ID] = [DECISION_MESSAGE_ID]
             self.accepted_monotonic = time.monotonic()
+
+    def refs_to(self, entity_id: str) -> list[dict]:
+        with self.lock:
+            return [
+                {"message_id": mid, "target_entity": entity_id}
+                for mid in self.refs.get(entity_id, [])
+            ]
 
     def messages_after(self, after_seq: int, limit: int) -> tuple[list[dict], int]:
         with self.lock:
@@ -97,6 +111,12 @@ class FakeBusHandler(BaseHTTPRequestHandler):
             limit = int((query.get("limit") or ["100"])[0])
             messages, head = self.server.bus_state.messages_after(after_seq, limit)  # type: ignore[attr-defined]
             self._json({"messages": messages, "head_seq": head})
+            return
+        prefix = "/v1/entities/"
+        suffix = "/refs"
+        if parsed.path.startswith(prefix) and parsed.path.endswith(suffix):
+            entity_id = parsed.path[len(prefix) : -len(suffix)]
+            self._json({"refs": self.server.bus_state.refs_to(entity_id)})  # type: ignore[attr-defined]
             return
         self._json({"messages": [], "head_seq": 0})
 
@@ -124,6 +144,9 @@ class FakeOwnerState:
     def discover(self, question_note_id: str) -> list[dict]:
         if question_note_id != QUESTION_ID:
             return []
+        return self.discover_all()
+
+    def discover_all(self) -> list[dict]:
         return [
             {
                 "kind": "dd",
@@ -173,8 +196,14 @@ class FakeOwnerHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path != "/owners":
+            self._json({"owners": []}, code=404)
+            return
         query = parse_qs(parsed.query)
-        owners = self.server.owner_state.discover((query.get("question_note_id") or [""])[0])  # type: ignore[attr-defined]
+        if "question_note_id" in query:
+            owners = self.server.owner_state.discover((query.get("question_note_id") or [""])[0])  # type: ignore[attr-defined]
+        else:
+            owners = self.server.owner_state.discover_all()  # type: ignore[attr-defined]
         self._json({"owners": owners})
 
     def do_POST(self) -> None:
