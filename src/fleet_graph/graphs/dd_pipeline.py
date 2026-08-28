@@ -49,6 +49,7 @@ from typing import Any, Protocol, TypedDict
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
+from fleet_graph.cost_obs.classify import MANAGEMENT
 from fleet_graph.dd.capability import CapabilityError, CapabilityLock
 from fleet_graph.dd.lifecycle import (
     AmbiguousSpine,
@@ -262,6 +263,13 @@ class PipelineDeps:
     # order's settlement (on completion) and its explicit absence accounting
     # (on a non-complete terminal). None means no collection.
     cost_plane: Any = None
+    # The management execution cost of one order, as a callable
+    # ``(order_id) -> float``. The walker emits this under the `management`
+    # attribution on every terminal, so recording rule
+    # `cost_obs:management_execution:ratio` has a real numerator rather than
+    # staying silent. None means manager spend is not measured and defaults to
+    # 0.0 -- a bounded zero, still distinguishable from an absent fact.
+    management_cost: Any = None
     # Stamped once per attempt, never per step. The sealer puts this in the
     # commit it writes, so a retry that re-stamped would produce a different
     # commit for the same work -- and the forward chain would stop matching.
@@ -313,19 +321,40 @@ def _act_or_wait(actor: Actor, stage: Stage, dispatch: Dispatch) -> StageOutcome
     )
 
 
-def _terminal(
-    state_kind: str, reason: str, *, fault: bool = False, code: str = ""
-) -> PipelineState:
-    return {
-        "terminal": state_kind,
-        "terminal_reason": reason,
-        "terminal_code": code,
-        "fault": fault,
-    }
-
-
 def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
     lifecycle = deps.lifecycle
+
+    def _terminal(
+        state: PipelineState, state_kind: str, reason: str, *, fault: bool = False, code: str = ""
+    ) -> PipelineState:
+        """Produce a terminal state, accounting cost-observability on the way out.
+
+        Two data-plane duties belong to the walker because only it knows the
+        order is ending:
+
+        - On any non-complete terminal the lifecycles that never produced a
+          fact are accounted *absent* (a bounded 0) instead of silently absent
+          -- the `missing` half of the unknown/missing distinction, for the
+          `failed`, `bounds` and `fault` exits as well as `refused`.
+        - Every managed order emits its management execution cost under the
+          `management` attribution, so rule 1 has a real numerator.
+        """
+        order_id = str(state.get("development_id") or "")
+        if deps.cost_plane is not None and order_id:
+            if state_kind != TERMINAL_COMPLETE:
+                deps.cost_plane.mark_absent_if_missing(order_id=order_id)
+            management = deps.management_cost(order_id) if deps.management_cost is not None else 0.0
+            deps.cost_plane.record_execution_cost(
+                attribution=MANAGEMENT,
+                tokens=float(management),
+                event_id=f"management:{order_id}",
+            )
+        return {
+            "terminal": state_kind,
+            "terminal_reason": reason,
+            "terminal_code": code,
+            "fault": fault,
+        }
 
     def _dispatch_for(state: PipelineState, stage: Stage) -> Dispatch:
         return {
@@ -374,13 +403,13 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
 
         The order launched but never completed, so the lifecycles that never
         produced a fact are accounted absent -- a bounded 0, distinguishable
-        from `unknown` attribution -- rather than silently absent.
+        from `unknown` attribution -- rather than silently absent. That
+        accounting and the management execution cost are applied centrally by
+        `_terminal`, exactly as for the other non-complete terminals.
         """
         code = getattr(refused, "code", "")
-        if deps.cost_plane is not None and state.get("development_id"):
-            deps.cost_plane.mark_absent_if_missing(order_id=str(state.get("development_id")))
         return {
-            **_terminal(TERMINAL_REFUSED, str(refused), code=code),
+            **_terminal(state, TERMINAL_REFUSED, str(refused), code=code),
             "steps": steps,
             "history": _record(
                 state,
@@ -397,11 +426,12 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         stage_id = state.get("stage", "")
         stage = lifecycle.stages.get(stage_id)
         if stage is None:
-            return _terminal(TERMINAL_FAULT, f"unknown stage {stage_id!r}", fault=True)
+            return _terminal(state, TERMINAL_FAULT, f"unknown stage {stage_id!r}", fault=True)
 
         steps = state.get("steps", 0) + 1
         if steps > deps.bounds.max_steps:
             return _terminal(
+                state,
                 TERMINAL_BOUNDS,
                 f"step limit {deps.bounds.max_steps} reached",
                 code=STEP_LIMIT_REACHED,
@@ -450,6 +480,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                 # Skipping a step we do not implement would report success for
                 # work that was never wrapped. Fault instead.
                 return _terminal(
+                    state,
                     TERMINAL_FAULT,
                     f"contract declares wrapper step {step!r} which this runner does not implement",
                     fault=True,
@@ -459,6 +490,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                 missing = [k for k in stage.required_artifacts if k not in artifacts]
                 if missing:
                     return _terminal(
+                        state,
                         TERMINAL_FAULT,
                         f"{stage.id} requires {sorted(missing)} which no stage has produced",
                         fault=True,
@@ -472,13 +504,13 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     try:
                         deps.capability.require()
                     except CapabilityError as exc:
-                        return _terminal(TERMINAL_FAULT, str(exc), fault=True)
+                        return _terminal(state, TERMINAL_FAULT, str(exc), fault=True)
                 try:
                     outcome = _act_or_wait(deps.actor_for(stage), stage, dispatch)
                 except StageRefused as refused:
                     return _refused(state, stage.id, step, refused, steps)
                 except PipelineFault as fault:
-                    return _terminal(TERMINAL_FAULT, str(fault), fault=True)
+                    return _terminal(state, TERMINAL_FAULT, str(fault), fault=True)
 
             elif step == STEP_MATERIALIZE:
                 assert outcome is not None  # actor precedes materialize in the contract
@@ -487,6 +519,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     continue
                 if deps.materializer is None:
                     return _terminal(
+                        state,
                         TERMINAL_FAULT,
                         f"{stage.id} declares a materialize step but no materializer is wired",
                         fault=True,
@@ -512,7 +545,10 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     return _refused(state, stage.id, step, refused, steps)
                 except Exception as exc:  # reported as a fault, never swallowed
                     return _terminal(
-                        TERMINAL_FAULT, f"materialize failed on {stage.id}: {exc}", fault=True
+                        state,
+                        TERMINAL_FAULT,
+                        f"materialize failed on {stage.id}: {exc}",
+                        fault=True,
                     )
                 for kind in outcome.produced:
                     artifacts[kind] = head_commit
@@ -524,6 +560,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                 missing = [k for k in stage.produced_artifacts if k not in outcome.produced]
                 if missing:
                     return _terminal(
+                        state,
                         TERMINAL_FAULT,
                         f"{stage.id} reported {outcome.event!r} "
                         f"without producing {sorted(missing)}",
@@ -569,7 +606,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         if lifecycle.is_terminal(stage_id):
             if deps.cost_plane is not None and state.get("development_id"):
                 deps.cost_plane.record_settlement(order_id=str(state.get("development_id")))
-            return _terminal(TERMINAL_COMPLETE, f"{stage_id} is the last declared stage")
+            return _terminal(state, TERMINAL_COMPLETE, f"{stage_id} is the last declared stage")
 
         exit_ = lifecycle.failure_transition(stage_id, event)
         if exit_ is not None:
@@ -582,7 +619,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             if used:
                 reason += f" after {used} bounded retries"
             return {
-                **_terminal(TERMINAL_FAILED, reason, code=failure_code),
+                **_terminal(state, TERMINAL_FAILED, reason, code=failure_code),
                 "retries": retries,
             }
 
@@ -599,13 +636,13 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                 # event would route around the receipt and both bindings, and
                 # a review that answered "success" instead of APPROVE would
                 # sail past the verdict machinery entirely.
-                return _terminal(TERMINAL_FAULT, str(exc), fault=True)
+                return _terminal(state, TERMINAL_FAULT, str(exc), fault=True)
             try:
                 successor = lifecycle.spine.get(stage_id)
             except AmbiguousSpine as ambiguous:
-                return _terminal(TERMINAL_FAULT, str(ambiguous), fault=True)
+                return _terminal(state, TERMINAL_FAULT, str(ambiguous), fault=True)
             if successor is None:
-                return _terminal(TERMINAL_FAULT, str(exc), fault=True)
+                return _terminal(state, TERMINAL_FAULT, str(exc), fault=True)
             return {"stage": successor, "mode": state.get("mode", MODE_INITIAL)}
 
         if not transition.is_rework:
@@ -620,6 +657,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         rework = state.get("rework_count", 0) + 1
         if rework > deps.bounds.max_rework:
             return _terminal(
+                state,
                 TERMINAL_BOUNDS,
                 f"rework limit {deps.bounds.max_rework} reached at {stage_id}",
                 code=REWORK_LIMIT_REACHED,

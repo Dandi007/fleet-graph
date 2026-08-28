@@ -29,6 +29,10 @@ produced, tested, and reconciled without a live systemd unit or a model round.
 
 from __future__ import annotations
 
+import os
+import tempfile
+from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -69,12 +73,20 @@ class CostDataPlane:
     """Emits labelled source facts and reconciles launch -> settlement.
 
     `exposition_dir`, when given, is where `write_exposition()` drops the
-    `cost-obs.prom` textfile the scrape layer reads. The in-memory sample set
-    is always authoritative; the file is a rendering of it.
+    textfile the scrape layer reads. The filename is per data plane: a
+    development that shares an exposition directory with others must render
+    into its own file (`exposition_filename`), so one run's facts never
+    overwrite another's and node_exporter re-exposes every `*.prom` file. The
+    in-memory sample set is always authoritative; the file is a rendering of it.
     """
 
-    def __init__(self, exposition_dir: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        exposition_dir: str | Path | None = None,
+        exposition_filename: str = "cost-obs.prom",
+    ) -> None:
         self.exposition_dir = Path(exposition_dir) if exposition_dir else None
+        self.exposition_filename = exposition_filename
         self._seen: set[str] = set()
         self._samples: dict[str, Sample] = {}
         # order_id -> set of lifecycle classes that produced at least one fact
@@ -117,15 +129,21 @@ class CostDataPlane:
         self._fact_lifecycles.setdefault(order_id, set()).add(LAUNCH)
         return emitted
 
-    def record_review(self, *, order_id: str, phase: str, verdict: str) -> bool:
-        """Emit a review fact for the `continuous` or `final` phase."""
+    def record_review(self, *, order_id: str, phase: str, verdict: str, attempt: int = 1) -> bool:
+        """Emit a review fact for the `continuous` or `final` phase.
+
+        The `attempt` dimension keeps distinct reviews of the same phase
+        distinct: a continuous review that REJECTs and then a reworked attempt
+        that approves are two facts, not one frozen verdict. A replayed review
+        of the *same* attempt is still a no-op, so retries never double-count.
+        """
         if phase not in {"continuous", "final"}:
             raise ValueError(f"review phase must be continuous or final, got {phase!r}")
         emitted = self._emit(
             REVIEW_METRIC,
             {"order_id": order_id, "phase": phase, "verdict": verdict},
             1.0,
-            key=f"review:{order_id}:{phase}",
+            key=f"review:{order_id}:{phase}:{attempt}",
         )
         self._fact_lifecycles.setdefault(order_id, set()).add(REVIEW)
         return emitted
@@ -204,8 +222,14 @@ class CostDataPlane:
         or was flagged absent, each lifecycle is `1` when a fact exists, else
         `0` when explicitly absent -- a bounded zero-compatible series that is
         distinguishable from `unknown` attribution.
+
+        Before returning, facts sharing a metric name and label set are
+        merged by summing their values. The cost metric is a counter bucketed
+        only by `attribution`, so two batches with the same attribution (e.g.
+        two orders' management spend) are one series, not a duplicate that a
+        scrape would reject.
         """
-        result = list(self._samples.values())
+        result = self._dedup_sum(self._samples.values())
         orders = set(self._fact_lifecycles) | set(self._absent)
         for order_id in sorted(orders):
             facts = self._fact_lifecycles.get(order_id, set())
@@ -229,6 +253,22 @@ class CostDataPlane:
                 )
         return result
 
+    @staticmethod
+    def _dedup_sum(samples: Iterable[Sample]) -> list[Sample]:
+        """Merge samples with an identical name + label set by summing values."""
+        merged: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
+        order: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        for sample in samples:
+            key = (sample.name, sample.labels)
+            if key not in merged:
+                merged[key] = 0.0
+                order.append(key)
+            merged[key] += sample.value
+        result: list[Sample] = []
+        for name, labels in order:
+            result.append(Sample(name=name, labels=labels, value=merged[(name, labels)]))
+        return result
+
     def query_rule(self, rule: RecordingRule) -> list[Sample]:
         """Evaluate one recording rule against the emitted facts."""
         return query(rule.expr, self.samples())
@@ -237,13 +277,19 @@ class CostDataPlane:
         """Evaluate all five recording rules, keyed by rule name."""
         return {rule.name: self.query_rule(rule) for rule in RECORDING_RULES}
 
-    def write_exposition(self, filename: str = "cost-obs.prom") -> Path:
-        """Render the data plane to the scrape file and return its path."""
+    def write_exposition(self, filename: str | None = None) -> Path:
+        """Render the data plane to its scrape file and return its path.
+
+        The target is `filename` when given, else this plane's own
+        `exposition_filename`. The write is atomic (render to a temp file, then
+        rename into place), so a concurrent node_exporter scrape can never read
+        a half-written textfile and drop it wholesale.
+        """
         if self.exposition_dir is None:
             raise ValueError("no exposition_dir set; nothing to write to")
         self.exposition_dir.mkdir(parents=True, exist_ok=True)
-        path = self.exposition_dir / filename
-        path.write_text(render(self.samples()), encoding="utf-8")
+        path = self.exposition_dir / (filename or self.exposition_filename)
+        _atomic_write_text(path, render(self.samples()))
         return path
 
     def reconcile(self) -> ReconcileReport:
@@ -280,6 +326,26 @@ class CostDataPlane:
                 continue
             counts[order_id] = counts.get(order_id, 0) + 1
         return counts
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `path` atomically: a temp file in the same directory, then rename.
+
+    node_exporter's textfile collector re-reads `*.prom` on every scrape; a
+    plain `write_text` can expose a truncated file mid-write and silently drop
+    every sample in it. Writing to a uniquely named sibling and `os.replace`ing
+    it over `path` makes the scrape see either the previous bytes or the new
+    bytes, never a partial render.
+    """
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 __all__ = [

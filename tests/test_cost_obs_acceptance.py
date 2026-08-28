@@ -16,7 +16,11 @@ from pathlib import Path
 
 import pytest
 
-from fleet_graph.cost_obs.acceptance import run_acceptance_scenario
+from fleet_graph.cost_obs.acceptance import (
+    EXPECTED_MANAGEMENT,
+    EXPECTED_TOTAL,
+    run_acceptance_scenario,
+)
 
 REPO_ROOT = Path(__file__).parent.parent
 FIXTURE = REPO_ROOT / "scripts" / "cost_obs_acceptance.py"
@@ -42,4 +46,4 @@ def test_fixture_scenario_satisfies_the_acceptance_criteria(tmp_path: Path) -> N
     assert results["exact_once"] is True
     assert results["replay_noop"] == (True, True)
     assert results["rerun_reconciliation"] == [1.0]
-    assert results["management_ratio"][0] == pytest.approx(10.0 / 77.0)
+    assert results["management_ratio"][0] == pytest.approx(EXPECTED_MANAGEMENT / EXPECTED_TOTAL)

@@ -188,6 +188,22 @@ class TestDataPlane:
         with pytest.raises(ValueError):
             plane.record_review(order_id="o", phase="typo", verdict="approve")
 
+    def test_a_reworked_review_is_a_new_fact_not_a_frozen_verdict(self) -> None:
+        plane = CostDataPlane()
+        assert plane.record_review(order_id="o", phase="continuous", verdict="reject", attempt=1)
+        assert plane.record_review(order_id="o", phase="continuous", verdict="approve", attempt=2)
+        # Replaying attempt 2 is still idempotent -- a retried run never double-counts.
+        assert (
+            plane.record_review(order_id="o", phase="continuous", verdict="approve", attempt=2)
+            is False
+        )
+
+        reviews = [s for s in plane.samples() if s.name == "cost_obs_review_total"]
+        assert {(s.label_map()["phase"], s.label_map()["verdict"]) for s in reviews} == {
+            ("continuous", "reject"),
+            ("continuous", "approve"),
+        }
+
     def test_exposition_writes_and_reads_back(self, tmp_path: Path) -> None:
         plane = CostDataPlane(exposition_dir=tmp_path)
         plane.record_launch(order_id="o", development_id="d")

@@ -92,10 +92,15 @@ class DevelopmentConfig:
     run_config: dict[str, Any] = field(default_factory=dict)
     acceptance_timeout_seconds: int = 1800
     # The node_exporter textfile directory the cost-observability data plane
-    # renders its `cost-obs.prom` into, so the recording rules the
-    # `deploy/prometheus` scrape config declares have source facts to read.
-    # Empty means "not wired" -- the dispatch runs, it just does not collect.
+    # renders its per-development `cost-obs-<development>.prom` into, so the
+    # recording rules the `deploy/prometheus` scrape config declares have
+    # source facts to read. Empty means "not wired" -- the dispatch runs, it
+    # just does not collect.
     cost_obs_dir: str = ""
+    # The management execution cost of one order, `(order_id) -> float`, the
+    # walker emits under the `management` attribution. None means manager spend
+    # is not measured and it is rendered as a bounded zero.
+    management_cost: Any = None
     # Pushing to a durable ref is the one step here that cannot be undone.
     publish_merge: bool = False
 
@@ -151,7 +156,7 @@ def build_pipeline(
     # and scripts that own each lifecycle; constructing it once here means
     # launch, review, promotion and settlement all land in the same exposition
     # file the scrape config reads.
-    cost_plane = build_cost_plane(config.cost_obs_dir or None)
+    cost_plane = build_cost_plane(config.cost_obs_dir or None, development_id=config.development_id)
 
     dispatcher = AgentRunStageActor(
         launcher=launcher or AgentRunLauncher(state_root=str(config.run_root / "agent-runs")),
@@ -257,6 +262,7 @@ def build_pipeline(
         # The settlement fact and the absent-lifecycle accounting the walker
         # owns; launch/review/promotion are emitted by their actors.
         cost_plane=cost_plane,
+        management_cost=config.management_cost,
         bounds=PipelineBounds(
             max_steps=config.max_steps,
             max_rework=config.max_rework,

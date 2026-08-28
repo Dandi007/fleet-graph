@@ -6,14 +6,12 @@ stages -- with only the external collaborators (the agent-run binary, the
 plugin sealer and the work board) substituted for deterministic stand-ins.
 Whatever the walker and actors emit for the launch, review, promotion and
 settlement lifecycles is therefore real, not hand-minted: the facts come out of
-the same code that runs a production development.
-
-The only facts emitted directly rather than by a DD component are the token
-*spend* records (``record_execution_cost`` / ``record_unknown_cost``): those
-belong to token accounting, which has no lifecycle component in this
-repository, so the scenario emits them as that producer. The lifecycle facts
-the recording rules number two through five depend on are produced by the DD
-machinery end to end.
+the same code that runs a production development. The same is true of the
+*execution cost* facts: the dispatch actor reads each run's reported token
+usage and attributes it to its lifecycle class (``launch``/``review``), and
+attributes a failed run's spend to ``unknown``; the walker emits each order's
+``management`` execution cost. This fixture does not mint any cost fact itself
+-- it only drives the production producers.
 
 Keeping this importable means the executable (``scripts/cost_obs_acceptance.py``)
 and the pytest acceptance test assert the exact same facts instead of two
@@ -32,7 +30,12 @@ from fleet_graph.cost_obs.exposition import parse
 from fleet_graph.cost_obs.rules import COST_METRIC, PRESENCE_METRIC
 from fleet_graph.dd.lifecycle import Lifecycle
 from fleet_graph.executors.agent_run import RunStatus, RunTicket
-from fleet_graph.graphs.dd_actors import AgentRunStageActor, BoardGate, review_stages
+from fleet_graph.graphs.dd_actors import (
+    AgentRunStageActor,
+    BoardGate,
+    implement_stage,
+    review_stages,
+)
 from fleet_graph.graphs.dd_pipeline import (
     FAILURE_EVENT,
     SPINE_EVENT,
@@ -50,12 +53,25 @@ LAUNCH_ORDER = "dev-fg-cost-obs-complete"
 #: The open order: a development launched but whose later lifecycles never
 #: produced (the gate rejects it), so its absence is accounted explicitly.
 ORPHAN_ORDER = "dev-fg-cost-obs-orphan"
+#: The unattributed order: a run that failed after spending tokens, so nothing
+#: attributes its spend to a lifecycle -- the explicit `unknown` bucket.
+UNKNOWN_ORDER = "dev-fg-cost-obs-unattributed"
 
 SPEC_COMMIT = "0" * 40
 
-#: The total token spend the scenario emits: 10+20+30+5+5 known plus 7 unknown.
-EXPECTED_TOTAL = 77.0
-EXPECTED_MANAGEMENT = 10.0
+#: Token usage the recording launcher reports per run, so the production actor
+#: emits the launch and review execution-cost facts itself (not the fixture).
+IMPLEMENT_TOKENS = 20.0
+REVIEW_TOKENS = 15.0
+#: Management execution cost per managed order, emitted by the walker.
+MANAGEMENT_TOKENS = 10.0
+#: Tokens spent by the run nothing attributes -- the `unknown` bucket.
+UNKNOWN_TOKENS = 7.0
+
+#: Total token spend across the whole scenario: 2 launches + 4 reviews + 2
+#: managed orders + one unattributed (failed) spend.
+EXPECTED_TOTAL = IMPLEMENT_TOKENS * 2 + REVIEW_TOKENS * 4 + MANAGEMENT_TOKENS * 2 + UNKNOWN_TOKENS
+EXPECTED_MANAGEMENT = MANAGEMENT_TOKENS * 2
 
 
 def _producer(lifecycle: Lifecycle, artifact: str) -> str:
@@ -83,6 +99,7 @@ class _RecordingLauncher:
         stage = self._stage_by_run[ticket.run_id]
         if stage in self._review_ids:
             declared: dict[str, Any] = {"verdict": "APPROVE", "findings": []}
+            tokens: float = REVIEW_TOKENS
         else:
             declared = {
                 "actor_job_id": "job-1",
@@ -91,7 +108,13 @@ class _RecordingLauncher:
                 "work_head_commit": "1" * 40,
                 "verification_record": {"verification_commands": []},
             }
-        return RunStatus("succeeded", {"structured_result": declared})
+            tokens = IMPLEMENT_TOKENS
+        # The run reports its token usage, so the production actor emits the
+        # execution-cost fact rather than this stand-in minting one.
+        return RunStatus(
+            "succeeded",
+            {"structured_result": declared, "usage": {"total_tokens": tokens}},
+        )
 
 
 class _DecidedBoard:
@@ -173,6 +196,7 @@ def _run_development(
         scripts=scripts,
         materializer=_Sealer(),
         cost_plane=plane,
+        management_cost=lambda _order_id: MANAGEMENT_TOKENS,
     )
     graph = build_dd_pipeline_graph(deps).compile()
     state = graph.invoke(
@@ -185,6 +209,46 @@ def _run_development(
         config={"recursion_limit": 200},
     )
     return state
+
+
+def _emit_unknown_spend(plane: CostDataPlane, lifecycle: Lifecycle, run_root: Path) -> None:
+    """Drive one run that fails after spending tokens, through the production actor.
+
+    The run spent tokens but never completed a lifecycle, so nothing can
+    attribute the spend to a class -- it is the explicit `unknown` bucket. The
+    dispatcher (``AgentRunStageActor``) emits it through its failure path, so
+    this is a production producer being exercised, not a fact the fixture mints.
+    """
+    stage = lifecycle.stages[implement_stage(lifecycle) or "implement"]
+
+    class _FailingLauncher:
+        def launch(self, spec: Any, run_id: str) -> RunTicket:
+            return RunTicket(run_id, f"/tmp/{run_id}", None)
+
+        def wait(self, ticket: RunTicket, **kwargs: Any) -> RunStatus:
+            return RunStatus("failed", {"usage": {"total_tokens": UNKNOWN_TOKENS}, "exit_code": 1})
+
+    actor = AgentRunStageActor(
+        launcher=_FailingLauncher(),  # type: ignore[arg-type]
+        development_id=UNKNOWN_ORDER,
+        run_root=run_root,
+        cost_plane=plane,
+    )
+    outcome = actor.act(
+        stage,
+        {
+            "development_id": UNKNOWN_ORDER,
+            "stage": stage.id,
+            "mode": "initial",
+            "generation": 1,
+            "attempt": 1,
+            "input_commit": SPEC_COMMIT,
+            "required_artifacts": ["spec"],
+            "produced_artifacts": list(stage.produced_artifacts),
+            "contract_version": lifecycle.contract_version,
+        },
+    )
+    assert outcome.event == FAILURE_EVENT, outcome
 
 
 def run_acceptance_scenario(exposition_dir: Path) -> dict[str, object]:
@@ -205,18 +269,11 @@ def run_acceptance_scenario(exposition_dir: Path) -> dict[str, object]:
         orphan = _run_development(
             plane, lifecycle, ORPHAN_ORDER, approve=False, repo=repo, run_root=run_root
         )
+        # One spend nothing attributes: a run that failed after burning tokens.
+        # Emitted by the production actor's failure path, not minted here.
+        _emit_unknown_spend(plane, lifecycle, run_root)
     assert settled.get("terminal") == "complete", settled
     assert orphan.get("terminal") == "refused", orphan
-
-    # Token spend: the token-accounting producer. These are the execution-cost
-    # facts the management ratio divides and the unknown bucket records; they
-    # have no DD lifecycle component and are emitted here as that producer.
-    plane.record_execution_cost(attribution="management", tokens=10, event_id="run-1")
-    plane.record_execution_cost(attribution="launch", tokens=20, event_id="run-1")
-    plane.record_execution_cost(attribution="review", tokens=30, event_id="run-1")
-    plane.record_execution_cost(attribution="promotion", tokens=5, event_id="run-1")
-    plane.record_execution_cost(attribution="settlement", tokens=5, event_id="run-1")
-    plane.record_unknown_cost(tokens=7, event_id="run-1")
 
     # Scrape wiring: render to a file, then read it back and query the bytes.
     exposition_path = plane.write_exposition()
