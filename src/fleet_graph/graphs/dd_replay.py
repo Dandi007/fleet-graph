@@ -56,6 +56,7 @@ from fleet_graph.dd.upstream_constants import compute_json_digest
 from fleet_graph.dd.vendor import plugin_adapter
 from fleet_graph.graphs.dd_actors import implement_stage, review_stages
 from fleet_graph.graphs.dd_pipeline import MODE_INITIAL, SPINE_EVENT, Dispatch, Replayed
+from fleet_graph.graphs.dd_scripts import RUN_CONFIG_PATH, write_json
 
 # The sealed receipt file per plugin-sealed stage, under
 # `<state_root>/receipts/<attempt_id>/`. The same table
@@ -103,6 +104,24 @@ def byte_digest(raw: bytes) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
+def _declared_acceptance_context(config: dict[str, Any]) -> dict[str, Any]:
+    """The acceptance-context fields the tamper check actually compares.
+
+    Mirrors ``AcceptanceStage.commands``: empty command lists are dropped, and
+    absent keys mean empty declarations -- a pre-R1-c run-config is not a
+    mismatch by itself.
+    """
+    return {
+        "acceptance_commands": [
+            list(command) for command in (config.get("acceptance_commands") or []) if command
+        ],
+        "setup_commands": [
+            list(command) for command in (config.get("setup_commands") or []) if command
+        ],
+        "acceptance_env": dict(config.get("acceptance_env") or {}),
+    }
+
+
 @dataclass
 class ReceiptReplayer:
     """Replays the receipt-sealed prefix of a previous generation.
@@ -125,6 +144,14 @@ class ReceiptReplayer:
     generation: int
     remote_url: str = ""
     remote_ref: str = ""
+    #: The current generation's declared acceptance context (acceptance
+    #: commands, setup commands, environment). The replayed configure commit
+    #: carries the *previous* generation's run-config; when the operator
+    #: reconfigured the context, this is the authoritative value that configure
+    #: would have written, and the replayer re-produces it so the acceptance
+    #: stage's tamper check sees agreement rather than a stale mismatch. None
+    #: means "leave the replayed tree alone" (the pre-reconfigure behaviour).
+    run_config: dict[str, Any] | None = None
     lifecycle: Lifecycle = field(default_factory=Lifecycle.load)
 
     def __post_init__(self) -> None:
@@ -453,7 +480,48 @@ class ReceiptReplayer:
             target = self.state_root / "receipts" / attempt_id
             target.mkdir(parents=True, exist_ok=True)
             (target / filename).write_bytes(step.raw)
+        if self.run_config is not None:
+            self._rewrite_run_config(plan[0].output_commit)
         return True
+
+    def _rewrite_run_config(self, configure_commit: str) -> None:
+        """Re-produce configure's output for this generation's own declaration.
+
+        The replayed configure commit carries the *previous* generation's run
+        config. When the operator reconfigured the acceptance context, that
+        file is stale: the acceptance stage would refuse the run with
+        ACCEPTANCE_DECLARATION_MISMATCH even though the declaration is the
+        authoritative value. Rewriting the file to this generation's declared
+        context is exactly what a re-run configure would have written, so the
+        acceptance stage's tamper check reads agreement instead of a stale
+        mismatch. The rewrite stays in the working tree and is picked up and
+        committed by the acceptance stage's own sealer (``git add -A``), so
+        the final tree still carries the reconfigured run-config.
+        """
+        committed = self._committed_run_config(configure_commit)
+        if committed is not None and _declared_acceptance_context(
+            committed
+        ) == _declared_acceptance_context(self.run_config or {}):
+            return
+        write_json(
+            self.workspace,
+            RUN_CONFIG_PATH,
+            {
+                "development_id": self.development_id,
+                "generation": self.generation,
+                **(self.run_config or {}),
+            },
+        )
+
+    def _committed_run_config(self, commit: str) -> dict[str, Any] | None:
+        proc = run_git(self.workspace, "show", f"{commit}:{RUN_CONFIG_PATH}")
+        if proc.returncode != 0:
+            return None
+        try:
+            config = json.loads(proc.stdout)
+        except ValueError:
+            return None
+        return config if isinstance(config, dict) else None
 
     # --- git plumbing ------------------------------------------------------
 
