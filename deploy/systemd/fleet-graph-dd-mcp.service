@@ -39,6 +39,11 @@ EnvironmentFile=-%h/.config/fleet-graph/env
 # at `env: 'bun': No such file or directory` before the agent even starts
 # (observed live on dev-fg-4628ef887564, three runs "ended lost").
 Environment=PATH=%h/.bun/bin:%h/.local/bin:%h/.opencode/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
+# cost-observability is turned on from the site-config env file above:
+# FLEET_GRAPH_COST_OBS_DIR (the node_exporter textfile directory, see
+# deploy/prometheus/cost-observability.yml) and FLEET_GRAPH_MANAGEMENT_COST
+# are forwarded to every launched dd run by the control plane's whitelist, so
+# setting them in ~/.config/fleet-graph/env is what switches collection on --
+# nothing here hardcodes a path that belongs to the operator's host.
 [Install]
 WantedBy=default.target

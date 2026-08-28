@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any
 
 from fleet_graph.bus.board import Board, GateTicket, normalize_decision
+from fleet_graph.cost_obs import CostDataPlane
+from fleet_graph.cost_obs.classify import LAUNCH, REVIEW
 from fleet_graph.dd.dispatch import derive_attempt_id
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.executors.agent_run import (
@@ -99,6 +101,31 @@ PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
 INVALID_HANDOFF_SCHEMA = "INVALID_HANDOFF_SCHEMA"
 
 
+def _usage_tokens(envelope: dict[str, Any] | None) -> float:
+    """The token spend of one agent run, read from its result envelope.
+
+    agent-run's ``result.json`` carries a ``usage`` block; accept the single
+    ``total_tokens`` form and the ``prompt_tokens`` + ``completion_tokens``
+    split. Returns ``0.0`` when no usable spend is present, so a caller never
+    fabricates a token count the run never reported.
+    """
+    if not isinstance(envelope, dict):
+        return 0.0
+    usage = envelope.get("usage")
+    if isinstance(usage, dict):
+        total = usage.get("total_tokens")
+        if isinstance(total, (int, float)):
+            return float(total)
+        prompt = usage.get("prompt_tokens")
+        completion = usage.get("completion_tokens")
+        if isinstance(prompt, (int, float)) or isinstance(completion, (int, float)):
+            return float(prompt or 0) + float(completion or 0)
+    total = envelope.get("total_tokens")
+    if isinstance(total, (int, float)):
+        return float(total)
+    return 0.0
+
+
 def stage_role(stage: Stage, roles: dict[str, str]) -> str:
     return roles.get(stage.id) or DEFAULT_ROLES.get(stage.id) or f"dd_{stage.id}"
 
@@ -126,6 +153,12 @@ class AgentRunStageActor:
     default_timeout_seconds: int = 3600
     poll_interval: float = 2.0
     extra_labels: dict[str, str] = field(default_factory=dict)
+    # When wired, this actor is the responsible producer of the launch (the
+    # implement stage it dispatches) and review (the continuous/final review
+    # stages) lifecycle facts the cost-observability recording rules consume.
+    # None means the data plane is not collecting -- the DD dispatch still
+    # runs, it just does not emit the facts.
+    cost_plane: CostDataPlane | None = None
 
     def writes(self, stage: Stage) -> bool:
         """Only the stage the contract says produces product code.
@@ -230,6 +263,9 @@ class AgentRunStageActor:
             # is reported as retryable on purpose: the run id is derived, so
             # the retry re-adopts the run in flight rather than paying for a
             # second one. Reporting it as terminal would strand a live run.
+            # Any spend the run already made cannot be attributed to a
+            # lifecycle it never completed, so it lands in `unknown`.
+            self._record_unknown_spend(run_id, envelope=None)
             return StageOutcome(
                 event=FAILURE_EVENT,
                 failure_code=PROVIDER_UNAVAILABLE,
@@ -237,6 +273,7 @@ class AgentRunStageActor:
             )
 
         if status.result is None or not status.ok:
+            self._record_unknown_spend(run_id, envelope=status.result)
             return StageOutcome(
                 event=FAILURE_EVENT,
                 failure_code=PROVIDER_UNAVAILABLE,
@@ -248,14 +285,89 @@ class AgentRunStageActor:
         except CoordinatorFault as fault:
             # The run succeeded but answered in a shape we will not guess at.
             # Reading meaning out of stdout here is the INV-3 violation the
-            # whole layering exists to avoid.
+            # whole layering exists to avoid. Its spend is thereby unattributed.
+            self._record_unknown_spend(run_id, envelope=status.result)
             return StageOutcome(
                 event=FAILURE_EVENT,
                 failure_code=INVALID_HANDOFF_SCHEMA,
                 detail=str(fault),
             )
 
-        return self._outcome_from(stage, declared)
+        outcome = self._outcome_from(stage, declared)
+        self._record_cost_obs(stage, dispatch, outcome, envelope=status.result, run_id=run_id)
+        return outcome
+
+    def _record_cost_obs(
+        self,
+        stage: Stage,
+        dispatch: Dispatch,
+        outcome: StageOutcome,
+        *,
+        envelope: dict[str, Any] | None,
+        run_id: str,
+    ) -> None:
+        """Emit the lifecycle fact -- and execution cost -- this stage owns.
+
+        The walker reaches nothing outside its ports and places no opinion here;
+        this actor is the component that actually owns the launch and review
+        lifecycles, so this is where they are emitted. Idempotency is the data
+        plane's: a replayed launch or a second review of the same phase+attempt
+        is a no-op by stable identity key, so a retry or rework cannot
+        double-count.
+
+        The same run is also the production producer of the execution-cost
+        facts rule 1 and the `unknown` bucket consume: the token spend the run
+        reported is attributed to the lifecycle class the run served. This is
+        the real token-accounting source, not a fixture total.
+        """
+        if self.cost_plane is None:
+            return
+        order_id = self.development_id
+        tokens = _usage_tokens(envelope)
+        if stage.id == implement_stage(self.lifecycle):
+            self.cost_plane.record_launch(
+                order_id=order_id,
+                development_id=order_id,
+                generation=int(dispatch.get("generation", 1)),
+                seat=stage_role(stage, self.roles),
+                model=str(self.models.get(stage.id) or ""),
+            )
+            if tokens > 0:
+                self.cost_plane.record_execution_cost(
+                    attribution=LAUNCH, order_id=order_id, tokens=tokens, event_id=run_id
+                )
+            return
+        reviews = review_stages(self.lifecycle)
+        if stage.id in reviews and outcome.event not in (FAILURE_EVENT, SPINE_EVENT):
+            phase = "continuous" if stage.id == reviews[0] else "final"
+            self.cost_plane.record_review(
+                order_id=order_id,
+                phase=phase,
+                verdict=str(outcome.event).lower(),
+                attempt=int(dispatch.get("attempt", 1)),
+            )
+            if tokens > 0:
+                self.cost_plane.record_execution_cost(
+                    attribution=REVIEW, order_id=order_id, tokens=tokens, event_id=run_id
+                )
+
+    def _record_unknown_spend(self, run_id: str, *, envelope: dict[str, Any] | None) -> None:
+        """Account a run's spend as `unknown` when nothing attributes it.
+
+        A run that failed, timed out, or answered in a shape we will not guess
+        at still spent tokens on a lifecycle that never completed, so those
+        tokens genuinely lack a lifecycle attribution. They are kept observable
+        under `unknown` -- spec requirement 3 -- rather than dropped or
+        silently relabelled as a known class. Unmeasured spend is left absent,
+        never minted as a synthetic zero.
+        """
+        if self.cost_plane is None:
+            return
+        tokens = _usage_tokens(envelope)
+        if tokens > 0:
+            self.cost_plane.record_unknown_cost(
+                order_id=self.development_id, tokens=tokens, event_id=run_id
+            )
 
     def _outcome_from(self, stage: Stage, declared: dict[str, Any]) -> StageOutcome:
         """The declared result, passed on as it stands.
