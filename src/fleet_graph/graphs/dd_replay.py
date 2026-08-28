@@ -238,12 +238,20 @@ class ReceiptReplayer:
                 if inherited is not None and not chain_rules.new_attempt_is_legal(inherited):
                     # Replaying a prefix that stops at implement is always
                     # followed by a fresh continuous review -- a brand-new
-                    # attempt. When the inherited feedback chain did not end in
-                    # REJECT, the carrier refuses exactly that new attempt
-                    # (ORDER_VIOLATION), so replaying would only move the tree
-                    # and then fail. Fail-closed here instead: replay nothing,
-                    # so the divergent work is surfaced rather than silently
-                    # re-reviewed. (An unreadable index defers to the carrier.)
+                    # attempt. The replayer is deliberately conservative here:
+                    # it replays such a partial prefix only when the committed
+                    # index that fresh attempt would follow is empty or already
+                    # REJECT-terminated, i.e. the flat carrier rule
+                    # ``check_chain_order`` accepts it. An APPROVE-ended
+                    # inherited index is refused -- in particular a previous
+                    # generation's accepted history, because replaying it would
+                    # move the tree only to trim that inherited record away,
+                    # erasing history the spec requires preserved. The
+                    # generation-aware permit of an older generation's inherited
+                    # chain is the materializer's job (``dd_materializer``),
+                    # which reads the committed entries at the seal -- never the
+                    # replayer's, and never by deleting records. (An unreadable
+                    # index defers to the materializer.)
                     self._disabled = True
                     return None
             # The one mutation happens exactly once, on exactly the selected
