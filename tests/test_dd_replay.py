@@ -14,9 +14,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from conftest import DEVELOPMENT_ID, git, head
+from fleet_graph.dd import chain_rules
 from fleet_graph.dd.dispatch import derive_attempt_id
 from fleet_graph.dd.lifecycle import Lifecycle
 from fleet_graph.dd.upstream_constants import (
@@ -178,80 +177,24 @@ def replayed_stages(state: dict[str, Any]) -> list[str]:
     return [e["stage"] for e in state["history"] if e.get("replayed")]
 
 
-class OrderViolation(AssertionError):
-    """The feedback carrier's ordering refusal, as an assertion failure."""
+def committed_index(repo: Path, entries: list[dict[str, Any]], message: str = "seal index") -> str:
+    """Commit a feedback index at the carrier's path, returning HEAD.
 
-
-def carrier_append(
-    entries: list[dict[str, Any]],
-    *,
-    review_id: str,
-    phase: str,
-    verdict: str,
-    attempt_id: str,
-    subject: str,
-    implementation_subject: str,
-) -> list[dict[str, Any]]:
-    """Append a review entry the way the plugin's feedback carrier does, then
-    enforce the carrier's ordering rule.
-
-    This is the deterministic append + `check_chain_order` from the pinned
-    plugin's `attempt-context.py`, restated so the replay tests assert against
-    the ordering rule itself rather than a proxy: a fresh `continuous` review
-    is a *new attempt*, legal only as the very first entry or the entry right
-    after a REJECT. `final` needs the same attempt's continuous APPROVE.
+    The replayer reads the inherited index from ``HEAD:.dev-dispatch/feedback/
+    index.json`` to decide whether a partial [configure, implement] prefix would
+    be followed by a legal new attempt. This fabricates that committed state.
     """
-    entries = [dict(entry) for entry in entries]
-    if phase == "continuous":
-        attempt = 1 if not entries else entries[-1]["attempt"] + 1
-    else:
-        if not entries:
-            raise OrderViolation("final review requires a materialized continuous APPROVE")
-        previous = entries[-1]
-        if (
-            previous["review_phase"] != "continuous"
-            or previous["verdict"] != "APPROVE"
-            or previous["attempt_id"] != attempt_id
-        ):
-            raise OrderViolation("final review requires the same-attempt continuous APPROVE")
-        attempt = previous["attempt"]
-
-    entry = {
-        "attempt": attempt,
-        "attempt_id": attempt_id,
-        "review_id": review_id,
-        "review_phase": phase,
-        "verdict": verdict,
-        "subject_commit": subject,
-        "implementation_subject_commit": implementation_subject,
+    index = {
+        "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
+        "development_id": DEVELOPMENT_ID,
+        "entries": entries,
     }
-    entries.append(entry)
-
-    previous: dict[str, Any] | None = None
-    for position, current in enumerate(entries):
-        if previous is None:
-            if current["attempt"] != 1 or current["review_phase"] != "continuous":
-                raise OrderViolation(
-                    f"entry {position}: chain must start with attempt 1 continuous"
-                )
-        elif current["review_phase"] == "continuous":
-            if previous["verdict"] != "REJECT":
-                raise OrderViolation(f"entry {position}: a new attempt requires a prior REJECT")
-            if current["attempt"] != previous["attempt"] + 1:
-                raise OrderViolation(
-                    f"entry {position}: continuous review must advance the attempt by exactly one"
-                )
-        else:
-            if (
-                previous["attempt"] != current["attempt"]
-                or previous["review_phase"] != "continuous"
-                or previous["verdict"] != "APPROVE"
-            ):
-                raise OrderViolation(
-                    f"entry {position}: final review requires the same-attempt continuous APPROVE"
-                )
-        previous = current
-    return entries
+    return commit_file(
+        repo,
+        ".dev-dispatch/feedback/index.json",
+        json.dumps(index, sort_keys=True),
+        message,
+    )
 
 
 class TestASealedPrefixReplays:
@@ -513,6 +456,51 @@ class TestAReviewedChainContinuesThroughItsReviews:
         assert g1.installed("continuous-review-receipt.json").read_bytes() == cr_raw
         assert g1.installed("final-review-receipt.json").exists()
 
+    def test_a_final_approve_chain_with_only_a_missing_continuous_intent_replays_through(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """The Continuous intent is re-read only by the Final *sealer*. When the
+        Final review is itself replayed, nothing re-reads it, so a missing
+        Continuous intent must not truncate the replay to a bare [configure,
+        implement] prefix that would then materialise a fresh continuous review
+        -- the ORDER_VIOLATION path. The accepted chain continues through its
+        reviews to acceptance with no new attempt."""
+        g1 = G1(repo, tmp_path)
+        rc = commit_file(
+            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
+        )
+        cr = review_receipt(
+            parent_digest=byte_digest(g1.raw),
+            subject=g1.implement,
+            output=rc,
+            verdict="APPROVE",
+        )
+        cr_raw = write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
+        # Deliberately no write_intent for the continuous review.
+        rf = commit_file(repo, ".dev-dispatch/reviews/final/g1-a1.json", '{"verdict": "APPROVE"}')
+        fr = review_receipt(
+            parent_digest=byte_digest(cr_raw),
+            subject=rc,
+            output=rf,
+            verdict="APPROVE",
+            phase="final",
+        )
+        write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr)
+        write_intent(g1.state_root, fr)
+        junk = g1.junk_configure()
+
+        actor = ContractActor()
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+
+        assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
+        assert replayed_stages(state) == [
+            "configure",
+            "implement",
+            "continuous_review",
+            "final_review",
+        ]
+        assert [stage for stage, _ in actor.calls] == ["acceptance", "human_gate", "merger"]
+
     def test_the_review_bearing_prefix_is_preferred_over_a_partial_one(
         self, repo: Path, tmp_path: Path
     ) -> None:
@@ -660,74 +648,75 @@ class TestAReviewedChainContinuesThroughItsReviews:
         assert ("implement", "") in seen, "the rework implement must not inherit the pin"
 
 
-class TestTheFeedbackCarrierOrdering:
-    """The carrier's ordering rule, and why replay must not open a fresh
-    continuous review after an inherited APPROVE-final chain.
+class TestAPartialPrefixRespectsTheInheritedChain:
+    """A replayed prefix that stops at implement is always followed by a fresh
+    continuous review -- a brand-new attempt. The replayer reads the inherited
+    feedback index and only replays that partial prefix when the fresh review
+    would be legal (the inherited chain ends in REJECT). Otherwise it fails
+    closed, so the carrier -- not the replayer -- stays the authority that
+    rejects a genuine new attempt without a prior REJECT (spec requirements 1,
+    2 and 4)."""
 
-    The rule is the pinned plugin's, not ours: a fresh `continuous` entry is a
-    *new attempt*, legal only as the very first entry or the entry right after
-    a REJECT. Replaying configure + implement of already-reviewed work must
-    therefore replay the reviews, not hand the carrier a new attempt. The
-    complementary side is asserted here directly: a genuine new attempt with
-    no prior REJECT stays rejected -- so the ordering rule is not weakened
-    globally (spec requirement 1 and 4).
-    """
-
-    @staticmethod
-    def _approved_chain() -> list[dict[str, Any]]:
-        return [
-            {
-                "attempt": 1,
-                "attempt_id": "a1",
-                "review_id": "rc-a1",
-                "review_phase": "continuous",
-                "verdict": "APPROVE",
-                "subject_commit": "s1",
-                "implementation_subject_commit": "s1",
-            },
-            {
-                "attempt": 1,
-                "attempt_id": "a1",
-                "review_id": "rf-a1",
-                "review_phase": "final",
-                "verdict": "APPROVE",
-                "subject_commit": "s2",
-                "implementation_subject_commit": "s1",
-            },
-        ]
-
-    def test_a_genuine_new_attempt_without_a_prior_reject_is_rejected(self) -> None:
-        """A fresh continuous review after an APPROVE-final chain is a new
-        attempt with no preceding REJECT -- the carrier must refuse it. This is
-        the exact ORDER_VIOLATION the replayed candidate must not produce."""
-        with pytest.raises(OrderViolation, match="a new attempt requires a prior REJECT"):
-            carrier_append(
-                self._approved_chain(),
-                review_id="rc-a2",
-                phase="continuous",
-                verdict="APPROVE",
-                attempt_id="a2",
-                subject="s3",
-                implementation_subject="s3",
-            )
-
-    def test_a_new_attempt_after_a_reject_is_legal(self) -> None:
-        """The complementary side: when the inherited chain ends in REJECT, the
-        same fresh continuous review is a legal next attempt. This pins that
-        the rule was not weakened -- a rework still advances the attempt by
-        exactly one."""
-        inherited = self._approved_chain()
-        inherited[-1]["verdict"] = "REJECT"
-        entries = carrier_append(
-            inherited,
-            review_id="rc-a2",
-            phase="continuous",
-            verdict="APPROVE",
-            attempt_id="a2",
-            subject="s3",
-            implementation_subject="s3",
+    def test_the_new_attempt_rule_mirrors_the_carrier(self) -> None:
+        assert chain_rules.new_attempt_is_legal([]) is True
+        assert (
+            chain_rules.new_attempt_is_legal([{"review_phase": "final", "verdict": "REJECT"}])
+            is True
         )
-        assert entries[-1]["attempt"] == 2
+        assert (
+            chain_rules.new_attempt_is_legal([{"review_phase": "continuous", "verdict": "APPROVE"}])
+            is False
+        )
+        assert (
+            chain_rules.new_attempt_is_legal(
+                [
+                    {"review_phase": "continuous", "verdict": "APPROVE"},
+                    {"review_phase": "final", "verdict": "APPROVE"},
+                ]
+            )
+            is False
+        )
+
+    def test_a_partial_prefix_is_declined_when_the_inherited_chain_did_not_end_in_reject(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        g1 = G1(repo, tmp_path)
+        committed_index(
+            repo,
+            [
+                {"review_phase": "continuous", "verdict": "APPROVE"},
+                {"review_phase": "final", "verdict": "APPROVE"},
+            ],
+        )
+        junk = g1.junk_configure()
+
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+
+        assert replayed_stages(state) == []
+        assert next(stage for stage, _ in actor.calls) == "configure"
+        assert head(repo) == junk, "a refused replay must not touch the tree"
+
+    def test_a_partial_prefix_replays_when_the_inherited_chain_ended_in_reject(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        g1 = G1(repo, tmp_path)
+        committed_index(
+            repo,
+            [
+                {"review_phase": "continuous", "verdict": "APPROVE"},
+                {"review_phase": "final", "verdict": "REJECT"},
+            ],
+        )
+        junk = g1.junk_configure()
+
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert replayed_stages(state) == ["configure", "implement"]
+        assert next(stage for stage, _ in actor.calls) == "continuous_review"
+        assert head(repo) == g1.implement
 
 
 class TestTheReplayedIdentityBindsTheRealReview:
