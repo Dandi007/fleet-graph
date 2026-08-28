@@ -184,6 +184,12 @@ class Replayed:
     # pass must dispatch under it -- the sealer reads the parent receipt at
     # exactly this identity and refuses one whose identity differs.
     attempt_id: str = ""
+    # The dispatch mode this replayed stage was sealed under (`initial` or
+    # `rework`), carried so the walker inherits it for the real stages that
+    # follow a reworked prefix. A Final review of reworked work that
+    # dispatched `initial` would not match the frozen Continuous intent's
+    # `dispatch_mode`, and the sealer refuses it with BINDING_MISMATCH.
+    mode: str = MODE_INITIAL
 
 
 class Replayer(Protocol):
@@ -414,6 +420,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     "artifacts": artifacts,
                     "receipt_digests": digests,
                     "head_commit": replayed.output_commit,
+                    "mode": replayed.mode or state.get("mode", MODE_INITIAL),
                     "pinned_attempt_id": replayed.attempt_id or state.get("pinned_attempt_id", ""),
                     "last_event": replayed.event,
                     "last_receipt": dict(replayed.receipt),
