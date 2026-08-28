@@ -561,7 +561,12 @@ class TestDdOwnerSideDedup:
         return plane, launcher
 
     def _suspended(self, plane: Any, dev: str, tmp_path: Path) -> None:
-        from fleet_graph.dd.control_plane import CHECKPOINT_FILE, RECORD_FILE, RESULT_FILE
+        from fleet_graph.dd.control_plane import (
+            CHECKPOINT_FILE,
+            LAUNCHES_FILE,
+            RECORD_FILE,
+            RESULT_FILE,
+        )
 
         dev_root = plane.root / dev
         dev_root.mkdir(parents=True, exist_ok=True)
@@ -592,6 +597,25 @@ class TestDdOwnerSideDedup:
             encoding="utf-8",
         )
         (dev_root / CHECKPOINT_FILE).touch()
+        # Production shape: an awaiting_gate development always reached the gate
+        # through its *fresh* generation-N launch. The claim/act-window guard
+        # must not mistake that fresh entry for a completed resume, or it reads
+        # every interrupted claim as already_resumed.
+        (dev_root / LAUNCHES_FILE).write_text(
+            json.dumps(
+                {
+                    "seq": 1,
+                    "unit": "fleet-graphd-dd-dev-abc.service",
+                    "mode": "fresh",
+                    "generation": 1,
+                    "at": "2026-08-28T00:00:00Z",
+                    "started": True,
+                    "detail": "recorded",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
     def test_a_duplicate_resume_claim_does_not_launch_again(self, tmp_path: Path) -> None:
         plane, launcher = self._plane(tmp_path)
@@ -846,3 +870,68 @@ class TestDeployUnit:
         directives = self._directives()
         assert any("decision-bridge.env" in line for line in directives)
         assert "EnvironmentFile=-%h/.config/fleet-graph/env" not in directives
+
+    def test_lines_config_points_at_the_installed_roster(self) -> None:
+        """The roster's declared home is the repo `config/ronin-lines.json`,
+        installed to ``/data/apps/fleet-graph/current/config/ronin-lines.json``
+        -- the same path fleet-graphd.service reads. The unit must not point at
+        a path nothing installs, which would turn the bridge's first tick into a
+        permanent crash loop under Restart=on-failure."""
+        joined = self._text().replace("\\\n", " ")
+        argv = []
+        for line in joined.splitlines():
+            if line.startswith("ExecStart="):
+                argv = line[len("ExecStart=") :].split()
+        assert "--lines-config" in argv, argv
+        value = argv[argv.index("--lines-config") + 1]
+        assert value == "/data/apps/fleet-graph/current/config/ronin-lines.json", argv
+
+
+class TestLineRosterFailSoft:
+    """A missing or malformed goal-line roster is a recorded degradation, not a
+    startup crash: the bridge still starts and recovers dd developments, and the
+    preserved 60s poller keeps covering lines until the roster is fixed."""
+
+    def test_a_missing_roster_yields_no_line_owners(self, tmp_path: Path) -> None:
+        from fleet_graph.cli import _load_line_roster
+
+        owners, run_root = _load_line_roster(str(tmp_path / "nope.json"))
+        assert owners == []
+        assert str(run_root) == "/data/fleet-graph/runs"
+
+    def test_a_malformed_roster_yields_no_line_owners(self, tmp_path: Path) -> None:
+        from fleet_graph.cli import _load_line_roster
+
+        malformed = tmp_path / "ronin-lines.json"
+        malformed.write_text("{not json", encoding="utf-8")
+        owners, run_root = _load_line_roster(str(malformed))
+        assert owners == []
+        assert str(run_root) == "/data/fleet-graph/runs"
+
+    def test_a_valid_roster_populates_lines_and_run_root(self, tmp_path: Path) -> None:
+        from fleet_graph.cli import _load_line_roster
+
+        roster = tmp_path / "ronin-lines.json"
+        roster.write_text(
+            json.dumps(
+                {
+                    "run_root": "/tmp/runs",
+                    "_comment": "ignore me",
+                    "lines": [
+                        {"folder_id": "wf-1", "seat": "s", "generation": 2, "_provenance": "x"}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        owners, run_root = _load_line_roster(str(roster))
+        assert [o["folder_id"] for o in owners] == ["wf-1"]
+        assert "_provenance" not in owners[0]
+        assert str(run_root) == "/tmp/runs"
+
+    def test_no_config_yields_no_line_owners(self) -> None:
+        from fleet_graph.cli import _load_line_roster
+
+        owners, run_root = _load_line_roster(None)
+        assert owners == []
+        assert str(run_root) == "/data/fleet-graph/runs"

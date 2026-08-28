@@ -29,7 +29,7 @@ Type=simple
 WorkingDirectory=/data/apps/fleet-graph/current
 ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph decision-bridge run \
     --state-dir /data/fleet-graph/decision-bridge \
-    --lines-config /data/fleet-graph/config/ronin-lines.json
+    --lines-config /data/apps/fleet-graph/current/config/ronin-lines.json
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
