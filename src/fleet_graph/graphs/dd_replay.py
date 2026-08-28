@@ -220,6 +220,12 @@ class ReceiptReplayer:
             if self._plan is None:
                 self._disabled = True
                 return None
+            # The one mutation happens exactly once, on exactly the selected
+            # candidate, before the first replayed step is returned. A refusal
+            # here is fail-closed: nothing else is tried, nothing was moved.
+            if not self._prepare(self._plan):
+                self._disabled = True
+                return None
         if self._index >= len(self._plan):
             self._disabled = True
             return None
@@ -255,11 +261,10 @@ class ReceiptReplayer:
         candidate: the replayed candidate continues through its continuous and
         final review stages instead of opening a new attempt. Candidates are
         therefore ordered review-depth-first, newest generation first within a
-        depth. The order is only a preference -- `_select` still falls back to
-        a less-reviewed candidate when `_prepare` refuses the stronger one (for
-        example on product drift), because replaying a partial prefix beats
-        re-dispatching a fresh implement actor against work already in the
-        tree.
+        depth. The order is a preference only: a candidate that cannot be
+        prepared means no replay at all (see `_select`), never a fall back to a
+        *divergent* partial prefix that would surface unreviewed work as a new
+        attempt.
         """
         implement_id = implement_stage(self.lifecycle)
         configure_id = self._spine_predecessor(implement_id)
@@ -286,35 +291,27 @@ class ReceiptReplayer:
         return sorted(plans, key=_review_depth, reverse=True)
 
     def _select(self, candidates: list[list[_Step]], stage: Stage) -> list[_Step] | None:
-        """The first candidate that applies to `stage` and can actually be
-        prepared. A candidate whose first step is not `stage` never applies
-        (that is a mid-walk resume, not the prefix). A candidate whose
-        `_prepare` refuses -- product drift above its tip, a vanished remote
-        head -- falls back to the next, because replay is a prefix and a
-        shorter, preparable prefix is still the sealed chain: re-dispatching a
-        fresh implement against a tree that already carries the work is the
-        F4 BLOCKED jam, not correctness."""
+        """The strongest candidate that starts at `stage`, chosen read-only.
+
+        `_candidate_plans` already ordered the candidates review-depth-first,
+        so the first one that applies is the one to try. Selection itself does
+        not mutate: `replay` then `_prepare`s exactly one candidate, so a later
+        candidate is never tried against a tree an earlier one already moved
+        (the rollback hazard of a prepare-inside-select loop). A candidate
+        whose `_prepare` refuses -- product drift above its tip, a vanished
+        remote head -- means no replay at all rather than a fall back to a
+        less-reviewed prefix: replaying a divergent partial prefix would hand
+        the feedback carrier a fresh review of work whose inherited chain did
+        not end in REJECT (ORDER_VIOLATION). That is the same fail-closed trim
+        the single-generation path already applies.
+        """
         for candidate in candidates:
             if not candidate or candidate[0].stage_id != stage.id:
                 continue
-            try:
-                prepared = self._prepare(candidate)
-            except Exception:
-                prepared = False
-            if prepared:
-                return candidate
+            return candidate
         return None
 
-    # ---- backward-compatible single-plan accessor ------------------------
-
-    def _build_plan(self) -> list[_Step]:
-        """The strongest candidate, for callers and tests that need one plan.
-
-        Selection and `_prepare` still happen lazily in `replay`; this is the
-        read-only "what would we prefer" answer.
-        """
-        candidates = self._candidate_plans()
-        return candidates[0] if candidates else []
+    # --- walk one generation's receipts -----------------------------------
 
     def _walk(
         self,
