@@ -302,9 +302,23 @@ class CostDataPlane:
         does not replay. Source facts are re-keyed to their stable identities --
         a replayed emission is still a no-op -- while the derived presence
         series is skipped and re-derived from the merged facts.
+
+        The cost metric carries only an ``attribution`` label, so a spent-batch
+        sample does not name its order. The walker, however, emits management
+        spend under the stable identity ``management:<order_id>`` on every
+        terminal, so the resumed run would re-emit it unless the rehydrated
+        sample is re-keyed to that exact identity. Because this plane lives in
+        one per-development file, its facts share a single order id; recover it
+        from any sample that carries one so the management re-emission on resume
+        stays a no-op instead of double-counting.
         """
+        materialized = list(samples)
+        order_ids = {s.label_map().get("order_id") for s in materialized}
+        order_ids.discard(None)
+        order_ids.discard("")
+        plane_order_id = next(iter(order_ids), "")
         review_attempt: dict[tuple[str, str], int] = {}
-        for sample in samples:
+        for sample in materialized:
             name = sample.name
             labels = sample.label_map()
             order_id = labels.get("order_id", "")
@@ -343,12 +357,12 @@ class CostDataPlane:
                     self._fact_lifecycles.setdefault(order_id, set()).add(REVIEW)
             elif name == COST_METRIC:
                 attribution = labels.get("attribution", "")
-                if attribution == MANAGEMENT and order_id:
+                if attribution == MANAGEMENT and plane_order_id:
                     # The walker re-emits management under this exact identity
                     # on a later resume, so re-keying it here keeps that a no-op.
-                    key = f"cost:management:{order_id}:{attribution}"
+                    key = f"cost:management:{plane_order_id}:{attribution}"
                 else:
-                    key = f"cost:rehydrated:{order_id}:{attribution}"
+                    key = f"cost:rehydrated:{plane_order_id}:{attribution}"
                 self._samples[key] = sample
                 self._seen.add(key)
 

@@ -251,3 +251,33 @@ class TestDataPlane:
         # The rehydrated launch keeps its stable identity, so a replay is a no-op.
         assert resumed.record_launch(order_id="o", development_id="d") is False
         assert resumed.reconcile().orders["o"]["launch"] == 1
+
+    def test_rehydrated_management_spend_is_not_double_counted(self, tmp_path: Path) -> None:
+        """A resumed run that re-emits management spend must not double-count it.
+
+        The walker emits management spend under the stable identity
+        ``management:<order_id>`` on every terminal, and the cost sample itself
+        carries no order id. Rehydrating a previous render must therefore re-key
+        management spend to that same identity, so the resumed terminal's
+        re-emission is a no-op and rule 1's numerator stays exactly one spend
+        instead of two.
+        """
+        first = CostDataPlane(exposition_dir=tmp_path)
+        first.record_launch(order_id="o", development_id="d")
+        first.record_execution_cost(attribution="management", tokens=10.0, event_id="management:o")
+        first.write_exposition()
+
+        resumed = CostDataPlane(exposition_dir=tmp_path)
+        assert resumed.rehydrate_from_file() is True
+        # The resumed walker reaches its terminal and re-emits the same spend.
+        resumed.record_execution_cost(
+            attribution="management", tokens=10.0, event_id="management:o"
+        )
+
+        costs = [
+            s
+            for s in resumed.samples()
+            if s.name == "cost_obs_execution_cost_total"
+            and s.label_map().get("attribution") == "management"
+        ]
+        assert [s.value for s in costs] == [10.0]
