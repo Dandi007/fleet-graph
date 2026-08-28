@@ -195,10 +195,22 @@ class ReceiptReplayer:
         self._plan: list[_Step] | None = None
         self._index = 0
         self._disabled = False
+        self._pending_run_config: dict[str, Any] | None = None
 
     # --- the walker's port ------------------------------------------------
 
     def replay(self, stage: Stage, dispatch: Dispatch) -> Replayed | None:
+        if self._pending_run_config is not None and not stage.is_llm:
+            # A reconfigured acceptance context is re-produced here, at the
+            # first script stage after the replayed reviews -- which is always
+            # `acceptance`, the last walker stage that reads the run-config.
+            # Deferring it this far keeps the controller-owned
+            # `.dev-dispatch/run-config.json` drift out of every review stage's
+            # view, so a read-only reviewer is never blamed for it
+            # (ACTOR_RESERVED_PATH_CHANGED). The acceptance stage's own sealer
+            # commits the rewrite with `git add -A`. See
+            # `_apply_pending_run_config`.
+            self._apply_pending_run_config()
         if self._disabled:
             return None
         if int(dispatch.get("attempt", 1)) != 1 or int(dispatch.get("retry", 0)) != 0:
@@ -722,37 +734,49 @@ class ReceiptReplayer:
                     intent_dir.mkdir(parents=True, exist_ok=True)
                     (intent_dir / f"{intent_id}.json").write_bytes(step.intent_raw)
         if self.run_config is not None:
-            self._rewrite_run_config(plan[0].output_commit)
+            self._pending_run_config = self._reconfigured_run_config(plan[0].output_commit)
         return True
 
-    def _rewrite_run_config(self, configure_commit: str) -> None:
-        """Re-produce configure's output for this generation's own declaration.
+    def _reconfigured_run_config(self, configure_commit: str) -> dict[str, Any] | None:
+        """The run-config this generation must materialise, when reconfigured.
 
         The replayed configure commit carries the *previous* generation's run
         config. When the operator reconfigured the acceptance context, that
         file is stale: the acceptance stage would refuse the run with
         ACCEPTANCE_DECLARATION_MISMATCH even though the declaration is the
-        authoritative value. Rewriting the file to this generation's declared
-        context is exactly what a re-run configure would have written, so the
-        acceptance stage's tamper check reads agreement instead of a stale
-        mismatch. The rewrite stays in the working tree and is picked up and
-        committed by the acceptance stage's own sealer (``git add -A``), so
-        the final tree still carries the reconfigured run-config.
+        authoritative value. This returns exactly what a re-run configure
+        would have written, so it can be re-produced later without dirtying the
+        tree under the review stages. ``None`` means the replayed tree already
+        agrees with the declaration and nothing needs to change.
         """
         committed = self._committed_run_config(configure_commit)
         if committed is not None and _declared_acceptance_context(
             committed
         ) == _declared_acceptance_context(self.run_config or {}):
+            return None
+        return {
+            "development_id": self.development_id,
+            "generation": self.generation,
+            **(self.run_config or {}),
+        }
+
+    def _apply_pending_run_config(self) -> None:
+        """Write the reconfigured run-config into the working tree, once.
+
+        Invoked lazily, at the first script stage after the replayed reviews --
+        always `acceptance`, which is the last stage that reads the file. Doing
+        it this late keeps controller-owned `.dev-dispatch/run-config.json`
+        drift out of the review stages' view, so a read-only reviewer is never
+        blamed for it (ACTOR_RESERVED_PATH_CHANGED). The rewrite stays in the
+        working tree and is picked up and committed by the acceptance stage's
+        own sealer (``git add -A``), so the final tree still carries the
+        reconfigured run-config.
+        """
+        pending = self._pending_run_config
+        if pending is None:
             return
-        write_json(
-            self.workspace,
-            RUN_CONFIG_PATH,
-            {
-                "development_id": self.development_id,
-                "generation": self.generation,
-                **(self.run_config or {}),
-            },
-        )
+        self._pending_run_config = None
+        write_json(self.workspace, RUN_CONFIG_PATH, pending)
 
     def _committed_run_config(self, commit: str) -> dict[str, Any] | None:
         proc = run_git(self.workspace, "show", f"{commit}:{RUN_CONFIG_PATH}")

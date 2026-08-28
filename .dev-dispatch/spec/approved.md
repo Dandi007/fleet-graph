@@ -1,24 +1,25 @@
-# Restore cost-observability data plane
+# Fix reconfigure run-config reserved-path attribution
 
-## Situation
-Prometheus loads five healthy `cost-observability` recording rules, but only `cost_obs:management_execution:ratio` emits a series. Most tokens are classified as `unknown`; settled-order and related source facts are absent. The fleet-graph-dd development, review, and promotion flow lacks the data-plane facts needed by four statistical outputs.
+## Incident evidence
 
-## Required work
-Use dev-dispatch for all implementation and code review. Diagnose the missing producers, label/cardinality joins, and scrape/exposition wiring in this repository. Repair the four statistical data-plane gaps at their responsible components, rather than masking empty inputs with synthetic totals.
+`dev-fg-3a5778fc6a35` generations 2 and 3 both replay configure/implement/continuous review, then run a read-only final reviewer successfully (`exit_code=0`, `verdict=APPROVE`) but terminate with:
 
-1. Ensure every source fact required by each of the five loaded cost-observability recording rules is emitted, scraped, and retains the labels required by its rule joins.
-2. Restore source facts for real DD launch lifecycle, final/continuous review lifecycle, promotion lifecycle, and settlement/order lifecycle, including settled-order facts.
-3. Preserve an explicit `unknown` classification for tokens that genuinely lack attribution. Add explicit `missing`/absence accounting or bounded zero-compatible series where a source fact is absent, so absent source data is observable and distinguishable from unknown attribution. Do not silently relabel unknown as a known class.
-4. Make lifecycle emission idempotent: a retried or replayed launch/settlement must not double-count. Correlate a real launch to its DD settlement by a stable identity and provide an exact-once reconciliation assertion.
-5. Add focused automated tests and an executable acceptance fixture that drives a real launch plus DD settlement and queries all five recording-rule expressions. The fixture must assert all five query results are non-empty, explicit unknown/missing visibility, and exact-once reconciliation after replay/retry.
+`materialize failed on final_review: ACTOR_RESERVED_PATH_CHANGED: Reviewer worktree has staged or unstaged .dev-dispatch/** changes`
 
-## Acceptance
-- `make verify` passes.
-- The executable acceptance test exercises one actual launch and DD settlement, evaluates all five cost-observability recording-rule queries, and proves each has a result.
-- The test proves unknown and missing are separately visible.
-- The test replays the relevant lifecycle operation and proves launch/settlement reconciliation remains exact-once.
-- Review must identify and resolve correctness risks around duplicate events, ordering, missing labels, and PromQL vector matching.
+In the dedicated development worktree at subject `f79735afc3897509bd8785a641ee532b32e5d003`, the only dirty reserved path is `.dev-dispatch/run-config.json`. Its committed generation-1 contents declare `make verify`; the controller-owned reconfigure path rewrites it in place to generation 3/4 plus the new setup and two acceptance commands before final review. The reviewer is read-only and does not write the path. An isolated acceptance worktree at the same subject proves both currently declared commands exit 0 (`tsc` clean; 166 pass, 0 fail).
+
+## Required behavior
+
+1. A reconfigured successor generation must not enter an actor stage with controller-owned staged or unstaged `.dev-dispatch/run-config.json` drift that is later attributed to the actor.
+2. Replayed configure receipts and a changed acceptance context must produce a clean, correctly sealed/materialized subject before final review materialization, or otherwise keep controller-owned runtime configuration outside actor-change attribution.
+3. Preserve the reserved-path guard for actual actor writes. A reviewer or implementer that modifies `.dev-dispatch/**` must still be rejected.
+4. Preserve acceptance authority and tamper detection: the effective setup, argv and environment remain the operator-declared reconfigure context, and product code cannot silently replace them.
+5. Add a regression test matching the incident shape: generation 1 committed run config, reconfigure to generation >1 with changed setup/argv, replay through final review with a read-only APPROVE result, then materialize without `ACTOR_RESERVED_PATH_CHANGED`. Assert the resulting receipt/commit chain is clean and acceptance sees the declared context.
+6. Add the negative control proving a genuine actor reserved-path modification still fails.
+7. Do not change agent-runtime product code, do not weaken unrelated materialization invariants, and do not merge, deploy, restart services, or manipulate any production checkout.
 
 ```dd-acceptance
+uv sync --frozen
+uv run pytest tests/test_dd_replay.py tests/test_dd_materializer.py tests/test_dd_control_plane.py -q
 make verify
 ```

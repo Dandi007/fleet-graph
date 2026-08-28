@@ -27,6 +27,10 @@ from fleet_graph.graphs.dd_pipeline import (
     MODE_INITIAL,
     MODE_REWORK,
     TERMINAL_COMPLETE,
+    TERMINAL_REFUSED,
+    Sealed,
+    StageOutcome,
+    StageRefused,
     build_dd_pipeline_graph,
     initial_state,
 )
@@ -36,7 +40,7 @@ from fleet_graph.graphs.dd_replay import (
     prior_generation_state_roots,
 )
 from fleet_graph.graphs.dd_scripts import RUN_CONFIG_PATH, AcceptanceStage
-from test_dd_pipeline import ContractActor, make_deps
+from test_dd_pipeline import ContractActor, Sealer, make_deps
 
 LIFECYCLE = Lifecycle.load()
 
@@ -923,6 +927,155 @@ class TestAReconfiguredContextRewritesTheRunConfig:
         assert head(repo) == g1.implement
         # g1's committed run-config still stands: it was not overwritten.
         assert git(repo, "show", f"{g1.configure}:{RUN_CONFIG_PATH}").strip() == '{"generation": 1}'
+
+
+class ReviewReservedPathGuard:
+    """The review sealer's reserved-path gate, applied at materialize time.
+
+    Mirrors the pinned plugin's `cmd_review_seal`: at any LLM (implement or
+    review) materialization the `.dev-dispatch/**` subtree must carry no staged
+    or unstaged change, or the actor is refused with ACTOR_RESERVED_PATH_CHANGED.
+    Script stages (acceptance, the gate, the merge) seal through the ordinary
+    fake, which -- like the real WorkspaceSealer -- has no such gate.
+    """
+
+    def __init__(self, repo: Path) -> None:
+        self.repo = repo
+        self.inner = Sealer()
+        self.violations: list[tuple[str, str]] = []
+
+    def materialize(self, stage: Any, dispatch: Any, outcome: Any) -> Sealed:
+        if stage.is_llm:
+            status = git(
+                self.repo,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--",
+                ".dev-dispatch",
+            )
+            if status:
+                self.violations.append((stage.id, status))
+                raise StageRefused(
+                    f"materialize failed on {stage.id}: ACTOR_RESERVED_PATH_CHANGED: "
+                    "Reviewer worktree has staged or unstaged .dev-dispatch/** changes",
+                    code="ACTOR_RESERVED_PATH_CHANGED",
+                )
+        return self.inner.materialize(stage, dispatch, outcome)
+
+
+class TestAReconfiguredReplayDoesNotBlameTheReviewer:
+    """The dev-fg-3a5778fc6a35 shape: a reconfigured context meets a replayed
+    review prefix.
+
+    A legal reconfigure changes the acceptance context of a successor
+    generation whose configure/implement/continuous-review prefix replays from
+    the previous generation. The replayed configure commit carries the stale
+    run-config, so the reconfigured run-config has to be re-produced -- but it
+    must not appear as staged or unstaged `.dev-dispatch/run-config.json` drift
+    while the read-only final reviewer is materializing, or the reviewer is
+    blamed for a write it never did (ACTOR_RESERVED_PATH_CHANGED)."""
+
+    def _g1_with_replayed_continuous_review(self, repo: Path, tmp_path: Path) -> tuple[G1, str]:
+        g1 = G1(repo, tmp_path)
+        rc = commit_file(
+            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
+        )
+        cr = review_receipt(
+            parent_digest=byte_digest(g1.raw),
+            subject=g1.implement,
+            output=rc,
+            verdict="APPROVE",
+        )
+        write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
+        write_intent(g1.state_root, cr)
+        junk = g1.junk_configure()
+        return g1, junk
+
+    def _reconfigured_replayer(self, g1: G1, tmp_path: Path) -> ReceiptReplayer:
+        declared = {
+            "acceptance_commands": [["true"]],
+            "setup_commands": [["echo", "reconfigured-setup"]],
+            "acceptance_env": {"PYTHONPATH": "src"},
+        }
+        return ReceiptReplayer(
+            workspace=g1.repo,
+            state_root=g1.dev_root / "g2" / "state",
+            prior_state_roots=((1, g1.state_root),),
+            development_id=DEVELOPMENT_ID,
+            generation=2,
+            lifecycle=LIFECYCLE,
+            run_config=declared,
+        )
+
+    def test_the_final_review_materializes_clean_and_acceptance_sees_the_context(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        g1, junk = self._g1_with_replayed_continuous_review(repo, tmp_path)
+        replayer = self._reconfigured_replayer(g1, tmp_path)
+        declared = {
+            "acceptance_commands": [["true"]],
+            "setup_commands": [["echo", "reconfigured-setup"]],
+            "acceptance_env": {"PYTHONPATH": "src"},
+        }
+        actor = ContractActor({"final_review": ["APPROVE"]})
+        scripts = {name: actor for name, stage in LIFECYCLE.stages.items() if not stage.is_llm}
+        scripts["acceptance"] = AcceptanceStage(
+            repo=repo,
+            declared=declared["acceptance_commands"],
+            setup=declared["setup_commands"],
+            env=declared["acceptance_env"],
+        )
+        guard = ReviewReservedPathGuard(repo)
+
+        state = run_generation_two(
+            make_deps(actor=actor, scripts=scripts, replayer=replayer, materializer=guard),
+            junk,
+        )
+
+        assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
+        # The sealed prefix replays through the continuous review; the final
+        # review runs for real and materializes without a reserved-path blame.
+        assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
+        assert ("final_review", 1) in actor.calls
+        assert not any(
+            stage in ("configure", "implement", "continuous_review") for stage, _ in actor.calls
+        )
+        assert guard.violations == []
+        # The reconfigured run-config was re-produced for the acceptance stage,
+        # which graded against it rather than g1's stale declaration.
+        config = json.loads((repo / RUN_CONFIG_PATH).read_text(encoding="utf-8"))
+        assert config["acceptance_commands"] == [["true"]]
+        assert config["setup_commands"] == [["echo", "reconfigured-setup"]]
+        assert config["acceptance_env"] == {"PYTHONPATH": "src"}
+        assert config["generation"] == 2
+
+    def test_a_genuine_actor_reserved_path_modification_still_refuses(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        g1, junk = self._g1_with_replayed_continuous_review(repo, tmp_path)
+        replayer = self._reconfigured_replayer(g1, tmp_path)
+
+        class ReviewerThatWrites(ContractActor):
+            def act(self, stage: Any, dispatch: Any) -> StageOutcome:
+                if stage.id == "final_review":
+                    (repo / ".dev-dispatch" / "actor-drift.json").write_text(
+                        '{"drift": true}', encoding="utf-8"
+                    )
+                return super().act(stage, dispatch)
+
+        actor = ReviewerThatWrites({"final_review": ["APPROVE"]})
+        guard = ReviewReservedPathGuard(repo)
+
+        state = run_generation_two(
+            make_deps(actor=actor, replayer=replayer, materializer=guard), junk
+        )
+
+        # The deferred controller rewrite never caused the blame; the actor's
+        # own write did, so the reserved-path guard still fires and refuses.
+        assert state["terminal"] == TERMINAL_REFUSED, state.get("terminal_reason")
+        assert guard.violations
+        assert any(stage == "final_review" for stage, _ in guard.violations)
 
 
 def write_review_intent(state_root: Path, receipt: dict[str, Any], *, dispatch_mode: str) -> bytes:
