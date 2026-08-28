@@ -1,0 +1,25 @@
+{
+ "development_id": "dev-fg-9e1ebbdd492b",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "-k",
+   "resolver"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
