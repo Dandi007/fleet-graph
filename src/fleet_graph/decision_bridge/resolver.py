@@ -91,7 +91,6 @@ def _validate(message: dict[str, Any]) -> str | None:
 def _referenced_questions(
     message_id: str,
     candidate_question_ids: list[str],
-    payload_question_note_id: str,
     refs_to: Callable[[str], list[dict[str, Any]]] | None,
 ) -> set[str]:
     """Which candidate question notes this decision references.
@@ -100,12 +99,12 @@ def _referenced_questions(
     that references question ``q`` is returned by ``refs_to(q)`` as
     ``{"message_id": <decision>, "target_entity": "q"}``. Forward reference
     discovery is therefore a reverse look-up over the currently-waiting
-    questions. A decision shape that carries ``payload.question_note_id``
-    inline is accepted as a direct answer without consulting the endpoint.
+    questions. A question is never established from an inline
+    ``payload.question_note_id``: the real bus does not inline refs, so
+    treating an inline field as an answer would let a decision resolve an owner
+    without ever touching the refs endpoint the resolver exists to adopt.
     """
     referenced: set[str] = set()
-    if payload_question_note_id:
-        referenced.add(payload_question_note_id)
     if refs_to is None:
         return referenced
     for question_id in candidate_question_ids:
@@ -160,11 +159,9 @@ def resolve_decision(
             f" (discovery failures: {type(exc).__name__}: {exc})",
         )
 
-    payload = message.get("payload") or {}
     referenced = _referenced_questions(
         message_id,
         list({target.question_note_id for target in waiting}),
-        str(payload.get("question_note_id") or ""),
         refs_to,
     )
 

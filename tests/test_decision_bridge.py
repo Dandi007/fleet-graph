@@ -302,6 +302,19 @@ class TestResolver:
         )
         assert resolution.category == CATEGORY_NO_WAITING_OWNER and not resolution.ok
 
+    def test_inline_question_note_id_is_not_trusted(self) -> None:
+        """A decision carrying ``payload.question_note_id`` inline does not
+        resolve an owner on its own: the question is established only through
+        the reverse-refs endpoint. An inline field, even matching a waiting
+        owner's question, resolves nothing when the refs endpoint does not name
+        this decision for that question."""
+        o = FakeOwner()
+        o.add(owner())  # waiting on q-1
+        msg = decision("d-1", 1, card="card-1")
+        msg["payload"]["question_note_id"] = "q-1"
+        resolution = resolve_decision(msg, o, refs_to=refs_to({}))
+        assert resolution.category == CATEGORY_NO_WAITING_OWNER and not resolution.ok
+
     def test_channel_outside_allowlist_is_invalid(self) -> None:
         o = FakeOwner()
         o.add(owner())
