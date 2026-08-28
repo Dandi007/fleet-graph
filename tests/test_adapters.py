@@ -124,6 +124,28 @@ class TestCoordinatorAdapter:
         again.turn(1, {"round": 1})
         assert launcher2.run_ids[0] == first
 
+    def test_a_resume_turn_derives_a_distinct_run_id(self, run_root: Path) -> None:
+        """The injected-decision resume turn must be a new run, not a re-adoption
+        of the pre-suspension round's succeeded run (E2 item 3): the adopted
+        result would replay the stale ``blocked + waiting_on=decision`` verdict
+        with no ``acknowledged_message_id``."""
+        coordinator, launcher = self.build(run_root, ok_status({"verdict": "done"}))
+        coordinator.turn(1, {"round": 1})
+        coordinator.turn(1, {"round": 1, "decision": {"message_id": "d-1"}}, resume=True)
+        first, second = launcher.run_ids
+        assert first != second
+
+    def test_a_resume_turn_re_adopts_the_same_resume_run(self, run_root: Path) -> None:
+        """The resume run id is deterministic, so a crash after the resume
+        launches still re-adopts the same resume run (never a second model
+        invocation) instead of colliding with the pre-suspension run."""
+        coordinator, launcher = self.build(run_root, ok_status({"verdict": "done"}))
+        coordinator.turn(1, {"round": 1, "decision": {"message_id": "d-1"}}, resume=True)
+
+        again, launcher2 = self.build(run_root, ok_status({"verdict": "done"}))
+        again.turn(1, {"round": 1, "decision": {"message_id": "d-1"}}, resume=True)
+        assert launcher2.run_ids[0] == launcher.run_ids[0]
+
     def test_uses_the_coordinator_role(self, run_root: Path) -> None:
         coordinator, launcher = self.build(run_root, ok_status({"verdict": "done"}))
         coordinator.turn(1, {"round": 1})
