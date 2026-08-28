@@ -856,6 +856,22 @@ class DdControlPlane:
             for entry in self._launches(development_id)
         )
 
+    def _resume_launched(self, development_id: str, generation: int) -> bool:
+        """Whether this generation has a *resume* launch entry.
+
+        The fresh launch that first carried the generation to the gate is not a
+        resume. Distinguishing the two is what makes the claim/act-window guard
+        reachable: an ``awaiting_gate`` development at generation N necessarily
+        already has its fresh generation-N launch entry, so ``_generation_launched``
+        is true the moment the gate is first consulted -- including when the only
+        thing on disk is the O_EXCL claim a SIGKILLed resume left behind. Only a
+        recorded ``mode == "resume"`` entry proves that recovery actually ran.
+        """
+        return any(
+            int(entry.get("generation") or 1) == generation and entry.get("mode") == "resume"
+            for entry in self._launches(development_id)
+        )
+
     def _read_result(self, development_id: str, generation: int = 1) -> dict[str, Any] | None:
         path = self._gen_root(development_id, generation) / RESULT_FILE
         if not path.is_file():
@@ -1242,7 +1258,7 @@ class DdControlPlane:
         if (
             action_key
             and not self._claim_resume_action(development_id, generation, action_key)
-            and self._generation_launched(development_id, generation)
+            and self._resume_launched(development_id, generation)
         ):
             gate_report["resume"] = {
                 "development_id": development_id,

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pathlib
 import shlex
 import sys
 from typing import Any
@@ -545,9 +546,6 @@ def _decision_bridge_run(args: argparse.Namespace) -> int:
     line entry, or an HTTP owner for the isolated drill). One JSON line per
     cycle on stdout.
     """
-    import json as _json
-    import pathlib
-
     from fleet_graph.decision_bridge.bridge import DecisionBridge, DecisionBridgeConfig
     from fleet_graph.decision_bridge.owners import HttpOwnerSource
 
@@ -555,21 +553,7 @@ def _decision_bridge_run(args: argparse.Namespace) -> int:
     if args.owner_url:
         owner_source = HttpOwnerSource(args.owner_url)
 
-    line_owners: list[object] = []
-    line_run_root = pathlib.Path("/data/fleet-graph/runs")
-    if args.lines_config:
-        with open(args.lines_config, encoding="utf-8") as handle:
-            raw = _json.load(handle)
-        entries = raw.get("lines") if isinstance(raw, dict) else None
-        if isinstance(entries, list):
-            line_owners = [
-                {k: v for k, v in entry.items() if not str(k).startswith("_")}
-                if isinstance(entry, dict)
-                else entry
-                for entry in entries
-            ]
-        if isinstance(raw, dict) and raw.get("run_root"):
-            line_run_root = pathlib.Path(str(raw["run_root"]))
+    line_owners, line_run_root = _load_line_roster(args.lines_config)
 
     bridge = DecisionBridge(
         DecisionBridgeConfig(
@@ -604,6 +588,50 @@ def _build_bridge_bus(args: argparse.Namespace):
         return BusClient(base_url=args.bus_url)
     except Exception:
         return None
+
+
+def _load_line_roster(lines_config: str | None) -> tuple[list[object], pathlib.Path]:
+    """Read the goal-line roster, fail-soft on an unreadable or malformed file.
+
+    The roster is the bridge's only route to the registered line recovery entry
+    (spec item 4). A missing or malformed roster must be a *recorded
+    degradation*, not a startup crash: the same posture the bridge already takes
+    for a missing env file or a missing bus token. On failure the bridge still
+    starts and recovers dd developments, and the preserved 60s poller keeps
+    covering lines until the roster is fixed.
+    """
+    line_run_root = pathlib.Path("/data/fleet-graph/runs")
+    if not lines_config:
+        return [], line_run_root
+    try:
+        with open(lines_config, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError) as exc:
+        print(
+            f"decision-bridge: lines roster unreadable at {lines_config}: {exc}; "
+            "line recovery stays offline (dd recovery and the 60s poller are unaffected)",
+            file=sys.stderr,
+        )
+        return [], line_run_root
+    if not isinstance(raw, dict):
+        print(
+            f"decision-bridge: lines roster at {lines_config} is not a JSON object; "
+            "line recovery stays offline",
+            file=sys.stderr,
+        )
+        return [], line_run_root
+    entries = raw.get("lines")
+    line_owners: list[object] = []
+    if isinstance(entries, list):
+        line_owners = [
+            {k: v for k, v in entry.items() if not str(k).startswith("_")}
+            if isinstance(entry, dict)
+            else entry
+            for entry in entries
+        ]
+    if raw.get("run_root"):
+        line_run_root = pathlib.Path(str(raw["run_root"]))
+    return line_owners, line_run_root
 
 
 def _decision_bridge_status(args: argparse.Namespace) -> int:
