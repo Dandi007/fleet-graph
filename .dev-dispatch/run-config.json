@@ -1,0 +1,46 @@
+{
+ "development_id": "dev-fg-0b84e2836b6b",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_decision_bridge.py",
+   "-q"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e1_decision_bridge_acceptance.py",
+   "--scenario",
+   "resume-under-5s",
+   "--max-latency-seconds",
+   "5"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e1_decision_bridge_acceptance.py",
+   "--scenario",
+   "kill-restart-exactly-once",
+   "--kill-after",
+   "intent_recorded",
+   "--max-recovery-seconds",
+   "5"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
