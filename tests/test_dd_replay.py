@@ -123,86 +123,6 @@ def write_intent(state_root: Path, receipt: dict[str, Any]) -> bytes:
     return raw
 
 
-def write_review_intent(state_root: Path, receipt: dict[str, Any], *, dispatch_mode: str) -> bytes:
-    """A review intent that also freezes the `dispatch_mode` the plugin froze,
-    so a replayed rework prefix's Continuous intent carries `rework` exactly
-    as it would on a real chain."""
-    intent_id = str(receipt.get("materialization_intent_id") or "")
-    assert intent_id
-    raw = json.dumps(
-        {
-            "materialization_intent_id": intent_id,
-            "kind": "review_materialization_intent",
-            "dispatch_mode": dispatch_mode,
-            "review_phase": receipt.get("review_phase", ""),
-        },
-        sort_keys=True,
-    ).encode("utf-8")
-    directory = state_root / "intents"
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / f"{intent_id}.json").write_bytes(raw)
-    return raw
-
-
-def implement_receipt_at(
-    *, attempt: int, input_commit: str, output_commit: str, parent_digest: str
-) -> dict[str, Any]:
-    """An applied implement receipt at an arbitrary attempt, for rework chains."""
-    receipt = {
-        "actor_job_id": "job-1",
-        "artifacts": [],
-        "attempt_id": derive_attempt_id(DEVELOPMENT_ID, 1, attempt),
-        "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
-        "development_id": DEVELOPMENT_ID,
-        "feedback_digest": "sha256:" + "0" * 64,
-        "input_commit": input_commit,
-        "materialization_intent_id": f"intent-implement-a{attempt}",
-        "output_commit": output_commit,
-        "parent_handoff_receipt_digest": parent_digest,
-        "spec_digest": "sha256:" + "1" * 64,
-        "verification_record": {"verification_commands": []},
-        "work_head_commit": output_commit,
-    }
-    assert set(receipt) == plugin_adapter.IMPLEMENT_RECEIPT_FIELDS
-    return receipt
-
-
-def review_receipt_at(
-    *,
-    attempt: int,
-    implementation_digest: str,
-    parent_digest: str,
-    implementation_subject: str,
-    subject: str,
-    output: str,
-    verdict: str,
-    phase: str,
-    intent_id: str,
-) -> dict[str, Any]:
-    """A review receipt at an arbitrary attempt, with the two digests a real
-    review carries separately (the implement digest and the parent receipt)."""
-    receipt = {
-        "attempt_id": derive_attempt_id(DEVELOPMENT_ID, 1, attempt),
-        "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
-        "development_id": DEVELOPMENT_ID,
-        "feedback_index": {"entries": []},
-        "implementation_handoff_receipt_digest": implementation_digest,
-        "implementation_subject_commit": implementation_subject,
-        "input_commit": subject,
-        "materialization_intent_id": intent_id,
-        "output_commit": output,
-        "parent_handoff_receipt_digest": parent_digest,
-        "review_artifact": {"path": "x"},
-        "review_id": f"R-{phase}-{attempt}",
-        "review_phase": phase,
-        "reviewer_job_id": "rev-1",
-        "subject_commit": subject,
-        "verdict": verdict,
-    }
-    assert set(receipt) == plugin_adapter.REVIEW_RECEIPT_FIELDS
-    return receipt
-
-
 class G1:
     """One previous generation: configure and implement sealed on a real repo."""
 
@@ -482,150 +402,6 @@ class TestARejectionIsNeverReplayed:
         assert head(repo) == g1.implement, "the rejected review's seal is dead weight"
 
 
-class TestAReworkedPrefixReplaysAsRework:
-    """dev-fg-6e4f9345b320 g7: the replayed Continuous intent froze
-    `dispatch_mode: "rework"`, while the next generation re-dispatched its real
-    final review as `initial` -- BINDING_MISMATCH "persisted Continuous intent
-    dispatch_mode does not match its authoritative binding".
-
-    A rework attempts implement + continuous again with mode `rework`; the
-    replayed prefix must carry that mode forward so the first real stage (the
-    final review) inherits `rework` and the sealer's binding closes."""
-
-    def _reworked_g1(self, repo: Path, tmp_path: Path) -> tuple[G1, str]:
-        g1 = G1(repo, tmp_path)
-        im1_raw = g1.raw
-
-        # attempt 1 continuous APPROVE
-        cr1_commit = commit_file(repo, ".dev-dispatch/reviews/rc-a1.json", '{"verdict": "APPROVE"}')
-        cr1 = review_receipt_at(
-            attempt=1,
-            implementation_digest=byte_digest(im1_raw),
-            parent_digest=byte_digest(im1_raw),
-            implementation_subject=g1.implement,
-            subject=g1.implement,
-            output=cr1_commit,
-            verdict="APPROVE",
-            phase="continuous",
-            intent_id="intent-cr-a1",
-        )
-        cr1_raw = write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr1)
-        write_review_intent(g1.state_root, cr1, dispatch_mode="initial")
-
-        # attempt 1 final REJECT
-        fr1_commit = commit_file(repo, ".dev-dispatch/reviews/rf-a1.json", '{"verdict": "REJECT"}')
-        fr1 = review_receipt_at(
-            attempt=1,
-            implementation_digest=byte_digest(im1_raw),
-            parent_digest=byte_digest(cr1_raw),
-            implementation_subject=g1.implement,
-            subject=cr1_commit,
-            output=fr1_commit,
-            verdict="REJECT",
-            phase="final",
-            intent_id="intent-fr-a1",
-        )
-        write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr1)
-
-        # attempt 2 rework implement, chained to the rejecting final review
-        im2_commit = commit_file(repo, "product.py", "print('reworked')\n")
-        im2 = implement_receipt_at(
-            attempt=2,
-            input_commit=fr1_commit,
-            output_commit=im2_commit,
-            parent_digest=chain_rules.rework_link_parent(fr1),
-        )
-        im2_raw = write_receipt(g1.state_root, 1, 2, "implement-receipt.json", im2)
-
-        # attempt 2 rework continuous APPROVE
-        cr2_commit = commit_file(repo, ".dev-dispatch/reviews/rc-a2.json", '{"verdict": "APPROVE"}')
-        cr2 = review_receipt_at(
-            attempt=2,
-            implementation_digest=byte_digest(im2_raw),
-            parent_digest=byte_digest(im2_raw),
-            implementation_subject=im2_commit,
-            subject=im2_commit,
-            output=cr2_commit,
-            verdict="APPROVE",
-            phase="continuous",
-            intent_id="intent-cr-a2",
-        )
-        write_receipt(g1.state_root, 1, 2, "continuous-review-receipt.json", cr2)
-        write_review_intent(g1.state_root, cr2, dispatch_mode="rework")
-        return g1, cr2_commit
-
-    def test_the_final_review_of_a_reworked_prefix_dispatches_rework(
-        self, repo: Path, tmp_path: Path
-    ) -> None:
-        g1, reworked_tip = self._reworked_g1(repo, tmp_path)
-        junk = g1.junk_configure()
-        modes: list[tuple[str, str]] = []
-
-        class Recorder(ContractActor):
-            def act(self, stage: Any, dispatch: dict[str, Any]) -> Any:
-                modes.append((stage.id, str(dispatch.get("mode") or "")))
-                return super().act(stage, dispatch)
-
-        actor = Recorder({"final_review": ["APPROVE"]})
-        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
-
-        assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
-        # The reworked implement + continuous APPROVE prefix replays; the final
-        # review is the first real stage and must inherit `rework`.
-        assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
-        assert modes[:1] == [("final_review", MODE_REWORK)], modes
-        assert head(repo) == reworked_tip
-
-    def test_an_initial_prefix_keeps_the_final_review_initial(
-        self, repo: Path, tmp_path: Path
-    ) -> None:
-        """The fix is principled, not a blanket 'replay means rework': an
-        ordinary initial prefix replays and the real final review still
-        dispatches `initial`."""
-        g1 = G1(repo, tmp_path)
-        cr_commit = commit_file(repo, ".dev-dispatch/reviews/rc-a1.json", '{"verdict": "APPROVE"}')
-        cr = review_receipt_at(
-            attempt=1,
-            implementation_digest=byte_digest(g1.raw),
-            parent_digest=byte_digest(g1.raw),
-            implementation_subject=g1.implement,
-            subject=g1.implement,
-            output=cr_commit,
-            verdict="APPROVE",
-            phase="continuous",
-            intent_id="intent-cr-a1",
-        )
-        write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
-        write_review_intent(g1.state_root, cr, dispatch_mode="initial")
-        junk = g1.junk_configure()
-        modes: list[tuple[str, str]] = []
-
-        class Recorder(ContractActor):
-            def act(self, stage: Any, dispatch: dict[str, Any]) -> Any:
-                modes.append((stage.id, str(dispatch.get("mode") or "")))
-                return super().act(stage, dispatch)
-
-        actor = Recorder({"final_review": ["APPROVE"]})
-        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
-
-        assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
-        assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
-        assert modes[:1] == [("final_review", MODE_INITIAL)], modes
-
-
-class TestANewAttemptWithoutARejectLinkIsNeverReplayed:
-    def test_a_rework_that_does_not_name_its_rejecting_review_is_not_a_link(
-        self, repo: Path, tmp_path: Path
-    ) -> None:
-        """The ORDER_VIOLATION-adjacent guard lives on the replay side: a new
-        attempt (rework implement) that does not name the rejecting review as
-        its parent has no REJECT predecessor, so it must not be replayed as a
-        sealed link -- the replayer declines it and the review re-runs for real
-        (where the plugin's attempt-context guard may then reject it)."""
-        g1 = G1(repo, tmp_path)
-        # attempt 1: continuous APPROVE, final REJECT (a real rework steer).
-        cr_commit = commit_file(
-
 class TestAReviewedChainContinuesThroughItsReviews:
     """The ORDER_VIOLATION lesson: a replayed implementation is not a new
     implementation attempt. A restarted generation that reuses configure and
@@ -647,58 +423,6 @@ class TestAReviewedChainContinuesThroughItsReviews:
         cr = review_receipt(
             parent_digest=byte_digest(g1.raw),
             subject=g1.implement,
-            output=cr_commit,
-            verdict="APPROVE",
-        )
-        write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
-        fr_commit = commit_file(
-            repo, ".dev-dispatch/reviews/final/g1-a1.json", '{"verdict": "REJECT"}'
-        )
-        fr = review_receipt(
-            parent_digest=byte_digest(
-                (
-                    g1.state_root
-                    / "receipts"
-                    / derive_attempt_id(DEVELOPMENT_ID, 1, 1)
-                    / "continuous-review-receipt.json"
-                ).read_bytes()
-            ),
-            subject=g1.implement,
-            output=fr_commit,
-            verdict="REJECT",
-            phase="final",
-        )
-        write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr)
-
-        rework_commit = commit_file(repo, ".dd-evidence/rework.json", '{"attempt": 2}')
-        # A rework implement that does NOT name the rejecting review: a "new
-        # attempt" with no REJECT predecessor, so it is not a rework link.
-        rework = {
-            "actor_job_id": "job-2",
-            "artifacts": [],
-            "attempt_id": derive_attempt_id(DEVELOPMENT_ID, 1, 2),
-            "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
-            "development_id": DEVELOPMENT_ID,
-            "feedback_digest": "sha256:" + "0" * 64,
-            "input_commit": fr_commit,
-            "materialization_intent_id": "intent-rework",
-            "output_commit": rework_commit,
-            "parent_handoff_receipt_digest": "sha256:" + "f" * 64,
-            "spec_digest": "sha256:" + "1" * 64,
-            "verification_record": {"verification_commands": []},
-            "work_head_commit": rework_commit,
-        }
-        assert set(rework) == plugin_adapter.IMPLEMENT_RECEIPT_FIELDS
-        write_receipt(g1.state_root, 1, 2, "implement-receipt.json", rework)
-
-        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
-        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), head(repo))
-
-        # Only the pre-rejection prefix replays: the rework attempt is not a
-        # closeable link, so it is declined and the review re-runs for real.
-        assert replayed_stages(state) == ["configure", "implement"]
-        assert next(stage for stage, _ in actor.calls) == "continuous_review"
-
             output=rc,
             verdict="APPROVE",
         )
@@ -1199,3 +923,284 @@ class TestAReconfiguredContextRewritesTheRunConfig:
         assert head(repo) == g1.implement
         # g1's committed run-config still stands: it was not overwritten.
         assert git(repo, "show", f"{g1.configure}:{RUN_CONFIG_PATH}").strip() == '{"generation": 1}'
+
+
+def write_review_intent(state_root: Path, receipt: dict[str, Any], *, dispatch_mode: str) -> bytes:
+    """A review intent that also freezes the `dispatch_mode` the plugin froze,
+    so a replayed rework prefix's Continuous intent carries `rework` exactly
+    as it would on a real chain."""
+    intent_id = str(receipt.get("materialization_intent_id") or "")
+    assert intent_id
+    raw = json.dumps(
+        {
+            "materialization_intent_id": intent_id,
+            "kind": "review_materialization_intent",
+            "dispatch_mode": dispatch_mode,
+            "review_phase": receipt.get("review_phase", ""),
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    directory = state_root / "intents"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{intent_id}.json").write_bytes(raw)
+    return raw
+
+
+def implement_receipt_at(
+    *, attempt: int, input_commit: str, output_commit: str, parent_digest: str
+) -> dict[str, Any]:
+    """An applied implement receipt at an arbitrary attempt, for rework chains."""
+    receipt = {
+        "actor_job_id": "job-1",
+        "artifacts": [],
+        "attempt_id": derive_attempt_id(DEVELOPMENT_ID, 1, attempt),
+        "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
+        "development_id": DEVELOPMENT_ID,
+        "feedback_digest": "sha256:" + "0" * 64,
+        "input_commit": input_commit,
+        "materialization_intent_id": f"intent-implement-a{attempt}",
+        "output_commit": output_commit,
+        "parent_handoff_receipt_digest": parent_digest,
+        "spec_digest": "sha256:" + "1" * 64,
+        "verification_record": {"verification_commands": []},
+        "work_head_commit": output_commit,
+    }
+    assert set(receipt) == plugin_adapter.IMPLEMENT_RECEIPT_FIELDS
+    return receipt
+
+
+def review_receipt_at(
+    *,
+    attempt: int,
+    implementation_digest: str,
+    parent_digest: str,
+    implementation_subject: str,
+    subject: str,
+    output: str,
+    verdict: str,
+    phase: str,
+    intent_id: str,
+) -> dict[str, Any]:
+    """A review receipt at an arbitrary attempt, with the two digests a real
+    review carries separately (the implement digest and the parent receipt)."""
+    receipt = {
+        "attempt_id": derive_attempt_id(DEVELOPMENT_ID, 1, attempt),
+        "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
+        "development_id": DEVELOPMENT_ID,
+        "feedback_index": {"entries": []},
+        "implementation_handoff_receipt_digest": implementation_digest,
+        "implementation_subject_commit": implementation_subject,
+        "input_commit": subject,
+        "materialization_intent_id": intent_id,
+        "output_commit": output,
+        "parent_handoff_receipt_digest": parent_digest,
+        "review_artifact": {"path": "x"},
+        "review_id": f"R-{phase}-{attempt}",
+        "review_phase": phase,
+        "reviewer_job_id": "rev-1",
+        "subject_commit": subject,
+        "verdict": verdict,
+    }
+    assert set(receipt) == plugin_adapter.REVIEW_RECEIPT_FIELDS
+    return receipt
+
+
+class TestAReworkedPrefixReplaysAsRework:
+    """dev-fg-6e4f9345b320 g7: the replayed Continuous intent froze
+    `dispatch_mode: "rework"`, while the next generation re-dispatched its real
+    final review as `initial` -- BINDING_MISMATCH "persisted Continuous intent
+    dispatch_mode does not match its authoritative binding".
+
+    A rework attempts implement + continuous again with mode `rework`; the
+    replayed prefix must carry that mode forward so the first real stage (the
+    final review) inherits `rework` and the sealer's binding closes."""
+
+    def _reworked_g1(self, repo: Path, tmp_path: Path) -> tuple[G1, str]:
+        g1 = G1(repo, tmp_path)
+        im1_raw = g1.raw
+
+        # attempt 1 continuous APPROVE
+        cr1_commit = commit_file(repo, ".dev-dispatch/reviews/rc-a1.json", '{"verdict": "APPROVE"}')
+        cr1 = review_receipt_at(
+            attempt=1,
+            implementation_digest=byte_digest(im1_raw),
+            parent_digest=byte_digest(im1_raw),
+            implementation_subject=g1.implement,
+            subject=g1.implement,
+            output=cr1_commit,
+            verdict="APPROVE",
+            phase="continuous",
+            intent_id="intent-cr-a1",
+        )
+        cr1_raw = write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr1)
+        write_review_intent(g1.state_root, cr1, dispatch_mode="initial")
+
+        # attempt 1 final REJECT
+        fr1_commit = commit_file(repo, ".dev-dispatch/reviews/rf-a1.json", '{"verdict": "REJECT"}')
+        fr1 = review_receipt_at(
+            attempt=1,
+            implementation_digest=byte_digest(im1_raw),
+            parent_digest=byte_digest(cr1_raw),
+            implementation_subject=g1.implement,
+            subject=cr1_commit,
+            output=fr1_commit,
+            verdict="REJECT",
+            phase="final",
+            intent_id="intent-fr-a1",
+        )
+        write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr1)
+
+        # attempt 2 rework implement, chained to the rejecting final review
+        im2_commit = commit_file(repo, "product.py", "print('reworked')\n")
+        im2 = implement_receipt_at(
+            attempt=2,
+            input_commit=fr1_commit,
+            output_commit=im2_commit,
+            parent_digest=chain_rules.rework_link_parent(fr1),
+        )
+        im2_raw = write_receipt(g1.state_root, 1, 2, "implement-receipt.json", im2)
+
+        # attempt 2 rework continuous APPROVE
+        cr2_commit = commit_file(repo, ".dev-dispatch/reviews/rc-a2.json", '{"verdict": "APPROVE"}')
+        cr2 = review_receipt_at(
+            attempt=2,
+            implementation_digest=byte_digest(im2_raw),
+            parent_digest=byte_digest(im2_raw),
+            implementation_subject=im2_commit,
+            subject=im2_commit,
+            output=cr2_commit,
+            verdict="APPROVE",
+            phase="continuous",
+            intent_id="intent-cr-a2",
+        )
+        write_receipt(g1.state_root, 1, 2, "continuous-review-receipt.json", cr2)
+        write_review_intent(g1.state_root, cr2, dispatch_mode="rework")
+        return g1, cr2_commit
+
+    def test_the_final_review_of_a_reworked_prefix_dispatches_rework(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        g1, reworked_tip = self._reworked_g1(repo, tmp_path)
+        junk = g1.junk_configure()
+        modes: list[tuple[str, str]] = []
+
+        class Recorder(ContractActor):
+            def act(self, stage: Any, dispatch: dict[str, Any]) -> Any:
+                modes.append((stage.id, str(dispatch.get("mode") or "")))
+                return super().act(stage, dispatch)
+
+        actor = Recorder({"final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+
+        assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
+        # The reworked implement + continuous APPROVE prefix replays; the final
+        # review is the first real stage and must inherit `rework`.
+        assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
+        assert modes[:1] == [("final_review", MODE_REWORK)], modes
+        assert head(repo) == reworked_tip
+
+    def test_an_initial_prefix_keeps_the_final_review_initial(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """The fix is principled, not a blanket 'replay means rework': an
+        ordinary initial prefix replays and the real final review still
+        dispatches `initial`."""
+        g1 = G1(repo, tmp_path)
+        cr_commit = commit_file(repo, ".dev-dispatch/reviews/rc-a1.json", '{"verdict": "APPROVE"}')
+        cr = review_receipt_at(
+            attempt=1,
+            implementation_digest=byte_digest(g1.raw),
+            parent_digest=byte_digest(g1.raw),
+            implementation_subject=g1.implement,
+            subject=g1.implement,
+            output=cr_commit,
+            verdict="APPROVE",
+            phase="continuous",
+            intent_id="intent-cr-a1",
+        )
+        write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
+        write_review_intent(g1.state_root, cr, dispatch_mode="initial")
+        junk = g1.junk_configure()
+        modes: list[tuple[str, str]] = []
+
+        class Recorder(ContractActor):
+            def act(self, stage: Any, dispatch: dict[str, Any]) -> Any:
+                modes.append((stage.id, str(dispatch.get("mode") or "")))
+                return super().act(stage, dispatch)
+
+        actor = Recorder({"final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+
+        assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
+        assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
+        assert modes[:1] == [("final_review", MODE_INITIAL)], modes
+
+
+class TestANewAttemptWithoutARejectLinkIsNeverReplayed:
+    def test_a_rework_that_does_not_name_its_rejecting_review_is_not_a_link(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """The ORDER_VIOLATION-adjacent guard lives on the replay side: a new
+        attempt (rework implement) that does not name the rejecting review as
+        its parent has no REJECT predecessor, so it must not be replayed as a
+        sealed link -- the replayer declines it and the review re-runs for real
+        (where the plugin's attempt-context guard may then reject it)."""
+        g1 = G1(repo, tmp_path)
+        # attempt 1: continuous APPROVE, final REJECT (a real rework steer).
+        cr_commit = commit_file(
+            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
+        )
+        cr = review_receipt(
+            parent_digest=byte_digest(g1.raw),
+            subject=g1.implement,
+            output=cr_commit,
+            verdict="APPROVE",
+        )
+        write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
+        fr_commit = commit_file(
+            repo, ".dev-dispatch/reviews/final/g1-a1.json", '{"verdict": "REJECT"}'
+        )
+        fr = review_receipt(
+            parent_digest=byte_digest(
+                (
+                    g1.state_root
+                    / "receipts"
+                    / derive_attempt_id(DEVELOPMENT_ID, 1, 1)
+                    / "continuous-review-receipt.json"
+                ).read_bytes()
+            ),
+            subject=g1.implement,
+            output=fr_commit,
+            verdict="REJECT",
+            phase="final",
+        )
+        write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr)
+
+        rework_commit = commit_file(repo, ".dd-evidence/rework.json", '{"attempt": 2}')
+        # A rework implement that does NOT name the rejecting review: a "new
+        # attempt" with no REJECT predecessor, so it is not a rework link.
+        rework = {
+            "actor_job_id": "job-2",
+            "artifacts": [],
+            "attempt_id": derive_attempt_id(DEVELOPMENT_ID, 1, 2),
+            "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
+            "development_id": DEVELOPMENT_ID,
+            "feedback_digest": "sha256:" + "0" * 64,
+            "input_commit": fr_commit,
+            "materialization_intent_id": "intent-rework",
+            "output_commit": rework_commit,
+            "parent_handoff_receipt_digest": "sha256:" + "f" * 64,
+            "spec_digest": "sha256:" + "1" * 64,
+            "verification_record": {"verification_commands": []},
+            "work_head_commit": rework_commit,
+        }
+        assert set(rework) == plugin_adapter.IMPLEMENT_RECEIPT_FIELDS
+        write_receipt(g1.state_root, 1, 2, "implement-receipt.json", rework)
+
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), head(repo))
+
+        # Only the pre-rejection prefix replays: the rework attempt is not a
+        # closeable link, so it is declined and the review re-runs for real.
+        assert replayed_stages(state) == ["configure", "implement"]
+        assert next(stage for stage, _ in actor.calls) == "continuous_review"
