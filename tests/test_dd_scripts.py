@@ -52,24 +52,31 @@ class TestConfigure:
         assert written["acceptance_commands"] == [["true"]]
         assert outcome.produced == CONFIGURE.produced_artifacts
 
-    def test_a_fresh_generation_resets_the_feedback_index(self, repo: Path) -> None:
-        """A later generation whose configure runs for real starts its own
-        attempt chain: the feedback index is reset to empty (the historical
-        entries stay in the prior generation's commits), so the pinned carrier's
-        flat ordering check sees the fresh continuous review as attempt 1 rather
-        than a new attempt after an inherited APPROVE (dev-fg-31b963659d16)."""
+    def test_a_fresh_generation_scopes_the_feedback_index(self, repo: Path) -> None:
+        """A later generation's configure re-seeds its own, empty feedback index
+        (the attempt identity is derived per generation), while the previous
+        generation's committed reviews stay immutably recorded in that
+        generation's commits. The pinned carrier's flat ordering check reads the
+        fresh generation's empty chain, not the inherited APPROVE-ended history
+        (dev-fg-31b963659d16)."""
         from conftest import write_index
         from fleet_graph.dd.bootstrap import INDEX_PATH
 
-        write_index(repo, entries=[{"attempt": 1, "review_phase": "continuous"}])
+        historical = [{"attempt": 1, "review_id": "rc-old", "review_phase": "continuous"}]
+        write_index(repo, entries=historical)
         git(repo, "add", "-A")
         git(repo, "commit", "-q", "-m", "carry historical index")
+        inherited = head(repo)
 
         ConfigureStage(repo=repo, run_config={}).act(CONFIGURE, dispatch(generation=2))
 
         index = json.loads((repo / INDEX_PATH).read_text(encoding="utf-8"))
         assert index["entries"] == []
         assert index["development_id"] == "dev-001"
+        # The re-scoping never rewrites history: the inherited index stays what
+        # its own generation committed it to be.
+        preserved = git(repo, "show", f"{inherited}:{INDEX_PATH}")
+        assert json.loads(preserved)["entries"] == historical
 
     def test_generation_one_leaves_the_feedback_index_alone(self, repo: Path) -> None:
         """Generation 1 already carries the bootstrap's empty index; configure

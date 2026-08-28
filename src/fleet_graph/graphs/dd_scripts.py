@@ -135,25 +135,33 @@ class ConfigureStage:
                 **self.run_config,
             },
         )
-        self._reset_feedback_index(dispatch)
+        self._scope_feedback_index(dispatch)
         return StageOutcome(produced=tuple(stage.produced_artifacts))
 
-    def _reset_feedback_index(self, dispatch: Dispatch) -> None:
-        """Start a fresh generation with an empty feedback index.
+    def _scope_feedback_index(self, dispatch: Dispatch) -> None:
+        """Seed the current generation's own, empty feedback index.
 
-        Generation 1 already has the bootstrap's empty index. A later
-        generation whose configure runs for real (the replayer failed closed on
-        product drift rather than replaying the previous generation's reviewed
-        prefix) needs the feedback index scoped to its own attempt chain: the
-        attempt identity is derived from ``(development_id, generation,
+        The feedback index tracks *one generation's* attempt chain: its
+        ``attempt_id`` values are derived from ``(development_id, generation,
         attempt)``, so a fresh generation's first continuous review is attempt 1
-        of its own chain, not a continuation of the previous generation's
-        attempt numbering. Without the reset the pinned carrier's flat
-        ``check_chain_order`` misreads the inherited APPROVE-ended history as
-        "a new attempt requires a prior REJECT" (ORDER_VIOLATION,
-        dev-fg-31b963659d16). The historical entries are preserved immutably in
-        the prior generation's commits; only the current generation's index
-        starts clean.
+        of its own chain -- never a continuation of the previous generation's
+        attempt numbering. Generation 1 already carries the bootstrap's empty
+        index, so only a later generation needs the file re-seeded.
+
+        This re-scoping is not an erasure of history. Every review the previous
+        generation committed remains immutably recorded in that generation's own
+        commits (and its sealed receipts under its state root); the pinned
+        carrier validates them there, exactly as it did when that generation ran.
+        What changes is only which chain the *current* generation is ordered
+        against: scoping the index lets the pinned carrier's flat
+        ``check_chain_order`` read the fresh generation's empty chain instead of
+        misreading the inherited APPROVE-ended history as "a new attempt
+        requires a prior REJECT" (ORDER_VIOLATION, dev-fg-31b963659d16).
+
+        The replayer handles the replayed path the same way: a replayed prefix
+        ends at an implement commit whose committed index is already the
+        generation's own seed or a REJECT-terminated rework prefix, so no
+        inherited APPROVE tail ever reaches the carrier there.
         """
         if int(dispatch.get("generation", 1)) <= 1:
             return

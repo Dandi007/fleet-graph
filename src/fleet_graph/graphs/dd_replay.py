@@ -241,6 +241,16 @@ class ReceiptReplayer:
                     # Fail-closed here instead: replay nothing, so the divergent
                     # work is surfaced rather than silently re-reviewed. (An
                     # unreadable index defers to the materializer.)
+                    #
+                    # When the rule *allows* the replay -- the cross-generation
+                    # case and the after-REJECT case -- the carrier converges on
+                    # the same answer rather than re-raising ORDER_VIOLATION:
+                    # `_prepare` trims to an implement commit whose committed
+                    # index is either the generation's own seed (empty) or a
+                    # REJECT-terminated rework prefix, so the pinned carrier's
+                    # flat ``check_chain_order`` reads a chain a fresh attempt
+                    # may legally follow. The pre-check and the carrier cannot
+                    # diverge into "move the tree, then fail at the seal".
                     self._disabled = True
                     return None
             # The one mutation happens exactly once, on exactly the selected

@@ -465,7 +465,12 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
     continuous review is a new attempt: legal only as the first entry of its
     generation's chain or after a same-chain REJECT. Entries whose durable
     attempt identity belongs to an older generation are immutable history and
-    impose no prior-REJECT requirement on the current generation."""
+    impose no prior-REJECT requirement on the current generation.
+
+    The regressions assert the structured ``materialize()`` result -- the
+    sealed commit and receipt a carrier produces for the legal cross-generation
+    attempt, and the structured ``ORDER_VIOLATION`` the guard raises for the
+    illegal same-chain attempt -- not merely that no shell error surfaced."""
 
     def _entry(self, generation: int, attempt: int, phase: str, verdict: str) -> dict[str, Any]:
         return {
@@ -486,32 +491,58 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
         git(repo, "add", "-A")
         git(repo, "commit", "-q", "-m", "index")
 
-    def test_a_cross_generation_continuous_review_is_legal(self, repo: Path) -> None:
+    def _seal_via_carrier(self, monkeypatch: Any) -> dict[str, Any]:
+        """Monkeypatch the pinned carrier to seal a structured review receipt.
+
+        The real carrier lives in the pinned plugin and cannot run in a unit
+        test; this stand-in returns the same structured receipt shape the
+        plugin's ``review-handoff-receipt`` admits, so ``materialize()`` runs
+        its full path -- the generation-aware guard, then the carrier -- and
+        returns the structured ``Sealed`` the caller asserts.
+        """
+        receipt: dict[str, Any] = {"output_commit": SEALED_COMMIT, "verdict": "APPROVE"}
+        monkeypatch.setattr(plugin_adapter, "invoke_review_materializer", lambda *a, **k: receipt)
+        return receipt
+
+    def test_a_cross_generation_continuous_review_is_legal(
+        self, repo: Path, monkeypatch: Any
+    ) -> None:
         """A later generation inherits the previous generation's committed
         feedback index, but its fresh continuous review is the first attempt of
-        its own chain: the older generation's accepted history must not be read
-        as a prior attempt lacking a REJECT (spec requirement 3)."""
+        its own chain: the older generation's ending-APPROVE history must not be
+        read as a prior attempt lacking a REJECT (spec requirement 3). The
+        assertion is on the structured materialization result -- the sealed
+        commit and receipt the carrier produced -- not on a request payload
+        field (spec requirement 6)."""
         self._commit_index(
             repo,
             [
                 self._entry(1, 1, "continuous", "APPROVE"),
-                self._entry(1, 1, "final", "APPROVE"),
+                self._entry(1, 1, "final", "REJECT"),
+                self._entry(1, 2, "continuous", "APPROVE"),
+                self._entry(1, 2, "final", "APPROVE"),
             ],
         )
         dispatch = dispatch_for(repo, "continuous_review")
         dispatch["generation"] = 2
         seal_implement_receipt(repo, derive_attempt_id(DEVELOPMENT_ID, 2, 1))
+        expected = self._seal_via_carrier(monkeypatch)
 
-        request = make_materializer(repo).request(
+        sealed = make_materializer(repo).materialize(
             REVIEW, dispatch, StageOutcome(receipt=review_receipt())
         )
-        assert request["dispatch"]["attempt_id"] == derive_attempt_id(DEVELOPMENT_ID, 2, 1)
 
-    def test_a_same_chain_new_attempt_without_a_prior_reject_is_refused(self, repo: Path) -> None:
+        assert sealed.commit == SEALED_COMMIT
+        assert sealed.receipt == expected
+
+    def test_a_same_chain_new_attempt_without_a_prior_reject_is_refused(
+        self, repo: Path, monkeypatch: Any
+    ) -> None:
         """A genuinely new attempt within the same generation's chain still owes
         its prior REJECT: an APPROVE-ended predecessor makes the fresh
-        continuous review illegal and it is refused at materialization, not
-        silently passed through (spec requirements 2 and 5)."""
+        continuous review illegal and materialization raises the structured
+        ORDER_VIOLATION, not a shell error and not a silent pass-through (spec
+        requirements 2 and 5)."""
         self._commit_index(
             repo,
             [
@@ -520,13 +551,16 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
             ],
         )
         dispatch = dispatch_for(repo, "continuous_review")
+        self._seal_via_carrier(monkeypatch)
 
         with pytest.raises(MaterializationFailed, match="ORDER_VIOLATION"):
-            make_materializer(repo).request(
+            make_materializer(repo).materialize(
                 REVIEW, dispatch, StageOutcome(receipt=review_receipt())
             )
 
-    def test_a_same_chain_new_attempt_after_a_reject_is_legal(self, repo: Path) -> None:
+    def test_a_same_chain_new_attempt_after_a_reject_is_legal(
+        self, repo: Path, monkeypatch: Any
+    ) -> None:
         self._commit_index(
             repo,
             [
@@ -536,11 +570,13 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
         )
         dispatch = dispatch_for(repo, "continuous_review", attempt=2)
         seal_implement_receipt(repo, derive_attempt_id(DEVELOPMENT_ID, 1, 2))
+        expected = self._seal_via_carrier(monkeypatch)
 
-        request = make_materializer(repo).request(
+        sealed = make_materializer(repo).materialize(
             REVIEW, dispatch, StageOutcome(receipt=review_receipt())
         )
-        assert request["dispatch"]["attempt_id"] == derive_attempt_id(DEVELOPMENT_ID, 1, 2)
+        assert sealed.commit == SEALED_COMMIT
+        assert sealed.receipt == expected
 
     def test_the_guard_mirrors_the_shared_rule(self, repo: Path) -> None:
         """The materializer's guard is the same generation-aware source the
