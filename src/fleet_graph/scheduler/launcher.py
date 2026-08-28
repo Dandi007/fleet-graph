@@ -44,6 +44,12 @@ class LaunchSpec:
     #: because the trust anchor is the roster config's PR review, not secrecy.
     #: None means the roster declared nothing and the line records that fact.
     acceptance_json: str | None = None
+    #: The line's streak breakers, forwarded as CLI bounds only when the roster
+    #: declared them. None means "absent" -- the line keeps its own defaults --
+    #: so a scheduler that never heard of a bound must not pass the runner's
+    #: defaults down as if someone had reviewed them.
+    noop_limit: int | None = None
+    timeout_limit: int | None = None
 
     @property
     def log_file(self) -> Path:
@@ -104,6 +110,10 @@ class LaunchSpec:
         ]
         if self.acceptance_json:
             argv += ["--acceptance-json", self.acceptance_json]
+        if self.noop_limit is not None:
+            argv += ["--noop-limit", str(self.noop_limit)]
+        if self.timeout_limit is not None:
+            argv += ["--timeout-limit", str(self.timeout_limit)]
         return argv
 
 

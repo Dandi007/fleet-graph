@@ -47,6 +47,17 @@ class AgentSessionError(RuntimeError):
     """agent-session returned ok:false, or could not be parsed."""
 
 
+class AgentSessionTimeout(AgentSessionError, TimeoutError):
+    """A turn that timed out, in-band or out-of-band.
+
+    Still an AgentSessionError -- every caller that catches the session error
+    keeps catching it -- but it also inherits TimeoutError so the goal_line
+    worker-turn guard (`except TimeoutError`) stops treating a timed-out seat as
+    an opaque seat failure. That guard is the graceful path: record the timeout,
+    append a `worker_turn_timeout` round, and let the streak breaker decide.
+    """
+
+
 def derive_seat_key(thread_id: str, seat: str) -> str:
     """Stable key for one logical seat of one graph thread.
 
@@ -122,9 +133,11 @@ def _envelope(stdout: str, *, context: str) -> dict[str, Any]:
         if isinstance(parsed, dict):
             if parsed.get("ok") is False:
                 error = parsed.get("error") or {}
-                raise AgentSessionError(
-                    f"{context} failed: {error.get('code')}: {error.get('message')}"
-                )
+                code = error.get("code")
+                message = f"{context} failed: {code}: {error.get('message')}"
+                if code == "TURN_TIMEOUT":
+                    raise AgentSessionTimeout(message)
+                raise AgentSessionError(message)
             return parsed
     raise AgentSessionError(f"{context}: no JSON envelope in output: {stdout[:300]!r}")
 
@@ -206,14 +219,20 @@ class AgentSessionSeat:
             "--timeout-seconds",
             str(timeout_seconds),
         ]
-        completed = subprocess.run(
-            argv,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout_seconds + 60,
-        )
+        try:
+            completed = subprocess.run(
+                argv,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_seconds + 60,
+            )
+        # subprocess.TimeoutExpired is not a TimeoutError, so the worker-turn
+        # guard would never see it as a timeout either; map it onto the same
+        # typed timeout as the in-band TURN_TIMEOUT envelope.
+        except subprocess.TimeoutExpired as exc:
+            raise AgentSessionTimeout(f"agent-session send timed out after {exc.timeout}s") from exc
         return _envelope(completed.stdout, context="agent-session send")
 
     def status(self, handle: SeatHandle) -> dict[str, Any]:
@@ -249,6 +268,7 @@ class AgentSessionSeat:
 __all__ = [
     "AgentSessionError",
     "AgentSessionSeat",
+    "AgentSessionTimeout",
     "SeatHandle",
     "SeatSpec",
     "derive_seat_key",
