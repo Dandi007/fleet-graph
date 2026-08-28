@@ -194,23 +194,38 @@ def bundle_resources(loaded: Any) -> dict[str, str]:
 REVIEW_PROMPT = """\
 You are the {phase} Reviewer for one `dev-dispatch.attempt-context/v1` attempt.
 
-## The commit under review
+## The commits under review
 
-- `input_commit`: `{subject_commit}`
-- `subject_commit`: `{subject_commit}`
-- `implementation_subject_commit`: `{implementation_subject_commit}`
+- `input_commit`: `{subject_commit}` (this review starts from the previous
+  stage's sealed output)
+- `subject_commit`: `{subject_commit}` (equal to `input_commit`, by contract)
+- `implementation_subject_commit`: `{implementation_subject_commit}` (the
+  implement stage's sealed output)
+- product commit (`work_head_commit`): `{product_commit}`
 
-Your persona asks you to check those three agree before reviewing. They are
-listed here because they are supplied to you, not discovered: if they do not
-agree, say so as a `blocker` finding with `REJECT` rather than stopping
-silently -- a review that stops without a verdict is indistinguishable from
-one that never ran.
+`subject_commit` and `implementation_subject_commit` are commits written by the
+dev-dispatch materializer. The implement materializer seals its handoff by
+stacking a metadata-only commit -- one that changes only the reserved
+`.dev-dispatch/` namespace -- on top of the implement actor's product commit
+(`work_head_commit`), and the review materializer does the same for the review
+artifacts. Two of these SHAs may therefore differ while their product trees are
+byte-identical. Verify product consistency mechanically before reviewing, not
+by SHA equality:
 
-Review the product changes at `{subject_commit}` against the approved spec at
-`{spec_path}`, in the worktree `{worktree_path}`. Read the committed feedback
-index at `{index_path}` and every review artifact it references; that index is
-the only feedback history. Do not modify anything: this is a read-only review,
-and a reviewer that writes to the subject workspace has its verdict discarded.
+    git diff --exit-code {product_commit} {subject_commit} -- . ':(exclude).dev-dispatch'
+
+must exit 0. If that diff is non-empty -- the materialization commit actually
+changed a product file -- report a `blocker` finding with `REJECT` rather than stopping
+silently; a review that stops without a verdict is indistinguishable
+from one that never ran. Do not reject merely because two SHAs differ: a
+metadata-only materialization is compliant, not a finding.
+
+Review the product changes at `{product_commit}` (carried unchanged into
+`{subject_commit}`) against the approved spec at `{spec_path}`, in the worktree
+`{worktree_path}`. Read the committed feedback index at `{index_path}` and
+every review artifact it references; that index is the only feedback history.
+Do not modify anything: this is a read-only review, and a reviewer that writes
+to the subject workspace has its verdict discarded.
 
 ## Your verdict
 
@@ -260,6 +275,26 @@ def derive_review_id(attempt_id: str, phase: str) -> str:
     return f"{REVIEW_ID_PREFIX[phase]}{attempt_id}"
 
 
+def implement_product_commit(
+    dispatch: dict[str, Any], *, implementation_subject_commit: str
+) -> str:
+    """The commit whose product tree a review is bound to review.
+
+    The implement materializer seals the handoff with a metadata-only commit
+    (its `output_commit`) stacked on the actor's product commit (its
+    `work_head_commit`). The product commit is what the review subject must be
+    product-path-equal to. It travels on the implement receipt, which for a
+    continuous review is the parent receipt carried on the dispatch. For a
+    final review the parent is the continuous review receipt, which carries no
+    `work_head_commit`, so the tree-equal anchor is `implementation_subject_commit`
+    -- the implement's sealed output, itself metadata-only with respect to the
+    same product tree.
+    """
+    parent = dispatch.get("parent_receipt") or {}
+    work_head = parent.get("work_head_commit")
+    return str(work_head) if work_head else implementation_subject_commit
+
+
 def render_review_prompt(
     stage_dispatch: dict[str, Any],
     *,
@@ -269,6 +304,7 @@ def render_review_prompt(
     implementation_subject_commit: str,
     spec_path: str,
     index_path: str,
+    product_commit: str = "",
 ) -> str:
     """Our own review prompt, not the bundle's workflow.
 
@@ -289,6 +325,7 @@ def render_review_prompt(
         review_id=derive_review_id(stage_dispatch["attempt_id"], phase),
         attempt_id=stage_dispatch["attempt_id"],
         implementation_subject_commit=implementation_subject_commit,
+        product_commit=product_commit or implementation_subject_commit,
         spec_digest=stage_dispatch["spec_ref"]["digest"],
         reviewer_job_id=reviewer_job_id,
     )
@@ -340,14 +377,17 @@ class PluginPromptSource:
             dispatch, parent_receipt=dispatch.get("parent_receipt") or None
         )
         if phase is not None:
+            implementation_subject_commit = (dispatch.get("artifact_commits") or {}).get(
+                IMPLEMENT_EVIDENCE
+            ) or stage_dispatch["input_commit"]
             return render_review_prompt(
                 stage_dispatch,
                 phase=phase,
                 worktree_path=self.worktree_path,
                 reviewer_job_id=actor_job_id,
-                implementation_subject_commit=(
-                    (dispatch.get("artifact_commits") or {}).get(IMPLEMENT_EVIDENCE)
-                    or stage_dispatch["input_commit"]
+                implementation_subject_commit=implementation_subject_commit,
+                product_commit=implement_product_commit(
+                    dispatch, implementation_subject_commit=implementation_subject_commit
                 ),
                 spec_path=self.builder.spec_path,
                 index_path=self.builder.index_path,
@@ -379,6 +419,7 @@ __all__ = [
     "as_value",
     "bundle_resources",
     "derive_review_id",
+    "implement_product_commit",
     "render_commands",
     "render_review_prompt",
     "render_stage_prompt",
