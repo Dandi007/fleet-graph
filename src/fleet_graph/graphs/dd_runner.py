@@ -104,6 +104,11 @@ class DevelopmentConfig:
     management_cost: Any = None
     # Pushing to a durable ref is the one step here that cannot be undone.
     publish_merge: bool = False
+    #: The bounded principal that dispatched this development (a line folder or
+    #: a human subject), threaded through to the stage run labels as
+    #: `dispatched_by`. Empty lets the actor fall back to the dispatcher. Never
+    #: a run_id/uuid: the label must name a bounded subject, not an identity.
+    dispatched_by: str = ""
 
     @property
     def thread_id(self) -> str:
@@ -180,6 +185,7 @@ def build_pipeline(
             acceptance_commands=list(config.run_config.get("acceptance_commands") or []),
             verify_worktree_head=config.verify_worktree_head,
         ),
+        dispatched_by=config.dispatched_by,
     )
     sealer = PluginMaterializer(
         builder=builder,

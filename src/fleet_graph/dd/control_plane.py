@@ -393,6 +393,12 @@ class DdLaunchSpec:
     setup_commands: list[list[str]] = field(default_factory=list)
     acceptance_env: dict[str, str] = field(default_factory=dict)
     board_card: str = ""
+    #: The bounded principal that dispatched this development (a line folder or
+    #: a human subject), forwarded to the runner as `--dispatched-by` and
+    #: recorded on every dd-worker run as the `dispatched_by` label. Empty means
+    #: no finer provenance was recorded and the runner falls back to the
+    #: dispatcher. Never a run_id/uuid.
+    dispatched_by: str = ""
     resume: bool = False
     launch_seq: int = 1
     #: Which generation this launch runs. The thread id, the derived run ids,
@@ -486,6 +492,8 @@ class DdLaunchSpec:
             argv += ["--stage-model", f"{stage}={model}"]
         if self.board_card:
             argv += ["--board-card", self.board_card]
+        if self.dispatched_by:
+            argv += ["--dispatched-by", self.dispatched_by]
         if self.resume:
             # Deliberately valueless: the gate re-reads the board on resume,
             # so whoever relaunches the unit cannot cast the verdict by it.
@@ -535,11 +543,17 @@ class DdControlPlane:
         target_base: str | None = None,
         spec_text: str | None = None,
         spec_path: str | None = None,
+        dispatched_by: str = "",
     ) -> dict[str, Any]:
         """Admit one development: derive everything, bootstrap, record.
 
         Idempotent: the same (repo, spec, base) admission returns the same
         development, with `already_admitted` set instead of a second identity.
+
+        `dispatched_by` is the bounded principal (a line folder or a human
+        subject) that dispatched this development; it is recorded and forwarded
+        to the runner as the `dispatched_by` worker-run label. Empty means no
+        finer provenance was recorded.
         """
         repo = self._admit_repo(repo_path)
         spec = self._read_spec(spec_text, spec_path)
@@ -547,6 +561,7 @@ class DdControlPlane:
         spec_digest = digest_of(spec)
         development_id = derive_development_id(repo, spec_digest, base)
         dev_root = self.root / development_id
+        dispatched_by = (dispatched_by or "").strip()
 
         existing = self._read_record_if_any(development_id)
         if existing is not None:
@@ -601,6 +616,7 @@ class DdControlPlane:
             "root_handoff_digest": root_handoff_digest,
             "acceptance_commands": acceptance_commands,
             "card_entity_id": card_entity_id,
+            "dispatched_by": dispatched_by,
             "plugin_binding_path": str(self.plugin_binding),
             "created_at": iso(self.clock()),
         }
@@ -1073,6 +1089,7 @@ class DdControlPlane:
             setup_commands=[list(c) for c in record.get("setup_commands") or []],
             acceptance_env=dict(record.get("acceptance_env") or {}),
             board_card=str(record.get("card_entity_id") or ""),
+            dispatched_by=str(record.get("dispatched_by") or ""),
             resume=resume,
             launch_seq=seq,
             generation=generation,

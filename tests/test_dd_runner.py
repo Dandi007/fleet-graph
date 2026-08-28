@@ -350,6 +350,15 @@ class TestTheWiringReadsTheContract:
         assert config.thread_id == f"{DEVELOPMENT_ID}:g1"
         assert json.dumps(str(config.run_root))
 
+    def test_dispatched_by_flows_from_config_to_the_actor(self, repo: Path, tmp_path: Path) -> None:
+        """The bounded dispatch principal is a config-chain value threaded to
+        the stage actor's run labels, not an identity minted at dispatch."""
+        config = make_config(repo, tmp_path)
+        config.dispatched_by = "ronin-model-switch"
+        _graph, deps = build_pipeline(config)
+
+        assert deps.dispatcher.dispatched_by == "ronin-model-switch"
+
 
 class FakeBoard:
     """A board that records what was asked and answers when told to.

@@ -278,6 +278,78 @@ class TestTheDdSubcommand:
         )
         assert args.accept == ["make verify", "pytest -q"]
 
+    def test_dispatched_by_defaults_to_empty(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "dd",
+                "run",
+                "--development",
+                "d",
+                "--workspace",
+                "/tmp/w",
+                "--plugin-binding",
+                "/tmp/b.json",
+                "--remote-url",
+                "u",
+                "--remote-ref",
+                "refs/heads/main",
+                "--root-digest",
+                "sha256:" + "a" * 64,
+            ]
+        )
+        assert args.dispatched_by == ""
+
+    def test_dispatched_by_reaches_the_development_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """`--dispatched-by` is the one production path that populates the
+        `dispatched_by` stage label; without this, every dd-worker run falls
+        back to the dispatcher constant (final-review blocker)."""
+        from conftest import git
+        from fleet_graph.cli import _dd_run
+        from fleet_graph.dd import vendor
+        from fleet_graph.graphs import dd_runner
+
+        workspace = tmp_path / "work"
+        workspace.mkdir()
+        git(workspace, "init", "-q", "-b", "main")
+        (workspace / "seed.txt").write_text("x\n", encoding="utf-8")
+        git(workspace, "add", "-A")
+        git(workspace, "commit", "-q", "-m", "seed")
+
+        seen: dict[str, Any] = {}
+        monkeypatch.setattr(vendor.plugin_adapter, "load_plugin_binding", lambda config: object())
+        monkeypatch.setattr(
+            dd_runner,
+            "run_pipeline",
+            lambda config, **kwargs: seen.update(config=config) or {"terminal": "complete"},
+        )
+        binding = tmp_path / "b.json"
+        binding.write_text("{}", encoding="utf-8")
+
+        args = build_parser().parse_args(
+            [
+                "dd",
+                "run",
+                "--development",
+                "d",
+                "--workspace",
+                str(workspace),
+                "--plugin-binding",
+                str(binding),
+                "--remote-url",
+                "u",
+                "--remote-ref",
+                "refs/heads/main",
+                "--root-digest",
+                "sha256:" + "a" * 64,
+                "--dispatched-by",
+                "ronin-model-switch",
+            ]
+        )
+        assert _dd_run(args) == 0
+        assert seen["config"].dispatched_by == "ronin-model-switch"
+
     @pytest.mark.parametrize(
         "missing", ["--development", "--workspace", "--plugin-binding", "--remote-ref"]
     )

@@ -7,6 +7,7 @@ results. Everything else in P1 can be re-done cheaply; this cannot.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -167,6 +168,40 @@ class TestReAdopt:
         status = restarted.poll(adopted)
         assert status.state == "succeeded"
         assert dispatch_count(launcher, run_id) == 1
+
+    def test_a_re_adopted_run_keeps_the_labels_it_was_first_dispatched_with(
+        self, launcher: AgentRunLauncher
+    ) -> None:
+        """kill-resume: a restarted process mints a new launch id, but the
+        adopted run must keep the first dispatch's label (idempotent upsert) --
+        the launcher never rewrites argv.json for an adopted session root."""
+        run_id = derive_run_id("t-labels", "coordinator-1")
+        launcher.launch(
+            AgentRunSpec(
+                prompt="sleep=2",
+                labels={"role": "supervisor", "goal": "wf-x", "launch": "launch-A", "round": "1"},
+            ),
+            run_id,
+        )
+        assert wait_until(lambda: dispatch_count(launcher, run_id) == 1)
+
+        restarted = AgentRunLauncher(
+            bin_path=launcher.bin_path, state_root=str(launcher.state_root)
+        )
+        adopted = restarted.launch(
+            AgentRunSpec(
+                prompt="sleep=2",
+                labels={"role": "supervisor", "goal": "wf-x", "launch": "launch-B", "round": "1"},
+            ),
+            run_id,
+        )
+        assert adopted.adopted is True
+
+        argv = json.loads((Path(adopted.session_root) / "argv.json").read_text())
+        assert "launch=launch-A" in argv
+        assert "launch=launch-B" not in argv
+
+        restarted.wait(adopted, poll_interval=0.05, deadline_seconds=60)
 
     def test_child_outlives_the_parent_process(self, launcher: AgentRunLauncher) -> None:
         """Detachment is the whole point -- verify it rather than assuming it.

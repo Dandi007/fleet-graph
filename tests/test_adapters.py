@@ -129,6 +129,25 @@ class TestCoordinatorAdapter:
         coordinator.turn(1, {"round": 1})
         assert launcher.specs[0].role == "goal_coordinator"
 
+    def test_per_turn_labels_carry_role_goal_launch_and_round(self, run_root: Path) -> None:
+        """role/goal/launch/round are the upstream observability contract
+        labels; round is per-turn, launch is the process-scoped identity."""
+        launcher = FakeLauncher(ok_status({"verdict": "done"}))
+        coordinator = AgentRunCoordinator(
+            launcher=launcher,
+            folder_id="wf-40fa8d",
+            thread_id="t1",
+            run_root=run_root,
+            launch_id="launch-wf-40fa8d-g1-1700000000",
+        )
+        coordinator.turn(3, {"round": 3})
+
+        labels = launcher.specs[0].labels
+        assert labels["role"] == "supervisor"
+        assert labels["goal"] == "wf-40fa8d"
+        assert labels["launch"] == "launch-wf-40fa8d-g1-1700000000"
+        assert labels["round"] == "3"
+
     def test_a_failed_run_is_a_fault(self, run_root: Path) -> None:
         failed = RunStatus("failed", {"state": "failed", "exit_code": 3})
         coordinator, _ = self.build(run_root, failed)

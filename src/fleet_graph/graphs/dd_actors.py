@@ -153,6 +153,12 @@ class AgentRunStageActor:
     default_timeout_seconds: int = 3600
     poll_interval: float = 2.0
     extra_labels: dict[str, str] = field(default_factory=dict)
+    #: The bounded principal that dispatched this development (a line folder or
+    #: a human subject), carried from DevelopmentConfig. Never a run_id/uuid:
+    #: the label must name a stable bounded subject, not an unbounded identity.
+    #: Empty falls back to the dispatcher constant, the one bounded system
+    #: subject always available when no finer provenance was recorded.
+    dispatched_by: str = ""
     # When wired, this actor is the responsible producer of the launch (the
     # implement stage it dispatches) and review (the continuous/final review
     # stages) lifecycle facts the cost-observability recording rules consume.
@@ -230,6 +236,10 @@ class AgentRunStageActor:
             "development": self.development_id,
             "dispatcher": DISPATCHER,
             "stage": stage.id,
+            "role": "dd-worker",
+            "order": self.development_id,
+            "attempt": str(int(dispatch.get("attempt", 1))),
+            "dispatched_by": self.dispatched_by or DISPATCHER,
             **self.extra_labels,
         }
         model = self.models.get(stage.id)
