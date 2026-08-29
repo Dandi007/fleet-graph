@@ -1,0 +1,35 @@
+{
+ "development_id": "dev-fg-e870804ad885",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_arbiter.py",
+   "tests/test_arbiter_managed_path.py",
+   "tests/test_deploy_unit.py"
+  ],
+  [
+   "uv",
+   "run",
+   "fleet-graph",
+   "arbiter",
+   "run",
+   "--bus-url",
+   "http://127.0.0.1:7490"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
