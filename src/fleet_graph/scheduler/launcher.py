@@ -31,6 +31,10 @@ class LaunchSpec:
     folder_id: str
     seat: str
     generation: int = 1
+    #: The line's agent-bus inbox alias. None means the line has no inbox and
+    #: runs the null inbox. Forwarded as `--alias` so the line process builds
+    #: a real `Inbox` over `agent:{alias}` instead of a structurally empty one.
+    alias: str | None = None
     max_rounds: int = 10
     run_root: Path | None = None
     log_path: Path | None = None
@@ -110,6 +114,8 @@ class LaunchSpec:
         ]
         if self.acceptance_json:
             argv += ["--acceptance-json", self.acceptance_json]
+        if self.alias:
+            argv += ["--alias", self.alias]
         if self.noop_limit is not None:
             argv += ["--noop-limit", str(self.noop_limit)]
         if self.timeout_limit is not None:

@@ -928,6 +928,7 @@ class Scheduler:
             folder_id=line.folder_id,
             seat=line.seat,
             generation=self.generation_of(line),
+            alias=line.alias,
             max_rounds=line.max_rounds,
             run_root=self.config.run_root / line.folder_id,
             environment=self.line_environment(),

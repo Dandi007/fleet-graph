@@ -19,6 +19,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from fleet_graph.acceptance import AcceptanceRunner, AcceptanceSpec
 from fleet_graph.bus.client import BusClient
 from fleet_graph.bus.inbox import Inbox
+from fleet_graph.bus.tokens import resolve_line_token
 from fleet_graph.executors.agent_run import AgentRunLauncher
 from fleet_graph.executors.agent_session import (
     AgentSessionSeat,
@@ -31,7 +32,7 @@ from fleet_graph.goal_interrupt.store import GoalInterruptStore
 from fleet_graph.graphs.adapters import AgentRunCoordinator, AgentSessionWorker
 from fleet_graph.graphs.goal_line import LineDeps, build_goal_line_graph
 from fleet_graph.graphs.guards import LineBounds, LineGuards
-from fleet_graph.state.run_artifacts import RunArtifacts, write_json_durable
+from fleet_graph.state.run_artifacts import RunArtifacts, iso, write_json_durable
 
 
 @dataclass
@@ -167,7 +168,7 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         turn_timeout_seconds=config.turn_timeout_seconds,
     )
 
-    inbox: Any = Inbox(BusClient(), config.inbox_alias) if config.inbox_alias else _NullInbox()
+    inbox: Any = _build_line_inbox(config)
 
     deps = LineDeps(
         coordinator=coordinator,
@@ -243,6 +244,66 @@ class _NullInbox:
     def drain_then_ack(self, persist: Any) -> tuple[list[Any], list[str]]:
         persist([])
         return [], []
+
+
+class _DegradedInbox:
+    """A line with an alias but no usable credential: drain degrades in place.
+
+    The line still runs and the coordinator still receives a well-formed empty
+    ``inbox_messages``; the reason is recorded durably under the run root, so a
+    missing line token is never silently mistaken for an empty inbox. Nothing
+    is acked (there was nothing to read) and the line is never faulted solely
+    because an inbox credential is absent (fail-open, E1 gap #4).
+    """
+
+    def __init__(self, alias: str, reason: str, record_path: Path) -> None:
+        self.alias = alias
+        self.reason = reason
+        self.record_path = record_path
+
+    def drain_then_ack(self, persist: Any) -> tuple[list[Any], list[str]]:
+        persist([])
+        try:
+            self.record_path.parent.mkdir(parents=True, exist_ok=True)
+            self.record_path.write_text(
+                json.dumps(
+                    {
+                        "alias": self.alias,
+                        "reason": self.reason,
+                        "recorded_at": iso(time.time()),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        return [], []
+
+
+def _build_line_inbox(config: LineConfig) -> Any:
+    """The line's inbox: a real ``Inbox`` authenticated as the line itself.
+
+    The ``agent:{alias}`` channel is owner-only and the owner is the line's
+    pump, so the client must present the line's own mirrored token (the same
+    credential family the scheduler's wake probe uses, resolved by the shared
+    ``resolve_line_token`` helper) -- never the fleet-graph service token,
+    which the channel ACL structurally 403s. A line with no alias gets the
+    null inbox; a line whose token cannot be resolved degrades explicitly
+    instead of faulting the line (fail-open).
+    """
+    alias = config.inbox_alias
+    if not alias:
+        return _NullInbox()
+    resolution = resolve_line_token(alias)
+    if not resolution.present:
+        return _DegradedInbox(
+            alias=alias,
+            reason=resolution.status,
+            record_path=config.run_root / "inbox-degraded.json",
+        )
+    return Inbox(BusClient(token=resolution.token), alias)
 
 
 def resume_start(compiled: Any, invoke_config: dict[str, Any]) -> dict[str, Any] | None:
