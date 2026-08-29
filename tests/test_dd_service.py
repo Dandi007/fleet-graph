@@ -29,6 +29,7 @@ from fastmcp.exceptions import ToolError
 from fleet_graph.dd.control_plane import ControlPlaneError
 from fleet_graph.dd.service import (
     DEFAULT_PORT,
+    GOAL_ENROLL_TOOLS,
     NOT_SUPPORTED_TOOLS,
     SUPPORTED_TOOLS,
     WORK_FOLDER_TOOLS,
@@ -53,6 +54,7 @@ ALL_TOOLS = {
     "development_adopt",
     "development_recover",
     "wf_reconcile",
+    "goal_enroll",
 }
 
 # Arguments that satisfy each legacy-only tool's schema, so the refusal we
@@ -147,7 +149,7 @@ def test_selected_port_is_free_and_not_a_legacy_port() -> None:
         pytest.skip("port 5610 is already being served on this host")
 
 
-def test_all_sixteen_tools_are_reachable() -> None:
+def test_all_seventeen_tools_are_reachable() -> None:
     server = build_mcp_server(FakeControlPlane())
     tools = asyncio.run(server.list_tools())
     assert {tool.name for tool in tools} == ALL_TOOLS
@@ -159,14 +161,21 @@ def test_the_surface_split_is_exactly_the_ruling() -> None:
     R1-c moved `development_reconfigure` from the refused side to the real
     side (the environment/contract failure exit); steer / relock / control /
     deployment_* stay refused. `wf_reconcile` (the B3 work-folder recovery exit)
-    is a third, separate family on the same surface -- it drives a work-folder
-    source seam, not the development control plane.
+    and `goal_enroll` (the E5 goal-line enroll exit) are separate families on
+    the same surface -- they drive source seams, not the development control
+    plane.
     """
-    assert SUPPORTED_TOOLS | set(NOT_SUPPORTED_TOOLS) | WORK_FOLDER_TOOLS == ALL_TOOLS
+    assert SUPPORTED_TOOLS | set(NOT_SUPPORTED_TOOLS) | WORK_FOLDER_TOOLS | GOAL_ENROLL_TOOLS == (
+        ALL_TOOLS
+    )
     assert not SUPPORTED_TOOLS & set(NOT_SUPPORTED_TOOLS)
     assert not WORK_FOLDER_TOOLS & SUPPORTED_TOOLS
     assert not WORK_FOLDER_TOOLS & set(NOT_SUPPORTED_TOOLS)
+    assert not GOAL_ENROLL_TOOLS & SUPPORTED_TOOLS
+    assert not GOAL_ENROLL_TOOLS & set(NOT_SUPPORTED_TOOLS)
+    assert not GOAL_ENROLL_TOOLS & WORK_FOLDER_TOOLS
     assert {"wf_reconcile"} == WORK_FOLDER_TOOLS
+    assert {"goal_enroll"} == GOAL_ENROLL_TOOLS
     assert {
         "development_list",
         "development_get",
