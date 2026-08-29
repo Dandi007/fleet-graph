@@ -719,6 +719,8 @@ class ReceiptReplayer:
             reset = run_git(self.workspace, "reset", "--hard", "--quiet", tip)
             if reset.returncode != 0:
                 return False
+        elif not self._clear_stale_run_config_residue():
+            return False
 
         # Installed under the identity the receipts were sealed with -- their
         # own `attempt_id`, which the walker pins for the rest of the pass.
@@ -744,6 +746,66 @@ class ReceiptReplayer:
         if self.run_config is not None:
             self._pending_run_config = self._reconfigured_run_config(plan[0].output_commit)
         return True
+
+    def _clear_stale_run_config_residue(self) -> bool:
+        """Drop a previous generation's controller-owned ``run-config.json`` dirt.
+
+        When ``HEAD`` already equals the replay tip, ``_prepare`` skips its
+        ``reset --hard`` branch, so a reconfigured acceptance declaration a
+        *previous* failed generation left uncommitted survives into the fresh
+        final reviewer and is blamed on the actor (ACTOR_RESERVED_PATH_CHANGED).
+        Restore HEAD's committed copy of exactly that one file, and only when
+        the residue is provably controller-owned: the sole ``.dev-dispatch/**``
+        change is ``run-config.json``, and its worktree copy names this
+        development at a previous generation. Anything else -- a write to any
+        other reserved path, or a run-config that is not a stale controller
+        declaration -- is left for the reserved-path guard to refuse, never
+        hidden (fail-closed).
+        """
+        status = run_git(
+            self.workspace,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            ".dev-dispatch",
+        )
+        if status.returncode != 0:
+            # Cannot inspect the tree: let the guard refuse rather than guess.
+            return True
+        changed = {line[3:] for line in status.stdout.splitlines() if len(line) > 3}
+        if changed != {RUN_CONFIG_PATH}:
+            # Clean, or a change beyond the one controller-owned file.
+            return True
+        if not self._is_stale_controller_run_config():
+            return True
+        restore = run_git(self.workspace, "checkout", "HEAD", "--", RUN_CONFIG_PATH)
+        return restore.returncode == 0
+
+    def _is_stale_controller_run_config(self) -> bool:
+        """Whether the dirty worktree run-config is a previous generation's.
+
+        The controller's configure/reconfigure always writes ``development_id``
+        and ``generation``. A run-config whose ``generation`` is strictly less
+        than the current one was written for a generation that already ended,
+        so it is stale controller residue rather than this generation's
+        declaration (which the replayer defers to acceptance) or an actor's
+        legitimate output.
+        """
+        try:
+            raw = (self.workspace / RUN_CONFIG_PATH).read_text(encoding="utf-8")
+        except OSError:
+            return False
+        try:
+            config = json.loads(raw)
+        except ValueError:
+            return False
+        if not isinstance(config, dict):
+            return False
+        if str(config.get("development_id") or "") != self.development_id:
+            return False
+        generation = config.get("generation")
+        return isinstance(generation, int) and generation < self.generation
 
     def _reconfigured_run_config(self, configure_commit: str) -> dict[str, Any] | None:
         """The run-config this generation must materialise, when reconfigured.
