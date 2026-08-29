@@ -734,6 +734,12 @@ class TestCredentialDiscipline:
         # not inherit this process's PATH (scheduler line_environment lesson).
         assert plane.environment["PATH"]
         monkeypatch.delenv("FLEET_GRAPH_BUS_TOKEN_FILE")
+        # The whitelist also forwards the cost-observability site config (pinned
+        # separately by test_cost_observability_site_config_is_forwarded); clear
+        # it here so this assertion is about the token path alone and stays
+        # deterministic whatever the ambient environment sets.
+        monkeypatch.delenv("FLEET_GRAPH_COST_OBS_DIR", raising=False)
+        monkeypatch.delenv("FLEET_GRAPH_MANAGEMENT_COST", raising=False)
         bare = DdControlPlane(root=tmp_path / "dd", board_factory=lambda: None)
         assert set(bare.environment) == {"PATH"}, "a raw token value is never forwarded"
 

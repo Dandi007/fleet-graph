@@ -345,6 +345,7 @@ def _scheduler_run(args: argparse.Namespace) -> int:
     """Run the resident scheduler: look at each line, ask, start or record why not."""
     import pathlib
 
+    from fleet_graph.scheduler.checkpoint_terminal import SqliteCheckpointTerminalReader
     from fleet_graph.scheduler.daemon import Scheduler, SchedulerConfig
     from fleet_graph.scheduler.launcher import TransientLauncher
     from fleet_graph.scheduler.probe import CliGatewayProber, GatewayProber, HttpxProbeTransport
@@ -380,6 +381,9 @@ def _scheduler_run(args: argparse.Namespace) -> int:
         observe=lambda result: print(json.dumps(result.as_dict(), ensure_ascii=False), flush=True),
         wake=LiveWakeSignals(),
         board=board,
+        # E3: normal terminal/account/parking decisions come from the line's
+        # durable checkpoint (get_state); terminal.json is the derived view.
+        checkpoints=SqliteCheckpointTerminalReader(config.run_root),
     )
 
     # R4-2: the supervisor event observer rides this scheduler's tick. Config
