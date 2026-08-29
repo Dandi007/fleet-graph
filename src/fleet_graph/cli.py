@@ -799,11 +799,14 @@ def _arbiter_run(args: argparse.Namespace) -> int:
     it would publish, but writes nothing. Publication requires the explicit
     --publish flag; this development never enables it in production.
 
-    The managed path (--publish) first proves, read-only, that the caller is the
-    expected arbiter principal and that the alias binding resolves to its inbox
-    ``agent:<alias>``: a missing/mismatched/rebound/unauthorized identity is
-    refused with a non-secret error and a non-zero exit before any model work or
-    publication.
+    The managed path (--publish) first proves, read-only, against the real
+    Agent Bus gateway, that the caller is the expected arbiter principal and
+    that the ``arbiter`` alias resolves to it: ``GET /v1/agents/whoami`` names
+    the caller, the alias read surface's ``current_agent_id`` is the
+    authoritative identity, and the inbox ``agent:<current_agent_id>`` is
+    derived only after both verify. A missing/mismatched/rebound/ambiguous/
+    unauthorized identity is refused with a non-secret error and a non-zero
+    exit before any model work or publication.
     """
     from fleet_graph.arbiter.a2 import TextReasoner, run_arbiter
     from fleet_graph.arbiter.managed_path import build_receipt
@@ -824,10 +827,10 @@ def _arbiter_run(args: argparse.Namespace) -> int:
         probe = BusPrincipalBindingProbe(client)
         try:
             reconcile_principal_alias(
-                authenticated_principal=probe.authenticated_principal(),
+                whoami_agent_id=probe.whoami(),
+                current_agent_id=probe.alias_agent_id(alias),
                 expected_principal=expected,
                 alias=alias,
-                alias_channel=probe.alias_channel(alias),
             )
         except ReconciliationError as exc:
             print(f"arbiter refused: {exc.detail}", file=sys.stderr)
