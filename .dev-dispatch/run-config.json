@@ -1,0 +1,37 @@
+{
+ "development_id": "dev-fg-8b5bbc39bc9d",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_work_folder_write_gate.py"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_work_folder_reconcile.py",
+   "tests/test_work_folder_write_gate.py"
+  ],
+  [
+   "uv",
+   "run",
+   "ruff",
+   "check",
+   "src/fleet_graph/dd/work_folder_store.py",
+   "tests/test_work_folder_reconcile.py",
+   "tests/test_work_folder_write_gate.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
