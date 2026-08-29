@@ -50,6 +50,12 @@ class LaunchSpec:
     #: defaults down as if someone had reviewed them.
     noop_limit: int | None = None
     timeout_limit: int | None = None
+    #: The board card the scheduler's escalation already materialised for this
+    #: line (stall-state ``board_card_entity_id``). Threaded into the line so the
+    #: E2 interrupt runtime reuses the existing card instead of publishing a
+    #: second one. Empty means the line starts with no known card and the
+    #: runtime falls back to the shared constructor.
+    board_card_entity_id: str = ""
 
     @property
     def log_file(self) -> Path:
@@ -114,6 +120,8 @@ class LaunchSpec:
             argv += ["--noop-limit", str(self.noop_limit)]
         if self.timeout_limit is not None:
             argv += ["--timeout-limit", str(self.timeout_limit)]
+        if self.board_card_entity_id:
+            argv += ["--board-card", self.board_card_entity_id]
         return argv
 
 

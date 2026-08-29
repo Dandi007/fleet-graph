@@ -122,6 +122,7 @@ def _line_run(args: argparse.Namespace) -> int:
         checkpoint_path=args.checkpoint,
         acceptance=acceptance,
         resume_verification=resume_verification_facts,
+        board_card_entity_id=args.board_card or "",
     )
     result = run_line(config, run_id=args.run_id)
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
@@ -874,6 +875,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--turn-timeout", type=int, default=3000)
     run.add_argument("--coordinator-timeout", type=int, default=2700)
     run.add_argument("--alias", default=None, help="agent-bus inbox alias")
+    run.add_argument(
+        "--board-card",
+        default=None,
+        help="the board card entity id the scheduler already materialised for "
+        "this line; the E2 interrupt runtime reuses it instead of publishing a "
+        "second card",
+    )
     run.add_argument(
         "--generation",
         type=int,
