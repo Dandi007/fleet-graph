@@ -1,6 +1,6 @@
 {
  "development_id": "dev-fg-e870804ad885",
- "generation": 1,
+ "generation": 2,
  "acceptance_commands": [
   [
    "uv",
@@ -17,17 +17,20 @@
    "pytest",
    "-q",
    "tests/test_arbiter.py",
-   "tests/test_arbiter_managed_path.py",
-   "tests/test_deploy_unit.py"
+   "-k",
+   "non_entity_evidence_ref or real_board_entity_evidence_ref or publish_failure or replay_is_idempotent"
   ],
   [
    "uv",
    "run",
-   "fleet-graph",
-   "arbiter",
-   "run",
+   "python",
+   "scripts/check_reconcile_a2_live_bus.py",
    "--bus-url",
-   "http://127.0.0.1:7490"
+   "http://127.0.0.1:7490",
+   "--expected-agent-id",
+   "arbiter",
+   "--expected-inbox-channel",
+   "agent:arbiter"
   ]
  ],
  "setup_commands": [],
