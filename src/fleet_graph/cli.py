@@ -799,9 +799,10 @@ def _arbiter_run(args: argparse.Namespace) -> int:
     it would publish, but writes nothing. Publication requires the explicit
     --publish flag; this development never enables it in production.
 
-    The managed path (--publish) first proves, read-only, that the caller is the
-    expected arbiter principal and that the alias binding resolves to its inbox
-    ``agent:<alias>``: a missing/mismatched/rebound/unauthorized identity is
+    The managed path (--publish) first proves, read-only, the arbiter identity
+    via ``GET /v1/agents/whoami`` and resolves the ``arbiter`` alias through the
+    real alias read surface, using its ``current_agent_id`` as the authoritative
+    identity: a missing/malformed/mismatched/unavailable/ambiguous identity is
     refused with a non-secret error and a non-zero exit before any model work or
     publication.
     """
@@ -809,28 +810,19 @@ def _arbiter_run(args: argparse.Namespace) -> int:
     from fleet_graph.arbiter.managed_path import build_receipt
     from fleet_graph.arbiter.reconcile import (
         ARBITER_ALIAS,
-        DEFAULT_EXPECTED_PRINCIPAL,
-        BusPrincipalBindingProbe,
-        ReconciliationError,
-        reconcile_principal_alias,
+        ArbiterReconcileError,
+        reconcile_arbiter_identity,
     )
-    from fleet_graph.bus.client import BusClient
+    from fleet_graph.bus.client import BusClient, BusError
 
     client = BusClient(base_url=args.bus_url)
 
     if args.publish:
         alias = args.alias or ARBITER_ALIAS
-        expected = os.environ.get("FLEET_GRAPH_ARBITER_PRINCIPAL") or DEFAULT_EXPECTED_PRINCIPAL
-        probe = BusPrincipalBindingProbe(client)
         try:
-            reconcile_principal_alias(
-                authenticated_principal=probe.authenticated_principal(),
-                expected_principal=expected,
-                alias=alias,
-                alias_channel=probe.alias_channel(alias),
-            )
-        except ReconciliationError as exc:
-            print(f"arbiter refused: {exc.detail}", file=sys.stderr)
+            reconcile_arbiter_identity(client, alias=alias)
+        except (ArbiterReconcileError, BusError) as exc:
+            print(f"arbiter refused: {exc}", file=sys.stderr)
             return 1
 
     reasoner = TextReasoner(model=args.model)

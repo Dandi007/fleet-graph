@@ -40,10 +40,11 @@ from fleet_graph.arbiter.publisher import SuggestionPublisher
 from fleet_graph.arbiter.reconcile import (
     ARBITER_ALIAS,
     ARBITER_INBOX,
-    DEFAULT_EXPECTED_PRINCIPAL,
-    Reconciliation,
-    ReconciliationError,
-    reconcile_principal_alias,
+    DEFAULT_ARBITER_AGENT_ID,
+    DEFAULT_ARBITER_ALIAS,
+    ArbiterIdentity,
+    ArbiterReconcileError,
+    reconcile_arbiter_identity,
 )
 
 __all__ = [
@@ -51,10 +52,13 @@ __all__ = [
     "ARBITER_ALIAS",
     "ARBITER_INBOX",
     "BLOCKED_STATUSES",
-    "DEFAULT_EXPECTED_PRINCIPAL",
+    "DEFAULT_ARBITER_AGENT_ID",
+    "DEFAULT_ARBITER_ALIAS",
     "DEFAULT_REASONING_MODEL",
     "FORBIDDEN_FIELDS",
     "NOTE_MARKER",
+    "ArbiterIdentity",
+    "ArbiterReconcileError",
     "ArbiterRun",
     "AuditReport",
     "AuditRow",
@@ -62,8 +66,6 @@ __all__ = [
     "Reasoner",
     "Recommendation",
     "RecommendationInvalid",
-    "Reconciliation",
-    "ReconciliationError",
     "Subject",
     "SuggestionPublisher",
     "TextReasoner",
@@ -74,7 +76,7 @@ __all__ = [
     "count_kinds",
     "is_decision_kind",
     "is_decision_marked_chat",
-    "reconcile_principal_alias",
+    "reconcile_arbiter_identity",
     "run_arbiter",
     "run_managed_path_scenario",
 ]

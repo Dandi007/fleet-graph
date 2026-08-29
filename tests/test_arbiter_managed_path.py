@@ -1,11 +1,11 @@
-"""The A2 managed periodic path: reconciliation, receipt, and the acceptance fixture.
+"""The A2 managed periodic path: reconciliation discipline, receipt, and acceptance.
 
-Three concerns pinned here:
+The A2 identity reconciliation itself (whoami + alias ``current_agent_id``,
+fail-closed) is covered in ``tests/test_arbiter_reconcile.py``; this file pins
+what the managed path depends on:
 
-- principal/alias reconciliation is validation-only -- correct identity passes
-  idempotently and mutates nothing; missing / mismatched / rebound / unauthorized
-  identity refuses with a non-secret error and a named state before any model
-  work or publication, and no reconciliation path exposes a mutation call;
+- the reconcile module stays validation-only -- no mutation call is reachable,
+  and the probe reads the bus through GET-only surfaces;
 - the bounded tick receipt carries counts/kinds/refs with no credentials, and
   its counters are real classifiers (a known decision fixture counts, a note
   does not);
@@ -20,9 +20,6 @@ import ast
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
-
-import pytest
 
 from fleet_graph.arbiter.managed_path import (
     build_receipt,
@@ -30,88 +27,11 @@ from fleet_graph.arbiter.managed_path import (
     is_decision_marked_chat,
     run_managed_path_scenario,
 )
-from fleet_graph.arbiter.reconcile import (
-    ARBITER_ALIAS,
-    ARBITER_INBOX,
-    DEFAULT_EXPECTED_PRINCIPAL,
-    STATE_MISMATCHED_PRINCIPAL,
-    STATE_MISSING_BINDING,
-    STATE_MISSING_PRINCIPAL,
-    STATE_OK,
-    STATE_REBOUND,
-    ReconciliationError,
-    inbox_for,
-    reconcile_principal_alias,
-)
 
 REPO_ROOT = Path(__file__).parent.parent
 ARBITER_PKG = REPO_ROOT / "src" / "fleet_graph" / "arbiter"
 RECONCILE_MODULE = ARBITER_PKG / "reconcile.py"
 ACCEPTANCE = REPO_ROOT / "scripts" / "a2_managed_path_acceptance.py"
-
-
-# --- principal/alias reconciliation -----------------------------------------
-
-
-def _reconcile(**overrides: Any) -> Any:
-    kwargs: dict[str, Any] = {
-        "authenticated_principal": "agent:arbiter",
-        "expected_principal": "agent:arbiter",
-        "alias": ARBITER_ALIAS,
-        "alias_channel": ARBITER_INBOX,
-    }
-    kwargs.update(overrides)
-    return reconcile_principal_alias(**kwargs)
-
-
-def test_correct_identity_reconciles_and_is_idempotent() -> None:
-    first = _reconcile()
-    second = _reconcile()
-    assert first.state == STATE_OK
-    assert first.ok is True
-    # Idempotent: re-verifying the same facts is the same verdict, no mutation.
-    assert first.as_dict() == second.as_dict()
-    assert first.inbox_channel == ARBITER_INBOX
-
-
-def test_missing_principal_refuses_closed_without_mutation() -> None:
-    with pytest.raises(ReconciliationError) as exc:
-        _reconcile(authenticated_principal=None)
-    assert exc.value.state == STATE_MISSING_PRINCIPAL
-
-
-def test_mismatched_principal_refuses_closed() -> None:
-    with pytest.raises(ReconciliationError) as exc:
-        _reconcile(authenticated_principal="agent:not-arbiter")
-    assert exc.value.state == STATE_MISMATCHED_PRINCIPAL
-
-
-def test_missing_binding_refuses_closed() -> None:
-    with pytest.raises(ReconciliationError) as exc:
-        _reconcile(alias_channel=None)
-    assert exc.value.state == STATE_MISSING_BINDING
-
-
-def test_rebound_alias_refuses_closed() -> None:
-    with pytest.raises(ReconciliationError) as exc:
-        _reconcile(alias_channel="agent:someone-else")
-    assert exc.value.state == STATE_REBOUND
-
-
-def test_a_refusal_leaves_a_later_correct_identity_unchanged() -> None:
-    # A refused verification does not affect the next one: verification is pure.
-    with pytest.raises(ReconciliationError):
-        _reconcile(alias_channel="agent:someone-else")
-    assert _reconcile().ok is True
-
-
-def test_inbox_for_maps_alias_to_agent_channel() -> None:
-    assert inbox_for("arbiter") == ARBITER_INBOX
-    assert inbox_for("ronin-x") == "agent:ronin-x"
-
-
-def test_default_expected_principal_is_the_arbiter_inbox() -> None:
-    assert DEFAULT_EXPECTED_PRINCIPAL == "agent:arbiter"
 
 
 # --- no mutation surface -----------------------------------------------------
@@ -157,7 +77,7 @@ def test_bus_probe_reads_via_get_only() -> None:
 def test_sabotage_self_verification_catches_a_mutation_call() -> None:
     assert _mutation_calls('client.publish("ch", "work.note.v1", {}, "k")\n') == [1]
     assert _mutation_calls('register("token")\n') == [1]
-    assert _mutation_calls('client.get("/v1/principal")\n') == []
+    assert _mutation_calls('client.get("/v1/agents/whoami")\n') == []
 
 
 # --- bounded receipt counters ------------------------------------------------

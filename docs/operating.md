@@ -355,12 +355,14 @@ token 文件。真正的激活是监督面在后续已批准窗口里的独立�
   arbiter 永不在 git/argv/stdout/stderr/receipt/journal 中引用它。
 
 **身份 reconcile（发布前置）**：`--publish` 路径在模型工作与落板之前先做
-只读 principal/alias reconcile（`src/fleet_graph/arbiter/reconcile.py`）：
-认证 principal == 期望 arbiter principal（默认 `agent:arbiter`，可用
-`FLEET_GRAPH_ARBITER_PRINCIPAL` 覆盖），且 alias binding 解析到
-`agent:arbiter`。缺失/不匹配/被重绑/未授权任一状态报非秘密错误并以非零退出，
-**先于任何模型工作与发布**；reconcile 模块没有 create/register/token-mint/
-token-write 或其它 mutation 调用。
+只读 identity reconcile（`src/fleet_graph/arbiter/reconcile.py`）：先做一次
+真实的 `GET /v1/agents/whoami`（凭证存活证明），再经真实 alias 读面
+`GET /v1/aliases/arbiter` 取权威身份 `current_agent_id`，fail-closed 验证
+`current_agent_id == "arbiter"`，验证通过后才派生 inbox
+`agent:<current_agent_id>`（即 `agent:arbiter`）。缺失/畸形/不匹配/不可用/
+歧义任一身份状态报非秘密错误并以非零退出，**先于任何模型工作与发布**；
+reconcile 模块没有 create/register/token-mint/token-write 或其它 mutation
+调用。
 
 **终态工件与验收查询**：一次成功 tick 打印一条有界机读 receipt
 （counts/kinds/refs），不含凭证。验收夹具
@@ -369,9 +371,10 @@ token-write 或其它 mutation 调用。
 `work.decision.v2 == 0`、`decision_marked_chat == 0`。验收查询：
 
 ```bash
-uv run pytest -q tests/test_arbiter.py tests/test_arbiter_managed_path.py tests/test_deploy_unit.py
+uv run pytest -q tests/test_arbiter.py tests/test_arbiter_reconcile.py tests/test_arbiter_managed_path.py tests/test_deploy_unit.py
 uv run python scripts/check_supervisor_conformance.py
 uv run python scripts/a2_managed_path_acceptance.py
+uv run python scripts/check_reconcile_a2_live_bus.py --expected-agent-id arbiter --expected-inbox-channel agent:arbiter
 ```
 
 **回滚（一行，仅供后续已批准窗口执行；本 development 不执行）**：
