@@ -1,0 +1,117 @@
+{
+ "development_id": "dev-fg-547ab501b2b5",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "uv",
+    "sync",
+    "--frozen"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": "Checked 100 packages in 11ms\n"
+  },
+  {
+   "command": [
+    "make",
+    "verify"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "............................. [  8%]\n........................................................................ [ 12%]\n........................................................................ [ 17%]\n........................................................................ [ 21%]\n........................................................................ [ 25%]\n........................................................................ [ 29%]\n.....................................................s.................. [ 34%]\n........................................................................ [ 38%]\n........................................................................ [ 42%]\n........................................................................ [ 46%]\n........................................................................ [ 51%]\n........................................................................ [ 55%]\n........................................................................ [ 59%]\n........................................................................ [ 63%]\n........................................................................ [ 68%]\n........................................................................ [ 72%]\n........................................................................ [ 76%]\n........................................................................ [ 80%]\n........................................................................ [ 85%]\n........................................................................ [ 89%]\n........................................................................ [ 93%]\n........................................................................ [ 97%]\n......................................                                   [100%]\n1693 passed, 1 skipped in 56.33s\nuv run python scripts/check_supervisor_conformance.py\nsupervisor conformance: clean\nuv run python scripts/check_work_report_conformance.py\nwork-report conformance: clean\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "pytest",
+    "tests/test_parking.py",
+    "-q"
+   ],
+   "exit_code": 0,
+   "stdout_tail": ".................................................                        [100%]\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "pytest",
+    "tests/test_goal_line.py",
+    "-q"
+   ],
+   "exit_code": 0,
+   "stdout_tail": ".........................................                                [100%]\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "pytest",
+    "tests/test_goal_interrupt.py",
+    "-q"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "..................................                                       [100%]\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "pytest",
+    "tests/test_inbox_content_path.py",
+    "-q"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "...........                                                              [100%]\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/e2_inbox_content_path_acceptance.py",
+    "--scenario",
+    "alias-passthrough-drain-receives-message"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "{\n  \"argv_alias_present\": true,\n  \"drained_count\": 1,\n  \"exit_code\": 0,\n  \"pass\": true,\n  \"real_inbox\": true,\n  \"received_message\": \"msg-hermetic-1\",\n  \"scenario\": \"alias-passthrough-drain-receives-message\",\n  \"utc_timestamp\": \"2026-08-29T11:10:54Z\"\n}\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/e2_inbox_content_path_acceptance.py",
+    "--scenario",
+    "service-token-403-asserted"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "{\n  \"drained_count\": 1,\n  \"exit_code\": 0,\n  \"inbox_client_credential\": \"line-token-abc\",\n  \"pass\": true,\n  \"scenario\": \"service-token-403-asserted\",\n  \"service_token_403\": true,\n  \"utc_timestamp\": \"2026-08-29T11:10:55Z\"\n}\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/e2_inbox_content_path_acceptance.py",
+    "--scenario",
+    "real-bus-inbox-roundtrip",
+    "--bus-url",
+    "http://127.0.0.1:7490",
+    "--line-token-file",
+    "/data/agent-bus/tokens/e2-wakecheck-repro-20260829.token"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "{\n  \"ack_outcomes\": [\n    \"acked\"\n  ],\n  \"bus_url\": \"http://127.0.0.1:7490\",\n  \"drain_count\": 1,\n  \"drill_alias\": \"e2-wakecheck-repro-20260829\",\n  \"exit_code\": 0,\n  \"head_seq_after\": 6,\n  \"head_seq_before\": 5,\n  \"pass\": true,\n  \"real_inbox\": true,\n  \"received\": true,\n  \"scenario\": \"real-bus-inbox-roundtrip\",\n  \"sent_message_id\": \"msg_01M16KEAPMQZS786W5S3RRW355\",\n  \"utc_timestamp\": \"2026-08-29T11:10:56Z\"\n}\n",
+   "stderr_tail": ""
+  }
+ ]
+}
