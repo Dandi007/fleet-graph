@@ -122,8 +122,12 @@ class GitWorkFolderSource:
         return tuple(result)
 
     def _governed_base(self, repo: Path, filename: str) -> bytes | None:
+        # ``repo`` is the resolver-returned cwd. ``HEAD:./{filename}`` addresses
+        # the blob relative to that cwd, so a governed folder that is a monorepo
+        # subdirectory resolves to ``HEAD:<subdir>/<filename>`` instead of the
+        # repository-root path the logical filename alone would name.
         proc = subprocess.run(
-            git_argv(repo, "show", f"HEAD:{filename}"),
+            git_argv(repo, "show", f"HEAD:./{filename}"),
             capture_output=True,
             env=git_ops.safe_git_environment(),
             check=False,
