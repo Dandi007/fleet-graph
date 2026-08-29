@@ -1,0 +1,17 @@
+{
+ "development_id": "dev-fg-6925540673b0",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "python3",
+    "-c",
+    "import json,pathlib; d=json.loads(pathlib.Path(\"config/ronin-lines.json\").read_text()); e=[l for l in d[\"lines\"] if l.get(\"folder_id\")==\"wf-a8c7b5\"]; assert len(e)==1; s=e[0]; assert s[\"seat\"]==\"opencode-dsv4pro\" and s[\"enabled\"] is False and s.get(\"alias\")==\"ronin-step7-drill\"; print(\"SCRATCH_LINE_OK\")"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "SCRATCH_LINE_OK\n",
+   "stderr_tail": ""
+  }
+ ]
+}
