@@ -23,6 +23,20 @@ seam, so no public payload or error can ever disclose where the data lives.
   writes the exact bytes and commits them atomically, returning a receipt
   fragment that names logical files and never a path.
 
+Write-gate compatibility: the governed work-folder writer serializes every
+mutation behind an exclusive ``fcntl.flock`` on
+``<git-common-dir>/katana-governed.lock``. ``adopt`` holds that *same* lock
+across its entire critical section (filename validation, byte CAS, writes,
+staging, commit, receipt), resolving the common directory via
+``git rev-parse --git-common-dir`` so a folder-subdirectory resolver and a
+repository-root MCP process contend on one inode. Sharing the lock -- rather
+than adopting unlocked -- is what lets reconciliation's byte CAS stay visible to
+a concurrent governed mutation: without it, an MCP governed write could land
+between the reconcile byte check, its writes, and its commit, silently
+overwriting a winner or staging another process's bytes. Lock resolution/open/
+acquisition failures refuse closed with ``ReconcileError`` and never fall back
+to an unlocked adoption or disclose the physical path.
+
 Any git failure, unresolvable folder, or a folder id that does not look like an
 opaque token raises ``ReconcileError`` (``RECONCILE_REFUSED`` over the wire)
 without mutating anything.
@@ -30,10 +44,13 @@ without mutating anything.
 
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import subprocess
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +67,19 @@ _SAFE_FOLDER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 #: store commits are written by this mechanism, never by a caller's config.
 _RECONCILE_COMMIT_USER = "WorkFolderReconciler"
 _RECONCILE_COMMIT_EMAIL = "work-folder-reconciler@example.invalid"
+
+#: The canonical cross-process mutation lock the governed work-folder writer
+#: serializes every mutation with. The reconciler must contend on the exact same
+#: inode, resolved from the same ``git rev-parse --git-common-dir``, so a
+#: folder-subdirectory resolver and a repository-root MCP process cannot bypass
+#: each other's write gate.
+_GOVERNED_LOCK_FILENAME = "katana-governed.lock"
+
+#: Bounded wait for the governed mutation lock. A blocked acquisition polls with
+#: a non-blocking flock and gives up after this budget, so a wedged holder fails
+#: the adoption closed instead of hanging a reconcile call forever.
+_GOVERNED_LOCK_TIMEOUT_SECONDS = 30.0
+_GOVERNED_LOCK_POLL_SECONDS = 0.05
 
 #: A physical repository resolver. ``None`` means "cannot resolve" and refuses.
 FolderResolver = Callable[[str], Path | None]
@@ -152,6 +182,17 @@ class GitWorkFolderSource:
 
     def adopt(self, folder_id: str, entries: tuple[AppendItem, ...]) -> dict[str, Any]:
         repo = self._repo(folder_id)
+        lock_path = self._governed_lock_path(repo)
+        with self._exclusive_governed_lock(lock_path):
+            return self._adopt_under_lock(repo, entries)
+
+    def _adopt_under_lock(
+        self, repo: Path, entries: tuple[AppendItem, ...]
+    ) -> dict[str, Any]:
+        # Everything from the filename validation through the receipt builds in
+        # one exclusive governed-lock critical section: no byte read is taken
+        # before the lock and later trusted, and a concurrent governed writer
+        # cannot interleave between any of these steps.
         for filename, base, appended in entries:
             if not self._is_safe_relpath(filename):
                 raise ReconcileError(f"refusing to adopt unsafe filename {filename!r}")
@@ -185,6 +226,70 @@ class GitWorkFolderSource:
     def _is_safe_relpath(filename: str) -> bool:
         rel = Path(filename)
         return not rel.is_absolute() and ".." not in rel.parts
+
+    # --- governed mutation lock -------------------------------------------
+
+    def _governed_lock_path(self, repo: Path) -> Path:
+        """Resolve the canonical cross-process mutation lock for ``repo``.
+
+        ``repo`` is the resolver-returned cwd, which may be a monorepo
+        subdirectory. ``git rev-parse --git-common-dir`` names the shared
+        ``.git`` directory for that repository regardless of the cwd, so a
+        folder-subdirectory resolver and a repository-root MCP process resolve
+        the same lock inode. Any resolution failure refuses closed with a
+        ReconcileError that never discloses the physical path.
+        """
+        proc = subprocess.run(
+            git_argv(repo, "rev-parse", "--git-common-dir"),
+            capture_output=True,
+            env=git_ops.safe_git_environment(),
+            check=False,
+        )
+        common_bytes = proc.stdout.strip() if proc.returncode == 0 else b""
+        if not common_bytes:
+            raise ReconcileError(
+                "governed work-folder store could not resolve the repository "
+                "mutation lock; refusing closed without mutation"
+            )
+        common = Path(os.fsdecode(common_bytes))
+        if not common.is_absolute():
+            common = repo / common
+        return common.resolve() / _GOVERNED_LOCK_FILENAME
+
+    @contextmanager
+    def _exclusive_governed_lock(self, lock_path: Path) -> Iterator[None]:
+        """Acquire the exclusive governed mutation lock, bounded, never unlocked.
+
+        A failed open, an acquisition that runs past the budget, or any refusal
+        raises ``ReconcileError`` without mutating anything and without naming
+        the physical lock path. There is deliberately no fallback to an
+        unlocked adoption.
+        """
+        try:
+            handle = lock_path.open("a+b")
+        except OSError as exc:
+            raise ReconcileError(
+                "governed work-folder store could not open the repository "
+                "mutation lock; refusing closed without mutation"
+            ) from exc
+        try:
+            deadline = time.monotonic() + _GOVERNED_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise ReconcileError(
+                            "governed work-folder store timed out acquiring the "
+                            "repository mutation lock; refusing closed without mutation"
+                        ) from None
+                    time.sleep(_GOVERNED_LOCK_POLL_SECONDS)
+            yield
+        finally:
+            with suppress(OSError):
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
 
     # --- git plumbing -----------------------------------------------------
 
