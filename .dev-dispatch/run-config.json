@@ -1,0 +1,83 @@
+{
+ "development_id": "dev-fg-b96d3a37c2a9",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_goal_interrupt.py",
+   "-q"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_parking.py",
+   "-q"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_line_restart.py",
+   "-q"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_goal_line_card.py",
+   "-q"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e2_card_passthrough_acceptance.py",
+   "--scenario",
+   "daemon-first-runtime-reuses"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e2_card_passthrough_acceptance.py",
+   "--scenario",
+   "concurrent-first-create"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e2_card_passthrough_acceptance.py",
+   "--scenario",
+   "decision-content-in-production-resume"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e2_card_passthrough_acceptance.py",
+   "--scenario",
+   "real-bus-stall-resume",
+   "--bus-url",
+   "http://127.0.0.1:7490",
+   "--bus-token-file",
+   "/data/agent-bus/tokens/fleet-graph.token",
+   "--decision-token-file",
+   "/data/agent-bus/tokens/fleet-graph-decision.token"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
