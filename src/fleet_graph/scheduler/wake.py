@@ -29,26 +29,17 @@ from __future__ import annotations
 
 import calendar
 import os
-import re
 import time
-from pathlib import Path
 from typing import Any, Protocol
+
+from fleet_graph.bus.tokens import (
+    LINE_TOKEN_PATH_ENV,
+    LINE_TOKEN_PATH_TEMPLATE,
+    resolve_line_token,
+)
 
 #: Wake probes ride the 60s tick loop; a hung endpoint must cost seconds.
 WAKE_TIMEOUT_SECONDS = 5.0
-
-#: Where a line's own bus credential lives ("{alias}" is substituted). The
-#: `agent:{alias}` channel is private, owner-only readable, and the owner is
-#: the line's pump agent -- so the inbox probe must present the *line's*
-#: token, not the fleet-graph service token (which gets a structural 403).
-#: These files mirror the pump tokens (persona §5c). Overridable via the
-#: FLEET_GRAPH_LINE_TOKEN_PATH env var or the constructor.
-LINE_TOKEN_PATH_TEMPLATE = "/data/ronin/secrets/{alias}.token"
-LINE_TOKEN_PATH_ENV = "FLEET_GRAPH_LINE_TOKEN_PATH"
-
-#: An alias is a path component of the token file; anything outside this set
-#: never touches the filesystem (the probe falls back to the service token).
-_SAFE_ALIAS = re.compile(r"^[A-Za-z0-9._-]+$")
 
 #: How far below head_seq the inbox probe re-reads. Only *existence* of a
 #: newer-than-terminal message matters, and a parked line's channel gains
@@ -128,17 +119,15 @@ class LiveWakeSignals:
         return self._bus
 
     def _line_token(self, alias: str) -> str | None:
-        """The line's own bus token, or None when the file is absent/unreadable.
+        """The line's own bus token, or None when it cannot be resolved.
 
         The token stays in memory only -- never in argv, logs, or error text.
+        Shared with the line process's inbox drain via
+        ``fleet_graph.bus.tokens.resolve_line_token``, so the wake probe and
+        the content path authenticate with the same credential family and can
+        never drift apart.
         """
-        if not _SAFE_ALIAS.match(alias):
-            return None
-        try:
-            token = Path(self.line_token_template.format(alias=alias)).read_text().strip()
-        except OSError:
-            return None
-        return token or None
+        return resolve_line_token(alias, template=self.line_token_template).token
 
     def _make_line_client(self, token: str) -> Any:
         if self._line_bus_factory is not None:
