@@ -253,9 +253,10 @@ def goal_line_card_payload(*, folder_id: str, title: str) -> dict[str, Any]:
 
     ``title`` must be identical across both producers for the same ``folder_id``
     so the payload is byte-identical and the bus deduplicates rather than
-    conflict-ing. The scheduler uses ``line.alias or line.folder_id``; the
-    interrupt runtime threads the same ``alias`` through ``LineConfig`` so both
-    producers agree.
+    conflict-ing. Both the scheduler's parking escalation and the interrupt
+    runtime collapse to ``folder_id`` as the title (the design's sanctioned
+    alternative to threading the roster alias into the line process, which the
+    production launch chain does not deliver), so the two payloads always agree.
     """
     return {
         "title": title,

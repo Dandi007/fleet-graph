@@ -860,9 +860,7 @@ class Scheduler:
         if not card_entity_id:
             try:
                 card = self.board.publish_card(
-                    goal_line_card_payload(
-                        folder_id=line.folder_id, title=line.alias or line.folder_id
-                    ),
+                    goal_line_card_payload(folder_id=line.folder_id, title=line.folder_id),
                     idempotency_key=goal_line_card_key(line.folder_id),
                 )
             except Exception as exc:  # telemetry must not bite

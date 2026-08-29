@@ -241,10 +241,6 @@ def _build_interrupt(config: LineConfig, *, run_id: str = "") -> LineInterruptPo
         # The scheduler's card, threaded through so the runtime reuses it
         # instead of publishing a second one (E2 card pass-through).
         card_entity_id=config.board_card_entity_id,
-        # The alias rides LineConfig so the fallback's card title matches the
-        # scheduler's ``line.alias or line.folder_id`` -- byte-identical payload,
-        # so the bus idempotency deduplicates rather than conflict-ing.
-        alias=config.alias,
         run_id=run_id,
     )
 
