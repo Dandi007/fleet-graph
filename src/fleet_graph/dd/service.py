@@ -47,6 +47,7 @@ from fleet_graph.dd.control_plane import (
     ControlPlaneError,
     DdControlPlane,
 )
+from fleet_graph.dd.reconcile import ReconcileError, ReconcileSource, WorkFolderReconciler
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +233,12 @@ SUPPORTED_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+#: The work-folder recovery exit (B3 correction): registered on the same surface
+#: so a real `wf_reconcile` invocation no longer returns `Unknown tool`. It is not
+#: part of the development use-case family -- it drives a work-folder source seam,
+#: not the in-process development control plane.
+WORK_FOLDER_TOOLS: frozenset[str] = frozenset({"wf_reconcile"})
+
 
 def port_is_available(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> bool:
     """Bind-test the selected loopback port before FastMCP tries to serve it."""
@@ -244,12 +251,24 @@ def port_is_available(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> boo
     return True
 
 
-def build_mcp_server(plane: DdControlPlane | None = None) -> Any:
-    """Build all active dev-dispatch tools over the in-process control plane."""
+def build_mcp_server(
+    plane: DdControlPlane | None = None,
+    work_folders: ReconcileSource | None = None,
+) -> Any:
+    """Build all active dev-dispatch tools over the in-process control plane.
+
+    `work_folders` optionally binds the B3 work-folder recovery exit
+    (`wf_reconcile`) to a governed work-folder source seam. When it is ``None``
+    the tool still exists on the surface but refuses with
+    ``RECONCILE_SOURCE_UNBOUND``, so an unbound helper can never masquerade as a
+    working route.
+    """
     from fastmcp import FastMCP
     from fastmcp.exceptions import ToolError
 
     control = plane or DdControlPlane()
+    reconciler = WorkFolderReconciler()
+    source = work_folders
     mcp = FastMCP("fleet-graph-dev-dispatch")
 
     def call(method: str, /, **kwargs: Any) -> dict[str, Any]:
@@ -413,6 +432,41 @@ def build_mcp_server(plane: DdControlPlane | None = None) -> Any:
         )
 
     @mcp.tool()
+    def wf_reconcile(folder_id: str, token: str | None = None) -> dict[str, Any]:
+        """Work-folder residue reconciliation: dry-run a plan, then confirm adoption.
+
+        Two-step governed exit. ``wf_reconcile(folder_id)`` is the dry-run: it
+        classifies the folder's tracked residue and returns a stable plan
+        (opaque ``folder_id``, logical filenames, classifications,
+        content/base/appended digests, and a confirmation ``token``) without
+        mutating anything. ``wf_reconcile(folder_id, token=<token>)`` adopts the
+        exact appended bytes only when that token still binds to the current
+        base and bytes; a stale confirmation, changed bytes, unsafe residue, or
+        wrong folder refuses without mutation. Responses and errors never expose
+        a physical data-repository path and never require client-side Git.
+        """
+        if source is None:
+            raise ToolError(
+                json.dumps(
+                    {
+                        "code": "RECONCILE_SOURCE_UNBOUND",
+                        "message": "no work-folder source is bound to this server",
+                        "tool": "wf_reconcile",
+                    },
+                    sort_keys=True,
+                )
+            )
+        try:
+            files = source.inspect(folder_id)
+            if token is None:
+                return reconciler.plan(folder_id, files)
+            return reconciler.confirm(folder_id, token, files, adopt=source.adopt)
+        except ReconcileError as exc:
+            raise ToolError(
+                json.dumps({"code": "RECONCILE_REFUSED", "message": str(exc)}, sort_keys=True)
+            ) from exc
+
+    @mcp.tool()
     def development_steer(
         development_id: str,
         instruction: str,
@@ -538,6 +592,7 @@ __all__ = [
     "NOT_SUPPORTED_RULING",
     "NOT_SUPPORTED_TOOLS",
     "SUPPORTED_TOOLS",
+    "WORK_FOLDER_TOOLS",
     "GateAutoResumer",
     "auto_resume_enabled_from_env",
     "auto_resume_interval_from_env",

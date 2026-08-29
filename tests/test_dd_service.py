@@ -31,6 +31,7 @@ from fleet_graph.dd.service import (
     DEFAULT_PORT,
     NOT_SUPPORTED_TOOLS,
     SUPPORTED_TOOLS,
+    WORK_FOLDER_TOOLS,
     build_mcp_server,
     port_is_available,
 )
@@ -51,6 +52,7 @@ ALL_TOOLS = {
     "development_relock",
     "development_adopt",
     "development_recover",
+    "wf_reconcile",
 }
 
 # Arguments that satisfy each legacy-only tool's schema, so the refusal we
@@ -145,21 +147,26 @@ def test_selected_port_is_free_and_not_a_legacy_port() -> None:
         pytest.skip("port 5610 is already being served on this host")
 
 
-def test_all_fifteen_tools_are_reachable() -> None:
+def test_all_sixteen_tools_are_reachable() -> None:
     server = build_mcp_server(FakeControlPlane())
     tools = asyncio.run(server.list_tools())
     assert {tool.name for tool in tools} == ALL_TOOLS
 
 
 def test_the_surface_split_is_exactly_the_ruling() -> None:
-    """Supported + refused partitions the 15 names, with no overlap.
+    """Supported + refused partitions the 15 development names, with no overlap.
 
     R1-c moved `development_reconfigure` from the refused side to the real
     side (the environment/contract failure exit); steer / relock / control /
-    deployment_* stay refused.
+    deployment_* stay refused. `wf_reconcile` (the B3 work-folder recovery exit)
+    is a third, separate family on the same surface -- it drives a work-folder
+    source seam, not the development control plane.
     """
-    assert SUPPORTED_TOOLS | set(NOT_SUPPORTED_TOOLS) == ALL_TOOLS
+    assert SUPPORTED_TOOLS | set(NOT_SUPPORTED_TOOLS) | WORK_FOLDER_TOOLS == ALL_TOOLS
     assert not SUPPORTED_TOOLS & set(NOT_SUPPORTED_TOOLS)
+    assert not WORK_FOLDER_TOOLS & SUPPORTED_TOOLS
+    assert not WORK_FOLDER_TOOLS & set(NOT_SUPPORTED_TOOLS)
+    assert {"wf_reconcile"} == WORK_FOLDER_TOOLS
     assert {
         "development_list",
         "development_get",
