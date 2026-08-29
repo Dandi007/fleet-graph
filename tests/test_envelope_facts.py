@@ -27,6 +27,7 @@ from fleet_graph.graphs.goal_line import (
 )
 from fleet_graph.graphs.guards import LineBounds, LineGuards
 from fleet_graph.state.work_folder import resume_verification_from
+from fleet_graph.work_report import SCHEMA_VERSION
 
 
 class FakeCoordinator:
@@ -40,8 +41,17 @@ class FakeCoordinator:
 
 
 class FakeWorker:
-    def turn(self, prompt: str, round_no: int) -> str:
-        return f"did {prompt}"
+    def turn(self, prompt: str, round_no: int) -> dict[str, Any]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "turn_id": f"t-{round_no}",
+            "outcome": "completed",
+            "summary": f"did {prompt}",
+            "did": [prompt],
+            "files": [],
+            "self_tests": [],
+            "blocker": None,
+        }
 
 
 class FakeInbox:
@@ -61,6 +71,9 @@ class FakeArtifacts:
     def append_round(self, line: dict[str, Any]) -> bool:
         self.rounds.append(line)
         return True
+
+    def write_worker_report(self, round_no: int, report: dict[str, Any]) -> str:
+        return "worker-report.json"
 
     def write_terminal(
         self,

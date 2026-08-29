@@ -722,6 +722,11 @@ class TestCredentialDiscipline:
     ) -> None:
         """A raw token value must never reach --setenv (argv is /proc-public);
         the 0600 token file's *path* is what crosses the boundary."""
+        # The cost-observability site config is whitelist-forwarded and tested
+        # separately (test_cost_observability_site_config_is_forwarded); clear
+        # any ambient values so this credential assertion is deterministic.
+        monkeypatch.delenv("FLEET_GRAPH_COST_OBS_DIR", raising=False)
+        monkeypatch.delenv("FLEET_GRAPH_MANAGEMENT_COST", raising=False)
         monkeypatch.setenv("FLEET_GRAPH_BUS_TOKEN", "secret-value")
         monkeypatch.setenv("FLEET_GRAPH_BUS_TOKEN_FILE", "/data/agent-bus/tokens/fleet-graph.token")
         plane = DdControlPlane(root=tmp_path / "dd", board_factory=lambda: None)

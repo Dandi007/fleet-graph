@@ -23,6 +23,7 @@ test:
 
 conformance:
 	uv run python scripts/check_supervisor_conformance.py
+	uv run python scripts/check_work_report_conformance.py
 
 verify: lint test conformance
 
