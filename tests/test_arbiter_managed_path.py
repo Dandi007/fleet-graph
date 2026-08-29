@@ -55,10 +55,10 @@ ACCEPTANCE = REPO_ROOT / "scripts" / "a2_managed_path_acceptance.py"
 
 def _reconcile(**overrides: Any) -> Any:
     kwargs: dict[str, Any] = {
-        "authenticated_principal": "agent:arbiter",
-        "expected_principal": "agent:arbiter",
+        "whoami_agent_id": DEFAULT_EXPECTED_PRINCIPAL,
+        "current_agent_id": DEFAULT_EXPECTED_PRINCIPAL,
+        "expected_principal": DEFAULT_EXPECTED_PRINCIPAL,
         "alias": ARBITER_ALIAS,
-        "alias_channel": ARBITER_INBOX,
     }
     kwargs.update(overrides)
     return reconcile_principal_alias(**kwargs)
@@ -72,36 +72,38 @@ def test_correct_identity_reconciles_and_is_idempotent() -> None:
     # Idempotent: re-verifying the same facts is the same verdict, no mutation.
     assert first.as_dict() == second.as_dict()
     assert first.inbox_channel == ARBITER_INBOX
+    # The authoritative identity is the alias current_agent_id, reported bare.
+    assert first.agent_id == DEFAULT_EXPECTED_PRINCIPAL
 
 
 def test_missing_principal_refuses_closed_without_mutation() -> None:
     with pytest.raises(ReconciliationError) as exc:
-        _reconcile(authenticated_principal=None)
+        _reconcile(whoami_agent_id=None)
     assert exc.value.state == STATE_MISSING_PRINCIPAL
 
 
 def test_mismatched_principal_refuses_closed() -> None:
     with pytest.raises(ReconciliationError) as exc:
-        _reconcile(authenticated_principal="agent:not-arbiter")
+        _reconcile(whoami_agent_id="fleet-graph")
     assert exc.value.state == STATE_MISMATCHED_PRINCIPAL
 
 
 def test_missing_binding_refuses_closed() -> None:
     with pytest.raises(ReconciliationError) as exc:
-        _reconcile(alias_channel=None)
+        _reconcile(current_agent_id=None)
     assert exc.value.state == STATE_MISSING_BINDING
 
 
 def test_rebound_alias_refuses_closed() -> None:
     with pytest.raises(ReconciliationError) as exc:
-        _reconcile(alias_channel="agent:someone-else")
+        _reconcile(current_agent_id="fleet-graph")
     assert exc.value.state == STATE_REBOUND
 
 
 def test_a_refusal_leaves_a_later_correct_identity_unchanged() -> None:
     # A refused verification does not affect the next one: verification is pure.
     with pytest.raises(ReconciliationError):
-        _reconcile(alias_channel="agent:someone-else")
+        _reconcile(current_agent_id="fleet-graph")
     assert _reconcile().ok is True
 
 
@@ -110,8 +112,11 @@ def test_inbox_for_maps_alias_to_agent_channel() -> None:
     assert inbox_for("ronin-x") == "agent:ronin-x"
 
 
-def test_default_expected_principal_is_the_arbiter_inbox() -> None:
-    assert DEFAULT_EXPECTED_PRINCIPAL == "agent:arbiter"
+def test_default_expected_principal_is_the_bare_arbiter_id() -> None:
+    assert DEFAULT_EXPECTED_PRINCIPAL == "arbiter"
+    # Never the derived inbox channel string: the channel is derived after
+    # verification, not the expected principal.
+    assert DEFAULT_EXPECTED_PRINCIPAL != ARBITER_INBOX
 
 
 # --- no mutation surface -----------------------------------------------------
@@ -120,7 +125,22 @@ def test_default_expected_principal_is_the_arbiter_inbox() -> None:
 def _mutation_calls(source: str) -> list[int]:
     """Call sites in ``reconcile.py`` reaching a write/mint/register verb."""
     tree = ast.parse(source)
-    forbidden = frozenset({"publish", "post", "create", "register", "mint", "write"})
+    forbidden = frozenset(
+        {
+            "publish",
+            "register",
+            "rebind",
+            "deliver",
+            "ack",
+            "nack",
+            "create",
+            "delete",
+            "mint",
+            "write",
+            "confirm",
+            "adopt",
+        }
+    )
     lines: list[int] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -139,25 +159,37 @@ def test_reconcile_module_exposes_no_mutation_call() -> None:
     assert not lines, f"reconcile.py reaches a mutation call at lines {lines}"
 
 
-def test_bus_probe_reads_via_get_only() -> None:
+def test_bus_probe_reads_only_the_two_read_surfaces() -> None:
+    """The probe is read-only: whoami GET and the alias resolve (pure lookup).
+
+    The only HTTP verbs the probe may reach are ``get`` (whoami) and a single
+    ``post`` that must be the read-only alias ``resolve`` action -- never a
+    publish/register/rebind/deliver path.
+    """
     source = RECONCILE_MODULE.read_text(encoding="utf-8")
+    assert "/v1/agents/whoami" in source
+    assert "/v1/aliases/" in source and "/resolve" in source
     tree = ast.parse(source)
-    probe_reads: list[str] = []
-    read_verbs = {"get", "post", "publish"}
+    reads: list[str] = []
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr in read_verbs
+            and node.func.attr in {"get", "post", "publish"}
         ):
-            probe_reads.append(node.func.attr)
-    assert set(probe_reads) == {"get"}
+            reads.append(node.func.attr)
+    assert reads.count("post") == 1, reads
+    assert "publish" not in reads, reads
+    # The single post is the resolve read; every other bus call is a get.
+    assert reads.count("get") >= 1, reads
 
 
 def test_sabotage_self_verification_catches_a_mutation_call() -> None:
     assert _mutation_calls('client.publish("ch", "work.note.v1", {}, "k")\n') == [1]
     assert _mutation_calls('register("token")\n') == [1]
-    assert _mutation_calls('client.get("/v1/principal")\n') == []
+    assert _mutation_calls('client.get("/v1/agents/whoami")\n') == []
+    # The read-only alias resolve stays a read, not a mutation verb.
+    assert _mutation_calls('client.post("/v1/aliases/arbiter/resolve")\n') == []
 
 
 # --- bounded receipt counters ------------------------------------------------
