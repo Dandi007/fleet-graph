@@ -1,0 +1,34 @@
+{
+ "development_id": "dev-fg-26909eac1867",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_arbiter.py",
+   "tests/test_arbiter_managed_path.py",
+   "tests/test_deploy_unit.py"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/check_supervisor_conformance.py"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/a2_managed_path_acceptance.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
