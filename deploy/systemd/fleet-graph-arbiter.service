@@ -1,0 +1,47 @@
+# systemd *user* unit for the A2 read-only fleet arbiter's periodic tick.
+#
+# Type=oneshot: one bounded tick through `fleet-graph arbiter run`, then the
+# process exits. There is deliberately no Restart= -- the only thing that runs
+# this again is fleet-graph-arbiter.timer, so a crash cannot become a respawn
+# loop. The arbiter is triage-and-suggest only; it never publishes a decision
+# (see src/fleet_graph/arbiter/, pinned by check_supervisor_conformance.py).
+#
+# Shipped as a template only, deliberately NOT installed, started, or enabled by
+# any script here. Deployment/activation is a supervision-plane decision for a
+# later approved window; the rollback for that window, documented and *not*
+# executed, is:
+#     systemctl --user disable --now fleet-graph-arbiter.timer fleet-graph-arbiter.service
+#
+# Credentials are env-only. The only credential surface this unit references is
+# its own dedicated EnvironmentFile (mandatory, no optional `-` marker: a
+# missing arbiter.env must be a visible start failure, not a silent run with no
+# credential). No token value or token-file value appears in git, argv,
+# stdout/stderr, a receipt, or the journal. The decision-publish credential is
+# never referenced here or anywhere in the arbiter package.
+#
+# `arbiter run` is a real subcommand, checked by tests/test_deploy_unit.py the
+# same way fleet-graphd.service is: an invented subcommand plus Type=oneshot is
+# a silent failure, not a visible one.
+[Unit]
+Description=fleet-graph A2 read-only arbiter (triage and suggest, never decide)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/data/apps/fleet-graph/current
+ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph arbiter run \
+    --publish --alias arbiter
+# Bounded runtime: one tick must finish; a hung reasoner call is cut, not
+# left to wedge the timer's next firing.
+TimeoutStartSec=300
+TimeoutStopSec=30
+# Mandatory dedicated credentials env file. This is the only credential path
+# the unit knows about, and it belongs to the arbiter alone.
+EnvironmentFile=%h/.config/fleet-graph/arbiter.env
+# Same PATH discipline as the other fleet-graph units: a systemd user unit does
+# not inherit a login shell's PATH, and the fleet's binaries live under ~/.local.
+Environment=PATH=%h/.bun/bin:%h/.local/bin:%h/.opencode/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=default.target

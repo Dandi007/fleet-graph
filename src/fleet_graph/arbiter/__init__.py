@@ -30,11 +30,28 @@ from fleet_graph.arbiter.a2 import (
     run_arbiter,
 )
 from fleet_graph.arbiter.audit import AuditReport, AuditRow, audit_messages, is_decision_kind
+from fleet_graph.arbiter.managed_path import (
+    build_receipt,
+    count_kinds,
+    is_decision_marked_chat,
+    run_managed_path_scenario,
+)
 from fleet_graph.arbiter.publisher import SuggestionPublisher
+from fleet_graph.arbiter.reconcile import (
+    ARBITER_ALIAS,
+    ARBITER_INBOX,
+    DEFAULT_EXPECTED_PRINCIPAL,
+    Reconciliation,
+    ReconciliationError,
+    reconcile_principal_alias,
+)
 
 __all__ = [
     "ALLOWED_NOTE_TYPES",
+    "ARBITER_ALIAS",
+    "ARBITER_INBOX",
     "BLOCKED_STATUSES",
+    "DEFAULT_EXPECTED_PRINCIPAL",
     "DEFAULT_REASONING_MODEL",
     "FORBIDDEN_FIELDS",
     "NOTE_MARKER",
@@ -45,12 +62,19 @@ __all__ = [
     "Reasoner",
     "Recommendation",
     "RecommendationInvalid",
+    "Reconciliation",
+    "ReconciliationError",
     "Subject",
     "SuggestionPublisher",
     "TextReasoner",
     "audit_messages",
+    "build_receipt",
     "coerce_recommendation",
     "collect_subjects",
+    "count_kinds",
     "is_decision_kind",
+    "is_decision_marked_chat",
+    "reconcile_principal_alias",
     "run_arbiter",
+    "run_managed_path_scenario",
 ]

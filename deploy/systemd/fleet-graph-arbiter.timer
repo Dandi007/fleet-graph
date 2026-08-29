@@ -1,0 +1,29 @@
+# systemd *user* timer for the A2 read-only fleet arbiter.
+#
+# Bounded cadence: exactly one oneshot tick every 15 minutes. The service is
+# Type=oneshot and exits after the tick, so there is no resident process and no
+# restart loop -- the cadence is entirely this timer's job.
+#
+# The timer targets only fleet-graph-arbiter.service and nothing else. It is
+# shipped as install metadata only: it is deliberately NOT enabled, started, or
+# installed by any script here. Deployment is a supervision-plane decision for a
+# later approved window; the rollback for that window, documented and *not*
+# executed:
+#     systemctl --user disable --now fleet-graph-arbiter.timer fleet-graph-arbiter.service
+[Unit]
+Description=Periodic tick for the fleet-graph A2 read-only arbiter
+
+[Timer]
+# One bounded tick every 15 minutes, not a steady loop.
+OnCalendar=*:0/15
+# Allow a bounded delay in a single firing so a burst of timers starting at the
+# same wall-clock minute does not stack on the fleet host.
+AccuracySec=60s
+# The arbiter is a stateless triage pass: if a firing was missed (host down),
+# don't replay it on boot -- the next regular tick covers the board.
+Persistent=false
+# Only the oneshot service target; never a second unit.
+Unit=fleet-graph-arbiter.service
+
+[Install]
+WantedBy=timers.target
