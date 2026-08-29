@@ -70,7 +70,7 @@ class LineInterruptPort:
         interrupt checkpoint for ``(folder_id, generation, round_no)``.
 
         When a board is present the card and question reuse the scheduler's
-        escalation idempotency keys (``goal-line-card:<folder>`` and
+        escalation idempotency keys (``e2-goal-line-card:<folder>`` and
         ``parked:<folder>:<run_id>``) so the line's own question and the
         scheduler's parking escalation converge on one note -- a human answering
         it resumes the very interrupt that asked (spec items 1 and 5, and the
@@ -98,7 +98,7 @@ class LineInterruptPort:
                     "intent": f"goal-line decision interrupt for {self.folder_id}",
                     "work_folder_id": self.folder_id,
                 },
-                idempotency_key=f"goal-line-card:{self.folder_id}",
+                idempotency_key=f"e2-goal-line-card:{self.folder_id}",
             )
             card_entity_id = card.entity_id
             self.card_entity_id = card_entity_id
