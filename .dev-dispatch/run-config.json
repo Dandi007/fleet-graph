@@ -1,0 +1,35 @@
+{
+ "development_id": "dev-fg-30957d025e47",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_work_folder_reconcile.py::TestGovernedGitSource::test_monorepo_subdirectory_reads_cwd_relative_governed_base"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_work_folder_reconcile.py"
+  ],
+  [
+   "uv",
+   "run",
+   "ruff",
+   "check",
+   "src/fleet_graph/dd/work_folder_store.py",
+   "tests/test_work_folder_reconcile.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
