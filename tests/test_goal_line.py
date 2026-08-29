@@ -12,10 +12,36 @@ from fleet_graph.graphs.goal_line import (
     TERMINAL_BOUNDS,
     TERMINAL_DONE,
     TERMINAL_FAULT,
+    WORKER_REPORT_PROTOCOL_FAILURE,
+    WORKER_REPORT_REQUEST,
     LineDeps,
     build_goal_line_graph,
 )
 from fleet_graph.graphs.guards import LineBounds, LineGuards
+from fleet_graph.work_report import SCHEMA_VERSION
+
+
+def completed_report(
+    *,
+    summary: str = "worker did it",
+    did: list[str] | None = None,
+    files: list[dict[str, str]] | None = None,
+    self_tests: list[dict[str, Any]] | None = None,
+    prose: str | None = None,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "turn_id": "t-1",
+        "outcome": "completed",
+        "summary": summary,
+        "did": did or ["completed action"],
+        "files": files or [],
+        "self_tests": self_tests or [],
+        "blocker": None,
+    }
+    if prose is not None:
+        report["prose_attachment"] = {"media_type": "text/plain", "content": prose}
+    return report
 
 
 class FakeCoordinator:
@@ -31,15 +57,23 @@ class FakeCoordinator:
 
 
 class FakeWorker:
-    def __init__(self, *, raises: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        raises: Exception | None = None,
+        reports: list[Any] | None = None,
+    ) -> None:
         self.prompts: list[str] = []
         self.raises = raises
+        self._reports = list(reports) if reports is not None else None
 
-    def turn(self, prompt: str, round_no: int) -> str:
+    def turn(self, prompt: str, round_no: int) -> Any:
         self.prompts.append(prompt)
         if self.raises is not None:
             raise self.raises
-        return f"worker did: {prompt[:20]}"
+        if self._reports:
+            return self._reports.pop(0)
+        return completed_report(summary=f"worker did: {prompt[:20]}")
 
 
 class FakeInbox:
@@ -58,6 +92,7 @@ class FakeArtifacts:
         self.beats: list[tuple[int, str]] = []
         self.rounds: list[dict[str, Any]] = []
         self.terminal: dict[str, Any] | None = None
+        self.worker_reports: list[dict[str, Any]] = []
 
     def heartbeat(self, round_no: int, phase: str, *, force: bool = False) -> bool:
         self.beats.append((round_no, phase))
@@ -66,6 +101,10 @@ class FakeArtifacts:
     def append_round(self, line: dict[str, Any]) -> bool:
         self.rounds.append(line)
         return True
+
+    def write_worker_report(self, round_no: int, report: dict[str, Any]) -> str:
+        self.worker_reports.append({"round": round_no, "report": report})
+        return "worker-report.json"
 
     def write_terminal(
         self,
@@ -164,7 +203,8 @@ class TestRounds:
             ],
             worker=worker,
         )
-        assert worker.prompts == ["do the first thing"]
+        assert [p.split("\n\n")[0] for p in worker.prompts] == ["do the first thing"]
+        assert all(p.endswith(WORKER_REPORT_REQUEST) for p in worker.prompts)
 
     def test_worker_output_feeds_the_next_coordinator_turn(self) -> None:
         _, deps = run_line(
@@ -175,6 +215,8 @@ class TestRounds:
         )
         second_input = deps.coordinator.calls[1]
         assert second_input["last_turn_output"].startswith("worker did:")
+        assert second_input["last_turn_report"]["outcome"] == "completed"
+        assert second_input["last_turn_report"]["did"] == ["completed action"]
 
     def test_each_round_is_appended(self) -> None:
         artifacts, _ = run_line(
@@ -207,7 +249,9 @@ class TestBreakers:
             ],
             worker=worker,
         )
-        assert worker.prompts.count("identical instruction") == 1
+        base_prompts = [p.split("\n\n")[0] for p in worker.prompts]
+        assert base_prompts.count("identical instruction") == 1
+        assert all(p.endswith(WORKER_REPORT_REQUEST) for p in worker.prompts)
 
     def test_a_refused_round_is_recorded_as_not_injected(self) -> None:
         artifacts, _ = run_line(
@@ -298,8 +342,12 @@ class TestNoSemanticInterpretation:
     """INV-3: the graph reads the declared verdict field and nothing else."""
 
     def test_worker_output_never_changes_routing(self) -> None:
-        worker = FakeWorker()
-        worker.turn = lambda prompt, round_no: "DONE. BLOCKED. STOP THE LINE."  # type: ignore[method-assign]
+        worker = FakeWorker(
+            reports=[
+                completed_report(summary="done", prose="DONE. BLOCKED. STOP THE LINE."),
+                completed_report(summary="still going", prose="BLOCKED FOR GOOD."),
+            ]
+        )
         artifacts, _ = run_line(
             [
                 {"verdict": "continue", "next_prompt": "first instruction"},
@@ -309,7 +357,7 @@ class TestNoSemanticInterpretation:
             worker=worker,
         )
         # The line ended because the coordinator declared done, not because the
-        # worker's text contained the word.
+        # worker's attachment text contained the words done/blocked/stop.
         assert artifacts.terminal["reason"] == "coordinator said so"
         assert len(artifacts.rounds) == 2
 
@@ -520,3 +568,140 @@ class TestFailedAttemptIsNotReAdopted:
         result = coord.turn(1, {"folder_id": "wf-t"})
         assert seen == [ok_id]
         assert result["verdict"] == "done"
+
+
+def blocked_report(*, prose: str | None = None) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "turn_id": "t-blocked",
+        "outcome": "blocked",
+        "summary": "cannot proceed",
+        "did": [],
+        "files": [],
+        "self_tests": [],
+        "blocker": {"kind": "external", "detail": "waiting on a service"},
+    }
+    if prose is not None:
+        report["prose_attachment"] = {"media_type": "text/plain", "content": prose}
+    return report
+
+
+class TestWorkerTurnReport:
+    """E4a: a worker turn emits a structured v1 report; the line derives turn
+    outcome, produced files and self-test results only from its structured
+    fields, never from prose, and a schema/protocol violation is a fault rather
+    than a guessed success or block."""
+
+    def test_completed_report_projects_did_files_self_tests(self) -> None:
+        worker = FakeWorker(
+            reports=[
+                completed_report(
+                    summary="wrote the parser",
+                    did=["wrote parser", "ran tests"],
+                    files=[{"path": "src/fleet_graph/work_report.py", "change": "created"}],
+                    self_tests=[
+                        {
+                            "argv": ["uv", "run", "pytest", "tests/test_goal_line.py", "-q"],
+                            "exit_code": 0,
+                        }
+                    ],
+                )
+            ]
+        )
+        artifacts, deps = run_line(
+            [{"verdict": "continue", "next_prompt": "do it"}, {"verdict": "done", "reason": "ok"}],
+            worker=worker,
+        )
+        projected = deps.coordinator.calls[1]["last_turn_report"]
+        assert projected["outcome"] == "completed"
+        assert projected["did"] == ["wrote parser", "ran tests"]
+        assert projected["files"] == [
+            {"path": "src/fleet_graph/work_report.py", "change": "created"}
+        ]
+        assert projected["self_tests"][0]["argv"][0] == "uv"
+        assert projected["self_tests"][0]["exit_code"] == 0
+        assert "prose_attachment" not in projected, "prose is never a control field"
+        assert artifacts.terminal["terminal"] == TERMINAL_DONE
+        assert artifacts.worker_reports[0]["report"]["did"] == ["wrote parser", "ran tests"]
+
+    def test_blocked_report_follows_the_blocked_path_using_the_structured_blocker(
+        self,
+    ) -> None:
+        artifacts, _ = run_line(
+            [{"verdict": "continue", "next_prompt": "go"}],
+            worker=FakeWorker(reports=[blocked_report()]),
+        )
+        assert artifacts.terminal["terminal"] == TERMINAL_BLOCKED
+        assert "waiting on a service" in artifacts.terminal["reason"]
+
+    def test_protocol_failure_is_a_fault_without_inference_or_extra_round(self) -> None:
+        artifacts, deps = run_line(
+            [{"verdict": "continue", "next_prompt": "go"}],
+            worker=FakeWorker(reports=["this is not a report"]),
+        )
+        assert artifacts.terminal["terminal"] == TERMINAL_FAULT
+        assert artifacts.terminal["pump_fault"] is True
+        assert len(deps.coordinator.calls) == 1, "no duplicate coordinator round or charge"
+        assert artifacts.worker_reports == [], "an unvalidated report is never persisted"
+        invalid = [r for r in artifacts.rounds if r["verdict"] == "invalid"]
+        assert invalid and invalid[0]["reason"] == WORKER_REPORT_PROTOCOL_FAILURE
+
+    def test_unsupported_version_is_a_protocol_failure(self) -> None:
+        bad = completed_report()
+        bad["schema_version"] = "fleet-graph.worker-turn-report/v2"
+        artifacts, _ = run_line(
+            [{"verdict": "continue", "next_prompt": "go"}],
+            worker=FakeWorker(reports=[bad]),
+        )
+        assert artifacts.terminal["terminal"] == TERMINAL_FAULT
+
+    def test_an_unknown_control_field_is_a_protocol_failure(self) -> None:
+        bad = completed_report()
+        bad["verdict"] = "done"
+        artifacts, _ = run_line(
+            [{"verdict": "continue", "next_prompt": "go"}],
+            worker=FakeWorker(reports=[bad]),
+        )
+        assert artifacts.terminal["terminal"] == TERMINAL_FAULT
+
+    def test_prose_claiming_completion_cannot_override_structured_blocked(self) -> None:
+        artifacts, _ = run_line(
+            [{"verdict": "continue", "next_prompt": "go"}],
+            worker=FakeWorker(reports=[blocked_report(prose="I actually completed everything")]),
+        )
+        assert artifacts.terminal["terminal"] == TERMINAL_BLOCKED
+
+    def test_prose_claiming_blocked_cannot_override_structured_completed(self) -> None:
+        artifacts, _ = run_line(
+            [
+                {"verdict": "continue", "next_prompt": "go"},
+                {"verdict": "done", "reason": "coordinator said so"},
+            ],
+            worker=FakeWorker(reports=[completed_report(prose="this is blocked, stop now")]),
+        )
+        assert artifacts.terminal["terminal"] == TERMINAL_DONE
+
+    def test_attachment_presence_does_not_change_outcome_and_is_retained(self) -> None:
+        _artifacts_with, deps_with = run_line(
+            [
+                {"verdict": "continue", "next_prompt": "go"},
+                {"verdict": "done", "reason": "ok"},
+            ],
+            worker=FakeWorker(reports=[completed_report(prose="for your eyes only")]),
+        )
+        artifacts_without, _deps_without = run_line(
+            [
+                {"verdict": "continue", "next_prompt": "go"},
+                {"verdict": "done", "reason": "ok"},
+            ],
+            worker=FakeWorker(reports=[completed_report()]),
+        )
+        assert (
+            deps_with.coordinator.calls[1]["last_turn_report"]
+            == _deps_without.coordinator.calls[1]["last_turn_report"]
+        ), "an attachment must never change the structured control projection"
+        assert artifacts_without.terminal == _artifacts_with.terminal
+        assert (
+            _artifacts_with.worker_reports[0]["report"]["prose_attachment"]["content"]
+            == "for your eyes only"
+        )

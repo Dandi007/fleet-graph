@@ -218,6 +218,34 @@ class RunArtifacts:
                 rounds.append(json.loads(raw))
         return rounds
 
+    # --- worker turn report ----------------------------------------------
+
+    def write_worker_report(self, round_no: int, report: dict[str, Any]) -> Path:
+        """Persist the validated structured worker turn report (E4a).
+
+        This is the canonical turn-result record: the only place the worker's
+        structured control fields and its optional prose attachment live,
+        written before any downstream accounting or transition reads it. The
+        prose attachment rides inside the record as a non-control child field
+        with the report's own identity -- inspection-only, never a control
+        surface. Overwrites the previous turn's record; the canonical record is
+        the latest validated report. Unlike heartbeat/rounds, a lost write is
+        failed loudly: an absent canonical record is indistinguishable from a
+        turn that never validated.
+        """
+        path = self._worker_report_path()
+        payload = {"round": round_no, "report": report}
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        return path
+
+    def _worker_report_path(self) -> Path:
+        return self.run_root / "worker-report.json"
+
+    @property
+    def worker_report_path(self) -> Path:
+        return self._worker_report_path()
+
     # --- terminal --------------------------------------------------------
 
     def write_terminal(

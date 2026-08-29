@@ -46,6 +46,7 @@ from fleet_graph.scheduler.checkpoint_terminal import (
 from fleet_graph.scheduler.daemon import LineSpec, Scheduler, SchedulerConfig
 from fleet_graph.scheduler.ignition import Refusal
 from fleet_graph.state.run_artifacts import RunArtifacts
+from fleet_graph.work_report import SCHEMA_VERSION
 
 
 class FakeCheckpointReader:
@@ -309,8 +310,19 @@ class ScriptedCoordinator:
 
 
 class _Worker:
-    def turn(self, prompt: str, round_no: int) -> str:
-        return f"did {prompt}"
+    def turn(self, prompt: str, round_no: int) -> dict:
+        # E4a: a worker turn is a structured v1 report; a bare string would be
+        # rejected by report validation and fault the line before it can park.
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "turn_id": f"t-{round_no}",
+            "outcome": "completed",
+            "summary": f"did {prompt[:40]}",
+            "did": ["completed action"],
+            "files": [],
+            "self_tests": [],
+            "blocker": None,
+        }
 
 
 class _Inbox:

@@ -16,6 +16,20 @@ from fleet_graph.graphs.adapters import (
     CoordinatorFault,
     parse_envelope,
 )
+from fleet_graph.work_report import SCHEMA_VERSION, ReportProtocolError
+
+
+def completed_report() -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "turn_id": "t-1",
+        "outcome": "completed",
+        "summary": "did the thing",
+        "did": ["did the thing"],
+        "files": [],
+        "self_tests": [],
+        "blocker": None,
+    }
 
 
 class FakeLauncher:
@@ -198,23 +212,59 @@ class FakeSeat:
 
 
 class TestWorkerAdapter:
-    def test_returns_the_turn_text(self) -> None:
-        seat = FakeSeat({"ok": True, "text": "did the thing"})
+    def test_returns_the_decoded_report_from_text(self) -> None:
+        seat = FakeSeat({"ok": True, "text": json.dumps(completed_report())})
         worker = AgentSessionWorker(seat=seat, seat_spec=object(), seat_key="k")
-        assert worker.turn("go", 1) == "did the thing"
+        assert worker.turn("go", 1)["outcome"] == "completed"
+
+    def test_a_report_field_wins_and_text_is_carried_as_a_text_plain_attachment(self) -> None:
+        seat = FakeSeat(
+            {"ok": True, "report": completed_report(), "text": "legacy human-facing prose"}
+        )
+        worker = AgentSessionWorker(seat=seat, seat_spec=object(), seat_key="k")
+        parsed = worker.turn("go", 1)
+        assert parsed["outcome"] == "completed"
+        assert parsed["prose_attachment"] == {
+            "media_type": "text/plain",
+            "content": "legacy human-facing prose",
+        }
 
     def test_seat_is_opened_once_across_rounds(self) -> None:
         """A seat is re-entered, not reopened -- reopening leaks a worker."""
-        seat = FakeSeat({"text": "ok"})
+        seat = FakeSeat({"ok": True, "text": json.dumps(completed_report())})
         worker = AgentSessionWorker(seat=seat, seat_spec=object(), seat_key="k")
         worker.turn("a", 1)
         worker.turn("b", 2)
         assert seat.opens == 1
         assert seat.sends == ["a", "b"]
 
-    def test_a_textless_envelope_is_a_fault_not_an_empty_round(self) -> None:
-        """Returning '' would feed an empty fact onward and look merely quiet."""
+    def test_prose_without_a_report_is_a_protocol_failure_not_a_fallback(self) -> None:
+        """Legacy prose with no valid v1 report is not a semantic fallback."""
+        seat = FakeSeat({"ok": True, "text": "did the thing (no report here)"})
+        worker = AgentSessionWorker(seat=seat, seat_spec=object(), seat_key="k")
+        with pytest.raises(ReportProtocolError):
+            worker.turn("go", 1)
+
+    def test_a_missing_report_and_text_is_a_protocol_failure(self) -> None:
         seat = FakeSeat({"ok": True})
         worker = AgentSessionWorker(seat=seat, seat_spec=object(), seat_key="k")
-        with pytest.raises(CoordinatorFault, match="no text"):
+        with pytest.raises(ReportProtocolError, match="missing"):
+            worker.turn("go", 1)
+
+    def test_oversize_carried_forward_prose_is_rejected_not_truncated(self) -> None:
+        """A valid report plus a multi-megabyte ``text`` must not bypass the
+        attachment bound: the carried-forward prose is validated by the same
+        explicit size limit the decoder enforces, so it is a protocol failure
+        rather than a persisted oversized attachment."""
+        from fleet_graph.work_report import ATTACHMENT_CONTENT_MAX_CHARS
+
+        seat = FakeSeat(
+            {
+                "ok": True,
+                "report": completed_report(),
+                "text": "x" * (ATTACHMENT_CONTENT_MAX_CHARS + 1),
+            }
+        )
+        worker = AgentSessionWorker(seat=seat, seat_spec=object(), seat_key="k")
+        with pytest.raises(ReportProtocolError, match="exceeds"):
             worker.turn("go", 1)
