@@ -55,6 +55,8 @@ OPENED = {
 # - wf-40fa8d：terminal=done（C1/C2/C3 五件套验收通过）。
 # - wf-7bc4d1：terminal=done（真机全量验收通过）。
 CONVERGED = {
+    # wf-a8c7b5：步 7 演练 scratch 线，入编即停用（enabled:false），演练时手动开。
+    "wf-a8c7b5",
     "wf-a08949",
     "wf-40fa8d",
     "wf-7bc4d1",
@@ -70,6 +72,9 @@ CONVERGED = {
 # 引擎自己——goal 线跑在 fleet-graph 上、改 fleet-graph 的代码、经 fleet-graph
 # 的 dd 管线交付。方向 SSoT：wiki w-577103；执行卷：work folder wf-d002a6。
 ENROLLED = {
+    # 2026-08-29 步 7 换座真机演练 scratch 线（dev-fg-6925540673b0，決议 seq 678）：
+    # wf-9b5931 的 DoD 演练载体，演练毕可退编。
+    "wf-a8c7b5",
     "wf-7cd0a7",
     "wf-d002a6",
     # 2026-08-29 第四波（用户「Deep research，chat group…重构开始」+ /loop 端到
@@ -135,6 +140,10 @@ class TestTheShippedConfigLoads:
         """9999, not the LineSpec default of 10. Migration is equivalence, and
         silently tightening a bound would end lines that used to keep going."""
         for line in SchedulerConfig.from_json(CONFIG).lines:
+            if line.folder_id == "wf-a8c7b5":
+                # 步 7 演练 scratch 线：单轮即够（换座→取证→完），非迁移线。
+                assert line.max_rounds == 1, line.folder_id
+                continue
             assert line.max_rounds == 9999, line.folder_id
 
     def test_exactly_the_current_batch_is_switched_on(self) -> None:
