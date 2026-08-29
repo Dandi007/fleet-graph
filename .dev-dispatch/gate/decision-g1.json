@@ -1,0 +1,11 @@
+{
+ "development_id": "dev-fg-8b5bbc39bc9d",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "supervisor-uther",
+ "decision_message_id": "msg_01M163R5MG4BS8WXG74RJ3KSHP",
+ "question_note_id": "msg_01M163P3JV6ABS6BE50CSG4CAZ",
+ "card_entity_id": "msg_01M160WJNTDNVFXP37BGSR6362",
+ "output_commit": "d9994cee102e2b079fce29dd865e00d6a5ab678d"
+}
