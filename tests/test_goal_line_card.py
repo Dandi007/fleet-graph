@@ -266,7 +266,6 @@ class TestPathADaemonFirst:
             store=GoalInterruptStore(root / "gi").open(),
             board=board,
             card_entity_id=stall_card,  # threaded through --board-card
-            alias=ALIAS,
             run_id="",
         )
         question_note_id, adopted = port.ask(1, "blocker")
@@ -295,7 +294,6 @@ class TestPathADaemonFirst:
             store=GoalInterruptStore(root / "gi").open(),
             board=board,
             card_entity_id=stall_card,
-            alias=ALIAS,
             run_id="",
         )
         graph, store = build_line_graph(root, port)
@@ -329,7 +327,6 @@ class TestPathBBothRace:
             store=GoalInterruptStore(root / "gi").open(),
             board=board,
             card_entity_id="",  # the race: no card visible to the runtime
-            alias=ALIAS,
             run_id="",
         )
         question_note_id, adopted = port.ask(1, "blocker")
@@ -352,7 +349,6 @@ class TestPathBBothRace:
             store=store,
             board=board,
             card_entity_id="",
-            alias=ALIAS,
             run_id="",
         )
         question_note_id, runtime_card = port.ask(1, "blocker")
@@ -467,5 +463,4 @@ class TestPassThroughWiring:
         port = _build_interrupt(config, run_id="run-x")
         assert port is not None
         assert port.card_entity_id == "card-xyz"
-        assert port.alias == ALIAS
         port.store.close()

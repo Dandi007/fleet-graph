@@ -442,7 +442,6 @@ def scenario_daemon_first_runtime_reuses(work_dir: Path) -> dict[str, Any]:
         store=GoalInterruptStore(line_root).open(),
         board=board,
         card_entity_id=stall_card,
-        alias=ALIAS,
         run_id="",
     )
     graph, store = suspension_line(line_root, port, FOLDER_ID)
@@ -490,7 +489,6 @@ def scenario_concurrent_first_create(work_dir: Path) -> dict[str, Any]:
         store=GoalInterruptStore(line_root).open(),
         board=board,
         card_entity_id="",
-        alias=ALIAS,
         run_id="",
     )
     _question_note_id, adopted = port.ask(1, "blocker")
@@ -526,7 +524,6 @@ def scenario_decision_content_in_production_resume(work_dir: Path) -> dict[str, 
         generation=1,
         store=GoalInterruptStore(line_root).open(),
         board=None,
-        alias=ALIAS,
         run_id="",
     )
     graph, store = suspension_line(line_root, port, FOLDER_ID)
@@ -581,7 +578,6 @@ def scenario_decision_content_in_production_resume(work_dir: Path) -> dict[str, 
         generation=1,
         store=GoalInterruptStore(line_root2).open(),
         board=None,
-        alias=ALIAS,
         run_id="",
     )
     graph2, store2 = suspension_line(line_root2, port2, FOLDER_ID)
@@ -679,7 +675,6 @@ def scenario_real_bus_stall_resume(
         store=GoalInterruptStore(line_root).open(),
         board=board,
         card_entity_id=card_id,
-        alias=None,
         run_id="",
     )
     graph, store = suspension_line(line_root, port, folder)

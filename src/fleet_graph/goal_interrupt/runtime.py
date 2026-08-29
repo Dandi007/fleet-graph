@@ -50,7 +50,6 @@ class LineInterruptPort:
         store: GoalInterruptStore,
         board: Any = None,
         card_entity_id: str = "",
-        alias: str | None = None,
         run_id: str = "",
     ) -> None:
         self.folder_id = folder_id
@@ -58,7 +57,6 @@ class LineInterruptPort:
         self.store = store
         self.board = board
         self.card_entity_id = card_entity_id
-        self.alias = alias
         self.run_id = run_id
 
     def generation(self) -> int:
@@ -85,7 +83,9 @@ class LineInterruptPort:
         through ``--board-card``) is reused, and a first ask with none falls back
         to publishing through the same constructor/key and adopts the returned
         entity id -- including a ``deduplicated=True`` result from a concurrent
-        first-create.
+        first-create. The title collapses to ``folder_id`` on both producers (the
+        design's sanctioned alternative to threading the alias), so the payload is
+        byte-identical even when the alias never reaches the line process.
         """
         existing = self.store.checkpoint_for_round(self.folder_id, self._generation, round_no)
         if existing is not None and existing.get("question_note_id"):
@@ -103,9 +103,7 @@ class LineInterruptPort:
         card_entity_id = self.card_entity_id
         if not card_entity_id:
             card = self.board.publish_card(
-                goal_line_card_payload(
-                    folder_id=self.folder_id, title=self.alias or self.folder_id
-                ),
+                goal_line_card_payload(folder_id=self.folder_id, title=self.folder_id),
                 idempotency_key=goal_line_card_key(self.folder_id),
             )
             card_entity_id = card.entity_id
