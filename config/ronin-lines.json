@@ -114,6 +114,13 @@
       "max_rounds": 9999,
       "enabled": true,
       "_provenance": "2026-08-29 复活入编（用户令「chat group…重构开始」+ /loop 端到端授权）：chatgroup-daemon 重构实施线（pre-P0→P4→promotion 就绪），GLM 智能位（覆盖 08-22 opus5 点名，代行裁决见 folder golden-order 2026-08-29 节）。P0-net loopback 绑定修复编入最高优先级。"
+    },
+    {
+      "folder_id": "wf-fa53cb",
+      "seat": "opencode-dsv4pro",
+      "alias": "ronin-ds-quota",
+      "max_rounds": 9999,
+      "enabled": true
     }
   ],
   "line_environment": {

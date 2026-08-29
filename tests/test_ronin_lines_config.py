@@ -75,6 +75,9 @@ ENROLLED = {
     # 2026-08-29 第四波（用户「Deep research，chat group…重构开始」+ /loop 端到
     # 端授权）：chatgroup-daemon 重构实施线复活入编，GLM 智能位（家族分流令）。
     "wf-e313be",
+    # 2026-08-29 第五波（用户 15:4x 原话：New API 可观测 + Coding Plan 前端质量
+    # 展示，goal-driven 端到端）：DS 供应商额度压测观测线。goal SSoT：wf-fa53cb。
+    "wf-fa53cb",
 }
 
 # 2026-08-29 复活：曾在 MIGRATED 里 enabled=false 停摆的线被用户令重新点亮。
