@@ -462,6 +462,22 @@ def _governed_repo(tmp_path: Path, working: bytes, *, extra_file: bytes | None =
     return repo
 
 
+def _monorepo_governed_folder(tmp_path: Path, working: bytes) -> Path:
+    repo = tmp_path / "monorepo"
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    governed = repo / "wf-governed"
+    governed.mkdir()
+    (governed / "progress.md").write_bytes(PROGRESS)
+    _git(repo, "add", "--", "wf-governed/progress.md")
+    _git(repo, "commit", "-q", "-m", "base")
+    if working is not None:
+        (governed / "progress.md").write_bytes(working)
+    return governed
+
+
 def _source_for(base: Path) -> Any:
     from fleet_graph.dd.work_folder_store import GitWorkFolderSource
 
@@ -481,6 +497,24 @@ class TestGovernedGitSource:
         files = source.inspect("wf-governed")
 
         assert files == (InspectedFile("progress.md", PROGRESS, PROGRESS + APPEND, True),)
+
+    def test_monorepo_subdirectory_reads_cwd_relative_governed_base(self, tmp_path: Path) -> None:
+        folder = _monorepo_governed_folder(tmp_path, PROGRESS + APPEND)
+        source = _source_for(folder)
+
+        files = source.inspect("wf-governed")
+
+        assert len(files) == 1
+        assert files[0].filename == "progress.md"
+        assert files[0].base == PROGRESS
+        assert files[0].base is not None
+        assert files[0].current == PROGRESS + APPEND
+        assert files[0].tracked is True
+
+        reconciler = WorkFolderReconciler()
+        plan = reconciler.plan("wf-governed", source.inspect("wf-governed"))
+        assert plan["entries"][0]["classification"] == CLS_ADOPTABLE
+        assert plan["entries"][0]["filename"] == "progress.md"
 
     def test_adopt_commits_exactly_the_appended_bytes(self, tmp_path: Path) -> None:
         repo = _governed_repo(tmp_path / "repo", PROGRESS + APPEND)
