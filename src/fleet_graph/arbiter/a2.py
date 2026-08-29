@@ -371,14 +371,46 @@ def _already_referenced(client: BusClient, subject: Subject, notes: list[dict[st
     return False
 
 
-def _subject_refs(subject: Subject, recommendation: Recommendation) -> tuple[str, ...]:
+def _board_entities(notes: list[dict[str, Any]], cards: list[dict[str, Any]]) -> frozenset[str]:
+    """The real board entity ids the arbiter observed this tick.
+
+    A published ``target_entity`` must resolve to a real board entity: a card
+    entity id (a root ``work.card.v1``) or a note entity id (a real
+    ``work.note.v1``). Model-emitted ``evidence_refs`` are untrusted strings and
+    are published only when they match one of these ids.
+    """
+    ids: set[str] = set()
+    for message in (*notes, *cards):
+        entity = str(message.get("entity_id") or "")
+        if entity:
+            ids.add(entity)
+    return frozenset(ids)
+
+
+def _subject_refs(
+    subject: Subject,
+    recommendation: Recommendation,
+    known_entities: frozenset[str],
+) -> tuple[str, ...]:
+    """The ref targets an A2 note may carry, restricted to real board entities.
+
+    ``card_entity_id`` (added by the publisher) and the subject's own
+    ``subject_id`` -- its question note -- are always valid ref targets. Model-
+    emitted ``evidence_refs`` are untrusted strings and survive only when they
+    resolve to a real board entity; non-entity strings stay out of the published
+    refs (they remain in the note text and the recommendation envelope for human
+    reading).
+    """
     refs = [subject.subject_id, *recommendation.evidence_refs]
     seen = {subject.card_entity_id}
     ordered: list[str] = []
     for ref in refs:
-        if ref and ref not in seen:
-            seen.add(ref)
-            ordered.append(ref)
+        if not ref or ref in seen:
+            continue
+        if ref != subject.subject_id and ref not in known_entities:
+            continue
+        seen.add(ref)
+        ordered.append(ref)
     return tuple(ordered)
 
 
@@ -420,6 +452,8 @@ def run_arbiter(
     publisher = SuggestionPublisher(Board(client))
     run = ArbiterRun(dry_run=not publish)
     notes, _ = client.messages(WORK_NOTES, limit=NOTES_LIMIT)
+    cards, _ = client.messages(WORK_INDEX, limit=NOTES_LIMIT)
+    known_entities = _board_entities(notes, cards)
     seen: set[str] = set()
 
     for subject in subjects:
@@ -436,16 +470,21 @@ def run_arbiter(
         note_type = "finding" if recommendation.needs_human else "progress"
         text = _render_note(recommendation)
         idempotency_key = f"arbiter-a2:{subject.subject_id}:{subject.source_revision}"
-        subject_refs = _subject_refs(subject, recommendation)
+        subject_refs = _subject_refs(subject, recommendation, known_entities)
         message_id = ""
         if publish:
-            result = publisher.publish(
-                card_entity_id=subject.card_entity_id,
-                note_type=note_type,
-                text=text,
-                subject_refs=subject_refs,
-                idempotency_key=idempotency_key,
-            )
+            try:
+                result = publisher.publish(
+                    card_entity_id=subject.card_entity_id,
+                    note_type=note_type,
+                    text=text,
+                    subject_refs=subject_refs,
+                    idempotency_key=idempotency_key,
+                )
+            except Exception as exc:  # a refused publish, not a crash: keep the tick alive
+                reason = f"publish failed: {str(exc)[:400]}"
+                run.refused.append({"subject_id": subject.subject_id, "reason": reason})
+                continue
             message_id = result.message_id
         run.emitted.append(
             EmittedMessage(
