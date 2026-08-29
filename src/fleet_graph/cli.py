@@ -131,6 +131,181 @@ def _line_run(args: argparse.Namespace) -> int:
     return 0 if result.get("terminal") in {"done", "blocked", "bounds"} else 1
 
 
+def perform_set_seat(
+    *,
+    folder_id: str,
+    to_seat: str,
+    reason: str,
+    who: str,
+    lines_config: pathlib.Path,
+    run_root: pathlib.Path | None = None,
+    prober: Any = None,
+    probe_enabled: bool = True,
+    clock: Any = time.time,
+) -> dict[str, Any]:
+    """The set-seat operation, as a plain function so tests can drive it.
+
+    Step 7's core: probe the target seat (C4 precheck, probe healthy before
+    switching), write a C1-complete override to the scheduler's persistent
+    surface, and bump the persisted generation so the next scheduler launch is
+    a fresh thread cold-starting on the override seat.
+
+    Refusals are operator errors (not in roster, missing reason, no-op switch,
+    probe not healthy) and raise ``SystemExit`` -- the same shape the rest of
+    the CLI uses for a command that cannot do what it was told. A no-op switch
+    (already on that seat) is refused before any probe: there is nothing to
+    switch, and manufacturing an override would only create audit noise.
+    """
+    from fleet_graph.scheduler.daemon import (
+        SchedulerConfig,
+        bump_line_generation,
+    )
+    from fleet_graph.scheduler.seat_override import SeatOverrideStore, validate_override
+    from fleet_graph.state.run_artifacts import iso
+
+    if not folder_id:
+        raise SystemExit("set-seat needs a folder_id")
+    if not reason:
+        raise SystemExit("set-seat needs --reason: a seat switch without a reason is not auditable")
+    if not who:
+        raise SystemExit("set-seat needs --who: a seat switch without an operator is not auditable")
+
+    config = SchedulerConfig.from_json(pathlib.Path(lines_config))
+    line = next((entry for entry in config.lines if entry.folder_id == folder_id), None)
+    if line is None:
+        raise SystemExit(
+            f"set-seat refused: {folder_id} is not in the roster at {lines_config}; "
+            "a seat switch needs a roster line to name the 'from' seat"
+        )
+
+    store = SeatOverrideStore(run_root or config.run_root)
+    current_override = store.get(folder_id)
+    from_seat = current_override.to if current_override is not None else line.seat
+    if from_seat == to_seat:
+        raise SystemExit(
+            f"set-seat refused: {folder_id} already runs on seat {to_seat!r} "
+            "(roster seat when no override is in effect); a no-op switch changes nothing"
+        )
+
+    # C4: probe the face the target seat depends on *before* switching. A seat
+    # that cannot be probed (no credential, unregistered) reads as "we don't
+    # know", and not knowing is a refusal -- the switch may be perfectly fine
+    # and we simply cannot ask, but switching blind is not the spec.
+    if probe_enabled:
+        if prober is None:
+            from fleet_graph.scheduler.probe import CliGatewayProber
+
+            prober = CliGatewayProber()
+        try:
+            healthy = bool(prober.check(to_seat))
+        except Exception as exc:
+            raise SystemExit(
+                f"set-seat refused: gateway probe for seat {to_seat!r} could not be run: {exc}"
+            ) from exc
+        if not healthy:
+            raise SystemExit(
+                f"set-seat refused: gateway probe red for seat {to_seat!r}; "
+                "probe healthy before switching (C4 precheck)"
+            )
+
+    when = iso(clock())
+    record = validate_override(
+        {
+            "folder_id": folder_id,
+            "who": who,
+            "when": when,
+            "from": from_seat,
+            "to": to_seat,
+            "reason": reason,
+        }
+    )
+    store.write(record)
+    next_generation = bump_line_generation(run_root or config.run_root, folder_id, line.generation)
+    return {
+        **record.as_dict(),
+        "generation": next_generation,
+        "run_root": str(run_root or config.run_root),
+    }
+
+
+def _line_set_seat(args: argparse.Namespace) -> int:
+    """Switch one goal line's runtime seat, audited, via the override surface."""
+    who = args.who or os.environ.get("USER") or "operator"
+    result = perform_set_seat(
+        folder_id=args.folder,
+        to_seat=args.seat,
+        reason=args.reason,
+        who=who,
+        lines_config=pathlib.Path(args.lines_config),
+        run_root=pathlib.Path(args.run_root) if args.run_root else None,
+        prober=None,
+        probe_enabled=not args.no_probe,
+    )
+    json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
+    sys.stdout.write("\n")
+    print(
+        f"set-seat: {result['folder_id']} {result['from']} -> {result['to']} "
+        f"(next launch as generation {result['generation']})",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _line_overrides(args: argparse.Namespace) -> int:
+    """The C3 reconcile/lint surface: fold converged overrides, list the drift.
+
+    Zero drift exits 0 (clean); any override still differing from the roster
+    exits 1 and prints every drift line with its diff facts -- drift is loud,
+    never silent. The fold itself is C2: an override that came to agree with
+    the roster (the roster PR merged and deployed) is cleared automatically.
+    """
+    from fleet_graph.scheduler.daemon import SchedulerConfig
+    from fleet_graph.scheduler.seat_override import (
+        SeatOverrideStore,
+        render_drift_line,
+        roster_seat_from,
+    )
+
+    config = SchedulerConfig.from_json(pathlib.Path(args.lines_config))
+    store = SeatOverrideStore(pathlib.Path(args.run_root) if args.run_root else config.run_root)
+    result = store.reconcile(roster_seat_from(config))
+
+    drift = [
+        {
+            "folder_id": folder_id,
+            "who": override.who,
+            "when": override.when,
+            "from": override.from_seat,
+            "to": override.to,
+            "reason": override.reason,
+            "roster_seat": roster or None,
+        }
+        for folder_id, override, roster in result.drifting
+    ]
+    if args.json:
+        json.dump(
+            {"cleared": [o.as_dict() for o in result.cleared], "drift": drift},
+            sys.stdout,
+            ensure_ascii=False,
+            indent=1,
+        )
+        sys.stdout.write("\n")
+    else:
+        for override in result.cleared:
+            print(
+                f"seat override cleared (converged with roster): {override.folder_id} "
+                f"{override.from_to}",
+                file=sys.stderr,
+            )
+        if result.drifting:
+            print("seat override drift (roster ≠ effective):", file=sys.stderr)
+            for folder_id, override, roster in result.drifting:
+                print("  " + render_drift_line(folder_id, override, roster), file=sys.stderr)
+        else:
+            print("no seat override drift; roster and effective seats agree")
+    return 1 if result.drifting else 0
+
+
 def plugin_binding_config(path: Any) -> dict[str, Any]:
     """Read a plugin binding, whole config or bare section.
 
@@ -899,6 +1074,58 @@ def build_parser() -> argparse.ArgumentParser:
         "is acceptable; absence means the line records `not_declared`",
     )
     run.set_defaults(func=_line_run)
+
+    set_seat = line_sub.add_parser(
+        "set-seat",
+        help="switch one line's runtime seat: probe (C4), write an audited "
+        "override (C1), bump the generation so the next launch cold-starts on "
+        "the new seat. Never rewrites the roster.",
+    )
+    set_seat.add_argument("folder", help="the goal line's work folder id (wf-...)")
+    set_seat.add_argument("seat", help="the seat to switch this line TO")
+    set_seat.add_argument("--reason", required=True, help="why (C1: a switch must be explainable)")
+    set_seat.add_argument(
+        "--who",
+        default=None,
+        help="who is doing this (C1; defaults to $USER)",
+    )
+    set_seat.add_argument(
+        "--lines-config",
+        default="config/ronin-lines.json",
+        help="the roster SSoT the 'from' seat is read from",
+    )
+    set_seat.add_argument(
+        "--run-root",
+        default=None,
+        help="override where the override surface and stall-state live "
+        "(default the roster's run_root)",
+    )
+    set_seat.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="skip the C4 gateway precheck of the target seat (drills only: "
+        "a production switch without the precheck is not the spec)",
+    )
+    set_seat.set_defaults(func=_line_set_seat)
+
+    overrides = line_sub.add_parser(
+        "overrides",
+        help="the C3 reconcile/lint face: fold overrides that converged with "
+        "the roster (C2) and list every remaining roster ≠ effective drift "
+        "loudly. Exits 1 while drift exists, 0 when clean.",
+    )
+    overrides.add_argument(
+        "--lines-config",
+        default="config/ronin-lines.json",
+        help="the roster SSoT that defines each line's seat",
+    )
+    overrides.add_argument(
+        "--run-root",
+        default=None,
+        help="override where the override surface lives (default the roster's run_root)",
+    )
+    overrides.add_argument("--json", action="store_true")
+    overrides.set_defaults(func=_line_overrides)
 
     research = subparsers.add_parser("research", help="run a deep-research ticket")
     research_sub = research.add_subparsers()

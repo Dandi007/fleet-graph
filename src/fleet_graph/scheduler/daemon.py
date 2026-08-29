@@ -55,6 +55,7 @@ import contextlib
 import json
 import os
 import subprocess
+import sys
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -78,6 +79,13 @@ from fleet_graph.scheduler.probe import (
     GatewayProber,
     MissingProbeCredential,
     UnknownSeat,
+)
+from fleet_graph.scheduler.seat_override import (
+    ReconcileResult,
+    SeatOverrideStore,
+    effective_seat,
+    render_drift_line,
+    roster_seat_from,
 )
 from fleet_graph.scheduler.wake import WakeSignals, parse_bus_timestamp, probe_error_tag
 
@@ -150,6 +158,13 @@ class TickResult:
     blocker: str | None = None
     #: Outcome of the best-effort board question on the parking tick.
     board_question: str | None = None
+    #: C4: the three seats of one line -- the roster (SSoT), the runtime
+    #: override (when one exists), and the effective one the line actually
+    #: runs on. The triple is filled from the seat-override surface on every
+    #: tick so an operator can always tell *which* seat a line is on and why.
+    seat_roster: str | None = None
+    seat_override: str | None = None
+    seat_effective: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -158,6 +173,10 @@ class TickResult:
             "refusal": self.decision.refusal.value if self.decision.refusal else None,
             "detail": self.decision.detail,
         }
+        if self.seat_effective is not None:
+            record["seat_roster"] = self.seat_roster
+            record["seat_override"] = self.seat_override
+            record["seat_effective"] = self.seat_effective
         if self.probe_detail is not None:
             record["probe_detail"] = self.probe_detail
         if self.parked:
@@ -279,6 +298,7 @@ class Scheduler:
         board: Any = None,
         supervisor: Any = None,
         checkpoints: Any = None,
+        seat_overrides: SeatOverrideStore | None = None,
     ) -> None:
         self.config = config
         self.prober = prober
@@ -287,6 +307,12 @@ class Scheduler:
         self.clock = clock or time.time
         self.observe = observe
         self.sleep = sleep or time.sleep
+        #: The seat-override surface (step 7). Defaults to the scheduler's own
+        #: persistent area; tests inject a store pointed at their run root.
+        #: The roster seat resolver reads the same config's lines, so reconcile
+        #: can tell a converged override from real drift.
+        self.seat_overrides = seat_overrides or SeatOverrideStore(self.config.run_root)
+        self._roster_seat = roster_seat_from(config)
         #: Wake facts for parking. None disables parking outright -- the same
         #: fail-open reading as a probe failure: no way to observe wake facts
         #: means no parking, and the line stays on plain backoff.
@@ -889,13 +915,58 @@ class Scheduler:
             return f"question_failed:{type(exc).__name__}:{str(exc)[:160]}"
 
     def status_of(self, line: LineSpec) -> LineStatus:
+        effective = self.effective_seat_for(line)
         return LineStatus(
             folder_id=line.folder_id,
-            seat=line.seat,
+            seat=effective,
             running=self.units.is_active(self.spec_for(line).unit_name),
             terminal=self.terminal_of(line.folder_id),
             last_start_at=self.last_start_of(line.folder_id),
         )
+
+    def effective_seat_for(self, line: LineSpec) -> str:
+        """The seat this line actually runs on: override wins, else roster.
+
+        C4: the effective seat is the override's target while an override
+        exists for the line, and the roster seat otherwise. Both the gateway
+        probe and the launch must speak of this seat -- probing the roster seat
+        while launching on the override would check the wrong face, and a
+        refusal message that names the wrong seat sends the operator hunting in
+        the wrong place.
+        """
+        return effective_seat(line.seat, self.seat_overrides.get(line.folder_id))
+
+    def seat_triple(self, line: LineSpec) -> tuple[str, str | None, str]:
+        """The C4 triple: (roster seat, override seat, effective seat)."""
+        override = self.seat_overrides.get(line.folder_id)
+        return (
+            line.seat,
+            override.to if override is not None else None,
+            effective_seat(line.seat, override),
+        )
+
+    def reconcile_overrides(self) -> ReconcileResult:
+        """C2/C3: fold converged overrides and surface the remaining drift loudly.
+
+        Runs at the top of every tick. An override whose target now equals the
+        roster seat (the roster PR merged and deployed) is folded away
+        automatically -- a temporary state that has become permanent is no
+        longer an override (C2). Every override that still differs from the
+        roster is printed to stderr with its diff facts, on every tick it
+        persists, so a long-running switch cannot rot silently (C3).
+
+        An override surface that cannot be read reads as empty: the lines fall
+        back to their roster seats, which is the safe reading of not knowing.
+        """
+        try:
+            result = self.seat_overrides.reconcile(self._roster_seat)
+        except OSError:
+            return ReconcileResult()
+        if result.drifting:
+            print("seat override drift (roster ≠ effective):", file=sys.stderr)
+            for folder_id, override, roster in result.drifting:
+                print("  " + render_drift_line(folder_id, override, roster), file=sys.stderr)
+        return result
 
     def gateway_healthy(self, seat: str) -> bool | None:
         """None means no answer, which `decide` treats as a refusal.
@@ -926,7 +997,7 @@ class Scheduler:
         # generation and double-start the line.
         return LaunchSpec(
             folder_id=line.folder_id,
-            seat=line.seat,
+            seat=self.effective_seat_for(line),
             generation=self.generation_of(line),
             alias=line.alias,
             max_rounds=line.max_rounds,
@@ -982,6 +1053,9 @@ class Scheduler:
         stopped = self.maintenance_stop()
         results: list[TickResult] = []
         launched_this_tick = 0
+        # C2/C3: fold converged overrides and print any remaining drift loudly,
+        # before status_of/spec_for read the effective seat this tick.
+        self.reconcile_overrides()
 
         for line in self.config.lines:
             # Accounting runs first: a terminal observed this tick must bump
@@ -997,13 +1071,14 @@ class Scheduler:
                 maintenance_stop=stopped,
                 zero_progress_streak=streak,
                 parked=park.parked,
-                gateway_healthy=self.gateway_healthy(line.seat),
+                gateway_healthy=self.gateway_healthy(self.effective_seat_for(line)),
                 unproductive_recent=self.unproductive_recent(now),
                 cooldown_seconds=self.config.cooldown_seconds,
                 total_cap=self.config.total_cap,
                 cap_window_seconds=self.config.cap_window_seconds,
                 backoff_cap_seconds=self.config.backoff_cap_seconds,
             )
+            seat_roster, seat_override, seat_effective = self.seat_triple(line)
             result = TickResult(
                 line.folder_id,
                 decision,
@@ -1011,9 +1086,12 @@ class Scheduler:
                 park_event=park.event,
                 blocker=park.blocker,
                 board_question=park.board_question,
+                seat_roster=seat_roster,
+                seat_override=seat_override,
+                seat_effective=seat_effective,
             )
             if decision.refusal is Refusal.NO_PROBE:
-                result.probe_detail = self.probe_reasons.get(line.seat)
+                result.probe_detail = self.probe_reasons.get(self.effective_seat_for(line))
             if decision.ignite:
                 if launched_this_tick and self.config.launch_stagger_seconds > 0:
                     # Between launches only -- never before the first, never
@@ -1073,6 +1151,43 @@ def lines_from(entries: Iterable[dict[str, Any]]) -> list[LineSpec]:
     return [LineSpec(**entry) for entry in entries]
 
 
+def bump_line_generation(run_root: Path, folder_id: str, base_generation: int) -> int:
+    """Persist a generation bump so the next launch is a fresh thread.
+
+    The set-seat surface calls this next to writing the override: cold-starting
+    the new seat on a *new* generation is what makes the switch a clean handoff
+    instead of a mid-thread seat change (step 7: 新 generation 以 override 座冷
+    启动). It reads the same per-line stall-state file the scheduler owns, so
+    the bump survives a daemon restart exactly like the streak does.
+
+    Returns the generation the next launch should use. A missing or unreadable
+    stall-state file bumps the roster base; an unreadable file is never a
+    reason to refuse the seat switch itself.
+    """
+    path = Path(run_root) / ".scheduler" / f"{folder_id}.json"
+    state: dict[str, Any] = {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            state = raw
+    except (OSError, json.JSONDecodeError):
+        pass
+    try:
+        current = int(state.get("generation") or 0)
+    except (TypeError, ValueError):
+        current = 0
+    next_generation = max(current, base_generation) + 1
+    state["generation"] = next_generation
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+    except OSError:
+        # Losing the bump costs a thread-id collision on the next launch, not
+        # correctness of the override; the switch itself already happened.
+        pass
+    return next_generation
+
+
 __all__ = [
     "DEFAULT_INTERVAL_SECONDS",
     "DEFAULT_MAINTENANCE_STOP",
@@ -1083,5 +1198,6 @@ __all__ = [
     "SystemdUnitProbe",
     "TickResult",
     "UnitProbe",
+    "bump_line_generation",
     "lines_from",
 ]

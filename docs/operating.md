@@ -182,6 +182,47 @@ journalctl --user -u fleet-graphd -f          # 每 60s 一批，每条线一行
 每行形如 `{"folder_id": ..., "ignited": false, "refusal": "line_disabled", ...}`。
 `refusal` 就是上面七道闸加名册的名字，一一对应。
 
+## 线级换座（step 7：`line set-seat`）
+
+名册座位是 SSoT，只走 PR/review/deploy 改。等不及发布的时候（座位订阅挂了、
+家族分流、坏放量要立刻换道），用**运行时 override** 换座——**绝不动
+`config/ronin-lines.json`**：
+
+```bash
+# 用法（从仓库根或部署目录跑；--lines-config 缺省 config/ronin-lines.json）
+fleet-graph line set-seat wf-9b5931 opencode-gpt-terra \
+  --reason "dsv4pro 订阅道故障，先切 terra 保线" \
+  --who "$USER"
+```
+
+流程：**先探活预检目标座**（C4，probe 不健康直接拒绝并报因）→ 写一条
+`who / when / from→to / reason` 四字段齐全的 override 到调度器持久面
+（`<run_root>/.scheduler/seat-overrides.json`）→ 把持久 generation +1，下一个
+tick 调度器以 override 座**新 generation 冷启动**、经 wf_resume 续上下文。
+当前 generation 还在跑时新 generation 不会起（`already_running`）；要立刻交接
+先停掉旧 unit（unit 名 = `fleet-graph-line-<folder>-g<generation>`，用
+`systemctl --user list-units 'fleet-graph-line-*'` 查当前名）：
+
+- **C1（审计字段）**：override 必带 `who/when/from→to/reason`，缺任一字段拒绝写入。
+  换座是 B 类生产变更，override 本身就是审计痕。
+- **C2（临时态）**：override 是运行时临时态。永久化仍走 PR 改名册；合入部署后
+  reconcile 自动清掉与 roster 相等的 override（相等即不再是 override）。
+- **C3（漂移不许静默）**：`line overrides` 是 reconcile/lint 巡检面——先折叠已
+  收敛的 override，再**响亮列出**所有 `roster ≠ 生效座位` 的 override（含 diff
+  事实），零漂移干净退出（exit 0），有漂移 exit 1。调度器每个 tick 也会在 stderr
+  重打一遍漂移清单，长期漂移不可能静默：
+
+```bash
+fleet-graph line overrides                 # 人类读
+fleet-graph line overrides --json          # 机器读（cleared + drift）
+```
+
+- **C4（三元可观测）**：每个 tick 的线状态带三元
+  `seat_roster / seat_override / seat_effective`，一眼能看出线实际跑在哪个座、
+  为什么。探活与启动都看**生效座位**，不是名册座位——探错面等于没探。
+
+批量换座 = 逐线 `set-seat` 原语编排，没有第二条旁路。
+
 ## 监督面：supervisor 图与事件泵（R4-2/R4-3）
 
 值守的机械化：四类**机械事件**唤醒一次短跑审计，审计报告落板（evidence note）
