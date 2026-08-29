@@ -120,12 +120,12 @@ class AgentRunCoordinator:
     folder_id: str
     thread_id: str
     run_root: Path
-    #: The line's seat, threaded into every coordinator run. Empty means the
-    #: role registry's default leg -- which is how the 2026-08-29 fleet-wide
-    #: family switch silently left coordinators on the old seat: the roster's
-    #: `seat` only reached the worker. The scheduler owns seat policy; the
-    #: coordinator must ride the same seat it schedules for.
-    agent: str = ""
+    # NOTE(2026-08-29): do NOT thread the roster seat into this run as
+    # `--agent` -- the agent-run CLI holds `--role` and `--agent` mutually
+    # exclusive (CONFIG_ERROR exit 90), which grounded the whole fleet for an
+    # hour. The coordinator's seat is declared by the role registry
+    # (profiles/roles/goal_coordinator.yaml); a fleet-wide family switch must
+    # edit that file, not this argv.
     role: str = "goal_coordinator"
     timeout_seconds: int = 2700
     poll_interval: float = 2.0
@@ -156,7 +156,6 @@ class AgentRunCoordinator:
         spec = AgentRunSpec(
             prompt="",
             role=self.role,
-            agent=self.agent or None,
             input_path=str(input_path),
             prompt_file=str(input_path),
             structured=True,

@@ -55,6 +55,22 @@ class TestDecodeAccepts:
         with pytest.raises(ReportProtocolError):
             decode_report("```json\nnot json at all\n```")
 
+    def test_a_report_buried_after_gateway_noise_is_extracted(self) -> None:
+        """SCNet 网关实测（2026-08-29）：空 assistant 消息被替换成
+        '[System: Empty message content sanitised to satisfy protocol]'，seat 把
+        全部 text part 拼接后报告埋在噪音尾部。报告以 {"schema_version" 协议魔数
+        自识别，尾部提取是去噪不是猜测；没有可解析报告的噪音照旧 malformed。"""
+        import json
+
+        noise = "[System: Empty message content sanitised to satisfy protocol]\n\n" * 24
+        body = json.dumps(report())
+        assert decode_report(noise + body) == decode_report(report())
+        assert decode_report(noise + body + "\n\n") == decode_report(report())
+        with pytest.raises(ReportProtocolError):
+            decode_report(noise + '{"schema_version": broken')
+        with pytest.raises(ReportProtocolError):
+            decode_report(noise)
+
     def test_all_four_change_values_are_accepted(self) -> None:
         for change in ("created", "modified", "deleted", "unchanged"):
             decoded = decode_report(report(files=[{"path": "src/a.py", "change": change}]))

@@ -20,6 +20,7 @@ the schema's bounds (spec: "Attachment size limits must be explicit in code").
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 #: The one schema_version this decoder accepts. The literal ``fleet-graph``
@@ -105,6 +106,26 @@ def _strip_code_fence(text: str) -> str:
     return text
 
 
+#: The report's protocol magic. A gateway may prepend zero-information noise to
+#: the turn text (SCNet 实测 2026-08-29: 空 assistant 消息被替换成
+#: "[System: Empty message content sanitised to satisfy protocol]"，seat 拼接后
+#: 报告被埋在噪音后面); the report self-identifies by this head, so extracting
+#: the trailing object that starts with it is normalization, not inference.
+_REPORT_HEAD = re.compile(r"\{\s*\"schema_version\"")
+
+
+def _extract_embedded_report(text: str) -> dict[str, Any] | None:
+    decoder = json.JSONDecoder()
+    for match in reversed(list(_REPORT_HEAD.finditer(text))):
+        try:
+            parsed, _ = decoder.raw_decode(text, match.start())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 def _coerce_object(raw: Any) -> dict[str, Any]:
     """A report dict, or a JSON-string report decoded to one -- else malformed."""
     if isinstance(raw, dict):
@@ -113,7 +134,10 @@ def _coerce_object(raw: Any) -> dict[str, Any]:
         try:
             parsed = json.loads(_strip_code_fence(raw))
         except json.JSONDecodeError as exc:
-            raise ReportProtocolError("malformed", f"report is not valid JSON: {exc}") from exc
+            embedded = _extract_embedded_report(raw)
+            if embedded is None:
+                raise ReportProtocolError("malformed", f"report is not valid JSON: {exc}") from exc
+            parsed = embedded
         if isinstance(parsed, dict):
             return parsed
         raise ReportProtocolError("malformed", "report must be a JSON object")
