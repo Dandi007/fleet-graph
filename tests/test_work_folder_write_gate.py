@@ -18,15 +18,15 @@ unrelated lock files fails rather than passing.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import select
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
-
-import pytest
 
 from fleet_graph.dd.reconcile import ReconcileError
 from fleet_graph.dd.work_folder_store import GitWorkFolderSource
@@ -39,12 +39,23 @@ APPEND = b"- resolved: adopt the residue\n"
 #: head-count probe, so a bypass is observed deterministically instead of racing.
 HOLD_SECONDS = 1.0
 
+#: How long the loser test confirms adoption is blocked on the held lock before
+#: it orders the competing commit. Bounded, and far above the ~milliseconds
+#: adoption takes to reach the lock, so a buggy pre-lock CAS has already read the
+#: pre-winner bytes before the winner lands.
+BLOCK_CONFIRM_SECONDS = 1.0
+
 #: A standalone governed-writer process. ``argv``:
 #: 1 cwd used to resolve the common dir (the repository root),
 #: 2 hold seconds,
 #: 3 mode: "hold" or "commit-competing",
 #: 4 (commit-competing only) repository-relative file to rewrite,
 #: 5 (commit-competing only) the exact new content (utf-8).
+#:
+#: ``commit-competing`` acquires the lock and then blocks on a single stdin line
+#: before it writes, stages, and commits the competing state. That lets the test
+#: hold the lock while adoption is provably blocked on it, and only then order
+#: the competing commit -- so adoption must contend and must re-read under lock.
 _GOVERNED_WRITER = r"""
 import fcntl
 import subprocess
@@ -72,6 +83,7 @@ fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
 print("locked " + str(lock), flush=True)
 
 if mode == "commit-competing":
+    sys.stdin.readline()
     rel = Path(sys.argv[4])
     target = cwd / rel
     target.write_bytes(sys.argv[5].encode("utf-8"))
@@ -87,7 +99,6 @@ if mode == "commit-competing":
         ],
         check=True,
     )
-    time.sleep(hold)
 elif mode == "hold":
     time.sleep(0.4)
     count = subprocess.run(
@@ -187,10 +198,21 @@ def _readline(stream: Any, timeout: float) -> str | None:
 def _spawn_writer(*args: str) -> subprocess.Popen[str]:
     return subprocess.Popen(
         [sys.executable, "-c", _GOVERNED_WRITER, *args],
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
+
+
+def _lock_is_held(lock: Path) -> bool:
+    """True while some process holds the exclusive governed lock, false otherwise."""
+    with open(lock, "a+b") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+        except BlockingIOError:
+            return True
 
 
 class TestWriteGateSerialization:
@@ -249,19 +271,58 @@ class TestWriteGateSerialization:
         winner_bytes = PROGRESS + b"- governed winner\n"
         writer = _spawn_writer(
             str(root),
-            "0.1",
+            "0.0",
             "commit-competing",
             "wf-governed/progress.md",
             winner_bytes.decode("utf-8"),
         )
-        out, err = writer.communicate(timeout=10.0)
-        assert writer.returncode == 0, err
-        assert f"locked {root_lock}" in out
-        assert "unlocked" in out
+        assert writer.stdout is not None and writer.stdin is not None
+        assert writer.stderr is not None
 
-        # Adoption must re-read under lock and refuse, never overwriting the winner.
-        with pytest.raises(ReconcileError, match="does not match the current bytes"):
-            source.adopt("wf-governed", entries)
+        # The writer acquires the canonical lock and then waits for the go signal
+        # before committing, so adoption overlaps with the held lock rather than
+        # running after a joined, already-finished writer.
+        locked_line = _readline(writer.stdout, 10.0)
+        assert locked_line == f"locked {root_lock}", (
+            "governed writer never acquired the canonical lock"
+        )
+
+        # Adoption must now start while the lock is held, so it contends.
+        outcomes: list[tuple[str, Any]] = []
+
+        def run_adopt() -> None:
+            try:
+                outcomes.append(("ok", source.adopt("wf-governed", entries)))
+            except BaseException as exc:  # surface any adoption failure to the test
+                outcomes.append(("err", exc))
+
+        thread = threading.Thread(target=run_adopt, daemon=True)
+        thread.start()
+
+        # Prove adoption is blocked on the writer's lock before the writer commits:
+        # the lock is still held (a non-blocking acquisition from here fails) and
+        # adoption has not completed, so its only remaining path is to wait on it.
+        deadline = time.monotonic() + BLOCK_CONFIRM_SECONDS
+        while time.monotonic() < deadline and not outcomes:
+            assert _lock_is_held(root_lock), (
+                "the governed writer released the lock before adoption contended"
+            )
+            time.sleep(0.05)
+        assert not outcomes, "adoption finished while the governed lock was held"
+        assert _lock_is_held(root_lock)
+
+        # Order the competing commit while adoption is still blocked, then release.
+        writer.stdin.write("go\n")
+        writer.stdin.flush()
+        assert writer.wait(timeout=10.0) == 0, writer.stderr.read()
+
+        thread.join(timeout=10.0)
+        assert not thread.is_alive(), "adoption never unblocked after the release"
+        assert len(outcomes) == 1 and outcomes[0][0] == "err", (
+            f"adoption did not refuse closed: {outcomes!r}"
+        )
+        assert isinstance(outcomes[0][1], ReconcileError)
+        assert "does not match the current bytes" in str(outcomes[0][1])
 
         # The winner's HEAD and bytes remain exact; no residue and no extra commit.
         assert _git(root, "log", "-1", "--format=%s") == "governed writer wins"

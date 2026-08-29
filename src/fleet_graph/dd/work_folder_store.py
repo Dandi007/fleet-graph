@@ -216,6 +216,8 @@ class GitWorkFolderSource:
             "-q",
             "-m",
             "reconcile: adopt append-only residue",
+            "--",
+            *(filename for filename, _, _ in entries),
         )
         return {
             "store": "git",
