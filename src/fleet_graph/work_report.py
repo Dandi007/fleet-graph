@@ -90,13 +90,28 @@ class ReportProtocolError(Exception):
         super().__init__(f"{kind}: {detail}")
 
 
+def _strip_code_fence(text: str) -> str:
+    """Mechanically unshell a markdown code fence around a JSON body (E4b 精神：
+    去壳不碰语义). Some seats (deepseek-v4 家族实测 2026-08-29) wrap the report
+    in ```json ... ``` despite the raw-JSON instruction; the fence carries no
+    information, so stripping it is normalization, not repair. Anything that
+    still fails to parse afterwards stays a malformed fault."""
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return text
+    lines = stripped.splitlines()
+    if len(lines) >= 2 and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1])
+    return text
+
+
 def _coerce_object(raw: Any) -> dict[str, Any]:
     """A report dict, or a JSON-string report decoded to one -- else malformed."""
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str):
         try:
-            parsed = json.loads(raw)
+            parsed = json.loads(_strip_code_fence(raw))
         except json.JSONDecodeError as exc:
             raise ReportProtocolError("malformed", f"report is not valid JSON: {exc}") from exc
         if isinstance(parsed, dict):

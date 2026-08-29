@@ -41,6 +41,20 @@ class TestDecodeAccepts:
 
         assert decode_report(json.dumps(report())) == decode_report(report())
 
+    def test_a_fenced_json_string_report_is_mechanically_unshelled(self) -> None:
+        """deepseek-v4 家族实测（2026-08-29 舰队瘫痪事故）：无视裸 JSON 指令，把
+        report 包进 markdown 栅栏。栅栏零信息量，去壳属 E4b 规范化不属修补；
+        去壳后仍坏的照旧 malformed。"""
+        import json
+
+        body = json.dumps(report())
+        fenced = f"```json\n{body}\n```"
+        assert decode_report(fenced) == decode_report(report())
+        bare_fence = f"```\n{body}\n```"
+        assert decode_report(bare_fence) == decode_report(report())
+        with pytest.raises(ReportProtocolError):
+            decode_report("```json\nnot json at all\n```")
+
     def test_all_four_change_values_are_accepted(self) -> None:
         for change in ("created", "modified", "deleted", "unchanged"):
             decoded = decode_report(report(files=[{"path": "src/a.py", "change": change}]))
