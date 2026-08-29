@@ -165,6 +165,25 @@ class BusClient:
         result = self._call("GET", f"/v1/entities/{entity_id}/refs")
         return result.get("refs", [])
 
+    def whoami(self) -> Any:
+        """The caller's own identity: ``GET /v1/agents/whoami`` (read-only).
+
+        Returns the bus's account record for the credential this client holds
+        (or, under an on-behalf-of header, the identity it is acting as). A
+        credential that is revoked, unknown, or impossible to reach surfaces as
+        a :class:`BusError` here -- there is no identity to return.
+        """
+        return self._call("GET", "/v1/agents/whoami")
+
+    def alias(self, alias: str) -> Any:
+        """Resolve an alias through the real alias read surface (``GET /v1/aliases/{alias}``).
+
+        Read-only. The response's ``current_agent_id`` is the authoritative
+        identity the alias is currently bound to. An unknown alias is a 404
+        :class:`BusError`; the caller must not fall back to a guessed identity.
+        """
+        return self._call("GET", f"/v1/aliases/{alias}")
+
     def message(self, channel_id: str, message_id: str) -> dict[str, Any] | None:
         messages, _ = self.messages(channel_id, limit=1000)
         for candidate in messages:

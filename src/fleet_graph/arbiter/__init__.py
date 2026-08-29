@@ -31,13 +31,24 @@ from fleet_graph.arbiter.a2 import (
 )
 from fleet_graph.arbiter.audit import AuditReport, AuditRow, audit_messages, is_decision_kind
 from fleet_graph.arbiter.publisher import SuggestionPublisher
+from fleet_graph.arbiter.reconcile import (
+    DEFAULT_ARBITER_AGENT_ID,
+    DEFAULT_ARBITER_ALIAS,
+    ArbiterIdentity,
+    ArbiterReconcileError,
+    reconcile_arbiter_identity,
+)
 
 __all__ = [
     "ALLOWED_NOTE_TYPES",
     "BLOCKED_STATUSES",
+    "DEFAULT_ARBITER_AGENT_ID",
+    "DEFAULT_ARBITER_ALIAS",
     "DEFAULT_REASONING_MODEL",
     "FORBIDDEN_FIELDS",
     "NOTE_MARKER",
+    "ArbiterIdentity",
+    "ArbiterReconcileError",
     "ArbiterRun",
     "AuditReport",
     "AuditRow",
@@ -52,5 +63,6 @@ __all__ = [
     "coerce_recommendation",
     "collect_subjects",
     "is_decision_kind",
+    "reconcile_arbiter_identity",
     "run_arbiter",
 ]
