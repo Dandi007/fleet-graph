@@ -87,6 +87,8 @@ def responses_probe(
 # Seat -> the face that seat actually depends on.
 SEAT_PROBES: dict[str, ProbeSpec] = {
     "opencode-dsv4pro": openai_probe("deepseek-v4-pro"),
+    # 同模同腿，只多 memory MCP——探活面与 dsv4pro 相同。
+    "opencode-dsv4pro-mem": openai_probe("deepseek-v4-pro"),
     "opencode-glm53": openai_probe("glm-5.3"),
     "opencode-gpt-terra": responses_probe("gpt-5.6-terra"),
     "opencode-gpt-sol": responses_probe("gpt-5.6-sol"),
