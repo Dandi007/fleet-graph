@@ -1,0 +1,30 @@
+{
+ "development_id": "dev-fg-abc320de4465",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_work_folder_reconcile.py",
+   "tests/test_dd_service.py"
+  ],
+  [
+   "uv",
+   "run",
+   "ruff",
+   "check",
+   "src",
+   "tests",
+   "scripts/reconcile_source_binding_acceptance.py"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/reconcile_source_binding_acceptance.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
