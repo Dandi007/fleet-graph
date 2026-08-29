@@ -793,16 +793,46 @@ def _goal_interrupt_run(args: argparse.Namespace) -> int:
 
 
 def _arbiter_run(args: argparse.Namespace) -> int:
-    """One A2 tick: triage, reason, and (only with --publish) post suggestions.
+    """One A2 tick: reconcile identity, triage, reason, and (with --publish) post.
 
     Defaults to dry-run/offline: the arbiter reads the board and records what
     it would publish, but writes nothing. Publication requires the explicit
     --publish flag; this development never enables it in production.
+
+    The managed path (--publish) first proves, read-only, that the caller is the
+    expected arbiter principal and that the alias binding resolves to its inbox
+    ``agent:<alias>``: a missing/mismatched/rebound/unauthorized identity is
+    refused with a non-secret error and a non-zero exit before any model work or
+    publication.
     """
     from fleet_graph.arbiter.a2 import TextReasoner, run_arbiter
+    from fleet_graph.arbiter.managed_path import build_receipt
+    from fleet_graph.arbiter.reconcile import (
+        ARBITER_ALIAS,
+        DEFAULT_EXPECTED_PRINCIPAL,
+        BusPrincipalBindingProbe,
+        ReconciliationError,
+        reconcile_principal_alias,
+    )
     from fleet_graph.bus.client import BusClient
 
     client = BusClient(base_url=args.bus_url)
+
+    if args.publish:
+        alias = args.alias or ARBITER_ALIAS
+        expected = os.environ.get("FLEET_GRAPH_ARBITER_PRINCIPAL") or DEFAULT_EXPECTED_PRINCIPAL
+        probe = BusPrincipalBindingProbe(client)
+        try:
+            reconcile_principal_alias(
+                authenticated_principal=probe.authenticated_principal(),
+                expected_principal=expected,
+                alias=alias,
+                alias_channel=probe.alias_channel(alias),
+            )
+        except ReconciliationError as exc:
+            print(f"arbiter refused: {exc.detail}", file=sys.stderr)
+            return 1
+
     reasoner = TextReasoner(model=args.model)
     result = run_arbiter(client=client, reasoner=reasoner, publish=args.publish, alias=args.alias)
     payload = {
@@ -811,6 +841,7 @@ def _arbiter_run(args: argparse.Namespace) -> int:
         "suppressed": result.suppressed,
         "refused": result.refused,
         "audit": result.audit().as_dict(),
+        "receipt": build_receipt(result),
     }
     json.dump(payload, sys.stdout, ensure_ascii=False, indent=1)
     sys.stdout.write("\n")

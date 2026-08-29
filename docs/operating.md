@@ -335,6 +335,51 @@ fleet-graph arbiter run --bus-url http://127.0.0.1:7490        # dry-run
 fleet-graph arbiter run --alias arbiter --publish               # 显式发布
 ```
 
+### A2 托管周期（managed path）
+
+常驻托管形态是 `deploy/systemd/fleet-graph-arbiter.service` + `.timer`：
+每个 tick 一次 oneshot `fleet-graph arbiter run --publish --alias arbiter`
+（`arbiter` alias 映射到 inbox `agent:arbiter`），15 分钟一次有界节律，
+`Type=oneshot` 且无 `Restart=`——tick 结束即退出，没有重启循环，再次触发
+只由 timer 决定。
+
+**前置条件（独立的部署闸，未激活）**：本 development 只交付代码，**不安装、
+不启用、不启动**任何 unit/timer，不创建生产 principal/alias/token，不落任何
+token 文件。真正的激活是监督面在后续已批准窗口里的独立决策。届时合规启用
+的前提是：
+
+- 生产上 arbiter principal 已存在且 `agent:arbiter` binding 已可读解析；
+- 站点 env 文件 `~/.config/fleet-graph/arbiter.env` 存在且只含读凭证
+  （`FLEET_GRAPH_BUS_TOKEN` 或 `FLEET_GRAPH_BUS_TOKEN_FILE`），**不含**决策
+  发布凭证——`FLEET_GRAPH_DECISION_TOKEN_FILE` 属于 supervisor act 节点独有，
+  arbiter 永不在 git/argv/stdout/stderr/receipt/journal 中引用它。
+
+**身份 reconcile（发布前置）**：`--publish` 路径在模型工作与落板之前先做
+只读 principal/alias reconcile（`src/fleet_graph/arbiter/reconcile.py`）：
+认证 principal == 期望 arbiter principal（默认 `agent:arbiter`，可用
+`FLEET_GRAPH_ARBITER_PRINCIPAL` 覆盖），且 alias binding 解析到
+`agent:arbiter`。缺失/不匹配/被重绑/未授权任一状态报非秘密错误并以非零退出，
+**先于任何模型工作与发布**；reconcile 模块没有 create/register/token-mint/
+token-write 或其它 mutation 调用。
+
+**终态工件与验收查询**：一次成功 tick 打印一条有界机读 receipt
+（counts/kinds/refs），不含凭证。验收夹具
+`scripts/a2_managed_path_acceptance.py` 打印有界 JSON 并断言
+`referenced_note_or_suggestion_count >= 1`、`work.decision.v1 == 0`、
+`work.decision.v2 == 0`、`decision_marked_chat == 0`。验收查询：
+
+```bash
+uv run pytest -q tests/test_arbiter.py tests/test_arbiter_managed_path.py tests/test_deploy_unit.py
+uv run python scripts/check_supervisor_conformance.py
+uv run python scripts/a2_managed_path_acceptance.py
+```
+
+**回滚（一行，仅供后续已批准窗口执行；本 development 不执行）**：
+
+```bash
+systemctl --user disable --now fleet-graph-arbiter.timer fleet-graph-arbiter.service
+```
+
 ## dd 控制面（R1-b：MCP 服务即控制面）
 
 `fleet-graph dd serve`（`:5610`，unit 模板 `deploy/systemd/fleet-graph-dd-mcp.service`）

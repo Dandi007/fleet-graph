@@ -22,6 +22,12 @@ UNIT = Path(__file__).resolve().parent.parent / "deploy" / "systemd" / "fleet-gr
 DD_MCP_UNIT = (
     Path(__file__).resolve().parent.parent / "deploy" / "systemd" / "fleet-graph-dd-mcp.service"
 )
+ARBITER_UNIT = (
+    Path(__file__).resolve().parent.parent / "deploy" / "systemd" / "fleet-graph-arbiter.service"
+)
+ARBITER_TIMER = (
+    Path(__file__).resolve().parent.parent / "deploy" / "systemd" / "fleet-graph-arbiter.timer"
+)
 
 
 def exec_start(text: str) -> list[str]:
@@ -214,3 +220,127 @@ class TestTheDdMcpUnitRunsSomethingThatExists:
             )
         noise = done.stderr + done.stdout
         assert "Unknown key" not in noise, noise
+
+
+class TestTheArbiterUnitRunsSomethingThatExists:
+    """The A2 arbiter oneshot unit, checked against the CLI it claims to run.
+
+    Same discipline as fleet-graphd.service: an invented subcommand plus
+    Type=oneshot is a silent failure every timer firing, not a visible one.
+    """
+
+    def test_the_subcommand_is_one_the_cli_accepts(self) -> None:
+        argv = exec_start(ARBITER_UNIT.read_text(encoding="utf-8"))
+        assert argv[0].endswith("fleet-graph"), argv[0]
+        parsed = build_parser().parse_args(argv[1:])
+        assert parsed.func is not None
+
+    def test_the_exact_managed_command(self) -> None:
+        argv = exec_start(ARBITER_UNIT.read_text(encoding="utf-8"))
+        assert argv == [
+            "/data/apps/fleet-graph/current/.venv/bin/fleet-graph",
+            "arbiter",
+            "run",
+            "--publish",
+            "--alias",
+            "arbiter",
+        ], argv
+
+    def test_it_is_oneshot_with_no_restart_loop(self) -> None:
+        text = ARBITER_UNIT.read_text(encoding="utf-8")
+        assert re.search(r"^Type=oneshot$", text, re.MULTILINE)
+        assert not re.search(r"^Restart=", text, re.MULTILINE), (
+            "A oneshot arbiter tick must not respawn itself"
+        )
+
+    def test_the_mandatory_dedicated_environment_file(self) -> None:
+        text = ARBITER_UNIT.read_text(encoding="utf-8")
+        assert re.search(
+            r"^EnvironmentFile=%h/\.config/fleet-graph/arbiter\.env$", text, re.MULTILINE
+        ), "the arbiter's EnvironmentFile must be mandatory (no optional `-`) and dedicated"
+        assert not re.search(r"^EnvironmentFile=-", text, re.MULTILINE)
+
+    def test_no_credential_is_baked_into_the_unit(self) -> None:
+        for line in ARBITER_UNIT.read_text(encoding="utf-8").splitlines():
+            if line.startswith("Environment"):
+                assert "TOKEN" not in line.upper(), line
+                assert "KEY" not in line.upper(), line
+        assert "DECISION_TOKEN" not in ARBITER_UNIT.read_text(encoding="utf-8")
+        assert "arbiter.env" in ARBITER_UNIT.read_text(encoding="utf-8")
+
+    def test_it_runs_from_the_current_snapshot(self) -> None:
+        argv = exec_start(ARBITER_UNIT.read_text(encoding="utf-8"))
+        assert argv[0].startswith("/data/apps/fleet-graph/current/"), argv[0]
+
+    def test_systemd_itself_accepts_every_key(self) -> None:
+        analyze = shutil.which("systemd-analyze")
+        if analyze is None:
+            pytest.skip("systemd-analyze not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = Path(tmp) / ARBITER_UNIT.name
+            staged.write_text(ARBITER_UNIT.read_text(encoding="utf-8"), encoding="utf-8")
+            done = subprocess.run(
+                [analyze, "--user", "verify", str(staged)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        noise = done.stderr + done.stdout
+        assert "Unknown key" not in noise, noise
+
+
+class TestTheArbiterTimer:
+    """The timer carries install metadata only; nothing here activates it."""
+
+    def test_it_targets_only_the_oneshot_service(self) -> None:
+        text = ARBITER_TIMER.read_text(encoding="utf-8")
+        assert re.search(r"^Unit=fleet-graph-arbiter\.service$", text, re.MULTILINE)
+        units = re.findall(r"^Unit=(\S+)$", text, re.MULTILINE)
+        assert units == ["fleet-graph-arbiter.service"], units
+
+    def test_documented_bounded_cadence(self) -> None:
+        text = ARBITER_TIMER.read_text(encoding="utf-8")
+        assert re.search(r"^OnCalendar=", text, re.MULTILINE), "the cadence must be declared"
+
+    def test_install_metadata_without_activation(self) -> None:
+        text = ARBITER_TIMER.read_text(encoding="utf-8")
+        assert "[Install]" in text
+        assert "WantedBy=timers.target" in text
+        assert "WantedBy=default.target" not in text
+
+    def test_systemd_itself_accepts_every_key(self) -> None:
+        analyze = shutil.which("systemd-analyze")
+        if analyze is None:
+            pytest.skip("systemd-analyze not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = Path(tmp) / ARBITER_TIMER.name
+            staged.write_text(ARBITER_TIMER.read_text(encoding="utf-8"), encoding="utf-8")
+            done = subprocess.run(
+                [analyze, "--user", "verify", str(staged)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        noise = done.stderr + done.stdout
+        assert "Unknown key" not in noise, noise
+
+
+class TestNoActivationSideEffect:
+    """No repo script enables, starts, or daemon-reloads the arbiter unit.
+
+    Shipping install metadata is allowed; activating it is a supervision-plane
+    decision for a later approved window, so no committed script may do it.
+    """
+
+    def test_no_script_enables_or_starts_the_arbiter_unit(self) -> None:
+        action_words = ("enable", "start", "daemon-reload", "restart", "systemctl")
+        offenders: list[str] = []
+        script_paths = [
+            *sorted(Path(__file__).resolve().parent.parent.glob("scripts/*.py")),
+            Path(__file__).resolve().parent.parent / "deploy" / "release.sh",
+        ]
+        for path in script_paths:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if "fleet-graph-arbiter" in line and any(word in line for word in action_words):
+                    offenders.append(f"{path.name}: {line.strip()}")
+        assert not offenders, offenders
