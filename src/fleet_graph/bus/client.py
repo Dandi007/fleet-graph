@@ -114,6 +114,10 @@ class BusClient:
         """POST an arbitrary bus path. For endpoints outside the publish flow."""
         return self._call("POST", path, body)
 
+    def get(self, path: str) -> Any:
+        """GET an arbitrary bus path. For endpoints outside the messages/refs flows."""
+        return self._call("GET", path)
+
     def publish(
         self,
         channel_id: str,
