@@ -26,6 +26,7 @@ from fleet_graph.executors.agent_run import (
 )
 from fleet_graph.executors.agent_session import AgentSessionSeat, SeatHandle
 from fleet_graph.state.run_artifacts import write_json_durable
+from fleet_graph.work_report import MEDIA_TYPE_PLAIN, ReportProtocolError, decode_report
 
 #: Upper bound on derived coordinator attempts per round. Failures normally
 #: fault the line well before this; the bound only stops a pathological spin.
@@ -66,6 +67,39 @@ def parse_envelope(result: dict[str, Any]) -> dict[str, Any]:
     raise CoordinatorFault(
         f"envelope carried no structured_result/result object; keys={sorted(result)}"
     )
+
+
+def parse_worker_envelope(envelope: dict[str, Any], *, round_no: int) -> dict[str, Any]:
+    """Parse a worker seat envelope into a validated v1 turn report (E4a).
+
+    This is the worker-result ingress. The report travels either in a dedicated
+    ``report`` field (dict or JSON string) or, for a seat that only knows
+    ``text``, as a JSON report in ``text``. Legacy prose that is not a report is
+    carried forward strictly as a ``text/plain`` attachment *when a valid report
+    is also present* -- the adapter never infers ``outcome``/``blocker``/``did``/
+    ``files``/``self_tests`` from it. Prose alone, with no valid report, is an
+    explicit protocol failure, not a semantic fallback.
+    """
+    report_field = envelope.get("report")
+    text = envelope.get("text")
+    candidate: Any
+    prose_to_carry: str | None = None
+
+    if report_field is not None:
+        candidate = report_field
+        if isinstance(text, str) and text.strip():
+            prose_to_carry = text
+    elif isinstance(text, str):
+        candidate = text
+    else:
+        raise ReportProtocolError(
+            "missing", f"worker turn {round_no} carried neither a report nor text"
+        )
+
+    report = decode_report(candidate)
+    if prose_to_carry is not None and "prose_attachment" not in report:
+        report["prose_attachment"] = {"media_type": MEDIA_TYPE_PLAIN, "content": prose_to_carry}
+    return report
 
 
 @dataclass
@@ -175,18 +209,10 @@ class AgentSessionWorker:
             self._handle = self.seat.open(self.seat_spec, self.seat_key)
         return self._handle
 
-    def turn(self, prompt: str, round_no: int) -> str:
+    def turn(self, prompt: str, round_no: int) -> dict[str, Any]:
         handle = self.open()
         envelope = self.seat.send(handle, prompt, timeout_seconds=self.turn_timeout_seconds)
-        text = envelope.get("text")
-        if isinstance(text, str):
-            return text
-        # The seat answered without text. Returning "" here would feed an empty
-        # fact to the next coordinator turn and look like a quiet round rather
-        # than a failed one -- the same silent-stall shape TextNode guards.
-        raise CoordinatorFault(
-            f"worker turn {round_no} returned no text; envelope keys={sorted(envelope)}"
-        )
+        return parse_worker_envelope(envelope, round_no=round_no)
 
 
 __all__ = [
@@ -195,4 +221,5 @@ __all__ = [
     "AgentSessionWorker",
     "CoordinatorFault",
     "parse_envelope",
+    "parse_worker_envelope",
 ]

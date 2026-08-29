@@ -42,6 +42,13 @@ from fleet_graph.goal_interrupt.contract import (
 )
 from fleet_graph.graphs.guards import LineGuards, PromptVerdict
 from fleet_graph.state.run_artifacts import WAITING_ON_DEFAULT, normalize_waiting_on
+from fleet_graph.work_report import (
+    OUTCOME_BLOCKED,
+    OUTCOME_FAILED,
+    ReportProtocolError,
+    decode_report,
+    project_control,
+)
 
 COORDINATOR_ROLE = "goal_coordinator"
 DISPATCHER_LABEL = "fleet-graph"
@@ -72,6 +79,12 @@ RESUME_VERIFICATION_BROKEN = "BROKEN"
 #: `resume_verification.overall` was not BROKEN. A mechanical mismatch marks
 #: the round invalid, so it retries instead of reaching park escalation.
 N7_INVALID_ROUND_CODE = "resume_verification_mismatch"
+
+#: Explicit code recorded on a round a worker turn report fails the v1 protocol
+#: (E4a). The round is invalid by protocol, never a success/blocked inference:
+#: the line faults rather than asking the coordinator to weigh a report that was
+#: never validated -- which would look like a quiet successful round.
+WORKER_REPORT_PROTOCOL_FAILURE = "worker_report_protocol_failure"
 
 
 def claims_resume_verification_broken(reason: str) -> bool:
@@ -187,6 +200,11 @@ class LineState(TypedDict, total=False):
     round_no: int
     last_turn_output: str
     last_turn_status: dict[str, Any]
+    #: The structured control projection of the last validated worker turn
+    #: report (E4a). Set only after a worker turn validated a v1 report; the
+    #: prose attachment never appears here -- it is persisted with the report,
+    #: not a control field.
+    last_turn_report: dict[str, Any]
     terminal: str
     terminal_reason: str
     #: Set only on a blocked terminal from the coordinator's declared verdict.
@@ -214,9 +232,15 @@ class Coordinator(Protocol):
 
 
 class Worker(Protocol):
-    """Injects a prompt into the long-lived worker seat and returns its text."""
+    """Injects a prompt into the long-lived worker seat and returns its output.
 
-    def turn(self, prompt: str, round_no: int) -> str: ...
+    The output is the structured worker turn report (a dict) or a JSON-string
+    report; anything else (legacy prose) fails validation at the worker-turn
+    ingress as a protocol failure. The graph never trusts the text of the
+    output -- it decodes the report and consumes only its structured fields.
+    """
+
+    def turn(self, prompt: str, round_no: int) -> Any: ...
 
 
 class InboxPort(Protocol):
@@ -232,6 +256,7 @@ class AcceptancePort(Protocol):
 class ArtifactsPort(Protocol):
     def heartbeat(self, round_no: int, phase: str, *, force: bool = False) -> bool: ...
     def append_round(self, line: dict[str, Any]) -> bool: ...
+    def write_worker_report(self, round_no: int, report: dict[str, Any]) -> Any: ...
     def write_terminal(
         self,
         *,
@@ -304,6 +329,8 @@ def _coordinator_input(
     }
     if state.get("last_turn_status"):
         coord_input["last_turn_status"] = state["last_turn_status"]
+    if state.get("last_turn_report"):
+        coord_input["last_turn_report"] = state["last_turn_report"]
     if state.get("last_acceptance"):
         coord_input["last_acceptance"] = state["last_acceptance"]
     if deps.resume_verification is not None:
@@ -564,6 +591,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         prompt = state.get("pending_prompt", "")
         try:
             output = deps.worker.turn(prompt, round_no)
+            report = decode_report(output)
         except TimeoutError as exc:
             deps.guards.record_timeout()
             deps.artifacts.append_round(
@@ -580,24 +608,80 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
                 "rounds_recorded": state.get("rounds_recorded", 0) + 1,
                 "last_turn_status": {"kind": "turn_timeout", "detail": str(exc)},
                 "last_turn_output": "",
+                "last_turn_report": None,
             }
 
+        except ReportProtocolError as exc:
+            # E4a protocol failure: a missing/malformed/unsupported-version/
+            # schema-invalid report is never interpreted as success, as blocked,
+            # or as an empty successful turn. Fault the line rather than asking
+            # the coordinator to weigh an unvalidated report -- no extra
+            # coordinator round and no account charge from the retry.
+            deps.artifacts.append_round(
+                {
+                    "round": round_no,
+                    "verdict": "invalid",
+                    "reason": WORKER_REPORT_PROTOCOL_FAILURE,
+                    "detail": f"{exc.kind}: {exc.detail}",
+                    "prompt_sha256": state.get("pending_sha", ""),
+                    "injected": True,
+                }
+            )
+            return {
+                "terminal": TERMINAL_FAULT,
+                "terminal_reason": f"worker turn report {exc.kind}: {exc.detail}",
+                "pump_fault": True,
+            }
+
+        # Structural guard (E4a): only the structured decoder/projection is
+        # consulted for control decisions. The prose attachment is persisted with
+        # the report (inspection-only) and never read here.
+        control = project_control(report)
         deps.guards.record_turn_ok()
+        deps.artifacts.write_worker_report(round_no, report)
         deps.artifacts.append_round(
             {
                 "round": round_no,
                 "verdict": "continue",
                 "reason": "",
+                "report_outcome": report["outcome"],
                 "prompt_sha256": state.get("pending_sha", ""),
                 "injected": True,
             }
         )
-        return {
+
+        progressed: LineState = {
             "round_no": round_no + 1,
             "rounds_recorded": state.get("rounds_recorded", 0) + 1,
-            "last_turn_output": output,
+            "last_turn_output": report["summary"],
+            "last_turn_report": control,
             "last_turn_status": {},
         }
+
+        outcome = report["outcome"]
+        if outcome == OUTCOME_BLOCKED:
+            # The structured blocker is the sole source of this blocked
+            # transition: `kind` and `detail` ride the terminal's reason, and
+            # the full structured blocker stays in the persisted report.
+            blocker = report["blocker"]
+            return {
+                **progressed,
+                "terminal": TERMINAL_BLOCKED,
+                "terminal_reason": f"{blocker['kind']}: {blocker['detail']}",
+                "waiting_on": WAITING_ON_DEFAULT,
+                "waiting_on_declared": None,
+            }
+        if outcome == OUTCOME_FAILED:
+            return {
+                **progressed,
+                "terminal": TERMINAL_FAULT,
+                "terminal_reason": report["summary"],
+                "pump_fault": True,
+            }
+        # completed: proceed through the ordinary completed-turn path -- the
+        # acceptance step runs, then the next coordinator turn weighs the
+        # projected did/files/self_tests facts.
+        return progressed
 
     def acceptance_step(state: LineState) -> LineState:
         """Script step, on the counts side of counts-versus-prose.
@@ -689,6 +773,7 @@ __all__ = [
     "TERMINAL_BOUNDS",
     "TERMINAL_DONE",
     "TERMINAL_FAULT",
+    "WORKER_REPORT_PROTOCOL_FAILURE",
     "AcceptancePort",
     "DecisionInterruptPort",
     "LineDeps",
