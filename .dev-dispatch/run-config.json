@@ -1,0 +1,27 @@
+{
+ "development_id": "dev-fg-2002a2acfdc6",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/check_reconcile_a2_live_bus.py",
+   "--expected-agent-id",
+   "arbiter",
+   "--expected-inbox-channel",
+   "agent:arbiter"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
