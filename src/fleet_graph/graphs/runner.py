@@ -48,6 +48,11 @@ class LineConfig:
     alias: str | None = None
     write: bool = False
     generation: int = 1
+    #: The board card entity id the scheduler's escalation already materialised
+    #: (stall-state ``board_card_entity_id``). Empty means no known card yet and
+    #: the interrupt runtime falls back to publishing through the shared
+    #: constructor + shared key on its first ask.
+    board_card_entity_id: str = ""
     #: None means durable: run_root / "checkpoint.sqlite3". ":memory:" stays
     #: available for tests that want a throwaway thread.
     checkpoint_path: str | None = None
@@ -234,6 +239,9 @@ def _build_interrupt(config: LineConfig, *, run_id: str = "") -> LineInterruptPo
         generation=config.generation,
         store=store,
         board=board,
+        # The scheduler's card, threaded through so the runtime reuses it
+        # instead of publishing a second one (E2 card pass-through).
+        card_entity_id=config.board_card_entity_id,
         run_id=run_id,
     )
 

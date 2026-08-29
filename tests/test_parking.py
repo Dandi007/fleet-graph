@@ -513,7 +513,7 @@ class TestCardMaterialisation:
         assert board.publishes == ["card", "question"]
         assert board.cards[0]["idempotency_key"] == "goal-line-card:wf-1"
         payload = board.cards[0]["payload"]
-        assert payload["title"] == "canary"
+        assert payload["title"] == "wf-1"
         assert payload["status"] == "doing"
         assert "wf-1" in payload["intent"]
         assert payload["work_folder_id"] == "wf-1"

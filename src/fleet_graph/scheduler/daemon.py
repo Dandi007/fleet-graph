@@ -63,6 +63,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from fleet_graph.acceptance import AcceptanceSpec
+from fleet_graph.bus.board import goal_line_card_key, goal_line_card_payload
 from fleet_graph.scheduler.checkpoint_terminal import CheckpointTerminal
 from fleet_graph.scheduler.ignition import (
     DEFAULT_BACKOFF_CAP_SECONDS,
@@ -885,13 +886,8 @@ class Scheduler:
         if not card_entity_id:
             try:
                 card = self.board.publish_card(
-                    {
-                        "title": line.alias or line.folder_id,
-                        "status": "doing",
-                        "intent": f"goal-line escalation surface for {line.folder_id}",
-                        "work_folder_id": line.folder_id,
-                    },
-                    idempotency_key=f"goal-line-card:{line.folder_id}",
+                    goal_line_card_payload(folder_id=line.folder_id, title=line.folder_id),
+                    idempotency_key=goal_line_card_key(line.folder_id),
                 )
             except Exception as exc:  # telemetry must not bite
                 return f"card_failed:{type(exc).__name__}:{str(exc)[:160]}"
@@ -1006,6 +1002,13 @@ class Scheduler:
             acceptance_json=self.acceptance_json_for(line),
             noop_limit=line.noop_limit,
             timeout_limit=line.timeout_limit,
+            # The board card the parking escalation already materialised (per
+            # line, in the stall-state file). Threaded into the line process so
+            # the E2 interrupt runtime reuses the existing card instead of
+            # publishing a second one -- the two producers converge on one card.
+            board_card_entity_id=str(
+                self.stall_state(line.folder_id)["board_card_entity_id"] or ""
+            ),
         )
 
     def acceptance_json_for(self, line: LineSpec) -> str | None:

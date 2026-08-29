@@ -31,6 +31,14 @@ DECISION_KIND_V2 = "work.decision.v2"
 #: 「这是不是一条裁决」的读径一律用本元组，不点名单个版本。
 DECISION_KINDS = (DECISION_KIND, DECISION_KIND_V2)
 
+#: The one shared idempotency identity of a goal line's board card. The
+#: scheduler daemon (parking escalation) and the E2 interrupt runtime both
+#: materialise a goal line's card; they must converge on *one* card per line,
+#: so they share one key and one payload constructor. Same key + same payload
+#: makes the bus idempotency deduplicate the two producers onto one entity;
+#: the ``e2-goal-line-card:`` hotfix key is gone, and nothing may depend on it.
+GOAL_LINE_CARD_KEY_PREFIX = "goal-line-card"
+
 NoteType = str  # "progress" | "evidence" | "finding" | "question"
 
 
@@ -235,6 +243,29 @@ class GateTicket:
         )
 
 
+def goal_line_card_key(folder_id: str) -> str:
+    """The shared idempotency key of one goal line's board card."""
+    return f"{GOAL_LINE_CARD_KEY_PREFIX}:{folder_id}"
+
+
+def goal_line_card_payload(*, folder_id: str, title: str) -> dict[str, Any]:
+    """The shared ``work.card.v1`` payload of one goal line's board card.
+
+    ``title`` must be identical across both producers for the same ``folder_id``
+    so the payload is byte-identical and the bus deduplicates rather than
+    conflict-ing. Both the scheduler's parking escalation and the interrupt
+    runtime collapse to ``folder_id`` as the title (the design's sanctioned
+    alternative to threading the roster alias into the line process, which the
+    production launch chain does not deliver), so the two payloads always agree.
+    """
+    return {
+        "title": title,
+        "status": "doing",
+        "intent": f"goal-line escalation surface for {folder_id}",
+        "work_folder_id": folder_id,
+    }
+
+
 class Board:
     def __init__(
         self,
@@ -393,10 +424,13 @@ __all__ = [
     "FORM_INLINE_CODE",
     "FORM_LABEL",
     "FORM_QUOTE",
+    "GOAL_LINE_CARD_KEY_PREFIX",
     "Board",
     "BusConflict",
     "Decision",
     "GateTicket",
     "NormalizedVerdict",
+    "goal_line_card_key",
+    "goal_line_card_payload",
     "normalize_decision",
 ]
