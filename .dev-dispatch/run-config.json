@@ -1,0 +1,35 @@
+{
+ "development_id": "dev-fg-727956e9befa",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_deploy_unit.py",
+   "tests/test_arbiter_managed_path.py"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/check_reconcile_a2_live_bus.py",
+   "--expected-agent-id",
+   "arbiter",
+   "--expected-inbox-channel",
+   "agent:arbiter"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
