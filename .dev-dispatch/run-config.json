@@ -1,0 +1,40 @@
+{
+ "development_id": "dev-fg-58a4b726121f",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_goal_enroll.py",
+   "-q"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e2_goal_enroll_acceptance.py",
+   "--scenario",
+   "no-acceptance-goal-fail-closed"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e2_goal_enroll_acceptance.py",
+   "--scenario",
+   "enroll-drill-line-end-to-end"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
