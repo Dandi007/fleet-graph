@@ -1,0 +1,73 @@
+{
+ "development_id": "dev-fg-547ab501b2b5",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_parking.py",
+   "-q"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_goal_line.py",
+   "-q"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_goal_interrupt.py",
+   "-q"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_inbox_content_path.py",
+   "-q"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e2_inbox_content_path_acceptance.py",
+   "--scenario",
+   "alias-passthrough-drain-receives-message"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e2_inbox_content_path_acceptance.py",
+   "--scenario",
+   "service-token-403-asserted"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e2_inbox_content_path_acceptance.py",
+   "--scenario",
+   "real-bus-inbox-roundtrip",
+   "--bus-url",
+   "http://127.0.0.1:7490",
+   "--line-token-file",
+   "/data/agent-bus/tokens/e2-wakecheck-repro-20260829.token"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
