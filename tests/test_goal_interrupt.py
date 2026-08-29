@@ -371,8 +371,8 @@ class TestLineInterruptPortAsk:
         question_note_id, card_entity_id = port.ask(1, "blocker")
 
         assert question_note_id == "note-parked:wf-1:run-1"
-        assert card_entity_id == "card-e2-goal-line-card:wf-1"
-        assert "e2-goal-line-card:wf-1" in board.cards
+        assert card_entity_id == "card-goal-line-card:wf-1"
+        assert "goal-line-card:wf-1" in board.cards
         assert "parked:wf-1:run-1" in board.questions
         store.close()
 

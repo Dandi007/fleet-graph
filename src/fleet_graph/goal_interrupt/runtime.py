@@ -18,6 +18,7 @@ from typing import Any
 
 from langgraph.types import Command
 
+from fleet_graph.bus.board import goal_line_card_key, goal_line_card_payload
 from fleet_graph.goal_interrupt.contract import (
     DecisionInput,
     DecisionRef,
@@ -49,6 +50,7 @@ class LineInterruptPort:
         store: GoalInterruptStore,
         board: Any = None,
         card_entity_id: str = "",
+        alias: str | None = None,
         run_id: str = "",
     ) -> None:
         self.folder_id = folder_id
@@ -56,6 +58,7 @@ class LineInterruptPort:
         self.store = store
         self.board = board
         self.card_entity_id = card_entity_id
+        self.alias = alias
         self.run_id = run_id
 
     def generation(self) -> int:
@@ -70,11 +73,19 @@ class LineInterruptPort:
         interrupt checkpoint for ``(folder_id, generation, round_no)``.
 
         When a board is present the card and question reuse the scheduler's
-        escalation idempotency keys (``e2-goal-line-card:<folder>`` and
+        escalation idempotency keys (``goal-line-card:<folder>`` and
         ``parked:<folder>:<run_id>``) so the line's own question and the
         scheduler's parking escalation converge on one note -- a human answering
         it resumes the very interrupt that asked (spec items 1 and 5, and the
         one-resume-per-question property the otherwise-double question breaks).
+
+        The card is published through the *shared* constructor and the *shared*
+        key the scheduler daemon uses, so the two producers converge on one card
+        per line: a passed-in ``card_entity_id`` (the scheduler's card, threaded
+        through ``--board-card``) is reused, and a first ask with none falls back
+        to publishing through the same constructor/key and adopts the returned
+        entity id -- including a ``deduplicated=True`` result from a concurrent
+        first-create.
         """
         existing = self.store.checkpoint_for_round(self.folder_id, self._generation, round_no)
         if existing is not None and existing.get("question_note_id"):
@@ -92,13 +103,10 @@ class LineInterruptPort:
         card_entity_id = self.card_entity_id
         if not card_entity_id:
             card = self.board.publish_card(
-                {
-                    "title": self.folder_id,
-                    "status": "doing",
-                    "intent": f"goal-line decision interrupt for {self.folder_id}",
-                    "work_folder_id": self.folder_id,
-                },
-                idempotency_key=f"e2-goal-line-card:{self.folder_id}",
+                goal_line_card_payload(
+                    folder_id=self.folder_id, title=self.alias or self.folder_id
+                ),
+                idempotency_key=goal_line_card_key(self.folder_id),
             )
             card_entity_id = card.entity_id
             self.card_entity_id = card_entity_id
