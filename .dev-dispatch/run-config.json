@@ -1,0 +1,40 @@
+{
+ "development_id": "dev-fg-ef0706e1962a",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_protocol_entry_normalization.py",
+   "-q"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_work_report.py",
+   "tests/test_work_report_conformance.py",
+   "-q"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_dd_materializer.py",
+   "tests/test_dd_actors.py",
+   "-q"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
