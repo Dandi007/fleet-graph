@@ -121,6 +121,13 @@
       "alias": "ronin-ds-quota",
       "max_rounds": 9999,
       "enabled": true
+    },
+    {
+      "folder_id": "wf-a8c7b5",
+      "seat": "opencode-dsv4pro",
+      "alias": "ronin-step7-drill",
+      "max_rounds": 1,
+      "enabled": false
     }
   ],
   "line_environment": {
