@@ -34,7 +34,7 @@ from fleet_graph.arbiter.a2 import (
 )
 from fleet_graph.arbiter.audit import audit_messages, is_decision_kind
 from fleet_graph.bus.board import Board, GateTicket
-from fleet_graph.bus.client import PublishResult
+from fleet_graph.bus.client import BusError, PublishResult
 
 REPO_ROOT = Path(__file__).parent.parent
 ARBITER_PKG = REPO_ROOT / "src" / "fleet_graph" / "arbiter"
@@ -55,12 +55,14 @@ class FakeBus:
         cards: list[dict[str, Any]] | None = None,
         refs: dict[str, list[str]] | None = None,
         inbox: list[dict[str, Any]] | None = None,
+        publish_error_for: dict[str, Exception] | None = None,
     ) -> None:
         self.notes = list(notes or [])
         self.cards = list(cards or [])
         self.refs: dict[str, list[str]] = {k: list(v) for k, v in (refs or {}).items()}
         self.inbox = list(inbox or [])
         self.published: list[dict[str, Any]] = []
+        self.publish_error_for = dict(publish_error_for or {})
         self._seq = max([m.get("channel_seq", 0) for m in self.notes + self.cards], default=0)
 
     def messages(self, channel: str, *, limit: int = 100, after_seq: int = 0):
@@ -90,6 +92,10 @@ class FakeBus:
         entity_id: str | None = None,
         supersedes: str | None = None,
     ) -> PublishResult:
+        card_entity_id = str(payload.get("card_entity_id") or "")
+        error = self.publish_error_for.get(card_entity_id)
+        if error is not None:
+            raise error
         self._seq += 1
         message_id = f"msg_{self._seq}"
         record = {
@@ -480,3 +486,128 @@ def test_coerce_recommendation_accepts_the_allowed_shape() -> None:
     assert coerced.subject_id == "q1"
     assert coerced.needs_human is True
     assert coerced.evidence_refs == ("e1",)
+
+
+# --- ref guard: non-entity targets must not be published ---------------------
+
+
+def test_non_entity_evidence_ref_is_not_published_as_target_entity() -> None:
+    """A model-emitted legacy ``gate_...`` string must not become a bus ref target.
+
+    The subject's own question note and its card are the only valid ref targets;
+    arbitrary evidence strings are untrusted and must not be published as
+    ``target_entity`` unless they resolve to a real board entity.
+    """
+    bus = FakeBus(
+        notes=[note("q1", 1, "question", "card-a", "should we merge this?")],
+        cards=[card("card-a", 1, title="dev", status="doing")],
+        refs={"q1": []},
+    )
+    gated = valid_response(evidence_refs=["gate_01KZ0W3T17W5EP49MDXJQN6NGG"])
+    run = run_arbiter(client=bus, reasoner=FakeReasoner([gated]), publish=True)
+
+    assert len(run.emitted) == 1
+    emitted = run.emitted[0]
+    assert emitted.kind == "work.note.v1"
+    assert emitted.marker == "suggestion"
+    assert "gate_01KZ0W3T17W5EP49MDXJQN6NGG" not in emitted.subject_refs
+    # the emitted note still references the question note, never the gate string
+    assert set(emitted.subject_refs) == {"q1"}
+
+    assert len(bus.published) == 1
+    targets = {ref["target_entity"] for ref in bus.published[0]["refs"]}
+    assert targets == {"card-a", "q1"}
+    assert "gate_01KZ0W3T17W5EP49MDXJQN6NGG" not in targets
+
+
+def test_real_board_entity_evidence_ref_still_resolves() -> None:
+    """An evidence ref that names a real board entity stays a valid ref target."""
+    bus = FakeBus(
+        notes=[note("q1", 1, "question", "card-a", "should we merge this?")],
+        cards=[
+            card("card-a", 1, title="dev", status="doing"),
+            card("card-b", 2, title="other", status="doing"),
+        ],
+        refs={"q1": []},
+    )
+    valid = valid_response(evidence_refs=["card-b"])
+    run = run_arbiter(client=bus, reasoner=FakeReasoner([valid]), publish=True)
+
+    assert len(run.emitted) == 1
+    targets = {ref["target_entity"] for ref in bus.published[0]["refs"]}
+    assert targets == {"card-a", "card-b", "q1"}
+
+
+def test_non_entity_evidence_ref_survives_in_note_text_for_human_reading() -> None:
+    """The non-entity string is dropped from refs but kept in the note text."""
+    bus = FakeBus(
+        notes=[note("q1", 1, "question", "card-a", "should we merge this?")],
+        cards=[card("card-a", 1, title="dev", status="doing")],
+        refs={"q1": []},
+    )
+    gated = valid_response(evidence_refs=["gate_01KZ0W3T17W5EP49MDXJQN6NGG"])
+    run_arbiter(client=bus, reasoner=FakeReasoner([gated]), publish=True)
+
+    assert len(bus.published) == 1
+    note_text = bus.published[0]["payload"]["note"]
+    assert "gate_01KZ0W3T17W5EP49MDXJQN6NGG" in note_text
+
+
+# --- per-subject publish refusal ---------------------------------------------
+
+
+def test_publish_failure_is_a_refusal_not_a_crash() -> None:
+    """A 422 DERIVATION_ERROR on publish must be a per-subject refusal.
+
+    The tick continues processing the remaining subjects and records the failed
+    one as refused instead of raising out of the whole oneshot run.
+    """
+    derivation_error = BusError(
+        422,
+        '{"code": "DERIVATION_ERROR",'
+        ' "message": "ref target entity [gate_01KZ] not found",'
+        ' "details": {"retryable": false}}',
+    )
+    bus = FakeBus(
+        notes=[note("q1", 1, "question", "card-a", "should we merge this?")],
+        cards=[
+            card("card-a", 1, title="dev", status="doing"),
+            card("card-b", 2, title="other", status="blocked"),
+        ],
+        refs={"q1": []},
+        publish_error_for={"card-b": derivation_error},
+    )
+    responses = [valid_response(), valid_response()]
+    run = run_arbiter(client=bus, reasoner=FakeReasoner(responses), publish=True)
+
+    # the question subject on card-a published; the blocked card-b publish failed
+    assert len(run.emitted) == 1
+    assert run.emitted[0].kind == "work.note.v1"
+    assert run.emitted[0].note_type in ALLOWED_NOTE_TYPES
+    assert run.emitted[0].marker == "suggestion"
+    assert len(run.refused) == 1
+    assert run.refused[0]["subject_id"] == "card-b"
+    assert "publish failed" in run.refused[0]["reason"]
+    # the refused subject did not raise and did not produce an emitted note
+    assert len(bus.published) == 1
+    assert {record["kind"] for record in bus.published} == {"work.note.v1"}
+
+
+def test_publish_failure_kind_surface_stays_note_only() -> None:
+    """Even when publish fails, nothing decision-shaped is emitted."""
+    bus = FakeBus(
+        notes=[note("q1", 1, "question", "card-a", "should we merge this?")],
+        cards=[card("card-a", 1, title="dev", status="doing")],
+        refs={"q1": []},
+        publish_error_for={
+            "card-a": BusError(
+                422, '{"code": "DERIVATION_ERROR", "message": "boom", "details": {}}'
+            )
+        },
+    )
+    run = run_arbiter(client=bus, reasoner=FakeReasoner([valid_response()]), publish=True)
+
+    assert run.emitted == []
+    assert len(run.refused) == 1
+    assert run.refused[0]["subject_id"] == "q1"
+    assert bus.published == []
