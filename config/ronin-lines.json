@@ -22,7 +22,7 @@
     },
     {
       "folder_id": "wf-386b2f",
-      "seat": "opencode-glm53",
+      "seat": "opencode-dsv4pro",
       "max_rounds": 9999,
       "alias": "ronin-cost-observ",
       "enabled": true
@@ -51,14 +51,14 @@
     },
     {
       "folder_id": "wf-5664e5",
-      "seat": "opencode-gpt-terra",
+      "seat": "opencode-dsv4pro-mem",
       "max_rounds": 9999,
       "alias": "ronin-quota",
       "enabled": true
     },
     {
       "folder_id": "wf-6475fd",
-      "seat": "opencode-glm53",
+      "seat": "opencode-dsv4pro",
       "max_rounds": 9999,
       "alias": "ronin-observ",
       "enabled": true
@@ -72,7 +72,7 @@
     },
     {
       "folder_id": "wf-7cd0a7",
-      "seat": "opencode-gpt-sol",
+      "seat": "opencode-dsv4pro",
       "alias": "ronin-bus-redesign",
       "max_rounds": 9999,
       "enabled": true
@@ -94,14 +94,14 @@
     },
     {
       "folder_id": "wf-a87b04",
-      "seat": "opencode-gpt-sol",
+      "seat": "opencode-dsv4pro",
       "enabled": true,
       "alias": "ronin-wf-robust",
       "max_rounds": 9999
     },
     {
       "folder_id": "wf-d002a6",
-      "seat": "opencode-gpt-terra",
+      "seat": "opencode-dsv4pro",
       "alias": "ronin-eventify",
       "max_rounds": 9999,
       "enabled": true,
@@ -109,7 +109,7 @@
     },
     {
       "folder_id": "wf-e313be",
-      "seat": "opencode-glm53",
+      "seat": "opencode-dsv4pro",
       "alias": "ronin-cgspec",
       "max_rounds": 9999,
       "enabled": true,
