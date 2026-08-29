@@ -1,0 +1,32 @@
+{
+ "development_id": "dev-fg-6071f004787e",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_dd_replay.py",
+   "-q"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_dd_materializer.py",
+   "tests/test_dd_control_plane.py",
+   "-q"
+  ],
+  [
+   "make",
+   "verify"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
