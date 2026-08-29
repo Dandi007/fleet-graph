@@ -250,3 +250,21 @@ class TestWorkerAdapter:
         worker = AgentSessionWorker(seat=seat, seat_spec=object(), seat_key="k")
         with pytest.raises(ReportProtocolError, match="missing"):
             worker.turn("go", 1)
+
+    def test_oversize_carried_forward_prose_is_rejected_not_truncated(self) -> None:
+        """A valid report plus a multi-megabyte ``text`` must not bypass the
+        attachment bound: the carried-forward prose is validated by the same
+        explicit size limit the decoder enforces, so it is a protocol failure
+        rather than a persisted oversized attachment."""
+        from fleet_graph.work_report import ATTACHMENT_CONTENT_MAX_CHARS
+
+        seat = FakeSeat(
+            {
+                "ok": True,
+                "report": completed_report(),
+                "text": "x" * (ATTACHMENT_CONTENT_MAX_CHARS + 1),
+            }
+        )
+        worker = AgentSessionWorker(seat=seat, seat_spec=object(), seat_key="k")
+        with pytest.raises(ReportProtocolError, match="exceeds"):
+            worker.turn("go", 1)

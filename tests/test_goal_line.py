@@ -13,6 +13,7 @@ from fleet_graph.graphs.goal_line import (
     TERMINAL_DONE,
     TERMINAL_FAULT,
     WORKER_REPORT_PROTOCOL_FAILURE,
+    WORKER_REPORT_REQUEST,
     LineDeps,
     build_goal_line_graph,
 )
@@ -202,7 +203,8 @@ class TestRounds:
             ],
             worker=worker,
         )
-        assert worker.prompts == ["do the first thing"]
+        assert [p.split("\n\n")[0] for p in worker.prompts] == ["do the first thing"]
+        assert all(p.endswith(WORKER_REPORT_REQUEST) for p in worker.prompts)
 
     def test_worker_output_feeds_the_next_coordinator_turn(self) -> None:
         _, deps = run_line(
@@ -247,7 +249,9 @@ class TestBreakers:
             ],
             worker=worker,
         )
-        assert worker.prompts.count("identical instruction") == 1
+        base_prompts = [p.split("\n\n")[0] for p in worker.prompts]
+        assert base_prompts.count("identical instruction") == 1
+        assert all(p.endswith(WORKER_REPORT_REQUEST) for p in worker.prompts)
 
     def test_a_refused_round_is_recorded_as_not_injected(self) -> None:
         artifacts, _ = run_line(

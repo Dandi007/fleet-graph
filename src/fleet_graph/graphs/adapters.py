@@ -26,7 +26,12 @@ from fleet_graph.executors.agent_run import (
 )
 from fleet_graph.executors.agent_session import AgentSessionSeat, SeatHandle
 from fleet_graph.state.run_artifacts import write_json_durable
-from fleet_graph.work_report import MEDIA_TYPE_PLAIN, ReportProtocolError, decode_report
+from fleet_graph.work_report import (
+    MEDIA_TYPE_PLAIN,
+    ReportProtocolError,
+    decode_report,
+    validate_attachment,
+)
 
 #: Upper bound on derived coordinator attempts per round. Failures normally
 #: fault the line well before this; the bound only stops a pathological spin.
@@ -98,7 +103,12 @@ def parse_worker_envelope(envelope: dict[str, Any], *, round_no: int) -> dict[st
 
     report = decode_report(candidate)
     if prose_to_carry is not None and "prose_attachment" not in report:
-        report["prose_attachment"] = {"media_type": MEDIA_TYPE_PLAIN, "content": prose_to_carry}
+        # The carried-forward prose is the one ingress path that can hand text
+        # to a report *after* decode_report has already enforced its bounds, so
+        # the size limit is re-applied explicitly here -- a seat returning a
+        # valid report plus a multi-megabyte ``text`` is rejected, never
+        # persisted as an oversized attachment.
+        report["prose_attachment"] = validate_attachment(MEDIA_TYPE_PLAIN, prose_to_carry)
     return report
 
 

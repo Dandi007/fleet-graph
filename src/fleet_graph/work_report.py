@@ -276,21 +276,23 @@ def _blocker(data: dict[str, Any], outcome: str) -> dict[str, str] | None:
     return {"kind": kind, "detail": detail}
 
 
-def _prose_attachment(data: dict[str, Any]) -> dict[str, str]:
-    attachment = data["prose_attachment"]
-    if not isinstance(attachment, dict):
-        raise ReportProtocolError("schema_invalid", "prose_attachment must be an object")
-    if set(attachment) != {"media_type", "content"}:
-        raise ReportProtocolError(
-            "schema_invalid", "prose_attachment must have only media_type and content"
-        )
-    media_type = attachment["media_type"]
+def validate_attachment(media_type: str, content: str) -> dict[str, str]:
+    """Validate an attachment's ``media_type``/``content`` as a pair.
+
+    This is the single enforcement point for the explicit
+    ``ATTACHMENT_CONTENT_MAX_CHARS`` bound, shared by the decoder's
+    ``prose_attachment`` field and by the adapter that carries legacy prose
+    forward into an attachment at the ingress. The bound must bite on *every*
+    path that puts prose into a report -- including prose carried forward after
+    ``decode_report`` has already run -- so the persisted record stays
+    unambiguous. Oversize content is rejected (``ReportProtocolError``), never
+    truncated.
+    """
     if media_type not in MEDIA_TYPES:
         raise ReportProtocolError(
             "schema_invalid",
             f"prose_attachment.media_type={media_type!r} is not one of {sorted(MEDIA_TYPES)}",
         )
-    content = attachment["content"]
     if not isinstance(content, str):
         raise ReportProtocolError("schema_invalid", "prose_attachment.content must be a string")
     if len(content) > ATTACHMENT_CONTENT_MAX_CHARS:
@@ -300,6 +302,17 @@ def _prose_attachment(data: dict[str, Any]) -> dict[str, str]:
             "characters (rejected, not truncated)",
         )
     return {"media_type": media_type, "content": content}
+
+
+def _prose_attachment(data: dict[str, Any]) -> dict[str, str]:
+    attachment = data["prose_attachment"]
+    if not isinstance(attachment, dict):
+        raise ReportProtocolError("schema_invalid", "prose_attachment must be an object")
+    if set(attachment) != {"media_type", "content"}:
+        raise ReportProtocolError(
+            "schema_invalid", "prose_attachment must have only media_type and content"
+        )
+    return validate_attachment(attachment["media_type"], attachment["content"])
 
 
 def decode_report(raw: Any) -> dict[str, Any]:
@@ -372,4 +385,5 @@ __all__ = [
     "ReportProtocolError",
     "decode_report",
     "project_control",
+    "validate_attachment",
 ]

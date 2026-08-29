@@ -45,6 +45,7 @@ from fleet_graph.state.run_artifacts import WAITING_ON_DEFAULT, normalize_waitin
 from fleet_graph.work_report import (
     OUTCOME_BLOCKED,
     OUTCOME_FAILED,
+    SCHEMA_VERSION,
     ReportProtocolError,
     decode_report,
     project_control,
@@ -85,6 +86,42 @@ N7_INVALID_ROUND_CODE = "resume_verification_mismatch"
 #: the line faults rather than asking the coordinator to weigh a report that was
 #: never validated -- which would look like a quiet successful round.
 WORKER_REPORT_PROTOCOL_FAILURE = "worker_report_protocol_failure"
+
+#: The report request appended to every worker turn prompt (E4a). The worker
+#: seat is a generic agent driven only by its prompt, so without this explicit
+#: request its natural answer is free prose -- which the now-strict ingress
+#: treats as a protocol failure. This is the in-repo lever the spec's scope line
+#: names for "changing worker prompts to request the report"; it asks for the
+#: schema, it does not encode a persona or an E4b normalization.
+WORKER_REPORT_REQUEST = (
+    "\n\nRespond with exactly one JSON object conforming to the schema "
+    f'{SCHEMA_VERSION!r}. Required keys: "schema_version" (the literal '
+    '"fleet-graph.worker-turn-report/v1"), "turn_id" (non-empty string), '
+    '"outcome" (one of "completed", "blocked", "failed"), "summary" '
+    '(string), "did" (array of strings), "files" (array of objects with '
+    'only `path`, a non-empty relative path, and `change`, one of "created", '
+    '"modified", "deleted", "unchanged"), "self_tests" (array of '
+    "objects with only `argv`, a non-empty string array, and `exit_code`, a "
+    'non-negative integer), and "blocker" (null for "completed"; an object '
+    'with only non-empty `kind` and `detail` for "blocked"; null or that '
+    'object for "failed"). Put any prose explanation only in the optional '
+    '`prose_attachment` object (with `media_type` of "text/plain" or '
+    '"text/markdown" and a bounded `content` string); it is inspection-only '
+    "and never a control field. Emit the JSON object alone, with no surrounding "
+    "text, markdown fences, or commentary."
+)
+
+
+def _worker_prompt(prompt: str) -> str:
+    """The instruction the worker seat actually receives for a turn (E4a).
+
+    The worker is a generic agent with no persona that requests the schema, so
+    the report request is appended to the coordinator's ``next_prompt``. The
+    request is added *after* the freshness guard has already hashed
+    ``next_prompt`` on its own, so it never masks a repeated instruction (INV-9).
+    """
+    base = prompt.strip()
+    return f"{base}{WORKER_REPORT_REQUEST}" if base else WORKER_REPORT_REQUEST
 
 
 def claims_resume_verification_broken(reason: str) -> bool:
@@ -588,7 +625,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         round_no = state.get("round_no", 1)
         deps.artifacts.heartbeat(round_no, "worker")
 
-        prompt = state.get("pending_prompt", "")
+        prompt = _worker_prompt(state.get("pending_prompt", ""))
         try:
             output = deps.worker.turn(prompt, round_no)
             report = decode_report(output)
@@ -633,9 +670,14 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
                 "pump_fault": True,
             }
 
-        # Structural guard (E4a): only the structured decoder/projection is
-        # consulted for control decisions. The prose attachment is persisted with
-        # the report (inspection-only) and never read here.
+        # Only the structured decoder/projection is consulted for control
+        # decisions: decode_report() validated the report at the boundary and
+        # project_control() is the sole control slice. The prose attachment is
+        # persisted with the report (inspection-only) and never read here. Its
+        # structural enforcement lives in scripts/check_work_report_conformance.py
+        # (Guard W1 pins this path to decode_report/project_control; Guard W2
+        # makes "prose_attachment" unreachable from this control module), fed
+        # violation samples by tests/test_work_report_conformance.py.
         control = project_control(report)
         deps.guards.record_turn_ok()
         deps.artifacts.write_worker_report(round_no, report)
@@ -774,6 +816,7 @@ __all__ = [
     "TERMINAL_DONE",
     "TERMINAL_FAULT",
     "WORKER_REPORT_PROTOCOL_FAILURE",
+    "WORKER_REPORT_REQUEST",
     "AcceptancePort",
     "DecisionInterruptPort",
     "LineDeps",
