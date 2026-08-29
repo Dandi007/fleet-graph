@@ -1,0 +1,64 @@
+{
+ "development_id": "dev-fg-58a4b726121f",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "uv",
+    "sync",
+    "--frozen"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": "Checked 100 packages in 1ms\n"
+  },
+  {
+   "command": [
+    "make",
+    "verify"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "............................. [ 12%]\n........................................................................ [ 16%]\n........................................................................ [ 20%]\n........................................................................ [ 24%]\n........................................................................ [ 28%]\n.....................................................s.................. [ 32%]\n........................................................................ [ 36%]\n........................................................................ [ 40%]\n........................................................................ [ 44%]\n........................................................................ [ 48%]\n........................................................................ [ 52%]\n........................................................................ [ 56%]\n........................................................................ [ 60%]\n........................................................................ [ 64%]\n........................................................................ [ 68%]\n........................................................................ [ 72%]\n........................................................................ [ 76%]\n........................................................................ [ 80%]\n........................................................................ [ 84%]\n........................................................................ [ 88%]\n........................................................................ [ 92%]\n........................................................................ [ 96%]\n........................................................                 [100%]\n1783 passed, 1 skipped in 50.96s\nuv run python scripts/check_supervisor_conformance.py\nsupervisor conformance: clean\nuv run python scripts/check_work_report_conformance.py\nwork-report conformance: clean\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "pytest",
+    "tests/test_goal_enroll.py",
+    "-q"
+   ],
+   "exit_code": 0,
+   "stdout_tail": ".........................                                                [100%]\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/e2_goal_enroll_acceptance.py",
+    "--scenario",
+    "no-acceptance-goal-fail-closed"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "{\n  \"exit_code\": 0,\n  \"pass\": true,\n  \"refusal_code\": \"NO_ACCEPTANCE_COMMAND\",\n  \"refused\": true,\n  \"scenario\": \"no-acceptance-goal-fail-closed\",\n  \"utc_timestamp\": \"2026-08-29T12:37:58Z\"\n}\n",
+   "stderr_tail": "[08/29/26 20:37:58] Error calling tool 'goal_enroll'                            \n"
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/e2_goal_enroll_acceptance.py",
+    "--scenario",
+    "enroll-drill-line-end-to-end"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "{\n  \"admitted\": {\n    \"acceptance_argv\": [\n      [\n        \"python3\",\n        \"-c\",\n        \"print('enroll drill line starts')\"\n      ]\n    ],\n    \"admitted_at\": \"2026-08-29T12:38:00Z\",\n    \"already_admitted\": false,\n    \"briefing_version\": \"v1\",\n    \"engine\": \"fleet-graph\",\n    \"folder_id\": \"wf-1\",\n    \"lint_warnings\": [],\n    \"liveness\": [\n      {\n        \"argv\": [\n          \"python3\",\n          \"-c\",\n          \"print('enroll drill line starts')\"\n        ],\n        \"duration_s\": 0.013,\n        \"exit_code\": 0,\n        \"started\": true\n      }\n    ],\n    \"mechanism\": \"goal_enroll\"\n  },\n  \"exit_code\": 0,\n  \"line_starts\": true,\n  \"pass\": true,\n  \"persisted_briefing_version\": \"v1\",\n  \"scenario\": \"enroll-drill-line-end-to-end\",\n  \"utc_timestamp\": \"2026-08-29T12:38:00Z\"\n}\n",
+   "stderr_tail": ""
+  }
+ ]
+}
