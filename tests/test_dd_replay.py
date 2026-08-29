@@ -1171,6 +1171,138 @@ class TestAReconfiguredReplayDoesNotBlameTheReviewer:
         assert any(stage == "final_review" for stage, _ in guard.violations)
 
 
+class TestAStaleRunConfigResidueAtTheReplayTipIsRemoved:
+    """The dev-fg-3a5778fc6a35 generation-5 shape.
+
+    The predecessor fix only defers a *newly reproduced* run-config until
+    acceptance; it does not cover stale controller-owned ``run-config.json``
+    dirt left by an earlier failed generation when replay preparation finds
+    ``HEAD == replay tip``, so ``_prepare`` skips its ``reset --hard`` branch
+    and the stale dirt survives into the fresh final reviewer
+    (ACTOR_RESERVED_PATH_CHANGED). This proves the uncovered path is closed:
+    only provably controller-owned stale residue is removed, a genuine
+    final-review actor write is still refused, and acceptance still observes
+    the current declaration."""
+
+    def _g1_with_replayed_continuous_review_at_tip(self, repo: Path, tmp_path: Path) -> G1:
+        """The replay tip is already HEAD: no junk above it to trim."""
+        g1 = G1(repo, tmp_path)
+        rc = commit_file(
+            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
+        )
+        cr = review_receipt(
+            parent_digest=byte_digest(g1.raw),
+            subject=g1.implement,
+            output=rc,
+            verdict="APPROVE",
+        )
+        write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
+        write_intent(g1.state_root, cr)
+        assert head(repo) == rc
+        return g1
+
+    def _generation_n_player(
+        self, g1: G1, generation: int, run_config: dict[str, Any] | None
+    ) -> ReceiptReplayer:
+        return ReceiptReplayer(
+            workspace=g1.repo,
+            state_root=g1.dev_root / f"g{generation}" / "state",
+            prior_state_roots=((1, g1.state_root),),
+            development_id=DEVELOPMENT_ID,
+            generation=generation,
+            lifecycle=LIFECYCLE,
+            run_config=run_config,
+        )
+
+    def test_the_stale_residue_is_removed_and_acceptance_sees_the_current_declaration(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        g1 = self._g1_with_replayed_continuous_review_at_tip(repo, tmp_path)
+        # A previous failed generation's controller-produced reconfigured
+        # declaration, left dirty: committed generation 1 config versus an
+        # unstaged generation 4 reconfigured acceptance declaration.
+        (repo / RUN_CONFIG_PATH).write_text(
+            json.dumps(
+                {
+                    "development_id": DEVELOPMENT_ID,
+                    "generation": 4,
+                    "acceptance_commands": [["true"]],
+                    "setup_commands": [["echo", "stale"]],
+                    "acceptance_env": {"PYTHONPATH": "stale"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        declared = {
+            "acceptance_commands": [["true"]],
+            "setup_commands": [["echo", "reconfigured-setup"]],
+            "acceptance_env": {"PYTHONPATH": "src"},
+        }
+        replayer = self._generation_n_player(g1, 5, declared)
+        actor = ContractActor({"final_review": ["APPROVE"]})
+        scripts = {name: actor for name, stage in LIFECYCLE.stages.items() if not stage.is_llm}
+        scripts["acceptance"] = AcceptanceStage(
+            repo=repo,
+            declared=declared["acceptance_commands"],
+            setup=declared["setup_commands"],
+            env=declared["acceptance_env"],
+        )
+        guard = ReviewReservedPathGuard(repo)
+        graph = build_dd_pipeline_graph(
+            make_deps(actor=actor, scripts=scripts, replayer=replayer, materializer=guard)
+        ).compile()
+        state = graph.invoke(
+            initial_state(
+                development_id=DEVELOPMENT_ID,
+                stage="configure",
+                head_commit=head(repo),
+                artifacts={"spec": head(repo)},
+                generation=5,
+            ),
+            config={"recursion_limit": 200},
+        )
+
+        assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
+        assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
+        assert ("final_review", 1) in actor.calls
+        assert guard.violations == []
+        # The stale residue was dropped, and acceptance graded against the
+        # current generation's reconfigured declaration, not the stale one.
+        config = json.loads((repo / RUN_CONFIG_PATH).read_text(encoding="utf-8"))
+        assert config["acceptance_env"] == {"PYTHONPATH": "src"}
+        assert config["generation"] == 5
+
+    def test_a_non_controller_run_config_change_is_not_hidden(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        g1 = self._g1_with_replayed_continuous_review_at_tip(repo, tmp_path)
+        # A run-config rewrite that carries no controller signature -- an
+        # attempt to edit the exam -- must not be silently removed; the
+        # reserved-path guard has to refuse it instead.
+        (repo / RUN_CONFIG_PATH).write_text(
+            json.dumps({"acceptance_commands": [["true"]]}), encoding="utf-8"
+        )
+        replayer = self._generation_n_player(g1, 5, None)
+        actor = ContractActor({"final_review": ["APPROVE"]})
+        guard = ReviewReservedPathGuard(repo)
+        graph = build_dd_pipeline_graph(
+            make_deps(actor=actor, replayer=replayer, materializer=guard)
+        ).compile()
+        state = graph.invoke(
+            initial_state(
+                development_id=DEVELOPMENT_ID,
+                stage="configure",
+                head_commit=head(repo),
+                artifacts={"spec": head(repo)},
+                generation=5,
+            ),
+            config={"recursion_limit": 200},
+        )
+
+        assert state["terminal"] == TERMINAL_REFUSED, state.get("terminal_reason")
+        assert any(stage == "final_review" for stage, _ in guard.violations)
+
+
 def write_review_intent(state_root: Path, receipt: dict[str, Any], *, dispatch_mode: str) -> bytes:
     """A review intent that also freezes the `dispatch_mode` the plugin froze,
     so a replayed rework prefix's Continuous intent carries `rework` exactly
