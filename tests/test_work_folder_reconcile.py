@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -435,6 +437,103 @@ class TestMCPRegisteredTool:
             message = asyncio.run(call(url))
 
         assert "RECONCILE_SOURCE_UNBOUND" in message
+
+
+def _git(repo: Path, *args: str) -> str:
+    proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise AssertionError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def _governed_repo(tmp_path: Path, working: bytes, *, extra_file: bytes | None = None) -> Path:
+    repo = tmp_path
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    (repo / "progress.md").write_bytes(PROGRESS)
+    _git(repo, "add", "--", "progress.md")
+    _git(repo, "commit", "-q", "-m", "base")
+    if working is not None:
+        (repo / "progress.md").write_bytes(working)
+    if extra_file is not None:
+        (repo / "scratch.md").write_bytes(extra_file)
+    return repo
+
+
+def _source_for(base: Path) -> Any:
+    from fleet_graph.dd.work_folder_store import GitWorkFolderSource
+
+    def resolve(folder_id: str) -> Path | None:
+        if folder_id != "wf-governed":
+            return None
+        return base
+
+    return GitWorkFolderSource(resolve)
+
+
+class TestGovernedGitSource:
+    def test_inspect_derives_governed_base_and_working_bytes(self, tmp_path: Path) -> None:
+        repo = _governed_repo(tmp_path / "repo", PROGRESS + APPEND)
+        source = _source_for(repo)
+
+        files = source.inspect("wf-governed")
+
+        assert files == (InspectedFile("progress.md", PROGRESS, PROGRESS + APPEND, True),)
+
+    def test_adopt_commits_exactly_the_appended_bytes(self, tmp_path: Path) -> None:
+        repo = _governed_repo(tmp_path / "repo", PROGRESS + APPEND)
+        source = _source_for(repo)
+        reconciler = WorkFolderReconciler()
+        plan = reconciler.plan("wf-governed", source.inspect("wf-governed"))
+
+        result = reconciler.confirm(
+            "wf-governed", plan["token"], source.inspect("wf-governed"), adopt=source.adopt
+        )
+
+        assert result["mechanism"] == RECONCILE_MECHANISM
+        assert _git(repo, "show", "HEAD:progress.md").encode() == PROGRESS + APPEND
+        assert _git(repo, "status", "--porcelain") == ""
+
+    def test_untracked_residue_is_reported_as_untracked(self, tmp_path: Path) -> None:
+        repo = _governed_repo(tmp_path / "repo", PROGRESS, extra_file=b"junk\n")
+        source = _source_for(repo)
+
+        files = {item.filename: item for item in source.inspect("wf-governed")}
+
+        assert files["scratch.md"].tracked is False
+        assert files["scratch.md"].base is None
+        assert files["scratch.md"].current == b"junk\n"
+
+    def test_rewrite_refuses_closed_without_mutation(self, tmp_path: Path) -> None:
+        repo = _governed_repo(tmp_path / "repo", b"# replaced\n")
+        source = _source_for(repo)
+        reconciler = WorkFolderReconciler()
+        before = (repo / "progress.md").read_bytes()
+
+        with pytest.raises(ReconcileError, match="rewrite"):
+            reconciler.plan("wf-governed", source.inspect("wf-governed"))
+
+        assert (repo / "progress.md").read_bytes() == before
+
+    def test_an_unknown_folder_refuses_without_disclosing_a_path(self) -> None:
+        from fleet_graph.dd.work_folder_store import governed_work_folder_store
+
+        source = governed_work_folder_store(None)
+        with pytest.raises(ReconcileError) as excinfo:
+            source.inspect("wf-elsewhere")
+        text = str(excinfo.value)
+        assert "wf-elsewhere" in text
+        for forbidden in ("/data", "/worktrees", "/code/self"):
+            assert forbidden not in text
+
+    def test_a_path_like_folder_id_is_refused_as_opaque(self, tmp_path: Path) -> None:
+        from fleet_graph.dd.work_folder_store import governed_work_folder_store
+
+        source = governed_work_folder_store(str(tmp_path))
+        with pytest.raises(ReconcileError, match="not a valid opaque folder id"):
+            source.inspect("../../../etc/shadow")
 
 
 def test_b3_findings_document_closes_the_chain_with_anchors() -> None:

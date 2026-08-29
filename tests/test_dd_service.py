@@ -388,6 +388,33 @@ def test_every_supported_tool_drives_the_control_plane_over_the_running_endpoint
     ]
 
 
+class TestReconcileSourceBinding:
+    def test_the_production_store_is_concrete_even_without_a_root(self) -> None:
+        from fleet_graph.dd.work_folder_store import GitWorkFolderSource, governed_work_folder_store
+
+        assert isinstance(governed_work_folder_store(None), GitWorkFolderSource)
+        assert isinstance(governed_work_folder_store("/tmp/nowhere"), GitWorkFolderSource)
+
+    def test_a_bound_but_unconfigured_store_refuses_not_unbound(self) -> None:
+        from fleet_graph.dd.work_folder_store import governed_work_folder_store
+
+        server = build_mcp_server(FakeControlPlane(), work_folders=governed_work_folder_store(None))
+
+        async def call(url: str) -> str:
+            async with Client(url) as client:
+                with pytest.raises(ToolError) as excinfo:
+                    await client.call_tool("wf_reconcile", {"folder_id": "wf-a87b04"})
+                return str(excinfo.value)
+
+        with running_server(server) as url:
+            message = asyncio.run(call(url))
+
+        assert "RECONCILE_REFUSED" in message
+        assert "RECONCILE_SOURCE_UNBOUND" not in message
+        for forbidden in ("/data", "/worktrees", "/code/self"):
+            assert forbidden not in message
+
+
 def test_a_control_plane_refusal_reaches_the_client_machine_readably() -> None:
     plane = FakeControlPlane()
     plane.error = ControlPlaneError("WORKTREE_DIRTY", "uncommitted changes", retryable=False)

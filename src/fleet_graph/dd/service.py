@@ -48,6 +48,7 @@ from fleet_graph.dd.control_plane import (
     DdControlPlane,
 )
 from fleet_graph.dd.reconcile import ReconcileError, ReconcileSource, WorkFolderReconciler
+from fleet_graph.dd.work_folder_store import governed_work_folder_store
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,11 @@ DEFAULT_PORT = 5610
 AUTO_RESUME_ENABLED_ENV = "FLEET_GRAPH_DD_AUTO_RESUME"
 AUTO_RESUME_INTERVAL_ENV = "FLEET_GRAPH_DD_AUTO_RESUME_INTERVAL"
 DEFAULT_AUTO_RESUME_INTERVAL = 60.0
+
+#: The directory that owns one governed work-folder repository per folder id.
+#: ``dd serve`` binds the concrete ``wf_reconcile`` source from this root (or the
+#: ``--work-folder-root`` flag), closing the ``RECONCILE_SOURCE_UNBOUND`` gap.
+WORK_FOLDER_ROOT_ENV = "FLEET_GRAPH_WORK_FOLDER_ROOT"
 
 _FALSE_WORDS = frozenset({"0", "false", "no", "off"})
 
@@ -546,6 +552,7 @@ def serve(
     stage_models: dict[str, str] | None = None,
     auto_resume: bool | None = None,
     auto_resume_interval: float | None = None,
+    work_folder_root: str | None = None,
 ) -> None:
     if not port_is_available(host, port):
         raise RuntimeError(f"fleet-graph dev-dispatch port {host}:{port} is unavailable")
@@ -561,6 +568,14 @@ def serve(
     if stage_models:
         overrides["stage_models"] = stage_models
     control = DdControlPlane(**overrides)
+    # B3 binding: the concrete wf_reconcile source is bound here, not left
+    # unbound (RECONCILE_SOURCE_UNBOUND). The root comes from the flag or the
+    # environment; a missing root still yields a *concrete* source that refuses
+    # closed per-folder rather than a server without a route.
+    store_root = (
+        work_folder_root if work_folder_root is not None else os.environ.get(WORK_FOLDER_ROOT_ENV)
+    )
+    work_folders: ReconcileSource = governed_work_folder_store(store_root)
     # R4-3 收尾：决议落板自动 resume 巡检随服务生命周期启停（daemon 线程，
     # 进程退出即止）。None = 未显式配置，回落环境变量，默认开。
     enabled = auto_resume_enabled_from_env() if auto_resume is None else auto_resume
@@ -575,7 +590,7 @@ def serve(
     else:
         logger.info("dd auto-resume patrol disabled by configuration")
     try:
-        build_mcp_server(control).run(
+        build_mcp_server(control, work_folders=work_folders).run(
             transport="streamable-http", host=host, port=port, path="/mcp"
         )
     finally:
@@ -592,6 +607,7 @@ __all__ = [
     "NOT_SUPPORTED_RULING",
     "NOT_SUPPORTED_TOOLS",
     "SUPPORTED_TOOLS",
+    "WORK_FOLDER_ROOT_ENV",
     "WORK_FOLDER_TOOLS",
     "GateAutoResumer",
     "auto_resume_enabled_from_env",

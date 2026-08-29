@@ -337,6 +337,7 @@ def _dd_serve(args: argparse.Namespace) -> int:
         stage_models=dict(pair.split("=", 1) for pair in args.stage_model),
         auto_resume=args.auto_resume,
         auto_resume_interval=args.auto_resume_interval,
+        work_folder_root=args.work_folder_root,
     )
     return 0
 
@@ -1036,6 +1037,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="seconds between auto-resume patrols (default 60; "
         "env FLEET_GRAPH_DD_AUTO_RESUME_INTERVAL)",
+    )
+    dd_serve.add_argument(
+        "--work-folder-root",
+        default=None,
+        help="directory owning one governed work-folder repository per folder id; "
+        "the concrete wf_reconcile source is bound from it "
+        "(env FLEET_GRAPH_WORK_FOLDER_ROOT)",
     )
     dd_serve.set_defaults(func=_dd_serve)
 
