@@ -119,27 +119,16 @@ class TestCoordinatorAdapter:
         assert "--" not in argv
         assert "--prompt-file" in argv
 
-    def test_the_line_seat_reaches_the_coordinator_argv(self, run_root: Path) -> None:
-        """2026-08-29 全舰换家族实录：roster 的 seat 只到 worker，coordinator
-        静默留在 role 默认腿。coordinator 必须坐它所调度的同一个座位。"""
-        launcher = FakeLauncher(ok_status({"verdict": "done"}))
-        coordinator = AgentRunCoordinator(
-            launcher=launcher,
-            folder_id="wf-40fa8d",
-            thread_id="t1",
-            run_root=run_root,
-            agent="opencode-dsv4pro",
-        )
-        coordinator.turn(1, {"round": 1})
-        argv = launcher.specs[0].argv(bin_path="/bin/agent-run", run_id="r", session_root="/tmp/s")
-        assert "--agent" in argv
-        assert argv[argv.index("--agent") + 1] == "opencode-dsv4pro"
-
-    def test_an_empty_seat_still_omits_agent_for_role_default(self, run_root: Path) -> None:
+    def test_a_role_run_never_carries_agent(self, run_root: Path) -> None:
+        """agent-run 的 CLI 契约：--role 与 --agent 互斥（CONFIG_ERROR exit 90）。
+        2026-08-29 试图用 --agent 给 coordinator 换座导致全舰点火即熄火；
+        coordinator 的座位由 role registry（goal_coordinator.yaml）声明，
+        本 argv 永远只带 --role。"""
         coordinator, launcher = self.build(run_root, ok_status({"verdict": "done"}))
         coordinator.turn(1, {"round": 1})
         argv = launcher.specs[0].argv(bin_path="/bin/agent-run", run_id="r", session_root="/tmp/s")
         assert "--agent" not in argv
+        assert "--role" in argv
 
     def test_labels_carry_folder_and_dispatcher(self, run_root: Path) -> None:
         coordinator, launcher = self.build(run_root, ok_status({"verdict": "done"}))

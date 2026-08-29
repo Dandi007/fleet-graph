@@ -144,7 +144,6 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         folder_id=config.folder_id,
         thread_id=thread_id,
         run_root=config.run_root,
-        agent=config.seat,
         timeout_seconds=config.coordinator_timeout_seconds,
         launch_id=launch_id,
     )
