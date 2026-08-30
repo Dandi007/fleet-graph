@@ -96,6 +96,13 @@ ENROLLED = {
 # 2026-08-29 复活：曾在 MIGRATED 里 enabled=false 停摆的线被用户令重新点亮。
 # 与 ENROLLED 分开——它们不是新线，folder 与考卷都是存量，只是驱动引擎从
 # ronin pump 换成本引擎、座位按家族分流令改派。
+# 2026-08-31 监督面收线：C5 五次冷启动终验失败取证完备，B 拍板由 wf-66300e 承接，
+# 本线历史使命结束（progress 终局代账 + wf_save 归档在案）。成员资格保留（全集断言），
+# enabled 期望移除。
+CLOSED_BY_SUPERVISOR = {
+    "wf-3f87f3",
+}
+
 REVIVED = {
     "wf-3f87f3",  # deep-research 平台化收口（C1-C6），DS 智能位
 }
@@ -163,7 +170,8 @@ class TestTheShippedConfigLoads:
         enabled = {
             line.folder_id for line in SchedulerConfig.from_json(CONFIG).lines if line.enabled
         }
-        assert enabled == (BATCH_TWO | OPENED | ENROLLED | REVIVED) - CONVERGED
+        expected = (BATCH_TWO | OPENED | ENROLLED | REVIVED) - CONVERGED
+        assert enabled == expected - CLOSED_BY_SUPERVISOR
 
     def test_the_converged_lines_stay_in_the_roster_but_off(self) -> None:
         """收编（2026-08-28）不是删除：金丝雀 wf-40fa8d 等三线 terminal=done /
