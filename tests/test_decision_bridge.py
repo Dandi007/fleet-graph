@@ -773,6 +773,28 @@ class TestLineOwner:
         assert source.discover("q-other") == []
         assert source.discover("not-parked-question") == []
 
+    def test_resolve_returns_ok_for_a_parked_line_question(self, tmp_path: Path) -> None:
+        """The swallowed-approve regression: a line parked with its
+        ``board_question_note_id`` persisted must resolve a decision that
+        references that question. Before the fix, the scheduler dropped the
+        question id on the next accounted terminal, discovery read a null
+        question, and the bridge sealed the human approve as
+        ``no_waiting_owner``."""
+        run_root = tmp_path / "runs"
+        self._parked(run_root, question="q-1")
+        source = LineOwnerSource(run_root, ["wf-1"])
+
+        resolution = resolve_decision(
+            decision("d-1", 1, card="card-1"), source, refs_to=refs_to({"q-1": ["d-1"]})
+        )
+
+        assert resolution.ok
+        assert resolution.target is not None
+        assert resolution.target.kind == OWNER_KIND_LINE
+        assert resolution.target.id == "wf-1"
+        assert resolution.question_note_id == "q-1"
+        assert resolution.card_entity_id == "card-1"
+
     def test_discover_accepts_roster_dict_entries(self, tmp_path: Path) -> None:
         """Production loads the roster from config/ronin-lines.json, whose lines
         are dicts -- the owner must read ``folder_id`` from a dict, not treat the
