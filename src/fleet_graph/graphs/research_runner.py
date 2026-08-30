@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from fleet_graph.executors.agent_run import AgentRunLauncher
 from fleet_graph.executors.text_node import TextNode
 from fleet_graph.graphs.research_pipeline import (
+    DEFAULT_SOURCES,
     REPORT_FILE,
     TERMINAL_FAULT,
     ResearchBounds,
@@ -54,6 +55,13 @@ class ResearchConfig:
     #: 测试接缝：指向 fake binary。生产保持 None，用 DEFAULT_AGENT_RUN_BIN。
     agent_run_bin: str | None = None
     seed_model: str = "deepseek-v4-flash"
+    #: 多源矩阵词汇（R2，规格第 8 条）：默认固定顺序，取首元素为默认源。空列表时
+    #: 回退到 DEFAULT_SOURCES。
+    sources: list[str] = field(default_factory=lambda: list(DEFAULT_SOURCES))
+
+    @property
+    def default_source(self) -> str:
+        return self.sources[0] if self.sources else DEFAULT_SOURCES[0]
 
     @property
     def research_id(self) -> str:
@@ -107,6 +115,7 @@ def build_research(
             max_rounds=config.max_rounds,
         ),
         seed_model=config.seed_model,
+        sources=config.sources,
         observe=observe,
         publisher=publisher,
     )

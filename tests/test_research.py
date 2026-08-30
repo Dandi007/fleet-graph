@@ -24,6 +24,8 @@ from fleet_graph.graphs.research_pipeline import (
     CLUE_BLOCKED,
     CLUE_DONE,
     CLUE_OPEN,
+    DEFAULT_SOURCE,
+    SOURCE_ROLE,
     SYNTHESIS_ROLE,
     TERMINAL_CAPPED,
     TERMINAL_CONVERGED,
@@ -62,20 +64,20 @@ class FakeTextNode:
 
 
 def worker_payload(claims: list[str], proposed: list[str]) -> dict[str, Any]:
-    """research-worker.result.v1 形状的结构化结果（roles 侧 schema 为 SSoT）。"""
+    """worker.result.v1 形状的结构化结果（roles 侧 schema 为 SSoT）。"""
     return {
         "clue_id": "c-fake",
         "verdict": "found" if claims else "not_found",
-        "findings": [
+        "evidences": [
             {"claim": c, "source": "wiki", "quote": c, "locator": f"fake.md:{i + 1}"}
             for i, c in enumerate(claims)
         ],
-        "proposed_clues": [{"text": t, "rationale": "测试线索"} for t in proposed],
+        "proposed_clues": [{"clue": t, "reason": "测试线索"} for t in proposed],
     }
 
 
 def worker_result(claims: list[str], proposed: list[str]) -> dict[str, Any]:
-    """agent-run 成功信封：structured_result 携带契约形状的 findings 与子线索。"""
+    """agent-run 成功信封：structured_result 携带契约形状的 evidences 与子线索。"""
     return {
         "state": "succeeded",
         "exit_code": 0,
@@ -91,7 +93,7 @@ def blocked_worker_result() -> dict[str, Any]:
         "structured_result": {
             "clue_id": "c-fake",
             "verdict": "blocked",
-            "findings": [],
+            "evidences": [],
             "proposed_clues": [],
             "notes": "wiki mcp 不可达",
         },
@@ -277,8 +279,9 @@ class TestEndToEnd:
 
         # worker run id 派生稳定：与 derive_run_id(thread, f"worker/{clue_id}", retry+1) 一致。
         thread = config.thread_id
-        clue_one = derive_clue_id("scheduler 的基本循环")
-        clue_two = derive_clue_id("tick 的唤醒源")
+        # seed 纯字符串回填默认源，clue id 带 source 寻址（R2）。
+        clue_one = derive_clue_id("scheduler 的基本循环", DEFAULT_SOURCE)
+        clue_two = derive_clue_id("tick 的唤醒源", DEFAULT_SOURCE)
         assert launcher.dispatched == [
             derive_run_id(thread, f"worker/{clue_one}", 1),
             derive_run_id(thread, f"worker/{clue_two}", 1),
@@ -338,7 +341,7 @@ class TestPartial:
         persisted = json.loads((tmp_path / "run" / RESULT).read_text(encoding="utf-8"))
         assert persisted["terminal"] == TERMINAL_PARTIAL
         # 两次派发用了两个不同 attempt 的 run id。
-        clue_one = derive_clue_id("clue one")
+        clue_one = derive_clue_id("clue one", DEFAULT_SOURCE)
         thread = config.thread_id
         assert launcher.dispatched[:2] == [
             derive_run_id(thread, f"worker/{clue_one}", 1),
@@ -358,7 +361,7 @@ class TestWorkerWaitTimeout:
 
         assert result["terminal"] == TERMINAL_PARTIAL
         assert result["rounds"] == 2
-        clue_one = derive_clue_id("clue one")
+        clue_one = derive_clue_id("clue one", DEFAULT_SOURCE)
         thread = config.thread_id
         assert launcher.dispatched[:2] == [
             derive_run_id(thread, f"worker/{clue_one}", 1),
@@ -386,8 +389,8 @@ class TestHarvestEnvelope:
         # 子线索没有被丢弃：父线索 done 后继续派发 child clue，共两轮。
         assert result["rounds"] == 2
         assert result["terminal"] == TERMINAL_CONVERGED
-        parent = derive_clue_id("parent clue")
-        child = derive_clue_id("child clue")
+        parent = derive_clue_id("parent clue", DEFAULT_SOURCE)
+        child = derive_clue_id("child clue", DEFAULT_SOURCE)
         thread = config.thread_id
         assert launcher.dispatched[:2] == [
             derive_run_id(thread, f"worker/{parent}", 1),
@@ -407,12 +410,19 @@ class TestInputContract:
         result = run_research(config, text_node=seed, launcher=launcher)
         assert result["terminal"] == TERMINAL_CONVERGED
 
-        # worker：input 文件存在且是 research-worker.input.v1 形状。
-        clue = derive_clue_id("scheduler 的基本循环")
+        # worker：input 文件存在且是 deep-research.worker-input/v1 形状（含 sources）。
+        clue = derive_clue_id("scheduler 的基本循环", DEFAULT_SOURCE)
         worker_spec = launcher.specs[derive_run_id(config.thread_id, f"worker/{clue}", 1)]
         assert worker_spec.input_path, "缺 --input 会被 agent-run 判 CONTRACT_ERROR"
         payload = json.loads(Path(worker_spec.input_path).read_text(encoding="utf-8"))
-        assert payload == {"clue_id": clue, "clue_text": "scheduler 的基本循环"}
+        assert payload == {
+            "clue_id": clue,
+            "clue_text": "scheduler 的基本循环",
+            "depth": 0,
+            "sources": [DEFAULT_SOURCE],
+        }
+        # R2：dispatch 按 clue.source 路由到 SOURCE_ROLE 角色（fake launcher 记录 spec.role）。
+        assert worker_spec.role == SOURCE_ROLE[DEFAULT_SOURCE]
 
         # synthesis：input 只携带题面 manifest（research-synth.input.v1）。
         synth_spec = launcher.specs[derive_run_id(config.thread_id, "synthesis", 1)]
@@ -429,7 +439,7 @@ class TestInputContract:
         result = run_research(config, text_node=seed, launcher=launcher)
         assert result["terminal"] == TERMINAL_CONVERGED
 
-        clue = derive_clue_id("clue one")
+        clue = derive_clue_id("clue one", DEFAULT_SOURCE)
         first = launcher.specs[derive_run_id(config.thread_id, f"worker/{clue}", 1)]
         second = launcher.specs[derive_run_id(config.thread_id, f"worker/{clue}", 2)]
         assert first.input_path.endswith(f"worker-{clue}-r0.json")
@@ -472,7 +482,7 @@ class TestResume:
             with pytest.raises(Boom):
                 compiled.invoke(resume_start(compiled, cfg, config), config=cfg)
 
-        clue_one = derive_clue_id("scheduler 的基本循环")
+        clue_one = derive_clue_id("scheduler 的基本循环", DEFAULT_SOURCE)
         assert boom_launcher.dispatched == [
             derive_run_id(config.thread_id, f"worker/{clue_one}", 1)
         ]

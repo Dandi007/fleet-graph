@@ -26,6 +26,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from fleet_graph.bus.client import BusClient
 from fleet_graph.graphs.research_pipeline import (
+    DEFAULT_SOURCE,
     SYNTHESIS_ROLE,
     TERMINAL_CONVERGED,
     derive_clue_id,
@@ -74,11 +75,11 @@ def worker_payload(claims: list[str], proposed: list[str]) -> dict[str, Any]:
     return {
         "clue_id": "c-fake",
         "verdict": "found" if claims else "not_found",
-        "findings": [
+        "evidences": [
             {"claim": c, "source": "wiki", "quote": c, "locator": f"fake.md:{i + 1}"}
             for i, c in enumerate(claims)
         ],
-        "proposed_clues": [{"text": t, "rationale": "测试线索"} for t in proposed],
+        "proposed_clues": [{"clue": t, "reason": "测试线索"} for t in proposed],
     }
 
 
@@ -288,7 +289,7 @@ class TestPublishing:
         # evidence payload 字段（leaf）：clue_id / anchor / quote / claim。
         ev = evidence_msgs[0]["payload"]
         assert set(ev) == {"clue_id", "anchor", "quote", "claim"}
-        assert ev["clue_id"] == derive_clue_id("scheduler 的基本循环")
+        assert ev["clue_id"] == derive_clue_id("scheduler 的基本循环", DEFAULT_SOURCE)
 
         # doc payload（leaf）：doc_kind=report / origin / digest。
         doc = docs_msgs[0]["payload"]
@@ -300,7 +301,7 @@ class TestPublishing:
         assert doc["digest"] == body_digest(doc["body"])
 
         # clue 版本链（supersedes）正确：open -> dispatched -> done。
-        clue_id = derive_clue_id("scheduler 的基本循环")
+        clue_id = derive_clue_id("scheduler 的基本循环", DEFAULT_SOURCE)
         chain = [m for m in clue_msgs if m["entity_id"] == clue_id]
         chain.sort(key=lambda m: m["channel_seq"])
         assert [m["payload"]["status"] for m in chain] == ["open", "in_flight", "explored"]
@@ -395,7 +396,7 @@ class TestKillRestartReplay:
             with pytest.raises(Boom):
                 compiled.invoke(resume_start(compiled, cfg, config), config=cfg)
 
-        clue_one = derive_clue_id("scheduler 的基本循环")
+        clue_one = derive_clue_id("scheduler 的基本循环", DEFAULT_SOURCE)
         from fleet_graph.executors.agent_run import derive_run_id
 
         assert boom_launcher.dispatched == [
