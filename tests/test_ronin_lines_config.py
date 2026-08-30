@@ -83,6 +83,10 @@ ENROLLED = {
     # 2026-08-29 第五波（用户 15:4x 原话：New API 可观测 + Coding Plan 前端质量
     # 展示，goal-driven 端到端）：DS 供应商额度压测观测线。goal SSoT：wf-fa53cb。
     "wf-fa53cb",
+    # 2026-08-30 第六波（用户令：监督面图化走自举，监督面监督其开发/部署/运行/
+    # 监督）：supervisor 模式抽象落地线——传感层 read-model(:7494)、E5–E7 事件、
+    # 收割反应器(allowlist 先行)、破障/人话汇报节点。goal/design SSoT：wf-216dc3。
+    "wf-216dc3",
 }
 
 # 2026-08-29 复活：曾在 MIGRATED 里 enabled=false 停摆的线被用户令重新点亮。
