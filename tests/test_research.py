@@ -64,15 +64,17 @@ class FakeTextNode:
 
 
 def worker_payload(claims: list[str], proposed: list[str]) -> dict[str, Any]:
-    """worker.result.v1 形状的结构化结果（roles 侧 schema 为 SSoT）。"""
+    """worker.result.v1 形状的结构化结果（roles 侧 schema 为 SSoT）。
+
+    R2-fix：契约无 verdict / 无 clue_id——完成与否由 evidences 判定。
+    """
     return {
-        "clue_id": "c-fake",
-        "verdict": "found" if claims else "not_found",
         "evidences": [
             {"claim": c, "source": "wiki", "quote": c, "locator": f"fake.md:{i + 1}"}
             for i, c in enumerate(claims)
         ],
         "proposed_clues": [{"clue": t, "reason": "测试线索"} for t in proposed],
+        "materials": [],
     }
 
 
@@ -85,19 +87,14 @@ def worker_result(claims: list[str], proposed: list[str]) -> dict[str, Any]:
     }
 
 
-def blocked_worker_result() -> dict[str, Any]:
-    """verdict=blocked 的成功信封：run 成功但取证被工具面挡住。"""
-    return {
-        "state": "succeeded",
-        "exit_code": 0,
-        "structured_result": {
-            "clue_id": "c-fake",
-            "verdict": "blocked",
-            "evidences": [],
-            "proposed_clues": [],
-            "notes": "wiki mcp 不可达",
-        },
-    }
+def unparseable_worker_result() -> dict[str, Any]:
+    """成功信封但其信封不可解析 / 不是合法 worker.result.v1。
+
+    新契约无 verdict 字段；blocked 语义改由「信封解析失败 / run 失败（status.ok
+    为假）」触发——这里返回缺 structured_result 对象的信封，collect 解析失败即走
+    clue 失败路径（retry/block）。
+    """
+    return {"state": "succeeded", "exit_code": 0, "result": "工具面不可达的叙述"}
 
 
 def synthesis_result(report: str) -> dict[str, Any]:
@@ -448,13 +445,31 @@ class TestInputContract:
             assert json.loads(Path(spec.input_path).read_text(encoding="utf-8"))["clue_id"] == clue
 
 
-class TestBlockedVerdict:
-    def test_blocked_verdict_retries_then_blocks_instead_of_done(self, tmp_path: Path) -> None:
-        # 契约 verdict=blocked（工具面不可用）不是调查完成：走 clue 失败路径
+class TestBlockedWorkerResult:
+    """新契约 worker.result.v1 无 verdict 字段：blocked 语义改由「run 失败
+    （status.ok 为假）/ 信封解析失败」触发，仍走 retry/block，不得计入 done。
+    """
+
+    def test_run_failure_retries_then_blocks_instead_of_done(self, tmp_path: Path) -> None:
+        # run 失败（status.ok 为假）不是调查完成：走 clue 失败路径
         # （retry -> blocked -> 终态 partial），不得计入 done/coverage。
         seed = FakeTextNode(json.dumps(["clue one"]))
+        launcher = FakeLauncher(["fail", "fail"], synthesis_result("report"))
+        config = ResearchConfig(question="q", run_root=tmp_path / "run")
+
+        result = run_research(config, text_node=seed, launcher=launcher)
+
+        assert result["terminal"] == TERMINAL_PARTIAL
+        assert not (tmp_path / "run" / "evidence.jsonl").exists()
+
+    def test_envelope_parse_failure_retries_then_blocks_instead_of_done(
+        self, tmp_path: Path
+    ) -> None:
+        # 信封解析失败（structured_result 缺失）同样不是调查完成：走 clue 失败
+        # 路径（retry -> blocked -> 终态 partial），不得计入 done/coverage。
+        seed = FakeTextNode(json.dumps(["clue one"]))
         launcher = FakeLauncher(
-            [blocked_worker_result(), blocked_worker_result()],
+            [unparseable_worker_result(), unparseable_worker_result()],
             synthesis_result("report"),
         )
         config = ResearchConfig(question="q", run_root=tmp_path / "run")
@@ -463,6 +478,36 @@ class TestBlockedVerdict:
 
         assert result["terminal"] == TERMINAL_PARTIAL
         assert not (tmp_path / "run" / "evidence.jsonl").exists()
+
+
+class TestNoVerdictWorkerResultIsDone:
+    """回归（R2-fix）：无 verdict 的合法 worker.result.v1（evidences 非空）必须判
+    done、coverage 增长、evidences 落 evidence.jsonl 并随 synthesis 投递（synthesis
+    input clue_ids 非空）——而不是被当成 clue 失败 retry/block。
+    """
+
+    def test_evidences_without_verdict_are_done_and_reach_synthesis(self, tmp_path: Path) -> None:
+        seed = FakeTextNode(json.dumps(["clue one"]))
+        launcher = FakeLauncher(
+            [worker_result(["事实 A", "事实 B"], [])],
+            synthesis_result("# 报告\n有证据支撑。"),
+        )
+        config = ResearchConfig(question="q", run_root=tmp_path / "run")
+
+        result = run_research(config, text_node=seed, launcher=launcher)
+
+        assert result["terminal"] == TERMINAL_CONVERGED
+        # coverage 随 done 数增长（无 zero-growth 误触，rounds=1 即收敛）。
+        assert result["rounds"] == 1
+        # evidences 落盘 evidence.jsonl。
+        evidence = read_jsonl(tmp_path / "run" / "evidence.jsonl")
+        assert [e["finding"]["claim"] for e in evidence] == ["事实 A", "事实 B"]
+        # 随 synthesis 投递：synthesis input clue_ids 非空。
+        manifest = json.loads(
+            (tmp_path / "run" / "inputs" / "synthesis.json").read_text(encoding="utf-8")
+        )
+        clue = derive_clue_id("clue one", DEFAULT_SOURCE)
+        assert manifest["clue_ids"] == [clue]
 
 
 class TestResume:

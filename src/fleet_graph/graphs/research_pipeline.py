@@ -76,15 +76,14 @@ DEFAULT_SOURCE: str = DEFAULT_SOURCES[0]
 # roles 侧 protocol 契约（agent-runtime profiles/roles/schemas/，SSoT 在 roles 仓）：
 # - worker input  deep-research.worker-input/v1：{clue_id, clue_text[, depth,
 #   sources[], revision, allowed_root]}
-# - worker result worker.result.v1：{clue_id, verdict, evidences[{quote,claim,
-#   source,locator,revision,...}], proposed_clues[{clue,reason}][, materials[], notes]}
+# - worker result worker.result.v1：{evidences[{quote,claim,source,locator,revision,
+#   range?,uri?,digest?}], proposed_clues[{clue,reason}], materials[{uri,digest?}]}
+#   （无 verdict / 无 clue_id——调查完成与否由 evidences 判定，见 collect 节点）
 # - synth input   research-synth.input.v1：{question[, clue_ids, corpus_note]}
 # - synth result  research-synth.result.v1：{report_markdown, coverage_summary,
 #   unresolved}
 # role 声明 protocol.input 后 agent-run 强制要求 --input，缺了直接 CONTRACT_ERROR，
 # 所以 dispatch/synthesis 必须为每个 run 落 input 文件并传 spec.input_path。
-#: worker verdict 中视为「调查完成」的两个值；blocked 走 clue 失败路径（retry/block）。
-WORKER_VERDICTS_DONE = frozenset({"found", "not_found"})
 
 DISPATCHER_LABEL = "fleet-graph"
 
@@ -659,19 +658,18 @@ def _collect_node(deps: ResearchDeps):
         # run 结果落盘（harvest 据此提取新线索，resume 后也能重读）。
         write_json_durable(_result_path(deps.run_root, clue_id), status.result or {})
 
-        # 消费契约 worker.result.v1：verdict ∈ {found, not_found} 才算调查完成；
-        # verdict=blocked（工具面不可用）与信封解析失败一样走 clue 失败路径
-        # （retry/block），绝不 fault 整图。R2 契约字段是 evidences[{quote,claim,
-        # source,locator,revision,...}]（不再是 R1 的 findings）。
+        # 消费契约 worker.result.v1：合法信封（isinstance dict 且 evidences 是
+        # list）即判「调查完成」——evidences 非空 = found，evidences 空 =
+        # not_found，二者都属 done，不触发 retry。工具面不可用 / blocked 不再依赖
+        # worker 自报字段（新契约无 verdict）：改由 run 失败（status.ok 为假）、
+        # 信封解析失败或 wait 超时触发，仍走 retry/block 路径，绝不 fault 整图。
+        # R2 契约字段是 evidences[{quote,claim,source,locator,revision,range?,uri?,
+        # digest?}]（不再是 R1 的 findings）。
         declared: dict[str, Any] | None = None
         if status.ok and status.result is not None:
             try:
                 parsed = parse_envelope(status.result)
-                if (
-                    isinstance(parsed, dict)
-                    and parsed.get("verdict") in WORKER_VERDICTS_DONE
-                    and isinstance(parsed.get("evidences"), list)
-                ):
+                if isinstance(parsed, dict) and isinstance(parsed.get("evidences"), list):
                     declared = parsed
             except Exception:
                 # 信封解析失败按 clue 失败处理（retry/block），绝不 fault 整图。
@@ -969,7 +967,6 @@ __all__ = [
     "TERMINAL_FAULT",
     "TERMINAL_PARTIAL",
     "WORKER_ROLE",
-    "WORKER_VERDICTS_DONE",
     "ResearchBounds",
     "ResearchDeps",
     "ResearchState",

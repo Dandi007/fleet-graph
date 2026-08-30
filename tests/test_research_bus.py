@@ -73,13 +73,12 @@ class FakeTextNode:
 
 def worker_payload(claims: list[str], proposed: list[str]) -> dict[str, Any]:
     return {
-        "clue_id": "c-fake",
-        "verdict": "found" if claims else "not_found",
         "evidences": [
             {"claim": c, "source": "wiki", "quote": c, "locator": f"fake.md:{i + 1}"}
             for i, c in enumerate(claims)
         ],
         "proposed_clues": [{"clue": t, "reason": "测试线索"} for t in proposed],
+        "materials": [],
     }
 
 
