@@ -83,6 +83,9 @@ ENROLLED = {
     # 2026-08-29 第五波（用户 15:4x 原话：New API 可观测 + Coding Plan 前端质量
     # 展示，goal-driven 端到端）：DS 供应商额度压测观测线。goal SSoT：wf-fa53cb。
     "wf-fa53cb",
+    # 2026-08-30 第六波：监督面图化自举线，新 goal 线入编，seat opencode-dsv4pro，
+    # alias ronin-sup-graph。
+    "wf-216dc3",
 }
 
 # 2026-08-29 复活：曾在 MIGRATED 里 enabled=false 停摆的线被用户令重新点亮。
