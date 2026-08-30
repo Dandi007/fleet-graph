@@ -68,6 +68,7 @@ def _research_run(args: argparse.Namespace) -> int:
         ),
         generation=args.generation,
         max_clues=args.max_clues,
+        concurrency=args.concurrency,
         checkpoint_path=args.checkpoint,
     )
     result = run_research(config, publisher=default_publisher())
@@ -1220,6 +1221,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=12,
         help="clue board size bound; hitting it terminates the run as `capped`",
+    )
+    research_run.add_argument(
+        "--concurrency",
+        type=int,
+        default=4,
+        help="how many open clues one dispatch wave launches in parallel (R3 fan-out, "
+        "default 4); only affects how many run per wave, never clue/run id derivation",
     )
     research_run.add_argument(
         "--checkpoint",

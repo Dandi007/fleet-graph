@@ -76,7 +76,10 @@ def synthesis_result(report: str) -> dict[str, Any]:
 
 
 class FakeLauncher:
-    """按 role 回放脚本，并记录每次派发的 ``spec.role``（R2 路由判据）。"""
+    """按 role 回放脚本，并记录每次派发的 ``spec.role``（R2 路由判据）。
+
+    ``launch`` 幂等（R3）：同 run_id 重复 launch = re-adopt 在途 run，只记录第一次。
+    """
 
     def __init__(self, worker_script: list[Any], synthesis: dict[str, Any]) -> None:
         self.worker_script = list(worker_script)
@@ -84,8 +87,12 @@ class FakeLauncher:
         self.dispatched: list[str] = []
         self.specs: dict[str, Any] = {}
         self._roles: dict[str, str] = {}
+        self._launched: set[str] = set()
 
     def launch(self, spec: Any, run_id: str) -> RunTicket:
+        if run_id in self._launched:
+            return RunTicket(run_id, f"/tmp/fake/{run_id}", None, adopted=True)
+        self._launched.add(run_id)
         self._roles[run_id] = spec.role
         self.specs[run_id] = spec
         self.dispatched.append(run_id)

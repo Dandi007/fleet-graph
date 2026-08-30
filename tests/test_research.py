@@ -125,7 +125,11 @@ class Boom(RuntimeError):
 
 
 class FakeLauncher:
-    """worker/synthesis 的替身：按 role 回放脚本，记录派发的 run id。"""
+    """worker/synthesis 的替身：按 role 回放脚本，记录派发的 run id。
+
+    ``launch`` 幂等（R3）：同 run_id 重复 launch = re-adopt 在途 run（与真实
+    AgentRunLauncher 一致），只记录第一次 spawn，不重复进 ``dispatched``。
+    """
 
     def __init__(
         self,
@@ -140,8 +144,12 @@ class FakeLauncher:
         self.dispatched: list[str] = []
         self.specs: dict[str, Any] = {}
         self._roles: dict[str, str] = {}
+        self._launched: set[str] = set()
 
     def launch(self, spec: Any, run_id: str) -> RunTicket:
+        if run_id in self._launched:
+            return RunTicket(run_id, f"/tmp/fake/{run_id}", None, adopted=True)
+        self._launched.add(run_id)
         self._roles[run_id] = spec.role
         self.specs[run_id] = spec
         self.dispatched.append(run_id)
@@ -575,6 +583,20 @@ class TestCli:
         assert args.generation == 2
         assert args.max_clues == 5
         assert args.checkpoint is None
+
+    def test_research_run_default_concurrency_is_four(self) -> None:
+        from fleet_graph.cli import build_parser
+
+        args = build_parser().parse_args(["research", "run", "--question", "q?"])
+        assert args.concurrency == 4
+
+    def test_research_run_accepts_explicit_concurrency(self) -> None:
+        from fleet_graph.cli import build_parser
+
+        args = build_parser().parse_args(
+            ["research", "run", "--question", "q?", "--concurrency", "8"]
+        )
+        assert args.concurrency == 8
 
     def test_question_is_required(self) -> None:
         from fleet_graph.cli import build_parser
