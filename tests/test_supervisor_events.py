@@ -331,6 +331,35 @@ class TestReadModelEvents:
         assert launcher.events() == []
 
     def test_e7_swallowed_decision_fires(self, tmp_path: Path) -> None:
+        """Reworked to watermark semantics (spec 交付 C.4): first tick adopts
+        the current snapshot as baseline (zero E7 emission), a new swallowed
+        decision on the second tick is the only thing emitted."""
+        snapshot = {
+            "/v1/decisions": {
+                "schema_version": "1",
+                "decisions": [
+                    {"source_message_id": "msg_sw", "state": "swallowed", "reason": "noop"},
+                    {"source_message_id": "msg_pub", "state": "published", "reason": ""},
+                ],
+            }
+        }
+        observer, launcher = observer_for(tmp_path, read_model=read_model_for(snapshot))
+        actions = tick(observer, {})  # baseline adoption
+        assert launcher.events() == []
+        assert any("cursor_adopted:e7_baseline" in a.get("action", "") for a in actions)
+        snapshot["/v1/decisions"]["decisions"].append(
+            {"source_message_id": "msg_new", "state": "swallowed", "reason": "noop"}
+        )
+        tick(observer, {})
+        [event] = launcher.events()
+        assert event["type"] == "decision_swallowed"
+        assert event["key"] == "e7-msg_new"
+        assert event["payload"] == {"source_message_id": "msg_new", "reason": "noop"}
+
+    def test_e7_first_run_adopts_baseline_and_emits_nothing(self, tmp_path: Path) -> None:
+        """交付 C.1: 首轮零发射——快照含历史 swallowed → 第一次 tick
+        launcher.events()==[]，cursor 落盘 e7_baseline 含该 source_message_id，
+        动作注记含 cursor_adopted:e7_baseline。"""
         observer, launcher = observer_for(
             tmp_path,
             read_model=read_model_for(
@@ -338,18 +367,140 @@ class TestReadModelEvents:
                     "/v1/decisions": {
                         "schema_version": "1",
                         "decisions": [
-                            {"source_message_id": "msg_sw", "state": "swallowed", "reason": "noop"},
-                            {"source_message_id": "msg_pub", "state": "published", "reason": ""},
+                            {
+                                "source_message_id": "msg_01M13x",
+                                "state": "swallowed",
+                                "reason": "noop",
+                            },
+                            {
+                                "source_message_id": "msg_01M14x",
+                                "state": "swallowed",
+                                "reason": "noop",
+                            },
                         ],
                     }
                 }
             ),
         )
+        actions = tick(observer, {})
+        assert launcher.events() == []
+        state = json.loads(
+            (tmp_path / "runs" / ".scheduler" / "supervisor-cursor.json").read_text()
+        )
+        assert state["e7_baseline"] == ["msg_01M13x", "msg_01M14x"]
+        assert any("cursor_adopted:e7_baseline=n=2" in a.get("action", "") for a in actions)
+
+    def test_e7_new_swallowed_fires_after_baseline(self, tmp_path: Path) -> None:
+        """交付 C.2: 第二 tick 快照多一条新增 swallowed（msg_new）→ 仅发射
+        e7-msg_new（type/key/payload 精确），历史 id 不重发；后续多 tick 重复
+        扫描不重复发射（水位推进）。"""
+        snapshot = {
+            "/v1/decisions": {
+                "schema_version": "1",
+                "decisions": [
+                    {"source_message_id": "msg_01M13x", "state": "swallowed", "reason": "noop"},
+                ],
+            }
+        }
+        observer, launcher = observer_for(tmp_path, read_model=read_model_for(snapshot))
+        tick(observer, {})  # baseline adoption
+        assert launcher.events() == []
+        snapshot["/v1/decisions"]["decisions"].append(
+            {"source_message_id": "msg_new", "state": "swallowed", "reason": "blocked"}
+        )
         tick(observer, {})
         [event] = launcher.events()
         assert event["type"] == "decision_swallowed"
-        assert event["key"] == "e7-msg_sw"
-        assert event["payload"] == {"source_message_id": "msg_sw", "reason": "noop"}
+        assert event["key"] == "e7-msg_new"
+        assert event["payload"] == {"source_message_id": "msg_new", "reason": "blocked"}
+        # Repeated rescans of the same snapshot must not re-emit.
+        tick(observer, {})
+        tick(observer, {})
+        assert len(launcher.events()) == 1
+
+    def test_e7_baseline_survives_restart(self, tmp_path: Path) -> None:
+        """交付 C.3: restart 后基线仍生效——新 observer 对象 + 同 state root /
+        cursor → 历史 id 不重发（水位持久化）。"""
+        snapshot = {
+            "/v1/decisions": {
+                "schema_version": "1",
+                "decisions": [
+                    {"source_message_id": "msg_01M13x", "state": "swallowed", "reason": "noop"},
+                ],
+            }
+        }
+        observer, launcher = observer_for(tmp_path, read_model=read_model_for(snapshot))
+        tick(observer, {})  # adopt baseline
+        assert launcher.events() == []
+        observer2, launcher2 = observer_for(tmp_path, read_model=read_model_for(snapshot))
+        tick(observer2, {})
+        assert launcher2.events() == []
+
+    def test_e7_deferred_by_budget_does_not_advance_watermark(self, tmp_path: Path) -> None:
+        """交付 A.4: 被 deferred:tick_budget 未真正处置的新 id 不得推进水位——
+        下一 tick 重扫重派；处置后才推进。"""
+        snapshot = {
+            "/v1/decisions": {
+                "schema_version": "1",
+                "decisions": [
+                    {"source_message_id": "msg_01M13x", "state": "swallowed", "reason": "noop"},
+                ],
+            }
+        }
+        observer, launcher = observer_for(
+            tmp_path, max_per_tick=0, read_model=read_model_for(snapshot)
+        )
+        tick(observer, {})  # baseline adoption
+        snapshot["/v1/decisions"]["decisions"].append(
+            {"source_message_id": "msg_new", "state": "swallowed", "reason": "noop"}
+        )
+        actions = tick(observer, {})  # budget 0: msg_new deferred
+        assert launcher.events() == []
+        assert any("deferred:tick_budget" in a.get("action", "") for a in actions)
+        cursor = tmp_path / "runs" / ".scheduler" / "supervisor-cursor.json"
+        state = json.loads(cursor.read_text())
+        assert "msg_new" not in state["e7_baseline"]
+        # Budget available again: re-dispatched and the watermark advances.
+        observer.config.max_launches_per_tick = 2
+        tick(observer, {})
+        assert len(launcher.events()) == 1
+        assert "msg_new" in json.loads(cursor.read_text())["e7_baseline"]
+
+    def test_no_progress_actions_aggregate_and_dedup_across_ticks(self, tmp_path: Path) -> None:
+        """交付 B (P3): 同 tick 内同类「无进展」action 聚合为一条计数
+        （skipped:receipt_exists:x2），且与上一 tick 完全相同的批不重复打印。
+        日志面去噪，返回的完整 actions 不受影响。"""
+        reports = tmp_path / "supervisor" / "reports"
+        reports.mkdir(parents=True)
+        (reports / "e5-dev-x.json").write_text("{}")
+        (reports / "e5-dev-y.json").write_text("{}")
+        observer, _launcher = observer_for(
+            tmp_path,
+            read_model=read_model_for(
+                {
+                    "/v1/harvestable": {
+                        "schema_version": "1",
+                        "developments": [
+                            {"development_id": "dev-x", "head_commit": "a", "stage": "s"},
+                            {"development_id": "dev-y", "head_commit": "b", "stage": "s"},
+                        ],
+                    }
+                }
+            ),
+        )
+        seen: list[dict[str, Any]] = []
+        observer.observe = lambda record: seen.append(record)
+        full_actions = tick(observer, {})
+        # Returned actions stay complete (both receipt_exists rows present).
+        assert sum(1 for a in full_actions if a.get("action") == "skipped:receipt_exists") == 2
+        emitted = [r["supervisor_observer"] for r in seen]
+        counted = [a for a in emitted if "receipt_exists" in a.get("action", "")]
+        assert len(counted) == 1
+        assert counted[0]["action"] == "skipped:receipt_exists:x2"
+        # Identical batch next tick: not reprinted.
+        seen.clear()
+        tick(observer, {})
+        assert not any("receipt_exists" in r["supervisor_observer"].get("action", "") for r in seen)
 
     def test_same_key_across_ticks_is_a_fresh_attempt_not_a_duplicate(self, tmp_path: Path) -> None:
         """The same snapshot re-scanned next tick re-derives the same key; the

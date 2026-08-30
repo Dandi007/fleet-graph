@@ -228,6 +228,9 @@ class SupervisorObserver:
         #: on any failure (fail-open). Defaults to the stdlib HTTP client
         #: against config.read_model_base_url; tests inject a fake snapshot.
         self.read_model = read_model or self._default_read_model_fetcher()
+        #: 交付 B (P3): last tick's aggregated "no progress" batch, so an
+        #: identical batch is not reprinted (去重打印，不重复刷屏).
+        self._last_no_progress_batch: tuple[tuple[str, int], ...] | None = None
 
     # --- persisted cursor state ------------------------------------------
 
@@ -248,10 +251,16 @@ class SupervisorObserver:
         if not isinstance(raw, dict):
             return empty
         attempts = raw.get("attempts")
-        return {
+        state = {
             "board_seq": raw.get("board_seq"),
             "attempts": dict(attempts) if isinstance(attempts, dict) else {},
         }
+        baseline = raw.get("e7_baseline")
+        if isinstance(baseline, list):
+            # E7 水位（spec 交付 A.1）：已观测（已审计）的 swallowed
+            # source_message_id 有序列表。只认合法列表；键缺失/损坏 = 首跑语义。
+            state["e7_baseline"] = [str(x) for x in baseline]
+        return state
 
     def _write_state(self, state: dict[str, Any]) -> None:
         path = self.config.resolved_cursor_path
@@ -284,6 +293,7 @@ class SupervisorObserver:
             # so deferring them to the next tick is free, whereas the board
             # cursor should only advance past questions we actually handled.
             events: list[SupervisorEvent] = []
+            new_e7: dict[str, str] = {}
             try:
                 events.extend(self._terminal_events(folder_ids, terminal_reader))
             except Exception as exc:  # fail open
@@ -295,8 +305,12 @@ class SupervisorObserver:
             try:
                 # E5/E6/E7 read-model scans share the same budget + attempt
                 # counters as E2/E3/E4; an unreachable :7494 is a skipped
-                # scan (an action note), never a dead tick.
-                events.extend(self._read_model_events())
+                # scan (an action note), never a dead tick. The decisions
+                # branch also returns which E7 ids are new this tick so the
+                # watermark only advances past ids we actually handled.
+                read_events, new_e7, read_notes = self._read_model_events(state)
+                events.extend(read_events)
+                actions.extend(read_notes)
             except Exception as exc:  # fail open
                 actions.append({"source": "read_model", "error": repr(exc)[:200]})
 
@@ -308,6 +322,13 @@ class SupervisorObserver:
                 actions.append(action)
                 if action["action"].startswith("launched"):
                     launched += 1
+                # E7 水位推进纪律（spec 交付 A.4，与 E1 游标同）：只有真正处置
+                # 的新 id（launched / skipped:receipt_exists /
+                # skipped:attempts_exhausted）才推进水位；deferred:tick_budget
+                # 或 skipped:audit_in_flight 未处置，下一 tick 重扫重派。
+                source_id = new_e7.get(event.key)
+                if source_id is not None:
+                    self._advance_e7_baseline(state, source_id, action)
 
             # E1 last, with whatever budget remains. The cursor advances only
             # past messages that were handled (launched, skipped, or not an
@@ -321,8 +342,12 @@ class SupervisorObserver:
             self._write_state(state)
         except Exception as exc:  # the tick must survive us, whatever happens
             actions.append({"source": "observer", "error": repr(exc)[:200]})
+        # 交付 B (P3)：同一 tick 同类「无进展」action 聚合为一条计数，且与上一
+        # tick 完全相同的「无进展」批去重打印——只作用于日志面（observe/print），
+        # 返回的完整 actions 供调用方/测试逐条核对，不受影响。
+        emitted = self._log_dedup(actions)
         if self.observe is not None:
-            for action in actions:
+            for action in emitted:
                 with contextlib.suppress(Exception):  # telemetry must not bite
                     self.observe({"supervisor_observer": action})
         return actions
@@ -359,7 +384,9 @@ class SupervisorObserver:
         detail = str(tripped[0].decision.detail or "")
         return [cap_breaker_event(bucket, detail, [r.folder_id for r in tripped])]
 
-    def _read_model_events(self) -> list[SupervisorEvent]:
+    def _read_model_events(
+        self, state: dict[str, Any]
+    ) -> tuple[list[SupervisorEvent], dict[str, str], list[dict[str, Any]]]:
         """E5/E6/E7 from the read-model's synthetic snapshots (:7494).
 
         The M1 read-model is the only data face these events have: no direct
@@ -367,8 +394,15 @@ class SupervisorObserver:
         禁止重扫 heartbeat/terminal/bus/bridge 文件（一律经 :7494）」).
         Every view fetch fails open -- an unreachable :7494 skips that scan,
         never the tick.
+
+        Returns ``(events, new_e7, notes)``: the derived events, a mapping of
+        each new E7 event key -> its ``source_message_id`` (so ``after_tick``
+        can advance the watermark only past ids actually handled), and any
+        action notes (e.g. ``cursor_adopted:e7_baseline``).
         """
         events: list[SupervisorEvent] = []
+        new_e7: dict[str, str] = {}
+        notes: list[dict[str, Any]] = []
 
         lines = self.read_model("/v1/lines")
         if isinstance(lines, dict):
@@ -405,17 +439,39 @@ class SupervisorObserver:
 
         decisions = self.read_model("/v1/decisions")
         if isinstance(decisions, dict):
-            for decision in decisions.get("decisions") or []:
-                if not isinstance(decision, dict):
-                    continue
-                if decision.get("state") != "swallowed":
-                    continue
-                source_message_id = str(decision.get("source_message_id") or "")
-                if not source_message_id:
-                    continue
-                events.append(
-                    decision_swallowed_event(source_message_id, str(decision.get("reason") or ""))
+            swallowed = [
+                decision
+                for decision in decisions.get("decisions") or []
+                if isinstance(decision, dict)
+                and decision.get("state") == "swallowed"
+                and str(decision.get("source_message_id") or "")
+            ]
+            baseline = state.get("e7_baseline")
+            if baseline is None:
+                # First run adopts the current head as its baseline, the same
+                # honest reading as _board_scan (E1 board_question): swallowed
+                # decisions from before we were watching are the human's
+                # existing backlog, not events we observed. This tick emits no
+                # E7 at all (spec 交付 A.2).
+                adopted = [str(decision["source_message_id"]) for decision in swallowed]
+                state["e7_baseline"] = adopted
+                notes.append(
+                    {
+                        "source": "read_model",
+                        "action": f"cursor_adopted:e7_baseline=n={len(adopted)}",
+                    }
                 )
+            else:
+                known = set(baseline)
+                for decision in swallowed:
+                    source_message_id = str(decision["source_message_id"])
+                    if source_message_id in known:
+                        continue
+                    event = decision_swallowed_event(
+                        source_message_id, str(decision.get("reason") or "")
+                    )
+                    events.append(event)
+                    new_e7[event.key] = source_message_id
 
         harvestable = self.read_model("/v1/harvestable")
         if isinstance(harvestable, dict):
@@ -433,7 +489,27 @@ class SupervisorObserver:
                     )
                 )
 
-        return events
+        return events, new_e7, notes
+
+    def _advance_e7_baseline(
+        self, state: dict[str, Any], source_id: str, action: dict[str, Any]
+    ) -> None:
+        """Advance the E7 watermark past a *handled* new id only (spec 交付 A.4).
+
+        Only launched / skipped:receipt_exists / skipped:attempts_exhausted
+        count as handled; deferred:tick_budget and skipped:audit_in_flight do
+        not, so the id is re-scanned and re-dispatched next tick.
+        """
+        outcome = action.get("action", "")
+        if not (
+            outcome.startswith("launched")
+            or outcome.startswith("skipped:receipt_exists")
+            or outcome.startswith("skipped:attempts_exhausted")
+        ):
+            return
+        baseline = state.get("e7_baseline")
+        if isinstance(baseline, list) and source_id not in baseline:
+            baseline.append(source_id)
 
     def _board_scan(self, state: dict[str, Any], *, remaining: int) -> list[dict[str, Any]]:
         if self.bus is None:
@@ -548,6 +624,48 @@ class SupervisorObserver:
             environment=environment,
         )
 
+    def _log_dedup(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """交付 B (P3): 日志去噪——同一 tick 内同类「无进展」action 聚合为一条
+        计数（如 ``skipped:receipt_exists:x<n>``），且与上一 tick 完全相同的
+        「无进展」批去重打印（不重复刷屏）。
+
+        Only the *log surface* is touched: the returned ``actions`` from
+        ``after_tick`` stay complete for callers/tests; what ``observe`` prints
+        is this deduplicated view. A "no progress" action is one whose action
+        carries no forward movement (``deferred:*`` / ``skipped:*``).
+        """
+        no_progress: list[dict[str, Any]] = []
+        progress: list[dict[str, Any]] = []
+        for action in actions:
+            if str(action.get("action", "")).startswith(("deferred:", "skipped:")):
+                no_progress.append(action)
+            else:
+                progress.append(action)
+
+        if not no_progress:
+            return actions
+
+        # Aggregate the same action kind within this tick into one counted row.
+        first: dict[str, dict[str, Any]] = {}
+        counts: dict[str, int] = {}
+        for action in no_progress:
+            kind = str(action.get("action", ""))
+            first.setdefault(kind, action)
+            counts[kind] = counts.get(kind, 0) + 1
+        aggregated: list[dict[str, Any]] = []
+        for kind, count in sorted(counts.items()):
+            if count == 1:
+                aggregated.append(first[kind])
+            else:
+                aggregated.append({**first[kind], "action": f"{kind}:x{count}"})
+
+        # A batch identical to the previous tick is dropped (去重打印).
+        batch = tuple(a["action"] for a in aggregated)
+        if batch == self._last_no_progress_batch:
+            return progress
+        self._last_no_progress_batch = batch
+        return progress + aggregated
+
     def describe(self, event: SupervisorEvent) -> str:
         return shlex.join(self._spec_for(event).argv())
 
@@ -595,6 +713,11 @@ def reset_supervisor_event(
     Idempotent, and touches nothing but the supervisor's own state surface.
     No daemon restart is required: the observer reloads the cursor file at the
     start of every tick (`after_tick` -> `_load_state`).
+
+    E7 (spec 交付 A.5): 需重审某历史 E7 key 时，删除 cursor 中的
+    `e7_baseline`（整体删 cursor 文件仍为文档化 reset）——水位重建即重扫当前
+    快照全部 swallowed。本命令不代删该键：E7 历史 key 重审是显式水位重建，
+    与 receipt/attempt 的机械语义不同。
     """
     summary: dict[str, Any] = {"key": key}
 
