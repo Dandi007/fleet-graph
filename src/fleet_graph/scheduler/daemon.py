@@ -63,7 +63,11 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from fleet_graph.acceptance import AcceptanceSpec
-from fleet_graph.bus.board import goal_line_card_key, goal_line_card_payload
+from fleet_graph.bus.board import (
+    goal_line_card_key,
+    goal_line_card_payload,
+    parked_question_key,
+)
 from fleet_graph.scheduler.checkpoint_terminal import CheckpointTerminal
 from fleet_graph.scheduler.ignition import (
     DEFAULT_BACKOFF_CAP_SECONDS,
@@ -935,7 +939,9 @@ class Scheduler:
             ticket = self.board.ask(
                 card_entity_id=card_entity_id,
                 question=question,
-                idempotency_key=f"parked:{line.folder_id}:{record['run_id']}",
+                idempotency_key=parked_question_key(
+                    folder_id=line.folder_id, run_id=record["run_id"], note_text=question
+                ),
             )
             state["board_question_note_id"] = ticket.question_note_id
             return f"question_sent:{ticket.question_note_id}"

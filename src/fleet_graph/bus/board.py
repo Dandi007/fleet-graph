@@ -12,6 +12,8 @@ revision, CAS-guarded on the entity head).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -266,6 +268,35 @@ def goal_line_card_payload(*, folder_id: str, title: str) -> dict[str, Any]:
     }
 
 
+def canonical_note_text(note_text: str) -> str:
+    """Canonical serialisation of a park question's note body for key
+    derivation.
+
+    A faithful JSON serialisation: injective (two different bodies never
+    collapse to one canonical form, so they can never share a key and 409 as a
+    same-key/different-intent conflict) while identical bodies always produce
+    the identical canonical form (so a re-send stays dedup idempotent).
+    """
+    return json.dumps(note_text, ensure_ascii=False, sort_keys=True)
+
+
+def parked_question_key(*, folder_id: str, run_id: str, note_text: str) -> str:
+    """The idempotency key of one park question note, derived from the note's
+    own body.
+
+    A re-park or retry changes the note body (the ``blocker`` field / the
+    ``round_no``), so a key that stayed at ``parked:<folder>:<run_id>``
+    collided on the bus as IDEMPOTENCY_CONFLICT ("Same idempotency_key with
+    different intent"). Folding the body's content-variant into the key
+    restores the invariant: same body -> same key (dedup idempotent), a
+    different body -> a different key (never a 409). Both the scheduler
+    daemon's ``_ask_board`` and the E2 interrupt runtime's ``ask`` must call
+    this *one* function so the two write points cannot drift apart again.
+    """
+    variant = hashlib.sha256(canonical_note_text(note_text).encode("utf-8")).hexdigest()[:12]
+    return f"parked:{folder_id}:{run_id}:{variant}"
+
+
 class Board:
     def __init__(
         self,
@@ -430,7 +461,9 @@ __all__ = [
     "Decision",
     "GateTicket",
     "NormalizedVerdict",
+    "canonical_note_text",
     "goal_line_card_key",
     "goal_line_card_payload",
     "normalize_decision",
+    "parked_question_key",
 ]
