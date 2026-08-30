@@ -72,6 +72,10 @@ CONVERGED = {
 # 引擎自己——goal 线跑在 fleet-graph 上、改 fleet-graph 的代码、经 fleet-graph
 # 的 dd 管线交付。方向 SSoT：wiki w-577103；执行卷：work folder wf-d002a6。
 ENROLLED = {
+    # 2026-08-30 自举入编（用户令：监督面图化自举）：wf-216dc3（ronin-sup-graph）
+    # 监督面图化自举线——传感层 read-model(:7494)/E5-E7 事件/收割反应器/破障与
+    # 人话汇报节点；监督面监督其开发、部署、运行。
+    "wf-216dc3",
     # 2026-08-29 步 7 换座真机演练 scratch 线（dev-fg-6925540673b0，決议 seq 678）：
     # wf-9b5931 的 DoD 演练载体，演练毕可退编。
     "wf-a8c7b5",

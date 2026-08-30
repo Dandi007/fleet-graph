@@ -186,7 +186,13 @@ def synthetic(tmp_path: Path) -> dict[str, Any]:
         phase="coordinator",
         updated_at=iso(1_787_000_000.0),
     )
-    write_terminal(run_root, "wf-000001", terminal="blocked", waiting_on="decision", reason="need human")
+    write_terminal(
+        run_root,
+        "wf-000001",
+        terminal="blocked",
+        waiting_on="decision",
+        reason="need human",
+    )
     write_heartbeat(
         run_root,
         "wf-000002",
