@@ -518,6 +518,24 @@ def _dd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _state_serve(args: argparse.Namespace) -> int:
+    """Serve the M1 fleet-state read-model on loopback. Read-only."""
+    from fleet_graph.state.fleet_state import FleetStateConfig, serve
+
+    serve(
+        FleetStateConfig(
+            host=args.host,
+            port=args.port,
+            run_root=pathlib.Path(args.run_root),
+            dd_root=pathlib.Path(args.dd_root),
+            lines_config=pathlib.Path(args.lines_config),
+            bridge_state_dir=pathlib.Path(args.bridge_state_dir),
+            bus_url=args.bus_url,
+        )
+    )
+    return 0
+
+
 def _scheduler_run(args: argparse.Namespace) -> int:
     """Run the resident scheduler: look at each line, ask, start or record why not."""
     import pathlib
@@ -1315,6 +1333,44 @@ def build_parser() -> argparse.ArgumentParser:
         "(env FLEET_GRAPH_WORK_FOLDER_ROOT)",
     )
     dd_serve.set_defaults(func=_dd_serve)
+
+    state = subparsers.add_parser(
+        "state", help="the M1 fleet-state read-model (read-only /v1 views)"
+    )
+    state_sub = state.add_subparsers()
+    state_serve = state_sub.add_parser(
+        "serve",
+        help="serve the read-only fleet-state views: GET /v1/lines, GET /v1/decisions",
+    )
+    state_serve.add_argument("--host", default="127.0.0.1")
+    state_serve.add_argument("--port", type=int, default=7494)
+    state_serve.add_argument(
+        "--run-root",
+        default="/data/fleet-graph/runs",
+        help="where the lines' heartbeat.json / terminal.json live",
+    )
+    state_serve.add_argument(
+        "--dd-root",
+        default="/data/fleet-graph/dd",
+        help="dd development state root (status.json / record.json)",
+    )
+    state_serve.add_argument(
+        "--lines-config",
+        default="config/ronin-lines.json",
+        help="the roster SSoT that decides which lines /v1/lines covers",
+    )
+    state_serve.add_argument(
+        "--bridge-state-dir",
+        default="/data/fleet-graph/decision-bridge",
+        help="the decision-bridge durable state root (holds bridge.sqlite3)",
+    )
+    state_serve.add_argument(
+        "--bus-url",
+        default=None,
+        help="optional agent-bus base URL for the published-decisions view "
+        "(read-only; unset or unreadable degrades to receipts only)",
+    )
+    state_serve.set_defaults(func=_state_serve)
 
     scheduler = subparsers.add_parser("scheduler", help="the resident line scheduler")
     scheduler_sub = scheduler.add_subparsers()
