@@ -14,6 +14,14 @@
       "enabled": true
     },
     {
+      "folder_id": "wf-216dc3",
+      "seat": "opencode-dsv4pro",
+      "max_rounds": 9999,
+      "alias": "ronin-sup-graph",
+      "enabled": true,
+      "_provenance": "2026-08-30 自举入编（用户令：监督面图化自举，监督面监督其开发/部署/运行，并监督它的监督）。goal.md M1–M4：传感层 read-model(:7494)、E5–E7 事件扩容、收割反应器(allowlist 先行)、破障/人话汇报节点；design/goal/context 见 wf-216dc3。"
+    },
+    {
       "folder_id": "wf-287e81",
       "seat": "opencode-gpt-terra",
       "max_rounds": 9999,
