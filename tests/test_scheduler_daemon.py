@@ -349,6 +349,40 @@ class TestTheStallStreak:
     def test_no_terminal_yet_is_not_a_stall(self, tmp_path: Path) -> None:
         assert make(tmp_path).account_last_run("wf-1") == 0
 
+    def test_an_accounted_terminal_keeps_both_board_fields(self, tmp_path: Path) -> None:
+        """The swallowed-approve bug: the advancing branch rebuilt the stall
+        state and kept `board_card_entity_id` but dropped `board_question_note_id`,
+        so a new terminal left the line parked with a null question id and the
+        decision bridge read no waiting owner. Both board fields are per *line*,
+        and both must survive a new terminal."""
+        scheduler = make(tmp_path)
+        scheduler.record_start("wf-1", 1000.0)
+        state_path = scheduler._stall_path("wf-1")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["board_card_entity_id"] = "card-1"
+        state["board_question_note_id"] = "q-1"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1")
+        assert scheduler.account_last_run("wf-1") == 1
+
+        after = json.loads(state_path.read_text(encoding="utf-8"))
+        assert after["board_card_entity_id"] == "card-1"
+        assert after["board_question_note_id"] == "q-1"
+
+    def test_the_baseline_adoption_writes_both_board_fields_explicitly(
+        self, tmp_path: Path
+    ) -> None:
+        """An adopted baseline is a fresh start: neither card nor question has
+        been materialised for a run this file never witnessed, and both fields
+        are written explicitly None so the schema stays stable."""
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "ancient")
+        scheduler = make(tmp_path)
+        scheduler.account_last_run("wf-1")
+        state = json.loads(scheduler._stall_path("wf-1").read_text(encoding="utf-8"))
+        assert state["board_card_entity_id"] is None
+        assert state["board_question_note_id"] is None
+
     def test_the_streak_reaches_the_decision(self, tmp_path: Path) -> None:
         """A counter nothing consults is a counter that looks like a working
         guard right up until the line it should have held restarts anyway."""
