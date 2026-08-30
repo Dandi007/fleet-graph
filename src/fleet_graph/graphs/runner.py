@@ -243,6 +243,12 @@ def _build_interrupt(config: LineConfig, *, run_id: str = "") -> LineInterruptPo
         # instead of publishing a second one (E2 card pass-through).
         card_entity_id=config.board_card_entity_id,
         run_id=run_id,
+        # The scheduler's stall-state file for this line
+        # (``<run_root>/.scheduler/<folder_id>.json``). Threaded so the E2
+        # interrupt's ``persist`` mirrors its question note into the stall
+        # state, letting the decision bridge map a ``work.decision.v1``
+        # answering it back to the parked line.
+        stall_state_path=config.run_root.parent / ".scheduler" / f"{config.folder_id}.json",
     )
 
 
