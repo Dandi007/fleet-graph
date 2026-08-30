@@ -208,13 +208,24 @@ class AgentRunStageActor:
     def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
         attempt_tag = f"g{dispatch['generation']}-a{dispatch['attempt']}"
         retry = int(dispatch.get("retry", 0))
-        if retry:
+        re_adopt = bool(dispatch.get("re_adopt", False))
+        # A timeout retry re-adopts the run still in flight: derive the
+        # ORIGINAL run id (the retry-0 one), so the idempotent launcher adopts
+        # the in-flight run instead of paying for a second one. Only a run
+        # that has truly terminally failed or been lost earns a fresh id --
+        # that is the deliberate-retry bump below, kept for when `re_adopt`
+        # is not set.
+        if retry and not re_adopt:
             attempt_tag = f"{attempt_tag}-r{retry}"
         # `derive_run_id`'s attempt dimension is exactly this: bump it and you
         # get a genuinely new run instead of re-adopting the old one. Without
         # it a bounded retry re-adopts the completed run it is retrying and
         # returns the same answer, which makes the bound decorative.
-        run_id = derive_run_id(f"{self.development_id}:{stage.id}", attempt_tag, attempt=retry + 1)
+        run_id = derive_run_id(
+            f"{self.development_id}:{stage.id}",
+            attempt_tag,
+            attempt=(1 if re_adopt else retry + 1),
+        )
         role_input = self.role_input(stage, dispatch, run_id)
         input_path = write_json_durable(
             self.run_root / "stages" / f"{stage.id}-{attempt_tag}-input.json", role_input
@@ -270,9 +281,11 @@ class AgentRunStageActor:
             )
         except RunWaitTimeout as timeout:
             # A timeout means the run is still going, not that it is gone. It
-            # is reported as retryable on purpose: the run id is derived, so
-            # the retry re-adopts the run in flight rather than paying for a
-            # second one. Reporting it as terminal would strand a live run.
+            # is reported as retryable on purpose: `run_in_flight` lets the
+            # retry re-adopt the same run in flight (same run_id, continue
+            # waiting) rather than paying for a second one. Reporting it as
+            # terminal would strand a live run, and bumping the run id here
+            # would abandon it -- the double-burn window this fence closes.
             # Any spend the run already made cannot be attributed to a
             # lifecycle it never completed, so it lands in `unknown`.
             self._record_unknown_spend(run_id, envelope=None)
@@ -280,6 +293,7 @@ class AgentRunStageActor:
                 event=FAILURE_EVENT,
                 failure_code=PROVIDER_UNAVAILABLE,
                 detail=f"{stage.id} run {run_id} did not finish: {timeout}",
+                run_in_flight=True,
             )
 
         if status.result is None or not status.ok:
