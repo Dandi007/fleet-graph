@@ -87,6 +87,10 @@ ENROLLED = {
     # 监督）：supervisor 模式抽象落地线——传感层 read-model(:7494)、E5-E7 事件、
     # 收割反应器(allowlist 先行)、破障/人话汇报节点。goal/design SSoT：wf-216dc3。
     "wf-216dc3",
+    # 2026-08-30 第七波（用户拍板 B：DR 重档在 fleet-graph research_pipeline 上
+    # 彻底重构，R1-R8 严格依赖序为硬约束）：deep-research V4 线。
+    # goal/宪法差距表 SSoT：wf-66300e；诊断：wf-b9be03。
+    "wf-66300e",
 }
 
 # 2026-08-29 复活：曾在 MIGRATED 里 enabled=false 停摆的线被用户令重新点亮。
