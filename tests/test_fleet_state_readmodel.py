@@ -327,6 +327,113 @@ class TestDecisionsView:
         assert payload["decisions"] == []
 
 
+# --- /v1/harvestable --------------------------------------------------------
+
+
+def write_dd_development(
+    dd_root: Path,
+    development_id: str,
+    *,
+    head_commit: str,
+    terminal: str,
+    stage: str = "implement",
+    missing_status: bool = False,
+    missing_record: bool = False,
+) -> None:
+    dev_dir = dd_root / development_id
+    dev_dir.mkdir(parents=True, exist_ok=True)
+    if not missing_record:
+        (dev_dir / "record.json").write_text(
+            json.dumps({"development_id": development_id, "repo_path": "/tmp/x"}),
+            encoding="utf-8",
+        )
+    if not missing_status:
+        (dev_dir / "status.json").write_text(
+            json.dumps(
+                {
+                    "development_id": development_id,
+                    "state": "awaiting_gate",
+                    "stage": stage,
+                    "terminal": terminal,
+                    "head_commit": head_commit,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+
+class TestHarvestableView:
+    def _config(self, tmp_path: Path) -> FleetStateConfig:
+        return FleetStateConfig(
+            host="127.0.0.1",
+            port=0,  # ephemeral: never collide with the live :7494 read-model
+            run_root=tmp_path / "runs",
+            dd_root=tmp_path / "dd",
+            lines_config=tmp_path / "missing.json",
+            bridge_state_dir=tmp_path / "bridge",
+        )
+
+    def test_empty_dd_root_degrades_to_empty_list(self, tmp_path: Path) -> None:
+        payload = FleetStateView(self._config(tmp_path)).harvestable()
+        assert payload["schema_version"] == LINES_SCHEMA_VERSION
+        assert payload["developments"] == []
+
+    def test_lists_only_gate_passed_unmerged_developments(self, tmp_path: Path) -> None:
+        dd_root = tmp_path / "dd"
+        # Unharvested: head_commit set, terminal != complete.
+        write_dd_development(dd_root, "dev-harvest", head_commit="abc123", terminal="done")
+        # Merged / complete: not harvestable.
+        write_dd_development(dd_root, "dev-complete", head_commit="def456", terminal="complete")
+        # Never passed a gate: no head_commit.
+        write_dd_development(dd_root, "dev-no-commit", head_commit="", terminal="fault")
+        payload = FleetStateView(self._config(tmp_path)).harvestable()
+        assert payload["developments"] == [
+            {
+                "development_id": "dev-harvest",
+                "head_commit": "abc123",
+                "stage": "implement",
+                "terminal": "done",
+            }
+        ]
+
+    def test_missing_status_or_record_degrades_the_entry(self, tmp_path: Path) -> None:
+        dd_root = tmp_path / "dd"
+        write_dd_development(dd_root, "dev-ok", head_commit="abc123", terminal="done")
+        write_dd_development(
+            dd_root,
+            "dev-no-status",
+            head_commit="def456",
+            terminal="done",
+            missing_status=True,
+        )
+        write_dd_development(
+            dd_root,
+            "dev-no-record",
+            head_commit="123456",
+            terminal="done",
+            missing_record=True,
+        )
+        payload = FleetStateView(self._config(tmp_path)).harvestable()
+        assert [d["development_id"] for d in payload["developments"]] == ["dev-ok"]
+
+    def test_harvestable_is_served_over_the_wire(self, tmp_path: Path) -> None:
+        dd_root = tmp_path / "dd"
+        write_dd_development(dd_root, "dev-harvest", head_commit="abc123", terminal="done")
+        server = FleetStateHTTPServer(self._config(tmp_path))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        try:
+            resp = httpx.get(f"http://127.0.0.1:{port}/v1/harvestable", timeout=5)
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["schema_version"] == LINES_SCHEMA_VERSION
+            assert body["developments"][0]["development_id"] == "dev-harvest"
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 # --- over the wire ----------------------------------------------------------
 
 

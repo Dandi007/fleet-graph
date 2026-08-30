@@ -253,6 +253,10 @@ class SchedulerConfig:
     #: units). Default off; enabling it is a reviewed config PR, exactly like
     #: probe_via_runtime.
     supervisor_events: bool = False
+    #: M2 E6: the loopback state read-model the E5/E6/E7 observer scans.
+    read_model_base_url: str = "http://127.0.0.1:7494"
+    #: M2 E6: a line is stale when its heartbeat_age_s exceeds this.
+    heartbeat_stale_threshold_seconds: float = 300.0
 
     @classmethod
     def from_json(cls, path: Path) -> SchedulerConfig:
@@ -279,6 +283,10 @@ class SchedulerConfig:
             # setting it in config silently did nothing.
             probe_via_runtime=bool(raw.get("probe_via_runtime", False)),
             supervisor_events=bool(raw.get("supervisor_events", False)),
+            read_model_base_url=str(raw.get("read_model_base_url", "http://127.0.0.1:7494")),
+            heartbeat_stale_threshold_seconds=float(
+                raw.get("heartbeat_stale_threshold_seconds", 300.0)
+            ),
             backoff_cap_seconds=float(raw.get("backoff_cap_seconds", DEFAULT_BACKOFF_CAP_SECONDS)),
             extra_line_environment=dict(raw.get("line_environment", {})),
         )
