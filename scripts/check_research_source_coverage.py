@@ -76,14 +76,21 @@ def synthesis_payload() -> dict[str, Any]:
 
 
 class FakeLauncher:
-    """按 role 回放脚本，并记录每次派发的 spec.role（覆盖检查的判据）。"""
+    """按 role 回放脚本，并记录每次派发的 spec.role（覆盖检查的判据）。
+
+    ``launch`` 幂等（R3）：同 run_id 重复 launch = re-adopt 在途 run，只记录第一次。
+    """
 
     def __init__(self, worker_results: list[dict[str, Any]]) -> None:
         self.worker_results = list(worker_results)
         self.roles: dict[str, str] = {}
         self.dispatched_roles: list[str] = []
+        self._launched: set[str] = set()
 
     def launch(self, spec: Any, run_id: str) -> RunTicket:
+        if run_id in self._launched:
+            return RunTicket(run_id, f"/tmp/coverage/{run_id}", None, adopted=True)
+        self._launched.add(run_id)
         self.roles[run_id] = spec.role
         self.dispatched_roles.append(spec.role)
         return RunTicket(run_id, f"/tmp/coverage/{run_id}", None)
