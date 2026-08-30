@@ -606,6 +606,8 @@ def _scheduler_run(args: argparse.Namespace) -> int:
             ObserverConfig(
                 run_root=config.run_root,
                 cap_window_seconds=config.cap_window_seconds,
+                read_model_base_url=config.read_model_base_url,
+                heartbeat_stale_threshold_seconds=config.heartbeat_stale_threshold_seconds,
                 environment=supervisor_environment,
             ),
             launcher=TransientLauncher(dry_run=args.dry_run),

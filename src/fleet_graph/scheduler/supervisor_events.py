@@ -6,7 +6,7 @@ performs while awake, plus a launcher call when a scan finds something worth
 an audit. The supervisor graph itself runs as yet another transient unit --
 a *scheduled* thing, never a second scheduler.
 
-Four scans, one per event (r4-design §1):
+Seven scans, one per event (r4-design §1; E5-E7 consume the read-model):
 
 - **E1** board question with no decision referencing it -- incremental pull
   over `board:work-notes`, cursor persisted next to the stall-state files.
@@ -18,6 +18,12 @@ Four scans, one per event (r4-design §1):
 - **E4** `TickResult.refusal == TOTAL_CAP_REACHED` -- in-process, straight
   from the tick's own results; deduped per cap window so a breaker that
   holds for an hour is one audit, not sixty.
+- **E5/E6/E7** read-model scans -- a stdlib HTTP client pulls the loopback
+  state read-model (`127.0.0.1:7494`) `/v1/harvestable`, `/v1/lines`,
+  `/v1/decisions` and derives the events from the *synthetic snapshots*, never
+  from heartbeat/terminal/bus/bridge files. The M1 read-model is the only
+  data face these three events have (spec: 「这三事件禁止重扫
+  heartbeat/terminal/bus/bridge 文件（一律经 :7494）」).
 
 Two budgets, both plain counters (absorbed from the old supervisor's action
 window -- the one part of its self-restraint worth keeping): at most
@@ -25,9 +31,9 @@ window -- the one part of its self-restraint worth keeping): at most
 `max_attempts_per_key` lifetime launches per event key. A supervisor that can
 flood is a supervisor someone will turn off.
 
-Failure discipline is the parking one: every scan fails open. A bus outage
-or an unreadable cursor costs observation, never scheduling -- `after_tick`
-cannot raise.
+Failure discipline is the parking one: every scan fails open. A bus outage,
+an unreadable cursor, or an unreachable read-model (:7494) costs observation,
+never scheduling -- `after_tick` cannot raise.
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ import contextlib
 import json
 import shlex
 import time
+import urllib.request
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -48,14 +55,23 @@ from fleet_graph.scheduler.launcher import TransientLauncher
 from fleet_graph.supervise.events import (
     EVENT_BOARD_QUESTION,
     SupervisorEvent,
+    approved_unharvested_event,
     blocked_decision_event,
     board_question_event,
     cap_breaker_event,
+    decision_swallowed_event,
+    heartbeat_stale_event,
     line_fault_event,
 )
 
 DEFAULT_SUPERVISOR_STATE_ROOT = Path("/data/fleet-graph/supervisor")
 DEFAULT_UNIT_PREFIX = "fleet-graph-supervisor"
+
+#: The M1 state read-model the E5/E6/E7 scans consume (loopback).
+DEFAULT_READ_MODEL_BASE_URL = "http://127.0.0.1:7494"
+
+#: E6 staleness threshold: heartbeat_age_s strictly greater than this.
+DEFAULT_HEARTBEAT_STALE_THRESHOLD_SECONDS = 300.0
 
 #: How many board messages one tick will page through at most.
 BOARD_PAGE_LIMIT = 200
@@ -64,6 +80,23 @@ BOARD_PAGE_LIMIT = 200
 #: 不 import 那个模块——Guard C 规定唯一 importer 是 supervisor act 节点，
 #: 调度层要的只是这个名字，不是发布入口。
 DECISION_TOKEN_ENV = "FLEET_GRAPH_DECISION_TOKEN_FILE"
+
+
+def _http_get_json(url: str, timeout: float = 5.0) -> dict[str, Any] | None:
+    """GET one read-model view; None on any failure (fail-open).
+
+    The read-model is loopback-only, so the request explicitly bypasses
+    HTTP(S)_PROXY: a proxy in the daemon environment must never try to route
+    a 127.0.0.1 call (spec 交付 C: 回环,显式绕过 HTTP(S)_PROXY).
+    """
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=timeout) as response:
+            raw = response.read()
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def observer_environment(
@@ -154,6 +187,12 @@ class ObserverConfig:
     max_launches_per_tick: int = 2
     max_attempts_per_key: int = 3
     cap_window_seconds: float = DEFAULT_CAP_WINDOW_SECONDS
+    #: The M1 read-model base URL the E5/E6/E7 scans consume. Loopback only;
+    #: the fetch explicitly bypasses HTTP(S)_PROXY (see _http_get_json).
+    read_model_base_url: str = DEFAULT_READ_MODEL_BASE_URL
+    #: E6 threshold: a line is stale when its heartbeat_age_s is strictly
+    #: greater than this (read-model /v1/lines).
+    heartbeat_stale_threshold_seconds: float = DEFAULT_HEARTBEAT_STALE_THRESHOLD_SECONDS
     unit_prefix: str = DEFAULT_UNIT_PREFIX
     working_directory: str = "/data/apps/fleet-graph/current"
     executable: str = "/data/apps/fleet-graph/current/.venv/bin/fleet-graph"
@@ -174,6 +213,7 @@ class SupervisorObserver:
         units: Any = None,
         observe: Callable[[dict[str, Any]], None] | None = None,
         clock: Callable[[], float] = time.time,
+        read_model: Callable[[str], dict[str, Any] | None] | None = None,
     ) -> None:
         self.config = config
         self.launcher = launcher
@@ -183,8 +223,21 @@ class SupervisorObserver:
         self.units = units
         self.observe = observe
         self.clock = clock
+        #: Synthetic-snapshot fetcher for the E5/E6/E7 read-model scans. Takes
+        #: a view path ("/v1/lines") and returns the parsed JSON body or None
+        #: on any failure (fail-open). Defaults to the stdlib HTTP client
+        #: against config.read_model_base_url; tests inject a fake snapshot.
+        self.read_model = read_model or self._default_read_model_fetcher()
 
     # --- persisted cursor state ------------------------------------------
+
+    def _default_read_model_fetcher(self) -> Callable[[str], dict[str, Any] | None]:
+        base_url = self.config.read_model_base_url.rstrip("/")
+
+        def fetch(path: str) -> dict[str, Any] | None:
+            return _http_get_json(f"{base_url}{path}")
+
+        return fetch
 
     def _load_state(self) -> dict[str, Any]:
         empty: dict[str, Any] = {"board_seq": None, "attempts": {}}
@@ -239,6 +292,13 @@ class SupervisorObserver:
                 events.extend(self._cap_events(tick_results, now))
             except Exception as exc:  # fail open
                 actions.append({"source": "cap", "error": repr(exc)[:200]})
+            try:
+                # E5/E6/E7 read-model scans share the same budget + attempt
+                # counters as E2/E3/E4; an unreachable :7494 is a skipped
+                # scan (an action note), never a dead tick.
+                events.extend(self._read_model_events())
+            except Exception as exc:  # fail open
+                actions.append({"source": "read_model", "error": repr(exc)[:200]})
 
             for event in events:
                 if launched >= self.config.max_launches_per_tick:
@@ -298,6 +358,82 @@ class SupervisorObserver:
         bucket = int(now // self.config.cap_window_seconds)
         detail = str(tripped[0].decision.detail or "")
         return [cap_breaker_event(bucket, detail, [r.folder_id for r in tripped])]
+
+    def _read_model_events(self) -> list[SupervisorEvent]:
+        """E5/E6/E7 from the read-model's synthetic snapshots (:7494).
+
+        The M1 read-model is the only data face these events have: no direct
+        heartbeat/terminal/bus/bridge file is re-read here (spec: 「这三事件
+        禁止重扫 heartbeat/terminal/bus/bridge 文件（一律经 :7494）」).
+        Every view fetch fails open -- an unreachable :7494 skips that scan,
+        never the tick.
+        """
+        events: list[SupervisorEvent] = []
+
+        lines = self.read_model("/v1/lines")
+        if isinstance(lines, dict):
+            for line in lines.get("lines") or []:
+                if not isinstance(line, dict):
+                    continue
+                folder_id = str(line.get("folder_id") or "")
+                if not folder_id:
+                    continue
+                heartbeat_age_s = line.get("heartbeat_age_s")
+                if heartbeat_age_s is None:
+                    continue
+                try:
+                    age = float(heartbeat_age_s)
+                except (TypeError, ValueError):
+                    continue
+                # E6: stale heartbeat on a line that has not terminal-ed and
+                # is not parked (a parked line waiting on a decision is not a
+                # stalled line; the heartbeat restores when it wakes).
+                if age <= self.config.heartbeat_stale_threshold_seconds:
+                    continue
+                if line.get("terminal") is not None:
+                    continue
+                if line.get("parked") is True:
+                    continue
+                events.append(
+                    heartbeat_stale_event(
+                        folder_id,
+                        age,
+                        line.get("round"),
+                        str(line.get("phase") or ""),
+                    )
+                )
+
+        decisions = self.read_model("/v1/decisions")
+        if isinstance(decisions, dict):
+            for decision in decisions.get("decisions") or []:
+                if not isinstance(decision, dict):
+                    continue
+                if decision.get("state") != "swallowed":
+                    continue
+                source_message_id = str(decision.get("source_message_id") or "")
+                if not source_message_id:
+                    continue
+                events.append(
+                    decision_swallowed_event(source_message_id, str(decision.get("reason") or ""))
+                )
+
+        harvestable = self.read_model("/v1/harvestable")
+        if isinstance(harvestable, dict):
+            for development in harvestable.get("developments") or []:
+                if not isinstance(development, dict):
+                    continue
+                development_id = str(development.get("development_id") or "")
+                if not development_id:
+                    continue
+                events.append(
+                    approved_unharvested_event(
+                        development_id,
+                        str(development.get("head_commit") or ""),
+                        str(development.get("stage") or ""),
+                    )
+                )
+
+        return events
 
     def _board_scan(self, state: dict[str, Any], *, remaining: int) -> list[dict[str, Any]]:
         if self.bus is None:
@@ -532,6 +668,8 @@ def reset_supervisor_event(
 
 __all__ = [
     "BOARD_PAGE_LIMIT",
+    "DEFAULT_HEARTBEAT_STALE_THRESHOLD_SECONDS",
+    "DEFAULT_READ_MODEL_BASE_URL",
     "DEFAULT_SUPERVISOR_STATE_ROOT",
     "ObserverConfig",
     "SupervisorLaunchSpec",

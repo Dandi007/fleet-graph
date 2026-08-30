@@ -12,8 +12,11 @@ The retreat-verified trio the R4-2 ticket names:
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from fleet_graph.scheduler.daemon import LineSpec, Scheduler, SchedulerConfig, TickResult
 from fleet_graph.scheduler.ignition import IgnitionDecision, Refusal
@@ -25,7 +28,7 @@ from fleet_graph.scheduler.supervisor_events import (
     observer_environment,
     reset_supervisor_event,
 )
-from fleet_graph.supervise.events import line_fault_event, validate_event
+from fleet_graph.supervise.events import SupervisorEventError, line_fault_event, validate_event
 
 
 class RecordingLauncher:
@@ -106,6 +109,27 @@ class FakeBus:
         return []
 
 
+EMPTY_READ_MODEL: dict[str, dict[str, Any]] = {
+    "/v1/lines": {"schema_version": "1", "lines": []},
+    "/v1/decisions": {"schema_version": "1", "decisions": []},
+    "/v1/harvestable": {"schema_version": "1", "developments": []},
+}
+
+
+def read_model_for(snapshots: dict[str, Any]) -> Callable[[str], dict[str, Any] | None]:
+    """A fake :7494 snapshot fetcher: view path -> parsed JSON body (or None).
+
+    The observer must never touch the *live* read-model in tests (交付 D:
+    合成 read-model 快照,注入假 :7494 客户端/快照函数), so every observer in
+    this file is wired to one of these.
+    """
+
+    def fetch(path: str) -> dict[str, Any] | None:
+        return snapshots.get(path)
+
+    return fetch
+
+
 def observer_for(
     tmp_path: Path,
     *,
@@ -113,6 +137,7 @@ def observer_for(
     units: Any = None,
     max_per_tick: int = 2,
     max_attempts: int = 3,
+    read_model: Callable[[str], dict[str, Any] | None] | None = None,
 ) -> tuple[SupervisorObserver, RecordingLauncher]:
     launcher = RecordingLauncher()
     observer = SupervisorObserver(
@@ -126,6 +151,7 @@ def observer_for(
         launcher=launcher,  # type: ignore[arg-type]
         bus=bus,
         units=units,
+        read_model=read_model or read_model_for(EMPTY_READ_MODEL),
     )
     return observer, launcher
 
@@ -208,6 +234,283 @@ class TestCapEvents:
         )
         tick(observer, {}, results=[result])
         assert launcher.events() == []
+
+
+class TestReadModelEvents:
+    """M2 E5/E6/E7: derived from the synthetic read-model snapshots (:7494),
+    never from heartbeat/terminal/bus/bridge files (spec 交付 C + D)."""
+
+    def test_e5_harvestable_development_fires(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(
+            tmp_path,
+            read_model=read_model_for(
+                {
+                    "/v1/harvestable": {
+                        "schema_version": "1",
+                        "developments": [
+                            {
+                                "development_id": "dev-x",
+                                "head_commit": "abc123",
+                                "stage": "implement",
+                                "terminal": "done",
+                            }
+                        ],
+                    }
+                }
+            ),
+        )
+        tick(observer, {})
+        [event] = launcher.events()
+        assert event["type"] == "approved_unharvested"
+        assert event["key"] == "e5-dev-x"
+        assert event["payload"] == {
+            "development_id": "dev-x",
+            "head_commit": "abc123",
+            "stage": "implement",
+        }
+
+    def test_e6_stale_heartbeat_line_fires(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(
+            tmp_path,
+            read_model=read_model_for(
+                {
+                    "/v1/lines": {
+                        "schema_version": "1",
+                        "lines": [
+                            {
+                                "folder_id": "wf-a",
+                                "heartbeat_age_s": 600.0,
+                                "round": 3,
+                                "phase": "coordinator",
+                                "terminal": None,
+                                "parked": False,
+                            }
+                        ],
+                    }
+                }
+            ),
+        )
+        tick(observer, {})
+        [event] = launcher.events()
+        assert event["type"] == "heartbeat_stale"
+        assert event["key"] == "e6-wf-a"
+        assert event["payload"] == {
+            "folder_id": "wf-a",
+            "heartbeat_age_s": 600.0,
+            "round": 3,
+            "phase": "coordinator",
+        }
+
+    def test_e6_skips_fresh_terminal_parked_and_unknown_lines(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(
+            tmp_path,
+            read_model=read_model_for(
+                {
+                    "/v1/lines": {
+                        "schema_version": "1",
+                        "lines": [
+                            # Fresh heartbeat: age below the 300s threshold.
+                            {"folder_id": "wf-fresh", "heartbeat_age_s": 5.0, "terminal": None},
+                            # Terminal-ed: not a stalled line.
+                            {"folder_id": "wf-term", "heartbeat_age_s": 600.0, "terminal": "done"},
+                            # Parked: waiting on a decision, not stalled.
+                            {
+                                "folder_id": "wf-parked",
+                                "heartbeat_age_s": 600.0,
+                                "terminal": None,
+                                "parked": True,
+                            },
+                            # No heartbeat at all.
+                            {"folder_id": "wf-nohb", "heartbeat_age_s": None, "terminal": None},
+                        ],
+                    }
+                }
+            ),
+        )
+        tick(observer, {})
+        assert launcher.events() == []
+
+    def test_e7_swallowed_decision_fires(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(
+            tmp_path,
+            read_model=read_model_for(
+                {
+                    "/v1/decisions": {
+                        "schema_version": "1",
+                        "decisions": [
+                            {"source_message_id": "msg_sw", "state": "swallowed", "reason": "noop"},
+                            {"source_message_id": "msg_pub", "state": "published", "reason": ""},
+                        ],
+                    }
+                }
+            ),
+        )
+        tick(observer, {})
+        [event] = launcher.events()
+        assert event["type"] == "decision_swallowed"
+        assert event["key"] == "e7-msg_sw"
+        assert event["payload"] == {"source_message_id": "msg_sw", "reason": "noop"}
+
+    def test_same_key_across_ticks_is_a_fresh_attempt_not_a_duplicate(self, tmp_path: Path) -> None:
+        """The same snapshot re-scanned next tick re-derives the same key; the
+        observer turns that into a *new attempt generation* (a2, a3 -- fresh
+        thread identity), never a silent duplicate within a tick. A receipt --
+        not an attempt -- ends the event for good (next test)."""
+        observer, launcher = observer_for(
+            tmp_path,
+            read_model=read_model_for(
+                {
+                    "/v1/harvestable": {
+                        "schema_version": "1",
+                        "developments": [
+                            {
+                                "development_id": "dev-x",
+                                "head_commit": "abc123",
+                                "stage": "implement",
+                                "terminal": "done",
+                            }
+                        ],
+                    }
+                }
+            ),
+        )
+        tick(observer, {})
+        tick(observer, {})
+        events = launcher.events()
+        assert len(events) == 2
+        assert events[0]["key"] == events[1]["key"] == "e5-dev-x"
+        assert [e["attempt"] for e in events] == [1, 2]
+        threads = [validate_event(e).thread_id for e in events]
+        assert threads == ["supervisor:e5-dev-x:a1", "supervisor:e5-dev-x:a2"]
+        # Within one tick the same key is launched at most once: one snapshot,
+        # one event object, one `_consider` decision.
+        observer2, launcher2 = observer_for(
+            tmp_path,
+            read_model=read_model_for(
+                {
+                    "/v1/harvestable": {
+                        "schema_version": "1",
+                        "developments": [
+                            {
+                                "development_id": "dev-x",
+                                "head_commit": "abc123",
+                                "stage": "implement",
+                                "terminal": "done",
+                            }
+                        ],
+                    }
+                }
+            ),
+        )
+        tick(observer2, {})
+        assert len(launcher2.events()) == 1
+
+    def test_receipt_ends_a_read_model_event_for_good(self, tmp_path: Path) -> None:
+        reports = tmp_path / "supervisor" / "reports"
+        reports.mkdir(parents=True)
+        (reports / "e6-wf-a.json").write_text("{}")
+        observer, launcher = observer_for(
+            tmp_path,
+            read_model=read_model_for(
+                {
+                    "/v1/lines": {
+                        "schema_version": "1",
+                        "lines": [
+                            {"folder_id": "wf-a", "heartbeat_age_s": 600.0, "terminal": None}
+                        ],
+                    }
+                }
+            ),
+        )
+        actions = tick(observer, {})
+        assert launcher.events() == []
+        assert any(a.get("action") == "skipped:receipt_exists" for a in actions)
+
+    def test_read_model_events_share_the_tick_budget(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(
+            tmp_path,
+            max_per_tick=1,
+            read_model=read_model_for(
+                {
+                    "/v1/harvestable": {
+                        "schema_version": "1",
+                        "developments": [
+                            {"development_id": "dev-1", "head_commit": "a", "stage": "s"},
+                            {"development_id": "dev-2", "head_commit": "b", "stage": "s"},
+                        ],
+                    }
+                }
+            ),
+        )
+        actions = tick(observer, {})
+        assert len(launcher.events()) == 1
+        assert any(a.get("action") == "deferred:tick_budget" for a in actions)
+
+    def test_lifetime_attempts_cap_applies_to_read_model_events(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(
+            tmp_path,
+            max_attempts=2,
+            read_model=read_model_for(
+                {
+                    "/v1/harvestable": {
+                        "schema_version": "1",
+                        "developments": [
+                            {"development_id": "dev-x", "head_commit": "a", "stage": "s"}
+                        ],
+                    }
+                }
+            ),
+        )
+        for _ in range(4):
+            tick(observer, {})
+        assert len(launcher.events()) == 2
+        actions = tick(observer, {})
+        assert any("attempts_exhausted" in a.get("action", "") for a in actions)
+
+    def test_unreachable_read_model_is_a_skip_not_a_crash(self, tmp_path: Path) -> None:
+        """fail-open: a dead :7494 (all fetches None) costs observation, never
+        the tick -- and no E5/E6/E7 event is minted from nothing."""
+        observer, launcher = observer_for(
+            tmp_path,
+            read_model=lambda path: None,
+        )
+        actions = tick(observer, {})
+        assert launcher.events() == []
+        assert not any("error" in a for a in actions)
+
+    def test_malformed_snapshot_entries_are_skipped(self, tmp_path: Path) -> None:
+        """Bad artifacts degrade per entry: non-dict rows and non-numeric
+        heartbeat ages never mint an event, and never 5xx the scan."""
+        observer, launcher = observer_for(
+            tmp_path,
+            read_model=read_model_for(
+                {
+                    "/v1/lines": {
+                        "schema_version": "1",
+                        "lines": [
+                            "not-a-dict",
+                            {"folder_id": "wf-badage", "heartbeat_age_s": "oops"},
+                            {"heartbeat_age_s": 600.0},  # no folder_id
+                        ],
+                    },
+                    "/v1/decisions": {
+                        "schema_version": "1",
+                        "decisions": ["not-a-dict", {"state": "swallowed"}],
+                    },
+                    "/v1/harvestable": {
+                        "schema_version": "1",
+                        "developments": ["not-a-dict", {"head_commit": "abc"}],
+                    },
+                }
+            ),
+        )
+        tick(observer, {})
+        assert launcher.events() == []
+
+    def test_validate_event_still_refuses_unknown_names(self) -> None:
+        # 负例保留（spec 交付 A.3）：词表扩容不改 validate_event 的拒绝语义。
+        with pytest.raises(SupervisorEventError, match="vocabulary is closed"):
+            validate_event({"type": "harvest_ready", "key": "e9-x", "payload": {}})
 
 
 class TestBudgets:
@@ -712,6 +1015,7 @@ class TestE1NoDecisionCredential:
             ),
             launcher=launcher,  # type: ignore[arg-type]
             bus=bus,
+            read_model=read_model_for(EMPTY_READ_MODEL),
         )
         return observer, launcher
 
