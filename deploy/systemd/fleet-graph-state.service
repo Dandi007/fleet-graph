@@ -1,0 +1,44 @@
+# systemd *user* unit for the M1 fleet-state read-model.
+#
+# Read-only: this service pulls existing artifacts (heartbeat/terminal under
+# the run root, dd status/record, decision-bridge receipts, and optionally the
+# agent-bus work.decision.v1 channel) and never writes to any observed
+# artifact, never publishes a decision, and holds no decision-publish
+# credential. It binds loopback only (127.0.0.1:7494).
+#
+# Deliberately a standalone unit, like fleet-graph-decision-bridge.service: it
+# is NOT linked to fleet-graphd.service by Requires=/PartOf=, so it can be
+# started/stopped/restarted independently and a fault here does not take the
+# resident scheduler down with it (and vice versa). Restart=always matches the
+# fleet-graphd convention for a resident service.
+#
+# `state serve` is a real subcommand, checked by tests/test_fleet_state_readmodel.py
+# the same way fleet-graphd.service is checked: an invented subcommand plus
+# Restart=always would otherwise crash-loop in the dark.
+#
+# No credential is baked into the unit. The optional (`-` after the `=`) env
+# file is the same convention fleet-graphd.service uses; the read-model only
+# ever uses a *read* bus credential from it for the optional published view and
+# degrades cleanly when the file is absent.
+[Unit]
+Description=fleet-graph state read-model (M1 sensing layer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/apps/fleet-graph/current
+ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph state serve \
+    --host 127.0.0.1 --port 7494 \
+    --lines-config /data/apps/fleet-graph/current/config/ronin-lines.json
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+# A systemd user unit does not get a login shell's PATH; carry the python entry
+# and system binaries on a predictable PATH, mirroring the other units.
+Environment=PATH=%h/.bun/bin:%h/.local/bin:%h/.opencode/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Optional env file (read-only bus credential for the published view).
+EnvironmentFile=-%h/.config/fleet-graph/state.env
+
+[Install]
+WantedBy=default.target
