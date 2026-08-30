@@ -1,0 +1,17 @@
+{
+ "development_id": "dev-fg-ece1ede28358",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "bash",
+   "-lc",
+   "n=0; uv run fleet-graph state serve --host 127.0.0.1 --port 7494 & srv=$!; trap 'kill $srv 2>/dev/null' EXIT; until env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy curl -sf http://127.0.0.1:7494/v1/lines >/dev/null 2>&1; do n=$((n+1)); if [ $n -gt 40 ]; then exit 1; fi; sleep 0.25; done; env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy curl -sf http://127.0.0.1:7494/v1/lines | grep -q schema_version && env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy curl -sf http://127.0.0.1:7494/v1/decisions | grep -q schema_version"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
