@@ -640,6 +640,12 @@ class Scheduler:
                         # the runbook hatch, and a delete that re-parked the
                         # line on the next tick would make the hatch a no-op.
                         **{**_EMPTY_PARK_FIELDS, "park_considered_run_id": record["run_id"]},
+                        # The board fields are per line, and an adopted baseline
+                        # is a fresh start: a run this file never witnessed has
+                        # materialised neither card nor question, so both are
+                        # written explicitly None to keep the schema stable.
+                        "board_card_entity_id": None,
+                        "board_question_note_id": None,
                     },
                 )
             return 0
@@ -669,6 +675,11 @@ class Scheduler:
                 # must not orphan it, or every re-parking would publish a
                 # duplicate card.
                 "board_card_entity_id": state["board_card_entity_id"],
+                # The question note is per *line* too: a new terminal must not
+                # orphan it either, or the decision bridge would read a parked
+                # line with a null question id and swallow the human's approve
+                # as `no_waiting_owner`.
+                "board_question_note_id": state["board_question_note_id"],
                 # A new terminal supersedes any parking of the previous run:
                 # its snapshot is cleared, and this run is not yet considered,
                 # so the parking logic gets to look at it exactly once.
@@ -802,14 +813,23 @@ class Scheduler:
         state["parked_at"] = now
         state["parked_goal_revision"] = revision
         state["parked_inbox_available"] = inbox_available
+
+        # Ask the board *before* writing anything: the question materialises
+        # the card and publishes the note into `state`, and the single write
+        # below persists the parked snapshot together with both board fields.
+        # This removes the observable "parked but question id null" window --
+        # a crash between two separate writes used to leave the line parked
+        # with no question note, so the decision bridge read a null question
+        # id and swallowed the human approve as `no_waiting_owner`.
+        blocker = self.blocker_summary(line.folder_id)
+        board_question = self._ask_board(line, record, blocker, state)
         self._write_stall_state(line.folder_id, state)
 
-        blocker = self.blocker_summary(line.folder_id)
         return ParkOutcome(
             parked=True,
             event="established" if inbox_note is None else f"established:{inbox_note}",
             blocker=blocker,
-            board_question=self._ask_board(line, record, blocker, state),
+            board_question=board_question,
         )
 
     def _check_wake(
@@ -882,6 +902,12 @@ class Scheduler:
         later ask refs it. The card publish carries a stable idempotency key,
         so a lost state file re-yields the same card instead of a duplicate.
 
+        This mutates ``state`` (writing ``board_card_entity_id`` /
+        ``board_question_note_id``) but never writes the stall file itself:
+        the caller (`_establish_park`) persists the complete state in a single
+        write, so the parked snapshot and both board fields land together and
+        there is never an observable "parked but question id null" window.
+
         Failure discipline is unchanged (#89): the board is telemetry and
         must not bite. A failed card publish degrades to log visibility and
         the question is not attempted -- it would 422 against the same
@@ -901,7 +927,6 @@ class Scheduler:
                 return f"card_failed:{type(exc).__name__}:{str(exc)[:160]}"
             card_entity_id = card.entity_id
             state["board_card_entity_id"] = card_entity_id
-            self._write_stall_state(line.folder_id, state)
         question = (
             f"line {line.folder_id} parked: blocked waiting on a human decision "
             f"(run {record['run_id']}). blocker: {blocker or 'see terminal.json'}"
@@ -913,7 +938,6 @@ class Scheduler:
                 idempotency_key=f"parked:{line.folder_id}:{record['run_id']}",
             )
             state["board_question_note_id"] = ticket.question_note_id
-            self._write_stall_state(line.folder_id, state)
             return f"question_sent:{ticket.question_note_id}"
         except Exception as exc:  # telemetry must not bite
             return f"question_failed:{type(exc).__name__}:{str(exc)[:160]}"
