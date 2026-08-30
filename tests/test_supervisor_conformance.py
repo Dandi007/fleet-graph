@@ -370,3 +370,134 @@ class TestGuardDHarvestWriteGating:
         )
         proc = run_guard(src)
         assert proc.returncode == 0, proc.stderr
+
+
+class TestGuardEE6StopWrites:
+    """M4: the E6 stop reactor may only stop its own folder's line unit.
+
+    Guard E inspects `supervise/e6_stop.py`: a function that performs a stop
+    write primitive (`stop_unit` / `systemctl` / subprocess) must also call the
+    stop gate (`authorize_e6_stop` / `authorize`) in the same body. An ungated
+    stop is the exact thing the M4 deny-all 铁律 forbids.
+    """
+
+    def test_ungated_stop_in_e6_module_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/e6_stop.py",
+            "def stop(state):\n    deps.ops.stop_unit(state['unit'])\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "allowlist" in proc.stderr
+        assert "stop_unit" in proc.stderr
+
+    def test_ungated_systemctl_stop_in_e6_module_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/e6_stop.py",
+            "import subprocess\ndef stop(state):\n    subprocess.run(['systemctl', 'stop', 'x'])\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "allowlist" in proc.stderr
+
+    def test_gated_stop_in_e6_module_survives(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/e6_stop.py",
+            "from fleet_graph.supervise.e6_stop import authorize_e6_stop\n"
+            "def stop(state):\n"
+            "    auth = authorize_e6_stop(state['folder_id'], state['unit'])\n"
+            "    if not auth.granted:\n"
+            "        return\n"
+            "    deps.ops.stop_unit(state['unit'])\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 0, proc.stderr
+
+    def test_module_level_ungated_stop_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/e6_stop.py",
+            "deps.ops.stop_unit('fleet-graph-line-x')\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "ungated" in proc.stderr
+
+    def test_e6_ops_layer_is_exempt(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/e6_ops.py",
+            "def stop_unit(self, unit):\n    return _run(['systemctl', 'stop', unit])\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 0, proc.stderr
+
+
+class TestGuardEE7GoalWrites:
+    """M4: the E7 reactor may only write its resolved folder's goal.md.
+
+    Guard E inspects `supervise/e7_write.py`: a function that performs a
+    goal.md write primitive (`append_delivery_fail_block` / `fs_write` /
+    `fs_edit` / `write` / `edit` / `create`) must also call the write gate
+    (`authorize_e7_write` / `authorize`) in the same body. An ungated goal.md
+    write is the exact thing the M4 直写目标圈点 铁律 forbids.
+    """
+
+    def test_ungated_goal_write_in_e7_module_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/e7_write.py",
+            "def write(state):\n"
+            "    deps.ops.append_delivery_fail_block(state['folder_id'], block)\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "allowlist" in proc.stderr
+        assert "append_delivery_fail_block" in proc.stderr
+
+    def test_ungated_fs_write_in_e7_module_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/e7_write.py",
+            "def write(state):\n    WorkFolder(folder).write('goal.md', content)\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "allowlist" in proc.stderr
+
+    def test_gated_goal_write_in_e7_module_survives(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/e7_write.py",
+            "from fleet_graph.supervise.e7_write import authorize_e7_write\n"
+            "def write(state):\n"
+            "    auth = authorize_e7_write(allowlist, state['folder_id'])\n"
+            "    if not auth.granted:\n"
+            "        return\n"
+            "    deps.ops.append_delivery_fail_block(state['folder_id'], block)\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 0, proc.stderr
+
+    def test_module_level_ungated_goal_write_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/e7_write.py",
+            "deps.ops.append_delivery_fail_block('wf-x', block)\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "ungated" in proc.stderr
+
+    def test_e7_ops_layer_is_exempt(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/e7_ops.py",
+            "def append_delivery_fail_block(self, folder_id, block):\n"
+            "    return wf.write('goal.md', content)\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 0, proc.stderr
