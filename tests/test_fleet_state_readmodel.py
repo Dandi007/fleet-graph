@@ -339,14 +339,15 @@ def write_dd_development(
     stage: str = "implement",
     missing_status: bool = False,
     missing_record: bool = False,
+    card_entity_id: str = "",
 ) -> None:
     dev_dir = dd_root / development_id
     dev_dir.mkdir(parents=True, exist_ok=True)
     if not missing_record:
-        (dev_dir / "record.json").write_text(
-            json.dumps({"development_id": development_id, "repo_path": "/tmp/x"}),
-            encoding="utf-8",
-        )
+        record: dict[str, Any] = {"development_id": development_id, "repo_path": "/tmp/x"}
+        if card_entity_id:
+            record["card_entity_id"] = card_entity_id
+        (dev_dir / "record.json").write_text(json.dumps(record), encoding="utf-8")
     if not missing_status:
         (dev_dir / "status.json").write_text(
             json.dumps(
@@ -373,62 +374,128 @@ class TestHarvestableView:
             bridge_state_dir=tmp_path / "bridge",
         )
 
+    def _baselined(self, config: FleetStateConfig, dd_root: Path) -> FleetStateView:
+        """One complete historical dev + one observation, so the first-run
+        baseline is adopted (direction B). Returns the view with the baseline
+        established; later-added complete devs are then *new* and listed."""
+        write_dd_development(dd_root, "dev-hist", head_commit="h0", terminal="complete")
+        view = FleetStateView(config)
+        assert view.harvestable()["developments"] == []
+        return view
+
     def test_empty_dd_root_degrades_to_empty_list(self, tmp_path: Path) -> None:
         payload = FleetStateView(self._config(tmp_path)).harvestable()
         assert payload["schema_version"] == LINES_SCHEMA_VERSION
         assert payload["developments"] == []
 
-    def test_lists_only_gate_passed_unmerged_developments(self, tmp_path: Path) -> None:
+    def test_refused_terminal_is_never_listed(self, tmp_path: Path) -> None:
         dd_root = tmp_path / "dd"
-        # Unharvested: head_commit set, terminal != complete.
-        write_dd_development(dd_root, "dev-harvest", head_commit="abc123", terminal="done")
-        # Merged / complete: not harvestable.
-        write_dd_development(dd_root, "dev-complete", head_commit="def456", terminal="complete")
-        # Never passed a gate: no head_commit.
-        write_dd_development(dd_root, "dev-no-commit", head_commit="", terminal="fault")
-        payload = FleetStateView(self._config(tmp_path)).harvestable()
-        assert payload["developments"] == [
-            {
-                "development_id": "dev-harvest",
-                "head_commit": "abc123",
-                "stage": "implement",
-                "terminal": "done",
-            }
-        ]
+        view = self._baselined(self._config(tmp_path), dd_root)
+        # refused: never listed.
+        write_dd_development(dd_root, "dev-refused", head_commit="r1", terminal="refused")
+        # a fresh complete is the positive control: only it is listed.
+        write_dd_development(dd_root, "dev-new", head_commit="n1", terminal="complete")
+        payload = view.harvestable()
+        assert [d["development_id"] for d in payload["developments"]] == ["dev-new"]
+
+    def test_fault_terminal_is_never_listed(self, tmp_path: Path) -> None:
+        dd_root = tmp_path / "dd"
+        view = self._baselined(self._config(tmp_path), dd_root)
+        write_dd_development(dd_root, "dev-fault", head_commit="f1", terminal="fault")
+        write_dd_development(dd_root, "dev-new", head_commit="n1", terminal="complete")
+        payload = view.harvestable()
+        assert [d["development_id"] for d in payload["developments"]] == ["dev-new"]
+
+    def test_complete_with_harvest_receipt_is_excluded(self, tmp_path: Path) -> None:
+        dd_root = tmp_path / "dd"
+        config = self._config(tmp_path)
+        config.has_harvest_receipt = lambda card: card == "card-reaped"
+        write_dd_development(
+            dd_root, "dev-hist", head_commit="h0", terminal="complete", card_entity_id="card-hist"
+        )
+        view = FleetStateView(config)
+        assert view.harvestable()["developments"] == []
+        # complete + harvest receipt (evidence note / evidence- prefix) -> not listed.
+        write_dd_development(
+            dd_root,
+            "dev-reaped",
+            head_commit="r1",
+            terminal="complete",
+            card_entity_id="card-reaped",
+        )
+        # complete without receipt is still listed (positive control).
+        write_dd_development(
+            dd_root,
+            "dev-open",
+            head_commit="o1",
+            terminal="complete",
+            card_entity_id="card-open",
+        )
+        payload = view.harvestable()
+        assert [d["development_id"] for d in payload["developments"]] == ["dev-open"]
+
+    def test_complete_without_receipt_is_listed(self, tmp_path: Path) -> None:
+        dd_root = tmp_path / "dd"
+        view = self._baselined(self._config(tmp_path), dd_root)
+        write_dd_development(dd_root, "dev-new", head_commit="n1", terminal="complete")
+        payload = view.harvestable()
+        assert [d["development_id"] for d in payload["developments"]] == ["dev-new"]
+
+    def test_first_run_baseline_clears_historical_complete(self, tmp_path: Path) -> None:
+        """交付 D.5 首跑基线豁免：147 条历史 complete（无回执）首跑全部出清不在
+        列；此后新增一条 complete 无回执 → 该条入列。"""
+        dd_root = tmp_path / "dd"
+        for i in range(147):
+            dev_id = f"dev-hist-{i:03d}"
+            write_dd_development(dd_root, dev_id, head_commit=f"h{i}", terminal="complete")
+        view = FleetStateView(self._config(tmp_path))
+        payload = view.harvestable()
+        assert payload["developments"] == []
+        write_dd_development(dd_root, "dev-new", head_commit="n1", terminal="complete")
+        payload = view.harvestable()
+        assert [d["development_id"] for d in payload["developments"]] == ["dev-new"]
 
     def test_missing_status_or_record_degrades_the_entry(self, tmp_path: Path) -> None:
         dd_root = tmp_path / "dd"
-        write_dd_development(dd_root, "dev-ok", head_commit="abc123", terminal="done")
+        view = self._baselined(self._config(tmp_path), dd_root)
+        write_dd_development(dd_root, "dev-ok", head_commit="abc123", terminal="complete")
         write_dd_development(
             dd_root,
             "dev-no-status",
             head_commit="def456",
-            terminal="done",
+            terminal="complete",
             missing_status=True,
         )
         write_dd_development(
             dd_root,
             "dev-no-record",
             head_commit="123456",
-            terminal="done",
+            terminal="complete",
             missing_record=True,
         )
-        payload = FleetStateView(self._config(tmp_path)).harvestable()
+        payload = view.harvestable()
         assert [d["development_id"] for d in payload["developments"]] == ["dev-ok"]
 
     def test_harvestable_is_served_over_the_wire(self, tmp_path: Path) -> None:
         dd_root = tmp_path / "dd"
-        write_dd_development(dd_root, "dev-harvest", head_commit="abc123", terminal="done")
-        server = FleetStateHTTPServer(self._config(tmp_path))
+        config = self._config(tmp_path)
+        server = FleetStateHTTPServer(config)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         port = server.server_address[1]
         try:
+            # First observation adopts the baseline (historical complete cleared).
+            write_dd_development(dd_root, "dev-hist", head_commit="h0", terminal="complete")
             resp = httpx.get(f"http://127.0.0.1:{port}/v1/harvestable", timeout=5)
             assert resp.status_code == 200
             body = resp.json()
             assert body["schema_version"] == LINES_SCHEMA_VERSION
-            assert body["developments"][0]["development_id"] == "dev-harvest"
+            assert body["developments"] == []
+            # A new complete without a receipt is served over the wire.
+            write_dd_development(dd_root, "dev-new", head_commit="n1", terminal="complete")
+            resp = httpx.get(f"http://127.0.0.1:{port}/v1/harvestable", timeout=5)
+            body = resp.json()
+            assert [d["development_id"] for d in body["developments"]] == ["dev-new"]
         finally:
             server.shutdown()
             server.server_close()

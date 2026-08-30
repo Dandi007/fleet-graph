@@ -54,6 +54,18 @@ STATE_BRIDGED = "bridged"
 STATE_CONSUMED = "consumed"
 STATE_SWALLOWED = "swallowed"
 
+#: E5 收割回执（harvest receipt）约定：监督面收割部署后，在单卡固定挂
+#: ``note_type=evidence`` 且 ``idempotency_key`` 以 ``evidence-`` 开头的回执。
+#: ``harvestable()`` 用它判「已收割」；bus 读面不暴露 idempotency_key 时退化为
+#: 只看 evidence note 在场（可注入实现负责精确判定）。
+HARVEST_RECEIPT_NOTE_TYPE = "evidence"
+HARVEST_RECEIPT_KEY_PREFIX = "evidence-"
+
+#: E5 首跑基线水位文件（方向 B，照抄 E7 ``e7_baseline`` 先例）：首次采存量
+#: complete 集合为基线、一次性出清历史；此后只审新增 complete。落在 scheduler
+#: 状态目录（read-model 已读 ``.scheduler/``），删文件即文档化重扫。
+E5_BASELINE_FILE = "e5-baseline.json"
+
 #: bridge receipt status → 送达链状态 +（swallowed 时）reason。
 #: ``intent_recorded`` 即 bridge 已见过该裁决（bridged）；``resumed`` 即已送达
 #: 消费（consumed）；``noop`` / ``refused`` 即被吞（swallowed，带 reason）。
@@ -77,6 +89,11 @@ class FleetStateConfig:
     bridge_state_dir: Path = DEFAULT_BRIDGE_STATE_DIR
     bus_url: str | None = None
     clock: Callable[[], float] = time.time
+    #: E5 收割回执判定，``(card_entity_id) -> bool``，可注入（默认读 bus work-notes；
+    #: 任何读取失败降级为「未收割」，绝不 5xx）。
+    has_harvest_receipt: Callable[[str], bool] | None = None
+    #: E5 首跑基线水位文件路径；None 用 ``<run_root>/.scheduler/e5-baseline.json``。
+    harvest_baseline_path: Path | None = None
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -207,11 +224,88 @@ def _read_published(config: FleetStateConfig, seen: set[str]) -> list[dict[str, 
     return published
 
 
+def _default_has_harvest_receipt(config: FleetStateConfig) -> Callable[[str], bool]:
+    """The default E5 receipt reader: an evidence note on the card (read-only).
+
+    The harvest receipt is an ``evidence`` note whose idempotency key starts
+    with ``evidence-``. The agent-bus read surface does not expose
+    ``idempotency_key`` on messages, so the best the default can confirm is an
+    evidence note present on the card (the ``evidence-`` prefix is enforced by
+    injected implementations). Read-only against the optional bus; no bus_url,
+    no credential, or any read failure degrades to *unharvested* -- never a
+    5xx, never a crash.
+    """
+    from fleet_graph.bus.board import NOTE_KIND, WORK_NOTES
+    from fleet_graph.bus.client import BusClient, load_token
+
+    def has_receipt(card_entity_id: str) -> bool:
+        if not config.bus_url or not card_entity_id:
+            return False
+        try:
+            client = BusClient(base_url=config.bus_url, token=load_token())
+            messages, _head = client.messages(WORK_NOTES, limit=200)
+        except Exception as exc:
+            log.debug("state read-model: harvest receipt read skipped: %s", exc)
+            return False
+        for message in messages:
+            payload = message.get("payload") or {}
+            if message.get("kind") != NOTE_KIND:
+                continue
+            if payload.get("note_type") != HARVEST_RECEIPT_NOTE_TYPE:
+                continue
+            if payload.get("card_entity_id") != card_entity_id:
+                continue
+            return True
+        return False
+
+    return has_receipt
+
+
 class FleetStateView:
     """Builds the two read-only payloads from the configured data sources."""
 
     def __init__(self, config: FleetStateConfig) -> None:
         self.config = config
+        #: E5 receipt predicate, injectable. Defaults to the read-only bus
+        #: reader; any read failure degrades to unharvested, never a 5xx.
+        self.has_harvest_receipt = config.has_harvest_receipt or _default_has_harvest_receipt(
+            config
+        )
+
+    def _e5_baseline_path(self) -> Path:
+        return self.config.harvest_baseline_path or (
+            self.config.run_root / ".scheduler" / E5_BASELINE_FILE
+        )
+
+    def _load_e5_baseline(self) -> set[str] | None:
+        """The E5 first-run baseline, or None when it does not exist yet.
+
+        The baseline is the set of development_ids that were complete at first
+        observation; those are cleared once and never re-listed. Missing or
+        unreadable watermark = first-run semantics (照抄 E7 ``e7_baseline``).
+        """
+        path = self._e5_baseline_path()
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        ids = raw.get("development_ids") if isinstance(raw, dict) else None
+        if not isinstance(ids, list):
+            return None
+        return {str(dev_id) for dev_id in ids}
+
+    def _write_e5_baseline(self, development_ids: set[str]) -> None:
+        """Persist the first-run baseline. Fail-soft: losing it just re-adopts
+        the current complete set as baseline next observation."""
+        path = self._e5_baseline_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"development_ids": sorted(development_ids)}, sort_keys=True),
+                encoding="utf-8",
+            )
+        except OSError:
+            log.debug("state read-model: e5 baseline write skipped: %s", path)
 
     def lines(self) -> dict[str, Any]:
         roster, run_root = _read_roster(self.config)
@@ -277,20 +371,30 @@ class FleetStateView:
         return {"schema_version": SCHEMA_VERSION, "decisions": decision_objs}
 
     def harvestable(self) -> dict[str, Any]:
-        """The M2 E5 data plane: developments whose product commit has not
-        landed on the default branch (read-only, degrade-don't-5xx).
+        """The M2 E5 data plane: complete developments with no harvest receipt.
 
-        For every admitted development under the dd root we pull
-        ``record.json`` (admission identity) and ``status.json`` (stage /
-        terminal / head_commit). A development is *harvestable* when it passed
-        its gate but its product commit is not yet on the default branch --
-        mechanically: ``head_commit`` non-empty and ``terminal != "complete"``.
-        Bad artifacts degrade that entry, never the whole table.
+        E5 ``approved_unharvested`` ⇔ ``terminal == "complete"`` **and** the
+        card carries no harvest receipt (an ``evidence`` note whose idempotency
+        key starts with ``evidence-``). ``refused`` / ``fault`` / any non-complete
+        terminal / in-flight developments are **never** listed.
+
+        First-run baseline exemption (direction B, per the E7 ``e7_baseline``
+        precedent): the first observation adopts the current complete set as
+        baseline and clears it (the historical 147); afterwards only *new*
+        complete developments are reviewed, combined with direction A (the
+        receipt check) for subsequent harvests. Bad artifacts degrade that
+        entry, never the whole table.
         """
         developments: list[dict[str, Any]] = []
         dd_root = self.config.dd_root
         if not dd_root.is_dir():
             return {"schema_version": SCHEMA_VERSION, "developments": developments}
+
+        baseline = self._load_e5_baseline()
+        first_run = baseline is None
+        if first_run:
+            baseline = set()
+
         for entry in sorted(dd_root.iterdir()):
             if not entry.is_dir():
                 continue
@@ -302,21 +406,35 @@ class FleetStateView:
             development_id = str(record.get("development_id") or entry.name)
             status = _read_json(entry / "status.json")
             if status is None:
-                # Unreadable/missing status degrades the entry away: without
-                # head_commit we cannot claim it passed a gate.
+                # Unreadable/missing status degrades the entry away.
                 continue
-            head_commit = str(status.get("head_commit") or "")
             terminal = str(status.get("terminal") or "")
-            if not head_commit or terminal == "complete":
+            # refused / fault / any non-complete terminal / in-flight never
+            # listed (目标语义): only `complete` can be approved_unharvested.
+            if terminal != "complete":
+                continue
+            if first_run:
+                # 首跑基线豁免：存量 complete 一次性出清，不入列。
+                baseline.add(development_id)
+                continue
+            if development_id in baseline:
+                # 已出清的历史 complete：不再重报。
+                continue
+            card_entity_id = str(record.get("card_entity_id") or "")
+            if self.has_harvest_receipt(card_entity_id):
+                # 方向 A：卡上有收割回执（evidence note + evidence- 前缀）→ 已收割。
                 continue
             developments.append(
                 {
                     "development_id": development_id,
-                    "head_commit": head_commit,
+                    "head_commit": str(status.get("head_commit") or ""),
                     "stage": str(status.get("stage") or ""),
                     "terminal": terminal,
                 }
             )
+
+        if first_run:
+            self._write_e5_baseline(baseline)
         return {"schema_version": SCHEMA_VERSION, "developments": developments}
 
 
