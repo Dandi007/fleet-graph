@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -65,12 +65,23 @@ from fleet_graph.supervise.audit import (
 )
 from fleet_graph.supervise.decision_publisher import publish_release_decision
 from fleet_graph.supervise.events import (
+    EVENT_APPROVED_UNHARVESTED,
     EVENT_BLOCKED_DECISION,
     EVENT_BOARD_QUESTION,
     EVENT_CAP_BREAKER,
     EVENT_LINE_FAULT,
     SupervisorEvent,
     validate_event,
+)
+from fleet_graph.supervise.harvest import (
+    DEFAULT_BRANCH as DEFAULT_HARVEST_BRANCH,
+)
+from fleet_graph.supervise.harvest import (
+    DEFAULT_VERIFY_ARGV as DEFAULT_HARVEST_VERIFY_ARGV,
+)
+from fleet_graph.supervise.harvest_allowlist import (
+    HarvestAllowlist,
+    load_harvest_allowlist,
 )
 from fleet_graph.supervise.preauth import (
     PREAUTH_PAYLOAD_KIND,
@@ -829,6 +840,24 @@ class SupervisorRunConfig:
     bus: BusClient | None = None
     bus_url: str = DEFAULT_BUS_URL
     decision_client: Any | None = None
+    # --- M3 harvest (E5) ---
+    #: The write allowlist the harvest subgraph checks before any write.
+    #: Deny-all by default: allowlist 未合入前 harvest 无任何写权限（铁律）。
+    harvest_allowlist: HarvestAllowlist = field(default_factory=HarvestAllowlist.default)
+    #: Explicit allowlist config file; overrides harvest_allowlist when set.
+    harvest_allowlist_path: str | None = None
+    #: Target default branch for the harvest squash merge + ff-only pull.
+    harvest_default_branch: str = DEFAULT_HARVEST_BRANCH
+    #: Deploy command the harvest subgraph may run (must be allowlisted).
+    harvest_deploy_command: list[str] = field(default_factory=list)
+    harvest_verify_argv: list[str] = field(
+        default_factory=lambda: list(DEFAULT_HARVEST_VERIFY_ARGV)
+    )
+    harvest_verify_real_argv: list[str] = field(
+        default_factory=lambda: list(DEFAULT_HARVEST_VERIFY_ARGV)
+    )
+    #: Test seam: injected HarvestOps; None -> DefaultHarvestOps.
+    harvest_ops: Any | None = None
 
     @property
     def resolved_checkpoint_path(self) -> str:
@@ -861,12 +890,51 @@ def build_supervisor(config: SupervisorRunConfig) -> tuple[Any, SupervisorDeps, 
 def run_supervisor(config: SupervisorRunConfig) -> dict[str, Any]:
     """Run one supervisor turn to its receipt, resuming if the thread exists.
 
+    An E5 `approved_unharvested` event is dispatched to the M3 harvest ReAct
+    subgraph (`supervise/harvest.py`) instead of the audit turn: it is the one
+    event type whose job is to *write* (squash merge + deploy), and that write
+    is gated by the harvest allowlist (deny-all default). Every other event
+    runs the audit graph below.
+
     Resume semantics mirror graphs/runner.resume_start, with one addition: a
     thread whose checkpoint already carries a receipt is *finished* -- invoke
     nothing, return the recorded outcome. Re-running a finished event must be
     a no-op, or every observer retry would republish notes.
     """
     from langgraph.checkpoint.sqlite import SqliteSaver
+
+    event = validate_event(config.event)
+    if event.type == EVENT_APPROVED_UNHARVESTED:
+        from fleet_graph.supervise.harvest import HarvestRunConfig, run_harvest
+
+        allowlist = config.harvest_allowlist
+        if config.harvest_allowlist_path:
+            allowlist = load_harvest_allowlist(config.harvest_allowlist_path)
+        harvest_config = HarvestRunConfig(
+            event=event.as_dict(),
+            state_root=config.state_root,
+            run_root=config.run_root,
+            checkpoint_path=config.checkpoint_path,
+            dd_root=config.dd_root,
+            repo=config.repo,
+            default_branch=config.harvest_default_branch,
+            deploy_command=list(config.harvest_deploy_command),
+            verify_argv=(
+                list(config.harvest_verify_argv)
+                if config.harvest_verify_argv
+                else list(DEFAULT_HARVEST_VERIFY_ARGV)
+            ),
+            verify_real_argv=(
+                list(config.harvest_verify_real_argv)
+                if config.harvest_verify_real_argv
+                else list(DEFAULT_HARVEST_VERIFY_ARGV)
+            ),
+            allowlist=allowlist,
+            ops=config.harvest_ops,
+            bus=config.bus,
+            publish_notes=config.publish_notes,
+        )
+        return run_harvest(harvest_config)
 
     graph, _deps, event = build_supervisor(config)
     invoke_config: dict[str, Any] = {

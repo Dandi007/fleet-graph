@@ -743,6 +743,14 @@ def _supervisor_run(args: argparse.Namespace) -> int:
         # R4-3: the decision publisher builds its own client against this URL,
         # with its own credential -- the board client above is never reused.
         bus_url=args.bus_url,
+        # M3 harvest (E5): allowlist + target branch + deploy command. The
+        # allowlist is deny-all when no file is given -- E5 then refuses every
+        # write and records the refusal, which is the M3 first delivery.
+        harvest_allowlist_path=args.harvest_allowlist,
+        harvest_default_branch=args.harvest_default_branch,
+        harvest_deploy_command=args.harvest_deploy,
+        harvest_verify_argv=args.harvest_verify,
+        harvest_verify_real_argv=args.harvest_verify_real,
     )
     result = run_supervisor(config)
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
@@ -1559,6 +1567,36 @@ def build_parser() -> argparse.ArgumentParser:
     supervisor_run.add_argument("--bus-url", default=DEFAULT_BUS_URL)
     supervisor_run.add_argument(
         "--no-note", action="store_true", help="publish nothing; report to the state root only"
+    )
+    supervisor_run.add_argument(
+        "--harvest-allowlist",
+        default=None,
+        help="M3 harvest (E5): harvest write allowlist config file. Deny-all "
+        "when unset -- E5 then refuses every write and records the refusal",
+    )
+    supervisor_run.add_argument(
+        "--harvest-default-branch",
+        default="main",
+        help="M3 harvest (E5): target default branch for squash merge + ff-only pull",
+    )
+    supervisor_run.add_argument(
+        "--harvest-deploy",
+        action="append",
+        default=[],
+        help="M3 harvest (E5): deploy command argv; must be allowlisted to run. Repeatable",
+    )
+    supervisor_run.add_argument(
+        "--harvest-verify",
+        action="append",
+        default=[],
+        help="M3 harvest (E5): full-suite verify argv in the harvest worktree "
+        "(defaults to 'make verify')",
+    )
+    supervisor_run.add_argument(
+        "--harvest-verify-real",
+        action="append",
+        default=[],
+        help="M3 harvest (E5): real-machine verify argv after deploy (defaults to 'make verify')",
     )
     supervisor_run.set_defaults(func=_supervisor_run)
 

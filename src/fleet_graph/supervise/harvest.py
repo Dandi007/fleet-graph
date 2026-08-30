@@ -1,0 +1,663 @@
+"""M3 收割反应器：harvest ReAct 子图（supervisor 进程内）。
+
+输入是 E5 `approved_unharvested` 事件（payload: development_id / head_commit /
+stage）。一条开发过了 gate 但产品 commit 尚未落默认分支，这里把它收割进默认分支
+并部署。
+
+SOP（spec 交付 B）逐节点实现，全部是 script 节点（机械判定，不采信任何自述）：
+
+1. `intake`       —— 解析 E5 payload，解析目标 repo（dd 准入 record -> repo_path）。
+2. `gate`         —— allowlist 判定写目标（repo_path / 目标分支 / 部署命令）。
+                   拒绝 -> outcome=refused，记录留痕，**不执行任何写**（交付 A.2/A.3）。
+3. `fetch`        —— fetch dd ref（refs/heads/dd/<development_id>）。
+4. `cherry`       —— cherry 判重：产品 commit 是否已 cherry 等价进默认分支。
+                   已等价 -> outcome=already_harvested，无写动作。
+5. `worktree`     —— 独立 worktree cherry-pick 产品 commit，冲突消解（即兴）。
+6. `verify`       —— 在 worktree 跑全量套件（make verify），记 exit code。
+7. `pr_merge`     —— PR -> squash merge。
+8. `pull`         —— ff-only pull 默认分支。
+9. `deploy`       —— 运行 allowlist 允许的部署命令。
+10. `verify_real` —— 真机 verify，记 exit code。
+11. `evidence`    —— evidence note 挂卡。
+12. `postconditions` —— 代码核验（交付 B.3）：PR merged + verify 零退出 +
+   evidence note 存在，三缺任一 -> outcome=escalated（失败/升报）。
+13. `receipt`     —— 结果落 supervisor 自己的 state root。
+
+**生成-验证分离**（交付 B.4）：所有写动作都落在 allowlist 圈定目标——写原语
+（git/部署执行）全部被 gate 节点与逐写步骤的 authorize 判定包住；编排层不直接
+执行任何 git/部署命令，机械操作委托给 `supervise/harvest_ops.DefaultHarvestOps`
+（AST 守卫 Guard D 钉死编排层每个含写原语的函数必须先调用 allowlist gate）。
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Protocol, TypedDict
+
+from langgraph.graph import END, START, StateGraph
+
+from fleet_graph.bus.board import NOTE_KIND, WORK_NOTES
+from fleet_graph.bus.client import BusClient
+from fleet_graph.dd.control_plane import DEFAULT_DD_ROOT, RECORD_FILE
+from fleet_graph.state.run_artifacts import write_json_durable
+from fleet_graph.supervise.events import (
+    EVENT_APPROVED_UNHARVESTED,
+    SupervisorEvent,
+    validate_event,
+)
+from fleet_graph.supervise.harvest_allowlist import (
+    HarvestAllowlist,
+    HarvestAuthorization,
+)
+
+#: harvest 终态词汇（outcome）。REFUSED / ALREADY_HARVESTED 都是无写动作的合法
+#: 终止；HARVESTED 要求后置条件三要素齐全；ESCALATED = 失败/升报。
+OUTCOME_REFUSED = "refused"
+OUTCOME_ALREADY_HARVESTED = "already_harvested"
+OUTCOME_HARVESTED = "harvested"
+OUTCOME_ESCALATED = "escalated"
+
+#: 默认分支名（spec 用词）。可用 config 覆盖。
+DEFAULT_BRANCH = "main"
+
+#: 默认全量套件命令（spec 交付 B SOP「全量套件(make verify)」）。
+DEFAULT_VERIFY_ARGV = ["make", "verify"]
+
+#: SOP 步骤名的封闭枚举——测试据此断言「编排步骤齐全」。
+SOP_STEPS = (
+    "fetch_dd_ref",
+    "cherry_check",
+    "worktree_cherry_pick",
+    "run_verify",
+    "pr_squash_merge",
+    "ff_only_pull",
+    "deploy",
+    "verify_real",
+    "evidence_note",
+)
+
+
+class HarvestOps(Protocol):
+    """机械操作层接口。编排层只调用这些方法；测试注入 fake。
+
+    默认实现见 `supervise/harvest_ops.DefaultHarvestOps`。所有方法都是「执行
+    一件事并返回机械事实」，编排层据此记录 steps 与后置条件。
+    """
+
+    def fetch_dd_ref(self, repo: Path, development_id: str) -> dict[str, Any]: ...
+    def cherry_equivalent(self, repo: Path, head_commit: str, default_branch: str) -> bool: ...
+    def worktree_cherry_pick(
+        self, repo: Path, head_commit: str, default_branch: str, worktree_root: Path
+    ) -> dict[str, Any]: ...
+    def run_verify(self, worktree: Path, argv: list[str]) -> int: ...
+    def pr_squash_merge(
+        self, repo: Path, head_commit: str, default_branch: str
+    ) -> dict[str, Any]: ...
+    def ff_only_pull(self, repo: Path, default_branch: str) -> dict[str, Any]: ...
+    def deploy(self, command: list[str]) -> int: ...
+    def verify_real(self, argv: list[str]) -> int: ...
+
+
+class HarvestState(TypedDict, total=False):
+    event: dict[str, Any]
+    development_id: str
+    head_commit: str
+    stage: str
+    repo_path: str
+    default_branch: str
+    deploy_command: list[str]
+    allowlist_auth: dict[str, Any]
+    steps: list[dict[str, Any]]
+    pr_merged: bool
+    verify_exit_code: int
+    verify_real_exit_code: int
+    deploy_exit_code: int
+    evidence_note_id: str
+    outcome: str
+    receipt_path: str
+    _gaps: list[str]
+
+
+@dataclass
+class HarvestDeps:
+    """harvest 子图对外只依赖这几个端口，全部注入以便测试替换。"""
+
+    allowlist: HarvestAllowlist
+    state_root: Path
+    run_root: Path
+    thread_id: str
+    dd_root: Path = DEFAULT_DD_ROOT
+    repo: Path | None = None
+    default_branch: str = DEFAULT_BRANCH
+    deploy_command: list[str] = field(default_factory=list)
+    verify_argv: list[str] = field(default_factory=lambda: list(DEFAULT_VERIFY_ARGV))
+    verify_real_argv: list[str] = field(default_factory=lambda: list(DEFAULT_VERIFY_ARGV))
+    ops: HarvestOps | None = None
+    bus: BusClient | None = None
+    publish_notes: bool = True
+
+    def thread_dir(self, key: str) -> Path:
+        return self.state_root / "threads" / key
+
+
+def _event_of(state: HarvestState) -> SupervisorEvent:
+    return validate_event(state.get("event") or {})
+
+
+def _resolve_repo(development_id: str, dd_root: Path) -> tuple[Path | None, list[str]]:
+    """dd 准入 record -> 目标 repo，机械解析（与 supervisor 同款链）。"""
+    record_path = dd_root / development_id / RECORD_FILE
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, [f"dd record 不可读（{record_path}）: {type(exc).__name__}: {exc}"[:300]]
+    if not isinstance(record, dict):
+        return None, [f"dd record 顶层不是 JSON 对象（{record_path}）"]
+    repo_path = str(record.get("repo_path") or "")
+    if not repo_path:
+        return None, [f"dd record 缺 repo_path 字段（{record_path}）"]
+    repo = Path(repo_path)
+    if not repo.is_dir():
+        return None, [f"dd record repo_path 不是可用目录: {repo_path}"[:300]]
+    return repo, []
+
+
+def authorize_harvest_write(
+    allowlist: HarvestAllowlist,
+    *,
+    repo_path: str,
+    branch: str,
+    deploy: tuple[str, ...],
+) -> HarvestAuthorization:
+    """机械写判定，唯一的写门（Guard D 钉死的 gate 名）。
+
+    写权限唯一来源 = 命中白名单条目；命中不了 -> 拒绝 + 留痕。拒绝是结果不是
+    异常：调用方把它记进 steps/evidence，并跳过该写动作。
+    """
+    return allowlist.authorize(repo_path=repo_path, branch=branch, deploy=deploy)
+
+
+# --- helpers ----------------------------------------------------------------
+
+
+def _branch_ref(default_branch: str) -> str:
+    return f"refs/heads/{default_branch}"
+
+
+def _record_step(state: HarvestState, step: str, **facts: Any) -> list[dict[str, Any]]:
+    steps = list(state.get("steps") or [])
+    steps.append({"step": step, **facts})
+    return steps
+
+
+def _record_auth(
+    state: HarvestState, auth: HarvestAuthorization, step: str
+) -> list[dict[str, Any]]:
+    return _record_step(
+        state,
+        step,
+        ok=auth.granted,
+        evidence={"granted": auth.granted, "reasons": list(auth.reasons)},
+    )
+
+
+# --- the graph --------------------------------------------------------------
+
+
+def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
+    def intake(state: HarvestState) -> HarvestState:
+        event = _event_of(state)
+        payload = event.payload or {}
+        development_id = str(payload.get("development_id") or "")
+        head_commit = str(payload.get("head_commit") or "")
+        stage = str(payload.get("stage") or "")
+        gaps: list[str] = []
+        if not development_id or not head_commit:
+            gaps.append("E5 payload 缺 development_id 或 head_commit——事件不完整")
+        repo = deps.repo
+        if repo is None and development_id:
+            repo, resolve_gaps = _resolve_repo(development_id, deps.dd_root)
+            gaps.extend(resolve_gaps)
+        steps = _record_step(
+            state,
+            "intake",
+            ok=not gaps,
+            development_id=development_id,
+            head_commit=head_commit,
+            stage=stage,
+            repo_path=str(repo) if repo is not None else "",
+        )
+        return {
+            "development_id": development_id,
+            "head_commit": head_commit,
+            "stage": stage,
+            "repo_path": str(repo) if repo is not None else "",
+            "default_branch": deps.default_branch,
+            "deploy_command": list(deps.deploy_command),
+            "steps": steps,
+            "_gaps": gaps,
+            "outcome": OUTCOME_ESCALATED if gaps else None,
+        }
+
+    def gate(state: HarvestState) -> HarvestState:
+        auth = authorize_harvest_write(
+            deps.allowlist,
+            repo_path=state.get("repo_path") or "",
+            branch=_branch_ref(state.get("default_branch") or DEFAULT_BRANCH),
+            deploy=tuple(state.get("deploy_command") or ()),
+        )
+        steps = _record_auth(state, auth, "gate")
+        if not auth.granted:
+            return {
+                "allowlist_auth": auth.as_dict(),
+                "steps": steps,
+                "outcome": OUTCOME_REFUSED,
+            }
+        return {"allowlist_auth": auth.as_dict(), "steps": steps}
+
+    def fetch(state: HarvestState) -> HarvestState:
+        auth = authorize_harvest_write(
+            deps.allowlist,
+            repo_path=state.get("repo_path") or "",
+            branch=_branch_ref(state.get("default_branch") or DEFAULT_BRANCH),
+            deploy=(),
+        )
+        if not auth.granted:
+            return {
+                "steps": _record_auth(state, auth, "fetch_dd_ref"),
+                "outcome": OUTCOME_REFUSED,
+            }
+        repo = Path(state.get("repo_path") or "")
+        try:
+            result = deps.ops.fetch_dd_ref(repo, state.get("development_id") or "")
+        except Exception as exc:
+            return {"steps": _record_step(state, "fetch_dd_ref", ok=False, detail=repr(exc)[:300])}
+        step = {**result, "ok": bool(result.get("ok"))}
+        return {"steps": _record_step(state, "fetch_dd_ref", **step)}
+
+    def cherry(state: HarvestState) -> HarvestState:
+        repo = Path(state.get("repo_path") or "")
+        equivalent = False
+        try:
+            equivalent = bool(
+                deps.ops.cherry_equivalent(
+                    repo, state.get("head_commit") or "", state.get("default_branch") or ""
+                )
+            )
+        except Exception as exc:
+            return {"steps": _record_step(state, "cherry_check", ok=False, detail=repr(exc)[:300])}
+        steps = _record_step(state, "cherry_check", ok=True, already_harvested=equivalent)
+        if equivalent:
+            return {"steps": steps, "outcome": OUTCOME_ALREADY_HARVESTED}
+        return {"steps": steps}
+
+    def worktree(state: HarvestState) -> HarvestState:
+        auth = authorize_harvest_write(
+            deps.allowlist,
+            repo_path=state.get("repo_path") or "",
+            branch=_branch_ref(state.get("default_branch") or DEFAULT_BRANCH),
+            deploy=(),
+        )
+        if not auth.granted:
+            return {
+                "steps": _record_auth(state, auth, "worktree_cherry_pick"),
+                "outcome": OUTCOME_REFUSED,
+            }
+        repo = Path(state.get("repo_path") or "")
+        worktree_root = deps.thread_dir(_event_of(state).key) / "worktree"
+        try:
+            result = deps.ops.worktree_cherry_pick(
+                repo,
+                state.get("head_commit") or "",
+                state.get("default_branch") or "",
+                worktree_root,
+            )
+        except Exception as exc:
+            return {
+                "steps": _record_step(
+                    state, "worktree_cherry_pick", ok=False, detail=repr(exc)[:300]
+                )
+            }
+        steps = _record_step(state, "worktree_cherry_pick", **result)
+        if not result.get("ok"):
+            return {
+                "steps": steps,
+                "outcome": OUTCOME_ESCALATED,
+            }
+        return {"steps": steps}
+
+    def verify(state: HarvestState) -> HarvestState:
+        auth = authorize_harvest_write(
+            deps.allowlist,
+            repo_path=state.get("repo_path") or "",
+            branch=_branch_ref(state.get("default_branch") or DEFAULT_BRANCH),
+            deploy=(),
+        )
+        if not auth.granted:
+            return {
+                "steps": _record_auth(state, auth, "run_verify"),
+                "outcome": OUTCOME_REFUSED,
+            }
+        worktree = deps.thread_dir(_event_of(state).key) / "worktree"
+        try:
+            exit_code = int(deps.ops.run_verify(worktree, deps.verify_argv))
+        except Exception as exc:
+            return {"steps": _record_step(state, "run_verify", ok=False, detail=repr(exc)[:300])}
+        steps = _record_step(
+            state, "run_verify", ok=exit_code == 0, exit_code=exit_code, argv=deps.verify_argv
+        )
+        return {"steps": steps, "verify_exit_code": exit_code}
+
+    def pr_merge(state: HarvestState) -> HarvestState:
+        auth = authorize_harvest_write(
+            deps.allowlist,
+            repo_path=state.get("repo_path") or "",
+            branch=_branch_ref(state.get("default_branch") or DEFAULT_BRANCH),
+            deploy=(),
+        )
+        if not auth.granted:
+            return {
+                "steps": _record_auth(state, auth, "pr_squash_merge"),
+                "outcome": OUTCOME_REFUSED,
+            }
+        repo = Path(state.get("repo_path") or "")
+        try:
+            result = deps.ops.pr_squash_merge(
+                repo, state.get("head_commit") or "", state.get("default_branch") or ""
+            )
+        except Exception as exc:
+            return {
+                "steps": _record_step(state, "pr_squash_merge", ok=False, detail=repr(exc)[:300])
+            }
+        merged = bool(result.get("merged"))
+        steps = _record_step(state, "pr_squash_merge", ok=merged, **result)
+        return {"steps": steps, "pr_merged": merged}
+
+    def pull(state: HarvestState) -> HarvestState:
+        auth = authorize_harvest_write(
+            deps.allowlist,
+            repo_path=state.get("repo_path") or "",
+            branch=_branch_ref(state.get("default_branch") or DEFAULT_BRANCH),
+            deploy=(),
+        )
+        if not auth.granted:
+            return {
+                "steps": _record_auth(state, auth, "ff_only_pull"),
+                "outcome": OUTCOME_REFUSED,
+            }
+        repo = Path(state.get("repo_path") or "")
+        try:
+            result = deps.ops.ff_only_pull(repo, state.get("default_branch") or "")
+        except Exception as exc:
+            return {"steps": _record_step(state, "ff_only_pull", ok=False, detail=repr(exc)[:300])}
+        step = {**result, "ok": bool(result.get("ok"))}
+        steps = _record_step(state, "ff_only_pull", **step)
+        return {"steps": steps}
+
+    def deploy(state: HarvestState) -> HarvestState:
+        command = list(state.get("deploy_command") or ())
+        auth = authorize_harvest_write(
+            deps.allowlist,
+            repo_path=state.get("repo_path") or "",
+            branch=_branch_ref(state.get("default_branch") or DEFAULT_BRANCH),
+            deploy=tuple(command),
+        )
+        if not auth.granted:
+            return {
+                "steps": _record_auth(state, auth, "deploy"),
+                "outcome": OUTCOME_REFUSED,
+            }
+        steps = _record_step(state, "deploy", command=command)
+        if not command:
+            return {"steps": steps, "deploy_exit_code": 0}
+        try:
+            exit_code = int(deps.ops.deploy(command))
+        except Exception as exc:
+            return {"steps": _record_step(state, "deploy", ok=False, detail=repr(exc)[:300])}
+        steps = _record_step(state, "deploy", ok=exit_code == 0, exit_code=exit_code)
+        return {"steps": steps, "deploy_exit_code": exit_code}
+
+    def verify_real(state: HarvestState) -> HarvestState:
+        auth = authorize_harvest_write(
+            deps.allowlist,
+            repo_path=state.get("repo_path") or "",
+            branch=_branch_ref(state.get("default_branch") or DEFAULT_BRANCH),
+            deploy=(),
+        )
+        if not auth.granted:
+            return {
+                "steps": _record_auth(state, auth, "verify_real"),
+                "outcome": OUTCOME_REFUSED,
+            }
+        try:
+            exit_code = int(deps.ops.verify_real(deps.verify_real_argv))
+        except Exception as exc:
+            return {"steps": _record_step(state, "verify_real", ok=False, detail=repr(exc)[:300])}
+        steps = _record_step(
+            state,
+            "verify_real",
+            ok=exit_code == 0,
+            exit_code=exit_code,
+            argv=deps.verify_real_argv,
+        )
+        return {"steps": steps, "verify_real_exit_code": exit_code}
+
+    def evidence(state: HarvestState) -> HarvestState:
+        event = _event_of(state)
+        if not deps.publish_notes or deps.bus is None:
+            return {
+                "steps": _record_step(
+                    state, "evidence_note", ok=False, detail="无 bus 凭证——note 未挂卡"
+                )
+            }
+        development_id = state.get("development_id") or ""
+        head_commit = state.get("head_commit") or ""
+        note = (
+            f"harvest {event.type} {event.key}: {state.get('outcome') or 'in_progress'}\n"
+            f"development={development_id} head_commit={head_commit}\n"
+            f"steps: {[s.get('step') for s in state.get('steps') or []]}"
+        )
+        try:
+            published = deps.bus.publish(
+                WORK_NOTES,
+                NOTE_KIND,
+                {"card_entity_id": development_id, "note": note, "note_type": "evidence"},
+                f"harvest:{event.key}",
+                refs=[{"target_entity": development_id}] if development_id else [],
+            )
+        except Exception as exc:
+            return {
+                "steps": _record_step(
+                    state, "evidence_note", ok=False, detail=f"board note 被拒: {repr(exc)[:300]}"
+                )
+            }
+        steps = _record_step(state, "evidence_note", ok=True, evidence_note_id=published.message_id)
+        return {"steps": steps, "evidence_note_id": published.message_id}
+
+    def postconditions(state: HarvestState) -> HarvestState:
+        """后置条件代码核验（交付 B.3）：不采信子图自述，只看机械事实。
+
+        PR merged + verify 命令零退出 + evidence note 存在，三缺任一 -> escalated。
+        """
+        missing: list[str] = []
+        if not state.get("pr_merged"):
+            missing.append("PR merged 未达成")
+        if state.get("verify_exit_code") != 0:
+            missing.append(f"verify 命令退出码 {state.get('verify_exit_code')!r} != 0")
+        if not state.get("evidence_note_id"):
+            missing.append("evidence note 不存在（未挂卡）")
+        steps = _record_step(state, "postconditions", ok=not missing, missing=missing)
+        outcome = OUTCOME_HARVESTED if not missing else OUTCOME_ESCALATED
+        return {"steps": steps, "outcome": outcome}
+
+    def receipt(state: HarvestState) -> HarvestState:
+        event = _event_of(state)
+        path = write_json_durable(
+            deps.state_root / "reports" / f"{event.key}.json",
+            {
+                "event": event.as_dict(),
+                "thread_id": deps.thread_id,
+                "development_id": state.get("development_id"),
+                "head_commit": state.get("head_commit"),
+                "stage": state.get("stage"),
+                "repo_path": state.get("repo_path"),
+                "default_branch": state.get("default_branch"),
+                "allowlist_auth": state.get("allowlist_auth") or {},
+                "steps": state.get("steps") or [],
+                "pr_merged": state.get("pr_merged"),
+                "verify_exit_code": state.get("verify_exit_code"),
+                "verify_real_exit_code": state.get("verify_real_exit_code"),
+                "evidence_note_id": state.get("evidence_note_id"),
+                "outcome": state.get("outcome"),
+            },
+        )
+        return {"receipt_path": str(path)}
+
+    def after_gate(state: HarvestState) -> str:
+        return "fetch" if state.get("outcome") is None else "receipt"
+
+    def after_cherry(state: HarvestState) -> str:
+        return "worktree" if state.get("outcome") is None else "receipt"
+
+    def after_intake(state: HarvestState) -> str:
+        return "gate" if state.get("outcome") is None else "receipt"
+
+    graph: StateGraph = StateGraph(HarvestState)
+    graph.add_node("intake", intake)
+    graph.add_node("gate", gate)
+    graph.add_node("fetch", fetch)
+    graph.add_node("cherry", cherry)
+    graph.add_node("worktree", worktree)
+    graph.add_node("verify", verify)
+    graph.add_node("pr_merge", pr_merge)
+    graph.add_node("pull", pull)
+    graph.add_node("deploy", deploy)
+    graph.add_node("verify_real", verify_real)
+    graph.add_node("evidence", evidence)
+    graph.add_node("postconditions", postconditions)
+    graph.add_node("receipt", receipt)
+
+    graph.add_edge(START, "intake")
+    graph.add_conditional_edges("intake", after_intake, {"gate", "receipt"})
+    graph.add_conditional_edges("gate", after_gate, {"fetch", "receipt"})
+    graph.add_edge("fetch", "cherry")
+    graph.add_conditional_edges("cherry", after_cherry, {"worktree", "receipt"})
+    graph.add_edge("worktree", "verify")
+    graph.add_edge("verify", "pr_merge")
+    graph.add_edge("pr_merge", "pull")
+    graph.add_edge("pull", "deploy")
+    graph.add_edge("deploy", "verify_real")
+    graph.add_edge("verify_real", "evidence")
+    graph.add_edge("evidence", "postconditions")
+    graph.add_edge("postconditions", "receipt")
+    graph.add_edge("receipt", END)
+    return graph
+
+
+# --- assembly ---------------------------------------------------------------
+
+
+@dataclass
+class HarvestRunConfig:
+    event: dict[str, Any]
+    state_root: Path = Path("/data/fleet-graph/supervisor")
+    run_root: Path = Path("/data/fleet-graph/runs")
+    checkpoint_path: str | None = None
+    dd_root: Path = DEFAULT_DD_ROOT
+    repo: Path | None = None
+    default_branch: str = DEFAULT_BRANCH
+    deploy_command: list[str] = field(default_factory=list)
+    verify_argv: list[str] = field(default_factory=lambda: list(DEFAULT_VERIFY_ARGV))
+    verify_real_argv: list[str] = field(default_factory=lambda: list(DEFAULT_VERIFY_ARGV))
+    allowlist: HarvestAllowlist = field(default_factory=HarvestAllowlist.default)
+    ops: HarvestOps | None = None
+    bus: BusClient | None = None
+    publish_notes: bool = True
+
+    @property
+    def resolved_checkpoint_path(self) -> str:
+        return self.checkpoint_path or str(self.state_root / "checkpoint.sqlite3")
+
+
+def build_harvest(config: HarvestRunConfig) -> tuple[Any, HarvestDeps, SupervisorEvent]:
+    from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+    event = validate_event(config.event)
+    deps = HarvestDeps(
+        allowlist=config.allowlist,
+        state_root=config.state_root,
+        run_root=config.run_root,
+        thread_id=event.thread_id,
+        dd_root=config.dd_root,
+        repo=config.repo,
+        default_branch=config.default_branch,
+        deploy_command=list(config.deploy_command),
+        verify_argv=list(config.verify_argv),
+        verify_real_argv=list(config.verify_real_argv),
+        ops=config.ops or DefaultHarvestOps(),
+        bus=config.bus,
+        publish_notes=config.publish_notes,
+    )
+    return build_harvest_graph(deps), deps, event
+
+
+def run_harvest(config: HarvestRunConfig) -> dict[str, Any]:
+    """跑一次 harvest 收割到 receipt，线程已终局则 no-op（与 run_supervisor 同语义）。"""
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    graph, _deps, event = build_harvest(config)
+    invoke_config: dict[str, Any] = {
+        "configurable": {"thread_id": event.thread_id},
+        "recursion_limit": 50,
+    }
+
+    checkpoint = config.resolved_checkpoint_path
+    if checkpoint != ":memory:":
+        Path(checkpoint).parent.mkdir(parents=True, exist_ok=True)
+
+    with SqliteSaver.from_conn_string(checkpoint) as saver:
+        compiled = graph.compile(checkpointer=saver)
+        snapshot = compiled.get_state(invoke_config)
+        if snapshot.next:
+            start: dict[str, Any] | None = None  # resume in place
+        elif snapshot.values and snapshot.values.get("receipt_path"):
+            return {
+                "event": event.as_dict(),
+                "thread_id": event.thread_id,
+                "outcome": snapshot.values.get("outcome"),
+                "receipt_path": snapshot.values.get("receipt_path"),
+                "resumed": "already_complete",
+            }
+        else:
+            start = {"event": event.as_dict()}
+        state = compiled.invoke(start, config=invoke_config)
+
+    return {
+        "event": event.as_dict(),
+        "thread_id": event.thread_id,
+        "outcome": state.get("outcome"),
+        "steps": state.get("steps"),
+        "receipt_path": state.get("receipt_path"),
+    }
+
+
+__all__ = [
+    "DEFAULT_BRANCH",
+    "DEFAULT_VERIFY_ARGV",
+    "EVENT_APPROVED_UNHARVESTED",
+    "OUTCOME_ALREADY_HARVESTED",
+    "OUTCOME_ESCALATED",
+    "OUTCOME_HARVESTED",
+    "OUTCOME_REFUSED",
+    "SOP_STEPS",
+    "HarvestDeps",
+    "HarvestOps",
+    "HarvestRunConfig",
+    "HarvestState",
+    "authorize_harvest_write",
+    "build_harvest",
+    "build_harvest_graph",
+    "run_harvest",
+]

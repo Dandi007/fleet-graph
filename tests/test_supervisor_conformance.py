@@ -236,3 +236,137 @@ class TestGuardCPublisherImports:
         )
         proc = run_guard(src)
         assert proc.returncode == 0, proc.stderr
+
+
+class TestGuardDHarvestWrites:
+    """M3: the harvest subgraph's writes are allowlist-gated (default deny-all).
+
+    Guard D inspects only `supervise/harvest.py`: a function that performs a
+    write primitive (git write / subprocess / OS write / deploy / ops-layer
+    execution) must also call the allowlist gate (`authorize` / `authorize_harvest_write`)
+    in the same function body. An ungated write is the exact thing the M3
+    allowlist-first ordering forbids.
+    """
+
+    def test_ungated_write_in_harvest_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/harvest.py",
+            "def squash(state):\n    deps.ops.pr_squash_merge(repo, head, branch)\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "allowlist" in proc.stderr
+
+    def test_ungated_subprocess_write_in_harvest_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/harvest.py",
+            "import subprocess\ndef deploy_step(state):\n    subprocess.run(['make', 'deploy'])\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "allowlist" in proc.stderr
+
+    def test_gated_write_in_harvest_survives(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/harvest.py",
+            "from fleet_graph.supervise.harvest_allowlist import authorize\n"
+            "def squash(state):\n"
+            "    auth = authorize(repo_path, branch, deploy)\n"
+            "    if not auth.granted:\n"
+            "        return\n"
+            "    deps.ops.pr_squash_merge(repo, head, branch)\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 0, proc.stderr
+
+    def test_module_level_ungated_write_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/harvest.py",
+            "deps.ops.pr_squash_merge(repo, head, branch)\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "allowlist" in proc.stderr
+
+    def test_non_harvest_module_writes_are_not_scoped(self, tmp_path: Path) -> None:
+        """Guard D is scoped to the harvest orchestration module only."""
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/harvest_ops.py",
+            "def pr_squash_merge(self, repo, head, branch):\n    return {'merged': True}\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 0, proc.stderr
+
+
+class TestGuardDHarvestWriteGating:
+    """M3: harvest write primitives must call the allowlist gate in the same body."""
+
+    def test_ungated_git_write_in_harvest_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/harvest.py",
+            "from pathlib import Path\n"
+            "def sneaky(repo: Path) -> None:\n"
+            "    run_git(repo, 'push', 'origin', 'main')\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "sneaky" in proc.stderr
+        assert "allowlist" in proc.stderr
+
+    def test_ungated_deploy_in_harvest_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/harvest.py",
+            "def deploy() -> int:\n    return subprocess.call(['/bin/true'])\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "deploy" in proc.stderr
+
+    def test_module_scope_write_without_gate_is_caught(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/harvest.py",
+            "run_git(Path('/tmp/x'), 'push')\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "ungated" in proc.stderr
+
+    def test_gated_write_survives(self, tmp_path: Path) -> None:
+        """The sanctioned shape: the write call sits beside the gate call."""
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/harvest.py",
+            "def fetch(repo, allowlist) -> None:\n"
+            "    authorize_harvest_write(allowlist, repo_path='x', branch='main', deploy=())\n"
+            "    run_git(repo, 'fetch', 'origin')\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 0, proc.stderr
+
+    def test_ops_layer_is_exempt(self, tmp_path: Path) -> None:
+        """harvest_ops.py executes only what the gated orchestration asked."""
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/harvest_ops.py",
+            "def push(repo) -> None:\n    run_git(repo, 'push', 'origin', 'main')\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 0, proc.stderr
+
+    def test_allowlist_module_itself_is_exempt(self, tmp_path: Path) -> None:
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/supervise/harvest_allowlist.py",
+            "def authorize(**kw):\n"
+            "    return HarvestAuthorization(granted=False, reasons=('x',))\n",
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 0, proc.stderr

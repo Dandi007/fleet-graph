@@ -26,6 +26,23 @@ execution paths (`executors/`, the dd graphs) and everything else in the repo
 structurally cannot reach the publisher -- an llm that talks a node into
 publishing a decision has no import to do it with.
 
+Guard D -- **the harvest subgraph's writes are allowlist-gated** (M3). The
+harvest ReAct subgraph (`supervise/harvest.py`) is the one supervisor path that
+writes (squash merge + deploy). Its write permission has exactly one source: a
+hit on the harvest allowlist (`supervise/harvest_allowlist.py`), and an
+out-of-bounds write is a refusal with recorded evidence, never a silent pass.
+Structurally, Guard D asserts that every function in `supervise/harvest.py`
+whose body performs a *write primitive* (a git write, a subprocess/OS write, a
+deploy execution -- anything that can touch the target repo or the deployed
+host) also calls the allowlist gate (`authorize_harvest_write` / `authorize` /
+`allowlist.authorize`, any spelling) in the same function body. Read-only
+helpers and the gate definition itself are exempt; a write function without
+the gate call is a diagnostic, so an llm-adjacent refactor cannot silently add
+an ungated write. The mechanical ops layer (`supervise/harvest_ops.py`) is the
+other side of the gate (it executes only what the gated orchestration asked),
+so it is exempt from Guard D -- the gate is the orchestrator's, and the
+diagnostic is scoped to the orchestration module.
+
 The technique is lifted from the old supervisor's check_no_local_scheduler.py,
 and so is its delivery discipline: tests/test_supervisor_conformance.py feeds
 this script deliberately violating samples and asserts a non-zero exit
@@ -57,6 +74,49 @@ DECISION_PUBLISHER_RELPATH = "fleet_graph/supervise/decision_publisher.py"
 # Guard C: who may import the publisher. The act script node, and nobody else.
 DECISION_PUBLISHER_MODULE = "fleet_graph.supervise.decision_publisher"
 DECISION_PUBLISHER_IMPORTERS = frozenset({"fleet_graph/graphs/supervisor.py"})
+
+# Guard D: the harvest orchestration module whose write functions must be gated.
+HARVEST_RELPATH = "fleet_graph/supervise/harvest.py"
+
+#: Write primitives: call names (function or attribute) that can write to the
+#: target repo or the deployed host. Anything in this set in a harvest function
+#: makes the function a write function that must also call the allowlist gate.
+HARVEST_WRITE_PRIMITIVES = frozenset(
+    {
+        # git writes.
+        "git",
+        "git_argv",
+        "run_git",
+        "cherry_pick",
+        "merge",
+        "push",
+        "pull",
+        "squash_merge",
+        "worktree",
+        "commit",
+        # process / OS writes.
+        "subprocess",
+        "Popen",
+        "check_call",
+        "check_output",
+        "run_process",
+        "os.system",
+        "shutil",
+        "deploy",
+        "exec",
+        # ops-layer executions that reach the repo or host.
+        "fetch_dd_ref",
+        "worktree_cherry_pick",
+        "run_verify",
+        "pr_squash_merge",
+        "ff_only_pull",
+        "verify_real",
+    }
+)
+
+#: Allowlist gate names: calling any of these counts as gating the write.
+#: (``authorize`` matches both the pure function and ``allowlist.authorize``.)
+HARVEST_GATE_NAMES = frozenset({"authorize_harvest_write", "authorize"})
 
 
 def supervisor_module_paths(src_root: Path) -> list[Path]:
@@ -151,6 +211,65 @@ def check_publisher_import_whitelist(path: Path, relpath: str, tree: ast.AST) ->
     return errors
 
 
+def _called_names(tree: ast.AST) -> set[str]:
+    """Every name and attribute actually invoked as a call in `tree`."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            names.add(func.id)
+        elif isinstance(func, ast.Attribute):
+            names.add(func.attr)
+            value = func.value
+            if isinstance(value, ast.Name):
+                names.add(value.id)
+    return names
+
+
+def check_harvest_write_gating(path: Path, relpath: str, tree: ast.AST) -> list[str]:
+    """Guard D: every write primitive call lives in a function that also calls
+    the allowlist gate, and no write primitive is called at module scope.
+
+    A write primitive (git write / subprocess / OS write / deploy / ops-layer
+    execution) is a diagnostic the moment it appears in the harvest orchestration
+    without an allowlist gate call in the same function body -- an ungated write
+    is the exact thing the M3 allowlist-first ordering forbids.
+    """
+    if relpath != HARVEST_RELPATH:
+        return []
+    errors: list[str] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("_") and node.name in {
+                "authorize_harvest_write",
+            }:
+                continue
+            body: ast.AST = node
+            called = _called_names(body)
+            writes = called & HARVEST_WRITE_PRIMITIVES
+            if not writes:
+                continue
+            if not (called & HARVEST_GATE_NAMES):
+                errors.append(
+                    f"{path}:{node.lineno}: function {node.name} performs a harvest "
+                    f"write ({sorted(writes)}) without calling the allowlist gate "
+                    f"({sorted(HARVEST_GATE_NAMES)}) -- harvest writes must be "
+                    "allowlist-gated (default deny-all)"
+                )
+
+    module_called = _called_names(tree)
+    if module_called & HARVEST_WRITE_PRIMITIVES and not (module_called & HARVEST_GATE_NAMES):
+        errors.append(
+            f"{path}:1: the harvest module invokes a write primitive "
+            f"({sorted(module_called & HARVEST_WRITE_PRIMITIVES)}) without importing "
+            f"the allowlist gate ({sorted(HARVEST_GATE_NAMES)}) -- ungated harvest write"
+        )
+    return errors
+
+
 def run(src_root: Path) -> list[str]:
     if not src_root.is_dir():
         raise SystemExit(f"not a directory: {src_root}")
@@ -166,6 +285,7 @@ def run(src_root: Path) -> list[str]:
         if relpath != DECISION_PUBLISHER_RELPATH:
             errors.extend(check_no_decision_publish(path, tree))
         errors.extend(check_publisher_import_whitelist(path, relpath, tree))
+        errors.extend(check_harvest_write_gating(path, relpath, tree))
     return errors
 
 
