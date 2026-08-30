@@ -148,6 +148,12 @@ class StageOutcome:
     produced: tuple[str, ...] = ()
     failure_code: str = ""
     detail: str = ""
+    #: True when the retryable failure was a RunWaitTimeout and the run is
+    #: still in flight. The retry must then re-adopt that run (continue
+    #: waiting on the same run_id) rather than dispatching a new one; a run
+    #: that has truly terminally failed or been lost leaves this False so a
+    #: fresh dispatch is allowed.
+    run_in_flight: bool = False
 
 
 # What a stage is handed: identity, mode, the commit it starts from, and the
@@ -248,6 +254,10 @@ class PipelineState(TypedDict, total=False):
     steps: int
     rework_count: int
     retries: dict[str, int]
+    #: Per-stage flag: True when that stage's run is still in flight (the
+    #: previous failure was a RunWaitTimeout), so the next retry of the stage
+    #: must re-adopt the same run instead of dispatching a new one.
+    re_adopt: dict[str, bool]
     last_receipt: dict[str, Any]
     receipt_digests: dict[str, str]
     last_event: str
@@ -420,6 +430,10 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             # on the dispatch because the run id is derived, and a retry that
             # derives the same id re-adopts the run it is retrying.
             "retry": int(state.get("retries", {}).get(stage.id, 0)),
+            # True when the last failure of this stage was a RunWaitTimeout
+            # (the run is still in flight): the actor must derive the ORIGINAL
+            # run id and re-adopt it rather than dispatching a new one.
+            "re_adopt": bool(state.get("re_adopt", {}).get(stage.id, False)),
             "input_commit": state.get("head_commit", ""),
             "parent_receipt": dict(state.get("last_receipt") or {}),
             # Chain digests by the stage that sealed them. A later stage that
@@ -619,6 +633,13 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             "artifacts": artifacts,
             "receipt_digests": digests,
             "head_commit": head_commit,
+            # The run-in-flight marker for this stage: a timeout leaves the run
+            # in flight, so the next retry of this stage must re-adopt it; any
+            # other outcome clears the marker and the retry may dispatch fresh.
+            "re_adopt": {
+                **state.get("re_adopt", {}),
+                stage.id: outcome.run_in_flight,
+            },
             "last_event": outcome.event,
             "last_receipt": outcome.receipt or {},
             "last_failure_code": outcome.failure_code,
@@ -756,6 +777,7 @@ def initial_state(
         "steps": 0,
         "rework_count": 0,
         "retries": {},
+        "re_adopt": {},
         "receipt_digests": {},
         "history": [],
     }

@@ -332,6 +332,38 @@ def _validate_env(env: dict[str, str]) -> dict[str, str]:
     return validated
 
 
+def validate_timeouts(timeouts: dict[str, Any] | None) -> dict[str, int]:
+    """Normalize and validate the per-stage run-fence overrides.
+
+    ``{stage_id -> positive whole seconds}``. A stage id the contract does not
+    declare, or a value that is not a positive integer, is refused by name
+    rather than silently dropped: a timeout for a stage nobody runs is a typo
+    that would read as "fenced at 7200" in an audit trail. Empty or ``None``
+    keeps the runner's 3600s default for every stage -- existing behavior.
+    """
+    if not timeouts:
+        return {}
+    from fleet_graph.dd.lifecycle import Lifecycle
+
+    declared = set(Lifecycle.load().stages)
+    validated: dict[str, int] = {}
+    for stage_id, seconds in timeouts.items():
+        if not isinstance(stage_id, str) or stage_id not in declared:
+            raise ControlPlaneError(
+                "STAGE_TIMEOUT_UNKNOWN",
+                f"{stage_id!r} is not a declared stage; per-stage timeouts may name "
+                f"only {sorted(declared)}",
+            )
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
+            raise ControlPlaneError(
+                "STAGE_TIMEOUT_INVALID",
+                f"timeout for {stage_id!r} must be a positive integer number of seconds, "
+                f"got {seconds!r}",
+            )
+        validated[stage_id] = seconds
+    return validated
+
+
 def build_h0_handoff(
     *, development_id: str, spec_digest: str, target_base_commit: str, remote_url: str
 ) -> dict[str, Any]:
@@ -446,6 +478,11 @@ class DdLaunchSpec:
     #: (the roles' own selectors stay the default). The §24 precedent runs
     #: review stages on deepseek-v4-pro.
     stage_models: dict[str, str] = field(default_factory=dict)
+    #: Per-stage run-fence overrides (stage_id -> seconds), forwarded from the
+    #: admission record so the launched `dd run` fences each stage with its own
+    #: timeout instead of the 3600s default. Empty means the runner's default
+    #: applies to every stage -- existing behavior unchanged.
+    timeouts: dict[str, int] = field(default_factory=dict)
     working_directory: str = DEFAULT_WORKING_DIRECTORY
     executable: str = DEFAULT_EXECUTABLE
     environment: dict[str, str] = field(default_factory=dict)
@@ -523,6 +560,8 @@ class DdLaunchSpec:
             argv += ["--accept-env", f"{key}={value}"]
         for stage, model in sorted(self.stage_models.items()):
             argv += ["--stage-model", f"{stage}={model}"]
+        for stage, seconds in sorted(self.timeouts.items()):
+            argv += ["--stage-timeout", f"{stage}={seconds}"]
         if self.board_card:
             argv += ["--board-card", self.board_card]
         if self.dispatched_by:
@@ -581,6 +620,7 @@ class DdControlPlane:
         spec_text: str | None = None,
         spec_path: str | None = None,
         dispatched_by: str = "",
+        timeouts: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """Admit one development: derive everything, bootstrap, record.
 
@@ -591,6 +631,11 @@ class DdControlPlane:
         subject) that dispatched this development; it is recorded and forwarded
         to the runner as the `dispatched_by` worker-run label. Empty means no
         finer provenance was recorded.
+
+        `timeouts` optionally overrides the per-stage run fence (stage_id ->
+        positive seconds); it is validated against the contract's stage ids and
+        recorded for audit. Not passed (or empty) keeps the 3600s default for
+        every stage -- existing behavior unchanged.
         """
         repo = self._admit_repo(repo_path)
         spec = self._read_spec(spec_text, spec_path)
@@ -604,6 +649,7 @@ class DdControlPlane:
         development_id = derive_development_id(repo, spec_digest, base)
         dev_root = self.root / development_id
         dispatched_by = (dispatched_by or "").strip()
+        validated_timeouts = validate_timeouts(timeouts)
 
         existing = self._read_record_if_any(development_id)
         if existing is not None:
@@ -660,6 +706,12 @@ class DdControlPlane:
             "acceptance_commands": acceptance_commands,
             "card_entity_id": card_entity_id,
             "dispatched_by": dispatched_by,
+            #: The per-stage run-fence overrides, as validated. Empty (or never
+            #: passed) keeps the runner's 3600s default for every stage -- this
+            #: field is then present but empty, and existing behavior is
+            #: byte-identical. Persisted so the audit trail says what fence the
+            #: order actually ran under.
+            "timeouts": validated_timeouts,
             "plugin_binding_path": str(self.plugin_binding),
             "created_at": iso(self.clock()),
         }
@@ -1182,6 +1234,7 @@ class DdControlPlane:
             generation=generation,
             run_root=run_root,
             stage_models=dict(self.stage_models),
+            timeouts=dict(record.get("timeouts") or {}),
             working_directory=self.working_directory,
             executable=self.executable,
             environment=dict(self.environment),
@@ -1466,6 +1519,7 @@ class DdControlPlane:
             "acceptance_commands": record["acceptance_commands"],
             "setup_commands": record.get("setup_commands", []),
             "acceptance_env": record.get("acceptance_env", {}),
+            "timeouts": record.get("timeouts", {}),
             "reconfigures": record.get("reconfigures", []),
             "card_entity_id": record.get("card_entity_id", ""),
             "created_at": record.get("created_at", ""),

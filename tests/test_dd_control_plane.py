@@ -785,6 +785,76 @@ class TestStageModelPolicy:
         assert argv[argv.index("--stage-model") + 1] == "continuous_review=deepseek-v4-pro"
 
 
+class TestPerStageTimeouts:
+    """The admission `timeouts` parameter: per-stage fence overrides that are
+    validated, persisted for audit, and forwarded to the launched run. Not
+    passing it keeps the 3600s default for every stage -- byte-identical."""
+
+    def _plane(self, tmp_path: Path, launcher: RecordingLauncher) -> DdControlPlane:
+        binding = tmp_path / "plugin-binding.json"
+        binding.write_text('{"plugin_producer": {}}', encoding="utf-8")
+        return DdControlPlane(
+            root=tmp_path / "dd",
+            plugin_binding=binding,
+            worktree_roots=(str(tmp_path),),
+            launcher=launcher,
+            unit_probe=lambda unit: False,
+            board_factory=lambda: None,
+        )
+
+    def test_timeouts_are_recorded_and_forwarded_to_the_launched_run(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        """timeouts={"implement": 7200} must fence implement at 7200s, leave
+        every other stage on the default, and be persisted in record.json for
+        audit -- not just passed through the argv."""
+        launcher = RecordingLauncher()
+        plane = self._plane(tmp_path, launcher)
+        dev = plane.create(str(scratch), spec_text=SPEC, timeouts={"implement": 7200})[
+            "development_id"
+        ]
+
+        record = json.loads((plane.root / dev / RECORD_FILE).read_text(encoding="utf-8"))
+        assert record["timeouts"] == {"implement": 7200}, "the fence is auditable in record.json"
+
+        plane.start(dev)
+        argv = launcher.specs[0].argv()
+        assert argv[argv.index("--stage-timeout") + 1] == "implement=7200"
+        assert argv.count("--stage-timeout") == 1, "other stages keep the default"
+
+    def test_an_unknown_stage_id_is_refused(self, scratch: Path, tmp_path: Path) -> None:
+        """A timeout for a stage nobody runs is a typo that would read as
+        'fenced at 7200' in an audit trail -- refuse by name."""
+        plane = self._plane(tmp_path, RecordingLauncher())
+        with pytest.raises(ControlPlaneError) as refused:
+            plane.create(str(scratch), spec_text=SPEC, timeouts={"implement": 7200, "nope": 900})
+        assert refused.value.code == "STAGE_TIMEOUT_UNKNOWN"
+
+    def test_a_non_positive_timeout_is_refused(self, scratch: Path, tmp_path: Path) -> None:
+        plane = self._plane(tmp_path, RecordingLauncher())
+        for bad in ({"implement": 0}, {"implement": -5}, {"implement": "7200"}):
+            with pytest.raises(ControlPlaneError) as refused:
+                plane.create(str(scratch), spec_text=SPEC, timeouts=bad)
+            assert refused.value.code == "STAGE_TIMEOUT_INVALID", bad
+
+    def test_no_timeouts_keeps_existing_behavior_byte_identical(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        """Not passing timeouts must leave the launched argv and the record
+        exactly as before the feature existed: no --stage-timeout flag, and an
+        empty (never-fenced) timeouts field."""
+        launcher = RecordingLauncher()
+        plane = self._plane(tmp_path, launcher)
+        dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
+
+        record = json.loads((plane.root / dev / RECORD_FILE).read_text(encoding="utf-8"))
+        assert record["timeouts"] == {}
+
+        plane.start(dev)
+        argv = launcher.specs[0].argv()
+        assert "--stage-timeout" not in argv
+
+
 class TestListDoesNotServeStaleLiveness:
     def test_a_cached_running_row_is_recomputed_once_the_unit_is_gone(
         self, scratch: Path, tmp_path: Path
