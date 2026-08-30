@@ -50,6 +50,9 @@ class ResearchConfig:
     max_depth: int = 6
     zero_growth_rounds: int = 3
     max_rounds: int = 24
+    #: R3 并发度：dispatch 每个 wave 至多并发派发这么多 open clue（缺省 4，W=4）。
+    #: 只影响「同 wave 派几个」，不影响 clue id / input / run id 的派生。
+    concurrency: int = 4
     #: None 表示持久化：run_root / "checkpoint.sqlite3"。":memory:" 留给一次性测试。
     checkpoint_path: str | None = None
     #: 测试接缝：指向 fake binary。生产保持 None，用 DEFAULT_AGENT_RUN_BIN。
@@ -113,6 +116,7 @@ def build_research(
             max_depth=config.max_depth,
             zero_growth_rounds=config.zero_growth_rounds,
             max_rounds=config.max_rounds,
+            concurrency=config.concurrency,
         ),
         seed_model=config.seed_model,
         sources=config.sources,

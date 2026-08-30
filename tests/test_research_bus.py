@@ -120,10 +120,14 @@ class FakeLauncher:
         self.dispatched: list[str] = []
         self.specs: dict[str, Any] = {}
         self._roles: dict[str, str] = {}
+        self._launched: set[str] = set()
 
     def launch(self, spec: Any, run_id: str):
         from fleet_graph.executors.agent_run import RunTicket
 
+        if run_id in self._launched:
+            return RunTicket(run_id, f"/tmp/fake/{run_id}", None, adopted=True)
+        self._launched.add(run_id)
         self._roles[run_id] = spec.role
         self.specs[run_id] = spec
         self.dispatched.append(run_id)

@@ -1,9 +1,11 @@
-"""deep-research 串行闭环图：一张 submit 驱动的 L2 业务图。
+"""deep-research 并发 fan-out 闭环图：一张 submit 驱动的 L2 业务图。
 
 一个 research 工单走完
-`seed -> {dispatch -> collect -> harvest -> converge} 循环 -> synthesis -> finalise`，
-在 run root 下产出 `report.md` 与 `result.json`。串行 W=1：每个循环只派一个 clue
-（`worker/clue_id`），worker 完成或失败后才进入下一轮。
+`seed -> {dispatch -[Send]-> collect* -> harvest -> converge} 循环 -> synthesis -> finalise`，
+在 run root 下产出 `report.md` 与 `result.json`。R3 起 dispatch 用 LangGraph Send API
+按 wave 并发派发（缺省 W=4，`concurrency` 可配）：一个 wave 内至多 `concurrency` 个
+open clue 同时 `dispatched`，collect 对每个 clue 单粒度的 launch+wait 并行执行，真实
+时间重叠、wall-clock 下降（而非仅结构并列）。
 
 节点纯度（规格第 5 条）：
 - **script 节点**（dispatch / collect / harvest / converge / finalise）零 LLM 调用，
@@ -24,9 +26,10 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 
 from fleet_graph.executors.agent_run import AgentRunSpec, RunWaitTimeout, derive_run_id
 from fleet_graph.executors.text_node import TextSpec
@@ -174,12 +177,41 @@ class ResearchBounds:
     - max_clues / max_depth：clue 总数/深度触顶 -> capped。
     - zero_growth_rounds：coverage 零增长连续 N 轮 -> converged。
     - max_rounds：轮次预算触顶 -> capped（预算截断尚未收敛的研究）。
+    - concurrency：每 wave 最多并发派发的 open clue 数（R3，缺省 4）。
+      只影响「同 wave 派几个」，不影响 clue id / input / run id 的派生。
     """
 
     max_clues: int = 12
     max_depth: int = 6
     zero_growth_rounds: int = 3
     max_rounds: int = 24
+    concurrency: int = 4
+
+
+def _merge_clues(
+    current: list[dict[str, Any]] | None, update: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """clue 板的合并 reducer（R3 fan-out）：按 id 合并，update 覆盖同 id 条目。
+
+    并行 collect 各自只返回自己那条 clue 的更新（dispatch/harvest 返回整板），
+    LangGraph 用这个 reducer 把它们合并回 clue 板。顺序保持 current 的首见序、
+    新 id 追加在尾部——children 的发现顺序因此允许与 W 相关，但集合不变。
+    """
+    merged = list(current or [])
+    index = {c["id"]: i for i, c in enumerate(merged)}
+    for entry in update:
+        i = index.get(entry["id"])
+        if i is None:
+            index[entry["id"]] = len(merged)
+            merged.append(entry)
+        else:
+            merged[i] = entry
+    return merged
+
+
+def _merge_heads(current: dict[str, str] | None, update: dict[str, str]) -> dict[str, str]:
+    """clue_heads 的合并 reducer（R3 fan-out）：dict 浅合并，后者覆盖同键。"""
+    return {**(current or {}), **(update or {})}
 
 
 class ResearchState(TypedDict, total=False):
@@ -188,19 +220,24 @@ class ResearchState(TypedDict, total=False):
     research_id: str
     question: str
     generation: int
-    #: clue 板：每项只含 id/status/depth/retry，不含线索正文（正文在 clues/<id>.json）。
-    clues: list[dict[str, Any]]
+    #: clue 板：每项只含 id/status/depth/retry/source，不含线索正文（正文在 clues/<id>.json）。
+    #: R3 起是 reducer channel：并行 collect 各自更新自己那条，按 id 合并。
+    clues: Annotated[list[dict[str, Any]], _merge_clues]
     rounds: int
     #: coverage = done clue 计数。零增长连续 N 轮即 converged。
     coverage: int
     zero_growth_rounds: int
-    #: 本轮已 dispatch 的 clue id（collect/harvest 据此定位；W=1 一次只一个）。
-    pending_clue_id: str
+    #: 本轮已 dispatch 的 clue id 集合（只存 id，规格第 3 条）。collect 经 Send 的
+    #: clue_id 定位，不再有全局 pending_clue_id；harvest 用它知道该收割哪些 clue。
+    dispatched_ids: list[str]
+    #: Send 命令携带的单 clue id（collect 的输入，只出现在 fan-out 任务的 state 里）。
+    clue_id: str
     terminal: str
     terminal_reason: str
     #: clue 实体在 bus 上的版本头（message_id），维护 ``research.clue.v2`` 的
     #: ``supersedes`` 版本链。只装 id（规格第 7 条：state 只装 id 与计数）。
-    clue_heads: dict[str, str]
+    #: R3 起是 reducer channel：并行 collect 各自更新自己那条，按 dict 合并。
+    clue_heads: Annotated[dict[str, str], _merge_heads]
 
 
 @dataclass
@@ -285,6 +322,7 @@ def initial_state(research_id: str, question: str, generation: int) -> ResearchS
         "rounds": 0,
         "coverage": 0,
         "zero_growth_rounds": 0,
+        "dispatched_ids": [],
     }
 
 
@@ -311,6 +349,23 @@ def _worker_input_path(run_root: Path, clue_id: str, retry: int) -> Path:
 
 def _synthesis_input_path(run_root: Path) -> Path:
     return run_root / "inputs" / "synthesis.json"
+
+
+def _worker_spec(deps: ResearchDeps, *, clue_id: str, source: str, retry: int) -> AgentRunSpec:
+    """worker 的 AgentRunSpec（deep-research.worker-input/v1）。dispatch 与 collect 共用：
+    dispatch 先 launch 全部（spawn detached worker，真实时间重叠），collect 同 id 再 launch
+    = re-adopt 在途 run（launcher 幂等）后 wait。role 按 source 路由（R2 矩阵）。"""
+    role = SOURCE_ROLE.get(source, SOURCE_ROLE[deps.default_source])
+    return AgentRunSpec(
+        prompt="",
+        role=role,
+        input_path=str(_worker_input_path(deps.run_root, clue_id, retry)),
+        prompt_file=str(_prompt_path(deps.run_root, clue_id)),
+        structured=True,
+        write=False,
+        timeout_seconds=deps.worker_timeout_seconds,
+        labels={"dispatcher": DISPATCHER_LABEL, "research": deps.research_id},
+    )
 
 
 def _write_clue_file(run_root: Path, clue_id: str, query: str, *, depth: int, source: str) -> None:
@@ -527,93 +582,107 @@ def _dispatch_node(deps: ResearchDeps):
     def dispatch(state: ResearchState) -> ResearchState:
         clues = state.get("clues", [])
         open_clues = [c for c in clues if c["status"] == CLUE_OPEN]
-        if not open_clues:
+        wave = open_clues[: deps.bounds.concurrency]  # R3：本 wave 至多 concurrency 个。
+        if not wave:
             # 无 open clue：让 converge 判定（converged / partial）。
-            return {"pending_clue_id": ""}
+            return {"dispatched_ids": []}
 
-        clue = open_clues[0]  # W=1：每轮只取一个。
-        clue_id = clue["id"]
-        # R2：clue 板每项带 source；未知 / 缺失回填默认源（clue 级降级，绝不 fault）。
-        source = clue.get("source") or deps.default_source
-        if source not in SOURCE_ROLE:
-            source = deps.default_source
-        query = _read_clue_query(deps.run_root, clue_id)
-        prompt = WORKER_PROMPT.format(question=state.get("question") or deps.question, clue=query)
-        prompt_path = _prompt_path(deps.run_root, clue_id)
-        prompt_path.parent.mkdir(parents=True, exist_ok=True)
-        prompt_path.write_text(prompt, encoding="utf-8")
-        # role 声明了 protocol.input（deep-research.worker-input/v1），agent-run 强制
-        # --input：每个 run 落一份 input 文件，collect 侧经 spec.input_path 投递。
-        # R2 input 形状：clue_id / clue_text / depth / sources（string array）。
-        write_json_durable(
-            _worker_input_path(deps.run_root, clue_id, clue["retry"]),
-            {
-                "clue_id": clue_id,
-                "clue_text": query,
-                "depth": clue["depth"],
-                "sources": [source],
-            },
-        )
-
-        _observe(
-            deps,
-            {"event": "dispatch", "clue_id": clue_id, "retry": clue["retry"], "source": source},
-        )
-        # 发布 open -> dispatched 迁移（research.clue.v2，supersedes 接上一版本头）。
+        new_clues = list(clues)
         heads = dict(state.get("clue_heads", {}))
-        run_id = worker_run_id(deps.thread_id, clue_id, clue["retry"])
-        mid = _publish_clue(
-            deps,
-            clue_id=clue_id,
-            text=query,
-            status=CLUE_DISPATCHED,
-            depth=clue["depth"],
-            retry=clue["retry"],
-            supersedes=_head(heads, clue_id),
-            run_id=run_id,
-            sources=[source],
-        )
-        if mid:
-            heads[clue_id] = mid
-        return {
-            "clues": _set_clue(clues, clue_id, status=CLUE_DISPATCHED),
-            "clue_heads": heads,
-            "pending_clue_id": clue_id,
-        }
+        dispatched_ids: list[str] = []
+        for clue in wave:
+            clue_id = clue["id"]
+            # R2：clue 板每项带 source；未知 / 缺失回填默认源（clue 级降级，绝不 fault）。
+            source = clue.get("source") or deps.default_source
+            if source not in SOURCE_ROLE:
+                source = deps.default_source
+            query = _read_clue_query(deps.run_root, clue_id)
+            prompt = WORKER_PROMPT.format(
+                question=state.get("question") or deps.question, clue=query
+            )
+            prompt_path = _prompt_path(deps.run_root, clue_id)
+            prompt_path.parent.mkdir(parents=True, exist_ok=True)
+            prompt_path.write_text(prompt, encoding="utf-8")
+            # role 声明了 protocol.input（deep-research.worker-input/v1），agent-run 强制
+            # --input：每个 run 落一份 input 文件，collect 侧经 spec.input_path 投递。
+            # R2 input 形状：clue_id / clue_text / depth / sources（string array）。
+            write_json_durable(
+                _worker_input_path(deps.run_root, clue_id, clue["retry"]),
+                {
+                    "clue_id": clue_id,
+                    "clue_text": query,
+                    "depth": clue["depth"],
+                    "sources": [source],
+                },
+            )
+
+            _observe(
+                deps,
+                {"event": "dispatch", "clue_id": clue_id, "retry": clue["retry"], "source": source},
+            )
+            # 发布 open -> dispatched 迁移（research.clue.v2，supersedes 接上一版本头）。
+            run_id = worker_run_id(deps.thread_id, clue_id, clue["retry"])
+            mid = _publish_clue(
+                deps,
+                clue_id=clue_id,
+                text=query,
+                status=CLUE_DISPATCHED,
+                depth=clue["depth"],
+                retry=clue["retry"],
+                supersedes=_head(heads, clue_id),
+                run_id=run_id,
+                sources=[source],
+            )
+            if mid:
+                heads[clue_id] = mid
+            # dispatch 先 launch 全部（真实时间重叠）：本 wave 全部 worker 此刻 spawn，
+            # collect 对每个 run_id 再 launch = re-adopt 在途 run（launcher 幂等）后 wait。
+            deps.launcher.launch(
+                _worker_spec(deps, clue_id=clue_id, source=source, retry=clue["retry"]), run_id
+            )
+            new_clues = _set_clue(new_clues, clue_id, status=CLUE_DISPATCHED)
+            dispatched_ids.append(clue_id)
+        return {"clues": new_clues, "clue_heads": heads, "dispatched_ids": dispatched_ids}
 
     return dispatch
 
 
+def _after_dispatch(state: ResearchState) -> str | list[Send]:
+    """dispatch 的 fan-out 路由：有本 wave 的 dispatched_ids 就 Send 给 collect，
+    否则让 converge 判定（converged / partial）。Send payload 携带 clue_id + 该 clue
+    的板条目 + 上一版本头——collect 是单 clue 粒度，任务输入就是 Send 命令的内容。
+    """
+    ids = state.get("dispatched_ids", [])
+    if not ids:
+        return "converge"
+    clues = {c["id"]: c for c in state.get("clues", [])}
+    heads = state.get("clue_heads", {})
+    return [
+        Send(
+            "collect",
+            {"clue_id": cid, "clue": clues[cid], "prev_head": heads.get(cid)},
+        )
+        for cid in ids
+    ]
+
+
 def _collect_node(deps: ResearchDeps):
     def collect(state: ResearchState) -> ResearchState:
-        clue_id = state.get("pending_clue_id", "")
-        if not clue_id:
+        clue_id = state.get("clue_id", "")
+        clue = state.get("clue")
+        if not clue_id or clue is None:
             return {}
 
-        clues = state.get("clues", [])
-        clue = _clue(clues, clue_id)
-        if clue is None:
-            # pending clue 不在板上 = 内部不一致，fault。
-            return {
-                "terminal": TERMINAL_FAULT,
-                "terminal_reason": f"pending clue {clue_id} 不在 clue 板上",
-            }
-
-        run_id = worker_run_id(deps.thread_id, clue_id, clue["retry"])
+        # R3：collect 单 clue 粒度。clue 条目由 Send 命令携带（id/status/depth/retry/
+        # source，只装 id 与计数），取代全局 pending_clue_id。run id 派生仍与并发度无关。
+        retry = clue["retry"]
+        depth = clue["depth"]
+        run_id = worker_run_id(deps.thread_id, clue_id, retry)
         # R2：按 clue.source 路由到 SOURCE_ROLE 矩阵（纯常量，不做内联 if）。未知 /
         # 缺失 source 已在 dispatch 回填默认源，这里只防御性兜底，绝不 fault。
         source = clue.get("source") or deps.default_source
-        role = SOURCE_ROLE.get(source, SOURCE_ROLE[deps.default_source])
-        spec = AgentRunSpec(
-            prompt="",
-            role=role,
-            input_path=str(_worker_input_path(deps.run_root, clue_id, clue["retry"])),
-            prompt_file=str(_prompt_path(deps.run_root, clue_id)),
-            structured=True,
-            write=False,
-            timeout_seconds=deps.worker_timeout_seconds,
-            labels={"dispatcher": DISPATCHER_LABEL, "research": deps.research_id},
-        )
+        # dispatch 已 launch 全部；同 run_id 再 launch = re-adopt 在途 run（幂等）。
+        spec = _worker_spec(deps, clue_id=clue_id, source=source, retry=retry)
         ticket = deps.launcher.launch(spec, run_id)
         try:
             status = deps.launcher.wait(
@@ -630,30 +699,30 @@ def _collect_node(deps: ResearchDeps):
                 deps,
                 {"event": "collect", "clue_id": clue_id, "run_id": run_id, "timeout": True},
             )
-            retry = clue["retry"] + 1
+            retry = retry + 1
             new_status = CLUE_BLOCKED if retry >= MAX_RETRIES else CLUE_OPEN
-            heads = dict(state.get("clue_heads", {}))
             query = _read_clue_query(deps.run_root, clue_id)
             mid = _publish_clue(
                 deps,
                 clue_id=clue_id,
                 text=query,
                 status=new_status,
-                depth=clue["depth"],
+                depth=depth,
                 retry=retry,
-                supersedes=_head(heads, clue_id),
+                supersedes=state.get("prev_head"),
                 sources=[source],
             )
-            if mid:
-                heads[clue_id] = mid
             return {
-                "clues": _set_clue(
-                    clues,
-                    clue_id,
-                    retry=retry,
-                    status=new_status,
-                ),
-                "clue_heads": heads,
+                "clues": [
+                    {
+                        "id": clue_id,
+                        "status": new_status,
+                        "depth": depth,
+                        "retry": retry,
+                        "source": source,
+                    }
+                ],
+                "clue_heads": {clue_id: mid} if mid else {},
             }
         # run 结果落盘（harvest 据此提取新线索，resume 后也能重读）。
         write_json_durable(_result_path(deps.run_root, clue_id), status.result or {})
@@ -675,66 +744,69 @@ def _collect_node(deps: ResearchDeps):
                 # 信封解析失败按 clue 失败处理（retry/block），绝不 fault 整图。
                 declared = None
 
-        heads = dict(state.get("clue_heads", {}))
         if declared is not None:
             for evidence in declared["evidences"]:
                 # 每条 evidence -> R1 evidence：evidence 已是 {claim, source, quote,
                 # locator} 形状，原样 append 与发布（research.evidence.v2 leaf）。
-                _append_evidence(deps.run_root, clue_id, clue["depth"], evidence, deps.now())
-                _publish_evidence(deps, clue_id=clue_id, finding=evidence, depth=clue["depth"])
-            new_clues = _set_clue(clues, clue_id, status=CLUE_DONE)
+                _append_evidence(deps.run_root, clue_id, depth, evidence, deps.now())
+                _publish_evidence(deps, clue_id=clue_id, finding=evidence, depth=depth)
+            entry: dict[str, Any] = {
+                "id": clue_id,
+                "status": CLUE_DONE,
+                "depth": depth,
+                "retry": retry,
+                "source": source,
+            }
             query = _read_clue_query(deps.run_root, clue_id)
             mid = _publish_clue(
                 deps,
                 clue_id=clue_id,
                 text=query,
                 status=CLUE_DONE,
-                depth=clue["depth"],
-                retry=clue["retry"],
-                supersedes=_head(heads, clue_id),
+                depth=depth,
+                retry=retry,
+                supersedes=state.get("prev_head"),
                 sources=[source],
             )
-            if mid:
-                heads[clue_id] = mid
         else:
-            retry = clue["retry"] + 1
+            retry = retry + 1
             new_status = CLUE_BLOCKED if retry >= MAX_RETRIES else CLUE_OPEN
-            new_clues = _set_clue(
-                clues,
-                clue_id,
-                retry=retry,
-                status=new_status,
-            )
+            entry = {
+                "id": clue_id,
+                "status": new_status,
+                "depth": depth,
+                "retry": retry,
+                "source": source,
+            }
             query = _read_clue_query(deps.run_root, clue_id)
             mid = _publish_clue(
                 deps,
                 clue_id=clue_id,
                 text=query,
                 status=new_status,
-                depth=clue["depth"],
+                depth=depth,
                 retry=retry,
-                supersedes=_head(heads, clue_id),
+                supersedes=state.get("prev_head"),
                 sources=[source],
             )
-            if mid:
-                heads[clue_id] = mid
 
         _observe(deps, {"event": "collect", "clue_id": clue_id, "run_id": run_id, "ok": status.ok})
-        return {"clues": new_clues, "clue_heads": heads}
+        return {"clues": [entry], "clue_heads": {clue_id: mid} if mid else {}}
 
     return collect
 
 
 def _harvest_node(deps: ResearchDeps):
     def harvest(state: ResearchState) -> ResearchState:
-        clue_id = state.get("pending_clue_id", "")
-        if not clue_id:
-            return {}
-
         clues = state.get("clues", [])
         heads = dict(state.get("clue_heads", {}))
-        clue = _clue(clues, clue_id)
-        if clue is not None and clue["status"] == CLUE_DONE:
+        dispatched_ids = state.get("dispatched_ids", [])
+
+        # R3：一个 wave 可能收割多个 done clue（每个都提取 proposed_clues）。
+        for clue_id in dispatched_ids:
+            clue = _clue(clues, clue_id)
+            if clue is None or clue["status"] != CLUE_DONE:
+                continue
             raw = json.loads(_result_path(deps.run_root, clue_id).read_text(encoding="utf-8"))
             try:
                 structured = parse_envelope(raw)
@@ -796,6 +868,7 @@ def _harvest_node(deps: ResearchDeps):
             "coverage": coverage,
             "zero_growth_rounds": zero_growth,
             "rounds": rounds,
+            "dispatched_ids": [],
         }
 
     return harvest
@@ -915,10 +988,6 @@ def _finalise_node(deps: ResearchDeps):
 
 def _after_seed(state: ResearchState) -> str:
     return "finalise" if state.get("terminal") else "dispatch"
-
-
-def _after_dispatch(state: ResearchState) -> str:
-    return "collect" if state.get("pending_clue_id") else "converge"
 
 
 def _after_converge(state: ResearchState) -> str:
