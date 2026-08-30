@@ -900,3 +900,96 @@ class TestKillRestartReAdopt:
         )
         assert result["receipt_path"]
         assert ledger_lines() == 1, "restart double-dispatched the audit run"
+
+
+class TestE6E7Dispatch:
+    """M4: run_supervisor 把 E6/E7 分派到各自处置反应器，不进入审计图。"""
+
+    class FakeE6Ops:
+        def resolve_line_unit(self, folder_id: str, run_root: Path) -> dict[str, Any]:
+            return {"ok": True, "unit": f"fleet-graph-line-{folder_id}-g1", "source": "list-units"}
+
+        def is_active(self, unit_name: str) -> bool:
+            return False
+
+        def stop_unit(self, unit_name: str) -> int:
+            return 0
+
+        def line_heartbeat_age_s(self, folder_id: str) -> float | None:
+            return None
+
+    class FakeE7Ops:
+        def resolve_folder_id(self, bus: Any, source_message_id: str) -> str:
+            return "wf-a"
+
+        def goal_revision(self, folder_id: str) -> str:
+            return "rev-before"
+
+        def append_delivery_fail_block(self, folder_id: str, block: str) -> dict[str, Any]:
+            return {
+                "before_revision": "rev-before",
+                "after_revision": "rev-after",
+                "revision_changed": True,
+                "readback_present": True,
+                "marker": "## E7 送达失败（监督面直写）",
+            }
+
+        def read_goal(self, folder_id: str) -> str:
+            return "## E7 送达失败（监督面直写）\n"
+
+    def test_e6_dispatches_to_the_stop_reactor(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.e6_stop import OUTCOME_STOPPED
+        from fleet_graph.supervise.events import heartbeat_stale_event
+
+        event = heartbeat_stale_event(
+            folder_id="wf-a", heartbeat_age_s=600.0, round=3, phase="coordinator"
+        ).as_dict()
+        result = run_supervisor(
+            SupervisorRunConfig(
+                event=event,
+                state_root=tmp_path / "supervisor",
+                run_root=tmp_path / "runs",
+                publish_notes=False,
+                e6_ops=self.FakeE6Ops(),
+            )
+        )
+        assert result["outcome"] == OUTCOME_STOPPED
+        assert result["receipt_path"]
+
+    def test_e7_dispatches_to_the_write_reactor(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.e7_allowlist import E7WriteAllowlist
+        from fleet_graph.supervise.e7_write import OUTCOME_DELIVERED
+        from fleet_graph.supervise.events import decision_swallowed_event
+
+        event = decision_swallowed_event(source_message_id="msg_sw", reason="noop").as_dict()
+        result = run_supervisor(
+            SupervisorRunConfig(
+                event=event,
+                state_root=tmp_path / "supervisor",
+                run_root=tmp_path / "runs",
+                publish_notes=False,
+                e7_ops=self.FakeE7Ops(),
+                e7_allowlist=E7WriteAllowlist(folder_ids=("wf-a",)),
+            )
+        )
+        assert result["outcome"] == OUTCOME_DELIVERED
+        assert result["receipt_path"]
+
+    def test_e7_outside_allowlist_refuses_without_write(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.e7_allowlist import E7WriteAllowlist
+        from fleet_graph.supervise.e7_write import OUTCOME_REFUSED
+        from fleet_graph.supervise.events import decision_swallowed_event
+
+        event = decision_swallowed_event(source_message_id="msg_sw", reason="noop").as_dict()
+        result = run_supervisor(
+            SupervisorRunConfig(
+                event=event,
+                state_root=tmp_path / "supervisor",
+                run_root=tmp_path / "runs",
+                publish_notes=False,
+                e7_ops=self.FakeE7Ops(),
+                e7_allowlist=E7WriteAllowlist.default(),
+            )
+        )
+        assert result["outcome"] == OUTCOME_REFUSED
+        assert result["receipt_path"]

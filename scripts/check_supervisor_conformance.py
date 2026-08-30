@@ -43,6 +43,20 @@ other side of the gate (it executes only what the gated orchestration asked),
 so it is exempt from Guard D -- the gate is the orchestrator's, and the
 diagnostic is scoped to the orchestration module.
 
+Guard E -- **the E6/E7 dispatch reactors' writes are gated too** (M4). The E6
+stop reactor (`supervise/e6_stop.py`) may only stop its own event.folder_id's
+line unit (prefix-exact match, no arbitrary unit), and the E7 goal.md reactor
+(`supervise/e7_write.py`) may only write the folder_id it resolved (圈点, default
+deny-all). Same discipline as Guard D, applied to both modules: every function
+in `supervise/e6_stop.py` that performs a stop write primitive (`stop_unit` /
+`systemctl` / subprocess) must also call the stop gate (`authorize_e6_stop` /
+`authorize`) in the same body; every function in `supervise/e7_write.py` that
+performs a goal.md write primitive (`append_delivery_fail_block` / `fs_write` /
+`fs_edit` / `write` / `edit` / `create`) must also call the write gate
+(`authorize_e7_write` / `authorize`) in the same body. The ops layers
+(`supervise/e6_ops.py`, `supervise/e7_ops.py`) and the allowlist module are
+exempt, exactly like `harvest_ops.py` is under Guard D.
+
 The technique is lifted from the old supervisor's check_no_local_scheduler.py,
 and so is its delivery discipline: tests/test_supervisor_conformance.py feeds
 this script deliberately violating samples and asserts a non-zero exit
@@ -78,9 +92,15 @@ DECISION_PUBLISHER_IMPORTERS = frozenset({"fleet_graph/graphs/supervisor.py"})
 # Guard D: the harvest orchestration module whose write functions must be gated.
 HARVEST_RELPATH = "fleet_graph/supervise/harvest.py"
 
+# Guard E: the E6/E7 dispatch orchestration modules whose write functions must
+# be gated (M4).
+E6_STOP_RELPATH = "fleet_graph/supervise/e6_stop.py"
+E7_WRITE_RELPATH = "fleet_graph/supervise/e7_write.py"
+
 #: Write primitives: call names (function or attribute) that can write to the
-#: target repo or the deployed host. Anything in this set in a harvest function
-#: makes the function a write function that must also call the allowlist gate.
+#: target repo, the deployed host, or the supervised line's own unit/goal.md.
+#: Anything in this set in a gated module's function makes the function a write
+#: function that must also call the corresponding gate.
 HARVEST_WRITE_PRIMITIVES = frozenset(
     {
         # git writes.
@@ -115,9 +135,52 @@ HARVEST_WRITE_PRIMITIVES = frozenset(
     }
 )
 
-#: Allowlist gate names: calling any of these counts as gating the write.
+#: E6 stop write primitives: anything that stops a line unit or shells out to
+#: systemd on behalf of the stop.
+E6_STOP_WRITE_PRIMITIVES = frozenset(
+    {
+        "stop_unit",
+        "systemctl",
+        "systemd",
+        "subprocess",
+        "Popen",
+        "check_call",
+        "check_output",
+        "os.system",
+        "exec",
+    }
+)
+
+#: E7 goal.md write primitives: anything that writes the supervised line's
+#: goal.md (via the ops layer or directly through the work-folder client).
+E7_WRITE_WRITE_PRIMITIVES = frozenset(
+    {
+        "append_delivery_fail_block",
+        "goal_write",
+        "fs_write",
+        "fs_edit",
+        "fs_create",
+        "write",
+        "edit",
+        "create",
+        "WorkFolder",
+        "subprocess",
+        "os.system",
+    }
+)
+
+#: Allowlist/gate names: calling any of these counts as gating the write.
 #: (``authorize`` matches both the pure function and ``allowlist.authorize``.)
 HARVEST_GATE_NAMES = frozenset({"authorize_harvest_write", "authorize"})
+E6_STOP_GATE_NAMES = frozenset({"authorize_e6_stop", "authorize"})
+E7_WRITE_GATE_NAMES = frozenset({"authorize_e7_write", "authorize"})
+
+#: The write-gating specs: relpath -> (write primitives, gate names, label).
+WRITE_GATING_SPECS: tuple[tuple[str, frozenset[str], frozenset[str], str], ...] = (
+    (HARVEST_RELPATH, HARVEST_WRITE_PRIMITIVES, HARVEST_GATE_NAMES, "harvest"),
+    (E6_STOP_RELPATH, E6_STOP_WRITE_PRIMITIVES, E6_STOP_GATE_NAMES, "E6 stop"),
+    (E7_WRITE_RELPATH, E7_WRITE_WRITE_PRIMITIVES, E7_WRITE_GATE_NAMES, "E7 goal.md write"),
+)
 
 
 def supervisor_module_paths(src_root: Path) -> list[Path]:
@@ -229,46 +292,96 @@ def _called_names(tree: ast.AST) -> set[str]:
     return names
 
 
-def check_harvest_write_gating(path: Path, relpath: str, tree: ast.AST) -> list[str]:
-    """Guard D: every write primitive call lives in a function that also calls
-    the allowlist gate, and no write primitive is called at module scope.
+def check_write_gating(
+    path: Path,
+    relpath: str,
+    tree: ast.AST,
+    *,
+    write_primitives: frozenset[str],
+    gate_names: frozenset[str],
+    label: str,
+) -> list[str]:
+    """Guard D/E: every write primitive call lives in a function that also calls
+    the gate, and no write primitive is called at module scope.
 
     A write primitive (git write / subprocess / OS write / deploy / ops-layer
-    execution) is a diagnostic the moment it appears in the harvest orchestration
-    without an allowlist gate call in the same function body -- an ungated write
-    is the exact thing the M3 allowlist-first ordering forbids.
+    execution / stop / goal.md write) is a diagnostic the moment it appears in a
+    gated orchestration module without a gate call in the same function body --
+    an ungated write is the exact thing the allowlist-first ordering forbids.
     """
-    if relpath != HARVEST_RELPATH:
-        return []
     errors: list[str] = []
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if node.name.startswith("_") and node.name in {
                 "authorize_harvest_write",
+                "authorize_e6_stop",
+                "authorize_e7_write",
             }:
                 continue
             body: ast.AST = node
             called = _called_names(body)
-            writes = called & HARVEST_WRITE_PRIMITIVES
+            writes = called & write_primitives
             if not writes:
                 continue
-            if not (called & HARVEST_GATE_NAMES):
+            if not (called & gate_names):
                 errors.append(
-                    f"{path}:{node.lineno}: function {node.name} performs a harvest "
-                    f"write ({sorted(writes)}) without calling the allowlist gate "
-                    f"({sorted(HARVEST_GATE_NAMES)}) -- harvest writes must be "
+                    f"{path}:{node.lineno}: function {node.name} performs a {label} "
+                    f"write ({sorted(writes)}) without calling the {label} gate "
+                    f"({sorted(gate_names)}) -- {label} writes must be "
                     "allowlist-gated (default deny-all)"
                 )
 
     module_called = _called_names(tree)
-    if module_called & HARVEST_WRITE_PRIMITIVES and not (module_called & HARVEST_GATE_NAMES):
+    if module_called & write_primitives and not (module_called & gate_names):
         errors.append(
-            f"{path}:1: the harvest module invokes a write primitive "
-            f"({sorted(module_called & HARVEST_WRITE_PRIMITIVES)}) without importing "
-            f"the allowlist gate ({sorted(HARVEST_GATE_NAMES)}) -- ungated harvest write"
+            f"{path}:1: the {label} module invokes a write primitive "
+            f"({sorted(module_called & write_primitives)}) without importing "
+            f"the allowlist gate ({sorted(gate_names)}) -- ungated {label} write"
         )
     return errors
+
+
+def check_harvest_write_gating(path: Path, relpath: str, tree: ast.AST) -> list[str]:
+    """Guard D: the harvest orchestration module's writes must be gated."""
+    if relpath != HARVEST_RELPATH:
+        return []
+    return check_write_gating(
+        path,
+        relpath,
+        tree,
+        write_primitives=HARVEST_WRITE_PRIMITIVES,
+        gate_names=HARVEST_GATE_NAMES,
+        label="harvest",
+    )
+
+
+def check_e6_stop_gating(path: Path, relpath: str, tree: ast.AST) -> list[str]:
+    """Guard E: the E6 stop reactor may only stop its own folder's line unit."""
+    if relpath != E6_STOP_RELPATH:
+        return []
+    return check_write_gating(
+        path,
+        relpath,
+        tree,
+        write_primitives=E6_STOP_WRITE_PRIMITIVES,
+        gate_names=E6_STOP_GATE_NAMES,
+        label="E6 stop",
+    )
+
+
+def check_e7_write_gating(path: Path, relpath: str, tree: ast.AST) -> list[str]:
+    """Guard E: the E7 reactor may only write its resolved folder's goal.md."""
+    if relpath != E7_WRITE_RELPATH:
+        return []
+    return check_write_gating(
+        path,
+        relpath,
+        tree,
+        write_primitives=E7_WRITE_WRITE_PRIMITIVES,
+        gate_names=E7_WRITE_GATE_NAMES,
+        label="E7 goal.md write",
+    )
 
 
 def run(src_root: Path) -> list[str]:
@@ -287,6 +400,8 @@ def run(src_root: Path) -> list[str]:
             errors.extend(check_no_decision_publish(path, tree))
         errors.extend(check_publisher_import_whitelist(path, relpath, tree))
         errors.extend(check_harvest_write_gating(path, relpath, tree))
+        errors.extend(check_e6_stop_gating(path, relpath, tree))
+        errors.extend(check_e7_write_gating(path, relpath, tree))
     return errors
 
 
