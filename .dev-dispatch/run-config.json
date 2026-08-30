@@ -1,0 +1,12 @@
+{
+ "development_id": "dev-fg-dbb07333b664",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "make",
+   "verify"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
