@@ -552,6 +552,20 @@ class Scheduler:
         }
 
     def _write_stall_state(self, folder_id: str, state: dict[str, Any]) -> None:
+        # 写前重读 (#170 follow-up): the E2 in-graph interrupt
+        # (goal_line decision_interrupt -> goal_interrupt LineInterruptPort)
+        # mirrors its question note into this same stall-state file. The
+        # daemon's per-tick full overwrite must not clobber a board field the
+        # line just wrote, so re-read the on-disk state before writing and
+        # preserve any board field the incoming state does not carry.
+        try:
+            existing = json.loads(self._stall_path(folder_id).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = None
+        if isinstance(existing, dict):
+            for key in ("board_card_entity_id", "board_question_note_id"):
+                if not state.get(key) and existing.get(key):
+                    state[key] = existing[key]
         path = self._stall_path(folder_id)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

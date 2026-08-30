@@ -370,6 +370,106 @@ class TestPathBBothRace:
         assert question_note_id.startswith("note-")
 
 
+# --- E2 -> scheduler stall-state write-side convergence (#170 follow-up) ----
+
+
+class TestE2WritesSchedulerStallState:
+    """The second parked-write path (the E2 in-graph interrupt) must converge
+    with the scheduler's stall state on the same question note. Before the fix,
+    ``LineInterruptPort.persist`` wrote the question note only to
+    ``goal-interrupt.sqlite3``; the decision bridge (which reads only
+    ``.scheduler/<folder_id>.json``) then read a null ``board_question_note_id``
+    and swallowed the human's approve as ``no_waiting_owner``. These tests
+    synthesize both write surfaces and assert they converge on the same note."""
+
+    def test_the_e2_interrupt_writes_the_question_note_into_the_stall_state(
+        self, tmp_path: Path
+    ) -> None:
+        """Full graph to the interrupt: the persisted checkpoint and the
+        scheduler stall-state carry the *same* question note and card."""
+        from fleet_graph.goal_interrupt.contract import resume_key_for
+
+        board = IdempotentFakeBoard()
+        stall = stall_file(tmp_path)
+        root = tmp_path / "run"
+        port = LineInterruptPort(
+            folder_id=FOLDER_ID,
+            generation=1,
+            store=GoalInterruptStore(root / "gi").open(),
+            board=board,
+            card_entity_id="",
+            run_id="run-1",
+            stall_state_path=stall,
+        )
+        graph, store = build_line_graph(root, port)
+        run_graph_to_interrupt(graph, str(root / "cp.sqlite3"))
+
+        question_note_id = "note-parked:wf-1:run-1"
+        checkpoint = store.interrupt(resume_key_for(FOLDER_ID, 1, question_note_id))
+        assert checkpoint is not None
+        assert checkpoint["question_note_id"] == question_note_id
+        assert checkpoint["card_entity_id"] == "card-goal-line-card:wf-1"
+
+        state = json.loads(stall.read_text(encoding="utf-8"))
+        assert state["board_question_note_id"] == question_note_id
+        assert state["board_card_entity_id"] == checkpoint["card_entity_id"]
+        store.close()
+
+    def test_the_e2_question_resolves_to_the_line_not_no_waiting_owner(
+        self, tmp_path: Path
+    ) -> None:
+        """The decision bridge's line owner reads the stall state the E2
+        interrupt wrote, so a ``work.decision.v1`` answering the E2 question
+        resolves to the parked line instead of ``no_waiting_owner``."""
+        from fleet_graph.decision_bridge.owners import OWNER_KIND_LINE, LineOwnerSource
+        from fleet_graph.decision_bridge.resolver import resolve_decision
+
+        board = IdempotentFakeBoard()
+        stall = stall_file(tmp_path)
+        root = tmp_path / "run"
+        port = LineInterruptPort(
+            folder_id=FOLDER_ID,
+            generation=1,
+            store=GoalInterruptStore(root / "gi").open(),
+            board=board,
+            card_entity_id="",
+            run_id="run-1",
+            stall_state_path=stall,
+        )
+        graph, store = build_line_graph(root, port)
+        run_graph_to_interrupt(graph, str(root / "cp.sqlite3"))
+        store.close()
+
+        # The scheduler parks the line: the parked snapshot lands in the same
+        # stall-state file the E2 interrupt already wrote the question note to.
+        state = json.loads(stall.read_text(encoding="utf-8"))
+        state["parked_run_id"] = "run-1"
+        state["parked_at"] = 1_700_000_000.0
+        stall.write_text(json.dumps(state), encoding="utf-8")
+
+        question_note_id = "note-parked:wf-1:run-1"
+        decision = {
+            "message_id": "d-1",
+            "channel_seq": 1,
+            "kind": "work.decision.v1",
+            "payload": {"decision": "APPROVE", "card_entity_id": "card-goal-line-card:wf-1"},
+        }
+        source = LineOwnerSource(tmp_path / "runs", ["wf-1"])
+        resolution = resolve_decision(
+            decision,
+            source,
+            refs_to=lambda q: (
+                [{"message_id": "d-1", "target_entity": question_note_id}]
+                if q == question_note_id
+                else []
+            ),
+        )
+        assert resolution.ok
+        assert resolution.target is not None
+        assert resolution.target.kind == OWNER_KIND_LINE
+        assert resolution.target.id == "wf-1"
+
+
 # --- the fake must not paper over the contract-shape bug --------------------
 
 

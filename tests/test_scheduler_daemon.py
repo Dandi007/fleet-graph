@@ -383,6 +383,38 @@ class TestTheStallStreak:
         assert state["board_card_entity_id"] is None
         assert state["board_question_note_id"] is None
 
+    def test_a_full_overwrite_never_drops_an_e2_written_question_note(self, tmp_path: Path) -> None:
+        """The #170 follow-up write-side race: the E2 in-graph interrupt mirrors
+        its question note into the same stall-state file the daemon owns. The
+        daemon's per-tick full overwrite must not clobber it, so `_write_stall_state`
+        re-reads the on-disk state before writing and preserves any board field the
+        incoming state does not carry."""
+        scheduler = make(tmp_path)
+        scheduler.record_start("wf-1", 1000.0)
+        state_path = scheduler._stall_path("wf-1")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["board_card_entity_id"] = "card-1"
+        state["board_question_note_id"] = "q-e2"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        # The daemon rebuilds a full state from its (older) in-memory snapshot
+        # that predates the E2 write and so lacks the question note. The write
+        # must keep the E2-written note rather than nulling it.
+        scheduler._write_stall_state(
+            "wf-1",
+            {
+                "streak": 1,
+                "accounted_run_id": "run-1",
+                "last_start_at": 1000.0,
+                "generation": 2,
+                "board_card_entity_id": "card-1",
+                "board_question_note_id": None,
+            },
+        )
+        after = json.loads(state_path.read_text(encoding="utf-8"))
+        assert after["board_question_note_id"] == "q-e2"
+        assert after["board_card_entity_id"] == "card-1"
+
     def test_the_streak_reaches_the_decision(self, tmp_path: Path) -> None:
         """A counter nothing consults is a counter that looks like a working
         guard right up until the line it should have held restarts anyway."""
