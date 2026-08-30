@@ -79,8 +79,13 @@ def build_research(
     text_node: Any = None,
     launcher: Any = None,
     observe: Any = None,
+    publisher: Any = None,
 ) -> tuple[Any, ResearchDeps]:
-    """接线一个 research 工单。返回编译前的图与 deps。"""
+    """接线一个 research 工单。返回编译前的图与 deps。
+
+    ``publisher`` 是发布端口（协议上等价 ``BusClient.publish``）：生产装配真实
+    ``BusClient``（无凭据时降级为 None = 不发布），测试注入 fake transport。
+    """
     run_root = config.run_root
     launcher_kwargs: dict[str, Any] = {"state_root": str(run_root / "agent-runs")}
     if config.agent_run_bin:
@@ -103,8 +108,22 @@ def build_research(
         ),
         seed_model=config.seed_model,
         observe=observe,
+        publisher=publisher,
     )
     return build_research_graph(deps), deps
+
+
+def default_publisher() -> Any:
+    """生产装配真实 ``BusClient``；无凭据/无法构造时返回 None（不发布，降级）。
+
+    与 scheduler/board 的惯例一致：能连才发布，连不上不拖垮工作。
+    """
+    try:
+        from fleet_graph.bus.client import BusClient
+
+        return BusClient(agent_id="fleet-graph")
+    except Exception:
+        return None
 
 
 def resume_start(
@@ -127,12 +146,17 @@ def run_research(
     text_node: Any = None,
     launcher: Any = None,
     clock: Any = None,
+    publisher: Any = None,
 ) -> dict[str, Any]:
     """跑一个 research 工单到终态，写 events.jsonl 与 result.json 后返回摘要。
 
     terminal ∈ {converged, capped, partial} 才算跑通；fault（seed/synthesis 故障、
     意外异常）非零退出由 CLI 侧决定。单 clue 失败绝不 fault 整图——那是图内的
     retry/block 状态机，不是这里的异常路径。
+
+    ``publisher`` 是发布端口：None = 不发布（库函数缺省不自动碰真实 bus，测试
+    全程 hermetic）；生产装配由 CLI 经 ``default_publisher()`` 传入真实 BusClient，
+    测试注入 fake transport。
     """
     now = clock or time.time
     run_root = config.run_root
@@ -149,7 +173,11 @@ def run_research(
             pass
 
     graph, _deps = build_research(
-        config, text_node=text_node, launcher=launcher, observe=persist_event
+        config,
+        text_node=text_node,
+        launcher=launcher,
+        observe=persist_event,
+        publisher=publisher,
     )
     invoke_config: dict[str, Any] = {
         "configurable": {"thread_id": config.thread_id},
@@ -187,4 +215,12 @@ def run_research(
     return result
 
 
-__all__ = ["EVENTS", "RESULT", "ResearchConfig", "build_research", "resume_start", "run_research"]
+__all__ = [
+    "EVENTS",
+    "RESULT",
+    "ResearchConfig",
+    "build_research",
+    "default_publisher",
+    "resume_start",
+    "run_research",
+]

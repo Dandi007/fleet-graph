@@ -118,6 +118,28 @@ class BusClient:
         """GET an arbitrary bus path. For endpoints outside the messages/refs flows."""
         return self._call("GET", path)
 
+    def protocols(self) -> dict[str, Any]:
+        """The protocol registry: ``GET /v1/protocols`` -> ``{kind: {payload_schema,
+        schema_digest, entity_role}}``.
+
+        The registry is the SSoT for consumer-side payload validation. A
+        consumer must derive its schema from this response at runtime (or
+        mechanically verify ``schema_digest``), never hand-copy a schema or
+        allowlist into the repository. Some gateways wrap the mapping under a
+        ``protocols`` key; both shapes are tolerated here.
+        """
+        payload = self._call("GET", "/v1/protocols")
+        if not isinstance(payload, dict):
+            return {}
+        inner = payload.get("protocols")
+        if isinstance(inner, dict):
+            return inner
+        return payload
+
+    def get_protocol(self, kind: str) -> dict[str, Any] | None:
+        """The registry entry for one kind, or None when unregistered."""
+        return self.protocols().get(kind)
+
     def publish(
         self,
         channel_id: str,
