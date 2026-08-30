@@ -52,14 +52,32 @@ from fleet_graph.research_bus import (
 from fleet_graph.state.run_artifacts import iso, write_json_durable
 
 # role 名（规格第 8 条）：agent-runtime 侧 role 由另单交付，本单测试全部用 fake
-# launcher/text node，不依赖真实 role 存在。
+# launcher/text node，不依赖真实 role 存在。R2 起 dispatch 按 clue 的 source 路由到
+# SOURCE_ROLE 矩阵（6 个 dr-worker 角色），不再用单一 worker 角色。
 WORKER_ROLE = "research_worker_local"
 SYNTHESIS_ROLE = "research_synth"
 
+# 多源 worker 矩阵（R2）：source 词汇 -> dr-worker 角色。SOURCE_ROLE 是纯库函数常量，
+# dispatch 只读它路由，不做内联 if；value 必须逐字等于 agent-runtime 已交付的 6 个
+# dr-worker 角色名，绝不新造 / 改名 / 重注册角色。
+SOURCE_ROLE: dict[str, str] = {
+    "code-local": "dr-worker-code-local",
+    "code-remote": "dr-worker-code-remote",
+    "wiki": "dr-worker-wiki",
+    "feishu": "dr-worker-feishu",
+    "content": "dr-worker-content",
+    "web": "dr-worker-web",
+}
+
+# 矩阵词汇（固定顺序）：seed 缺省标注 / 未知 source 回填用。取首元素为默认源。
+DEFAULT_SOURCES: list[str] = ["code-local", "code-remote", "wiki", "feishu", "content", "web"]
+DEFAULT_SOURCE: str = DEFAULT_SOURCES[0]
+
 # roles 侧 protocol 契约（agent-runtime profiles/roles/schemas/，SSoT 在 roles 仓）：
-# - worker input  research-worker.input.v1：{clue_id, clue_text[, source, context]}
-# - worker result research-worker.result.v1：{clue_id, verdict, findings[{claim,
-#   source, quote, locator}], proposed_clues[{text, rationale}][, notes]}
+# - worker input  deep-research.worker-input/v1：{clue_id, clue_text[, depth,
+#   sources[], revision, allowed_root]}
+# - worker result worker.result.v1：{clue_id, verdict, evidences[{quote,claim,
+#   source,locator,revision,...}], proposed_clues[{clue,reason}][, materials[], notes]}
 # - synth input   research-synth.input.v1：{question[, clue_ids, corpus_note]}
 # - synth result  research-synth.result.v1：{report_markdown, coverage_summary,
 #   unresolved}
@@ -98,11 +116,15 @@ SYNTHESIS_FILE = "synthesis.json"
 
 SEED_SYSTEM = (
     "You plan a deep-research investigation. Answer with a JSON array of clue "
-    "strings only, no prose, no markdown fences."
+    "entries. Each entry is a plain clue string, or an object "
+    '{"text": str, "source": str}. No prose, no markdown fences.'
 )
-SEED_PROMPT = "为研究问题生成初始调查线索（仅返回 JSON 数组）：{question}"
+SEED_PROMPT = (
+    "为研究问题生成初始调查线索（仅返回 JSON 数组）。每条线索请标注 source，"
+    "source 取值仅限：{sources}；纯字符串将回填默认源 {default_source}。\n问题：{question}"
+)
 
-# worker 的输出契约由 role 侧 protocol.output（research-worker.result.v1）钉死，
+# worker 的输出契约由 role 侧 protocol.output（worker.result.v1）钉死，
 # 这里不再随 prompt 复述 schema——prompt 只投递题面与线索。
 WORKER_PROMPT = (
     "研究问题：{question}\n\n调查线索：{clue}\n\n"
@@ -119,12 +141,16 @@ def derive_research_id(question: str) -> str:
     return f"r-{digest}"
 
 
-def derive_clue_id(query: str) -> str:
+def derive_clue_id(query: str, source: str | None = None) -> str:
     """clue id 同样内容寻址派生（`c-` + sha256 前 12 hex）。
 
-    同一个线索文本永远映射到同一个 id，harvest 据此去重，避免同一子线索反复入板。
+    R2 起按 source 参与寻址（`text|source`）：同一题面从不同源探查，clue id 不互相
+    顶撞。``source=None`` 时退化为只按 text 寻址，与 R1 完全一致（向后兼容，不破 R1）。
     """
-    digest = hashlib.sha256(query.strip().encode("utf-8")).hexdigest()[:12]
+    key = query.strip()
+    if source is not None:
+        key = f"{key}|{source}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
     return f"c-{digest}"
 
 
@@ -190,6 +216,9 @@ class ResearchDeps:
     launcher: Any
     bounds: ResearchBounds = field(default_factory=ResearchBounds)
     seed_model: str = "deepseek-v4-flash"
+    #: 多源矩阵词汇（R2，规格第 8 条）：默认固定顺序，取首元素为默认源（回填与 seed 提示用）。
+    #: 生产装配 ResearchConfig.sources；测试注入自定义列表验证路由/回填。
+    sources: list[str] = field(default_factory=lambda: list(DEFAULT_SOURCES))
     worker_role: str = WORKER_ROLE
     synthesis_role: str = SYNTHESIS_ROLE
     worker_timeout_seconds: int = 900
@@ -201,6 +230,11 @@ class ResearchDeps:
     #: idempotency_key）。生产装配真实 BusClient；测试注入 fake transport。
     #: None = 不发布（best-effort 降级，同 observe 缺失时一样静默）。
     publisher: Any = None
+
+    @property
+    def default_source(self) -> str:
+        """矩阵首元素 = 默认源：未知 / 缺失 source 的 clue 回填到这个源。"""
+        return self.sources[0] if self.sources else DEFAULT_SOURCE
 
     def now(self) -> float:
         return self.clock() if self.clock is not None else time.time()
@@ -271,7 +305,7 @@ def _result_path(run_root: Path, clue_id: str) -> Path:
 
 
 def _worker_input_path(run_root: Path, clue_id: str, retry: int) -> Path:
-    """worker 的 --input 文件（research-worker.input.v1）。按 retry 区分：
+    """worker 的 --input 文件（deep-research.worker-input/v1）。按 retry 区分：
     retry 重派是一个新 run，input 文件与 run 一一对应，续跑时可整体复核。"""
     return run_root / "inputs" / f"worker-{clue_id}-r{retry}.json"
 
@@ -280,10 +314,11 @@ def _synthesis_input_path(run_root: Path) -> Path:
     return run_root / "inputs" / "synthesis.json"
 
 
-def _write_clue_file(run_root: Path, clue_id: str, query: str, *, depth: int) -> None:
-    # 线索正文落在文件里而不是 state 里：state 只装 id/status/depth/retry（规格第 7 条）。
+def _write_clue_file(run_root: Path, clue_id: str, query: str, *, depth: int, source: str) -> None:
+    # 线索正文落在文件里而不是 state 里：state 只装 id/status/depth/retry/source（规格第 7 条）。
     write_json_durable(
-        _clue_file_path(run_root, clue_id), {"id": clue_id, "query": query, "depth": depth}
+        _clue_file_path(run_root, clue_id),
+        {"id": clue_id, "query": query, "depth": depth, "source": source},
     )
 
 
@@ -413,7 +448,11 @@ def _seed_node(deps: ResearchDeps):
         question = state.get("question") or deps.question
         result = deps.text_node.complete(
             TextSpec(model=deps.seed_model, system=SEED_SYSTEM, max_tokens=2048),
-            SEED_PROMPT.format(question=question),
+            SEED_PROMPT.format(
+                question=question,
+                sources=", ".join(deps.sources),
+                default_source=deps.default_source,
+            ),
         )
         seed_text = result.text
         # seed 正文落盘（审计用），不进 state。
@@ -429,24 +468,46 @@ def _seed_node(deps: ResearchDeps):
                 "terminal": TERMINAL_FAULT,
                 "terminal_reason": f"seed 返回不可解析的 JSON：{exc}",
             }
-        if not isinstance(queries, list) or not all(isinstance(q, str) for q in queries):
+        if not isinstance(queries, list):
             return {
                 "terminal": TERMINAL_FAULT,
-                "terminal_reason": "seed 未返回 clue 字符串数组",
+                "terminal_reason": "seed 未返回 clue 数组",
             }
 
         clues: list[dict[str, Any]] = []
         heads: dict[str, str] = {}
-        for query in queries:
-            clue_id = derive_clue_id(query)
+        for item in queries:
+            if isinstance(item, str):
+                text, source = item, deps.default_source
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                text = item["text"]
+                source = item.get("source") or deps.default_source
+            else:
+                # seed 项既非纯字符串也非 {"text","source"} 对象 = 输出畸形，fault。
+                return {
+                    "terminal": TERMINAL_FAULT,
+                    "terminal_reason": "seed 项既非纯字符串也非 {text,source} 对象",
+                }
+            # 未知 / 缺失 source 属 clue 级降级：回填默认源，绝不 fault 整图。
+            if source not in SOURCE_ROLE:
+                source = deps.default_source
+            clue_id = derive_clue_id(text, source)
             if _clue(clues, clue_id) is not None:
                 # 内容寻址 id 去重：重复线索只入板一次。
                 continue
-            _write_clue_file(deps.run_root, clue_id, query, depth=0)
-            clues.append({"id": clue_id, "status": CLUE_OPEN, "depth": 0, "retry": 0})
+            _write_clue_file(deps.run_root, clue_id, text, depth=0, source=source)
+            clues.append(
+                {"id": clue_id, "status": CLUE_OPEN, "depth": 0, "retry": 0, "source": source}
+            )
             # 发布初始 open 状态（research.clue.v2，root 版本链起点）。
             mid = _publish_clue(
-                deps, clue_id=clue_id, text=query, status=CLUE_OPEN, depth=0, retry=0
+                deps,
+                clue_id=clue_id,
+                text=text,
+                status=CLUE_OPEN,
+                depth=0,
+                retry=0,
+                sources=[source],
             )
             if mid:
                 heads[clue_id] = mid
@@ -473,19 +534,32 @@ def _dispatch_node(deps: ResearchDeps):
 
         clue = open_clues[0]  # W=1：每轮只取一个。
         clue_id = clue["id"]
+        # R2：clue 板每项带 source；未知 / 缺失回填默认源（clue 级降级，绝不 fault）。
+        source = clue.get("source") or deps.default_source
+        if source not in SOURCE_ROLE:
+            source = deps.default_source
         query = _read_clue_query(deps.run_root, clue_id)
         prompt = WORKER_PROMPT.format(question=state.get("question") or deps.question, clue=query)
         prompt_path = _prompt_path(deps.run_root, clue_id)
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
         prompt_path.write_text(prompt, encoding="utf-8")
-        # role 声明了 protocol.input（research-worker.input.v1），agent-run 强制
+        # role 声明了 protocol.input（deep-research.worker-input/v1），agent-run 强制
         # --input：每个 run 落一份 input 文件，collect 侧经 spec.input_path 投递。
+        # R2 input 形状：clue_id / clue_text / depth / sources（string array）。
         write_json_durable(
             _worker_input_path(deps.run_root, clue_id, clue["retry"]),
-            {"clue_id": clue_id, "clue_text": query},
+            {
+                "clue_id": clue_id,
+                "clue_text": query,
+                "depth": clue["depth"],
+                "sources": [source],
+            },
         )
 
-        _observe(deps, {"event": "dispatch", "clue_id": clue_id, "retry": clue["retry"]})
+        _observe(
+            deps,
+            {"event": "dispatch", "clue_id": clue_id, "retry": clue["retry"], "source": source},
+        )
         # 发布 open -> dispatched 迁移（research.clue.v2，supersedes 接上一版本头）。
         heads = dict(state.get("clue_heads", {}))
         run_id = worker_run_id(deps.thread_id, clue_id, clue["retry"])
@@ -498,6 +572,7 @@ def _dispatch_node(deps: ResearchDeps):
             retry=clue["retry"],
             supersedes=_head(heads, clue_id),
             run_id=run_id,
+            sources=[source],
         )
         if mid:
             heads[clue_id] = mid
@@ -526,9 +601,13 @@ def _collect_node(deps: ResearchDeps):
             }
 
         run_id = worker_run_id(deps.thread_id, clue_id, clue["retry"])
+        # R2：按 clue.source 路由到 SOURCE_ROLE 矩阵（纯常量，不做内联 if）。未知 /
+        # 缺失 source 已在 dispatch 回填默认源，这里只防御性兜底，绝不 fault。
+        source = clue.get("source") or deps.default_source
+        role = SOURCE_ROLE.get(source, SOURCE_ROLE[deps.default_source])
         spec = AgentRunSpec(
             prompt="",
-            role=deps.worker_role,
+            role=role,
             input_path=str(_worker_input_path(deps.run_root, clue_id, clue["retry"])),
             prompt_file=str(_prompt_path(deps.run_root, clue_id)),
             structured=True,
@@ -564,6 +643,7 @@ def _collect_node(deps: ResearchDeps):
                 depth=clue["depth"],
                 retry=retry,
                 supersedes=_head(heads, clue_id),
+                sources=[source],
             )
             if mid:
                 heads[clue_id] = mid
@@ -579,9 +659,10 @@ def _collect_node(deps: ResearchDeps):
         # run 结果落盘（harvest 据此提取新线索，resume 后也能重读）。
         write_json_durable(_result_path(deps.run_root, clue_id), status.result or {})
 
-        # 消费契约 research-worker.result.v1：verdict ∈ {found, not_found} 才算
-        # 调查完成；verdict=blocked（工具面不可用）与信封解析失败一样走 clue
-        # 失败路径（retry/block），绝不 fault 整图。
+        # 消费契约 worker.result.v1：verdict ∈ {found, not_found} 才算调查完成；
+        # verdict=blocked（工具面不可用）与信封解析失败一样走 clue 失败路径
+        # （retry/block），绝不 fault 整图。R2 契约字段是 evidences[{quote,claim,
+        # source,locator,revision,...}]（不再是 R1 的 findings）。
         declared: dict[str, Any] | None = None
         if status.ok and status.result is not None:
             try:
@@ -589,7 +670,7 @@ def _collect_node(deps: ResearchDeps):
                 if (
                     isinstance(parsed, dict)
                     and parsed.get("verdict") in WORKER_VERDICTS_DONE
-                    and isinstance(parsed.get("findings"), list)
+                    and isinstance(parsed.get("evidences"), list)
                 ):
                     declared = parsed
             except Exception:
@@ -598,10 +679,11 @@ def _collect_node(deps: ResearchDeps):
 
         heads = dict(state.get("clue_heads", {}))
         if declared is not None:
-            for finding in declared["findings"]:
-                _append_evidence(deps.run_root, clue_id, clue["depth"], finding, deps.now())
-                # 每条 finding -> research.evidence.v2（leaf，clue_id 指 clue 的 entity_id）。
-                _publish_evidence(deps, clue_id=clue_id, finding=finding, depth=clue["depth"])
+            for evidence in declared["evidences"]:
+                # 每条 evidence -> R1 evidence：evidence 已是 {claim, source, quote,
+                # locator} 形状，原样 append 与发布（research.evidence.v2 leaf）。
+                _append_evidence(deps.run_root, clue_id, clue["depth"], evidence, deps.now())
+                _publish_evidence(deps, clue_id=clue_id, finding=evidence, depth=clue["depth"])
             new_clues = _set_clue(clues, clue_id, status=CLUE_DONE)
             query = _read_clue_query(deps.run_root, clue_id)
             mid = _publish_clue(
@@ -612,6 +694,7 @@ def _collect_node(deps: ResearchDeps):
                 depth=clue["depth"],
                 retry=clue["retry"],
                 supersedes=_head(heads, clue_id),
+                sources=[source],
             )
             if mid:
                 heads[clue_id] = mid
@@ -633,6 +716,7 @@ def _collect_node(deps: ResearchDeps):
                 depth=clue["depth"],
                 retry=retry,
                 supersedes=_head(heads, clue_id),
+                sources=[source],
             )
             if mid:
                 heads[clue_id] = mid
@@ -660,21 +744,33 @@ def _harvest_node(deps: ResearchDeps):
                 # collect 已判定 done 说明信封本可解析；这里解不出就按无子线索继续，
                 # 绝不 fault 整图（与 collect 的降级同义，保续跑健壮性）。
                 structured = {}
-            # 契约字段是 proposed_clues[{text, rationale}]（research-worker.result.v1），
-            # 不是旧设想的 new_clues 字符串数组。
+            # 契约字段是 proposed_clues[{clue, reason}]（worker.result.v1），
+            # 不是旧设想的 new_clues 字符串数组，也不是 R1 的 [{text, rationale}]。
             proposed = structured.get("proposed_clues", []) if isinstance(structured, dict) else []
+            # 子线索继承父 clue 的 source（worker 在哪个源取证，其子线索也归该源）。
+            child_source = clue.get("source") or deps.default_source
+            if child_source not in SOURCE_ROLE:
+                child_source = deps.default_source
             for item in proposed:
-                text = item.get("text") if isinstance(item, dict) else None
+                text = item.get("clue") if isinstance(item, dict) else None
                 if not isinstance(text, str) or not text.strip():
                     continue
-                child_id = derive_clue_id(text.strip())
+                child_id = derive_clue_id(text.strip(), child_source)
                 if _clue(clues, child_id) is not None:
                     continue
                 depth = clue["depth"] + 1
-                _write_clue_file(deps.run_root, child_id, text.strip(), depth=depth)
+                _write_clue_file(
+                    deps.run_root, child_id, text.strip(), depth=depth, source=child_source
+                )
                 clues = [
                     *clues,
-                    {"id": child_id, "status": CLUE_OPEN, "depth": depth, "retry": 0},
+                    {
+                        "id": child_id,
+                        "status": CLUE_OPEN,
+                        "depth": depth,
+                        "retry": 0,
+                        "source": child_source,
+                    },
                 ]
                 # 新子线索入板即发布初始 open（research.clue.v2 版本链起点）。
                 mid = _publish_clue(
@@ -684,6 +780,7 @@ def _harvest_node(deps: ResearchDeps):
                     status=CLUE_OPEN,
                     depth=depth,
                     retry=0,
+                    sources=[child_source],
                 )
                 if mid:
                     heads[child_id] = mid
@@ -858,11 +955,14 @@ __all__ = [
     "CLUE_DONE",
     "CLUE_OPEN",
     "CONVERGE_CONTINUE",
+    "DEFAULT_SOURCE",
+    "DEFAULT_SOURCES",
     "DISPATCHER_LABEL",
     "EVIDENCE_FILE",
     "MAX_RETRIES",
     "REPORT_FILE",
     "SEED_FILE",
+    "SOURCE_ROLE",
     "SYNTHESIS_FILE",
     "TERMINAL_CAPPED",
     "TERMINAL_CONVERGED",
