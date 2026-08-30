@@ -7,6 +7,7 @@ dd status / decision-bridge 的 bridge.sqlite3，以及可选的 agent-bus
 
 - ``GET /v1/lines`` → ``{"schema_version": <str>, "lines": [...]}``
 - ``GET /v1/decisions`` → ``{"schema_version": <str>, "decisions": [...]}``
+- ``GET /v1/harvestable`` → ``{"schema_version": <str>, "developments": [...]}``
 
 铁律（本模块与规格一致）：
 
@@ -275,6 +276,49 @@ class FleetStateView:
         decision_objs.extend(_read_published(self.config, seen))
         return {"schema_version": SCHEMA_VERSION, "decisions": decision_objs}
 
+    def harvestable(self) -> dict[str, Any]:
+        """The M2 E5 data plane: developments whose product commit has not
+        landed on the default branch (read-only, degrade-don't-5xx).
+
+        For every admitted development under the dd root we pull
+        ``record.json`` (admission identity) and ``status.json`` (stage /
+        terminal / head_commit). A development is *harvestable* when it passed
+        its gate but its product commit is not yet on the default branch --
+        mechanically: ``head_commit`` non-empty and ``terminal != "complete"``.
+        Bad artifacts degrade that entry, never the whole table.
+        """
+        developments: list[dict[str, Any]] = []
+        dd_root = self.config.dd_root
+        if not dd_root.is_dir():
+            return {"schema_version": SCHEMA_VERSION, "developments": developments}
+        for entry in sorted(dd_root.iterdir()):
+            if not entry.is_dir():
+                continue
+            record = _read_json(entry / "record.json")
+            if record is None:
+                # Not an admitted development (missing admission record):
+                # nothing mechanical to say, so nothing to report.
+                continue
+            development_id = str(record.get("development_id") or entry.name)
+            status = _read_json(entry / "status.json")
+            if status is None:
+                # Unreadable/missing status degrades the entry away: without
+                # head_commit we cannot claim it passed a gate.
+                continue
+            head_commit = str(status.get("head_commit") or "")
+            terminal = str(status.get("terminal") or "")
+            if not head_commit or terminal == "complete":
+                continue
+            developments.append(
+                {
+                    "development_id": development_id,
+                    "head_commit": head_commit,
+                    "stage": str(status.get("stage") or ""),
+                    "terminal": terminal,
+                }
+            )
+        return {"schema_version": SCHEMA_VERSION, "developments": developments}
+
 
 class FleetStateHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -293,6 +337,8 @@ class FleetStateHandler(BaseHTTPRequestHandler):
             payload = self.server.view.lines()
         elif path == "/v1/decisions":
             payload = self.server.view.decisions()
+        elif path == "/v1/harvestable":
+            payload = self.server.view.harvestable()
         else:
             self.send_error(404)
             return
