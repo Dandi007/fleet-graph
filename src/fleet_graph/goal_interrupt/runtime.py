@@ -18,7 +18,11 @@ from typing import Any
 
 from langgraph.types import Command
 
-from fleet_graph.bus.board import goal_line_card_key, goal_line_card_payload
+from fleet_graph.bus.board import (
+    goal_line_card_key,
+    goal_line_card_payload,
+    parked_question_key,
+)
 from fleet_graph.goal_interrupt.contract import (
     DecisionInput,
     DecisionRef,
@@ -71,11 +75,14 @@ class LineInterruptPort:
         interrupt checkpoint for ``(folder_id, generation, round_no)``.
 
         When a board is present the card and question reuse the scheduler's
-        escalation idempotency keys (``goal-line-card:<folder>`` and
-        ``parked:<folder>:<run_id>``) so the line's own question and the
-        scheduler's parking escalation converge on one note -- a human answering
-        it resumes the very interrupt that asked (spec items 1 and 5, and the
-        one-resume-per-question property the otherwise-double question breaks).
+        escalation idempotency keys (``goal-line-card:<folder>`` and the
+        content-variant ``parked:<folder>:<run_id>:<variant>``) so the line's
+        own question and the scheduler's parking escalation converge on one
+        note -- a human answering it resumes the very interrupt that asked
+        (spec items 1 and 5, and the one-resume-per-question property the
+        otherwise-double question breaks). The variant folds the final note
+        body into the key, so a changed body (blocker / round) is a new key
+        (never a 409) and an unchanged body stays the same key (dedup).
 
         The card is published through the *shared* constructor and the *shared*
         key the scheduler daemon uses, so the two producers converge on one card
@@ -109,19 +116,23 @@ class LineInterruptPort:
             card_entity_id = card.entity_id
             self.card_entity_id = card_entity_id
 
-        # The scheduler's escalation key: ``parked:<folder_id>:<run_id>``. When
-        # this line's run id is threaded through (production), the line's own ask
-        # and the scheduler's later escalation share one question note. A line
-        # whose run id is unknown (tests, offline) keeps the stable
-        # generation/round key so the re-ask still idempotently re-finds itself.
+        # The scheduler's escalation key: ``parked:<folder_id>:<run_id>`` with a
+        # content-variant suffix derived from the note body (blocker / round_no),
+        # so a re-park or retry that changes the note never reuses a key with a
+        # different intent (agent-bus 409 IDEMPOTENCY_CONFLICT). When this line's
+        # run id is threaded through (production), the line's own ask and the
+        # scheduler's later escalation share one question note. A line whose run
+        # id is unknown (tests, offline) keeps the stable generation/round key so
+        # the re-ask still idempotently re-finds itself.
+        question = f"line {self.folder_id} waiting on a human decision (round {round_no})."
         question_key = (
-            f"parked:{self.folder_id}:{self.run_id}"
+            parked_question_key(folder_id=self.folder_id, run_id=self.run_id, note_text=question)
             if self.run_id
             else f"e2-question:{self.folder_id}:{self._generation}:{round_no}"
         )
         ticket = self.board.ask(
             card_entity_id=card_entity_id,
-            question=f"line {self.folder_id} waiting on a human decision (round {round_no}).",
+            question=question,
             idempotency_key=question_key,
         )
         return ticket.question_note_id, card_entity_id

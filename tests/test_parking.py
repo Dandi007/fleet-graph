@@ -21,9 +21,11 @@ The tests therefore prime each line with one launch before blocking it.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.bus.board import parked_question_key
 from fleet_graph.scheduler.daemon import LineSpec, Scheduler, SchedulerConfig
 from fleet_graph.scheduler.ignition import Refusal
 from fleet_graph.scheduler.launcher import LaunchResult
@@ -478,7 +480,14 @@ class TestEscalation:
         scheduler.tick()
 
         assert len(board.asked) == 1
-        assert board.asked[0]["idempotency_key"] == "parked:wf-1:run-b1"
+        assert board.asked[0]["idempotency_key"] == parked_question_key(
+            folder_id="wf-1",
+            run_id="run-b1",
+            note_text=(
+                "line wf-1 parked: blocked waiting on a human decision "
+                "(run run-b1). blocker: 等监督面拍板（L2-5）"
+            ),
+        )
         assert "等监督面拍板" in board.asked[0]["question"]
         assert result.board_question == "question_sent:note-123"
 
@@ -551,7 +560,14 @@ class TestCardMaterialisation:
         assert result.decision.refusal is Refusal.PARKED_AWAITING_DECISION
         assert board.publishes == ["card", "question", "question"]
         assert board.asked[1]["card_entity_id"] == "msg-card-1"
-        assert board.asked[1]["idempotency_key"] == "parked:wf-1:run-b2"
+        assert board.asked[1]["idempotency_key"] == parked_question_key(
+            folder_id="wf-1",
+            run_id="run-b2",
+            note_text=(
+                "line wf-1 parked: blocked waiting on a human decision "
+                "(run run-b2). blocker: 等监督面拍板（L2-5）"
+            ),
+        )
 
     def test_a_failed_card_publish_degrades_and_skips_the_question(self, tmp_path: Path) -> None:
         """Card materialisation failing must cost nothing but the escalation:
@@ -566,6 +582,61 @@ class TestCardMaterialisation:
         assert board.publishes == ["card"]
         state = json.loads(stall_file(tmp_path).read_text(encoding="utf-8"))
         assert state.get("board_card_entity_id") is None
+
+
+PARKED_KEY_VARIANT_RE = re.compile(r"^parked:[^:]+:[^:]+:[0-9a-f]{12}$")
+
+
+class TestParkQuestionKeyContentVariant:
+    """#170 regression: the parked question key must carry a content-variant
+    derived from the note body, so a re-park / retry that changes the blocker
+    publishes under a *new* key instead of reusing the old one with a different
+    intent (agent-bus 409 IDEMPOTENCY_CONFLICT, retryable=False)."""
+
+    def test_changed_blocker_changes_the_key(self, tmp_path: Path) -> None:
+        board = FakeBoard()
+        scheduler, _, _ = make(tmp_path, wake=FakeWake(), board=board)
+        line = LineSpec(folder_id="wf-1", seat="opencode-dsv4pro", alias="canary", enabled=True)
+        record: dict[str, Any] = {"run_id": "run-b1"}
+        state: dict[str, Any] = {}
+
+        scheduler._ask_board(line, record, "blocker A", state)
+        scheduler._ask_board(line, record, "blocker B", state)
+
+        keys = [asked["idempotency_key"] for asked in board.asked]
+        assert len(keys) == 2
+        assert keys[0] != keys[1]
+        assert PARKED_KEY_VARIANT_RE.match(keys[0])
+        assert PARKED_KEY_VARIANT_RE.match(keys[1])
+        assert keys[0] != "parked:wf-1:run-b1"
+
+    def test_unchanged_blocker_reuses_the_same_key(self, tmp_path: Path) -> None:
+        board = FakeBoard()
+        scheduler, _, _ = make(tmp_path, wake=FakeWake(), board=board)
+        line = LineSpec(folder_id="wf-1", seat="opencode-dsv4pro", alias="canary", enabled=True)
+        record: dict[str, Any] = {"run_id": "run-b1"}
+        state: dict[str, Any] = {}
+
+        scheduler._ask_board(line, record, "same blocker", state)
+        scheduler._ask_board(line, record, "same blocker", state)
+
+        keys = [asked["idempotency_key"] for asked in board.asked]
+        assert len(keys) == 2
+        assert keys[0] == keys[1]
+
+    def test_the_daemon_write_point_always_emits_the_content_variant(self, tmp_path: Path) -> None:
+        """Write-point enumeration: the scheduler's `parked:` key construction
+        must keep the content-variant. A regression to the invariant
+        ``parked:<folder>:<run_id>`` turns this red."""
+        board = FakeBoard()
+        scheduler, _, _ = make(tmp_path, wake=FakeWake(), board=board)
+        line = LineSpec(folder_id="wf-1", seat="opencode-dsv4pro", alias="canary", enabled=True)
+        scheduler._ask_board(line, {"run_id": "run-b1"}, None, {})
+
+        key = board.asked[0]["idempotency_key"]
+        assert key.startswith("parked:wf-1:run-b1:")
+        assert PARKED_KEY_VARIANT_RE.match(key)
+        assert key != "parked:wf-1:run-b1"
 
 
 def hermetic_signals(tmp_path: Path, **kwargs: Any) -> LiveWakeSignals:

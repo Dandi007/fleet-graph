@@ -21,6 +21,7 @@ durable surfaces -- a real SQLite checkpointer, a real ``GoalInterruptStore``
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ from typing import Any
 import pytest
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from fleet_graph.bus.board import parked_question_key
 from fleet_graph.decision_bridge.bridge import DecisionBridge, DecisionBridgeConfig
 from fleet_graph.decision_bridge.owners import (
     RESUME_RESUMED,
@@ -370,10 +372,21 @@ class TestLineInterruptPortAsk:
 
         question_note_id, card_entity_id = port.ask(1, "blocker")
 
-        assert question_note_id == "note-parked:wf-1:run-1"
+        assert question_note_id == "note-" + parked_question_key(
+            folder_id="wf-1",
+            run_id="run-1",
+            note_text="line wf-1 waiting on a human decision (round 1).",
+        )
         assert card_entity_id == "card-goal-line-card:wf-1"
         assert "goal-line-card:wf-1" in board.cards
-        assert "parked:wf-1:run-1" in board.questions
+        assert (
+            parked_question_key(
+                folder_id="wf-1",
+                run_id="run-1",
+                note_text="line wf-1 waiting on a human decision (round 1).",
+            )
+            in board.questions
+        )
         store.close()
 
     def test_ask_is_stable_across_a_resume_reexecution(self, tmp_path: Path) -> None:
@@ -405,6 +418,61 @@ class TestLineInterruptPortAsk:
         assert second_card == first_card
         # The re-ask published nothing: same card, same question, one wake path.
         assert board.publishes == ["card", "question"]
+        store.close()
+
+
+class TestParkQuestionKeyContentVariant:
+    """#170 write point: the runtime's ``ask`` must fold the note body into the
+    ``parked:`` idempotency key so a changed round_no is a new key (never a
+    same-key-different-intent 409) while an unchanged body stays the same key."""
+
+    def test_changed_round_no_changes_the_key(self, tmp_path: Path) -> None:
+        store = GoalInterruptStore(tmp_path / "gi").open()
+        board = FakeBoard()
+        port = LineInterruptPort(
+            folder_id="wf-1", generation=1, store=store, board=board, run_id="run-1"
+        )
+
+        port.ask(1, "blocker")
+        port.ask(2, "blocker")
+
+        parked_keys = [k for k in board.questions if k.startswith("parked:wf-1:run-1:")]
+        assert len(parked_keys) == 2
+        assert parked_keys[0] != parked_keys[1]
+        store.close()
+
+    def test_unchanged_round_no_reuses_the_same_key(self, tmp_path: Path) -> None:
+        store = GoalInterruptStore(tmp_path / "gi").open()
+        board = FakeBoard()
+        port = LineInterruptPort(
+            folder_id="wf-1", generation=1, store=store, board=board, run_id="run-1"
+        )
+
+        first_qid, _ = port.ask(1, "blocker")
+        second_qid, _ = port.ask(1, "blocker")
+
+        assert second_qid == first_qid
+        parked_keys = [k for k in board.questions if k.startswith("parked:wf-1:run-1:")]
+        assert len(parked_keys) == 1
+        store.close()
+
+    def test_the_runtime_write_point_always_emits_the_content_variant(self, tmp_path: Path) -> None:
+        """Write-point enumeration: the runtime's ``parked:`` key must keep the
+        content-variant; a regression to ``parked:<folder>:<run_id>`` turns red."""
+        store = GoalInterruptStore(tmp_path / "gi").open()
+        board = FakeBoard()
+        port = LineInterruptPort(
+            folder_id="wf-1", generation=1, store=store, board=board, run_id="run-1"
+        )
+
+        port.ask(1, "blocker")
+
+        parked_keys = [k for k in board.questions if k.startswith("parked:wf-1:run-1:")]
+        assert len(parked_keys) == 1
+        key = parked_keys[0]
+        assert key.startswith("parked:wf-1:run-1:")
+        assert re.fullmatch(r"parked:wf-1:run-1:[0-9a-f]{12}", key)
+        assert key != "parked:wf-1:run-1"
         store.close()
 
 
