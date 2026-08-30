@@ -55,7 +55,11 @@ def _research_run(args: argparse.Namespace) -> int:
     import pathlib
 
     from fleet_graph.graphs.research_pipeline import derive_research_id
-    from fleet_graph.graphs.research_runner import ResearchConfig, run_research
+    from fleet_graph.graphs.research_runner import (
+        ResearchConfig,
+        default_publisher,
+        run_research,
+    )
 
     config = ResearchConfig(
         question=args.question,
@@ -66,7 +70,7 @@ def _research_run(args: argparse.Namespace) -> int:
         max_clues=args.max_clues,
         checkpoint_path=args.checkpoint,
     )
-    result = run_research(config)
+    result = run_research(config, publisher=default_publisher())
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
     sys.stdout.write("\n")
     # 终态 ∈ {converged, capped, partial} 才算跑通；fault 非零退出（规格第 9 条）。

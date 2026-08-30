@@ -31,6 +31,24 @@ from langgraph.graph import END, START, StateGraph
 from fleet_graph.executors.agent_run import AgentRunSpec, RunWaitTimeout, derive_run_id
 from fleet_graph.executors.text_node import TextSpec
 from fleet_graph.graphs.adapters import parse_envelope
+from fleet_graph.research_bus import (
+    DOC_KIND_REPORT,
+    PIPELINE_STATUS_TO_PROTOCOL,
+    RESEARCH_CLUE_KIND,
+    RESEARCH_DOC_KIND,
+    RESEARCH_EVIDENCE_KIND,
+    body_digest,
+    clue_idempotency_key,
+    clue_index_channel,
+    clue_payload,
+    doc_idempotency_key,
+    doc_payload,
+    docs_channel,
+    evidence_channel,
+    evidence_idempotency_key,
+    evidence_payload,
+    publish_best_effort,
+)
 from fleet_graph.state.run_artifacts import iso, write_json_durable
 
 # role 名（规格第 8 条）：agent-runtime 侧 role 由另单交付，本单测试全部用 fake
@@ -155,6 +173,9 @@ class ResearchState(TypedDict, total=False):
     pending_clue_id: str
     terminal: str
     terminal_reason: str
+    #: clue 实体在 bus 上的版本头（message_id），维护 ``research.clue.v2`` 的
+    #: ``supersedes`` 版本链。只装 id（规格第 7 条：state 只装 id 与计数）。
+    clue_heads: dict[str, str]
 
 
 @dataclass
@@ -176,6 +197,10 @@ class ResearchDeps:
     poll_interval: float = 2.0
     observe: Any = None
     clock: Any = None
+    #: 发布端口：协议上等价 ``BusClient.publish``（含 entity_id / supersedes /
+    #: idempotency_key）。生产装配真实 BusClient；测试注入 fake transport。
+    #: None = 不发布（best-effort 降级，同 observe 缺失时一样静默）。
+    publisher: Any = None
 
     def now(self) -> float:
         return self.clock() if self.clock is not None else time.time()
@@ -298,6 +323,88 @@ def _observe(deps: ResearchDeps, entry: dict[str, Any]) -> None:
         deps.observe(entry)
 
 
+def _publish_clue(
+    deps: ResearchDeps,
+    *,
+    clue_id: str,
+    text: str,
+    status: str,
+    depth: int,
+    retry: int,
+    supersedes: str | None = None,
+    run_id: str | None = None,
+    sources: list[str] | None = None,
+) -> str | None:
+    """发布一条 clue 状态迁移到 ``research:{research_id}.index``（research.clue.v2）。
+
+    root 实体：稳定 entity_id = clue_id，版本链经 ``supersedes``。幂等 key 由
+    run/clue/status/retry 内容寻址派生，kill-restart 重派同 key 不产生重复实体。
+    best-effort：失败只降级记录，返回 message_id 或 None。
+    """
+    protocol_status = PIPELINE_STATUS_TO_PROTOCOL[status]
+    payload = clue_payload(
+        text=text,
+        status=protocol_status,
+        depth=depth,
+        sources=sources,
+        run_id=run_id,
+    )
+    key = clue_idempotency_key(deps.research_id, clue_id, protocol_status, retry)
+    return publish_best_effort(
+        deps.publisher,
+        channel_id=clue_index_channel(deps.research_id),
+        kind=RESEARCH_CLUE_KIND,
+        payload=payload,
+        idempotency_key=key,
+        entity_id=clue_id,
+        supersedes=supersedes,
+    )
+
+
+def _publish_evidence(
+    deps: ResearchDeps, *, clue_id: str, finding: dict[str, Any], depth: int
+) -> str | None:
+    """发布一条 finding 到 ``research:{research_id}.evidence``（research.evidence.v2）。
+
+    leaf 实体：无版本链；``clue_id`` 指 clue 的 entity_id。幂等 key 由 finding
+    内容寻址派生。best-effort：失败只降级记录。
+    """
+    payload = evidence_payload(clue_id=clue_id, finding=finding)
+    key = evidence_idempotency_key(deps.research_id, clue_id, finding)
+    return publish_best_effort(
+        deps.publisher,
+        channel_id=evidence_channel(deps.research_id),
+        kind=RESEARCH_EVIDENCE_KIND,
+        payload=payload,
+        idempotency_key=key,
+    )
+
+
+def _publish_doc(deps: ResearchDeps, *, body: str) -> str | None:
+    """发布 synthesis 报告到 ``research:{research_id}.docs``（research.doc.v2）。
+
+    leaf 实体：``doc_kind=report``，``origin=research_id``，``digest`` = 正文内容
+    寻址（全局去重键）。幂等 key 由 digest 派生。best-effort：失败只降级记录。
+    """
+    digest = body_digest(body)
+    payload = doc_payload(
+        doc_kind=DOC_KIND_REPORT, digest=digest, body=body, origin=deps.research_id
+    )
+    key = doc_idempotency_key(deps.research_id, digest)
+    return publish_best_effort(
+        deps.publisher,
+        channel_id=docs_channel(deps.research_id),
+        kind=RESEARCH_DOC_KIND,
+        payload=payload,
+        idempotency_key=key,
+    )
+
+
+def _head(clue_heads: dict[str, str] | None, clue_id: str) -> str | None:
+    """某 clue 实体当前的 bus 版本头 message_id（版本链 supersedes 用）。"""
+    return (clue_heads or {}).get(clue_id)
+
+
 # --- 节点 -------------------------------------------------------------------
 
 
@@ -329,6 +436,7 @@ def _seed_node(deps: ResearchDeps):
             }
 
         clues: list[dict[str, Any]] = []
+        heads: dict[str, str] = {}
         for query in queries:
             clue_id = derive_clue_id(query)
             if _clue(clues, clue_id) is not None:
@@ -336,9 +444,21 @@ def _seed_node(deps: ResearchDeps):
                 continue
             _write_clue_file(deps.run_root, clue_id, query, depth=0)
             clues.append({"id": clue_id, "status": CLUE_OPEN, "depth": 0, "retry": 0})
+            # 发布初始 open 状态（research.clue.v2，root 版本链起点）。
+            mid = _publish_clue(
+                deps, clue_id=clue_id, text=query, status=CLUE_OPEN, depth=0, retry=0
+            )
+            if mid:
+                heads[clue_id] = mid
 
         _observe(deps, {"event": "seed", "clues": len(clues)})
-        return {"clues": clues, "coverage": 0, "zero_growth_rounds": 0, "rounds": 0}
+        return {
+            "clues": clues,
+            "clue_heads": heads,
+            "coverage": 0,
+            "zero_growth_rounds": 0,
+            "rounds": 0,
+        }
 
     return seed
 
@@ -366,8 +486,24 @@ def _dispatch_node(deps: ResearchDeps):
         )
 
         _observe(deps, {"event": "dispatch", "clue_id": clue_id, "retry": clue["retry"]})
+        # 发布 open -> dispatched 迁移（research.clue.v2，supersedes 接上一版本头）。
+        heads = dict(state.get("clue_heads", {}))
+        run_id = worker_run_id(deps.thread_id, clue_id, clue["retry"])
+        mid = _publish_clue(
+            deps,
+            clue_id=clue_id,
+            text=query,
+            status=CLUE_DISPATCHED,
+            depth=clue["depth"],
+            retry=clue["retry"],
+            supersedes=_head(heads, clue_id),
+            run_id=run_id,
+        )
+        if mid:
+            heads[clue_id] = mid
         return {
             "clues": _set_clue(clues, clue_id, status=CLUE_DISPATCHED),
+            "clue_heads": heads,
             "pending_clue_id": clue_id,
         }
 
@@ -417,13 +553,28 @@ def _collect_node(deps: ResearchDeps):
                 {"event": "collect", "clue_id": clue_id, "run_id": run_id, "timeout": True},
             )
             retry = clue["retry"] + 1
+            new_status = CLUE_BLOCKED if retry >= MAX_RETRIES else CLUE_OPEN
+            heads = dict(state.get("clue_heads", {}))
+            query = _read_clue_query(deps.run_root, clue_id)
+            mid = _publish_clue(
+                deps,
+                clue_id=clue_id,
+                text=query,
+                status=new_status,
+                depth=clue["depth"],
+                retry=retry,
+                supersedes=_head(heads, clue_id),
+            )
+            if mid:
+                heads[clue_id] = mid
             return {
                 "clues": _set_clue(
                     clues,
                     clue_id,
                     retry=retry,
-                    status=CLUE_BLOCKED if retry >= MAX_RETRIES else CLUE_OPEN,
-                )
+                    status=new_status,
+                ),
+                "clue_heads": heads,
             }
         # run 结果落盘（harvest 据此提取新线索，resume 后也能重读）。
         write_json_durable(_result_path(deps.run_root, clue_id), status.result or {})
@@ -445,21 +596,49 @@ def _collect_node(deps: ResearchDeps):
                 # 信封解析失败按 clue 失败处理（retry/block），绝不 fault 整图。
                 declared = None
 
+        heads = dict(state.get("clue_heads", {}))
         if declared is not None:
             for finding in declared["findings"]:
                 _append_evidence(deps.run_root, clue_id, clue["depth"], finding, deps.now())
+                # 每条 finding -> research.evidence.v2（leaf，clue_id 指 clue 的 entity_id）。
+                _publish_evidence(deps, clue_id=clue_id, finding=finding, depth=clue["depth"])
             new_clues = _set_clue(clues, clue_id, status=CLUE_DONE)
+            query = _read_clue_query(deps.run_root, clue_id)
+            mid = _publish_clue(
+                deps,
+                clue_id=clue_id,
+                text=query,
+                status=CLUE_DONE,
+                depth=clue["depth"],
+                retry=clue["retry"],
+                supersedes=_head(heads, clue_id),
+            )
+            if mid:
+                heads[clue_id] = mid
         else:
             retry = clue["retry"] + 1
+            new_status = CLUE_BLOCKED if retry >= MAX_RETRIES else CLUE_OPEN
             new_clues = _set_clue(
                 clues,
                 clue_id,
                 retry=retry,
-                status=CLUE_BLOCKED if retry >= MAX_RETRIES else CLUE_OPEN,
+                status=new_status,
             )
+            query = _read_clue_query(deps.run_root, clue_id)
+            mid = _publish_clue(
+                deps,
+                clue_id=clue_id,
+                text=query,
+                status=new_status,
+                depth=clue["depth"],
+                retry=retry,
+                supersedes=_head(heads, clue_id),
+            )
+            if mid:
+                heads[clue_id] = mid
 
         _observe(deps, {"event": "collect", "clue_id": clue_id, "run_id": run_id, "ok": status.ok})
-        return {"clues": new_clues}
+        return {"clues": new_clues, "clue_heads": heads}
 
     return collect
 
@@ -471,6 +650,7 @@ def _harvest_node(deps: ResearchDeps):
             return {}
 
         clues = state.get("clues", [])
+        heads = dict(state.get("clue_heads", {}))
         clue = _clue(clues, clue_id)
         if clue is not None and clue["status"] == CLUE_DONE:
             raw = json.loads(_result_path(deps.run_root, clue_id).read_text(encoding="utf-8"))
@@ -496,6 +676,17 @@ def _harvest_node(deps: ResearchDeps):
                     *clues,
                     {"id": child_id, "status": CLUE_OPEN, "depth": depth, "retry": 0},
                 ]
+                # 新子线索入板即发布初始 open（research.clue.v2 版本链起点）。
+                mid = _publish_clue(
+                    deps,
+                    clue_id=child_id,
+                    text=text.strip(),
+                    status=CLUE_OPEN,
+                    depth=depth,
+                    retry=0,
+                )
+                if mid:
+                    heads[child_id] = mid
 
         coverage = _done_count(clues)
         zero_growth = (
@@ -506,6 +697,7 @@ def _harvest_node(deps: ResearchDeps):
         _observe(deps, {"event": "harvest", "rounds": rounds, "coverage": coverage})
         return {
             "clues": clues,
+            "clue_heads": heads,
             "coverage": coverage,
             "zero_growth_rounds": zero_growth,
             "rounds": rounds,
@@ -600,6 +792,9 @@ def _synthesis_node(deps: ResearchDeps):
             }
 
         (deps.run_root / REPORT_FILE).write_text(report, encoding="utf-8")
+        # synthesis 报告 -> research.doc.v2（leaf，doc_kind=report，origin=research_id，
+        # digest = 正文内容寻址）。本地镜像照旧写 report.md。
+        _publish_doc(deps, body=report)
         _observe(deps, {"event": "synthesis", "run_id": run_id})
         return {}
 
