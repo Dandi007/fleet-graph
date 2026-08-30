@@ -70,7 +70,9 @@
       "max_rounds": 9999,
       "alias": "ronin-dr-v4",
       "enabled": true,
-      "_provenance": "2026-08-30 23:4x 第七波入编（用户拍板 B：deep-research 重档放弃续修 loop-engine，在 fleet-graph research_pipeline 上彻底重构；用户硬约束：R1-R8 严格按依赖序全做，改序/跳项属 B 类升报 user-only）。诊断 wf-b9be03；判据 SSoT wf-3f87f3/constitution.md；方向权 vault-ee session，gate/收割 cc-supervisor。"
+      "_provenance": "2026-08-30 23:4x 第七波入编（用户拍板 B：deep-research 重档放弃续修 loop-engine，在 fleet-graph research_pipeline 上彻底重构；用户硬约束：R1-R8 严格按依赖序全做，改序/跳项属 B 类升报 user-only）。诊断 wf-b9be03；判据 SSoT wf-3f87f3/constitution.md；方向权 vault-ee session，gate/收割 cc-supervisor。",
+      "generation": 2,
+      "_generation_note": "2026-08-31 00:0x 监督面抬代破崩溃循环：g1 崩于 started.v2 幂等 409（resume 复用 run_id），未写 terminal 致计数不推进、scheduler 永久 resume 废线程。roster 抬 generation=2 走 generation_of 的 max() 立即生效。根修（lifecycle 幂等容忍/attempt 维幂等键 + 无 terminal 崩溃的计数推进）已立案 wf-216dc3。"
     },
     {
       "folder_id": "wf-6475fd",
