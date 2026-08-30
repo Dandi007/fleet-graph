@@ -14,6 +14,7 @@ advances a generation.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from langgraph.types import Command
@@ -55,6 +56,7 @@ class LineInterruptPort:
         board: Any = None,
         card_entity_id: str = "",
         run_id: str = "",
+        stall_state_path: str | Path | None = None,
     ) -> None:
         self.folder_id = folder_id
         self._generation = int(generation)
@@ -62,6 +64,15 @@ class LineInterruptPort:
         self.board = board
         self.card_entity_id = card_entity_id
         self.run_id = run_id
+        #: The scheduler's per-line stall-state file
+        #: (``.scheduler/<folder_id>.json``). When provided, ``persist`` writes
+        #: the interrupt's question note / card into the stall state's
+        #: ``board_question_note_id`` / ``board_card_entity_id`` fields, so the
+        #: decision bridge's ``LineOwnerSource`` (which only reads the stall
+        #: state) can map a ``work.decision.v1`` answering this E2 question back
+        #: to the parked line. None (tests, offline) keeps the old behaviour:
+        #: only the goal-interrupt store is written.
+        self.stall_state_path = Path(stall_state_path) if stall_state_path else None
 
     def generation(self) -> int:
         return self._generation
@@ -139,6 +150,49 @@ class LineInterruptPort:
 
     def persist(self, checkpoint: InterruptCheckpoint) -> None:
         self.store.put_interrupt(checkpoint.as_dict())
+        self._sync_scheduler_stall(checkpoint)
+
+    def _sync_scheduler_stall(self, checkpoint: InterruptCheckpoint) -> None:
+        """Write-side convergence: mirror the interrupt's board facts into the
+        scheduler's stall-state file.
+
+        The decision bridge's ``LineOwnerSource`` discovers parked lines by
+        reading *only* ``.scheduler/<folder_id>.json`` and mapping on
+        ``board_question_note_id``. The E2 interrupt used to persist its
+        question note to ``goal-interrupt.sqlite3`` alone, so a
+        ``work.decision.v1`` answering it resolved nobody and the human's
+        verdict was swallowed as ``no_waiting_owner`` (the #170 follow-up
+        bug). This read-modify-write sets the stall state's board fields to the
+        same question note / card the interrupt asked, idempotently, while
+        preserving every other field the scheduler owns (streak, generation,
+        parking snapshot). Fail-soft like the daemon's own stall write: the
+        goal-interrupt store remains the durable source of truth, so a stall
+        file that cannot be written never faults the suspension.
+        """
+        if self.stall_state_path is None:
+            return
+        path = self.stall_state_path
+        try:
+            raw = path.read_text(encoding="utf-8") if path.exists() else None
+        except OSError:
+            return
+        state: dict[str, Any] = {}
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except (OSError, json.JSONDecodeError):
+                return
+            if isinstance(parsed, dict):
+                state = parsed
+        if checkpoint.question_note_id:
+            state["board_question_note_id"] = checkpoint.question_note_id
+        if checkpoint.card_entity_id:
+            state["board_card_entity_id"] = checkpoint.card_entity_id
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+        except OSError:
+            pass
 
     def record_turn_result(self, turn_id: str, result: dict[str, Any]) -> None:
         self.store.record_turn_result(turn_id, result)
