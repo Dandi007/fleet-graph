@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -363,7 +364,12 @@ def write_dd_development(
 
 
 class TestHarvestableView:
-    def _config(self, tmp_path: Path) -> FleetStateConfig:
+    def _config(
+        self,
+        tmp_path: Path,
+        *,
+        landed_in_default_branch: Callable[[str], bool] | None = None,
+    ) -> FleetStateConfig:
         return FleetStateConfig(
             host="127.0.0.1",
             port=0,  # ephemeral: never collide with the live :7494 read-model
@@ -371,6 +377,7 @@ class TestHarvestableView:
             dd_root=tmp_path / "dd",
             lines_config=tmp_path / "missing.json",
             bridge_state_dir=tmp_path / "bridge",
+            landed_in_default_branch=landed_in_default_branch,
         )
 
     def test_empty_dd_root_degrades_to_empty_list(self, tmp_path: Path) -> None:
@@ -378,48 +385,94 @@ class TestHarvestableView:
         assert payload["schema_version"] == LINES_SCHEMA_VERSION
         assert payload["developments"] == []
 
-    def test_lists_only_gate_passed_unmerged_developments(self, tmp_path: Path) -> None:
+    def test_refused_terminal_is_never_harvestable(self, tmp_path: Path) -> None:
         dd_root = tmp_path / "dd"
-        # Unharvested: head_commit set, terminal != complete.
-        write_dd_development(dd_root, "dev-harvest", head_commit="abc123", terminal="done")
-        # Merged / complete: not harvestable.
-        write_dd_development(dd_root, "dev-complete", head_commit="def456", terminal="complete")
-        # Never passed a gate: no head_commit.
-        write_dd_development(dd_root, "dev-no-commit", head_commit="", terminal="fault")
+        write_dd_development(dd_root, "dev-refused", head_commit="abc123", terminal="refused")
         payload = FleetStateView(self._config(tmp_path)).harvestable()
+        assert payload["developments"] == []
+
+    def test_fault_terminal_is_never_harvestable(self, tmp_path: Path) -> None:
+        dd_root = tmp_path / "dd"
+        write_dd_development(dd_root, "dev-fault", head_commit="abc123", terminal="fault")
+        payload = FleetStateView(self._config(tmp_path)).harvestable()
+        assert payload["developments"] == []
+
+    def test_empty_terminal_and_inflight_are_never_harvestable(self, tmp_path: Path) -> None:
+        dd_root = tmp_path / "dd"
+        # Empty terminal: never listed.
+        write_dd_development(dd_root, "dev-empty", head_commit="abc123", terminal="")
+        # In-flight (non-complete terminal): never listed.
+        write_dd_development(dd_root, "dev-inflight", head_commit="abc123", terminal="implement")
+        payload = FleetStateView(self._config(tmp_path)).harvestable()
+        assert payload["developments"] == []
+
+    def test_complete_unharvested_is_listed(self, tmp_path: Path) -> None:
+        dd_root = tmp_path / "dd"
+        write_dd_development(dd_root, "dev-unharvested", head_commit="abc123", terminal="complete")
+        # Not landed on the default branch -> harvestable.
+        view = FleetStateView(
+            self._config(tmp_path, landed_in_default_branch=lambda _commit: False)
+        )
+        payload = view.harvestable()
         assert payload["developments"] == [
             {
-                "development_id": "dev-harvest",
+                "development_id": "dev-unharvested",
                 "head_commit": "abc123",
                 "stage": "implement",
-                "terminal": "done",
+                "terminal": "complete",
             }
         ]
 
+    def test_complete_harvested_is_excluded(self, tmp_path: Path) -> None:
+        dd_root = tmp_path / "dd"
+        write_dd_development(dd_root, "dev-harvested", head_commit="def456", terminal="complete")
+        # Already landed on the default branch -> harvested, not listed.
+        view = FleetStateView(self._config(tmp_path, landed_in_default_branch=lambda _commit: True))
+        payload = view.harvestable()
+        assert payload["developments"] == []
+
+    def test_landing_check_failure_degrades_to_unharvested(self, tmp_path: Path) -> None:
+        """A landing query failure must list the complete development (spec:
+        读取/查询失败降级,绝不 5xx、绝不崩溃) -- never raise, never 5xx."""
+        dd_root = tmp_path / "dd"
+        write_dd_development(dd_root, "dev-unverified", head_commit="abc123", terminal="complete")
+
+        def boom(_commit: str) -> bool:
+            raise RuntimeError("git unreadable")
+
+        view = FleetStateView(self._config(tmp_path, landed_in_default_branch=boom))
+        payload = view.harvestable()
+        assert [d["development_id"] for d in payload["developments"]] == ["dev-unverified"]
+
     def test_missing_status_or_record_degrades_the_entry(self, tmp_path: Path) -> None:
         dd_root = tmp_path / "dd"
-        write_dd_development(dd_root, "dev-ok", head_commit="abc123", terminal="done")
+        write_dd_development(dd_root, "dev-ok", head_commit="abc123", terminal="complete")
         write_dd_development(
             dd_root,
             "dev-no-status",
             head_commit="def456",
-            terminal="done",
+            terminal="complete",
             missing_status=True,
         )
         write_dd_development(
             dd_root,
             "dev-no-record",
             head_commit="123456",
-            terminal="done",
+            terminal="complete",
             missing_record=True,
         )
-        payload = FleetStateView(self._config(tmp_path)).harvestable()
+        view = FleetStateView(
+            self._config(tmp_path, landed_in_default_branch=lambda _commit: False)
+        )
+        payload = view.harvestable()
         assert [d["development_id"] for d in payload["developments"]] == ["dev-ok"]
 
     def test_harvestable_is_served_over_the_wire(self, tmp_path: Path) -> None:
         dd_root = tmp_path / "dd"
-        write_dd_development(dd_root, "dev-harvest", head_commit="abc123", terminal="done")
-        server = FleetStateHTTPServer(self._config(tmp_path))
+        write_dd_development(dd_root, "dev-harvest", head_commit="abc123", terminal="complete")
+        server = FleetStateHTTPServer(
+            self._config(tmp_path, landed_in_default_branch=lambda _commit: False)
+        )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         port = server.server_address[1]

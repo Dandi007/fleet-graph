@@ -531,6 +531,8 @@ def _state_serve(args: argparse.Namespace) -> int:
             lines_config=pathlib.Path(args.lines_config),
             bridge_state_dir=pathlib.Path(args.bridge_state_dir),
             bus_url=args.bus_url,
+            repo_path=pathlib.Path(args.repo_path) if args.repo_path else None,
+            default_branch=args.default_branch,
         )
     )
     return 0
@@ -1371,6 +1373,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="optional agent-bus base URL for the published-decisions view "
         "(read-only; unset or unreadable degrades to receipts only)",
+    )
+    state_serve.add_argument(
+        "--repo-path",
+        default=None,
+        help="git repo whose default branch decides whether a complete "
+        "development's product commit has been harvested (read-only; the "
+        "E5 landing check degrades to unharvested when unset or unreadable)",
+    )
+    state_serve.add_argument(
+        "--default-branch",
+        default="main",
+        help="the default branch of --repo-path the E5 landing check compares "
+        "product commits against (content-equivalent)",
     )
     state_serve.set_defaults(func=_state_serve)
 

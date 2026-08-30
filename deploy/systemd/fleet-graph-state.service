@@ -30,7 +30,8 @@ Type=simple
 WorkingDirectory=/data/apps/fleet-graph/current
 ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph state serve \
     --host 127.0.0.1 --port 7494 \
-    --lines-config /data/apps/fleet-graph/current/config/ronin-lines.json
+    --lines-config /data/apps/fleet-graph/current/config/ronin-lines.json \
+    --repo-path /data/code/self/fleet-graph --default-branch main
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

@@ -48,6 +48,11 @@ DEFAULT_LINES_CONFIG = Path("config/ronin-lines.json")
 DEFAULT_BRIDGE_STATE_DIR = Path("/data/fleet-graph/decision-bridge")
 DEFAULT_BRIDGE_DB_NAME = "bridge.sqlite3"
 
+#: The main checkout whose default branch decides whether a product commit
+#: has been harvested. Read-only git only: nothing here ever writes to it.
+DEFAULT_REPO_PATH = Path("/data/code/self/fleet-graph")
+DEFAULT_DEFAULT_BRANCH = "main"
+
 #: 送达链状态（closed）。
 STATE_PUBLISHED = "published"
 STATE_BRIDGED = "bridged"
@@ -76,6 +81,15 @@ class FleetStateConfig:
     lines_config: Path = DEFAULT_LINES_CONFIG
     bridge_state_dir: Path = DEFAULT_BRIDGE_STATE_DIR
     bus_url: str | None = None
+    #: The repo whose default branch decides whether a product commit has been
+    #: harvested (content-equivalent landing check; read-only git, never write).
+    #: None disables the check and degrades every `complete` development to
+    #: "not landed" (harvestable) -- see `_default_landed_in_default_branch`.
+    repo_path: Path | None = None
+    default_branch: str = DEFAULT_DEFAULT_BRANCH
+    #: Inject the `landed_in_default_branch(commit) -> bool` predicate. None
+    #: uses the git-backed production default (`repo_path` + `default_branch`).
+    landed_in_default_branch: Callable[[str], bool] | None = None
     clock: Callable[[], float] = time.time
 
 
@@ -172,6 +186,41 @@ def _receipt_to_decision(receipt: dict[str, Any]) -> dict[str, Any]:
     return obj
 
 
+def _default_landed_in_default_branch(config: FleetStateConfig) -> Callable[[str], bool]:
+    """The production default `landed_in_default_branch(commit) -> bool`.
+
+    Read-only git against ``config.repo_path``'s ``config.default_branch``:
+    a product commit counts as *landed* when its **tree** appears among the
+    trees of the commits reachable from the default branch. That is a content
+    equivalence, not a literal SHA ancestry test: a squash that rewrote the
+    SHA but produced the same tree (a clean squash onto the same base) is
+    still detected as landed.
+
+    Any read/query failure (missing repo, missing branch, unknown commit,
+    git not available) degrades to ``False`` -- the development is treated as
+    *unharvested* and stays listed -- and never raises, never 5xx (spec:
+    读取/查询失败降级,绝不 5xx、绝不崩溃). ``repo_path is None`` (not
+    configured) disables the check and also degrades to ``False``.
+    """
+
+    repo = config.repo_path
+    branch = config.default_branch
+
+    def landed(commit: str) -> bool:
+        if not repo:
+            return False
+        try:
+            from fleet_graph.dd.git import run_git
+
+            tree = run_git(repo, "rev-parse", f"{commit}^{{tree}}", check=True).stdout.strip()
+            trees = set(run_git(repo, "log", "--format=%T", branch, check=True).stdout.split())
+            return tree in trees
+        except Exception:
+            return False
+
+    return landed
+
+
 def _read_published(config: FleetStateConfig, seen: set[str]) -> list[dict[str, Any]]:
     """Best-effort bus decisions without a bridge receipt → ``published``.
 
@@ -212,6 +261,9 @@ class FleetStateView:
 
     def __init__(self, config: FleetStateConfig) -> None:
         self.config = config
+        self._landed_in_default_branch = (
+            config.landed_in_default_branch or _default_landed_in_default_branch(config)
+        )
 
     def lines(self) -> dict[str, Any]:
         roster, run_root = _read_roster(self.config)
@@ -282,10 +334,12 @@ class FleetStateView:
 
         For every admitted development under the dd root we pull
         ``record.json`` (admission identity) and ``status.json`` (stage /
-        terminal / head_commit). A development is *harvestable* when it passed
-        its gate but its product commit is not yet on the default branch --
-        mechanically: ``head_commit`` non-empty and ``terminal != "complete"``.
-        Bad artifacts degrade that entry, never the whole table.
+        terminal / head_commit). A development is *harvestable* exactly when
+        it reached ``terminal == "complete"`` and its product commit has not
+        landed on the default branch (content-equivalent check). refused /
+        fault / empty terminal / in-flight developments are never listed, and
+        a landing query failure degrades to "not landed" (listed) -- never a
+        5xx, never a crash. Bad artifacts degrade that entry, never the table.
         """
         developments: list[dict[str, Any]] = []
         dd_root = self.config.dd_root
@@ -303,11 +357,28 @@ class FleetStateView:
             status = _read_json(entry / "status.json")
             if status is None:
                 # Unreadable/missing status degrades the entry away: without
-                # head_commit we cannot claim it passed a gate.
+                # terminal + head_commit we cannot claim it is harvestable.
+                continue
+            terminal = str(status.get("terminal") or "")
+            if terminal != "complete":
+                # E5 approved_unharvested: only a `complete` terminal can be
+                # an approved-but-unharvested development. refused / fault /
+                # empty terminal / in-flight are never listed.
                 continue
             head_commit = str(status.get("head_commit") or "")
-            terminal = str(status.get("terminal") or "")
-            if not head_commit or terminal == "complete":
+            if not head_commit:
+                # No product commit to check landing against: nothing
+                # mechanical to say, so nothing to report.
+                continue
+            try:
+                landed = bool(self._landed_in_default_branch(head_commit))
+            except Exception:
+                # A landing-query failure degrades to "not landed" (listed):
+                # never a 5xx, never a crash (spec: 读取/查询失败降级).
+                landed = False
+            if landed:
+                # The product commit's content already reached the default
+                # branch: harvested, no longer the supervisor's business.
                 continue
             developments.append(
                 {
@@ -368,9 +439,11 @@ def serve(config: FleetStateConfig) -> None:
 __all__ = [
     "DEFAULT_BRIDGE_STATE_DIR",
     "DEFAULT_DD_ROOT",
+    "DEFAULT_DEFAULT_BRANCH",
     "DEFAULT_HOST",
     "DEFAULT_LINES_CONFIG",
     "DEFAULT_PORT",
+    "DEFAULT_REPO_PATH",
     "DEFAULT_RUN_ROOT",
     "SCHEMA_VERSION",
     "FleetStateConfig",
