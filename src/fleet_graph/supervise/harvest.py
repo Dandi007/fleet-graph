@@ -14,14 +14,16 @@ SOP（spec 交付 B）逐节点实现，全部是 script 节点（机械判定�
                    已等价 -> outcome=already_harvested，无写动作。
 5. `worktree`     —— 独立 worktree cherry-pick 产品 commit，冲突消解（即兴）。
 6. `verify`       —— 在 worktree 跑全量套件（make verify），记 exit code。
-7. `pr_merge`     —— PR -> squash merge。
-8. `pull`         —— ff-only pull 默认分支。
-9. `deploy`       —— 运行 allowlist 允许的部署命令。
-10. `verify_real` —— 真机 verify，记 exit code。
-11. `evidence`    —— evidence note 挂卡。
-12. `postconditions` —— 代码核验（交付 B.3）：PR merged + verify 零退出 +
+7. `cleanup_worktree` —— verify 之后移除一次性 worktree（harvest_ops 成功路径
+   保留 worktree 供 verify 使用，见 rc-702098ab）。
+8. `pr_merge`     —— PR -> squash merge。
+9. `pull`         —— ff-only pull 默认分支。
+10. `deploy`      —— 运行 allowlist 允许的部署命令。
+11. `verify_real` —— 真机 verify，记 exit code。
+12. `evidence`    —— evidence note 挂卡。
+13. `postconditions` —— 代码核验（交付 B.3）：PR merged + verify 零退出 +
    evidence note 存在，三缺任一 -> outcome=escalated（失败/升报）。
-13. `receipt`     —— 结果落 supervisor 自己的 state root。
+14. `receipt`     —— 结果落 supervisor 自己的 state root。
 
 **生成-验证分离**（交付 B.4）：所有写动作都落在 allowlist 圈定目标——写原语
 （git/部署执行）全部被 gate 节点与逐写步骤的 authorize 判定包住；编排层不直接
@@ -71,6 +73,7 @@ SOP_STEPS = (
     "cherry_check",
     "worktree_cherry_pick",
     "run_verify",
+    "cleanup_worktree",
     "pr_squash_merge",
     "ff_only_pull",
     "deploy",
@@ -91,6 +94,7 @@ class HarvestOps(Protocol):
     def worktree_cherry_pick(
         self, repo: Path, head_commit: str, default_branch: str, worktree_root: Path
     ) -> dict[str, Any]: ...
+    def remove_worktree(self, repo: Path, worktree_root: Path) -> dict[str, Any]: ...
     def run_verify(self, worktree: Path, argv: list[str]) -> int: ...
     def pr_squash_merge(
         self, repo: Path, head_commit: str, default_branch: str
@@ -350,6 +354,35 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         )
         return {"steps": steps, "verify_exit_code": exit_code}
 
+    def cleanup_worktree(state: HarvestState) -> HarvestState:
+        """verify 之后移除一次性 worktree。
+
+        harvest_ops 成功路径保留 worktree 供 `run_verify` 在真实目录上跑全量套件
+        （rc-702098ab：finally 提前删除会导致 verify 永远 127）；这里在 verify
+        完成之后清理。仍是写动作，走同一个 allowlist 门（拒绝 -> refused）。
+        """
+        auth = authorize_harvest_write(
+            deps.allowlist,
+            repo_path=state.get("repo_path") or "",
+            branch=_branch_ref(state.get("default_branch") or DEFAULT_BRANCH),
+            deploy=(),
+        )
+        if not auth.granted:
+            return {
+                "steps": _record_auth(state, auth, "cleanup_worktree"),
+                "outcome": OUTCOME_REFUSED,
+            }
+        repo = Path(state.get("repo_path") or "")
+        worktree_root = deps.thread_dir(_event_of(state).key) / "worktree"
+        try:
+            result = deps.ops.remove_worktree(repo, worktree_root)
+        except Exception as exc:
+            return {
+                "steps": _record_step(state, "cleanup_worktree", ok=False, detail=repr(exc)[:300])
+            }
+        steps = _record_step(state, "cleanup_worktree", **result)
+        return {"steps": steps}
+
     def pr_merge(state: HarvestState) -> HarvestState:
         auth = authorize_harvest_write(
             deps.allowlist,
@@ -531,6 +564,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
     graph.add_node("cherry", cherry)
     graph.add_node("worktree", worktree)
     graph.add_node("verify", verify)
+    graph.add_node("cleanup_worktree", cleanup_worktree)
     graph.add_node("pr_merge", pr_merge)
     graph.add_node("pull", pull)
     graph.add_node("deploy", deploy)
@@ -545,7 +579,8 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
     graph.add_edge("fetch", "cherry")
     graph.add_conditional_edges("cherry", after_cherry, {"worktree", "receipt"})
     graph.add_edge("worktree", "verify")
-    graph.add_edge("verify", "pr_merge")
+    graph.add_edge("verify", "cleanup_worktree")
+    graph.add_edge("cleanup_worktree", "pr_merge")
     graph.add_edge("pr_merge", "pull")
     graph.add_edge("pull", "deploy")
     graph.add_edge("deploy", "verify_real")

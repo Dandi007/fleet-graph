@@ -102,7 +102,14 @@ class DefaultHarvestOps:
 
         一次性 detached worktree，冲突即兴消解：先尝试直接 cherry-pick，若因
         冲突失败则尝试 `-X theirs`（以默认分支为主）重跑；仍失败则如实报告
-        冲突，绝不强行覆盖。worktree 在每个路径上都会被清理。
+        冲突，绝不强行覆盖。
+
+        **worktree 生命周期（rc-702098ab 回归）**：成功路径保留 worktree，供
+        下一步 `run_verify` 在真实目录上跑全量套件（若 here 提前删除目录，
+        subprocess 必然 FileNotFoundError -> 127，verify 永远不能 0 退出）；
+        移除由编排层在 verify 之后的 `cleanup_worktree` 步骤调用
+        `remove_worktree` 统一负责。失败/冲突路径无可验证内容，在此立即清理，
+        不留给编排层。
         """
         if worktree_root.exists():
             shutil.rmtree(worktree_root, ignore_errors=True)
@@ -114,31 +121,38 @@ class DefaultHarvestOps:
                 "ok": False,
                 "detail": (added.stderr or added.stdout).strip()[:400],
             }
-        try:
-            picked = run_git(worktree_root, "cherry-pick", head_commit)
-            if picked.returncode == 0:
-                return {"ok": True, "method": "cherry-pick"}
-            if (
-                picked.returncode != 0
-                and b"conflict" not in (picked.stderr + picked.stdout).encode("utf-8").lower()
-            ):
-                return {
-                    "ok": False,
-                    "detail": (picked.stderr or picked.stdout).strip()[:400],
-                }
-            retried = run_git(worktree_root, "cherry-pick", "-X", "theirs", head_commit)
-            if retried.returncode == 0:
-                return {"ok": True, "method": "cherry-pick -X theirs"}
+        picked = run_git(worktree_root, "cherry-pick", head_commit)
+        if picked.returncode == 0:
+            return {"ok": True, "method": "cherry-pick"}
+        if (
+            picked.returncode != 0
+            and b"conflict" not in (picked.stderr + picked.stdout).encode("utf-8").lower()
+        ):
+            self.remove_worktree(repo, worktree_root)
             return {
                 "ok": False,
-                "conflicts": True,
-                "detail": (retried.stderr or retried.stdout).strip()[:400],
+                "detail": (picked.stderr or picked.stdout).strip()[:400],
             }
-        finally:
-            removed = run_git(repo, "worktree", "remove", "--force", str(worktree_root))
-            if removed.returncode != 0:
-                shutil.rmtree(worktree_root, ignore_errors=True)
-                run_git(repo, "worktree", "prune")
+        retried = run_git(worktree_root, "cherry-pick", "-X", "theirs", head_commit)
+        if retried.returncode == 0:
+            return {"ok": True, "method": "cherry-pick -X theirs"}
+        self.remove_worktree(repo, worktree_root)
+        return {
+            "ok": False,
+            "conflicts": True,
+            "detail": (retried.stderr or retried.stdout).strip()[:400],
+        }
+
+    def remove_worktree(self, repo: Path, worktree_root: Path) -> dict[str, Any]:
+        """移除 verify 之后的一次性 detached worktree（编排层 cleanup 步骤调用）。
+
+        `git worktree remove` 失败时兜底：删目录 + `git worktree prune` 清注册。
+        """
+        removed = run_git(repo, "worktree", "remove", "--force", str(worktree_root))
+        if removed.returncode != 0:
+            shutil.rmtree(worktree_root, ignore_errors=True)
+            run_git(repo, "worktree", "prune")
+        return {"ok": True}
 
     def run_verify(self, worktree: Path, argv: list[str]) -> int:
         return int(_run(list(argv), cwd=worktree).get("exit_code") or 0)

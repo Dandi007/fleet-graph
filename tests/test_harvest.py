@@ -9,6 +9,8 @@
    不执行任何写（fake ops 记录零次调用）。
 
 所有 git/部署操作都是注入的 fake ops，绝不触碰真实网络或生产 checkout。
+回归 rc-702098ab：DefaultHarvestOps 成功路径必须保留 worktree 供 run_verify
+使用，verify 之后才由 remove_worktree 清理。
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from conftest import git, head
 from fleet_graph.supervise.events import approved_unharvested_event, validate_event
 from fleet_graph.supervise.harvest import (
     OUTCOME_ALREADY_HARVESTED,
@@ -60,6 +63,10 @@ def fake_ops(
         ) -> dict[str, Any]:
             calls.append("worktree_cherry_pick")
             return {"ok": worktree_ok, "method": "cherry-pick"}
+
+        def remove_worktree(self, repo: Path, worktree_root: Path) -> dict[str, Any]:
+            calls.append("remove_worktree")
+            return {"ok": True}
 
         def run_verify(self, worktree: Path, argv: list[str]) -> int:
             calls.append("run_verify")
@@ -377,3 +384,78 @@ class TestGraphDispatch:
             )
         )
         assert graph is not None
+
+
+class TestDefaultHarvestOpsWorktreeLifecycle:
+    """回归 rc-702098ab：真实 git 上，成功路径的 worktree 必须活到 run_verify。
+
+    rc-702098ab：`worktree_cherry_pick` 的 finally 无条件删除 worktree，但
+    `run_verify` 要在同一路径跑 make verify -> 必然 127，子图永远到不了
+    HARVESTED。这里用真实 git 验证：cherry-pick 成功后 worktree 仍在，
+    run_verify 对同一目录能 0 退出，之后 remove_worktree 才清理。
+    """
+
+    def test_worktree_survives_cherry_pick_through_verify_then_is_removed(
+        self, tmp_path: Path
+    ) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "config", "user.email", "test@example.invalid")
+        git(repo, "config", "user.name", "test")
+        (repo / "base.txt").write_text("base\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "seed")
+
+        git(repo, "checkout", "-q", "-b", "feature")
+        (repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "product change")
+        product_commit = head(repo)
+        git(repo, "checkout", "-q", "main")
+
+        ops = DefaultHarvestOps()
+        worktree_root = tmp_path / "harvest-worktree"
+
+        picked = ops.worktree_cherry_pick(repo, product_commit, "main", worktree_root)
+        assert picked["ok"] is True, picked
+        assert worktree_root.is_dir(), "worktree removed before run_verify (rc-702098ab)"
+        assert (worktree_root / "feature.txt").read_text().strip() == "feature"
+
+        verify_exit = ops.run_verify(worktree_root, ["/bin/true"])
+        assert verify_exit == 0, "run_verify failed against a surviving worktree"
+
+        removed = ops.remove_worktree(repo, worktree_root)
+        assert removed["ok"] is True, removed
+        assert not worktree_root.exists(), "worktree not cleaned up after verify"
+
+    def test_conflict_path_still_reports_conflicts(self, tmp_path: Path) -> None:
+        """冲突路径行为不变：worktree add 失败/冲突都如实报告，不强行覆盖。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "config", "user.email", "test@example.invalid")
+        git(repo, "config", "user.name", "test")
+        (repo / "shared.txt").write_text("base\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "seed")
+
+        git(repo, "checkout", "-q", "-b", "feature")
+        (repo / "shared.txt").write_text("feature\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "product change")
+        product_commit = head(repo)
+        git(repo, "checkout", "-q", "main")
+        (repo / "shared.txt").write_text("main changed\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "main change")
+
+        ops = DefaultHarvestOps()
+        worktree_root = tmp_path / "harvest-worktree"
+        result = ops.worktree_cherry_pick(repo, product_commit, "main", worktree_root)
+        assert result.get("conflicts") is True or result["ok"] is False
+        assert not worktree_root.exists(), "failed worktree left behind"

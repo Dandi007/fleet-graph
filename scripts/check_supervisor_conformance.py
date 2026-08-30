@@ -107,6 +107,7 @@ HARVEST_WRITE_PRIMITIVES = frozenset(
         # ops-layer executions that reach the repo or host.
         "fetch_dd_ref",
         "worktree_cherry_pick",
+        "remove_worktree",
         "run_verify",
         "pr_squash_merge",
         "ff_only_pull",
