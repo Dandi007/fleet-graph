@@ -781,6 +781,8 @@ def _supervisor_run(args: argparse.Namespace) -> int:
         harvest_deploy_command=args.harvest_deploy,
         harvest_verify_argv=args.harvest_verify,
         harvest_verify_real_argv=args.harvest_verify_real,
+        # M4 E7: goal.md 直写目标线白名单（deny-all 默认）。
+        e7_allowlist_path=args.e7_allowlist,
     )
     result = run_supervisor(config)
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
@@ -1635,6 +1637,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="M3 harvest (E5): real-machine verify argv after deploy (defaults to 'make verify')",
+    )
+    supervisor_run.add_argument(
+        "--e7-allowlist",
+        default=None,
+        help="M4 E7 (decision_swallowed): E7 goal.md 直写目标线白名单 config file. "
+        "Deny-all when unset -- E7 then refuses every goal.md direct write and "
+        "records the refusal",
     )
     supervisor_run.set_defaults(func=_supervisor_run)
 
