@@ -55,6 +55,23 @@ class TestDecodeAccepts:
         with pytest.raises(ReportProtocolError):
             decode_report("```json\nnot json at all\n```")
 
+    def test_raw_control_characters_inside_strings_decode(self) -> None:
+        """dsv4pro 实测（2026-08-30 wf-216dc3 g1 整代烧毁）：模型在 JSON 字符串值里
+        直接输出原始换行/tab（未转义控制字符）。字符串内控制字符是 seat 噪音不是
+        协议违规——strict=False 收下；字符串外的结构性损坏照旧 malformed。"""
+        import json
+
+        body = json.dumps(report(summary="line one\nline two"))
+        raw_ctrl = body.replace("line one\\nline two", "line one\nline two\tend")
+        assert "\n" in raw_ctrl  # 字符串值内真实控制字符
+        decoded = decode_report(raw_ctrl)
+        assert decoded["schema_version"] == SCHEMA_VERSION
+        # 埋噪音尾部提取路径同样收下
+        noise = "[System: Empty message content sanitised to satisfy protocol]\n\n"
+        assert decode_report(noise + raw_ctrl)["schema_version"] == SCHEMA_VERSION
+        with pytest.raises(ReportProtocolError):
+            decode_report('{"schema_version": \n broken')
+
     def test_a_report_buried_after_gateway_noise_is_extracted(self) -> None:
         """SCNet 网关实测（2026-08-29）：空 assistant 消息被替换成
         '[System: Empty message content sanitised to satisfy protocol]'，seat 把

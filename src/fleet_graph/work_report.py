@@ -115,7 +115,10 @@ _REPORT_HEAD = re.compile(r"\{\s*\"schema_version\"")
 
 
 def _extract_embedded_report(text: str) -> dict[str, Any] | None:
-    decoder = json.JSONDecoder()
+    # strict=False: control characters inside string values are seat noise
+    # (raw newlines/tabs from the model), not protocol violations -- a whole
+    # generation died on one (wf-216dc3 g1, 2026-08-30).
+    decoder = json.JSONDecoder(strict=False)
     for match in reversed(list(_REPORT_HEAD.finditer(text))):
         try:
             parsed, _ = decoder.raw_decode(text, match.start())
@@ -132,7 +135,7 @@ def _coerce_object(raw: Any) -> dict[str, Any]:
         return raw
     if isinstance(raw, str):
         try:
-            parsed = json.loads(_strip_code_fence(raw))
+            parsed = json.loads(_strip_code_fence(raw), strict=False)
         except json.JSONDecodeError as exc:
             embedded = _extract_embedded_report(raw)
             if embedded is None:
