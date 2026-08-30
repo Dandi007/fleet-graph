@@ -31,6 +31,8 @@ packages = ["src/fleet_graph"]
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
+# dev-dispatch 命名空间是 controller 保留区：ruff（lint/format）不得检视/改写。
+extend-exclude = [".dev-dispatch"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
