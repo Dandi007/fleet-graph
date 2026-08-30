@@ -65,6 +65,14 @@
       "enabled": true
     },
     {
+      "folder_id": "wf-66300e",
+      "seat": "opencode-dsv4pro",
+      "max_rounds": 9999,
+      "alias": "ronin-dr-v4",
+      "enabled": true,
+      "_provenance": "2026-08-30 23:4x 第七波入编（用户拍板 B：deep-research 重档放弃续修 loop-engine，在 fleet-graph research_pipeline 上彻底重构；用户硬约束：R1-R8 严格按依赖序全做，改序/跳项属 B 类升报 user-only）。诊断 wf-b9be03；判据 SSoT wf-3f87f3/constitution.md；方向权 vault-ee session，gate/收割 cc-supervisor。"
+    },
+    {
       "folder_id": "wf-6475fd",
       "seat": "opencode-dsv4pro",
       "max_rounds": 9999,
