@@ -428,6 +428,7 @@ def build_mcp_server(
         spec_text: str | None = None,
         spec_path: str | None = None,
         dispatched_by: str = "",
+        timeouts: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """Admit one development. Everything else is derived server-side.
 
@@ -440,6 +441,11 @@ def build_mcp_server(
         derives the durable ref and the acceptance argv (from the spec's
         ```dd-acceptance block), and publishes the work board card. Idempotent
         for the same (repo, spec, base).
+
+        `timeouts` optionally overrides the per-stage run fence
+        (`{stage_id: positive seconds}`, e.g. `{"implement": 7200}`); an
+        unknown stage id is refused. Not passing it keeps the 3600s default
+        for every stage -- existing behavior unchanged.
         """
         return call(
             "create",
@@ -448,6 +454,7 @@ def build_mcp_server(
             spec_text=spec_text,
             spec_path=spec_path,
             dispatched_by=dispatched_by,
+            timeouts=timeouts,
         )
 
     @mcp.tool()

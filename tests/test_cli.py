@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from fleet_graph.cli import build_parser, plugin_binding_config
+from fleet_graph.cli import _stage_timeouts, build_parser, plugin_binding_config
 
 
 class TestTheDdSubcommand:
@@ -252,6 +252,41 @@ class TestTheDdSubcommand:
             "continuous_review": "deepseek-v4-pro",
             "final_review": "claude-opus-5",
         }
+
+    def test_stage_timeouts_accumulate_as_whole_seconds(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "dd",
+                "run",
+                "--development",
+                "d",
+                "--workspace",
+                "/tmp/w",
+                "--plugin-binding",
+                "/tmp/b.json",
+                "--remote-url",
+                "u",
+                "--remote-ref",
+                "refs/heads/main",
+                "--root-digest",
+                "sha256:" + "a" * 64,
+                "--stage-timeout",
+                "implement=7200",
+                "--stage-timeout",
+                "continuous_review=3600",
+            ]
+        )
+        assert _stage_timeouts(args.stage_timeout) == {
+            "implement": 7200,
+            "continuous_review": 3600,
+        }
+
+    def test_a_non_positive_stage_timeout_is_refused(self) -> None:
+        from fleet_graph.cli import _stage_timeouts
+
+        for bad in ("implement=0", "implement=-5", "implement=soon", "no-separator"):
+            with pytest.raises(SystemExit, match="stage-timeout"):
+                _stage_timeouts([bad])
 
     def test_acceptance_commands_accumulate(self) -> None:
         args = build_parser().parse_args(

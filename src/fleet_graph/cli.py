@@ -333,6 +333,31 @@ def _env_pairs(pairs: list[str]) -> dict[str, str]:
     return env
 
 
+def _stage_timeouts(pairs: list[str]) -> dict[str, int]:
+    """STAGE=SECONDS flags into a dict of positive whole seconds.
+
+    The control plane already validated the values at admission; this side
+    only has to turn the transport's strings back into the integers the
+    runner's `DevelopmentConfig.timeouts` expects. A value that is not a
+    positive integer is an operator error and a refusal, never a silent guess.
+    """
+    timeouts: dict[str, int] = {}
+    for pair in pairs:
+        stage, separator, raw = pair.partition("=")
+        if not separator or not stage:
+            raise SystemExit(f"--stage-timeout wants STAGE=SECONDS, got {pair!r}")
+        try:
+            seconds = int(raw)
+        except ValueError as exc:
+            raise SystemExit(
+                f"--stage-timeout {pair!r} is not an integer number of seconds"
+            ) from exc
+        if seconds <= 0:
+            raise SystemExit(f"--stage-timeout {pair!r} must be a positive number of seconds")
+        timeouts[stage] = seconds
+    return timeouts
+
+
 #: env fallback for the fixed per-order management execution cost, mirroring
 #: how ``FLEET_GRAPH_COST_OBS_DIR`` wires the exposition directory.
 MANAGEMENT_COST_ENV = "FLEET_GRAPH_MANAGEMENT_COST"
@@ -418,6 +443,11 @@ def _dd_run(args: argparse.Namespace) -> int:
             "acceptance_env": _env_pairs(args.accept_env),
         },
         models=dict(pair.split("=", 1) for pair in args.stage_model),
+        # The per-stage run fence, forwarded verbatim from the admission record
+        # (`--stage-timeout implement=7200`). Values are whole seconds; the
+        # control plane validated them at create time, so a malformed one here
+        # is an operator error worth stopping on.
+        timeouts=_stage_timeouts(args.stage_timeout),
         publish_merge=args.publish_merge,
         cost_obs_dir=args.cost_obs_dir or "",
         management_cost=management_cost,
@@ -1247,6 +1277,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="STAGE=MODEL",
         help="override one stage's model, e.g. continuous_review=deepseek-v4-pro. "
         "The role's own selector is the default and stays the policy",
+    )
+    dd_run.add_argument(
+        "--stage-timeout",
+        action="append",
+        default=[],
+        metavar="STAGE=SECONDS",
+        help="override one stage's run fence in whole seconds, e.g. "
+        "implement=7200. Stages without an override keep the 3600s default",
     )
     dd_run.add_argument(
         "--publish-merge",

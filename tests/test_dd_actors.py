@@ -335,6 +335,110 @@ class TestFailuresUseTheContractsOwnTaxonomy:
         assert outcome.event == SPINE_EVENT
 
 
+class FenceSimulatingLauncher:
+    """A launcher that re-adopts by run_id exactly like the real one.
+
+    ``launch`` dispatches once per distinct run_id; a second launch of the
+    same run_id re-adopts instead of spawning a second run. ``wait`` is
+    scripted: ``"timeout"`` raises the fence (the run is still going), any
+    other entry is the ``RunStatus`` the run ended with. This is the "simulated
+    launcher" the fence fix's regression tests drive.
+    """
+
+    def __init__(self, wait_script: list[Any]) -> None:
+        self.wait_script = list(wait_script)
+        self.spawned_run_ids: list[str] = []
+        self.launched: list[str] = []
+
+    def launch(self, spec: Any, run_id: str) -> RunTicket:
+        self.launched.append(run_id)
+        if run_id in self.spawned_run_ids:
+            return RunTicket(run_id, f"/tmp/{run_id}", None, adopted=True)
+        self.spawned_run_ids.append(run_id)
+        return RunTicket(run_id, f"/tmp/{run_id}", None, adopted=False)
+
+    def wait(self, ticket: RunTicket, **kwargs: Any) -> RunStatus:
+        entry = self.wait_script.pop(0)
+        if entry == "timeout":
+            raise RunWaitTimeout(ticket, 90.0)
+        return entry
+
+
+def implement_success() -> RunStatus:
+    return RunStatus(
+        "succeeded",
+        {
+            "structured_result": {
+                "actor_job_id": "job-implement",
+                "input_commit": "1" * 40,
+                "work_head_commit": "2" * 40,
+            }
+        },
+    )
+
+
+class TestTimeoutRetryReAdopts:
+    """The fence fix: a timeout must re-adopt the run in flight, not abandon it.
+
+    Before the fix the retry bumped the run_id derivation factor, so the
+    retry *paid for a second run* while the first one kept burning tokens --
+    the double-burn window this class closes. Both tests pin the two allowed
+    outcomes: re-adopt the still-going run, and -- only once it is truly
+    terminal/lost -- dispatch a fresh one.
+    """
+
+    def test_a_timeout_retry_re_adopts_the_run_still_in_flight(self, tmp_path: Path) -> None:
+        """First wait hits the fence, the run then completes: the retry must
+        continue waiting on the SAME run, so the launch total stays 1."""
+        launcher = FenceSimulatingLauncher(["timeout", implement_success()])
+        actor = make_actor(tmp_path, launcher)
+
+        first = actor.act(IMPLEMENT, dispatch_for(IMPLEMENT))
+        assert first.event == FAILURE_EVENT
+        assert first.run_in_flight is True, "a timeout leaves the run in flight"
+        assert LIFECYCLE.is_retryable(first.failure_code)
+
+        retry = actor.act(
+            IMPLEMENT,
+            {**dispatch_for(IMPLEMENT), "retry": 1, "re_adopt": True},
+        )
+        assert retry.event == SPINE_EVENT
+        assert retry.run_in_flight is False
+
+        # The retry derived the ORIGINAL run id and re-adopted it: the same
+        # run id was launched twice but only one run was ever spawned.
+        assert launcher.launched[0] == launcher.launched[1]
+        assert len(launcher.spawned_run_ids) == 1, "a timeout retry must not spawn a second run"
+
+    def test_a_lost_adopted_run_earns_the_second_launch(self, tmp_path: Path) -> None:
+        """Re-adopt first; only once the adopted run is truly lost may the
+        retry dispatch a fresh run -- the two-lines of the fence."""
+        launcher = FenceSimulatingLauncher(["timeout", RunStatus("lost"), implement_success()])
+        actor = make_actor(tmp_path, launcher)
+
+        first = actor.act(IMPLEMENT, dispatch_for(IMPLEMENT))
+        assert first.run_in_flight is True
+
+        adopted = actor.act(
+            IMPLEMENT,
+            {**dispatch_for(IMPLEMENT), "retry": 1, "re_adopt": True},
+        )
+        assert adopted.event == FAILURE_EVENT
+        assert adopted.run_in_flight is False, "a lost run is not in flight"
+        # The adopted run was re-adopted (same run id), not re-spawned.
+        assert launcher.launched[0] == launcher.launched[1]
+        assert len(launcher.spawned_run_ids) == 1
+
+        fresh = actor.act(
+            IMPLEMENT,
+            {**dispatch_for(IMPLEMENT), "retry": 2, "re_adopt": False},
+        )
+        assert fresh.event == SPINE_EVENT
+        # Now -- and only now -- a second launch is allowed, with a fresh id.
+        assert launcher.launched[2] != launcher.launched[0]
+        assert len(launcher.spawned_run_ids) == 2, "only a lost run earns a second launch"
+
+
 class FakeBoard:
     """Records questions; answers only what has been put on it."""
 

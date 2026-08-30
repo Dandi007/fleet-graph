@@ -347,6 +347,76 @@ class TestFailureExits:
         assert state["terminal"] == TERMINAL_COMPLETE
         assert len(attempts) == 3
 
+    def test_a_timeout_retry_is_driven_to_re_adopt_the_run(self) -> None:
+        """The fence fix, observed at the walker: a RunWaitTimeout reports
+        `run_in_flight`, and the next dispatch of the same stage must carry
+        `re_adopt` so the actor re-adopts the run rather than paying for a
+        second one."""
+        dispatched: list[tuple[str, int, bool]] = []
+
+        class TimeoutOnce(ContractActor):
+            def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
+                if stage.id != "implement":
+                    return super().act(stage, dispatch)
+                dispatched.append(
+                    (
+                        str(dispatch.get("retry")),
+                        bool(dispatch.get("re_adopt")),
+                        bool(stage.produced_artifacts),
+                    )
+                )
+                if len(dispatched) == 1:
+                    return StageOutcome(
+                        event="failed", failure_code="PROVIDER_UNAVAILABLE", run_in_flight=True
+                    )
+                return super().act(stage, dispatch)
+
+        state = run(
+            make_deps(
+                actor=TimeoutOnce({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}),
+                bounds=PipelineBounds(max_retries=2),
+            )
+        )
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert len(dispatched) == 2
+        first, retry = dispatched
+        assert first[0] == "0" and first[1] is False
+        assert retry[0] == "1" and retry[1] is True, "the timeout retry must re-adopt"
+
+    def test_a_lost_re_adopted_run_clears_the_marker_for_the_next_retry(self) -> None:
+        """Re-adopt first; only when the adopted run is truly lost does the
+        retry dispatch fresh. The marker is per-stage and cleared by any
+        non-in-flight outcome."""
+        dispatched: list[tuple[str, bool]] = []
+
+        class TimeoutThenLost(ContractActor):
+            def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
+                if stage.id != "implement":
+                    return super().act(stage, dispatch)
+                dispatched.append((str(dispatch.get("retry")), bool(dispatch.get("re_adopt"))))
+                if len(dispatched) == 1:
+                    # The fence hit; the run is still in flight.
+                    return StageOutcome(
+                        event="failed", failure_code="PROVIDER_UNAVAILABLE", run_in_flight=True
+                    )
+                if len(dispatched) == 2:
+                    # The adopted run turned out to be gone; no longer in flight.
+                    return StageOutcome(event="failed", failure_code="PROVIDER_UNAVAILABLE")
+                return super().act(stage, dispatch)
+
+        state = run(
+            make_deps(
+                actor=TimeoutThenLost(
+                    {"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}
+                ),
+                bounds=PipelineBounds(max_retries=2),
+            )
+        )
+
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert dispatched == [("0", False), ("1", True), ("2", False)]
+
     def test_retries_stop_at_the_bound(self) -> None:
         class AlwaysDown(ContractActor):
             def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
