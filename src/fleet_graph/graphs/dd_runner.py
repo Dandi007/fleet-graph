@@ -89,6 +89,14 @@ class DevelopmentConfig:
     max_rework: int = 6
     max_retries: int = 2
     verify_worktree_head: bool = True
+    #: Auto re-prepare before a fresh attempt: when a previous attempt of a
+    #: worktree-writing stage ended failed/contract_violation leaving a
+    #: committed remnant (or a dirty tree), restore the worktree
+    #: (``reset --hard`` to the attempt's input_commit + ``clean``) before
+    #: dispatching the next attempt, and record ``event=re_prepare``. The
+    #: engine does this so the retry never has to declare BLOCKED on its
+    #: predecessor's remnant (spec: dd implement 重试自动 re-prepare).
+    reprepare_worktree: bool = True
     run_config: dict[str, Any] = field(default_factory=dict)
     acceptance_timeout_seconds: int = 1800
     # The node_exporter textfile directory the cost-observability data plane
@@ -186,6 +194,12 @@ def build_pipeline(
             verify_worktree_head=config.verify_worktree_head,
         ),
         dispatched_by=config.dispatched_by,
+        # Before a fresh dispatch, restore the worktree to the attempt's input
+        # commit if a failed/contract_violation predecessor left a remnant, and
+        # record the re-prepare into the run's event log. The re-adopt path
+        # (a run still in flight) is excluded inside the actor.
+        reprepare_worktree=config.reprepare_worktree,
+        observe=observe,
     )
     sealer = PluginMaterializer(
         builder=builder,

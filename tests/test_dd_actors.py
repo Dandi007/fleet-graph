@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from conftest import git, head
 from fleet_graph.bus.board import Decision, GateTicket
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.executors.agent_run import RunStatus, RunTicket, RunWaitTimeout
@@ -437,6 +438,134 @@ class TestTimeoutRetryReAdopts:
         # Now -- and only now -- a second launch is allowed, with a fresh id.
         assert launcher.launched[2] != launcher.launched[0]
         assert len(launcher.spawned_run_ids) == 2, "only a lost run earns a second launch"
+
+
+class TestAutoRePrepareClearsARemnantBeforeAFreshAttempt:
+    """A failed implement attempt that did its work but never reported (the
+    contract_violation exit: committed product, no structured output) leaves a
+    remnant commit at HEAD. The next attempt's exact-commit check would find
+    HEAD != input_commit and refuse (BLOCKED), jamming the retry -- the
+    dev-fg-82373b544898 g1 failure this spec clears. The stage re-prepares:
+    `reset --hard <input_commit>` + `clean` before the fresh dispatch, and
+    records `event=re_prepare` with the cleaned HEAD sha.
+
+    Never while re-adopting a run still in flight (#167): that run owns its
+    workspace, so `re_adopt` dispatches are left untouched.
+    """
+
+    @staticmethod
+    def _repo(tmp_path: Path) -> tuple[Path, str]:
+        workspace = tmp_path / "work"
+        workspace.mkdir()
+        git(workspace, "init", "-q", "-b", "main")
+        (workspace / "seed.txt").write_text("seed\n", encoding="utf-8")
+        git(workspace, "add", "-A")
+        git(workspace, "commit", "-q", "-m", "seed")
+        return workspace, head(workspace)
+
+    def _actor(
+        self,
+        tmp_path: Path,
+        repo: Path,
+        events: list[dict[str, Any]],
+        *,
+        reprepare: bool = True,
+    ) -> AgentRunStageActor:
+        actor = make_actor(tmp_path, RecordingLauncher())
+        actor.worktree_path = repo
+        actor.reprepare_worktree = reprepare
+        actor.observe = events.append
+        return actor
+
+    def test_a_remnant_commit_is_re_prepared_before_a_fresh_dispatch(self, tmp_path: Path) -> None:
+        """The spec's first regression: a failed implement's remnant is cleared
+        so the next attempt starts with HEAD == input_commit on a clean tree,
+        and the re-prepare lands in the events as `event=re_prepare`."""
+        repo, input_commit = self._repo(tmp_path)
+        (repo / "work.txt").write_text("did the work, never reported\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "remnant commit")
+        remnant = head(repo)
+        assert remnant != input_commit
+
+        events: list[dict[str, Any]] = []
+        actor = self._actor(tmp_path, repo, events)
+        outcome = actor.act(
+            IMPLEMENT, {**dispatch_for(IMPLEMENT), "input_commit": input_commit, "retry": 1}
+        )
+
+        assert outcome.event == SPINE_EVENT, "the fresh attempt ran normally"
+        assert head(repo) == input_commit, "the remnant was reset away"
+        assert not git(repo, "status", "--porcelain").strip(), "the tree is clean"
+        re_prepares = [e for e in events if e.get("event") == "re_prepare"]
+        assert len(re_prepares) == 1
+        assert re_prepares[0]["cleaned_head"] == remnant
+        assert re_prepares[0]["input_commit"] == input_commit
+        assert re_prepares[0]["stage"] == "implement"
+
+    def test_known_negative_reproduction_of_dev_fg_82373b544898_g1(self, tmp_path: Path) -> None:
+        """The known negative, mechanized: before this change, on main, the
+        same scenario's second attempt found HEAD != input_commit and refused
+        (BLOCKED), ending the order refused. This pins the mechanism -- the
+        remnant survives a dispatch when re-prepare is off -- which is what
+        the actor-side exact-commit check used to refuse on."""
+        repo, input_commit = self._repo(tmp_path)
+        (repo / "work.txt").write_text("did the work, never reported\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "remnant commit")
+        remnant = head(repo)
+
+        events: list[dict[str, Any]] = []
+        actor = self._actor(tmp_path, repo, events, reprepare=False)
+        actor.act(IMPLEMENT, {**dispatch_for(IMPLEMENT), "input_commit": input_commit, "retry": 1})
+
+        assert head(repo) == remnant, (
+            "with re-prepare off the remnant survives -- the exact-commit "
+            "violation that produced the BLOCKED/refused on main"
+        )
+        assert not any(e.get("event") == "re_prepare" for e in events)
+
+    def test_a_re_adopt_never_re_prepares(self, tmp_path: Path) -> None:
+        """The adoption path is untouched: a run still in flight owns its
+        workspace, so a re-adopting retry leaves it byte-for-byte alone."""
+        repo, input_commit = self._repo(tmp_path)
+        (repo / "work.txt").write_text("in-flight work\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "in flight")
+        in_flight_head = head(repo)
+
+        events: list[dict[str, Any]] = []
+        actor = self._actor(tmp_path, repo, events)
+        outcome = actor.act(
+            IMPLEMENT,
+            {
+                **dispatch_for(IMPLEMENT),
+                "input_commit": input_commit,
+                "retry": 1,
+                "re_adopt": True,
+            },
+        )
+
+        assert outcome.event == SPINE_EVENT
+        assert head(repo) == in_flight_head, "an in-flight run's workspace is its own"
+        assert not any(e.get("event") == "re_prepare" for e in events)
+
+    def test_a_clean_worktree_retry_is_byte_identical(self, tmp_path: Path) -> None:
+        """The zero-regression baseline: a normal retry on a clean, correctly
+        positioned worktree must not touch it or mint a re-prepare event."""
+        repo, input_commit = self._repo(tmp_path)
+        before = head(repo)
+
+        events: list[dict[str, Any]] = []
+        actor = self._actor(tmp_path, repo, events)
+        outcome = actor.act(
+            IMPLEMENT, {**dispatch_for(IMPLEMENT), "input_commit": input_commit, "retry": 1}
+        )
+
+        assert outcome.event == SPINE_EVENT
+        assert head(repo) == before
+        assert not git(repo, "status", "--porcelain").strip()
+        assert not any(e.get("event") == "re_prepare" for e in events)
 
 
 class FakeBoard:

@@ -682,6 +682,72 @@ class TestARestartedGenerationKeepsItsCostFacts:
         ] == [1.0]
 
 
+class TestRePrepareClearsARemnantBeforeTheRetry:
+    """The failed-implement-remnant scenario from the spec: an implement
+    attempt that did its work but never reported (contract_violation, no
+    structured output) leaves a committed remnant at HEAD. The next attempt's
+    fresh dispatch must re-prepare the worktree (reset --hard to the attempt's
+    input_commit + clean) before it runs, and record `event=re_prepare` in
+    events.jsonl, so the retry starts from a clean tree at input_commit
+    instead of being refused by the actor-side exact-commit check."""
+
+    def test_a_failed_implement_remnant_is_re_prepared_before_the_retry(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        from fleet_graph.graphs.dd_runner import EVENTS_FILE
+
+        class RemnantThenSucceed(AgentRunStub):
+            def __init__(self) -> None:
+                super().__init__({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+                self.implement_waits = 0
+                self.remnant_sha = ""
+
+            def wait(self, ticket: RunTicket, **kwargs: Any) -> RunStatus:
+                if self.stage == "implement" and self.implement_waits == 0:
+                    self.implement_waits += 1
+                    # The agent did the work and committed it, then failed to
+                    # report -- the contract_violation exit.
+                    (repo / "work.txt").write_text("did the work, never reported\n")
+                    git(repo, "add", "-A")
+                    git(repo, "commit", "-q", "-m", "implement remnant")
+                    self.remnant_sha = head(repo)
+                    return RunStatus("failed", {"exit_code": 97})
+                if self.stage == "implement":
+                    self.implement_waits += 1
+                return super().wait(ticket, **kwargs)
+
+        launcher = RemnantThenSucceed()
+        scripts = ScriptStub()
+        local = RealCommitSealer(repo)
+        unsealed = {name: local for name, stage in LIFECYCLE.stages.items() if not stage.is_llm}
+        config = make_config(repo, tmp_path)
+        result = run_pipeline(
+            config,
+            scripts={name: scripts for name, s in LIFECYCLE.stages.items() if not s.is_llm},
+            materializers=unsealed,
+            launcher=launcher,
+        )
+
+        # The retry was re-prepared, then succeeded; the order completed.
+        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        assert not git(repo, "status", "--porcelain").strip(), "the tree is clean at the end"
+
+        lines = [
+            json.loads(raw)
+            for raw in (config.run_root / EVENTS_FILE).read_text(encoding="utf-8").splitlines()
+            if raw
+        ]
+        re_prepares = [entry for entry in lines if entry.get("event") == "re_prepare"]
+        assert len(re_prepares) == 1
+        assert re_prepares[0]["stage"] == "implement"
+        # The re-prepare cleared the exact remnant commit the failed attempt
+        # left, and reset to the attempt's own input commit (the configure
+        # seal, whatever it was), never the remnant itself.
+        assert re_prepares[0]["cleaned_head"] == launcher.remnant_sha
+        assert re_prepares[0]["input_commit"] != launcher.remnant_sha
+        assert re_prepares[0]["at"]
+
+
 class TestTheRunLeavesArtifactsBehind:
     """The control plane's read side assembles get/events from these files
     after the process is gone -- they are the state model, not telemetry."""
