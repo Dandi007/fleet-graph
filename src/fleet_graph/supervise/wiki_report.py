@@ -21,7 +21,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-DEFAULT_WIKI_MCP_URL = "http://127.0.0.1:5610/mcp/"
+#: The real katana-wiki-mcp surface. This used to point at :5610/mcp/ (the
+#: dev-dispatch MCP itself), a same-topic confusion resolved when the goal
+#: surface split clarified :5610's job: :5610 is dev-dispatch, and wiki prose
+#: lands through the katana-wiki-mcp service on :8113, not the dd control plane.
+DEFAULT_WIKI_MCP_URL = "http://127.0.0.1:8113/mcp"
 DEFAULT_REPORT_PAGE_TITLE = "舰队开发阶段性成果报告"
 
 #: §6.5：正文不得含的裸抽象缩写（wf-id / dev-fg / order 号等）。

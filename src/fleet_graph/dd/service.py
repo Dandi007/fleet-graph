@@ -49,17 +49,6 @@ from fleet_graph.dd.control_plane import (
 )
 from fleet_graph.dd.reconcile import ReconcileError, ReconcileSource, WorkFolderReconciler
 from fleet_graph.dd.work_folder_store import governed_work_folder_store
-from fleet_graph.goal_enroll.briefing import BRIEFING_TEXT, goal_open_prompt_text
-from fleet_graph.goal_enroll.contract import (
-    BRIEFING_RESOURCE_URI,
-    BRIEFING_VERSION,
-    GOAL_OPEN_PROMPT_NAME,
-    GoalEnrollError,
-)
-from fleet_graph.goal_enroll.service import GoalEnrollService
-from fleet_graph.goal_enroll.source import governed_goal_folder_store
-from fleet_graph.goal_enroll.store import GoalEnrollRoster
-from fleet_graph.goal_enroll.validator import GoalEnrollValidator, GoalFolderSource
 
 logger = logging.getLogger(__name__)
 
@@ -256,12 +245,6 @@ SUPPORTED_TOOLS: frozenset[str] = frozenset(
 #: not the in-process development control plane.
 WORK_FOLDER_TOOLS: frozenset[str] = frozenset({"wf_reconcile"})
 
-#: The E5 goal-line enroll exit: the fail-closed `goal_enroll` tool plus the
-#: versioned `goal-open` briefing prompt. Neither belongs to the development
-#: use-case family -- goal_enroll drives the goal-folder source + roster seam,
-#: not the in-process development control plane.
-GOAL_ENROLL_TOOLS: frozenset[str] = frozenset({"goal_enroll"})
-
 
 def port_is_available(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> bool:
     """Bind-test the selected loopback port before FastMCP tries to serve it."""
@@ -277,8 +260,6 @@ def port_is_available(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> boo
 def build_mcp_server(
     plane: DdControlPlane | None = None,
     work_folders: ReconcileSource | None = None,
-    goal_folders: GoalFolderSource | None = None,
-    goal_roster: GoalEnrollRoster | None = None,
 ) -> Any:
     """Build all active dev-dispatch tools over the in-process control plane.
 
@@ -288,12 +269,10 @@ def build_mcp_server(
     ``RECONCILE_SOURCE_UNBOUND``, so an unbound helper can never masquerade as a
     working route.
 
-    `goal_folders` / `goal_roster` optionally bind the E5 goal-line enroll exit
-    (`goal_enroll`) to a goal-folder source seam and a roster registry. When
-    ``goal_folders`` is ``None`` the tool still exists but refuses with
-    ``GOAL_ENROLL_SOURCE_UNBOUND``, and the versioned ``goal-open`` briefing
-    prompt + resource are always registered (the briefing is a read-side fact,
-    not an enrollment result, so it does not need a bound source).
+    The goal-driven family (`goal_enroll` / `goal-open` / briefing) is NOT
+    registered here: it moved to its own standalone surface
+    (`fleet-graph goal serve`, :5611, `fleet_graph.goal.service`), per the
+    goal-driven MCP surface split. This surface is dev-dispatch only.
     """
     from fastmcp import FastMCP
     from fastmcp.exceptions import ToolError
@@ -301,10 +280,6 @@ def build_mcp_server(
     control = plane or DdControlPlane()
     reconciler = WorkFolderReconciler()
     source = work_folders
-    enroll = GoalEnrollService(
-        GoalEnrollValidator(goal_folders),
-        roster=goal_roster if goal_roster is not None else GoalEnrollRoster(),
-    )
     mcp = FastMCP("fleet-graph-dev-dispatch")
 
     def call(method: str, /, **kwargs: Any) -> dict[str, Any]:
@@ -327,50 +302,6 @@ def build_mcp_server(
                 sort_keys=True,
             )
         )
-
-    def refuse_enroll(tool: str, exc: GoalEnrollError) -> dict[str, Any]:
-        """Raise the machine-readable goal_enroll refusal structure."""
-        raise ToolError(
-            json.dumps(
-                {
-                    "code": exc.code,
-                    "message": exc.detail,
-                    "tool": tool,
-                    "briefing_version": BRIEFING_VERSION,
-                },
-                sort_keys=True,
-            )
-        )
-
-    # E5: the versioned opening briefing (交底), registered as both a prompt and
-    # a versioned resource so the handoff is pinned to this engine release. The
-    # roster entries `goal_enroll` admits record the same BRIEFING_VERSION.
-    @mcp.prompt(name=GOAL_OPEN_PROMPT_NAME)
-    def goal_open() -> str:
-        """The Phase-0 goal-line opening briefing (交底), engine-versioned."""
-        return goal_open_prompt_text()
-
-    @mcp.resource(BRIEFING_RESOURCE_URI)
-    def goal_open_briefing() -> str:
-        """The versioned briefing text behind the goal-open prompt."""
-        return BRIEFING_TEXT
-
-    @mcp.tool()
-    def goal_enroll(folder_id: str) -> dict[str, Any]:
-        """Admit one goal line to the roster, fail-closed, versioned.
-
-        Validates the candidate goal folder against every gate -- folder is a
-        goal line, goal.md declares executable acceptance argv, golden-order.md
-        is present and non-empty, spec-lint bans are clean, and every declared
-        acceptance command starts in a throwaway liveness probe -- and only then
-        records the engine-versioned roster entry (briefing version id
-        included). A refusal is an explicit, machine-readable error with a
-        stable code and the failing clause; there is never a partial entry.
-        """
-        try:
-            return enroll.enroll(folder_id)
-        except GoalEnrollError as exc:
-            return refuse_enroll("goal_enroll", exc)
 
     @mcp.tool()
     def deployment_create(request: dict[str, Any]) -> dict[str, Any]:
@@ -657,11 +588,6 @@ def serve(
         work_folder_root if work_folder_root is not None else os.environ.get(WORK_FOLDER_ROOT_ENV)
     )
     work_folders: ReconcileSource = governed_work_folder_store(store_root)
-    # E5 binding: the goal-line enroll exit reads the same work-folder root.
-    # A missing root yields a concrete source that refuses closed per-folder,
-    # and the roster registry is persistent under the same root when one is set.
-    goal_folders: GoalFolderSource = governed_goal_folder_store(store_root)
-    goal_roster = GoalEnrollRoster(store_root)
     # R4-3 收尾：决议落板自动 resume 巡检随服务生命周期启停（daemon 线程，
     # 进程退出即止）。None = 未显式配置，回落环境变量，默认开。
     enabled = auto_resume_enabled_from_env() if auto_resume is None else auto_resume
@@ -676,12 +602,9 @@ def serve(
     else:
         logger.info("dd auto-resume patrol disabled by configuration")
     try:
-        build_mcp_server(
-            control,
-            work_folders=work_folders,
-            goal_folders=goal_folders,
-            goal_roster=goal_roster,
-        ).run(transport="streamable-http", host=host, port=port, path="/mcp")
+        build_mcp_server(control, work_folders=work_folders).run(
+            transport="streamable-http", host=host, port=port, path="/mcp"
+        )
     finally:
         if resumer is not None:
             resumer.stop()
@@ -693,7 +616,6 @@ __all__ = [
     "DEFAULT_AUTO_RESUME_INTERVAL",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
-    "GOAL_ENROLL_TOOLS",
     "NOT_SUPPORTED_RULING",
     "NOT_SUPPORTED_TOOLS",
     "SUPPORTED_TOOLS",

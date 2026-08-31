@@ -1,7 +1,7 @@
 """Thin CLI entrypoint.
 
-`version`, `hello`, `line run`, `research run`, `dd run`, `scheduler run`,
-`inbox list`, and `supervise audit`.
+`version`, `hello`, `line run`, `research run`, `dd run`, `goal serve`,
+`scheduler run`, `inbox list`, and `supervise audit`.
 """
 
 from __future__ import annotations
@@ -561,6 +561,24 @@ def _dd_serve(args: argparse.Namespace) -> int:
         auto_resume_interval=args.auto_resume_interval,
         work_folder_root=args.work_folder_root,
     )
+    return 0
+
+
+def _goal_serve(args: argparse.Namespace) -> int:
+    """Serve the goal-driven MCP surface on loopback. It is its own service."""
+    from fleet_graph.goal.service import serve
+
+    try:
+        serve(
+            host=args.host,
+            port=args.port,
+            work_folder_root=args.work_folder_root,
+        )
+    except RuntimeError as exc:
+        # A startup refusal (root unbound, port taken) is a visible failure,
+        # not a crash loop: print the clear reason and exit non-zero.
+        print(f"fleet-graph goal serve: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -1419,6 +1437,25 @@ def build_parser() -> argparse.ArgumentParser:
         "(env FLEET_GRAPH_WORK_FOLDER_ROOT)",
     )
     dd_serve.set_defaults(func=_dd_serve)
+
+    goal = subparsers.add_parser(
+        "goal",
+        help="the goal-driven MCP surface (goal_enroll / goal-open / briefing)",
+    )
+    goal_sub = goal.add_subparsers()
+    goal_serve = goal_sub.add_parser(
+        "serve", help="serve the goal-driven MCP surface (the standalone goal service)"
+    )
+    goal_serve.add_argument("--host", default="127.0.0.1")
+    goal_serve.add_argument("--port", type=int, default=5611)
+    goal_serve.add_argument(
+        "--work-folder-root",
+        default=None,
+        help="directory owning one governed goal-folder repository per folder id; "
+        "required -- without it (or without FLEET_GRAPH_WORK_FOLDER_ROOT) the "
+        "service refuses to start (GOAL_ENROLL_SOURCE_UNBOUND family)",
+    )
+    goal_serve.set_defaults(func=_goal_serve)
 
     state = subparsers.add_parser(
         "state", help="the M1 fleet-state read-model (read-only /v1 views)"
