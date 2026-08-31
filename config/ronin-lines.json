@@ -146,6 +146,14 @@
       "alias": "ronin-step7-drill",
       "max_rounds": 1,
       "enabled": false
+    },
+    {
+      "folder_id": "wf-fdd6ac",
+      "seat": "opencode-gpt-sol",
+      "alias": "ronin-cal-export",
+      "max_rounds": 9999,
+      "enabled": true,
+      "_provenance": "2026-08-31 用户拍板「要 goal driven agent 开发」。calendar-agent 日程页一键导出打码图片：goal/spec/golden-order SSoT 在 wf-fdd6ac，验收 harness 已先于实现落在 Dandi007/calendar-agent@2b0b8164（scripts/check-acceptance.sh 静态门 A1-A4、check-export-privacy.sh 真机门 A5-A6，两门实测正确变红）。三条用户拍板（只糊内容留时间骨架 / 纯色块非像素马赛克 / 只导当前可见范围）写在 golden-order，实现方不得改动。座位选 opencode-gpt-sol 而非 dsv4pro：入编前 12 条 enabled 线有 11 条挤在 dsv4pro，gpt-sol/gpt-terra/glm53 三座全空，遵 2026-08-29 家族分流令（三家族分开用防单订阅撑爆）；terra 座留给需要 katana-memory-mcp 的线，本线不需要。本线是产品线不是引擎线，唯一非 fleet-graph 自身的题目。"
     }
   ],
   "line_environment": {
