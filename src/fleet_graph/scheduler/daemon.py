@@ -261,6 +261,13 @@ class SchedulerConfig:
     read_model_base_url: str = "http://127.0.0.1:7494"
     #: M2 E6: a line is stale when its heartbeat_age_s exceeds this.
     heartbeat_stale_threshold_seconds: float = 300.0
+    #: M3 E5 harvest: 补传 supervisor run 的 harvest 写权旗标。全部缺省
+    #: None/空 → 不发射任何 harvest 旗标，supervisor run 默认 deny-all +
+    #: main（默认拒绝零放宽）。纯配置透传，无业务逻辑。
+    harvest_allowlist_path: str | None = None
+    harvest_default_branch: str | None = None
+    harvest_deploy: list[str] = field(default_factory=list)
+    repo: str | None = None
 
     @classmethod
     def from_json(cls, path: Path) -> SchedulerConfig:
@@ -293,6 +300,12 @@ class SchedulerConfig:
             ),
             backoff_cap_seconds=float(raw.get("backoff_cap_seconds", DEFAULT_BACKOFF_CAP_SECONDS)),
             extra_line_environment=dict(raw.get("line_environment", {})),
+            # M3 E5 harvest: 纯配置透传（无业务逻辑）。缺省 None/空 → 不发射
+            # 任何 harvest 旗标，supervisor run 默认 deny-all + main。
+            harvest_allowlist_path=raw.get("harvest_allowlist_path"),
+            harvest_default_branch=raw.get("harvest_default_branch"),
+            harvest_deploy=list(raw.get("harvest_deploy") or []),
+            repo=raw.get("repo"),
         )
 
 
