@@ -13,8 +13,21 @@ research 专用 channel，并在此基础上提供双源对账与从 bus 回放�
   严禁在仓库里手抄 schema / allowlist。
 
 发布一律 best-effort：失败只降级记录（与 observe 同义），绝不 fault 整图。
+**但降级必须响亮可观测**（R1-返工）：每一次失败都累计进
+``PublishDegradation``（count + first_error），run 终局产物以
+``publish_degraded`` 落盘——静默降级等于悄悄取消 P2（过程即产品）。409 不在
+此处放宽：内容寻址键下吞 409 = 数据分岔静默化（本卷硬约束），同样如实计降级。
+
 幂等：同一 run 同一中间态用确定性 idempotency_key（run/clue/finding 内容寻址
 派生），kill-restart 重派同 key 不产生重复实体。
+
+R1-返工（真机落 bus 的两个根修）：
+- root 实体（clue）版本链是 **bus 原生** 的：首条发布**不传** entity_id
+  （bus 分配 ``entity_id = message_id`` 作锚），续条传 ``entity_id``（= 锚）
+  + ``supersedes``（= 上一版本头 message_id）。本地线索身份走
+  ``payload.clue_id`` 内容寻址，对账按它归组。
+- 发布目标频道必须**已存在**（缺失频道 publish 直接 404）：真实 run 先用
+  ``ensure_research_channels`` 幂等建好三个 research 频道。
 """
 
 from __future__ import annotations
@@ -23,6 +36,7 @@ import hashlib
 import json
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -73,14 +87,22 @@ def clue_payload(
     assignee: str | None = None,
     run_id: str | None = None,
     rationale: str | None = None,
+    clue_id: str | None = None,
 ) -> dict[str, Any]:
-    """research.clue.v2 的 payload（root 实体，字段与注册 schema 一致）。"""
+    """research.clue.v2 的 payload（root 实体，字段与注册 schema 一致）。
+
+    ``clue_id`` 不是注册 schema 的必填字段，但 consumer 侧对账（replay / 双源
+    diff）需要一个稳定的本地线索 id —— 生产只把内容寻址 id 放进 payload，
+    entity_id 交由 bus 分配（root 首条不传 entity_id）。
+    """
     payload: dict[str, Any] = {
         "text": text,
         "status": status,
         "depth": depth,
         "sources": list(sources or []),
     }
+    if clue_id is not None:
+        payload["clue_id"] = clue_id
     if parent is not None:
         payload["parent"] = parent
     if assignee is not None:
@@ -145,6 +167,32 @@ def doc_idempotency_key(research_id: str, digest: str) -> str:
 # --- best-effort 发布 -------------------------------------------------------
 
 
+@dataclass
+class PublishDegradation:
+    """best-effort 发布的降级观测：count + first_error。
+
+    R1-返工：best-effort 可以继续吞异常（不 fault 整图），但**不许静默**——
+    每次吞掉的失败都记进这里，run 终局产物据此落 ``publish_degraded``，否则
+    静默降级等于悄悄取消 P2。只装 id 与计数（规格边界硬线）。
+    """
+
+    count: int = 0
+    first_error: str | None = None
+
+    def record(self, error: BaseException) -> None:
+        self.count += 1
+        if self.first_error is None:
+            self.first_error = f"{type(error).__name__}: {error}"[:400]
+
+    def as_dict(self) -> dict[str, Any]:
+        """run 终局产物的 ``publish_degraded`` 字段：恒为 ``{count, first_error}``。"""
+        return {"count": self.count, "first_error": self.first_error}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> PublishDegradation:
+        return cls(count=int(data.get("count", 0)), first_error=data.get("first_error"))
+
+
 def publish_best_effort(
     publisher: Any,
     *,
@@ -154,9 +202,13 @@ def publish_best_effort(
     idempotency_key: str,
     entity_id: str | None = None,
     supersedes: str | None = None,
+    degraded: PublishDegradation | None = None,
 ) -> str | None:
     """发布一个实体，best-effort：失败只降级记录，绝不抛给图（与 observe 同义）。
 
+    R1-返工：失败不再只 log.warning——同步记入 ``degraded``（非空即可观测降级态）。
+    409 不在此处放宽：内容寻址键下吞 409 = 数据分岔静默化（本卷硬约束），它同样
+    如实计入降级。
     返回 bus 分配的 message_id；publisher 缺失 / 失败时返回 None。
     """
     if publisher is None:
@@ -173,7 +225,35 @@ def publish_best_effort(
         return getattr(result, "message_id", None)
     except Exception as exc:
         log.warning("research publish degraded (kind=%s channel=%s): %s", kind, channel_id, exc)
+        if degraded is not None:
+            degraded.record(exc)
         return None
+
+
+def ensure_research_channels(
+    publisher: Any,
+    research_id: str,
+    *,
+    degraded: PublishDegradation | None = None,
+) -> None:
+    """幂等确保三个 research 频道存在（缺了就创建），best-effort。
+
+    agent-bus 发布只进**已存在**的频道（缺失频道 publish 直接 404），所以真实
+    run 必须先建频道。创建失败照样 loud（累计进 degraded），绝不 fault。
+    """
+    if publisher is None or not hasattr(publisher, "create_channel"):
+        return
+    for channel in (
+        clue_index_channel(research_id),
+        evidence_channel(research_id),
+        docs_channel(research_id),
+    ):
+        try:
+            publisher.create_channel(channel)
+        except Exception as exc:
+            log.warning("research channel ensure degraded (channel=%s): %s", channel, exc)
+            if degraded is not None:
+                degraded.record(exc)
 
 
 # --- consumer 侧 schema 校验（从 registry 派生） -----------------------------
@@ -209,8 +289,9 @@ def replay_research(client: Any, research_id: str) -> dict[str, Any]:
     """从 bus 回放一个 research 的完整过程轨迹。
 
     返回：
-    - ``clues``：entity_id -> 按 channel_seq 升序的 revision 列表
-      （每项含 message_id / supersedes / channel_seq / payload）；
+    - ``clues``：本地线索 id（payload.clue_id，缺失时回退 entity_id）-> 按
+      channel_seq 升序的 revision 列表（每项含 message_id / supersedes /
+      channel_seq / payload）；
     - ``evidence``：payload 列表；
     - ``docs``：payload 列表。
     供 kill-restart 后与本地镜像 / result.json 核对。
@@ -223,10 +304,10 @@ def replay_research(client: Any, research_id: str) -> dict[str, Any]:
     for msg in index:
         if msg.get("kind") != RESEARCH_CLUE_KIND:
             continue
-        eid = msg.get("entity_id")
-        if not eid:
+        key = (msg.get("payload") or {}).get("clue_id") or msg.get("entity_id")
+        if not key:
             continue
-        chains.setdefault(eid, []).append(msg)
+        chains.setdefault(key, []).append(msg)
 
     clues = {eid: sorted(msgs, key=lambda m: m["channel_seq"]) for eid, msgs in chains.items()}
     return {
@@ -363,6 +444,7 @@ __all__ = [
     "RESEARCH_CLUE_KIND",
     "RESEARCH_DOC_KIND",
     "RESEARCH_EVIDENCE_KIND",
+    "PublishDegradation",
     "body_digest",
     "check_dual_source",
     "clue_idempotency_key",
@@ -372,6 +454,7 @@ __all__ = [
     "doc_payload",
     "docs_channel",
     "dual_source_diff",
+    "ensure_research_channels",
     "evidence_channel",
     "evidence_idempotency_key",
     "evidence_payload",

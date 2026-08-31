@@ -304,8 +304,10 @@ class TestPublishing:
         assert doc["digest"] == body_digest(doc["body"])
 
         # clue 版本链（supersedes）正确：open -> dispatched -> done。
+        # R1-返工：root 实体版本链是 bus 原生 的——首条发布不传 entity_id（bus 分配
+        # entity_id = message_id 作锚），本地线索身份走 payload.clue_id 归组。
         clue_id = derive_clue_id("scheduler 的基本循环", DEFAULT_SOURCE)
-        chain = [m for m in clue_msgs if m["entity_id"] == clue_id]
+        chain = [m for m in clue_msgs if (m.get("payload") or {}).get("clue_id") == clue_id]
         chain.sort(key=lambda m: m["channel_seq"])
         assert [m["payload"]["status"] for m in chain] == ["open", "in_flight", "explored"]
         assert chain[0]["supersedes"] is None
@@ -473,3 +475,128 @@ class TestKillRestartReplay:
     def test_evidence_anchor_is_content_addressed(self) -> None:
         finding = {"claim": "c", "source": "wiki", "quote": "c", "locator": "fake.md:1"}
         assert finding_anchor(finding) == "wiki@fake.md:1"
+
+
+class TestPublishDegradation:
+    """R1-返工：best-effort 发布降级必须响亮可观测（publish_degraded），不许静默。"""
+
+    def test_publish_best_effort_records_failures(self) -> None:
+        from fleet_graph.bus.client import BusError
+        from fleet_graph.research_bus import PublishDegradation
+
+        degradation = PublishDegradation()
+        client = BusClient(token="tok", transport=FakeBusTransport())
+
+        def boom(*args: Any, **kwargs: Any) -> Any:
+            raise BusError(403, '{"code": "DELEGATION_NOT_PERMITTED"}')
+
+        class Forbidden:
+            publish = boom
+
+        mid = publish_best_effort(
+            Forbidden(),
+            channel_id=clue_index_channel("r-abc"),
+            kind=RESEARCH_CLUE_KIND,
+            payload={},
+            idempotency_key="k",
+            degraded=degradation,
+        )
+        assert mid is None
+        assert degradation.count == 1
+        assert "DELEGATION_NOT_PERMITTED" in (degradation.first_error or "")
+        assert degradation.as_dict() == {"count": 1, "first_error": degradation.first_error}
+
+        # 成功发布不再计降级。
+        assert publish_best_effort(
+            client,
+            channel_id=clue_index_channel("r-abc"),
+            kind=RESEARCH_CLUE_KIND,
+            payload={"text": "x", "status": "open", "depth": 0},
+            idempotency_key="k2",
+            degraded=degradation,
+        )
+        assert degradation.count == 1
+
+    def test_run_with_forbidden_publisher_ends_degraded_not_green(self, tmp_path: Path) -> None:
+        from fleet_graph.bus.client import BusError
+
+        class Forbidden:
+            def publish(self, *args: Any, **kwargs: Any) -> Any:
+                raise BusError(403, '{"code": "DELEGATION_NOT_PERMITTED"}')
+
+        seed = FakeTextNode(json.dumps(["scheduler 的基本循环"]))
+        launcher = FakeLauncher(
+            [worker_result(["每轮 tick 检查所有 line"], [])],
+            synthesis_result("# 报告\n调度器按 tick 工作。"),
+        )
+        config = ResearchConfig(question="降级判据问题", run_root=tmp_path / "run")
+        result = run_research(config, text_node=seed, launcher=launcher, publisher=Forbidden())
+
+        persisted = json.loads((tmp_path / "run" / RESULT).read_text(encoding="utf-8"))
+        for record in (result, persisted):
+            degraded = record["publish_degraded"]
+            assert degraded["count"] > 0, "403 全程 publish 必须可观测降级，不得静默"
+            assert degraded["first_error"], "first_error 必须非空"
+
+    def test_run_without_publisher_records_zero_degradation(self, tmp_path: Path) -> None:
+        seed = FakeTextNode(json.dumps(["clue one"]))
+        launcher = FakeLauncher(
+            [worker_result(["f1"], [])],
+            synthesis_result("report"),
+        )
+        config = ResearchConfig(question="q", run_root=tmp_path / "run")
+        result = run_research(config, text_node=seed, launcher=launcher)
+        assert result["publish_degraded"] == {"count": 0, "first_error": None}
+
+
+class TestCheckScriptJudge:
+    """check_research_publish.py 的机器判据：importlib 载入脚本，纯函数可测。"""
+
+    def _load(self):
+        import importlib.util
+
+        repo = Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location(
+            "check_research_publish", repo / "scripts" / "check_research_publish.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_green_when_all_channels_land_and_no_degradation(self) -> None:
+        module = self._load()
+        ok, verdict = module.judge_publish(
+            {"index": 3, "evidence": 1, "docs": 1},
+            {"count": 0, "first_error": None},
+        )
+        assert ok is True
+        assert verdict["pass"] is True
+        assert verdict["missing_channels"] == []
+
+    def test_red_when_channels_missing(self) -> None:
+        module = self._load()
+        ok, verdict = module.judge_publish(
+            {"index": 3, "evidence": 0, "docs": 1},
+            {"count": 0, "first_error": None},
+        )
+        assert ok is False
+        assert verdict["missing_channels"] == ["evidence"]
+
+    def test_red_when_publish_degraded_non_empty(self) -> None:
+        module = self._load()
+        ok, verdict = module.judge_publish(
+            {"index": 3, "evidence": 1, "docs": 1},
+            {"count": 5, "first_error": "BusError: 403"},
+        )
+        assert ok is False
+        assert verdict["degraded"] is True
+
+    def test_negative_fixture_research_id_must_be_red(self) -> None:
+        module = self._load()
+        assert module.NEGATIVE_FIXTURE_RESEARCH_ID == "r-2193db185d0f"
+        ok, verdict = module.judge_publish(
+            {"index": 0, "evidence": 0, "docs": 0},
+            {"count": 0, "first_error": None},
+        )
+        assert ok is False
+        assert verdict["missing_channels"] == ["docs", "evidence", "index"]
