@@ -8,7 +8,8 @@
 goal 线从入册申请开始。`goal_enroll` 是 goal-driven MCP 独立面
 （`fleet-graph goal serve`，`:5611`，MCP 注册名 `fleet-graph-goal`）上的
 fail-closed 入册**申请**工具：候选 goal 文件夹只有**每一道闸都过**才落
-**pending queue**（`enroll-queue.jsonl`），任一闸不过就以稳定的机器可读
+**pending queue**（`enroll-queue.jsonl`，独立 queue home，默认
+`/data/fleet-graph/goal/`），任一闸不过就以稳定的机器可读
 code（带失败条款）拒绝——绝无半条、绝无 warning-as-admission。
 
 **统一的是提交（submit），不是点火（ignite）**：入册成功 ≠ 线会跑。放行
@@ -20,8 +21,11 @@ code（带失败条款）拒绝——绝无半条、绝无 warning-as-admission�
   goal 文件夹上逐道跑——① 文件夹是 goal 线（含 `goal.md` 与 `golden-order.md`）；
   ② `goal.md` 声明了可执行验收 argv；③ `golden-order.md` 非空；④ spec-lint 禁
   条款干净；⑤ 声明的验收命令能在一次性 liveness probe 里启动；⑥ **alias token
-  存在**（`/data/ronin/secrets/<alias>.token`，缺失即 `GOAL_ENROLL_ALIAS_TOKEN_MISSING`，
-  把静默半残前置为提交期可见失败）；⑦ **alias 唯一**（与现 roster 及 pending
+  归本线所有**（`/data/ronin/secrets/<alias>.token` 经 `realpath` 规范化后必须是
+  该线自己的常规文件——落在 secrets 边界内、解析不进监督面（控制面凭证根，默认
+  `/data/agent-bus/tokens`）、不是另一线的 token、不是符号链接伪装；任一失败即
+  `GOAL_ENROLL_ALIAS_TOKEN_MISSING`，把静默半残/冒名前置为提交期可见失败）；
+  ⑦ **alias 唯一**（与现 roster 及 pending
   queue 内 alias 冲突即 `GOAL_ENROLL_ALIAS_CONFLICT`）。通过才写 pending queue
   entry（`alias/seat_hint/max_rounds/briefing_version/submitted_by/submitted_at`，
   状态 `pending`）。幂等：已在真名册 → `already_enrolled`；已 pending →
@@ -41,8 +45,9 @@ code（带失败条款）拒绝——绝无半条、绝无 warning-as-admission�
   运行时才报 `GOAL_ENROLL_SOURCE_UNBOUND` 的半残服务（registered-but-unbound
   族 bug 的结构性根治）。
 
-- **生效**：调用即生效（queue entry 持久于 work-folder-root 下的
-  `enroll-queue.jsonl`）
+- **生效**：调用即生效（queue entry 持久于 goal queue home 下的
+  `enroll-queue.jsonl`，默认 `/data/fleet-graph/goal/`——与工作文件夹
+  治理仓库隔离，绝不污染/消费之）
 - **用途**：goal 线入册申请的唯一入口；名册（闸一）只认已入册的线
 - 失败的入册是**显式拒绝**，不是静默跳过：`NO_ACCEPTANCE_COMMAND`、
   `GOLDEN_ORDER_EMPTY`、`SPEC_LINT_BAN`、`ACCEPTANCE_ARGV_UNEXECUTABLE`、

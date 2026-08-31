@@ -3,12 +3,13 @@
 This package owns the Phase-0 opening contract of a goal line as an
 **application**, not an ignition: ``goal_enroll`` validates a candidate goal
 folder before a ``pending`` application lands in the enrollment queue
-(``enroll-queue.jsonl``), refusing closed with a stable machine-readable code
-for every failing clause. Admission to the real roster (``config/ronin-lines.json``)
-is deliberately NOT granted here -- the roster is only ever written by the
-supervisory roster-PR path. The supervisory face sees every application through
-the state read-model (``/v1/enrollments``), the E8 ``enrollment_pending``
-event, and the best-effort board question note.
+(``enroll-queue.jsonl``, under the goal service's independent queue home
+``/data/fleet-graph/goal/``), refusing closed with a stable machine-readable
+code for every failing clause. Admission to the real roster
+(``config/ronin-lines.json``) is deliberately NOT granted here -- the roster is
+only ever written by the supervisory roster-PR path. The supervisory face sees
+every application through the state read-model (``/v1/enrollments``), the E8
+``enrollment_pending`` event, and the best-effort board question note.
 
 The public surface is small and split along durability lines:
 

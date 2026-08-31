@@ -19,6 +19,19 @@ root, real-roster file and alias-token dir under a temp dir.
   leaving the row in place (失败留痕原则).
 - ``alias-token-missing-reject`` -- the gate-6 negative: an alias whose bus
   token file is absent is refused with ``GOAL_ENROLL_ALIAS_TOKEN_MISSING``.
+- ``gate6-token-ownership`` -- gate-6 ownership: a supervision-plane token, an
+  other-line token, and a symlink-alias token are each refused with
+  ``GOAL_ENROLL_ALIAS_TOKEN_MISSING``, while a genuinely owned token passes the
+  gate. The check is the real ownership validator (realpath-canonicalized over
+  a scratch secrets root and supervision root), not an existence lambda.
+- ``queue-home-isolation`` -- the default goal queue home is
+  ``/data/fleet-graph/goal/``; both queue files (``enroll-queue.jsonl`` and
+  ``enroll-rejections.jsonl``) land in the injected queue home, never in the
+  work-records (goal-folder) root, and ``/v1/enrollments`` observes the same
+  queue file.
+- ``e8-observable-enrollment`` -- a valid enrollment through the aligned queue
+  home is visible on ``/v1/enrollments`` and the supervisor observer emits an
+  ``enrollment_pending`` (E8) event for it.
 
 Evidence is one JSON object per scenario on stdout; the process exits non-zero
 when the scenario does not pass.
@@ -51,7 +64,7 @@ from fleet_graph.goal_enroll.contract import (
     QUEUE_STATUS_PENDING,
     QUEUE_STATUS_WITHDRAWN,
 )
-from fleet_graph.goal_enroll.queue import EnrollQueue
+from fleet_graph.goal_enroll.queue import QUEUE_FILE, REJECTIONS_FILE, EnrollQueue
 from fleet_graph.goal_enroll.roster import RealRosterReader
 from fleet_graph.goal_enroll.source import governed_goal_folder_store
 
@@ -127,6 +140,65 @@ def running_server(server: Any) -> Iterator[str]:
     finally:
         uvicorn_server.should_exit = True
         thread.join(timeout=5)
+
+
+def _goal_folder(root: Path, folder_id: str) -> Path:
+    folder = root / folder_id
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "goal.md").write_text(GOAL_MD_OK, encoding="utf-8")
+    (folder / "golden-order.md").write_text(GOLDEN_ORDER_OK, encoding="utf-8")
+    return folder
+
+
+def _submit(server: Any, folder_id: str, alias: str, **extra: Any) -> dict[str, Any]:
+    """Submit one enrollment through the live MCP surface; never raises."""
+    from fastmcp.exceptions import ToolError
+
+    async def call(url: str) -> dict[str, Any]:
+        async with Client(url) as client:
+            try:
+                result = await client.call_tool(
+                    "goal_enroll", {"folder_id": folder_id, "alias": alias, **extra}
+                )
+                return {"refused": False, "code": None, "payload": _payload(result)}
+            except ToolError as exc:
+                message = str(exc)
+                payload = json.loads(message[message.index("{") : message.rindex("}") + 1])
+                return {"refused": True, "code": payload.get("code"), "payload": payload}
+
+    with running_server(server) as url:
+        return asyncio.run(call(url))
+
+
+def _state_read_model(
+    work_dir: Path, roster_file: Path, enroll_queue_path: Path
+) -> tuple[Any, int]:
+    """Start the state read-model over the given queue file; (server, port)."""
+    from fleet_graph.state.fleet_state import FleetStateConfig, FleetStateHTTPServer
+
+    state_config = FleetStateConfig(
+        host="127.0.0.1",
+        port=0,
+        run_root=work_dir / "runs",
+        dd_root=work_dir / "dd",
+        lines_config=roster_file,
+        bridge_state_dir=work_dir / "bridge",
+        enroll_queue_path=enroll_queue_path,
+    )
+    state_server = FleetStateHTTPServer(state_config)
+    state_thread = threading.Thread(target=state_server.serve_forever, daemon=True)
+    state_thread.start()
+    return state_server, state_server.server_address[1]
+
+
+def _fetch_enrollments(state_port: int) -> dict[str, Any]:
+    resp = httpx.get(f"http://127.0.0.1:{state_port}/v1/enrollments", timeout=5)
+    body = resp.json()
+    return {
+        "status_code": resp.status_code,
+        "schema_version": body.get("schema_version"),
+        "folder_ids": [e.get("folder_id") for e in body.get("enrollments", [])],
+    }
 
 
 def scenario_no_acceptance_goal_fail_closed(work_dir: Path) -> dict[str, Any]:
@@ -333,6 +405,238 @@ def scenario_alias_token_missing_reject(work_dir: Path) -> dict[str, Any]:
     )
 
 
+def scenario_gate6_token_ownership(work_dir: Path) -> dict[str, Any]:
+    """Gate-6 ownership: supervision-plane / other-line / symlink-alias tokens
+    are refused; a genuinely owned token passes."""
+    from fleet_graph.bus.tokens import build_line_token_ownership_check
+    from fleet_graph.goal.service import build_goal_mcp_server
+
+    folder_root = work_dir / "folders"
+    queue_root = work_dir / "queue3"
+    secrets_dir = work_dir / "secrets"
+    supervision_dir = work_dir / "supervision"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    supervision_dir.mkdir(parents=True, exist_ok=True)
+
+    # Supervision-plane token: realpath resolves into the supervision dir.
+    (supervision_dir / "supervisor.token").write_text("supervisor-token", encoding="utf-8")
+    (secrets_dir / "ronin-sup.token").symlink_to(supervision_dir / "supervisor.token")
+
+    # Other-line token: realpath resolves to another line's token file.
+    (secrets_dir / "ronin-other.token").write_text("other-token", encoding="utf-8")
+    (secrets_dir / "ronin-x.token").symlink_to(secrets_dir / "ronin-other.token")
+
+    # Symlink alias: a symlink masquerading as the line's own token (resolves
+    # within the secrets boundary to a same-named file under a subdirectory).
+    (secrets_dir / "real").mkdir()
+    (secrets_dir / "real" / "ronin-link.token").write_text("real-token", encoding="utf-8")
+    (secrets_dir / "ronin-link.token").symlink_to(secrets_dir / "real" / "ronin-link.token")
+
+    # Genuinely owned token: a plain regular file at the canonical path.
+    (secrets_dir / "ronin-owned.token").write_text("owned-token", encoding="utf-8")
+
+    _goal_folder(folder_root, "wf-1")
+    alias_token_check = build_line_token_ownership_check(
+        template=str(secrets_dir / "{alias}.token"),
+        secrets_root=secrets_dir,
+        supervision_roots=(supervision_dir,),
+    )
+    server = build_goal_mcp_server(
+        goal_folders=governed_goal_folder_store(str(folder_root)),
+        goal_queue=EnrollQueue(str(queue_root)),
+        real_roster=RealRosterReader(work_dir / "ronin-lines.json"),
+        board=None,
+        alias_token_check=alias_token_check,
+    )
+
+    supervision = _submit(server, "wf-1", "ronin-sup")
+    other_line = _submit(server, "wf-1", "ronin-x")
+    symlink_alias = _submit(server, "wf-1", "ronin-link")
+    owned = _submit(server, "wf-1", "ronin-owned")
+
+    passed = bool(
+        supervision["refused"]
+        and supervision["code"] == CODE_ALIAS_TOKEN_MISSING
+        and other_line["refused"]
+        and other_line["code"] == CODE_ALIAS_TOKEN_MISSING
+        and symlink_alias["refused"]
+        and symlink_alias["code"] == CODE_ALIAS_TOKEN_MISSING
+        and not owned["refused"]
+        and owned["payload"].get("status") == QUEUE_STATUS_PENDING
+    )
+    return evidence(
+        "gate6-token-ownership",
+        passed,
+        supervision=supervision,
+        other_line=other_line,
+        symlink_alias=symlink_alias,
+        owned=owned,
+    )
+
+
+def scenario_queue_home_isolation(work_dir: Path) -> dict[str, Any]:
+    """Default queue home is /data/fleet-graph/goal/; both queue files land in
+    the injected queue home, never in work-records; /v1/enrollments sees the
+    same queue."""
+    from fleet_graph.goal.service import DEFAULT_GOAL_QUEUE_HOME, build_goal_mcp_server
+
+    folder_root = work_dir / "work-records"  # the governance warehouse (goal folders)
+    queue_home = work_dir / "goal"  # test-isolated equivalent of the queue home
+    roster_file = work_dir / "ronin-lines.json"
+    roster_file.write_text(
+        json.dumps({"run_root": "/data/fleet-graph/runs", "lines": []}), encoding="utf-8"
+    )
+    secrets_dir = work_dir / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    (secrets_dir / "ronin-owned.token").write_text("owned-token", encoding="utf-8")
+
+    _goal_folder(folder_root, "wf-1")
+    queue = EnrollQueue(str(queue_home))
+    server = build_goal_mcp_server(
+        goal_folders=governed_goal_folder_store(str(folder_root)),
+        goal_queue=queue,
+        real_roster=RealRosterReader(roster_file),
+        board=None,
+        alias_token_check=lambda alias: (secrets_dir / f"{alias}.token").is_file(),
+    )
+
+    # A valid enrollment lands pending in the queue home.
+    submitted = _submit(server, "wf-1", "ronin-owned", note="queue home drill")
+    # A failing submission (unknown folder -> gate refusal) records a rejection
+    # into the same queue home, proving the rejections file also lives outside
+    # work-records.
+    _submit(server, "wf-reject", "ronin-no-token")
+
+    queue_home_files = sorted(p.name for p in queue_home.iterdir())
+    # Nothing queue-shaped may appear in the work-records root.
+    work_records_queue_files = sorted(
+        p.name for p in folder_root.iterdir() if p.name in (QUEUE_FILE, REJECTIONS_FILE)
+    )
+
+    state_server, state_port = _state_read_model(work_dir, roster_file, queue_home / QUEUE_FILE)
+    visible = {}
+    try:
+        visible = _fetch_enrollments(state_port)
+    finally:
+        state_server.shutdown()
+        state_server.server_close()
+
+    passed = bool(
+        DEFAULT_GOAL_QUEUE_HOME == "/data/fleet-graph/goal"
+        and submitted.get("payload", {}).get("status") == QUEUE_STATUS_PENDING
+        and QUEUE_FILE in queue_home_files
+        and REJECTIONS_FILE in queue_home_files
+        and work_records_queue_files == []
+        and visible.get("status_code") == 200
+        and "wf-1" in visible.get("folder_ids", [])
+    )
+    return evidence(
+        "queue-home-isolation",
+        passed,
+        default_goal_queue_home=DEFAULT_GOAL_QUEUE_HOME,
+        submitted_status=submitted.get("payload", {}).get("status"),
+        queue_home_files=queue_home_files,
+        work_records_queue_files=work_records_queue_files,
+        enrollments_visible=visible,
+    )
+
+
+def scenario_e8_observable_enrollment(work_dir: Path) -> dict[str, Any]:
+    """A valid enrollment through the aligned queue home is visible on
+    /v1/enrollments and the supervisor observer emits an E8
+    ``enrollment_pending`` event for it."""
+    from fleet_graph.goal.service import build_goal_mcp_server
+    from fleet_graph.scheduler.supervisor_events import ObserverConfig, SupervisorObserver
+    from fleet_graph.supervise.events import EVENT_ENROLLMENT_PENDING
+
+    folder_root = work_dir / "folders"
+    queue_home = work_dir / "goal"
+    roster_file = work_dir / "ronin-lines.json"
+    roster_file.write_text(
+        json.dumps({"run_root": "/data/fleet-graph/runs", "lines": []}), encoding="utf-8"
+    )
+    secrets_dir = work_dir / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    (secrets_dir / "ronin-owned.token").write_text("owned-token", encoding="utf-8")
+
+    _goal_folder(folder_root, "wf-1")
+    server = build_goal_mcp_server(
+        goal_folders=governed_goal_folder_store(str(folder_root)),
+        goal_queue=EnrollQueue(str(queue_home)),
+        real_roster=RealRosterReader(roster_file),
+        board=None,
+        alias_token_check=lambda alias: (secrets_dir / f"{alias}.token").is_file(),
+    )
+    submitted = _submit(server, "wf-1", "ronin-owned")
+
+    state_server, state_port = _state_read_model(work_dir, roster_file, queue_home / QUEUE_FILE)
+
+    class RecordingLauncher:
+        def __init__(self) -> None:
+            self.specs: list[Any] = []
+
+        def launch(self, spec: Any):
+            self.specs.append(spec)
+
+            class _Result:
+                unit_name = spec.unit_name
+                started = True
+                detail = "recorded"
+
+            return _Result()
+
+        def events(self) -> list[dict[str, Any]]:
+            parsed = []
+            for spec in self.specs:
+                argv = spec.argv()
+                parsed.append(json.loads(argv[argv.index("--event-json") + 1]))
+            return parsed
+
+    def read_model(path: str) -> dict[str, Any] | None:
+        if path == "/v1/enrollments":
+            return httpx.get(f"http://127.0.0.1:{state_port}/v1/enrollments", timeout=5).json()
+        if path == "/v1/lines":
+            return {"schema_version": "1", "lines": []}
+        if path == "/v1/decisions":
+            return {"schema_version": "1", "decisions": []}
+        if path == "/v1/harvestable":
+            return {"schema_version": "1", "developments": []}
+        return None
+
+    launcher = RecordingLauncher()
+    observer = SupervisorObserver(
+        ObserverConfig(
+            run_root=work_dir / "runs",
+            supervisor_state_root=work_dir / "supervisor",
+        ),
+        launcher=launcher,  # type: ignore[arg-type]
+        read_model=read_model,
+    )
+    try:
+        observer.after_tick(
+            now=1_000_000.0, folder_ids=[], terminal_reader=lambda folder: None, tick_results=[]
+        )
+        events = launcher.events()
+        pending = [e for e in events if e.get("type") == EVENT_ENROLLMENT_PENDING]
+        passed = bool(
+            submitted.get("payload", {}).get("status") == QUEUE_STATUS_PENDING
+            and pending
+            and pending[0]["key"] == "enroll-wf-1"
+            and pending[0]["payload"].get("folder_id") == "wf-1"
+        )
+        return evidence(
+            "e8-observable-enrollment",
+            passed,
+            submitted_status=submitted.get("payload", {}).get("status"),
+            event_types=[e.get("type") for e in events],
+            e8_key=pending[0]["key"] if pending else None,
+            e8_payload=pending[0]["payload"] if pending else None,
+        )
+    finally:
+        state_server.shutdown()
+        state_server.server_close()
+
+
 # --- cli ---------------------------------------------------------------------
 
 
@@ -345,6 +649,9 @@ def build_parser() -> argparse.ArgumentParser:
             "no-acceptance-goal-fail-closed",
             "submit-queue-and-withdraw-end-to-end",
             "alias-token-missing-reject",
+            "gate6-token-ownership",
+            "queue-home-isolation",
+            "e8-observable-enrollment",
         ],
         help="run one scenario only; default runs all (the full acceptance)",
     )
@@ -366,6 +673,9 @@ def main(argv: list[str] | None = None) -> int:
             "no-acceptance-goal-fail-closed",
             "submit-queue-and-withdraw-end-to-end",
             "alias-token-missing-reject",
+            "gate6-token-ownership",
+            "queue-home-isolation",
+            "e8-observable-enrollment",
         ]
 
     results: list[dict[str, Any]] = []
@@ -374,8 +684,14 @@ def main(argv: list[str] | None = None) -> int:
             result = scenario_no_acceptance_goal_fail_closed(work_dir)
         elif scenario == "submit-queue-and-withdraw-end-to-end":
             result = scenario_submit_queue_and_withdraw_end_to_end(work_dir)
-        else:
+        elif scenario == "alias-token-missing-reject":
             result = scenario_alias_token_missing_reject(work_dir)
+        elif scenario == "gate6-token-ownership":
+            result = scenario_gate6_token_ownership(work_dir)
+        elif scenario == "queue-home-isolation":
+            result = scenario_queue_home_isolation(work_dir)
+        else:
+            result = scenario_e8_observable_enrollment(work_dir)
         results.append(result)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
 
