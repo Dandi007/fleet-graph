@@ -146,11 +146,16 @@ def default_publisher() -> Any:
     """生产装配真实 ``BusClient``；无凭据/无法构造时返回 None（不发布，降级）。
 
     与 scheduler/board 的惯例一致：能连才发布，连不上不拖垮工作。
+
+    R1-返工（委托头根修）：服务 token 就是 fleet-graph 自身——``agent_id`` 与
+    ``own_agent_id`` 同置 ``fleet-graph``，client 端据此**不发**
+    ``X-Bus-On-Behalf-Of``（发它会被 bus 当成无权委托，403
+    DELEGATION_NOT_PERMITTED，全部 publish 静默吞掉——生产实锤根因）。
     """
     try:
         from fleet_graph.bus.client import BusClient
 
-        return BusClient(agent_id="fleet-graph")
+        return BusClient(agent_id="fleet-graph", own_agent_id="fleet-graph")
     except Exception:
         return None
 
@@ -201,13 +206,19 @@ def run_research(
             # 可观测性不能拖垮它观测的工作。
             pass
 
-    graph, _deps = build_research(
+    graph, deps = build_research(
         config,
         text_node=text_node,
         launcher=launcher,
         observe=persist_event,
         publisher=publisher,
     )
+    # R1-返工：发布目标频道必须已存在（缺失频道 publish 直接 404）——真实 run
+    # 先幂等建好三个 research 频道。创建失败照样 loud（累计进 publish_degraded）。
+    from fleet_graph.research_bus import ensure_research_channels
+
+    ensure_research_channels(publisher, config.research_id, degraded=deps.publish_degraded)
+
     invoke_config: dict[str, Any] = {
         "configurable": {"thread_id": config.thread_id},
         # bounds 才是真上限，这只是失控兜底。
@@ -239,6 +250,7 @@ def run_research(
         "rounds": rounds,
         "report": str(run_root / REPORT_FILE),
         "run_root": str(run_root),
+        "publish_degraded": deps.publish_degraded.as_dict(),
     }
     write_json_durable(run_root / RESULT, {**result, "written_at": iso(now())})
     return result
