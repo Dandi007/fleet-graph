@@ -548,7 +548,7 @@ class TestPublishDegradation:
         seed = FakeTextNode(json.dumps(["scheduler 的基本循环"]))
         launcher = FakeLauncher(
             [worker_result(["每轮 tick 检查所有 line"], [])],
-            synthesis_result("# 报告\n调度器按 tick 工作。"),
+            default_debate(),
         )
         config = ResearchConfig(question="降级判据问题", run_root=tmp_path / "run")
         result = run_research(config, text_node=seed, launcher=launcher, publisher=Forbidden())
@@ -563,7 +563,7 @@ class TestPublishDegradation:
         seed = FakeTextNode(json.dumps(["clue one"]))
         launcher = FakeLauncher(
             [worker_result(["f1"], [])],
-            synthesis_result("report"),
+            default_debate(),
         )
         config = ResearchConfig(question="q", run_root=tmp_path / "run")
         result = run_research(config, text_node=seed, launcher=launcher)
