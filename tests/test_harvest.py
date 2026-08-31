@@ -29,6 +29,8 @@ from fleet_graph.supervise.harvest import (
     SOP_STEPS,
     HarvestDeps,
     HarvestRunConfig,
+    _resolve_repo,
+    authorize_harvest_write,
     build_harvest_graph,
     run_harvest,
 )
@@ -39,12 +41,15 @@ def fake_ops(
     *,
     cherry_equivalent: bool = False,
     merged: bool = True,
+    pr_url: str = "https://github.com/Dandi007/fleet-harvest-sandbox/pull/1",
+    board_card_entity_id: str | None = "card-xyz",
     worktree_ok: bool = True,
     verify_exit: int = 0,
     verify_real_exit: int = 0,
     deploy_exit: int = 0,
     fetch_ok: bool = True,
     pull_ok: bool = True,
+    resolve_canonical: Path | None = None,
 ) -> dict[str, Any]:
     """A recording fake ops: every write/execute is recorded, results scripted."""
     calls: list[str] = []
@@ -53,6 +58,17 @@ def fake_ops(
         def fetch_dd_ref(self, repo: Path, development_id: str) -> dict[str, Any]:
             calls.append("fetch_dd_ref")
             return {"ok": fetch_ok}
+
+        def resolve_canonical_repo(
+            self,
+            record_repo_path: str,
+            record_remote_url: str | None,
+            allowlist_repo_paths: list[str],
+        ) -> tuple[Path | None, str]:
+            # 读口：不构成写原语，不入 calls（calls 只记录写/执行动作）。
+            if resolve_canonical is not None:
+                return resolve_canonical, ""
+            return Path(record_repo_path), ""
 
         def cherry_equivalent(self, repo: Path, head_commit: str, default_branch: str) -> bool:
             calls.append("cherry_equivalent")
@@ -72,11 +88,15 @@ def fake_ops(
             calls.append("run_verify")
             return verify_exit
 
+        def board_card_entity_id(self, development_id: str, dd_root: Path) -> str | None:
+            calls.append("board_card_entity_id")
+            return board_card_entity_id
+
         def pr_squash_merge(
-            self, repo: Path, head_commit: str, default_branch: str
+            self, repo: Path, development_id: str, head_commit: str, default_branch: str
         ) -> dict[str, Any]:
             calls.append("pr_squash_merge")
-            return {"merged": merged, "method": "squash-merge"}
+            return {"merged": merged, "pr_url": pr_url, "method": "gh-pr-squash-merge"}
 
         def ff_only_pull(self, repo: Path, default_branch: str) -> dict[str, Any]:
             calls.append("ff_only_pull")
@@ -115,13 +135,28 @@ def repo_path_for(tmp_path: Path, name: str = "repos/fleet-graph") -> str:
     return str(repo)
 
 
-def dd_record_root(tmp_path: Path, repo_path: str) -> Path:
+def dd_record_root(tmp_path: Path, repo_path: str, card_entity_id: str | None = None) -> Path:
     dd_root = tmp_path / "dd"
     dev_dir = dd_root / "dev-x"
     dev_dir.mkdir(parents=True, exist_ok=True)
-    (dev_dir / "record.json").write_text(
-        json.dumps({"development_id": "dev-x", "repo_path": repo_path}), encoding="utf-8"
-    )
+    record: dict[str, Any] = {"development_id": "dev-x", "repo_path": repo_path}
+    if card_entity_id is not None:
+        record["card_entity_id"] = card_entity_id
+    (dev_dir / "record.json").write_text(json.dumps(record), encoding="utf-8")
+    return dd_root
+
+
+def dd_record_root_with_remote_url(tmp_path: Path, repo_path: str, remote_url: str) -> Path:
+    """与 dd_record_root 同构，但 record 显式携带 remote_url（spec 交付 A 新读字段）。"""
+    dd_root = tmp_path / "dd"
+    dev_dir = dd_root / "dev-x"
+    dev_dir.mkdir(parents=True, exist_ok=True)
+    record: dict[str, Any] = {
+        "development_id": "dev-x",
+        "repo_path": repo_path,
+        "remote_url": remote_url,
+    }
+    (dev_dir / "record.json").write_text(json.dumps(record), encoding="utf-8")
     return dd_root
 
 
@@ -335,7 +370,67 @@ class TestPostconditions:
         assert result["outcome"] == OUTCOME_HARVESTED
         [note] = bus.published
         assert note["payload"]["note_type"] == "evidence"
-        assert note["refs"] == [{"target_entity": "dev-x"}]
+        assert note["refs"] == [{"target_entity": "card-xyz"}]
+
+    def test_pr_url_lands_on_receipt_and_state(self, tmp_path: Path) -> None:
+        fake = fake_ops(pr_url="https://github.com/Dandi007/fleet-harvest-sandbox/pull/1")
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["pr_url"] == "https://github.com/Dandi007/fleet-harvest-sandbox/pull/1"
+        pr_step = next(s for s in receipt["steps"] if s["step"] == "pr_squash_merge")
+        assert pr_step["pr_url"] == "https://github.com/Dandi007/fleet-harvest-sandbox/pull/1"
+
+    def test_missing_pr_url_escalates(self, tmp_path: Path) -> None:
+        """fake ops 返回 merged=True 但 pr_url 为空 -> escalated（链接缺失）。"""
+        fake = fake_ops(merged=True, pr_url="")
+        config, _ = config_for(tmp_path, ops=fake)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        missing = [item for s in receipt["steps"] for item in (s.get("missing") or [])]
+        assert any("PR merged 链接缺失" in item for item in missing)
+
+    def test_pr_merged_false_still_escalates(self, tmp_path: Path) -> None:
+        """旧 negative 零回归：merged=False -> escalated。"""
+        fake = fake_ops(merged=False, pr_url="")
+        config, _ = config_for(tmp_path, ops=fake)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        missing = [item for s in receipt["steps"] for item in (s.get("missing") or [])]
+        assert any("PR merged 未达成" in item for item in missing)
+
+    def test_evidence_note_targets_real_board_card_entity(self, tmp_path: Path) -> None:
+        """evidence 用真实板卡实体 id：payload 与 refs 都填 card-xyz，绝不填 dev-x。"""
+        fake = fake_ops(board_card_entity_id="card-xyz")
+        bus = FakeBus()
+        config, _ = config_for(tmp_path, ops=fake, bus=bus)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert len(bus.published) == 1, f"published: {bus.published}"
+        note = bus.published[0]
+        assert note["payload"]["card_entity_id"] == "card-xyz"
+        assert note["refs"] == [{"target_entity": "card-xyz"}]
+        targets = {ref["target_entity"] for ref in note["refs"]}
+        assert "dev-x" not in targets
+
+    def test_evidence_note_skips_when_no_board_card(self, tmp_path: Path) -> None:
+        """无卡（fake ops -> None）：零发布 + evidence_note ok=False + detail 含「缺失」。
+
+        无卡 -> evidence 步 best-effort skip（零发布）；postconditions 因缺
+        evidence_note_id 自然 escalated。
+        """
+        fake = fake_ops(board_card_entity_id=None)
+        bus = FakeBus()
+        config, _ = config_for(tmp_path, ops=fake, bus=bus)
+        result = run_harvest(config)
+        assert bus.published == [], f"published: {bus.published}"
+        evidence = next(s for s in result["steps"] if s["step"] == "evidence_note")
+        assert evidence["ok"] is False
+        assert "缺失" in evidence["detail"]
+        assert "未挂卡" in evidence["detail"]
 
 
 class TestCherryDedup:
@@ -384,6 +479,49 @@ class TestGraphDispatch:
             )
         )
         assert graph is not None
+
+
+class TestDefaultHarvestOpsBoardCardRead:
+    """交付 A：DefaultHarvestOps.board_card_entity_id 读 dd 准入 record 的 card_entity_id。"""
+
+    def test_reads_card_entity_id_from_dd_record(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        dd_root = dd_record_root(tmp_path, "/data/code/self/fleet-graph", card_entity_id="card-xyz")
+        ops = DefaultHarvestOps()
+        assert ops.board_card_entity_id("dev-x", dd_root) == "card-xyz"
+
+    def test_missing_or_empty_card_entity_id_returns_none(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = repo_path_for(tmp_path)
+        dd_root = tmp_path / "dd"
+        dev_a = dd_root / "dev-a"
+        dev_a.mkdir(parents=True)
+        (dev_a / "record.json").write_text(
+            json.dumps({"development_id": "dev-a", "repo_path": repo}), encoding="utf-8"
+        )
+        dev_b = dd_root / "dev-b"
+        dev_b.mkdir(parents=True)
+        (dev_b / "record.json").write_text(
+            json.dumps({"development_id": "dev-b", "repo_path": repo, "card_entity_id": None}),
+            encoding="utf-8",
+        )
+        dev_c = dd_root / "dev-c"
+        dev_c.mkdir(parents=True)
+        (dev_c / "record.json").write_text(
+            json.dumps({"development_id": "dev-c", "repo_path": repo, "card_entity_id": ""}),
+            encoding="utf-8",
+        )
+        dev_bad = dd_root / "dev-bad"
+        dev_bad.mkdir(parents=True)
+        (dev_bad / "record.json").write_text("not json", encoding="utf-8")
+        ops = DefaultHarvestOps()
+        assert ops.board_card_entity_id("dev-a", dd_root) is None
+        assert ops.board_card_entity_id("dev-b", dd_root) is None
+        assert ops.board_card_entity_id("dev-c", dd_root) is None
+        assert ops.board_card_entity_id("dev-bad", dd_root) is None
+        assert ops.board_card_entity_id("dev-missing", dd_root) is None
 
 
 class TestDefaultHarvestOpsWorktreeLifecycle:
@@ -459,3 +597,206 @@ class TestDefaultHarvestOpsWorktreeLifecycle:
         result = ops.worktree_cherry_pick(repo, product_commit, "main", worktree_root)
         assert result.get("conflicts") is True or result["ok"] is False
         assert not worktree_root.exists(), "failed worktree left behind"
+
+
+def _init_git_repo(repo: Path) -> None:
+    """一个可收割的真 git 仓（含 origin remote），全部本地合成，禁触真网。"""
+    repo.mkdir(parents=True, exist_ok=True)
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "test@example.invalid")
+    git(repo, "config", "user.name", "test")
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "seed")
+
+
+def _canonical_allowlist(canonical: Path) -> HarvestAllowlist:
+    return full_allowlist(str(canonical))
+
+
+class TestCanonicalRepoResolution:
+    """M3 第二轮根因修复：harvest 解析 canonical 目标仓（spec 交付 A/C）。
+
+    真机回执 granted=false 的根因是 record.repo_path 是每单一次的 linked
+    worktree，而 allowlist 按 canonical 仓签发。这里用真实 git worktree +
+    本地合成仓验证：`_resolve_repo` 把 worktree 解析成 canonical 主 checkout，
+    授权 granted=True；阴性（非白名单 canonical / 无 origin / worktree 路径
+    本身）仍 deny/refused，绝不拉宽 deny-all。全程禁触真网/生产 checkout。
+    """
+
+    def test_linked_worktree_resolves_to_canonical_main_checkout(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        git(canonical, "remote", "add", "origin", "https://example.invalid/x.git")
+        worktree = tmp_path / "linked-wt"
+        git(canonical, "worktree", "add", "--detach", str(worktree), "main")
+
+        allowlist = _canonical_allowlist(canonical)
+        resolved, gaps = _resolve_repo(
+            "dev-x",
+            dd_record_root(tmp_path, str(worktree)),
+            DefaultHarvestOps(),
+            [e.repo_path for e in allowlist.entries],
+        )
+        assert gaps == []
+        assert resolved == canonical, f"resolved {resolved!r} != canonical {canonical!r}"
+        auth = authorize_harvest_write(
+            allowlist,
+            repo_path=str(resolved),
+            branch="refs/heads/main",
+            deploy=(),
+        )
+        assert auth.granted is True, auth.reasons
+
+    def test_origin_url_mapping_hits_canonical(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        git(canonical, "remote", "add", "origin", "https://example.invalid/x.git")
+        other = tmp_path / "other"
+        _init_git_repo(other)
+        git(other, "remote", "add", "origin", "https://example.invalid/x.git")
+
+        allowlist = _canonical_allowlist(canonical)
+        resolved, gaps = _resolve_repo(
+            "dev-x",
+            dd_record_root(tmp_path, str(other), None),
+            DefaultHarvestOps(),
+            [e.repo_path for e in allowlist.entries],
+        )
+        assert gaps == []
+        assert resolved == canonical, f"origin mapping resolved {resolved!r}"
+        auth = authorize_harvest_write(
+            allowlist,
+            repo_path=str(resolved),
+            branch="refs/heads/main",
+            deploy=(),
+        )
+        assert auth.granted is True
+
+    def test_origin_url_mapping_uses_record_remote_url(self, tmp_path: Path) -> None:
+        """record 显式 remote_url 时优先用该字段做 origin URL 映射。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        git(canonical, "remote", "add", "origin", "https://example.invalid/x.git")
+        standalone = tmp_path / "standalone"
+        _init_git_repo(standalone)
+
+        allowlist = _canonical_allowlist(canonical)
+        resolved, gaps = _resolve_repo(
+            "dev-x",
+            dd_record_root_with_remote_url(
+                tmp_path, str(standalone), "https://example.invalid/x.git"
+            ),
+            DefaultHarvestOps(),
+            [e.repo_path for e in allowlist.entries],
+        )
+        assert gaps == []
+        assert resolved == canonical, f"record remote_url mapping resolved {resolved!r}"
+        auth = authorize_harvest_write(
+            allowlist,
+            repo_path=str(resolved),
+            branch="refs/heads/main",
+            deploy=(),
+        )
+        assert auth.granted is True
+
+    def test_intake_stores_canonical_and_gate_grants(self, tmp_path: Path) -> None:
+        """record 指向 worktree，intake 存 canonical，gate 对 canonical 授权。"""
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        worktree = tmp_path / "linked-wt"
+        git(canonical, "worktree", "add", "--detach", str(worktree), "main")
+
+        fake = fake_ops(resolve_canonical=canonical)
+        allowlist = _canonical_allowlist(canonical)
+        config, _ = config_for(
+            tmp_path,
+            allowlist=allowlist,
+            repo_path=str(worktree),
+            ops=fake,
+            bus=FakeBus(),
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["repo_path"] == str(canonical)
+        assert receipt["allowlist_auth"]["granted"] is True
+
+    def test_worktree_path_itself_is_still_denied(self, tmp_path: Path) -> None:
+        """回归：直接拿 record 原始 worktree 路径授权 -> 仍 deny（不拉宽 deny-all）。"""
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        worktree = tmp_path / "linked-wt"
+        git(canonical, "worktree", "add", "--detach", str(worktree), "main")
+
+        allowlist = _canonical_allowlist(canonical)
+        auth = authorize_harvest_write(
+            allowlist,
+            repo_path=str(worktree),
+            branch="refs/heads/main",
+            deploy=(),
+        )
+        assert auth.granted is False
+        assert any("不在收割写白名单" in r for r in auth.reasons)
+
+    def test_non_allowlist_canonical_denies(self, tmp_path: Path) -> None:
+        """解析出的 canonical 仓不在 allowlist -> 拒绝（authorize 语义不变）。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        worktree = tmp_path / "linked-wt"
+        git(canonical, "worktree", "add", "--detach", str(worktree), "main")
+        other_canon = tmp_path / "other-canon"
+        _init_git_repo(other_canon)
+
+        allowlist = _canonical_allowlist(other_canon)
+        resolved, gaps = _resolve_repo(
+            "dev-x",
+            dd_record_root(tmp_path, str(worktree)),
+            DefaultHarvestOps(),
+            [e.repo_path for e in allowlist.entries],
+        )
+        assert resolved is None
+        assert gaps and any("无法解析" in g for g in gaps)
+
+    def test_no_origin_refuses(self, tmp_path: Path) -> None:
+        """无 origin 且不在 allowlist -> 解析不到 canonical -> 拒绝。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        lone = tmp_path / "lone"
+        _init_git_repo(lone)
+        allowlist = _canonical_allowlist(tmp_path / "other")
+        resolved, gaps = _resolve_repo(
+            "dev-x",
+            dd_record_root(tmp_path, str(lone)),
+            DefaultHarvestOps(),
+            [e.repo_path for e in allowlist.entries],
+        )
+        assert resolved is None
+        assert gaps and any("无法解析" in g for g in gaps)
+
+    def test_unresolvable_escalates_without_writes(self, tmp_path: Path) -> None:
+        """解析不到任何 canonical -> intake 留 gaps -> escalated，零写动作。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        lone = tmp_path / "lone"
+        _init_git_repo(lone)
+        allowlist = _canonical_allowlist(tmp_path / "other")
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            allowlist=allowlist,
+            repo_path=str(lone),
+            ops=fake,
+        )
+        config.ops = DefaultHarvestOps()
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert fake["calls"] == []
