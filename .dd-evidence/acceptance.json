@@ -1,0 +1,37 @@
+{
+ "development_id": "dev-fg-119252fbfe8c",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "uv",
+    "sync",
+    "--frozen"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": "Checked 100 packages in 1ms\n"
+  },
+  {
+   "command": [
+    "make",
+    "verify"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "............................. [ 27%]\n........s............................................................... [ 30%]\n........................................................................ [ 33%]\n........................................................................ [ 37%]\n........................................................................ [ 40%]\n........................................................................ [ 44%]\n........................................................................ [ 47%]\n........................................................................ [ 50%]\n........................................................................ [ 54%]\n........................................................................ [ 57%]\n........................................................................ [ 60%]\n........................................................................ [ 64%]\n........................................................................ [ 67%]\n........................................................................ [ 71%]\n........................................................................ [ 74%]\n........................................................................ [ 77%]\n........................................................................ [ 81%]\n........................................................................ [ 84%]\n........................................................................ [ 88%]\n........................................................................ [ 91%]\n........................................................................ [ 94%]\n........................................................................ [ 98%]\n.....................................                                    [100%]\n2124 passed, 1 skipped in 58.05s\nuv run python scripts/check_supervisor_conformance.py\nsupervisor conformance: clean\nuv run python scripts/check_work_report_conformance.py\nwork-report conformance: clean\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/check_research_preflight.py"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "{\"checkpoint_stuck\": {\"exit_zero\": false, \"loud\": true, \"terminal\": \"fault\"}, \"facets\": {\"bad_channel\": {\"creatable\": false, \"error\": \"RuntimeError: channel create refused\"}, \"bad_channel_red\": true, \"bad_checkout\": {\"aligned\": false, \"build_head\": \"abc123\", \"expected_head\": \"def456\"}, \"bad_checkout_red\": true, \"bad_deps\": {\"problems\": [\"dr-arbiter: missing\"], \"role_count\": 13, \"uv\": true, \"venv\": true}, \"bad_deps_red\": true, \"bad_role\": {\"problems\": [\"dr-arbiter: no runtime declaration\"]}, \"bad_role_red\": true, \"channel\": {\"creatable\": true}, \"checkout\": {\"aligned\": true, \"build_head\": \"abc123\", \"expected_head\": \"abc123\"}, \"deps\": {\"problems\": [], \"role_count\": 13, \"uv\": true, \"venv\": true}, \"facets_channel\": \"green\", \"facets_checkout\": \"green\", \"facets_deps\": \"green\", \"facets_role\": \"green\", \"good_fixture_green\": true, \"missing_facet_red\": true, \"role\": {\"problems\": []}}, \"pass\": true, \"sentinel_killed\": {\"exit_zero\": false, \"loud\": true, \"terminal\": \"fault\"}, \"tracking\": {\"case\": \"dev-fg-67feadc91821\", \"case_referenced\": true, \"tracking_doc_present\": true}, \"worker_no_output\": {\"evidence_empty\": true, \"exit_zero\": false, \"loud\": true, \"negative_fixture_red\": true, \"not_converged\": true, \"predicate_all_empty\": true, \"terminal\": \"fault\"}}\nresearch-preflight self_check: pass\n",
+   "stderr_tail": ""
+  }
+ ]
+}
