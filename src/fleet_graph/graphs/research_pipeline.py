@@ -40,6 +40,7 @@ from fleet_graph.research_bus import (
     RESEARCH_CLUE_KIND,
     RESEARCH_DOC_KIND,
     RESEARCH_EVIDENCE_KIND,
+    PublishDegradation,
     body_digest,
     clue_idempotency_key,
     clue_index_channel,
@@ -253,6 +254,9 @@ class ResearchState(TypedDict, total=False):
     #: ``supersedes`` 版本链。只装 id（规格第 7 条：state 只装 id 与计数）。
     #: R3 起是 reducer channel：并行 collect 各自更新自己那条，按 dict 合并。
     clue_heads: Annotated[dict[str, str], _merge_heads]
+    #: clue 实体的 bus entity 锚（root 首发的 message_id）。bus 原生版本链里
+    #: entity 不随 supersedes 换，续条必须用这个锚做 entity_id。只装 id。
+    clue_entities: Annotated[dict[str, str], _merge_heads]
 
 
 @dataclass
@@ -281,6 +285,9 @@ class ResearchDeps:
     #: idempotency_key）。生产装配真实 BusClient；测试注入 fake transport。
     #: None = 不发布（best-effort 降级，同 observe 缺失时一样静默）。
     publisher: Any = None
+    #: best-effort 发布的降级观测（R1-返工）：每次被吞掉的发布失败都记入这里，
+    #: run 终局产物据此落 ``publish_degraded``——降级不许静默。
+    publish_degraded: PublishDegradation = field(default_factory=PublishDegradation)
 
     @property
     def default_source(self) -> str:
@@ -435,15 +442,18 @@ def _publish_clue(
     status: str,
     depth: int,
     retry: int,
+    entity_id: str | None = None,
     supersedes: str | None = None,
     run_id: str | None = None,
     sources: list[str] | None = None,
 ) -> str | None:
     """发布一条 clue 状态迁移到 ``research:{research_id}.index``（research.clue.v2）。
 
-    root 实体：稳定 entity_id = clue_id，版本链经 ``supersedes``。幂等 key 由
-    run/clue/status/retry 内容寻址派生，kill-restart 重派同 key 不产生重复实体。
-    best-effort：失败只降级记录，返回 message_id 或 None。
+    root 实体版本链是 **bus 原生** 的：首条发布**不传** entity_id（bus 分配
+    ``entity_id = message_id`` 作锚），续条传 ``entity_id``（= 锚）+ ``supersedes``
+    （= 上一版本头 message_id）。本地线索身份走 ``payload.clue_id`` 内容寻址。
+    幂等 key 由 run/clue/status/retry 内容寻址派生，kill-restart 重派同 key 不产生
+    重复实体。best-effort：失败只降级记录，返回 message_id 或 None。
     """
     protocol_status = PIPELINE_STATUS_TO_PROTOCOL[status]
     payload = clue_payload(
@@ -452,6 +462,7 @@ def _publish_clue(
         depth=depth,
         sources=sources,
         run_id=run_id,
+        clue_id=clue_id,
     )
     key = clue_idempotency_key(deps.research_id, clue_id, protocol_status, retry)
     return publish_best_effort(
@@ -460,8 +471,9 @@ def _publish_clue(
         kind=RESEARCH_CLUE_KIND,
         payload=payload,
         idempotency_key=key,
-        entity_id=clue_id,
+        entity_id=entity_id,
         supersedes=supersedes,
+        degraded=deps.publish_degraded,
     )
 
 
@@ -481,6 +493,7 @@ def _publish_evidence(
         kind=RESEARCH_EVIDENCE_KIND,
         payload=payload,
         idempotency_key=key,
+        degraded=deps.publish_degraded,
     )
 
 
@@ -501,12 +514,22 @@ def _publish_doc(deps: ResearchDeps, *, body: str) -> str | None:
         kind=RESEARCH_DOC_KIND,
         payload=payload,
         idempotency_key=key,
+        degraded=deps.publish_degraded,
     )
 
 
 def _head(clue_heads: dict[str, str] | None, clue_id: str) -> str | None:
     """某 clue 实体当前的 bus 版本头 message_id（版本链 supersedes 用）。"""
     return (clue_heads or {}).get(clue_id)
+
+
+def _entity(clue_entities: dict[str, str] | None, clue_id: str) -> str | None:
+    """某 clue 实体的 bus entity 锚（root 首发的 message_id）。
+
+    续条必须用这个锚做 entity_id：bus 原生版本链里 entity 不随 supersedes 换，
+    一旦锚错整条链就跨实体断裂。
+    """
+    return (clue_entities or {}).get(clue_id)
 
 
 # --- 节点 -------------------------------------------------------------------
@@ -545,6 +568,7 @@ def _seed_node(deps: ResearchDeps):
 
         clues: list[dict[str, Any]] = []
         heads: dict[str, str] = {}
+        entities: dict[str, str] = {}
         for item in queries:
             if isinstance(item, str):
                 text, source = item, deps.default_source
@@ -580,11 +604,13 @@ def _seed_node(deps: ResearchDeps):
             )
             if mid:
                 heads[clue_id] = mid
+                entities[clue_id] = mid
 
         _observe(deps, {"event": "seed", "clues": len(clues)})
         return {
             "clues": clues,
             "clue_heads": heads,
+            "clue_entities": entities,
             "coverage": 0,
             "zero_growth_rounds": 0,
             "rounds": 0,
@@ -604,6 +630,7 @@ def _dispatch_node(deps: ResearchDeps):
 
         new_clues = list(clues)
         heads = dict(state.get("clue_heads", {}))
+        entities = dict(state.get("clue_entities", {}))
         dispatched_ids: list[str] = []
         for clue in wave:
             clue_id = clue["id"]
@@ -644,6 +671,7 @@ def _dispatch_node(deps: ResearchDeps):
                 status=CLUE_DISPATCHED,
                 depth=clue["depth"],
                 retry=clue["retry"],
+                entity_id=_entity(entities, clue_id),
                 supersedes=_head(heads, clue_id),
                 run_id=run_id,
                 sources=[source],
@@ -657,7 +685,12 @@ def _dispatch_node(deps: ResearchDeps):
             )
             new_clues = _set_clue(new_clues, clue_id, status=CLUE_DISPATCHED)
             dispatched_ids.append(clue_id)
-        return {"clues": new_clues, "clue_heads": heads, "dispatched_ids": dispatched_ids}
+        return {
+            "clues": new_clues,
+            "clue_heads": heads,
+            "clue_entities": entities,
+            "dispatched_ids": dispatched_ids,
+        }
 
     return dispatch
 
@@ -665,17 +698,24 @@ def _dispatch_node(deps: ResearchDeps):
 def _after_dispatch(state: ResearchState) -> str | list[Send]:
     """dispatch 的 fan-out 路由：有本 wave 的 dispatched_ids 就 Send 给 collect，
     否则让 converge 判定（converged / partial）。Send payload 携带 clue_id + 该 clue
-    的板条目 + 上一版本头——collect 是单 clue 粒度，任务输入就是 Send 命令的内容。
+    的板条目 + 上一版本头 + entity 锚——collect 是单 clue 粒度，任务输入就是
+    Send 命令的内容。
     """
     ids = state.get("dispatched_ids", [])
     if not ids:
         return "converge"
     clues = {c["id"]: c for c in state.get("clues", [])}
     heads = state.get("clue_heads", {})
+    entities = state.get("clue_entities", {})
     return [
         Send(
             "collect",
-            {"clue_id": cid, "clue": clues[cid], "prev_head": heads.get(cid)},
+            {
+                "clue_id": cid,
+                "clue": clues[cid],
+                "prev_head": heads.get(cid),
+                "prev_entity": entities.get(cid),
+            },
         )
         for cid in ids
     ]
@@ -724,6 +764,7 @@ def _collect_node(deps: ResearchDeps):
                 status=new_status,
                 depth=depth,
                 retry=retry,
+                entity_id=state.get("prev_entity"),
                 supersedes=state.get("prev_head"),
                 sources=[source],
             )
@@ -780,6 +821,7 @@ def _collect_node(deps: ResearchDeps):
                 status=CLUE_DONE,
                 depth=depth,
                 retry=retry,
+                entity_id=state.get("prev_entity"),
                 supersedes=state.get("prev_head"),
                 sources=[source],
             )
@@ -801,6 +843,7 @@ def _collect_node(deps: ResearchDeps):
                 status=new_status,
                 depth=depth,
                 retry=retry,
+                entity_id=state.get("prev_entity"),
                 supersedes=state.get("prev_head"),
                 sources=[source],
             )
@@ -815,6 +858,7 @@ def _harvest_node(deps: ResearchDeps):
     def harvest(state: ResearchState) -> ResearchState:
         clues = state.get("clues", [])
         heads = dict(state.get("clue_heads", {}))
+        entities = dict(state.get("clue_entities", {}))
         dispatched_ids = state.get("dispatched_ids", [])
 
         # R3：一个 wave 可能收割多个 done clue（每个都提取 proposed_clues）。
@@ -869,6 +913,7 @@ def _harvest_node(deps: ResearchDeps):
                 )
                 if mid:
                     heads[child_id] = mid
+                    entities[child_id] = mid
 
         coverage = _done_count(clues)
         zero_growth = (
@@ -880,6 +925,7 @@ def _harvest_node(deps: ResearchDeps):
         return {
             "clues": clues,
             "clue_heads": heads,
+            "clue_entities": entities,
             "coverage": coverage,
             "zero_growth_rounds": zero_growth,
             "rounds": rounds,

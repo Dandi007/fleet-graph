@@ -80,6 +80,24 @@ def load_token(env: dict[str, str] | None = None) -> str:
     raise RuntimeError("no bus credential: set FLEET_GRAPH_BUS_TOKEN or FLEET_GRAPH_BUS_TOKEN_FILE")
 
 
+def _agent_id_candidates(data: Any) -> list[str]:
+    """Every distinct non-empty agent-id value a response carries.
+
+    The gateway shapes read off the running bus: ``GET /v1/agents/whoami`` ->
+    ``{"agent_id": ...}``. Accept the familiar spellings (``agent_id`` /
+    ``current_agent_id`` / ``id``) so a renamed field degrades to an unknown
+    identity, never a guessed one.
+    """
+    if not isinstance(data, dict):
+        return []
+    out: list[str] = []
+    for key in ("agent_id", "current_agent_id", "id"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            out.append(value.strip())
+    return out
+
+
 class BusClient:
     def __init__(
         self,
@@ -87,18 +105,69 @@ class BusClient:
         base_url: str = DEFAULT_BUS_URL,
         token: str | None = None,
         agent_id: str | None = None,
+        own_agent_id: str | None = None,
         transport: HttpTransport | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._token = token if token is not None else load_token()
+        #: The agent this client intends to act on behalf of. Only when this
+        #: differs from the caller's own identity (``own_agent_id``) is a
+        #: delegation header sent -- see :meth:`_headers`.
         self.agent_id = agent_id
+        #: The authenticated caller's own agent identity. When unknown (None)
+        #: the client falls back to the non-delegation self-proof path: it
+        #: publishes as the token's own agent and sends no delegation header.
+        self.own_agent_id = own_agent_id
         self._transport = transport if transport is not None else HttpxTransport()
+        #: whoami 解析缓存：None=未解析，str=身份，False=解析失败/无身份。
+        self._whoami_cache: str | bool | None = None
 
     def _headers(self) -> dict[str, str]:
         headers = {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
-        if self.agent_id:
-            headers["X-Bus-On-Behalf-Of"] = self.agent_id
+        delegate_to = self._delegate_target()
+        if delegate_to:
+            headers["X-Bus-On-Behalf-Of"] = delegate_to
         return headers
+
+    def _delegate_target(self) -> str | None:
+        """The on-behalf-of target, or None to publish as the token's own agent.
+
+        The delegation header must only be sent when acting for a *different*
+        agent. Sending it with the caller's own token makes agent-bus treat the
+        request as a self-delegation and reject it with
+        ``403 DELEGATION_NOT_PERMITTED`` -- the R1 production root cause where
+        every research publish was silently rejected. We therefore only emit
+        the header when the caller's own identity is known (``own_agent_id``)
+        and differs from the configured ``agent_id``; otherwise we fall back to
+        the non-delegation self-proof path (no header at all) and publish as
+        the token's own agent.
+        """
+        if not self.agent_id:
+            return None
+        if not self.own_agent_id or self.own_agent_id == self.agent_id:
+            return None
+        return self.agent_id
+
+    def whoami(self) -> str | None:
+        """The authenticated caller's own agent id (GET /v1/agents/whoami), cached.
+
+        Read-only identity read; never raises -- a failed read (bus down,
+        endpoint absent, malformed body) degrades to None so the caller falls
+        back to the non-delegation self-proof path instead of guessing.
+        """
+        if self._whoami_cache is None:
+            try:
+                status, payload = self._transport.request(
+                    "GET",
+                    f"{self.base_url}/v1/agents/whoami",
+                    headers={"Authorization": f"Bearer {self._token}"},
+                    json_body=None,
+                )
+                candidates = _agent_id_candidates(payload) if 200 <= status < 300 else []
+                self._whoami_cache = candidates[0] if len(set(candidates)) == 1 else False
+            except Exception:
+                self._whoami_cache = False
+        return self._whoami_cache or None
 
     def _call(self, method: str, path: str, body: Any | None = None) -> Any:
         status, payload = self._transport.request(
@@ -113,6 +182,26 @@ class BusClient:
     def post(self, path: str, body: dict[str, Any]) -> Any:
         """POST an arbitrary bus path. For endpoints outside the publish flow."""
         return self._call("POST", path, body)
+
+    def create_channel(
+        self,
+        channel_id: str,
+        *,
+        delivery_mode: str = "fanout",
+        visibility: str = "public",
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """Create (idempotently) a channel.
+
+        agent-bus publishes only into *existing* channels (publish to a missing
+        channel is 404 ``NOT_FOUND``), so a producer must ensure its channels
+        before the first publish. Re-creating with the same configuration is an
+        idempotent upsert; a conflicting configuration raises ``BusConflict``.
+        """
+        body = {"channel_id": channel_id, "delivery_mode": delivery_mode, "visibility": visibility}
+        body.update(extra)
+        result = self.post("/v1/channels", body)
+        return result if isinstance(result, dict) else {}
 
     def get(self, path: str) -> Any:
         """GET an arbitrary bus path. For endpoints outside the messages/refs flows."""

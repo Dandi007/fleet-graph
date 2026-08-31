@@ -108,7 +108,36 @@ class TestClient:
         client.publish("ch", "k", {"a": 1}, "idem")
         headers = transport.calls[0]["headers"]
         assert headers["Authorization"] == "Bearer tok"
-        assert headers["X-Bus-On-Behalf-Of"] == "fleet-graph"
+        # R1-返工：own_agent_id 未知（未显式给出）时**不发**委托头——改走非委托
+        # 自证路径，以 token 自身身份发布，避免 403 DELEGATION_NOT_PERMITTED。
+        assert "X-Bus-On-Behalf-Of" not in headers
+
+    def test_no_delegation_header_when_acting_as_self(self, transport: RecordingTransport) -> None:
+        """R1-返工 根修：token 即该 agent 自身（own_agent_id == agent_id）时
+        不得发 X-Bus-On-Behalf-Of——发了会被 bus 当成无权委托，403
+        DELEGATION_NOT_PERMITTED（生产实锤：fleet-graph 服务 token 每 publish
+        全 403，best-effort 静默吞掉）。
+        """
+        self_client = BusClient(
+            token="tok", agent_id="fleet-graph", own_agent_id="fleet-graph", transport=transport
+        )
+        transport.queue(*publish_ok())
+        self_client.publish("ch", "k", {"a": 1}, "idem")
+        headers = transport.calls[0]["headers"]
+        assert headers["Authorization"] == "Bearer tok"
+        assert "X-Bus-On-Behalf-Of" not in headers
+
+    def test_delegation_header_only_for_a_different_agent(
+        self, transport: RecordingTransport
+    ) -> None:
+        """真正替别的 agent 行事（agent_id != own_agent_id）才发委托头。"""
+        delegating = BusClient(
+            token="tok", agent_id="someone-else", own_agent_id="fleet-graph", transport=transport
+        )
+        transport.queue(*publish_ok())
+        delegating.publish("ch", "k", {"a": 1}, "idem")
+        headers = transport.calls[0]["headers"]
+        assert headers["X-Bus-On-Behalf-Of"] == "someone-else"
 
     def test_publish_body_carries_optional_fields_only_when_set(
         self, client: BusClient, transport: RecordingTransport
