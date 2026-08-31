@@ -39,6 +39,8 @@ def fake_ops(
     *,
     cherry_equivalent: bool = False,
     merged: bool = True,
+    pr_url: str = "https://github.com/Dandi007/fleet-harvest-sandbox/pull/1",
+    board_card_entity_id: str | None = "card-xyz",
     worktree_ok: bool = True,
     verify_exit: int = 0,
     verify_real_exit: int = 0,
@@ -72,11 +74,15 @@ def fake_ops(
             calls.append("run_verify")
             return verify_exit
 
+        def board_card_entity_id(self, development_id: str, dd_root: Path) -> str | None:
+            calls.append("board_card_entity_id")
+            return board_card_entity_id
+
         def pr_squash_merge(
-            self, repo: Path, head_commit: str, default_branch: str
+            self, repo: Path, development_id: str, head_commit: str, default_branch: str
         ) -> dict[str, Any]:
             calls.append("pr_squash_merge")
-            return {"merged": merged, "method": "squash-merge"}
+            return {"merged": merged, "pr_url": pr_url, "method": "gh-pr-squash-merge"}
 
         def ff_only_pull(self, repo: Path, default_branch: str) -> dict[str, Any]:
             calls.append("ff_only_pull")
@@ -115,13 +121,14 @@ def repo_path_for(tmp_path: Path, name: str = "repos/fleet-graph") -> str:
     return str(repo)
 
 
-def dd_record_root(tmp_path: Path, repo_path: str) -> Path:
+def dd_record_root(tmp_path: Path, repo_path: str, card_entity_id: str | None = None) -> Path:
     dd_root = tmp_path / "dd"
     dev_dir = dd_root / "dev-x"
     dev_dir.mkdir(parents=True, exist_ok=True)
-    (dev_dir / "record.json").write_text(
-        json.dumps({"development_id": "dev-x", "repo_path": repo_path}), encoding="utf-8"
-    )
+    record: dict[str, Any] = {"development_id": "dev-x", "repo_path": repo_path}
+    if card_entity_id is not None:
+        record["card_entity_id"] = card_entity_id
+    (dev_dir / "record.json").write_text(json.dumps(record), encoding="utf-8")
     return dd_root
 
 
@@ -335,7 +342,67 @@ class TestPostconditions:
         assert result["outcome"] == OUTCOME_HARVESTED
         [note] = bus.published
         assert note["payload"]["note_type"] == "evidence"
-        assert note["refs"] == [{"target_entity": "dev-x"}]
+        assert note["refs"] == [{"target_entity": "card-xyz"}]
+
+    def test_pr_url_lands_on_receipt_and_state(self, tmp_path: Path) -> None:
+        fake = fake_ops(pr_url="https://github.com/Dandi007/fleet-harvest-sandbox/pull/1")
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["pr_url"] == "https://github.com/Dandi007/fleet-harvest-sandbox/pull/1"
+        pr_step = next(s for s in receipt["steps"] if s["step"] == "pr_squash_merge")
+        assert pr_step["pr_url"] == "https://github.com/Dandi007/fleet-harvest-sandbox/pull/1"
+
+    def test_missing_pr_url_escalates(self, tmp_path: Path) -> None:
+        """fake ops 返回 merged=True 但 pr_url 为空 -> escalated（链接缺失）。"""
+        fake = fake_ops(merged=True, pr_url="")
+        config, _ = config_for(tmp_path, ops=fake)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        missing = [item for s in receipt["steps"] for item in (s.get("missing") or [])]
+        assert any("PR merged 链接缺失" in item for item in missing)
+
+    def test_pr_merged_false_still_escalates(self, tmp_path: Path) -> None:
+        """旧 negative 零回归：merged=False -> escalated。"""
+        fake = fake_ops(merged=False, pr_url="")
+        config, _ = config_for(tmp_path, ops=fake)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        missing = [item for s in receipt["steps"] for item in (s.get("missing") or [])]
+        assert any("PR merged 未达成" in item for item in missing)
+
+    def test_evidence_note_targets_real_board_card_entity(self, tmp_path: Path) -> None:
+        """evidence 用真实板卡实体 id：payload 与 refs 都填 card-xyz，绝不填 dev-x。"""
+        fake = fake_ops(board_card_entity_id="card-xyz")
+        bus = FakeBus()
+        config, _ = config_for(tmp_path, ops=fake, bus=bus)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert len(bus.published) == 1, f"published: {bus.published}"
+        note = bus.published[0]
+        assert note["payload"]["card_entity_id"] == "card-xyz"
+        assert note["refs"] == [{"target_entity": "card-xyz"}]
+        targets = {ref["target_entity"] for ref in note["refs"]}
+        assert "dev-x" not in targets
+
+    def test_evidence_note_skips_when_no_board_card(self, tmp_path: Path) -> None:
+        """无卡（fake ops -> None）：零发布 + evidence_note ok=False + detail 含「缺失」。
+
+        无卡 -> evidence 步 best-effort skip（零发布）；postconditions 因缺
+        evidence_note_id 自然 escalated。
+        """
+        fake = fake_ops(board_card_entity_id=None)
+        bus = FakeBus()
+        config, _ = config_for(tmp_path, ops=fake, bus=bus)
+        result = run_harvest(config)
+        assert bus.published == [], f"published: {bus.published}"
+        evidence = next(s for s in result["steps"] if s["step"] == "evidence_note")
+        assert evidence["ok"] is False
+        assert "缺失" in evidence["detail"]
+        assert "未挂卡" in evidence["detail"]
 
 
 class TestCherryDedup:
@@ -384,6 +451,49 @@ class TestGraphDispatch:
             )
         )
         assert graph is not None
+
+
+class TestDefaultHarvestOpsBoardCardRead:
+    """交付 A：DefaultHarvestOps.board_card_entity_id 读 dd 准入 record 的 card_entity_id。"""
+
+    def test_reads_card_entity_id_from_dd_record(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        dd_root = dd_record_root(tmp_path, "/data/code/self/fleet-graph", card_entity_id="card-xyz")
+        ops = DefaultHarvestOps()
+        assert ops.board_card_entity_id("dev-x", dd_root) == "card-xyz"
+
+    def test_missing_or_empty_card_entity_id_returns_none(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = repo_path_for(tmp_path)
+        dd_root = tmp_path / "dd"
+        dev_a = dd_root / "dev-a"
+        dev_a.mkdir(parents=True)
+        (dev_a / "record.json").write_text(
+            json.dumps({"development_id": "dev-a", "repo_path": repo}), encoding="utf-8"
+        )
+        dev_b = dd_root / "dev-b"
+        dev_b.mkdir(parents=True)
+        (dev_b / "record.json").write_text(
+            json.dumps({"development_id": "dev-b", "repo_path": repo, "card_entity_id": None}),
+            encoding="utf-8",
+        )
+        dev_c = dd_root / "dev-c"
+        dev_c.mkdir(parents=True)
+        (dev_c / "record.json").write_text(
+            json.dumps({"development_id": "dev-c", "repo_path": repo, "card_entity_id": ""}),
+            encoding="utf-8",
+        )
+        dev_bad = dd_root / "dev-bad"
+        dev_bad.mkdir(parents=True)
+        (dev_bad / "record.json").write_text("not json", encoding="utf-8")
+        ops = DefaultHarvestOps()
+        assert ops.board_card_entity_id("dev-a", dd_root) is None
+        assert ops.board_card_entity_id("dev-b", dd_root) is None
+        assert ops.board_card_entity_id("dev-c", dd_root) is None
+        assert ops.board_card_entity_id("dev-bad", dd_root) is None
+        assert ops.board_card_entity_id("dev-missing", dd_root) is None
 
 
 class TestDefaultHarvestOpsWorktreeLifecycle:
