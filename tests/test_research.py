@@ -277,7 +277,7 @@ class TestRunInstanceIsolation:
         assert a.thread_id != b.thread_id
         clue = derive_clue_id("clue one", DEFAULT_SOURCE)
         assert worker_run_id(a.thread_id, clue, 0) != worker_run_id(b.thread_id, clue, 0)
-        assert debate_run_id(a.thread_id, "advocate") != debate_run_id(b.thread_id, "advocate")
+        assert debate_run_id(a.thread_id, ARBITER_ROLE) != debate_run_id(b.thread_id, ARBITER_ROLE)
 
     def test_same_run_root_derives_same_run_ids(self, tmp_path: Path) -> None:
         a = ResearchConfig(question="q", run_root=tmp_path / "run")
@@ -285,7 +285,7 @@ class TestRunInstanceIsolation:
         assert a.thread_id == b.thread_id
         clue = derive_clue_id("clue one", DEFAULT_SOURCE)
         assert worker_run_id(a.thread_id, clue, 0) == worker_run_id(b.thread_id, clue, 0)
-        assert debate_run_id(a.thread_id, "advocate") == debate_run_id(b.thread_id, "advocate")
+        assert debate_run_id(a.thread_id, ARBITER_ROLE) == debate_run_id(b.thread_id, ARBITER_ROLE)
 
     def test_run_instance_is_stable_and_not_random(self, tmp_path: Path) -> None:
         from fleet_graph.graphs.research_pipeline import derive_run_instance
