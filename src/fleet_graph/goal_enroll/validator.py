@@ -48,6 +48,8 @@ from fleet_graph.goal_enroll.contract import (
     BRIEFING_VERSION,
     CODE_ACCEPTANCE_ARGV_UNEXECUTABLE,
     CODE_ACCEPTANCE_DECLARATION_INVALID,
+    CODE_ALIAS_CONFLICT,
+    CODE_ALIAS_TOKEN_MISSING,
     CODE_FOLDER_NOT_FOUND,
     CODE_GOLDEN_ORDER_EMPTY,
     CODE_NO_ACCEPTANCE_COMMAND,
@@ -63,6 +65,10 @@ from fleet_graph.goal_enroll.contract import (
 
 GOAL_MD = "goal.md"
 GOLDEN_ORDER_MD = "golden-order.md"
+
+#: Gate 6's token path template -- must agree with bus/tokens.py's
+#: LINE_TOKEN_PATH_TEMPLATE (the fleet's own credential layout).
+_ALIAS_TOKEN_TEMPLATE = "/data/ronin/secrets/{alias}.token"
 
 #: A short liveness probe budget. The probe only proves a command can start,
 #: so a long-running declared command is timed out and still counted as
@@ -206,7 +212,15 @@ def liveness_probe(
 
 
 class GoalEnrollValidator:
-    """Runs every gate in order and refuses closed at the first failure."""
+    """Runs every gate in order and refuses closed at the first failure.
+
+    Gates 6 and 7 are the application-face gates the spec adds. They take
+    injectable seams so the validator stays deterministic and self-contained:
+    the alias-token check (the ``/data/ronin/secrets/<alias>.token`` existence)
+    and the alias-uniqueness check (against the real roster and the pending
+    queue) are both supplied by the caller -- the service wires them to the
+    real token store and the queue/roster readers, tests inject fakes.
+    """
 
     def __init__(
         self,
@@ -215,13 +229,29 @@ class GoalEnrollValidator:
         briefing_version: str = BRIEFING_VERSION,
         clock: Any = time.time,
         probe: Any = liveness_probe,
+        alias_token_check: Any = None,
+        alias_conflict_check: Any = None,
     ) -> None:
         self._source = source
         self._briefing_version = briefing_version
         self._clock = clock
         self._probe = probe
+        #: Gate 6 seam: ``(alias) -> bool``, True when the alias's line token
+        #: already exists. Defaults to a real existence check against the
+        #: fleet's token template (the same one bus/tokens.py resolves).
+        self._alias_token_check = alias_token_check or _default_alias_token_check()
+        #: Gate 7 seam: ``(alias) -> str | None``, the folder_id already
+        #: claiming the alias (roster or pending queue), or None when free.
+        self._alias_conflict_check = alias_conflict_check or (lambda alias: None)
 
-    def validate(self, folder_id: str) -> dict[str, Any]:
+    def validate(
+        self,
+        folder_id: str,
+        *,
+        alias: str | None = None,
+        seat_hint: str | None = None,
+        max_rounds: int | None = None,
+    ) -> dict[str, Any]:
         """Admit one goal line, or refuse with the failing clause's code.
 
         On success returns the gate facts (acceptance argv, liveness results,
@@ -281,8 +311,32 @@ class GoalEnrollValidator:
                     f"{result.get('detail', 'unexecutable')}",
                 )
 
+        # Gate 6: the applicant's alias token must already exist. Only runs
+        # when an alias is supplied (the MCP tool always supplies one).
+        if alias is not None and not self._alias_token_check(alias):
+            raise GoalEnrollError(
+                CODE_ALIAS_TOKEN_MISSING,
+                f"alias token for {alias!r} does not exist "
+                f"({_ALIAS_TOKEN_TEMPLATE.format(alias=alias)}); "
+                "enrollment refuses closed so the line never starts half-broken",
+            )
+
+        # Gate 7: the alias must not already be claimed by a roster line or a
+        # pending application.
+        if alias is not None:
+            claimant = self._alias_conflict_check(alias)
+            if claimant is not None:
+                raise GoalEnrollError(
+                    CODE_ALIAS_CONFLICT,
+                    f"alias {alias!r} is already claimed by {claimant!r} "
+                    "(roster or pending queue); one line has one alias",
+                )
+
         return {
             "folder_id": folder_id,
+            "alias": alias,
+            "seat_hint": seat_hint,
+            "max_rounds": max_rounds,
             "briefing_version": self._briefing_version,
             "acceptance_argv": tuple(tuple(argv) for argv in acceptance_argv),
             "liveness": tuple(liveness),
@@ -290,6 +344,24 @@ class GoalEnrollValidator:
             "mechanism": GOAL_ENROLL_MECHANISM,
             "admitted_at": iso_timestamp(self._clock()),
         }
+
+
+def _default_alias_token_check() -> Any:
+    """Gate 6's production default: the alias's line token file exists.
+
+    Reuses the exact template bus/tokens.py resolves (``LINE_TOKEN_PATH_TEMPLATE``
+    = ``/data/ronin/secrets/{alias}.token``) so the validator and the line's
+    inbox/board credential agree on the same path -- and honours the
+    ``FLEET_GRAPH_LINE_TOKEN_PATH`` env override (drills use it to point at a
+    scratch secrets dir). The check is *existence* only -- the token bytes
+    never leave the file.
+    """
+    from fleet_graph.bus.tokens import resolve_line_token
+
+    def check(alias: str) -> bool:
+        return resolve_line_token(alias).present
+
+    return check
 
 
 __all__ = [

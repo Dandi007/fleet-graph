@@ -1,16 +1,19 @@
 """The goal-driven MCP surface: ``fleet-graph goal serve`` on loopback.
 
 The goal-driven MCP surface is its own service, not a guest of the
-dev-dispatch MCP. It serves exactly the goal-driven family -- the ``goal_enroll``
-tool, the versioned ``goal-open`` briefing prompt, and the
-``fleet-graph://goal-open/briefing`` resource -- on its own port (:5611),
+dev-dispatch MCP. It serves exactly the goal-driven family -- the
+``goal_enroll`` application tool plus the ``goal_list`` / ``goal_status`` /
+``goal_withdraw`` view tools, the versioned ``goal-open`` briefing prompt, and
+the ``fleet-graph://goal-open/briefing`` resource -- on its own port (:5611),
 registered as ``fleet-graph-goal``. dd (:5610) carries no goal-driven
 registrations any more.
 
-The ``goal_enroll`` machinery itself is untouched: the fail-closed validator,
-the refusal codes, the roster registry, and the briefing versioning all come
-from :mod:`fleet_graph.goal_enroll` unchanged. This module is only the
-surface that binds them to the standalone service.
+``goal_enroll`` is an *application*, not an ignition: a passing submission
+lands in the pending queue (``enroll-queue.jsonl``), where the supervisory
+face sees it (read-model ``/v1/enrollments`` + E8 + the best-effort board
+question note) and decides. This surface deliberately offers **no release or
+ignite tool**: ``enabled`` flips, seat finalization and roster writes all stay
+on the supervisory roster-PR path.
 
 Fail-fast root binding: ``goal serve`` refuses to start when neither
 ``--work-folder-root`` nor ``FLEET_GRAPH_WORK_FOLDER_ROOT`` is set. A goal MCP
@@ -35,9 +38,10 @@ from fleet_graph.goal_enroll.contract import (
     GOAL_OPEN_PROMPT_NAME,
     GoalEnrollError,
 )
+from fleet_graph.goal_enroll.queue import EnrollQueue
+from fleet_graph.goal_enroll.roster import RealRosterReader
 from fleet_graph.goal_enroll.service import GoalEnrollService
 from fleet_graph.goal_enroll.source import governed_goal_folder_store
-from fleet_graph.goal_enroll.store import GoalEnrollRoster
 from fleet_graph.goal_enroll.validator import GoalEnrollValidator
 
 logger = logging.getLogger(__name__)
@@ -66,25 +70,60 @@ def port_is_available(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> boo
     return True
 
 
+def _bind_board() -> Any | None:
+    """The best-effort board writer (B.3), or None when no bus credential.
+
+    The application's question note needs an agent-bus credential; without one
+    the entry records ``board_notify: failed`` and E8 is the fallback
+    visibility -- a goal service must never depend on the bus to submit.
+    """
+    try:
+        from fleet_graph.bus.board import Board
+        from fleet_graph.bus.client import BusClient, load_token
+
+        base_url = os.environ.get("FLEET_GRAPH_BUS_URL", "http://127.0.0.1:7490")
+        return Board(BusClient(base_url=base_url, token=load_token()))
+    except Exception as exc:  # no credential / bus misconfigured: degrade, not block
+        logger.debug("goal serve: board question note unavailable: %s", exc)
+        return None
+
+
 def build_goal_mcp_server(
     goal_folders: Any | None = None,
-    goal_roster: GoalEnrollRoster | None = None,
+    goal_queue: EnrollQueue | None = None,
+    real_roster: RealRosterReader | None = None,
+    *,
+    board: Any | None = None,
+    submitted_by: str | None = None,
+    alias_token_check: Any | None = None,
 ) -> Any:
     """Build the standalone goal-driven MCP surface.
 
     ``goal_folders`` optionally binds the goal-line enroll exit to a governed
-    goal-folder source seam; ``goal_roster`` optionally binds the persistent
-    roster registry. When ``goal_folders`` is ``None`` the tool still exists
-    but refuses with ``GOAL_ENROLL_SOURCE_UNBOUND`` (the validator's own
+    goal-folder source seam; ``goal_queue`` optionally binds the persistent
+    pending-queue store; ``real_roster`` binds the read-only real-roster
+    reader. When ``goal_folders`` is ``None`` the tool still exists but
+    refuses with ``GOAL_ENROLL_SOURCE_UNBOUND`` (the validator's own
     fail-closed answer) -- and ``goal serve`` itself never starts that way, so
     production cannot reach the unbound route.
+
+    ``board`` is the best-effort question-note writer (B.3); when None (the
+    default, and what ``goal serve`` uses when no bus credential exists) the
+    application still queues and the entry records ``board_notify: failed``,
+    with E8 as the fallback visibility. ``alias_token_check`` is the gate-6
+    seam (``(alias) -> bool``); when None the validator uses the production
+    default (``/data/ronin/secrets/<alias>.token``, honouring
+    ``FLEET_GRAPH_LINE_TOKEN_PATH``). Drills inject a temp-dir check.
     """
     from fastmcp import FastMCP
     from fastmcp.exceptions import ToolError
 
     enroll = GoalEnrollService(
-        GoalEnrollValidator(goal_folders),
-        roster=goal_roster if goal_roster is not None else GoalEnrollRoster(),
+        GoalEnrollValidator(goal_folders, alias_token_check=alias_token_check),
+        queue=goal_queue if goal_queue is not None else EnrollQueue(),
+        roster=real_roster if real_roster is not None else RealRosterReader(),
+        board=board,
+        submitted_by=submitted_by or os.environ.get("FLEET_GRAPH_SUBMITTED_BY", "goal-mcp"),
     )
     mcp = FastMCP(MCP_SERVER_NAME)
 
@@ -104,7 +143,8 @@ def build_goal_mcp_server(
 
     # The versioned opening briefing (交底), registered as both a prompt and a
     # versioned resource so the handoff is pinned to this engine release. The
-    # roster entries `goal_enroll` admits record the same BRIEFING_VERSION.
+    # pending-queue entries `goal_enroll` submits record the same
+    # BRIEFING_VERSION.
     @mcp.prompt(name=GOAL_OPEN_PROMPT_NAME)
     def goal_open() -> str:
         """The Phase-0 goal-line opening briefing (交底), engine-versioned."""
@@ -116,21 +156,65 @@ def build_goal_mcp_server(
         return BRIEFING_TEXT
 
     @mcp.tool()
-    def goal_enroll(folder_id: str) -> dict[str, Any]:
-        """Admit one goal line to the roster, fail-closed, versioned.
+    def goal_enroll(
+        folder_id: str,
+        alias: str,
+        seat_hint: str | None = None,
+        max_rounds: int | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Submit one goal line's enrollment application, fail-closed.
 
         Validates the candidate goal folder against every gate -- folder is a
         goal line, goal.md declares executable acceptance argv, golden-order.md
-        is present and non-empty, spec-lint bans are clean, and every declared
-        acceptance command starts in a throwaway liveness probe -- and only then
-        records the engine-versioned roster entry (briefing version id
-        included). A refusal is an explicit, machine-readable error with a
-        stable code and the failing clause; there is never a partial entry.
+        is present and non-empty, spec-lint bans are clean, every declared
+        acceptance command starts in a throwaway liveness probe, the alias's
+        bus token already exists, and the alias is not already claimed -- and
+        only then lands a ``pending`` application in the enrollment queue
+        (``enroll-queue.jsonl``) that the supervisory face sees. Admission to
+        the real roster is NOT granted here; it happens only via the roster PR
+        (supervisory) path. A folder already in the real roster answers
+        ``already_enrolled``; a folder already pending answers
+        ``already_pending``. A refusal is an explicit, machine-readable error
+        with a stable code and the failing clause; there is never a partial
+        application.
         """
         try:
-            return enroll.enroll(folder_id)
+            return enroll.submit(
+                folder_id, alias, seat_hint=seat_hint, max_rounds=max_rounds, note=note
+            )
         except GoalEnrollError as exc:
+            enroll.record_rejection(folder_id, code=exc.code, detail=exc.detail, alias=alias)
             return refuse_enroll("goal_enroll", exc)
+
+    @mcp.tool()
+    def goal_list() -> dict[str, Any]:
+        """Unified enrollment view: the real roster plus the pending queue.
+
+        Every entry carries ``origin`` (``roster`` or ``pending``) and a status.
+        The two reconciliation drifts are reported, never fixed: a queue entry
+        already ``admitted`` whose line is missing from the real roster, and a
+        roster line that still has a ``pending`` queue entry.
+        """
+        return enroll.list_all()
+
+    @mcp.tool()
+    def goal_status(folder_id: str) -> dict[str, Any]:
+        """One application's detail: roster/pending entry + rejection history."""
+        return enroll.status(folder_id)
+
+    @mcp.tool()
+    def goal_withdraw(folder_id: str) -> dict[str, Any]:
+        """Withdraw a *pending* enrollment application.
+
+        Only a ``pending`` application can be withdrawn; the row stays in the
+        queue with status ``withdrawn`` (失败留痕原则). A decided application
+        (admitted/rejected) refuses with ``GOAL_ENROLL_NOT_PENDING``.
+        """
+        try:
+            return enroll.withdraw(folder_id)
+        except GoalEnrollError as exc:
+            return refuse_enroll("goal_withdraw", exc)
 
     return mcp
 
@@ -164,10 +248,13 @@ def serve(
     if not port_is_available(host, port):
         raise RuntimeError(f"fleet-graph goal port {host}:{port} is unavailable")
     goal_folders = governed_goal_folder_store(root)
-    goal_roster = GoalEnrollRoster(root)
-    build_goal_mcp_server(goal_folders=goal_folders, goal_roster=goal_roster).run(
-        transport="streamable-http", host=host, port=port, path="/mcp"
-    )
+    goal_queue = EnrollQueue(root)
+    build_goal_mcp_server(
+        goal_folders=goal_folders,
+        goal_queue=goal_queue,
+        real_roster=RealRosterReader(),
+        board=_bind_board(),
+    ).run(transport="streamable-http", host=host, port=port, path="/mcp")
 
 
 __all__ = [

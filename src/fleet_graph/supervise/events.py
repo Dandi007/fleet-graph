@@ -33,6 +33,12 @@ EVENT_APPROVED_UNHARVESTED = "approved_unharvested"
 EVENT_HEARTBEAT_STALE = "heartbeat_stale"
 #: E7 -- a decision was swallowed (read-model /v1/decisions).
 EVENT_DECISION_SWALLOWED = "decision_swallowed"
+#: E8 -- a goal enrollment application is pending (read-model /v1/enrollments).
+#: dedup key = ``enroll:{folder_id}``; a pending application older than the
+#: staleness threshold gets an additional reminder attempt keyed
+#: ``enroll:{folder_id}:g{n}`` (the ronin generation semantics, so a reminder
+#: is a fresh audit thread, never a replay of the original).
+EVENT_ENROLLMENT_PENDING = "enrollment_pending"
 
 EVENT_TYPES = frozenset(
     {
@@ -43,6 +49,7 @@ EVENT_TYPES = frozenset(
         EVENT_APPROVED_UNHARVESTED,
         EVENT_HEARTBEAT_STALE,
         EVENT_DECISION_SWALLOWED,
+        EVENT_ENROLLMENT_PENDING,
     }
 )
 
@@ -197,12 +204,44 @@ def decision_swallowed_event(source_message_id: str, reason: str) -> SupervisorE
     )
 
 
+def enrollment_pending_event(
+    folder_id: str,
+    *,
+    alias: str = "",
+    submitted_at: str = "",
+    reminder_generation: int | None = None,
+) -> SupervisorEvent:
+    """E8: one pending goal enrollment application.
+
+    Base key = ``enroll:{folder_id}``. ``reminder_generation`` (>= 1) is the
+    over-age reminder: the key becomes ``enroll:{folder_id}:g{n}`` so a
+    reminder is its own audit thread -- the same ``{folder_id}:g{n}``
+    generation semantics the ronin lines already have -- and cannot replay the
+    original application's audit.
+    """
+    if reminder_generation is not None:
+        key = sanitize_key(f"enroll:{folder_id}:g{reminder_generation}")
+    else:
+        key = sanitize_key(f"enroll:{folder_id}")
+    return SupervisorEvent(
+        type=EVENT_ENROLLMENT_PENDING,
+        key=key,
+        payload={
+            "folder_id": folder_id,
+            "alias": alias,
+            "submitted_at": submitted_at,
+            "reminder_generation": reminder_generation,
+        },
+    )
+
+
 __all__ = [
     "EVENT_APPROVED_UNHARVESTED",
     "EVENT_BLOCKED_DECISION",
     "EVENT_BOARD_QUESTION",
     "EVENT_CAP_BREAKER",
     "EVENT_DECISION_SWALLOWED",
+    "EVENT_ENROLLMENT_PENDING",
     "EVENT_HEARTBEAT_STALE",
     "EVENT_LINE_FAULT",
     "EVENT_TYPES",
@@ -213,6 +252,7 @@ __all__ = [
     "board_question_event",
     "cap_breaker_event",
     "decision_swallowed_event",
+    "enrollment_pending_event",
     "heartbeat_stale_event",
     "line_fault_event",
     "sanitize_key",

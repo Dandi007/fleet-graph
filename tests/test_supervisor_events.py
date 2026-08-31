@@ -113,6 +113,7 @@ EMPTY_READ_MODEL: dict[str, dict[str, Any]] = {
     "/v1/lines": {"schema_version": "1", "lines": []},
     "/v1/decisions": {"schema_version": "1", "decisions": []},
     "/v1/harvestable": {"schema_version": "1", "developments": []},
+    "/v1/enrollments": {"schema_version": "1", "enrollments": []},
 }
 
 
@@ -662,6 +663,118 @@ class TestReadModelEvents:
         # 负例保留（spec 交付 A.3）：词表扩容不改 validate_event 的拒绝语义。
         with pytest.raises(SupervisorEventError, match="vocabulary is closed"):
             validate_event({"type": "harvest_ready", "key": "e9-x", "payload": {}})
+
+    def test_e8_pending_enrollment_fires(self, tmp_path: Path) -> None:
+        """E8: a pending enrollment in the /v1/enrollments snapshot emits
+        `enrollment_pending` with the dedup key `enroll:{folder_id}`."""
+        observer, launcher = observer_for(
+            tmp_path,
+            read_model=read_model_for(
+                {
+                    "/v1/enrollments": {
+                        "schema_version": "1",
+                        "enrollments": [
+                            {
+                                "folder_id": "wf-1",
+                                "alias": "ronin-fresh",
+                                "submitted_at": "2026-08-31T00:00:00Z",
+                                "status": "pending",
+                            }
+                        ],
+                    }
+                }
+            ),
+        )
+        tick(observer, {})
+        [event] = launcher.events()
+        assert event["type"] == "enrollment_pending"
+        assert event["key"] == "enroll-wf-1"
+        assert event["payload"]["folder_id"] == "wf-1"
+        assert event["payload"]["reminder_generation"] is None
+
+    def test_e8_decided_enrollments_do_not_fire(self, tmp_path: Path) -> None:
+        """Only `pending` applications are facts worth an audit; decided and
+        withdrawn ones are no longer open."""
+        observer, launcher = observer_for(
+            tmp_path,
+            read_model=read_model_for(
+                {
+                    "/v1/enrollments": {
+                        "schema_version": "1",
+                        "enrollments": [
+                            {"folder_id": "wf-a", "alias": "ronin-a", "status": "admitted"},
+                            {"folder_id": "wf-b", "alias": "ronin-b", "status": "rejected"},
+                            {"folder_id": "wf-c", "alias": "ronin-c", "status": "withdrawn"},
+                        ],
+                    }
+                }
+            ),
+        )
+        tick(observer, {})
+        assert launcher.events() == []
+
+    def test_e8_over_age_pending_appends_a_reminder_generation(self, tmp_path: Path) -> None:
+        """pending 超龄（24h 未裁）追加提醒 attempt：submitted_at 早于阈值
+        24h 的申请额外发射 `enroll:{folder_id}:g{n}` 提醒键，n 为完整超龄
+        周期数——`{key}:g{n}` 语义沿用。"""
+        observer, launcher = observer_for(
+            tmp_path,
+            read_model=read_model_for(
+                {
+                    "/v1/enrollments": {
+                        "schema_version": "1",
+                        "enrollments": [
+                            # now=1_000_000.0, threshold=86400; epoch 0 is far
+                            # older than 24h, so the reminder generation is >= 1
+                            {
+                                "folder_id": "wf-old",
+                                "alias": "ronin-old",
+                                "submitted_at": "1970-01-01T00:00:00Z",
+                                "status": "pending",
+                            }
+                        ],
+                    }
+                }
+            ),
+        )
+        tick(observer, {})
+        keys = [e["key"] for e in launcher.events()]
+        assert "enroll-wf-old" in keys
+        reminders = [e for e in launcher.events() if e["payload"].get("reminder_generation")]
+        assert reminders, keys
+        assert reminders[0]["key"].startswith("enroll-wf-old-g")
+
+    def test_e8_same_key_across_ticks_is_a_fresh_attempt_not_a_duplicate(
+        self, tmp_path: Path
+    ) -> None:
+        """E8 follows the E5-E7 dedup discipline: the same pending application
+        re-scanned next tick is a fresh attempt (a1, a2) with a stable dedup
+        key -- never a silent duplicate within one tick."""
+        snapshot = {
+            "/v1/enrollments": {
+                "schema_version": "1",
+                "enrollments": [{"folder_id": "wf-1", "alias": "ronin-fresh", "status": "pending"}],
+            }
+        }
+        observer, launcher = observer_for(tmp_path, read_model=read_model_for(snapshot))
+        tick(observer, {})
+        tick(observer, {})
+        events = launcher.events()
+        assert len(events) == 2
+        assert events[0]["key"] == events[1]["key"] == "enroll-wf-1"
+        assert [e["attempt"] for e in events] == [1, 2]
+        threads = [validate_event(e).thread_id for e in events]
+        assert threads == ["supervisor:enroll-wf-1:a1", "supervisor:enroll-wf-1:a2"]
+        # Within one tick the same application is launched at most once.
+        observer2, launcher2 = observer_for(tmp_path, read_model=read_model_for(snapshot))
+        tick(observer2, {})
+        assert len(launcher2.events()) == 1
+
+    def test_e8_missing_or_malformed_snapshot_is_a_skip(self, tmp_path: Path) -> None:
+        observer, launcher = observer_for(tmp_path, read_model=lambda path: None)
+        actions = tick(observer, {})
+        assert launcher.events() == []
+        assert not any("error" in a for a in actions)
 
 
 class TestBudgets:

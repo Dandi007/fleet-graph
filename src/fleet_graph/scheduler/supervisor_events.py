@@ -6,7 +6,7 @@ performs while awake, plus a launcher call when a scan finds something worth
 an audit. The supervisor graph itself runs as yet another transient unit --
 a *scheduled* thing, never a second scheduler.
 
-Seven scans, one per event (r4-design §1; E5-E7 consume the read-model):
+Eight scans, one per event (r4-design §1; E5-E8 consume the read-model):
 
 - **E1** board question with no decision referencing it -- incremental pull
   over `board:work-notes`, cursor persisted next to the stall-state files.
@@ -18,12 +18,16 @@ Seven scans, one per event (r4-design §1; E5-E7 consume the read-model):
 - **E4** `TickResult.refusal == TOTAL_CAP_REACHED` -- in-process, straight
   from the tick's own results; deduped per cap window so a breaker that
   holds for an hour is one audit, not sixty.
-- **E5/E6/E7** read-model scans -- a stdlib HTTP client pulls the loopback
+- **E5/E6/E7/E8** read-model scans -- a stdlib HTTP client pulls the loopback
   state read-model (`127.0.0.1:7494`) `/v1/harvestable`, `/v1/lines`,
-  `/v1/decisions` and derives the events from the *synthetic snapshots*, never
-  from heartbeat/terminal/bus/bridge files. The M1 read-model is the only
-  data face these three events have (spec: 「这三事件禁止重扫
-  heartbeat/terminal/bus/bridge 文件（一律经 :7494）」).
+  `/v1/decisions`, `/v1/enrollments` and derives the events from the *synthetic
+  snapshots*, never from heartbeat/terminal/bus/bridge files. The M1 read-model
+  is the only data face these events have (spec: 「这三事件禁止重扫
+  heartbeat/terminal/bus/bridge 文件（一律经 :7494）」). E8 additionally
+  appends an over-age reminder attempt: a pending enrollment older than
+  `enrollment_stale_threshold_seconds` (24h undecided) re-fires as
+  `enroll:{folder_id}:g{n}` -- the ronin generation semantics, so a reminder is
+  a fresh audit thread, never a replay of the original application's.
 
 Two budgets, both plain counters (absorbed from the old supervisor's action
 window -- the one part of its self-restraint worth keeping): at most
@@ -60,6 +64,7 @@ from fleet_graph.supervise.events import (
     board_question_event,
     cap_breaker_event,
     decision_swallowed_event,
+    enrollment_pending_event,
     heartbeat_stale_event,
     line_fault_event,
 )
@@ -72,6 +77,10 @@ DEFAULT_READ_MODEL_BASE_URL = "http://127.0.0.1:7494"
 
 #: E6 staleness threshold: heartbeat_age_s strictly greater than this.
 DEFAULT_HEARTBEAT_STALE_THRESHOLD_SECONDS = 300.0
+
+#: E8 staleness threshold: a pending enrollment undecided for longer than this
+#: (default 24h) gets an additional reminder attempt (``enroll:{folder_id}:g{n}``).
+DEFAULT_ENROLLMENT_STALE_THRESHOLD_SECONDS = 24 * 60 * 60
 
 #: How many board messages one tick will page through at most.
 BOARD_PAGE_LIMIT = 200
@@ -193,6 +202,9 @@ class ObserverConfig:
     #: E6 threshold: a line is stale when its heartbeat_age_s is strictly
     #: greater than this (read-model /v1/lines).
     heartbeat_stale_threshold_seconds: float = DEFAULT_HEARTBEAT_STALE_THRESHOLD_SECONDS
+    #: E8 threshold: a pending enrollment undecided for longer than this gets
+    #: an additional reminder attempt (read-model /v1/enrollments).
+    enrollment_stale_threshold_seconds: float = DEFAULT_ENROLLMENT_STALE_THRESHOLD_SECONDS
     unit_prefix: str = DEFAULT_UNIT_PREFIX
     working_directory: str = "/data/apps/fleet-graph/current"
     executable: str = "/data/apps/fleet-graph/current/.venv/bin/fleet-graph"
@@ -303,12 +315,12 @@ class SupervisorObserver:
             except Exception as exc:  # fail open
                 actions.append({"source": "cap", "error": repr(exc)[:200]})
             try:
-                # E5/E6/E7 read-model scans share the same budget + attempt
+                # E5-E8 read-model scans share the same budget + attempt
                 # counters as E2/E3/E4; an unreachable :7494 is a skipped
                 # scan (an action note), never a dead tick. The decisions
                 # branch also returns which E7 ids are new this tick so the
                 # watermark only advances past ids we actually handled.
-                read_events, new_e7, read_notes = self._read_model_events(state)
+                read_events, new_e7, read_notes = self._read_model_events(state, now=now)
                 events.extend(read_events)
                 actions.extend(read_notes)
             except Exception as exc:  # fail open
@@ -385,9 +397,9 @@ class SupervisorObserver:
         return [cap_breaker_event(bucket, detail, [r.folder_id for r in tripped])]
 
     def _read_model_events(
-        self, state: dict[str, Any]
+        self, state: dict[str, Any], *, now: float
     ) -> tuple[list[SupervisorEvent], dict[str, str], list[dict[str, Any]]]:
-        """E5/E6/E7 from the read-model's synthetic snapshots (:7494).
+        """E5/E6/E7/E8 from the read-model's synthetic snapshots (:7494).
 
         The M1 read-model is the only data face these events have: no direct
         heartbeat/terminal/bus/bridge file is re-read here (spec: 「这三事件
@@ -489,7 +501,61 @@ class SupervisorObserver:
                     )
                 )
 
+        enrollments = self.read_model("/v1/enrollments")
+        if isinstance(enrollments, dict):
+            for entry in enrollments.get("enrollments") or []:
+                if not isinstance(entry, dict):
+                    continue
+                folder_id = str(entry.get("folder_id") or "")
+                if not folder_id:
+                    continue
+                # E8: a *pending* application is a fact worth an audit; a
+                # decided one (admitted/rejected/withdrawn) is no longer open.
+                if str(entry.get("status") or "") != "pending":
+                    continue
+                submitted_at = str(entry.get("submitted_at") or "")
+                events.append(
+                    enrollment_pending_event(
+                        folder_id,
+                        alias=str(entry.get("alias") or ""),
+                        submitted_at=submitted_at,
+                    )
+                )
+                # Over-age reminder (spec: pending 超龄 24h 未裁追加提醒 attempt,
+                # `{key}:g{n}` 语义沿用): each full staleness period past the
+                # first adds a fresh generation key, so an application that is
+                # still pending after a day gets its own reminder audit.
+                age_s = self._age_seconds(submitted_at, now)
+                if age_s is not None and age_s > self.config.enrollment_stale_threshold_seconds:
+                    generation = int(age_s // self.config.enrollment_stale_threshold_seconds)
+                    events.append(
+                        enrollment_pending_event(
+                            folder_id,
+                            alias=str(entry.get("alias") or ""),
+                            submitted_at=submitted_at,
+                            reminder_generation=generation,
+                        )
+                    )
+
         return events, new_e7, notes
+
+    @staticmethod
+    def _age_seconds(submitted_at: str, now: float) -> float | None:
+        """The age of an ISO UTC ``submitted_at`` stamp, or None (fail-open).
+
+        Unparseable or empty stamps carry no mechanical age, so no reminder is
+        minted from nothing -- the base E8 event still fires for the pending
+        application.
+        """
+        if not submitted_at:
+            return None
+        try:
+            from fleet_graph.scheduler.wake import parse_bus_timestamp
+
+            submitted_epoch = parse_bus_timestamp(submitted_at)
+        except (ValueError, TypeError):
+            return None
+        return max(0.0, now - submitted_epoch)
 
     def _advance_e7_baseline(
         self, state: dict[str, Any], source_id: str, action: dict[str, Any]
@@ -791,6 +857,7 @@ def reset_supervisor_event(
 
 __all__ = [
     "BOARD_PAGE_LIMIT",
+    "DEFAULT_ENROLLMENT_STALE_THRESHOLD_SECONDS",
     "DEFAULT_HEARTBEAT_STALE_THRESHOLD_SECONDS",
     "DEFAULT_READ_MODEL_BASE_URL",
     "DEFAULT_SUPERVISOR_STATE_ROOT",

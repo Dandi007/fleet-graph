@@ -44,6 +44,21 @@ CODE_ACCEPTANCE_DECLARATION_INVALID = "ACCEPTANCE_DECLARATION_INVALID"
 CODE_SPEC_LINT_BAN = "SPEC_LINT_BAN"
 CODE_ACCEPTANCE_ARGV_UNEXECUTABLE = "ACCEPTANCE_ARGV_UNEXECUTABLE"
 
+#: Gate 6: the applicant's alias token (`/data/ronin/secrets/<alias>.token`)
+#: must already exist. An application whose alias has no bus credential would
+#: start a line whose inbox/board face is silently half-broken
+#: (bus/tokens.py:76-87), so the submission refuses closed up front.
+CODE_ALIAS_TOKEN_MISSING = "GOAL_ENROLL_ALIAS_TOKEN_MISSING"
+
+#: Gate 7: the applicant's alias must not already be claimed by a roster line
+#: or a pending application. One line has one alias; a second claimant would
+#: forge a second identity on the same inbox.
+CODE_ALIAS_CONFLICT = "GOAL_ENROLL_ALIAS_CONFLICT"
+
+#: ``goal_withdraw`` only ever moves a *pending* application. Anything already
+#: decided (admitted/rejected) or already withdrawn refuses with this code.
+CODE_NOT_PENDING = "GOAL_ENROLL_NOT_PENDING"
+
 #: The reserved identity paths the spec-lint bans from product code and tests.
 #: References here are a refusal, not a warning: these namespaces are the
 #: controller's identity boundary, and a goal that routes work into them is
@@ -54,6 +69,26 @@ RESERVED_PATHS = (".dev-dispatch", ".dd-evidence")
 #: It is a warning, never a refusal (the spec says so explicitly): a pinned
 #: SHA in a critical path is a smell, but it does not invalidate admission.
 LINT_WARNING_PINNED_SHA = "pinned_sha_in_critical_path"
+
+#: The pending-queue state machine: ``pending -> admitted | rejected |
+#: withdrawn``. Only ``pending`` is actionable (withdrawable); the terminal
+#: states are decisions already made and carry ``decided_by`` / ``decision_ref``.
+QUEUE_STATUS_PENDING = "pending"
+QUEUE_STATUS_ADMITTED = "admitted"
+QUEUE_STATUS_REJECTED = "rejected"
+QUEUE_STATUS_WITHDRAWN = "withdrawn"
+
+#: ``goal_list`` origins: every listed entry is either a real roster line
+#: (read-only ``config/ronin-lines.json``) or a pending-queue application.
+ORIGIN_ROSTER = "roster"
+ORIGIN_PENDING = "pending"
+
+#: The two reconciliation drifts ``goal_list`` reports (报告不修 -- 只报不修):
+#: a queue entry already marked ``admitted`` while the real roster has no such
+#: line, and a roster line that still has a ``pending`` queue entry. Both are
+#: disagreements to file per constitution, not fixes this surface performs.
+DRIFT_ADMITTED_MISSING_FROM_ROSTER = "admitted_missing_from_roster"
+DRIFT_ROSTER_BUT_PENDING = "roster_but_pending"
 
 
 class GoalEnrollError(RuntimeError):
@@ -115,15 +150,26 @@ __all__ = [
     "BRIEFING_VERSION",
     "CODE_ACCEPTANCE_ARGV_UNEXECUTABLE",
     "CODE_ACCEPTANCE_DECLARATION_INVALID",
+    "CODE_ALIAS_CONFLICT",
+    "CODE_ALIAS_TOKEN_MISSING",
     "CODE_FOLDER_NOT_FOUND",
     "CODE_GOLDEN_ORDER_EMPTY",
     "CODE_NOT_A_GOAL_LINE",
+    "CODE_NOT_PENDING",
     "CODE_NO_ACCEPTANCE_COMMAND",
     "CODE_SOURCE_UNBOUND",
     "CODE_SPEC_LINT_BAN",
+    "DRIFT_ADMITTED_MISSING_FROM_ROSTER",
+    "DRIFT_ROSTER_BUT_PENDING",
     "GOAL_ENROLL_MECHANISM",
     "GOAL_OPEN_PROMPT_NAME",
     "LINT_WARNING_PINNED_SHA",
+    "ORIGIN_PENDING",
+    "ORIGIN_ROSTER",
+    "QUEUE_STATUS_ADMITTED",
+    "QUEUE_STATUS_PENDING",
+    "QUEUE_STATUS_REJECTED",
+    "QUEUE_STATUS_WITHDRAWN",
     "RESERVED_PATHS",
     "GoalEnrollError",
     "GoalRosterEntry",
