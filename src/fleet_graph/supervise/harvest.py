@@ -90,6 +90,12 @@ class HarvestOps(Protocol):
     """
 
     def fetch_dd_ref(self, repo: Path, development_id: str) -> dict[str, Any]: ...
+    def resolve_canonical_repo(
+        self,
+        record_repo_path: str,
+        record_remote_url: str | None,
+        allowlist_repo_paths: list[str],
+    ) -> tuple[Path | None, str]: ...
     def cherry_equivalent(self, repo: Path, head_commit: str, default_branch: str) -> bool: ...
     def worktree_cherry_pick(
         self, repo: Path, head_commit: str, default_branch: str, worktree_root: Path
@@ -152,8 +158,21 @@ def _event_of(state: HarvestState) -> SupervisorEvent:
     return validate_event(state.get("event") or {})
 
 
-def _resolve_repo(development_id: str, dd_root: Path) -> tuple[Path | None, list[str]]:
-    """dd 准入 record -> 目标 repo，机械解析（与 supervisor 同款链）。"""
+def _resolve_repo(
+    development_id: str,
+    dd_root: Path,
+    ops: HarvestOps,
+    allowlist_repo_paths: list[str],
+) -> tuple[Path | None, list[str]]:
+    """dd 准入 record -> canonical 目标仓，机械解析（与 supervisor 同款链）。
+
+    读 record 的 `repo_path`（原始 worktree 路径）+ `remote_url`（纯 JSON 读，
+    Guard D 安全），把 canonical 解析委托给 ops 读口 `resolve_canonical_repo`
+    （Guard D 豁免的机械层）。返回 `(canonical_path | None, gaps)`；解析不到
+    可命中 allowlist 的 canonical -> None + 机器可读留痕理由，交由 intake/gate
+    走既有 escalated/refused 路径，绝不 fallback 到 record 原始 worktree 路径
+    去授权或写。
+    """
     record_path = dd_root / development_id / RECORD_FILE
     try:
         record = json.loads(record_path.read_text(encoding="utf-8"))
@@ -164,10 +183,14 @@ def _resolve_repo(development_id: str, dd_root: Path) -> tuple[Path | None, list
     repo_path = str(record.get("repo_path") or "")
     if not repo_path:
         return None, [f"dd record 缺 repo_path 字段（{record_path}）"]
-    repo = Path(repo_path)
-    if not repo.is_dir():
-        return None, [f"dd record repo_path 不是可用目录: {repo_path}"[:300]]
-    return repo, []
+    remote_url = record.get("remote_url")
+    if remote_url is not None and not isinstance(remote_url, str):
+        remote_url = str(remote_url)
+    canonical, reason = ops.resolve_canonical_repo(repo_path, remote_url, allowlist_repo_paths)
+    if canonical is None:
+        message = reason or (f"record repo_path 无法解析到任何白名单 canonical 仓（{record_path}）")
+        return None, [message]
+    return canonical, []
 
 
 def authorize_harvest_write(
@@ -224,7 +247,10 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             gaps.append("E5 payload 缺 development_id 或 head_commit——事件不完整")
         repo = deps.repo
         if repo is None and development_id:
-            repo, resolve_gaps = _resolve_repo(development_id, deps.dd_root)
+            allowlist_repo_paths = [entry.repo_path for entry in deps.allowlist.entries]
+            repo, resolve_gaps = _resolve_repo(
+                development_id, deps.dd_root, deps.ops, allowlist_repo_paths
+            )
             gaps.extend(resolve_gaps)
         steps = _record_step(
             state,

@@ -96,8 +96,101 @@ def _gh_pr_number(pr_url: str) -> str | None:
     return tail if tail.isdigit() else None
 
 
+def _resolved(path: Path) -> Path:
+    """规范化绝对路径（用于 allowlist 命中判定；不用于返回授权对象）。"""
+    return Path(path).expanduser().resolve()
+
+
+def _resolve_canonical_repo(
+    record_repo_path: str,
+    record_remote_url: str | None,
+    allowlist_repo_paths: list[str],
+) -> tuple[Path | None, str]:
+    """见 `DefaultHarvestOps.resolve_canonical_repo` 的 docstring。
+
+    独立为模块级函数便于直接单测解析逻辑本身（真 git / 合成仓皆可）。
+    """
+    allowlist_by_resolved = {_resolved(p): p for p in allowlist_repo_paths}
+    record = Path(record_repo_path)
+    record_resolved = _resolved(record)
+
+    # 1. 直接命中：record repo_path 本身就是白名单里的 canonical。
+    if record_resolved.is_dir() and record_resolved in allowlist_by_resolved:
+        return Path(allowlist_by_resolved[record_resolved]), ""
+
+    # 2. linked worktree 归属：common-dir 指向 <canonical>/.git。
+    common = run_git(record, "rev-parse", "--git-common-dir")
+    if common.returncode == 0 and common.stdout.strip():
+        common_dir = Path(common.stdout.strip())
+        if not common_dir.is_absolute():
+            common_dir = record / common_dir
+        common_resolved = _resolved(common_dir)
+        if common_resolved.name == ".git" and common_resolved != (record / ".git").resolve():
+            canonical = common_resolved.parent
+            if canonical.is_dir() and canonical in allowlist_by_resolved:
+                return Path(allowlist_by_resolved[canonical]), ""
+
+    # 3. origin 本地路径 / 4. origin URL 映射。
+    origin = record_remote_url
+    if not origin:
+        origin_proc = run_git(record, "remote", "get-url", "origin")
+        if origin_proc.returncode == 0 and origin_proc.stdout.strip():
+            origin = origin_proc.stdout.strip()
+    if origin:
+        if Path(origin).is_absolute() and Path(origin).is_dir():
+            origin_resolved = _resolved(origin)
+            if origin_resolved in allowlist_by_resolved:
+                return Path(allowlist_by_resolved[origin_resolved]), ""
+        else:
+            for entry_path in allowlist_repo_paths:
+                entry = Path(entry_path)
+                if not entry.is_dir():
+                    continue
+                proc = run_git(entry, "remote", "get-url", "origin")
+                if proc.returncode == 0 and proc.stdout.strip() == origin:
+                    return entry, ""
+
+    return None, f"record repo_path {record_repo_path!r} 无法解析到任何白名单 canonical 仓"
+
+
 class DefaultHarvestOps:
     """真实 git/部署操作的默认实现。测试一律注入 fake。"""
+
+    def resolve_canonical_repo(
+        self,
+        record_repo_path: str,
+        record_remote_url: str | None,
+        allowlist_repo_paths: list[str],
+    ) -> tuple[Path | None, str]:
+        """从 record repo_path 解析 canonical 目标仓绝对路径（机械判定，读口）。
+
+        dd 准入 record 的 `repo_path` 是**每单一次的 linked worktree**
+        （`/data/worktrees/...`），而收割写白名单按 **canonical 仓**（如
+        `/data/code/self/fleet-harvest-sandbox`）签发——直接拿 worktree 路径授权
+        恒 deny（真机回执 granted=false，本 spec 根因）。这里把 record repo_path
+        解析成命中白名单的 canonical 主 checkout，授权与全部写步才作用其上。
+
+        解析顺序（优先级从高到低，任一命中即返回，全程机械判定）：
+
+        1. **直接命中**：record_repo_path（规范化绝对路径）本身是目录且等于某
+           allowlist 条目的 repo_path → canonical = 它（保留「record 已指向
+           canonical」的既有正确行为）。
+        2. **linked worktree 归属**：`git -C <record_repo_path> rev-parse
+           --git-common-dir` 若不等 `<record_repo_path>/.git`（即该路径是被
+           canonical 仓注册的 linked worktree），则 common-dir 指向
+           `<canonical>/.git`，剥尾段 `.git` 得 canonical 主 checkout；若该目录
+           存在且命中 allowlist → canonical = 它。
+        3. **origin 本地路径**：record_remote_url（或缺失时 `git -C
+           <record_repo_path> remote get-url origin`）是本地绝对路径且该目录命中
+           allowlist → canonical = 它。
+        4. **origin URL 映射**：record_remote_url 是 forge URL → 对 allowlist 每个
+           条目的 repo_path（目录存在）读其 `git remote get-url origin`，精确
+           字符串匹配命中者 → canonical = 该条目的 repo_path。
+
+        解析不到可命中 allowlist 的 canonical → `(None, 机器可读留痕理由)`。绝不
+        静默放行、绝不 fallback 到 record repo_path（worktree 路径）本身去授权。
+        """
+        return _resolve_canonical_repo(record_repo_path, record_remote_url, allowlist_repo_paths)
 
     def fetch_dd_ref(self, repo: Path, development_id: str) -> dict[str, Any]:
         ref = _dd_ref(development_id)

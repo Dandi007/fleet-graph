@@ -29,6 +29,8 @@ from fleet_graph.supervise.harvest import (
     SOP_STEPS,
     HarvestDeps,
     HarvestRunConfig,
+    _resolve_repo,
+    authorize_harvest_write,
     build_harvest_graph,
     run_harvest,
 )
@@ -47,6 +49,7 @@ def fake_ops(
     deploy_exit: int = 0,
     fetch_ok: bool = True,
     pull_ok: bool = True,
+    resolve_canonical: Path | None = None,
 ) -> dict[str, Any]:
     """A recording fake ops: every write/execute is recorded, results scripted."""
     calls: list[str] = []
@@ -55,6 +58,17 @@ def fake_ops(
         def fetch_dd_ref(self, repo: Path, development_id: str) -> dict[str, Any]:
             calls.append("fetch_dd_ref")
             return {"ok": fetch_ok}
+
+        def resolve_canonical_repo(
+            self,
+            record_repo_path: str,
+            record_remote_url: str | None,
+            allowlist_repo_paths: list[str],
+        ) -> tuple[Path | None, str]:
+            # 读口：不构成写原语，不入 calls（calls 只记录写/执行动作）。
+            if resolve_canonical is not None:
+                return resolve_canonical, ""
+            return Path(record_repo_path), ""
 
         def cherry_equivalent(self, repo: Path, head_commit: str, default_branch: str) -> bool:
             calls.append("cherry_equivalent")
@@ -128,6 +142,20 @@ def dd_record_root(tmp_path: Path, repo_path: str, card_entity_id: str | None = 
     record: dict[str, Any] = {"development_id": "dev-x", "repo_path": repo_path}
     if card_entity_id is not None:
         record["card_entity_id"] = card_entity_id
+    (dev_dir / "record.json").write_text(json.dumps(record), encoding="utf-8")
+    return dd_root
+
+
+def dd_record_root_with_remote_url(tmp_path: Path, repo_path: str, remote_url: str) -> Path:
+    """与 dd_record_root 同构，但 record 显式携带 remote_url（spec 交付 A 新读字段）。"""
+    dd_root = tmp_path / "dd"
+    dev_dir = dd_root / "dev-x"
+    dev_dir.mkdir(parents=True, exist_ok=True)
+    record: dict[str, Any] = {
+        "development_id": "dev-x",
+        "repo_path": repo_path,
+        "remote_url": remote_url,
+    }
     (dev_dir / "record.json").write_text(json.dumps(record), encoding="utf-8")
     return dd_root
 
@@ -569,3 +597,206 @@ class TestDefaultHarvestOpsWorktreeLifecycle:
         result = ops.worktree_cherry_pick(repo, product_commit, "main", worktree_root)
         assert result.get("conflicts") is True or result["ok"] is False
         assert not worktree_root.exists(), "failed worktree left behind"
+
+
+def _init_git_repo(repo: Path) -> None:
+    """一个可收割的真 git 仓（含 origin remote），全部本地合成，禁触真网。"""
+    repo.mkdir(parents=True, exist_ok=True)
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "test@example.invalid")
+    git(repo, "config", "user.name", "test")
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "seed")
+
+
+def _canonical_allowlist(canonical: Path) -> HarvestAllowlist:
+    return full_allowlist(str(canonical))
+
+
+class TestCanonicalRepoResolution:
+    """M3 第二轮根因修复：harvest 解析 canonical 目标仓（spec 交付 A/C）。
+
+    真机回执 granted=false 的根因是 record.repo_path 是每单一次的 linked
+    worktree，而 allowlist 按 canonical 仓签发。这里用真实 git worktree +
+    本地合成仓验证：`_resolve_repo` 把 worktree 解析成 canonical 主 checkout，
+    授权 granted=True；阴性（非白名单 canonical / 无 origin / worktree 路径
+    本身）仍 deny/refused，绝不拉宽 deny-all。全程禁触真网/生产 checkout。
+    """
+
+    def test_linked_worktree_resolves_to_canonical_main_checkout(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        git(canonical, "remote", "add", "origin", "https://example.invalid/x.git")
+        worktree = tmp_path / "linked-wt"
+        git(canonical, "worktree", "add", "--detach", str(worktree), "main")
+
+        allowlist = _canonical_allowlist(canonical)
+        resolved, gaps = _resolve_repo(
+            "dev-x",
+            dd_record_root(tmp_path, str(worktree)),
+            DefaultHarvestOps(),
+            [e.repo_path for e in allowlist.entries],
+        )
+        assert gaps == []
+        assert resolved == canonical, f"resolved {resolved!r} != canonical {canonical!r}"
+        auth = authorize_harvest_write(
+            allowlist,
+            repo_path=str(resolved),
+            branch="refs/heads/main",
+            deploy=(),
+        )
+        assert auth.granted is True, auth.reasons
+
+    def test_origin_url_mapping_hits_canonical(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        git(canonical, "remote", "add", "origin", "https://example.invalid/x.git")
+        other = tmp_path / "other"
+        _init_git_repo(other)
+        git(other, "remote", "add", "origin", "https://example.invalid/x.git")
+
+        allowlist = _canonical_allowlist(canonical)
+        resolved, gaps = _resolve_repo(
+            "dev-x",
+            dd_record_root(tmp_path, str(other), None),
+            DefaultHarvestOps(),
+            [e.repo_path for e in allowlist.entries],
+        )
+        assert gaps == []
+        assert resolved == canonical, f"origin mapping resolved {resolved!r}"
+        auth = authorize_harvest_write(
+            allowlist,
+            repo_path=str(resolved),
+            branch="refs/heads/main",
+            deploy=(),
+        )
+        assert auth.granted is True
+
+    def test_origin_url_mapping_uses_record_remote_url(self, tmp_path: Path) -> None:
+        """record 显式 remote_url 时优先用该字段做 origin URL 映射。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        git(canonical, "remote", "add", "origin", "https://example.invalid/x.git")
+        standalone = tmp_path / "standalone"
+        _init_git_repo(standalone)
+
+        allowlist = _canonical_allowlist(canonical)
+        resolved, gaps = _resolve_repo(
+            "dev-x",
+            dd_record_root_with_remote_url(
+                tmp_path, str(standalone), "https://example.invalid/x.git"
+            ),
+            DefaultHarvestOps(),
+            [e.repo_path for e in allowlist.entries],
+        )
+        assert gaps == []
+        assert resolved == canonical, f"record remote_url mapping resolved {resolved!r}"
+        auth = authorize_harvest_write(
+            allowlist,
+            repo_path=str(resolved),
+            branch="refs/heads/main",
+            deploy=(),
+        )
+        assert auth.granted is True
+
+    def test_intake_stores_canonical_and_gate_grants(self, tmp_path: Path) -> None:
+        """record 指向 worktree，intake 存 canonical，gate 对 canonical 授权。"""
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        worktree = tmp_path / "linked-wt"
+        git(canonical, "worktree", "add", "--detach", str(worktree), "main")
+
+        fake = fake_ops(resolve_canonical=canonical)
+        allowlist = _canonical_allowlist(canonical)
+        config, _ = config_for(
+            tmp_path,
+            allowlist=allowlist,
+            repo_path=str(worktree),
+            ops=fake,
+            bus=FakeBus(),
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["repo_path"] == str(canonical)
+        assert receipt["allowlist_auth"]["granted"] is True
+
+    def test_worktree_path_itself_is_still_denied(self, tmp_path: Path) -> None:
+        """回归：直接拿 record 原始 worktree 路径授权 -> 仍 deny（不拉宽 deny-all）。"""
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        worktree = tmp_path / "linked-wt"
+        git(canonical, "worktree", "add", "--detach", str(worktree), "main")
+
+        allowlist = _canonical_allowlist(canonical)
+        auth = authorize_harvest_write(
+            allowlist,
+            repo_path=str(worktree),
+            branch="refs/heads/main",
+            deploy=(),
+        )
+        assert auth.granted is False
+        assert any("不在收割写白名单" in r for r in auth.reasons)
+
+    def test_non_allowlist_canonical_denies(self, tmp_path: Path) -> None:
+        """解析出的 canonical 仓不在 allowlist -> 拒绝（authorize 语义不变）。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        worktree = tmp_path / "linked-wt"
+        git(canonical, "worktree", "add", "--detach", str(worktree), "main")
+        other_canon = tmp_path / "other-canon"
+        _init_git_repo(other_canon)
+
+        allowlist = _canonical_allowlist(other_canon)
+        resolved, gaps = _resolve_repo(
+            "dev-x",
+            dd_record_root(tmp_path, str(worktree)),
+            DefaultHarvestOps(),
+            [e.repo_path for e in allowlist.entries],
+        )
+        assert resolved is None
+        assert gaps and any("无法解析" in g for g in gaps)
+
+    def test_no_origin_refuses(self, tmp_path: Path) -> None:
+        """无 origin 且不在 allowlist -> 解析不到 canonical -> 拒绝。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        lone = tmp_path / "lone"
+        _init_git_repo(lone)
+        allowlist = _canonical_allowlist(tmp_path / "other")
+        resolved, gaps = _resolve_repo(
+            "dev-x",
+            dd_record_root(tmp_path, str(lone)),
+            DefaultHarvestOps(),
+            [e.repo_path for e in allowlist.entries],
+        )
+        assert resolved is None
+        assert gaps and any("无法解析" in g for g in gaps)
+
+    def test_unresolvable_escalates_without_writes(self, tmp_path: Path) -> None:
+        """解析不到任何 canonical -> intake 留 gaps -> escalated，零写动作。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        lone = tmp_path / "lone"
+        _init_git_repo(lone)
+        allowlist = _canonical_allowlist(tmp_path / "other")
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            allowlist=allowlist,
+            repo_path=str(lone),
+            ops=fake,
+        )
+        config.ops = DefaultHarvestOps()
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert fake["calls"] == []
