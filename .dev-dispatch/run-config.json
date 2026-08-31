@@ -1,0 +1,17 @@
+{
+ "development_id": "dev-fg-92789a6049e1",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "bash",
+   "-lc",
+   "set -euo pipefail; f=docs/operating.md; grep -F -- \"舰队入口总表\" \"$f\"; for entry in \"goal 提交面\" \"dd 派单面\" \"放行入口\" \"裁决入口\" \"收割入口\" \"带外手工入口\"; do grep -F -- \"$entry\" \"$f\"; done"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
