@@ -50,11 +50,23 @@ def _hello(args: argparse.Namespace) -> int:
     return 0
 
 
+def default_research_run_root(question: str) -> str:
+    """默认 run_root 由题面内容寻址派生——R3-fix 误双开保护的锚点。
+
+    不显式给 ``--run-root`` 的两次同题启动落到同一 run_root ⇒ 同一 run instance
+    ⇒ 同一 thread 身份 ⇒ 第二次启动领养而非并跑双烧。显式 ``--run-root`` 才进入
+    「独立实例」语义（那本就该是显式动作）。抽成具名函数以便验收脚本直接断言
+    这条保护，而不是复制派生表达式。
+    """
+    from fleet_graph.graphs.research_pipeline import derive_research_id
+
+    return f"/data/fleet-graph/research/{derive_research_id(question)}"
+
+
 def _research_run(args: argparse.Namespace) -> int:
     """Run one research ticket to termination, printing its terminal record."""
     import pathlib
 
-    from fleet_graph.graphs.research_pipeline import derive_research_id
     from fleet_graph.graphs.research_runner import (
         ResearchConfig,
         default_publisher,
@@ -63,9 +75,7 @@ def _research_run(args: argparse.Namespace) -> int:
 
     config = ResearchConfig(
         question=args.question,
-        run_root=pathlib.Path(
-            args.run_root or f"/data/fleet-graph/research/{derive_research_id(args.question)}"
-        ),
+        run_root=pathlib.Path(args.run_root or default_research_run_root(args.question)),
         generation=args.generation,
         max_clues=args.max_clues,
         concurrency=args.concurrency,

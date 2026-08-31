@@ -165,6 +165,35 @@ def run_one(tmp: Path, name: str) -> dict[str, Any]:
     return run_research(config, text_node=seed, launcher=FakeLauncher())
 
 
+def check_default_path_protection() -> bool:
+    """默认路径误双开保护（监督面补充断言，2026-08-31 过闸条件 1）。
+
+    保护的唯一凭据是 cli 的默认 run_root 派生：不传 ``--run-root`` 时同一题
+    两次启动必须落同一 run_root ⇒ 同一 instance/thread 身份（领养而非并跑）。
+    只断言「显式异 root 异 id」看不住这条——必须断言默认路径本身。
+    """
+    from fleet_graph.cli import build_parser, default_research_run_root
+
+    args = build_parser().parse_args(["research", "run", "--question", QUESTION])
+    cli_default_is_none = args.run_root is None
+
+    root_1 = default_research_run_root(QUESTION)
+    root_2 = default_research_run_root(QUESTION)
+    a = ResearchConfig(question=QUESTION, run_root=Path(root_1))
+    b = ResearchConfig(question=QUESTION, run_root=Path(root_2))
+    same_identity = root_1 == root_2 and a.thread_id == b.thread_id
+
+    ok = cli_default_is_none and same_identity
+    if not ok:
+        print(
+            "默认路径双开保护失效："
+            f"cli_default_is_none={cli_default_is_none} roots=({root_1},{root_2}) "
+            f"threads=({a.thread_id},{b.thread_id})",
+            file=sys.stderr,
+        )
+    return ok
+
+
 def check() -> int:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -191,12 +220,15 @@ def check() -> int:
                 file=sys.stderr,
             )
 
+    default_path_protected = check_default_path_protection()
+
     print(f"research_id={research_id}")
     print(f"distinct_threads={distinct_threads}")
     print(f"distinct_run_ids={distinct_run_ids}")
     print(f"idempotent_run_ids={idempotent_run_ids}")
     print(f"both_legal_terminal={both_legal_terminal}")
-    return 0 if derivation_ok and both_legal_terminal else 1
+    print(f"default_path_protected={default_path_protected}")
+    return 0 if derivation_ok and both_legal_terminal and default_path_protected else 1
 
 
 def main() -> int:
