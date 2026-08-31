@@ -279,6 +279,7 @@ class TestHumanGate:
         self, board: Board, transport: RecordingTransport
     ) -> None:
         transport.queue(200, {"refs": [{"message_id": "msg_d", "target_entity": "msg_q"}]})
+        transport.queue(200, {"messages": [], "head_seq": 12})  # head 学习针
         transport.queue(
             200,
             {
@@ -310,6 +311,7 @@ class TestHumanGate:
     ) -> None:
         """兼收：v1 留给人工问答裁决，decision_for 必须继续认它。"""
         transport.queue(200, {"refs": [{"message_id": "msg_d", "target_entity": "msg_q"}]})
+        transport.queue(200, {"messages": [], "head_seq": 12})  # head 学习针
         transport.queue(
             200,
             {
@@ -338,6 +340,7 @@ class TestHumanGate:
     ) -> None:
         """兼收：decision_publisher 发的 v2 gate_release 必须解锁 gate。"""
         transport.queue(200, {"refs": [{"message_id": "msg_d", "target_entity": "msg_q"}]})
+        transport.queue(200, {"messages": [], "head_seq": 12})  # head 学习针
         transport.queue(
             200,
             {
@@ -371,6 +374,7 @@ class TestHumanGate:
     ) -> None:
         """Someone commenting on the question is not someone deciding it."""
         transport.queue(200, {"refs": [{"message_id": "msg_n", "target_entity": "msg_q"}]})
+        transport.queue(200, {"messages": [], "head_seq": 12})  # head 学习针
         transport.queue(
             200,
             {
@@ -399,6 +403,7 @@ class TestHumanGate:
                 ]
             },
         )
+        transport.queue(200, {"messages": [], "head_seq": 30})  # head 学习针
         transport.queue(
             200,
             {
@@ -478,3 +483,41 @@ class TestLoopbackIsNeverProxied:
         # Constructing must not raise, and must not pick up a proxy mount.
         transport = HttpxTransport()
         assert transport._client.trust_env is False
+
+
+class TestGatePaginationRegression:
+    """2026-08-31 生产实锤：频道破千后裸 limit=1000（升序=最老窗）令新裁决不可见，
+    全部 gate 假等。decision_for 必须先学 head 再读尾窗。"""
+
+    def test_decision_beyond_first_thousand_is_found(
+        self, board: Board, transport: RecordingTransport
+    ) -> None:
+        transport.queue(200, {"refs": [{"message_id": "msg_d", "target_entity": "msg_q"}]})
+        # 第一针：head 学习（频道已有 1500 条）
+        transport.queue(200, {"messages": [], "head_seq": 1500})
+        # 第二针：尾窗返回裁决（seq 1490，在最老千条窗之外）
+        transport.queue(
+            200,
+            {
+                "messages": [
+                    {
+                        "message_id": "msg_d",
+                        "kind": DECISION_KIND,
+                        "channel_seq": 1490,
+                        "payload": {
+                            "decision": "APPROVE",
+                            "decided_by": "human:operator",
+                            "question": "q",
+                            "rationale": "r",
+                            "card_entity_id": "card_1",
+                        },
+                    }
+                ],
+                "head_seq": 1500,
+            },
+        )
+        decision = board.decision_for(GateTicket("msg_q", "card_1"))
+        assert decision is not None and decision.message_id == "msg_d"
+        # 尾窗请求必须带 after_seq=head-1000
+        tail_call = transport.calls[-1]
+        assert "after_seq=500" in str(tail_call), tail_call
