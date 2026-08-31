@@ -1,7 +1,36 @@
-# 运维：两个闸门
+# 运维：三个闸门
 
-调度器有两个互不替代的闸。搞混它们的代价在事故里才显形，所以这里写清楚
+入口有三个互不替代的闸。搞混它们的代价在事故里才显形，所以这里写清楚
 各自管什么、怎么动、多久生效。
+
+## 闸零：入册申请（goal_enroll @ :5611）—— 哪些线**能**被名册接纳
+
+goal 线从入册申请开始。`goal_enroll` 是 goal-driven MCP 独立面
+（`fleet-graph goal serve`，`:5611`，MCP 注册名 `fleet-graph-goal`）上的
+fail-closed 入册工具：候选 goal 文件夹只有**每一道闸都过**才落 roster 条目，
+任一闸不过就以稳定的机器可读 code（带失败条款）拒绝——绝无半条、绝无
+warning-as-admission。
+
+调用面（goal 面独立于 dd 面，dd 面是纯 dev-dispatch，不含 `goal_enroll`）：
+
+- **`goal_enroll(folder_id)`**：校验闸在 goal 文件夹上逐道跑——文件夹是 goal
+  线（含 `goal.md` 与 `golden-order.md`）、`goal.md` 声明了可执行验收 argv、
+  `golden-order.md` 非空、spec-lint 禁条款干净、声明的验收命令能在一次性
+  liveness probe 里启动。通过才写**引擎版本化** roster 条目（briefing
+  版本 id 在内），此后同 folder 重跑幂等返回既有条目（`already_admitted`）。
+- **`goal-open` prompt / `fleet-graph://goal-open/briefing` resource**：开线
+  交底（Phase-0 opening briefing），随引擎发布版本化，roster 条目记录同一
+  briefing 版本 id——线上能审计到开它时的那版交底。
+- **绑定 fail-fast**：goal 面缺 `--work-folder-root`（或 env
+  `FLEET_GRAPH_WORK_FOLDER_ROOT`）时**拒绝启动**并打印明确错误——不允许起一个
+  运行时才报 `GOAL_ENROLL_SOURCE_UNBOUND` 的半残服务（registered-but-unbound
+  族 bug 的结构性根治）。
+
+- **生效**：调用即生效（roster 条目持久于 work-folder-root 下）
+- **用途**：goal 线入册的唯一入口；名册（闸一）只认已入册的线
+- 失败的入册是**显式拒绝**，不是静默跳过：`NO_ACCEPTANCE_COMMAND`、
+  `GOLDEN_ORDER_EMPTY`、`SPEC_LINT_BAN`、`ACCEPTANCE_ARGV_UNEXECUTABLE` 等
+  稳定 code 逐条可见
 
 ## 闸一：名册（`enabled`）—— 哪些线**允许**跑
 

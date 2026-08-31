@@ -13,8 +13,9 @@
 #
 # Port 5610 was bind-tested free on the fleet host (2026-08-27) and collides
 # with none of the reserved ports (5606/7455/7460/8113/5601/5602/5605/5608/
-# 7490/9090/9093/3300/8101/3002). The service itself refuses to start when the
-# port is taken (see fleet_graph.dd.service.port_is_available).
+# 7490/9090/9093/3300/8101/3002/5611). The service itself refuses to start when
+# the port is taken (see fleet_graph.dd.service.port_is_available). 5611 is the
+# goal-driven MCP surface's own port (see fleet-graph-goal-mcp.service).
 [Unit]
 Description=fleet-graph dev-dispatch MCP surface
 After=network-online.target

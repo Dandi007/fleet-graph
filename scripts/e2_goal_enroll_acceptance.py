@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """E5 goal-enroll acceptance: two isolated drills over the real MCP surface.
 
-Each scenario builds a real ``build_mcp_server`` (the same surface ``dd serve``
-serves), runs it over loopback HTTP, and drives ``goal_enroll`` through a real
-fastmcp ``Client`` -- no fakes at the surface. The only scratch state is a
-throwaway goal-folder root and roster store under a temp dir.
+Each scenario builds a real ``build_goal_mcp_server`` (the same surface
+``fleet-graph goal serve`` serves, :5611), runs it over loopback HTTP, and
+drives ``goal_enroll`` through a real fastmcp ``Client`` -- no fakes at the
+surface. The only scratch state is a throwaway goal-folder root and roster
+store under a temp dir.
 
 - ``no-acceptance-goal-fail-closed`` -- the negative-sample assertion: a goal
   whose ``goal.md`` declares no executable acceptance command is refused with
@@ -60,16 +61,6 @@ GOLDEN_ORDER_OK = """# Golden order (throwaway drill)
 
 The golden order outranks the spec. This line is a disposable acceptance drill.
 """
-
-
-class _FakeControlPlane:
-    """Minimal development control plane: the drill never touches it."""
-
-    def list(self, **kwargs: object) -> dict[str, Any]:
-        return {"developments": [], "cursor": None}
-
-    def get(self, **kwargs: object) -> dict[str, Any]:
-        return {"method": "get"}
 
 
 def utc_now() -> str:
@@ -133,16 +124,14 @@ def running_server(server: Any) -> Iterator[str]:
 
 def scenario_no_acceptance_goal_fail_closed(work_dir: Path) -> dict[str, Any]:
     """The negative sample: no acceptance command -> NO_ACCEPTANCE_COMMAND."""
-    from fleet_graph.dd.service import build_mcp_server
+    from fleet_graph.goal.service import build_goal_mcp_server
 
     folder_root = work_dir / "folders"
     (folder_root / "wf-1").mkdir(parents=True, exist_ok=True)
     (folder_root / "wf-1" / "goal.md").write_text("# no acceptance here\n", encoding="utf-8")
     (folder_root / "wf-1" / "golden-order.md").write_text(GOLDEN_ORDER_OK, encoding="utf-8")
 
-    server = build_mcp_server(
-        _FakeControlPlane(), goal_folders=governed_goal_folder_store(str(folder_root))
-    )
+    server = build_goal_mcp_server(goal_folders=governed_goal_folder_store(str(folder_root)))
 
     async def call(url: str) -> dict[str, Any]:
         from fastmcp.exceptions import ToolError
@@ -170,7 +159,7 @@ def scenario_no_acceptance_goal_fail_closed(work_dir: Path) -> dict[str, Any]:
 
 def scenario_enroll_drill_line_end_to_end(work_dir: Path) -> dict[str, Any]:
     """One throwaway drill line is enrolled through the MCP and starts."""
-    from fleet_graph.dd.service import build_mcp_server
+    from fleet_graph.goal.service import build_goal_mcp_server
 
     folder_root = work_dir / "folders"
     roster_root = work_dir / "roster"
@@ -179,8 +168,7 @@ def scenario_enroll_drill_line_end_to_end(work_dir: Path) -> dict[str, Any]:
     (folder_root / "wf-1" / "golden-order.md").write_text(GOLDEN_ORDER_OK, encoding="utf-8")
 
     roster = GoalEnrollRoster(str(roster_root))
-    server = build_mcp_server(
-        _FakeControlPlane(),
+    server = build_goal_mcp_server(
         goal_folders=governed_goal_folder_store(str(folder_root)),
         goal_roster=roster,
     )
@@ -220,11 +208,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--scenario",
-        required=True,
+        default=None,
         choices=[
             "no-acceptance-goal-fail-closed",
             "enroll-drill-line-end-to-end",
         ],
+        help="run one scenario only; default runs both (the full acceptance)",
     )
     parser.add_argument("--work-dir", default=None, help="scratch dir (default: a fresh temp dir)")
     return parser
@@ -237,13 +226,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.scenario == "no-acceptance-goal-fail-closed":
-        result = scenario_no_acceptance_goal_fail_closed(work_dir)
+    if args.scenario is not None:
+        scenarios = [args.scenario]
     else:
-        result = scenario_enroll_drill_line_end_to_end(work_dir)
+        scenarios = ["no-acceptance-goal-fail-closed", "enroll-drill-line-end-to-end"]
 
-    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0 if result.get("pass") else 1
+    results: list[dict[str, Any]] = []
+    for scenario in scenarios:
+        if scenario == "no-acceptance-goal-fail-closed":
+            result = scenario_no_acceptance_goal_fail_closed(work_dir)
+        else:
+            result = scenario_enroll_drill_line_end_to_end(work_dir)
+        results.append(result)
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+
+    return 0 if all(result.get("pass") for result in results) else 1
 
 
 if __name__ == "__main__":
