@@ -1,7 +1,7 @@
 """Thin CLI entrypoint.
 
-`version`, `hello`, `line run`, `research run`, `dd run`, `goal serve`,
-`scheduler run`, `inbox list`, and `supervise audit`.
+`version`, `hello`, `line run`, `research run`, `research serve`, `dd run`,
+`goal serve`, `scheduler run`, `inbox list`, and `supervise audit`.
 """
 
 from __future__ import annotations
@@ -64,29 +64,47 @@ def default_research_run_root(question: str) -> str:
 
 
 def _research_run(args: argparse.Namespace) -> int:
-    """Run one research ticket to termination, printing its terminal record."""
+    """Run one research ticket to termination, printing its terminal record.
+
+    R6：经统一入口 ``research_entry.run_research_ticket``（与 MCP tool / skill
+    同一路由）——按 ``--tier light|heavy`` 或确定性规模判定分档，finalise 侧归位
+    report 到 wiki 域 ``DeepThought/<topic>/``。
+    """
     import pathlib
 
-    from fleet_graph.graphs.research_runner import (
-        ResearchConfig,
-        default_publisher,
-        run_research,
-    )
+    from fleet_graph.graphs.research_runner import default_publisher
+    from fleet_graph.research_entry import run_research_ticket
 
-    config = ResearchConfig(
-        question=args.question,
-        run_root=pathlib.Path(args.run_root or default_research_run_root(args.question)),
+    result = run_research_ticket(
+        args.question,
+        tier=args.tier,
+        scale=args.scale,
+        run_root=pathlib.Path(args.run_root) if args.run_root else None,
         generation=args.generation,
         max_clues=args.max_clues,
         concurrency=args.concurrency,
-        checkpoint_path=args.checkpoint,
+        checkpoint=args.checkpoint,
         instance=args.instance,
+        publisher=default_publisher(),
     )
-    result = run_research(config, publisher=default_publisher())
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
     sys.stdout.write("\n")
     # 终态 ∈ {converged, capped, partial} 才算跑通；fault 非零退出（规格第 9 条）。
     return 0 if result.get("terminal") in {"converged", "capped", "partial"} else 1
+
+
+def _research_serve(args: argparse.Namespace) -> int:
+    """Serve the research MCP surface on loopback. It is its own service."""
+    from fleet_graph.research_mcp import serve
+
+    try:
+        serve(host=args.host, port=args.port, wiki_root=args.wiki_root)
+    except RuntimeError as exc:
+        # A startup refusal (root unbound, port taken) is a visible failure,
+        # not a crash loop: print the clear reason and exit non-zero.
+        print(f"fleet-graph research serve: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _line_run(args: argparse.Namespace) -> int:
@@ -1251,6 +1269,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="run root; defaults to /data/fleet-graph/research/<research_id>",
     )
     research_run.add_argument(
+        "--tier",
+        default=None,
+        choices=("light", "heavy"),
+        help="light/heavy tier (R6 unified routing); defaults to a deterministic "
+        "scale-based routing (heavy when the sources scale >= 4, else light)",
+    )
+    research_run.add_argument(
+        "--scale",
+        type=int,
+        default=None,
+        help="scale input for the deterministic tier routing when --tier is absent "
+        "(defaults to the number of configured sources)",
+    )
+    research_run.add_argument(
+        "--wiki-root",
+        default=None,
+        help="wiki-domain root the final report is placed under (DeepThought/<topic>/); "
+        "defaults to $FLEET_GRAPH_WIKI_ROOT or /data/vault",
+    )
+    research_run.add_argument(
         "--generation",
         type=int,
         default=1,
@@ -1260,15 +1298,17 @@ def build_parser() -> argparse.ArgumentParser:
     research_run.add_argument(
         "--max-clues",
         type=int,
-        default=12,
-        help="clue board size bound; hitting it terminates the run as `capped`",
+        default=None,
+        help="clue board size bound override (R6 tier bounds by default; "
+        "hitting the bound terminates the run as `capped`)",
     )
     research_run.add_argument(
         "--concurrency",
         type=int,
-        default=4,
-        help="how many open clues one dispatch wave launches in parallel (R3 fan-out, "
-        "default 4); only affects how many run per wave, never clue/run id derivation",
+        default=None,
+        help="how many open clues one dispatch wave launches in parallel (R3 fan-out; "
+        "R6 tier bounds by default); only affects how many run per wave, never "
+        "clue/run id derivation",
     )
     research_run.add_argument(
         "--instance",
@@ -1283,6 +1323,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="checkpoint sqlite path; defaults to <run-root>/checkpoint.sqlite3",
     )
     research_run.set_defaults(func=_research_run)
+
+    research_serve = research_sub.add_parser(
+        "serve", help="serve the research MCP surface (the standalone research service)"
+    )
+    research_serve.add_argument("--host", default="127.0.0.1")
+    research_serve.add_argument("--port", type=int, default=5612)
+    research_serve.add_argument(
+        "--wiki-root",
+        default=None,
+        help="wiki-domain root for DeepThought/<topic>/ report placement; required -- "
+        "without it (or without FLEET_GRAPH_WIKI_ROOT) the service refuses to start",
+    )
+    research_serve.set_defaults(func=_research_serve)
 
     dd = subparsers.add_parser("dd", help="run a dev-dispatch development")
     dd_sub = dd.add_subparsers()
