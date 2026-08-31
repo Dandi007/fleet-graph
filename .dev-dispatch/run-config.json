@@ -1,0 +1,23 @@
+{
+ "development_id": "dev-fg-2eae07574d7d",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/check_research_anchor.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
