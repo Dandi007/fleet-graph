@@ -7,14 +7,15 @@
 
     sources={code-local,wiki,web}
     web=1
-    synthesis_clue_ids=1
+    debate_evidences=1
 
 - ``sources`` 是本次 run **实际派发到的去重 source 集合**（按字母序）；
 - ``web`` 是 web 的派发次数；
-- ``synthesis_clue_ids`` 是 synthesis input 的 clue_ids 条数（无 verdict 的
-  evidences 必须判 done 并随 synthesis 投递——R2-fix 验收判据）。
+- ``debate_evidences`` 是 R4 debate 阶段 advocate manifest 投递的 evidences 条数
+  （无 verdict 的 evidences 必须判 done 并进入对抗裁决子图——R2-fix 验收判据的
+  R4 承接形态，synthesis 已由 debate 替代）。
 
-exit 0 当且仅当 去重数 ≥ 3 且 web ≥ 1 且 synthesis_clue_ids ≥ 1，否则 exit 1。
+exit 0 当且仅当 去重数 ≥ 3 且 web ≥ 1 且 debate_evidences ≥ 1，否则 exit 1。
 
 R2-fix：fake ``worker_payload`` 产出**真实** worker.result.v1 形状（evidences /
 proposed_clues / materials，无 verdict、无 clue_id）——覆盖检查真走修复后的 collect
@@ -31,10 +32,18 @@ from types import SimpleNamespace
 from typing import Any
 
 from fleet_graph.executors.agent_run import RunStatus, RunTicket
-from fleet_graph.graphs.research_pipeline import SOURCE_ROLE, SYNTHESIS_ROLE
+from fleet_graph.graphs.research_pipeline import (
+    ADVOCATE_ROLE,
+    ARBITER_ROLE,
+    JUDGE_ROLE,
+    OPPONENT_ROLE,
+    SOURCE_ROLE,
+)
 from fleet_graph.graphs.research_runner import ResearchConfig, run_research
 
 ROLE_TO_SOURCE: dict[str, str] = {role: source for source, role in SOURCE_ROLE.items()}
+
+DEBATE_ROLES: set[str] = {ADVOCATE_ROLE, OPPONENT_ROLE, JUDGE_ROLE, ARBITER_ROLE}
 
 
 class FakeTextNode:
@@ -66,35 +75,51 @@ def worker_payload(source: str) -> dict[str, Any]:
     }
 
 
-def synthesis_payload() -> dict[str, Any]:
-    """research-synth.result.v1 形状。"""
+def debate_payload(body: str) -> dict[str, Any]:
+    """dr-doc.result.v1 形状。"""
     return {
-        "report_markdown": "# 报告\n覆盖检查通过。",
-        "coverage_summary": "all sources covered",
-        "unresolved": [],
+        "state": "succeeded",
+        "exit_code": 0,
+        "structured_result": {"body": body},
+    }
+
+
+def arbiter_payload() -> dict[str, Any]:
+    """dr-arbiter.result.v1 形状。"""
+    return {
+        "state": "succeeded",
+        "exit_code": 0,
+        "structured_result": {"verdict": "enough", "rationale": "证据已充分"},
     }
 
 
 class FakeLauncher:
-    """按 role 回放脚本，并记录每次派发的 spec.role（覆盖检查的判据）。"""
+    """按 role 回放脚本，并记录每次派发的 spec.role（覆盖检查的判据）。
+
+    ``launch`` 幂等（R3）：同 run_id 重复 launch = re-adopt 在途 run，只记录第一次；
+    wait 与 launch 同序（worker 先、debate 链后）。
+    """
 
     def __init__(self, worker_results: list[dict[str, Any]]) -> None:
         self.worker_results = list(worker_results)
         self.roles: dict[str, str] = {}
         self.dispatched_roles: list[str] = []
+        self._launched: set[str] = set()
 
     def launch(self, spec: Any, run_id: str) -> RunTicket:
-        self.roles[run_id] = spec.role
-        self.dispatched_roles.append(spec.role)
+        if run_id not in self._launched:
+            self._launched.add(run_id)
+            self.roles[run_id] = spec.role
+            self.dispatched_roles.append(spec.role)
         return RunTicket(run_id, f"/tmp/coverage/{run_id}", None)
 
     def wait(self, ticket: RunTicket, **kwargs: Any) -> RunStatus:
         role = self.roles[ticket.run_id]
-        if role == SYNTHESIS_ROLE:
-            return RunStatus(
-                "succeeded",
-                {"state": "succeeded", "exit_code": 0, "structured_result": synthesis_payload()},
-            )
+        if role in DEBATE_ROLES:
+            if role == ARBITER_ROLE:
+                return RunStatus("succeeded", arbiter_payload())
+            body = "# body\n支持。" if role == ADVOCATE_ROLE else "# body\n反驳。"
+            return RunStatus("succeeded", debate_payload(body))
         result = self.worker_results.pop(0)
         return RunStatus(
             "succeeded", {"state": "succeeded", "exit_code": 0, "structured_result": result}
@@ -132,14 +157,15 @@ def check() -> int:
         web_count = sum(
             1 for role in launcher.dispatched_roles if ROLE_TO_SOURCE.get(role) == "web"
         )
-        # R2-fix：无 verdict 的 evidences 必须判 done 并随 synthesis 投递（clue_ids 非空）。
+        # R2-fix 承接（R4）：无 verdict 的 evidences 必须判 done 并进入 debate 阶段
+        # （advocate manifest 的 evidences 非空）。
         try:
             manifest = json.loads(
-                (run_root / "inputs" / "synthesis.json").read_text(encoding="utf-8")
+                (run_root / "inputs" / "debate-advocate.json").read_text(encoding="utf-8")
             )
-            synthesis_clue_ids = len(manifest.get("clue_ids") or [])
+            debate_evidences = len(manifest.get("evidences") or [])
         except (OSError, json.JSONDecodeError) as exc:
-            print(f"synthesis input 不可读：{exc}", file=sys.stderr)
+            print(f"debate-advocate input 不可读：{exc}", file=sys.stderr)
             return 1
         evidence_lines = 0
         evidence_path = run_root / "evidence.jsonl"
@@ -150,11 +176,11 @@ def check() -> int:
 
     print(f"sources={{{','.join(dispatched_sources)}}}")
     print(f"web={web_count}")
-    print(f"synthesis_clue_ids={synthesis_clue_ids}")
+    print(f"debate_evidences={debate_evidences}")
     ok = (
         len(dispatched_sources) >= 3
         and web_count >= 1
-        and synthesis_clue_ids >= 1
+        and debate_evidences >= 1
         and evidence_lines >= 1
     )
     return 0 if ok else 1

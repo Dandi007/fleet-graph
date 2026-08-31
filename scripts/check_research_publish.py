@@ -25,11 +25,16 @@ import time
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 from fleet_graph.bus.client import DEFAULT_BUS_URL, BusClient
 from fleet_graph.executors.agent_run import RunStatus, RunTicket
-from fleet_graph.graphs.research_pipeline import SYNTHESIS_ROLE
+from fleet_graph.graphs.research_pipeline import (
+    ADVOCATE_ROLE,
+    ARBITER_ROLE,
+    JUDGE_ROLE,
+    OPPONENT_ROLE,
+)
 from fleet_graph.graphs.research_runner import ResearchConfig, run_research
 from fleet_graph.research_bus import clue_index_channel, docs_channel, evidence_channel
 
@@ -112,9 +117,17 @@ class FakeLauncher:
     同形，pipeline 侧 parse_envelope 才能拆出来。
     """
 
-    def __init__(self, workers: list[dict[str, Any]], synthesis: dict[str, Any]) -> None:
+    #: R4 后终局 LLM 面 = 对抗子图四角色（advocate/opponent/judge/arbiter），
+    #: 按角色常量回放固定信封——与 tests 里 default_debate() 同形。
+    DEBATE_REPLAY: ClassVar[dict[str, dict[str, Any]]] = {
+        ADVOCATE_ROLE: {"body": "# advocate 论证\n正面。"},
+        OPPONENT_ROLE: {"body": "# opponent 论证\n反驳。"},
+        JUDGE_ROLE: {"body": "# judge 裁定\n暂无分歧。"},
+        ARBITER_ROLE: {"verdict": "enough", "rationale": "证据已充分"},
+    }
+
+    def __init__(self, workers: list[dict[str, Any]]) -> None:
         self.workers = list(workers)
-        self.synthesis = synthesis
         self.roles: dict[str, str] = {}
 
     def launch(self, spec: Any, run_id: str) -> RunTicket:
@@ -123,23 +136,19 @@ class FakeLauncher:
 
     def wait(self, ticket: RunTicket, **kwargs: Any) -> RunStatus:
         role = self.roles[ticket.run_id]
-        if role == SYNTHESIS_ROLE:
+        if role in self.DEBATE_REPLAY:
             return RunStatus(
                 "succeeded",
-                {"state": "succeeded", "exit_code": 0, "structured_result": self.synthesis},
+                {
+                    "state": "succeeded",
+                    "exit_code": 0,
+                    "structured_result": self.DEBATE_REPLAY[role],
+                },
             )
         item = self.workers.pop(0)
         return RunStatus(
             "succeeded", {"state": "succeeded", "exit_code": 0, "structured_result": item}
         )
-
-
-def synthesis_payload() -> dict[str, Any]:
-    return {
-        "report_markdown": "# 报告\nR1-返工 验收通过。",
-        "coverage_summary": "all covered",
-        "unresolved": [],
-    }
 
 
 class ForbiddenPublisher:
@@ -154,10 +163,7 @@ class ForbiddenPublisher:
 def run_one_question(question: str, publisher: Any, result_path: Path) -> dict[str, Any]:
     """跑一次真实 pipeline（fake text/launcher + 注入 publisher），返回 result。"""
     seed = FakeTextNode(json.dumps(["调度器的基本循环"]))
-    launcher = FakeLauncher(
-        [worker_payload("每轮 tick 检查所有 line")],
-        synthesis_payload(),
-    )
+    launcher = FakeLauncher([worker_payload("每轮 tick 检查所有 line")])
     config = ResearchConfig(question=question, run_root=result_path)
     return run_research(config, text_node=seed, launcher=launcher, publisher=publisher)
 

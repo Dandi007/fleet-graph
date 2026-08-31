@@ -146,6 +146,14 @@ class SupervisorLaunchSpec:
     executable: str = "/data/apps/fleet-graph/current/.venv/bin/fleet-graph"
     environment: dict[str, str] = field(default_factory=dict)
     log_path: Path | None = None
+    #: M3 harvest (E5): observer-side passthrough of the `supervisor run`
+    #: harvest write flags. All default empty/None -- an unconfigured observer
+    #: emits no harvest flag, so the run keeps its deny-all + 'main' defaults
+    #: (零放宽).
+    harvest_allowlist_path: str | None = None
+    harvest_default_branch: str | None = None
+    harvest_deploy: tuple[str, ...] = ()
+    repo: str | None = None
 
     @property
     def unit_name(self) -> str:
@@ -182,6 +190,18 @@ class SupervisorLaunchSpec:
             "--state-root",
             str(self.state_root),
         ]
+        # M3 harvest (E5): 在 --state-root 之后按需追加（词法顺序稳定，测试按
+        # `in argv` 断言）。全部缺省 None/空 → 不发射任何 harvest 旗标，保持
+        # deny-all 默认拒绝语义零放宽。
+        if self.harvest_allowlist_path is not None:
+            argv += ["--harvest-allowlist", self.harvest_allowlist_path]
+        if self.harvest_default_branch is not None:
+            argv += ["--harvest-default-branch", self.harvest_default_branch]
+        for word in self.harvest_deploy:
+            # cli `--harvest-deploy` 是 action="append"：每个词一个旗标。
+            argv += ["--harvest-deploy", word]
+        if self.repo is not None:
+            argv += ["--repo", self.repo]
         return argv
 
 
@@ -209,6 +229,12 @@ class ObserverConfig:
     working_directory: str = "/data/apps/fleet-graph/current"
     executable: str = "/data/apps/fleet-graph/current/.venv/bin/fleet-graph"
     environment: dict[str, str] = field(default_factory=dict)
+    #: M3 harvest (E5): 透传给 SupervisorLaunchSpec（argv）。全部缺省
+    #: None/空 → 不发射任何 harvest 旗标，保持 deny-all 默认拒绝语义零放宽。
+    harvest_allowlist_path: str | None = None
+    harvest_default_branch: str | None = None
+    harvest_deploy: list[str] = field(default_factory=list)
+    repo: str | None = None
 
     @property
     def resolved_cursor_path(self) -> Path:
@@ -688,6 +714,10 @@ class SupervisorObserver:
             working_directory=self.config.working_directory,
             executable=self.config.executable,
             environment=environment,
+            harvest_allowlist_path=self.config.harvest_allowlist_path,
+            harvest_default_branch=self.config.harvest_default_branch,
+            harvest_deploy=tuple(self.config.harvest_deploy),
+            repo=self.config.repo,
         )
 
     def _log_dedup(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
