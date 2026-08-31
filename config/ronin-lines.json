@@ -154,6 +154,14 @@
       "max_rounds": 9999,
       "enabled": true,
       "_provenance": "2026-08-31 用户拍板「要 goal driven agent 开发」。calendar-agent 日程页一键导出打码图片：goal/spec/golden-order SSoT 在 wf-fdd6ac，验收 harness 已先于实现落在 Dandi007/calendar-agent@2b0b8164（scripts/check-acceptance.sh 静态门 A1-A4、check-export-privacy.sh 真机门 A5-A6，两门实测正确变红）。三条用户拍板（只糊内容留时间骨架 / 纯色块非像素马赛克 / 只导当前可见范围）写在 golden-order，实现方不得改动。座位选 opencode-gpt-sol 而非 dsv4pro：入编前 12 条 enabled 线有 11 条挤在 dsv4pro，gpt-sol/gpt-terra/glm53 三座全空，遵 2026-08-29 家族分流令（三家族分开用防单订阅撑爆）；terra 座留给需要 katana-memory-mcp 的线，本线不需要。本线是产品线不是引擎线，唯一非 fleet-graph 自身的题目。"
+    },
+    {
+      "folder_id": "wf-c22907",
+      "seat": "opencode-gpt-sol",
+      "alias": "ronin-glm-retire",
+      "max_rounds": 9999,
+      "enabled": true,
+      "_provenance": "2026-08-31 第九波（用户令「看下 wf-c22907 派发进入舰队？彻底全部退役glm52」）。glm-5.2 退役收尾线：调用方全量切 glm-5.3（agent-runtime 9 角色+座位 claude-glm52 改名 claude-glm53）→ 7 天观察窗零成功调用 → 网关摘别名与展开产物（gateway-config.sh 补对称收回能力，唯一真代码项）。前置（ladder/改名/无腿留痕/别名）已上生产，见 wf-cef4c0；goal/golden-order/findings SSoT：wf-c22907，验收命令已真机空跑，开工前四问已裁（座位改名/收回进 gateway-config/观察窗 7 天/不做跨 session 协调）。互锁五步序不可颠倒，第 3 步观察窗不得跳过。座位选 opencode-gpt-sol：避 dsv4pro 集中度（11/12），terra 留给需 katana-memory-mcp 的线，glm 家族有 coordinator 空收尾前科不用于本线。"
     }
   ],
   "line_environment": {
