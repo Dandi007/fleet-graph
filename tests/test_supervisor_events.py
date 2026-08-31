@@ -1193,3 +1193,105 @@ class TestE1NoDecisionCredential:
         [spec] = launcher.specs
         assert spec.environment[DECISION_TOKEN_ENV] == "/run/decision.token"
         assert self._creates_decision_setenv(spec)
+
+
+class TestHarvestWiring:
+    """M3 E5 harvest 接线：observer 侧把 harvest 写权旗标补传进
+    `supervisor run` argv（spec 契约：带 harvest 字段的 ObserverConfig +
+    SupervisorObserver → spec.argv() 中 --harvest-allowlist /
+    --harvest-default-branch / --harvest-deploy / --repo 逐项 in argv；
+    未配置这些字段时上述旗标不出现——deny-all 默认拒绝零放宽）。"""
+
+    def _observer(
+        self, tmp_path: Path, **harvest: Any
+    ) -> tuple[SupervisorObserver, RecordingLauncher]:
+        launcher = RecordingLauncher()
+        observer = SupervisorObserver(
+            ObserverConfig(
+                run_root=tmp_path / "runs",
+                supervisor_state_root=tmp_path / "supervisor",
+                **harvest,
+            ),
+            launcher=launcher,  # type: ignore[arg-type]
+            read_model=read_model_for(EMPTY_READ_MODEL),
+        )
+        return observer, launcher
+
+    def test_argv_carries_harvest_flags_when_configured(self, tmp_path: Path) -> None:
+        observer, launcher = self._observer(
+            tmp_path,
+            harvest_allowlist_path="/data/fleet-graph/supervisor/harvest-allowlist.json",
+            harvest_default_branch="master",
+            harvest_deploy=["bash", "scripts/deploy.sh"],
+            repo="/data/code/self/fleet-harvest-sandbox",
+        )
+        tick(observer, {"wf-a": terminal("fault", "run-1")})
+        [spec] = launcher.specs
+        argv = spec.argv()
+        assert "--harvest-allowlist" in argv
+        assert (
+            argv[argv.index("--harvest-allowlist") + 1]
+            == "/data/fleet-graph/supervisor/harvest-allowlist.json"
+        )
+        assert "--harvest-default-branch" in argv
+        assert argv[argv.index("--harvest-default-branch") + 1] == "master"
+        # 每个 deploy 词一个旗标（cli action="append"）。
+        assert argv.count("--harvest-deploy") == 2
+        assert argv[argv.index("--harvest-deploy") + 1] == "bash"
+        assert argv[argv.index("--harvest-deploy") + 3] == "scripts/deploy.sh"
+        assert "--repo" in argv
+        assert argv[argv.index("--repo") + 1] == "/data/code/self/fleet-harvest-sandbox"
+
+    def test_unconfigured_observer_emits_no_harvest_flags(self, tmp_path: Path) -> None:
+        observer, launcher = self._observer(tmp_path)
+        tick(observer, {"wf-a": terminal("fault", "run-1")})
+        [spec] = launcher.specs
+        argv = spec.argv()
+        assert not any(arg.startswith("--harvest-") for arg in argv)
+        assert "--repo" not in argv
+
+    def test_launch_spec_without_harvest_fields_emits_no_harvest_flags(
+        self, tmp_path: Path
+    ) -> None:
+        # 阴性（默认拒绝零放宽）：SupervisorLaunchSpec 不带 harvest 字段时
+        # argv() 无任何 --harvest-*。
+        spec = SupervisorLaunchSpec(
+            event=line_fault_event("wf-a", "run-1"),
+            run_root=tmp_path / "runs",
+            state_root=tmp_path / "supervisor",
+        )
+        argv = spec.argv()
+        assert not any(arg.startswith("--harvest-") for arg in argv)
+        assert "--repo" not in argv
+        assert "--harvest-allowlist" not in argv
+        assert "--harvest-default-branch" not in argv
+
+    def test_config_from_json_reads_harvest_fields(self, tmp_path: Path) -> None:
+        path = tmp_path / "config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "lines": [],
+                    "harvest_allowlist_path": "/data/fleet-graph/supervisor/harvest-allowlist.json",
+                    "harvest_default_branch": "master",
+                    "harvest_deploy": ["bash", "scripts/deploy.sh"],
+                    "repo": "/data/code/self/fleet-harvest-sandbox",
+                }
+            )
+        )
+        config = SchedulerConfig.from_json(path)
+        assert (
+            config.harvest_allowlist_path == "/data/fleet-graph/supervisor/harvest-allowlist.json"
+        )
+        assert config.harvest_default_branch == "master"
+        assert config.harvest_deploy == ["bash", "scripts/deploy.sh"]
+        assert config.repo == "/data/code/self/fleet-harvest-sandbox"
+
+    def test_config_from_json_absent_harvest_fields_default_empty(self, tmp_path: Path) -> None:
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps({"lines": []}))
+        config = SchedulerConfig.from_json(path)
+        assert config.harvest_allowlist_path is None
+        assert config.harvest_default_branch is None
+        assert config.harvest_deploy == []
+        assert config.repo is None

@@ -673,6 +673,11 @@ def _scheduler_run(args: argparse.Namespace) -> int:
                 read_model_base_url=config.read_model_base_url,
                 heartbeat_stale_threshold_seconds=config.heartbeat_stale_threshold_seconds,
                 environment=supervisor_environment,
+                # M3 E5 harvest: 纯配置透传，无业务逻辑。
+                harvest_allowlist_path=config.harvest_allowlist_path,
+                harvest_default_branch=config.harvest_default_branch,
+                harvest_deploy=config.harvest_deploy,
+                repo=config.repo,
             ),
             launcher=TransientLauncher(dry_run=args.dry_run),
             bus=board.client if board is not None else None,
