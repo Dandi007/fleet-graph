@@ -70,6 +70,7 @@ def _research_run(args: argparse.Namespace) -> int:
         max_clues=args.max_clues,
         concurrency=args.concurrency,
         checkpoint_path=args.checkpoint,
+        instance=args.instance,
     )
     result = run_research(config, publisher=default_publisher())
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
@@ -1228,6 +1229,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="how many open clues one dispatch wave launches in parallel (R3 fan-out, "
         "default 4); only affects how many run per wave, never clue/run id derivation",
+    )
+    research_run.add_argument(
+        "--instance",
+        default=None,
+        help="explicit run instance (R3-fix); defaults to a stable content-address of "
+        "the run root, so different run roots of the same question stay isolated and "
+        "never collide on the bus 409. Keep it stable across kill-restart",
     )
     research_run.add_argument(
         "--checkpoint",
