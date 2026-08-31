@@ -26,7 +26,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -381,26 +380,36 @@ class TestKillRestartContract:
 
             inner.launch = recording_launch  # type: ignore[method-assign]
 
-            # Let the fake finish shortly after the restart has adopted it, so
-            # the resumed wait() can return. If the timer loses the race and
-            # the fake finishes first, launch() adopts the finished result --
-            # still the adopt path, still one dispatch.
-            releaser = threading.Timer(2.0, release.touch)
-            releaser.start()
-            try:
-                invoke_config: dict[str, Any] = {
-                    "configurable": {"thread_id": config.thread_id},
-                    "recursion_limit": 100,
-                }
-                with SqliteSaver.from_conn_string(config.resolved_checkpoint_path) as saver:
-                    compiled = graph.compile(checkpointer=saver)
-                    start = resume_start(compiled, invoke_config)
-                    assert start is None, "the restart must resume, not replay round 1"
-                    state = compiled.invoke(start, config=invoke_config)
-            finally:
-                releaser.cancel()
+            # Deterministic adopt-before-release ordering (de-flake). The old
+            # `threading.Timer(2.0, release.touch)` raced resume_start: under
+            # full-suite load resume_start (checkpoint read + graph compile)
+            # took >2.0s, the timer fired first, the fake wrote result.json
+            # and exited before the restart adopted it, and resume_start
+            # returned {'round_no': 1} instead of None. Now the adopt verdict
+            # is taken first, while the fake is still in-flight by
+            # construction: release has not been signalled, so launch() must
+            # adopt the running run (adopted=True, one dispatch). Only then is
+            # release signalled so the fake can finish, and invoke(None)
+            # resumes the wait() to the adopted result.
+            #
+            # Known negative path (the defect this test pins): signal release
+            # *before* resume_start, or restore the threading.Timer(2.0, ...)
+            # race, and `assert start is None` reds with
+            # `assert {'round_no': 1} is None` -- the restart replays round 1
+            # instead of adopting the in-flight run. The assertions are not
+            # gutted for green: the ordering is what makes the contract
+            # deterministic.
+            invoke_config: dict[str, Any] = {
+                "configurable": {"thread_id": config.thread_id},
+                "recursion_limit": 100,
+            }
+            with SqliteSaver.from_conn_string(config.resolved_checkpoint_path) as saver:
+                compiled = graph.compile(checkpointer=saver)
+                start = resume_start(compiled, invoke_config)
+                assert start is None, "the restart must resume, not replay round 1"
                 release.parent.mkdir(parents=True, exist_ok=True)
                 release.touch()
+                state = compiled.invoke(start, config=invoke_config)
 
             # The contract, in order of importance.
             assert [t.run_id for t in launches] == [expected_run_id], (
