@@ -25,7 +25,9 @@ from fleet_graph.executors.agent_run import AgentRunLauncher
 from fleet_graph.executors.text_node import TextNode
 from fleet_graph.graphs.research_pipeline import (
     DEFAULT_SOURCES,
+    EVIDENCE_FILE,
     REPORT_FILE,
+    TERMINAL_CONVERGED,
     TERMINAL_FAULT,
     ResearchBounds,
     ResearchDeps,
@@ -34,6 +36,7 @@ from fleet_graph.graphs.research_pipeline import (
     derive_run_instance,
     initial_state,
 )
+from fleet_graph.research_sentinel import escalate_all_empty_terminal
 from fleet_graph.state.run_artifacts import iso, write_json_durable
 
 EVENTS = "events.jsonl"
@@ -174,6 +177,17 @@ def resume_start(
     return initial_state(config.research_id, config.question, config.generation)
 
 
+def _evidence_line_count(run_root: Path) -> int:
+    """evidence.jsonl 的非空行数（R7 哨兵判「全空」用，零产出即 0）。"""
+    path = Path(run_root) / EVIDENCE_FILE
+    if not path.is_file():
+        return 0
+    try:
+        return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+    except OSError:
+        return 0
+
+
 def run_research(
     config: ResearchConfig,
     *,
@@ -240,6 +254,15 @@ def run_research(
     except Exception as exc:
         terminal = TERMINAL_FAULT
         reason = f"{type(exc).__name__}: {exc}"
+
+    # R7 失败语义哨兵：把「全空」判成 converged 是静默成功——converged 但零
+    # evidence 产出（worker 无产出）必须响亮 fault，不得报 succeeded/exit 0。
+    # partial（有 blocked）是另一条响亮路径，不在这里动。
+    terminal, sentinel_reason = escalate_all_empty_terminal(
+        terminal, _evidence_line_count(run_root), converged=TERMINAL_CONVERGED, fault=TERMINAL_FAULT
+    )
+    if sentinel_reason is not None:
+        reason = sentinel_reason
 
     result = {
         "research_id": config.research_id,
