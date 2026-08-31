@@ -1,16 +1,37 @@
 {
- "development_id": "dev-fg-c62bb1490ffb",
+ "development_id": "dev-fg-4999f5b29aeb",
  "attempt": 1,
- "passed": true,
+ "passed": false,
  "results": [
+  {
+   "command": [
+    "uv",
+    "sync",
+    "--frozen"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": "Checked 100 packages in 9ms\n"
+  },
   {
    "command": [
     "make",
     "verify"
    ],
+   "exit_code": 2,
+   "stdout_tail": "object at 0x74d28fcf9c90>\nmonkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x74d28fcf8950>\n\n    def test_result_landing_during_the_liveness_check_is_not_called_lost(\n        self, launcher: AgentRunLauncher, monkeypatch: pytest.MonkeyPatch\n    ) -> None:\n        \"\"\"The poll race: finished-and-exited must never be mistaken for died.\n    \n        poll() reads the result, then checks liveness. A run that completes in\n        between looks exactly like one that died -- and reporting `lost` there\n        would discard a real result and invite a duplicate dispatch.\n        \"\"\"\n        run_id = derive_run_id(\"t8\", \"worker_turn\")\n        ticket = launcher.launch(AgentRunSpec(prompt=\"sleep=0\"), run_id)\n        launcher.wait(ticket, poll_interval=0.05, deadline_seconds=60)\n    \n        from fleet_graph.executors import agent_run as module\n    \n        real_find_result = module.find_result\n        calls = {\"n\": 0}\n    \n        def racing_find_result(session_root):\n            # First read sees nothing (the run had not finished yet); by the\n            # time we look again the result is there.\n            calls[\"n\"] += 1\n            if calls[\"n\"] == 1:\n                return None\n            return real_find_result(session_root)\n    \n        monkeypatch.setattr(module, \"find_result\", racing_find_result)\n    \n        # pid is long dead, so poll falls through to the liveness branch.\n        status = launcher.poll(RunTicket(run_id, ticket.session_root, pid=None))\n>       assert status.state == \"succeeded\", \"a completed run was reported as lost\"\nE       AssertionError: a completed run was reported as lost\nE       assert 'running' == 'succeeded'\nE         \nE         - succeeded\nE         + running\n\ntests/test_re_adopt.py:285: AssertionError\n=========================== short test summary info ============================\nFAILED tests/test_re_adopt.py::TestFailureModes::test_result_landing_during_the_liveness_check_is_not_called_lost\n1 failed, 2002 passed, 1 skipped in 57.17s\n",
+   "stderr_tail": "make: *** [Makefile:22: test] Error 1\n"
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/check_research_publish.py"
+   ],
    "exit_code": 0,
-   "stdout_tail": "............................. [ 21%]\n........................................................................ [ 25%]\n........................................................................ [ 28%]\n.s...................................................................... [ 32%]\n........................................................................ [ 36%]\n........................................................................ [ 39%]\n........................................................................ [ 43%]\n........................................................................ [ 46%]\n........................................................................ [ 50%]\n........................................................................ [ 54%]\n........................................................................ [ 57%]\n........................................................................ [ 61%]\n........................................................................ [ 64%]\n........................................................................ [ 68%]\n........................................................................ [ 72%]\n........................................................................ [ 75%]\n........................................................................ [ 79%]\n........................................................................ [ 83%]\n........................................................................ [ 86%]\n........................................................................ [ 90%]\n........................................................................ [ 93%]\n........................................................................ [ 97%]\n...................................................                      [100%]\n1994 passed, 1 skipped in 52.09s\nuv run python scripts/check_supervisor_conformance.py\nsupervisor conformance: clean\nuv run python scripts/check_work_report_conformance.py\nwork-report conformance: clean\n",
-   "stderr_tail": ""
+   "stdout_tail": "{\n  \"acceptance\": \"check-research-publish\",\n  \"negative_fixture\": {\n    \"channel_heads\": {\n      \"docs\": 0,\n      \"evidence\": 0,\n      \"index\": 0\n    },\n    \"degraded\": false,\n    \"missing_channels\": [\n      \"docs\",\n      \"evidence\",\n      \"index\"\n    ],\n    \"pass\": false,\n    \"publish_degraded\": {\n      \"count\": 0,\n      \"first_error\": null\n    },\n    \"research_id\": \"r-2193db185d0f\"\n  },\n  \"pass\": true,\n  \"r1_a\": {\n    \"channel_heads\": {\n      \"docs\": 1,\n      \"evidence\": 1,\n      \"index\": 3\n    },\n    \"degraded\": false,\n    \"missing_channels\": [],\n    \"pass\": true,\n    \"publish_degraded\": {\n      \"count\": 0,\n      \"first_error\": null\n    },\n    \"research_id\": \"r-9006901073fd\",\n    \"terminal\": \"converged\"\n  },\n  \"r1_b\": {\n    \"channel_heads\": {\n      \"docs\": 0,\n      \"evidence\": 0,\n      \"index\": 0\n    },\n    \"degraded\": true,\n    \"degraded_observable\": true,\n    \"missing_channels\": [\n      \"docs\",\n      \"evidence\",\n      \"index\"\n    ],\n    \"pass\": false,\n    \"publish_degraded\": {\n      \"count\": 5,\n      \"first_error\": \"BusError: agent-bus returned HTTP 403: {\\\"code\\\": \\\"DELEGATION_NOT_PERMITTED\\\"}\"\n    },\n    \"research_id\": \"r-df508847c3b2\",\n    \"terminal\": \"converged\"\n  },\n  \"utc_timestamp\": \"2026-08-31T10:02:45Z\"\n}\n",
+   "stderr_tail": "research publish degraded (kind=research.clue.v2 channel=research:r-df508847c3b2.index): agent-bus returned HTTP 403: {\"code\": \"DELEGATION_NOT_PERMITTED\"}\nresearch publish degraded (kind=research.clue.v2 channel=research:r-df508847c3b2.index): agent-bus returned HTTP 403: {\"code\": \"DELEGATION_NOT_PERMITTED\"}\nresearch publish degraded (kind=research.evidence.v2 channel=research:r-df508847c3b2.evidence): agent-bus returned HTTP 403: {\"code\": \"DELEGATION_NOT_PERMITTED\"}\nresearch publish degraded (kind=research.clue.v2 channel=research:r-df508847c3b2.index): agent-bus returned HTTP 403: {\"code\": \"DELEGATION_NOT_PERMITTED\"}\nresearch publish degraded (kind=research.doc.v2 channel=research:r-df508847c3b2.docs): agent-bus returned HTTP 403: {\"code\": \"DELEGATION_NOT_PERMITTED\"}\n"
   }
  ]
 }
