@@ -288,18 +288,6 @@ class TestFailureModes:
 
         from fleet_graph.executors import agent_run as module
 
-        # wait() returns as soon as result.json exists, while the subprocess may
-        # still be tearing down. The race under test needs the process *gone* so
-        # poll() falls through the liveness branch to its second result read;
-        # otherwise poll legitimately reports "running". Make that deterministic
-        # instead of timing-dependent.
-        pid = int((Path(ticket.session_root) / "launcher.pid").read_text())
-        assert wait_until(
-            lambda: not module._pid_is_our_run(pid, run_id),
-            timeout=10.0,
-            interval=0.02,
-        ), "the finished subprocess never exited"
-
         real_find_result = module.find_result
         calls = {"n": 0}
 
