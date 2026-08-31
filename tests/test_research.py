@@ -851,11 +851,15 @@ class TestCli:
         assert args.max_clues == 5
         assert args.checkpoint is None
 
-    def test_research_run_default_concurrency_is_four(self) -> None:
+    def test_research_run_bounds_default_to_tier_driven(self) -> None:
         from fleet_graph.cli import build_parser
 
+        # R6: bounds come from the deterministic tier routing, not a flat CLI
+        # default; --max-clues / --concurrency are explicit overrides on top.
         args = build_parser().parse_args(["research", "run", "--question", "q?"])
-        assert args.concurrency == 4
+        assert args.max_clues is None
+        assert args.concurrency is None
+        assert args.tier is None
 
     def test_research_run_accepts_explicit_concurrency(self) -> None:
         from fleet_graph.cli import build_parser
