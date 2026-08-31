@@ -1,11 +1,11 @@
 {
- "development_id": "dev-fg-119252fbfe8c",
+ "development_id": "dev-fg-957c7a1fdc14",
  "decision": "APPROVE",
  "raw_decision": "APPROVE",
  "normalization_form": "bare",
  "decided_by": "cc-supervisor",
- "decision_message_id": "msg_01M1CQYC1ZKZC1ZS1M7KCD8BWN",
- "question_note_id": "msg_01M1CQRAWHPXAYJTA9E7JDCW1A",
- "card_entity_id": "msg_01M1CM9YV9DQCB0AX4KY653SMY",
- "output_commit": "847815d994311320ec4c7799a9b8258cc420b7bb"
+ "decision_message_id": "msg_01M1DB7JBBYHWPJQBS22JJ30YH",
+ "question_note_id": "msg_01M1CW6C1WG51FTRHH1SM076GC",
+ "card_entity_id": "msg_01M1CRDEDMAM8RFX25JXEX4XYT",
+ "output_commit": "2cb8054862d315c983e0e8b842c79eef9e967e74"
 }
