@@ -8,8 +8,8 @@ open clue 同时 `dispatched`，collect 对每个 clue 单粒度的 launch+wait 
 时间重叠、wall-clock 下降（而非仅结构并列）。
 
 节点纯度（规格第 5 条）：
-- **script 节点**（dispatch / collect / harvest / converge / debate_report / finalise）
-  零 LLM 调用，只做计数、落盘与路由——它们不读含义、不写代理结论。
+- **script 节点**（dispatch / collect / harvest / converge / debate_report / finalise /
+  anchor_check）零 LLM 调用，只做计数、落盘与路由——它们不读含义、不写代理结论。
 - **LLM 节点**只有 `seed`（TextNode，纯文本进出，产出初始 clue 列表）与 R4 的
   对抗裁决子图 `debate`（advocate → opponent → judge → arbiter 四段 structured run，
   全部 `write=False`、语料经 `--prompt-file` 文件投递、`--input` 只携带 manifest）。
@@ -17,6 +17,11 @@ open clue 同时 `dispatched`，collect 对每个 clue 单粒度的 launch+wait 
   任何一个 LLM 角色直接写出的。arbiter 的 `verdict=continue` 只记录并响亮落盘（进
   report「分歧裁定」段 + events），不改动 converge 的路由语义——循环继续/终止仍由
   纯函数 `converge()` 决定。
+- **R5 anchor_check**（零 LLM、零外呼 IO 的纯脚本节点）：finalise 之后把 report.md
+  每条 `[anchor: …]` 引用核验回 evidence.jsonl，产出 `run_root/anchor-check.json`
+  并在 report.md 报告头写 `dr-anchor-rate`。核验率 ≤90% 是软闸门：响亮记录（报告头
+  + anchor-check.json + events），不判红、不改 converge 路由。正文/verdict 一律落
+  文件，state 只装 id 与计数，不进 checkpoint。
 
 state 只装 id 与计数（规格第 7 条）：clue 板（id/status/depth/retry）与
 coverage/zero_growth_rounds/rounds。findings 逐条 append 到 `evidence.jsonl`、
@@ -39,6 +44,7 @@ from langgraph.types import Send
 from fleet_graph.executors.agent_run import AgentRunSpec, RunWaitTimeout, derive_run_id
 from fleet_graph.executors.text_node import TextSpec
 from fleet_graph.graphs.adapters import parse_envelope
+from fleet_graph.research_anchor import SOFT_GATE_RATE, check_run
 from fleet_graph.research_bus import (
     DOC_KIND_REPORT,
     PIPELINE_STATUS_TO_PROTOCOL,
@@ -1348,7 +1354,8 @@ def _debate_report_node(deps: ResearchDeps):
             arbiter,
         )
         (deps.run_root / REPORT_FILE).write_text(report, encoding="utf-8")
-        _publish_doc(deps, body=report)
+        # R5：报告 doc 的发布移到 anchor_check 之后（报告头需先写 dr-anchor-rate，
+        # 保证 R1 双源对账的「report doc body == 本地 report.md」不被打破）。
         # arbiter 的 verdict 响亮落 events（含 continue），供审计对账。
         _observe(
             deps,
@@ -1378,6 +1385,47 @@ def _finalise_node(deps: ResearchDeps):
         return {}
 
     return finalise
+
+
+def _anchor_check_node(deps: ResearchDeps):
+    def anchor_check(state: ResearchState) -> ResearchState:
+        """R5：锚点核验节点（零 LLM、零外呼 IO 的纯脚本节点）。
+
+        finalise 之后逐条把 report.md 的 ``[anchor: …]`` 引用核验回 evidence.jsonl，
+        产出 ``run_root/anchor-check.json``（claims + summary），并在 report.md
+        报告头写 ``dr-anchor-rate``。核验率 ≤90% 是**软闸门**：响亮记录（报告头 +
+        anchor-check.json + events），不判红、不改 converge 路由（本节点不碰
+        converge）。state 只装 id 与计数，正文/verdict 一律落文件，不进 checkpoint。
+        """
+        run_root = deps.run_root
+        report_path = run_root / REPORT_FILE
+        if not report_path.is_file():
+            # fault 路径（无报告可核验）：保持原样，不写任何产物。
+            return {}
+        result = check_run(run_root)
+        summary = result["summary"]
+        rate = summary["rate"]
+        met = rate > SOFT_GATE_RATE
+        # 报告头已写 dr-anchor-rate：report doc（research.doc.v2）在此时发布，保证
+        # R1 双源对账「report doc body == 本地 report.md」一致。
+        _publish_doc(deps, body=report_path.read_text(encoding="utf-8"))
+        # 软闸门响亮记录：rate ≤90% 只记录未达标（met=false），不改路由。
+        _observe(
+            deps,
+            {
+                "event": "anchor_check",
+                "rate": rate,
+                "met": met,
+                "total": summary["total"],
+                "ok": summary["ok"],
+                "failed": summary["failed"],
+                "unanchored": summary["unanchored"],
+                "sums_ok": summary["sums_ok"],
+            },
+        )
+        return {}
+
+    return anchor_check
 
 
 def _after_seed(state: ResearchState) -> str:
@@ -1427,6 +1475,7 @@ def build_research_graph(deps: ResearchDeps) -> StateGraph:
     graph.add_node("debate_arbiter", _arbiter_node(deps))
     graph.add_node("debate_report", _debate_report_node(deps))
     graph.add_node("finalise", _finalise_node(deps))
+    graph.add_node("anchor_check", _anchor_check_node(deps))
 
     graph.add_edge(START, "seed")
     graph.add_conditional_edges("seed", _after_seed, {"dispatch", "finalise"})
@@ -1445,7 +1494,8 @@ def build_research_graph(deps: ResearchDeps) -> StateGraph:
         "debate_arbiter", _after_debate_arbiter, {"debate_report", "finalise"}
     )
     graph.add_edge("debate_report", "finalise")
-    graph.add_edge("finalise", END)
+    graph.add_edge("finalise", "anchor_check")
+    graph.add_edge("anchor_check", END)
     return graph
 
 
@@ -1483,6 +1533,7 @@ __all__ = [
     "ResearchBounds",
     "ResearchDeps",
     "ResearchState",
+    "_anchor_check_node",
     "_assemble_report",
     "_extract_judge_disagreements",
     "build_research_graph",

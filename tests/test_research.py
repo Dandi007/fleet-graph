@@ -40,7 +40,6 @@ from fleet_graph.graphs.research_pipeline import (
     derive_clue_id,
     derive_research_id,
     initial_state,
-    synthesis_run_id,
     worker_run_id,
 )
 from fleet_graph.graphs.research_runner import (
@@ -278,7 +277,8 @@ class TestRunInstanceIsolation:
         assert a.thread_id != b.thread_id
         clue = derive_clue_id("clue one", DEFAULT_SOURCE)
         assert worker_run_id(a.thread_id, clue, 0) != worker_run_id(b.thread_id, clue, 0)
-        assert synthesis_run_id(a.thread_id) != synthesis_run_id(b.thread_id)
+        # R4：终局 LLM 面是 debate 子图（synthesis 已由 debate 替代），run id 同样按实例隔离。
+        assert debate_run_id(a.thread_id, "advocate") != debate_run_id(b.thread_id, "advocate")
 
     def test_same_run_root_derives_same_run_ids(self, tmp_path: Path) -> None:
         a = ResearchConfig(question="q", run_root=tmp_path / "run")
@@ -286,7 +286,8 @@ class TestRunInstanceIsolation:
         assert a.thread_id == b.thread_id
         clue = derive_clue_id("clue one", DEFAULT_SOURCE)
         assert worker_run_id(a.thread_id, clue, 0) == worker_run_id(b.thread_id, clue, 0)
-        assert synthesis_run_id(a.thread_id) == synthesis_run_id(b.thread_id)
+        # R4：debate run id 同样按 run_root 恒同（kill-restart 幂等不回退）。
+        assert debate_run_id(a.thread_id, "advocate") == debate_run_id(b.thread_id, "advocate")
 
     def test_run_instance_is_stable_and_not_random(self, tmp_path: Path) -> None:
         from fleet_graph.graphs.research_pipeline import derive_run_instance
@@ -421,6 +422,7 @@ class TestEndToEnd:
         )
         events = read_jsonl(tmp_path / "run" / EVENTS)
         # R4：四角色各一次 debate 事件 + debate_report（零 LLM 脚本节点）一次。
+        # R5：finalise 之后 anchor_check（零 LLM 纯脚本节点）一次。
         assert [e["event"] for e in events] == [
             "seed",
             "dispatch",
@@ -432,6 +434,7 @@ class TestEndToEnd:
             "debate",
             "debate_report",
             "finalise",
+            "anchor_check",
         ]
         arbiter_event = next(e for e in events if e.get("role") == "arbiter")
         assert arbiter_event["verdict"] == "enough"

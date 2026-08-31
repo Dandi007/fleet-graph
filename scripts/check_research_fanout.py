@@ -33,7 +33,11 @@ from types import SimpleNamespace
 from typing import Any
 
 from fleet_graph.executors.agent_run import RunStatus, RunTicket
-from fleet_graph.graphs.research_pipeline import SYNTHESIS_ROLE
+from fleet_graph.graphs.research_pipeline import (
+    ADVOCATE_ROLE,
+    ARBITER_ROLE,
+    DEBATE_ROLES,
+)
 from fleet_graph.graphs.research_runner import ResearchConfig, run_research
 
 QUESTION = "fanout 并行派发的等价性与提速?"
@@ -58,11 +62,17 @@ def worker_payload(claim: str) -> dict[str, Any]:
     }
 
 
-def synthesis_payload() -> dict[str, Any]:
+def debate_payload(body: str) -> dict[str, Any]:
+    """dr-doc.result.v1 形状：debater（advocate/opponent/judge）的 body 信封。"""
+    return {"state": "succeeded", "exit_code": 0, "structured_result": {"body": body}}
+
+
+def arbiter_payload() -> dict[str, Any]:
+    """dr-arbiter.result.v1 形状。"""
     return {
-        "report_markdown": "# 报告\nfanout 检查通过。",
-        "coverage_summary": "ok",
-        "unresolved": [],
+        "state": "succeeded",
+        "exit_code": 0,
+        "structured_result": {"verdict": "enough", "rationale": "证据已充分"},
     }
 
 
@@ -83,7 +93,8 @@ class FakeLauncher:
 
     ``launch`` 幂等（同 run_id 只记录首次派发）——judgment ④：kill-restart 同 id
     重派即 re-adopt，绝不重复记录。每个 worker run 首次派发时按 SEED_CLUES 顺序分配
-    一条 claim，wait 时回放对应 evidence（确定性、可控）。
+    一条 claim，wait 时回放对应 evidence（确定性、可控）。R4：debate 四角色按角色
+    回放固定信封（不睡 WORK_SECONDS——fanout 度量的是 worker 并发，不掺 debate 耗时）。
     """
 
     def __init__(self) -> None:
@@ -98,16 +109,17 @@ class FakeLauncher:
         self._launched.add(run_id)
         self._roles[run_id] = spec.role
         self.dispatched.append(run_id)
-        if spec.role != SYNTHESIS_ROLE:
+        if spec.role not in DEBATE_ROLES:
             self._claim_seq[run_id] = SEED_CLUES[len(self._claim_seq) % len(SEED_CLUES)]
         return RunTicket(run_id, f"/tmp/fanout/{run_id}", None)
 
     def wait(self, ticket: RunTicket, **kwargs: Any) -> RunStatus:
-        if self._roles[ticket.run_id] == SYNTHESIS_ROLE:
-            return RunStatus(
-                "succeeded",
-                {"state": "succeeded", "exit_code": 0, "structured_result": synthesis_payload()},
-            )
+        role = self._roles[ticket.run_id]
+        if role == ARBITER_ROLE:
+            return RunStatus("succeeded", arbiter_payload())
+        if role in DEBATE_ROLES:
+            body = "# body\n支持。" if role == ADVOCATE_ROLE else "# body\n反驳。"
+            return RunStatus("succeeded", debate_payload(body))
         time.sleep(WORK_SECONDS)
         claim = self._claim_seq[ticket.run_id]
         return RunStatus(
