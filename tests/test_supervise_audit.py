@@ -299,7 +299,15 @@ def test_native_anchor_fallback_without_bootstrap_commit(
     assert "edited since bootstrap" in recomputed.detail
 
 
-def test_failing_frozen_command_goes_red(tmp_path: Path, tracked_tmp: list[Path]) -> None:
+def test_no_frozen_setup_and_rerun_fail_is_env_unverified(
+    tmp_path: Path, tracked_tmp: list[Path]
+) -> None:
+    """E1 known negative, reproduction noted: on pre-fix main this fixture's
+    rerun went red and drove recommend_reject (e.g. `vite: command not found`,
+    exit 127 on a bun repo whose throwaway worktree never provisioned deps).
+    Post-fix: the audit sandbox has no frozen setup_commands, so the red is
+    unjudgeable -- the item degrades to `env_unverified` (advisory), appears in
+    the list, and does NOT drive recommend_reject."""
     frozen = {
         "command_results": [{"argv": [sys.executable, "-c", "raise SystemExit(3)"], "exit_code": 0}]
     }
@@ -307,20 +315,99 @@ def test_failing_frozen_command_goes_red(tmp_path: Path, tracked_tmp: list[Path]
     report = audit_development("dev_x", engine=FakeEngine(fixture), repo=fixture.repo)
 
     assert not report.ok
-    rerun = by_name(report)["acceptance_rerun"]
-    assert not rerun.ok
-    assert rerun.exit_code == 3
-    assert report.acceptance_results[0]["exit_code"] == 3
+    names = by_name(report)
+    assert "acceptance_rerun" not in names
+    env_unverified = names["acceptance_rerun_env_unverified"]
+    assert not env_unverified.ok
+    assert env_unverified.exit_code == 3
+    assert "审计沙箱无环境供给，rerun 结果不可判" in env_unverified.detail
+    assert any("审计沙箱无环境供给" in gap for gap in report.gaps)
+    # The degraded item is not a reject driver: no reproducible failure.
+    from fleet_graph.graphs.supervisor import reproducible_failures
+
+    assert reproducible_failures(report.as_dict()) == []
 
 
-def test_missing_file_is_red_not_skipped(tmp_path: Path, tracked_tmp: list[Path]) -> None:
-    """No `[ -f ] && run` guards: the frozen argv runs as-is and goes red."""
-    frozen = {"command_results": [{"argv": [sys.executable, "no_such_script.py"], "exit_code": 0}]}
+def test_missing_file_with_successful_setup_still_drives_reject(
+    tmp_path: Path, tracked_tmp: list[Path]
+) -> None:
+    """No `[ -f ] && run` guards: the frozen argv runs as-is and goes red. With
+    a frozen setup that succeeds, a red rerun is a *real* failure -- it still
+    drives recommend_reject (zero relaxation)."""
+    frozen = {
+        "results": [{"command": [sys.executable, "no_such_script.py"], "exit_code": 0}],
+        "setup_results": [{"command": [sys.executable, "-c", "pass"], "exit_code": 0}],
+    }
     fixture = build_repo(tmp_path, frozen=frozen)
     report = audit_development("dev_x", engine=FakeEngine(fixture), repo=fixture.repo)
 
     assert not report.ok
+    rerun = by_name(report)["acceptance_rerun"]
+    assert not rerun.ok
     assert report.acceptance_results[0]["exit_code"] != 0
+    assert report.setup_results[0]["exit_code"] == 0
+    from fleet_graph.graphs.supervisor import reproducible_failures
+
+    assert reproducible_failures(report.as_dict())
+
+
+def test_frozen_setup_provisions_before_acceptance_rerun_green(
+    tmp_path: Path, tracked_tmp: list[Path]
+) -> None:
+    """E1 regression fixture: acceptance depends on a worktree-side setup step
+    (the script checks a file the setup creates). The audit runs the frozen
+    setup first, so the rerun goes green. Before the fix the throwaway worktree
+    never ran setup and this rerun was red and drove recommend_reject."""
+    setup_argv = [
+        sys.executable,
+        "-c",
+        "import pathlib; pathlib.Path('prepared.txt').write_text('ok')",
+    ]
+    accept_argv = [
+        sys.executable,
+        "-c",
+        "import pathlib, sys; sys.exit(0 if pathlib.Path('prepared.txt').is_file() else 3)",
+    ]
+    frozen = {
+        "results": [{"command": accept_argv, "exit_code": 0}],
+        "setup_results": [{"command": setup_argv, "exit_code": 0}],
+    }
+    fixture = build_repo(tmp_path, frozen=frozen)
+    report = audit_development("dev_x", engine=FakeEngine(fixture), repo=fixture.repo)
+
+    assert report.ok, [a.as_dict() for a in report.assertions if not a.ok]
+    rerun = by_name(report)["acceptance_rerun"]
+    assert rerun.ok
+    assert [r["exit_code"] for r in report.setup_results] == [0]
+    assert [r["exit_code"] for r in report.acceptance_results] == [0]
+    from fleet_graph.graphs.supervisor import reproducible_failures
+
+    assert reproducible_failures(report.as_dict()) == []
+
+
+def test_setup_fails_in_sandbox_is_env_unverified(tmp_path: Path, tracked_tmp: list[Path]) -> None:
+    """A frozen setup that fails in the audit sandbox is an environment fact,
+    not a verdict on the work: the item degrades to env_unverified."""
+    frozen = {
+        "results": [{"command": [sys.executable, "-c", "pass"], "exit_code": 0}],
+        "setup_results": [
+            {"command": [sys.executable, "-c", "raise SystemExit(7)"], "exit_code": 0}
+        ],
+    }
+    fixture = build_repo(tmp_path, frozen=frozen)
+    report = audit_development("dev_x", engine=FakeEngine(fixture), repo=fixture.repo)
+
+    assert not report.ok
+    names = by_name(report)
+    assert "acceptance_rerun" not in names
+    env_unverified = names["acceptance_rerun_env_unverified"]
+    assert not env_unverified.ok
+    assert env_unverified.exit_code == 7
+    assert "供给失败" in env_unverified.detail
+    assert report.acceptance_results == []
+    from fleet_graph.graphs.supervisor import reproducible_failures
+
+    assert reproducible_failures(report.as_dict()) == []
 
 
 def test_skip_in_frozen_record_counts_as_failure(tmp_path: Path, tracked_tmp: list[Path]) -> None:
