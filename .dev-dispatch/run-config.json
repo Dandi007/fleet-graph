@@ -1,0 +1,17 @@
+{
+ "development_id": "dev-fg-b59b8264b6ac",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "bash",
+   "-lc",
+   "for i in $(seq 1 20); do uv run pytest tests/test_line_restart.py -q -x >/dev/null 2>&1 || { echo \"iter $i FAILED\"; exit 1; }; done; echo \"20 iters green\""
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
