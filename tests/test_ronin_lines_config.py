@@ -91,6 +91,12 @@ ENROLLED = {
     # 彻底重构，R1-R8 严格依赖序为硬约束）：deep-research V4 线。
     # goal/宪法差距表 SSoT：wf-66300e；诊断：wf-b9be03。
     "wf-66300e",
+    # 2026-08-31 第八波（用户拍板「要 goal driven agent 开发」）：calendar-agent
+    # 日程页一键导出打码图片。名册里第一条**产品线**——此前每条线的题目都是
+    # fleet-graph 自己或它的邻居基建，这条改的是一个独立产品仓
+    # (Dandi007/calendar-agent)。验收 harness 先于实现存在（@2b0b8164 两个门
+    # 实测正确变红）。goal/spec/golden-order SSoT：wf-fdd6ac。
+    "wf-fdd6ac",
 }
 
 # 2026-08-29 复活：曾在 MIGRATED 里 enabled=false 停摆的线被用户令重新点亮。
