@@ -420,6 +420,7 @@ class TestEndToEnd:
         )
         events = read_jsonl(tmp_path / "run" / EVENTS)
         # R4：四角色各一次 debate 事件 + debate_report（零 LLM 脚本节点）一次。
+        # R5：finalise 之后 anchor_check（零 LLM 纯脚本节点）一次。
         assert [e["event"] for e in events] == [
             "seed",
             "dispatch",
@@ -431,6 +432,7 @@ class TestEndToEnd:
             "debate",
             "debate_report",
             "finalise",
+            "anchor_check",
         ]
         arbiter_event = next(e for e in events if e.get("role") == "arbiter")
         assert arbiter_event["verdict"] == "enough"
