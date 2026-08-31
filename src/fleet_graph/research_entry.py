@@ -196,6 +196,12 @@ def run_research_ticket(
     resolved = resolve_tier(scale=scale, tier=tier)
     bounds = tier_bounds(resolved)
     run_root = Path(run_root) if run_root is not None else default_run_root(question)
+    # R8 判据 ①：唯一入口机械记录 CLI argv（落 run_root/launch.json）。三面
+    # （CLI/MCP/skill）都经本函数发起，这里记录即覆盖全部真实入口，不再是判据
+    # 脚本 fixture 或测试专属。
+    from fleet_graph.research_coldstart import canonical_launch_argv, record_launch_argv
+
+    record_launch_argv(run_root, canonical_launch_argv(question))
     src = list(sources) if sources is not None else list(DEFAULT_SOURCES)
     config = ResearchConfig(
         question=question,

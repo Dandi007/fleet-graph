@@ -290,7 +290,9 @@ def judge_coldstart(
     """五件套综合判定：①-⑤ 全绿才绿（任一判红即整体红）。"""
     run_root = Path(run_root)
     if argv is None:
-        argv = load_launch_argv(run_root) or canonical_launch_argv(question)
+        # 判据 ① 只认真实 pipeline 机械记录（run_research_ticket 落 launch.json）。
+        # 缺失 launch.json = 该 run 不是经唯一入口发起，不得自动通过（防空转放行）。
+        argv = load_launch_argv(run_root)
 
     ok1, v1 = judge_launch_command(argv, question)
     ok2, v2 = judge_evidence_chain(run_root)
