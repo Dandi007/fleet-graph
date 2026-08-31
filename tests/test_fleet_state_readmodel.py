@@ -501,6 +501,97 @@ class TestHarvestableView:
             server.server_close()
 
 
+# --- /v1/enrollments --------------------------------------------------------
+
+
+class TestEnrollmentsView:
+    """goal-driven 入册申请 (spec 交付 B.1): GET /v1/enrollments re-reads the
+    goal service's enroll-queue.jsonl on every request, same discipline as
+    _read_roster -- bad rows degrade per entry, never a 5xx for the chain."""
+
+    def _config(self, tmp_path: Path, queue_path: Path | None) -> FleetStateConfig:
+        return FleetStateConfig(
+            host="127.0.0.1",
+            port=0,
+            run_root=tmp_path / "runs",
+            dd_root=tmp_path / "dd",
+            lines_config=tmp_path / "missing.json",
+            bridge_state_dir=tmp_path / "bridge",
+            enroll_queue_path=queue_path,
+        )
+
+    def _queue_file(self, tmp_path: Path, lines: list[dict[str, Any]]) -> Path:
+        path = tmp_path / "goal" / "enroll-queue.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(json.dumps(line, ensure_ascii=False, sort_keys=True) + "\n" for line in lines),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_returns_schema_version_and_enrollments_list(self, tmp_path: Path) -> None:
+        queue = self._queue_file(
+            tmp_path,
+            [
+                {
+                    "folder_id": "wf-1",
+                    "alias": "ronin-fresh",
+                    "seat_hint": "opencode-gpt-sol",
+                    "max_rounds": 9999,
+                    "briefing_version": "v1",
+                    "submitted_by": "drill",
+                    "submitted_at": "2026-08-31T00:00:00Z",
+                    "status": "pending",
+                }
+            ],
+        )
+        payload = FleetStateView(self._config(tmp_path, queue)).enrollments()
+        assert payload["schema_version"] == LINES_SCHEMA_VERSION
+        assert [e["folder_id"] for e in payload["enrollments"]] == ["wf-1"]
+        assert payload["enrollments"][0]["status"] == "pending"
+
+    def test_a_missing_queue_degrades_to_empty_list(self, tmp_path: Path) -> None:
+        payload = FleetStateView(self._config(tmp_path, None)).enrollments()
+        assert payload["schema_version"] == LINES_SCHEMA_VERSION
+        assert payload["enrollments"] == []
+
+    def test_bad_rows_degrade_the_entry_not_the_table(self, tmp_path: Path) -> None:
+        queue = self._queue_file(
+            tmp_path,
+            [
+                "{not json",
+                {"alias": "no-folder-id", "status": "pending"},
+                {
+                    "folder_id": "wf-good",
+                    "alias": "ronin-good",
+                    "status": "pending",
+                },
+            ],
+        )
+        payload = FleetStateView(self._config(tmp_path, queue)).enrollments()
+        assert [e["folder_id"] for e in payload["enrollments"]] == ["wf-good"]
+
+    def test_the_view_is_served_over_the_wire(self, tmp_path: Path) -> None:
+        queue = self._queue_file(
+            tmp_path,
+            [{"folder_id": "wf-1", "alias": "ronin-fresh", "status": "pending"}],
+        )
+        config = self._config(tmp_path, queue)
+        server = FleetStateHTTPServer(config)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        try:
+            resp = httpx.get(f"http://127.0.0.1:{port}/v1/enrollments", timeout=5)
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["schema_version"] == LINES_SCHEMA_VERSION
+            assert [e["folder_id"] for e in body["enrollments"]] == ["wf-1"]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 # --- over the wire ----------------------------------------------------------
 
 

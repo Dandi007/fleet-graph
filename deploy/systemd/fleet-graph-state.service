@@ -20,6 +20,11 @@
 # file is the same convention fleet-graphd.service uses; the read-model only
 # ever uses a *read* bus credential from it for the optional published view and
 # degrades cleanly when the file is absent.
+#
+# The goal service (fleet-graph-goal-mcp.service) writes its enrollment pending
+# queue under its own --work-folder-root; the /v1/enrollments view must point at
+# that same enroll-queue.jsonl (spec 交付 B.1). The site value is filled in by
+# the deployer, matching the goal unit's <work-folder-root> placeholder.
 [Unit]
 Description=fleet-graph state read-model (M1 sensing layer)
 After=network-online.target
@@ -30,7 +35,8 @@ Type=simple
 WorkingDirectory=/data/apps/fleet-graph/current
 ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph state serve \
     --host 127.0.0.1 --port 7494 \
-    --lines-config /data/apps/fleet-graph/current/config/ronin-lines.json
+    --lines-config /data/apps/fleet-graph/current/config/ronin-lines.json \
+    --enroll-queue <work-folder-root>/enroll-queue.jsonl
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

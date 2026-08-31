@@ -595,6 +595,7 @@ def _state_serve(args: argparse.Namespace) -> int:
             lines_config=pathlib.Path(args.lines_config),
             bridge_state_dir=pathlib.Path(args.bridge_state_dir),
             bus_url=args.bus_url,
+            enroll_queue_path=(pathlib.Path(args.enroll_queue) if args.enroll_queue else None),
         )
     )
     return 0
@@ -1497,6 +1498,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="optional agent-bus base URL for the published-decisions view "
         "(read-only; unset or unreadable degrades to receipts only)",
+    )
+    state_serve.add_argument(
+        "--enroll-queue",
+        default=None,
+        help="the goal enrollment pending queue (enroll-queue.jsonl) the "
+        "/v1/enrollments view re-reads per request; unset keeps the view empty",
     )
     state_serve.set_defaults(func=_state_serve)
 

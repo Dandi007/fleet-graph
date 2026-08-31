@@ -8,10 +8,12 @@ dd status / decision-bridge 的 bridge.sqlite3，以及可选的 agent-bus
 - ``GET /v1/lines`` → ``{"schema_version": <str>, "lines": [...]}``
 - ``GET /v1/decisions`` → ``{"schema_version": <str>, "decisions": [...]}``
 - ``GET /v1/harvestable`` → ``{"schema_version": <str>, "developments": [...]}``
+- ``GET /v1/enrollments`` → ``{"schema_version": <str>, "enrollments": [...]}``
 
 铁律（本模块与规格一致）：
 
-- 主键列表字段名严格为 ``lines`` / ``decisions``；``schema_version`` 必填。
+- 主键列表字段名严格为 ``lines`` / ``decisions`` / ``developments`` /
+  ``enrollments``；``schema_version`` 必填。
 - **读失败降级不 5xx 全链**：单个工件缺失/解析失败只对该条目标记
   absent/unknown，绝不让整表挂掉。
 - 机械事实只读：``heartbeat_age_s`` = 现在 - heartbeat.json 的 ``updated_at``；
@@ -47,6 +49,11 @@ DEFAULT_DD_ROOT = Path("/data/fleet-graph/dd")
 DEFAULT_LINES_CONFIG = Path("config/ronin-lines.json")
 DEFAULT_BRIDGE_STATE_DIR = Path("/data/fleet-graph/decision-bridge")
 DEFAULT_BRIDGE_DB_NAME = "bridge.sqlite3"
+#: The goal service's enrollment pending queue (``enroll-queue.jsonl``), read
+#: read-only by ``/v1/enrollments``. None means "no enrollments" (the view
+#: degrades to an empty list, never a 5xx) -- the same convention as the other
+#: optional data sources.
+DEFAULT_ENROLL_QUEUE = Path("/data/fleet-graph/goal/enroll-queue.jsonl")
 
 #: 送达链状态（closed）。
 STATE_PUBLISHED = "published"
@@ -88,6 +95,9 @@ class FleetStateConfig:
     lines_config: Path = DEFAULT_LINES_CONFIG
     bridge_state_dir: Path = DEFAULT_BRIDGE_STATE_DIR
     bus_url: str | None = None
+    #: The goal enrollment pending queue the /v1/enrollments view reads.
+    #: None keeps the view empty (degrade, never 5xx).
+    enroll_queue_path: Path | None = None
     clock: Callable[[], float] = time.time
     #: E5 收割回执判定，``(card_entity_id) -> bool``，可注入（默认读 bus work-notes；
     #: 任何读取失败降级为「未收割」，绝不 5xx）。
@@ -146,6 +156,41 @@ def _read_roster(config: FleetStateConfig) -> tuple[list[tuple[str, int]], Path]
             generation = 1
         lines.append((str(folder_id), generation))
     return lines, run_root
+
+
+def _read_enroll_queue(config: FleetStateConfig) -> list[dict[str, Any]]:
+    """The goal enrollment pending queue, fail-soft (never 5xx).
+
+    Re-reads ``enroll-queue.jsonl`` on every request (与 ``_read_roster`` 同法):
+    each line is one application's current state. A missing queue, an
+    unreadable file, or a bad line degrades that entry -- never the whole
+    table. No path configured = no enrollments (the safe reading of not
+    knowing where the goal service writes its queue).
+    """
+    path = config.enroll_queue_path
+    if path is None or not path.is_file():
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        raw_lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in raw_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        # An application without a folder_id is not an application; degrade
+        # the entry away rather than surfacing a shapeless row.
+        if not record.get("folder_id"):
+            continue
+        out.append(record)
+    return out
 
 
 def _read_receipts(config: FleetStateConfig) -> list[dict[str, Any]]:
@@ -370,6 +415,16 @@ class FleetStateView:
         decision_objs.extend(_read_published(self.config, seen))
         return {"schema_version": SCHEMA_VERSION, "decisions": decision_objs}
 
+    def enrollments(self) -> dict[str, Any]:
+        """The goal enrollment applications the supervisory face watches.
+
+        Re-reads the goal service's ``enroll-queue.jsonl`` on every request
+        (spec 交付 B.1: 与 ``_read_roster`` 同法); bad rows degrade per entry,
+        never 5xx. This is the only data face the E8 ``enrollment_pending``
+        event has (same source discipline as E5-E7).
+        """
+        return {"schema_version": SCHEMA_VERSION, "enrollments": _read_enroll_queue(self.config)}
+
     def harvestable(self) -> dict[str, Any]:
         """The M2 E5 data plane: complete developments with no harvest receipt.
 
@@ -457,6 +512,8 @@ class FleetStateHandler(BaseHTTPRequestHandler):
             payload = self.server.view.decisions()
         elif path == "/v1/harvestable":
             payload = self.server.view.harvestable()
+        elif path == "/v1/enrollments":
+            payload = self.server.view.enrollments()
         else:
             self.send_error(404)
             return
@@ -486,6 +543,7 @@ def serve(config: FleetStateConfig) -> None:
 __all__ = [
     "DEFAULT_BRIDGE_STATE_DIR",
     "DEFAULT_DD_ROOT",
+    "DEFAULT_ENROLL_QUEUE",
     "DEFAULT_HOST",
     "DEFAULT_LINES_CONFIG",
     "DEFAULT_PORT",

@@ -27,17 +27,26 @@ from fleet_graph.goal_enroll.contract import (
     BRIEFING_VERSION,
     CODE_ACCEPTANCE_ARGV_UNEXECUTABLE,
     CODE_ACCEPTANCE_DECLARATION_INVALID,
+    CODE_ALIAS_CONFLICT,
+    CODE_ALIAS_TOKEN_MISSING,
     CODE_FOLDER_NOT_FOUND,
     CODE_GOLDEN_ORDER_EMPTY,
     CODE_NO_ACCEPTANCE_COMMAND,
     CODE_NOT_A_GOAL_LINE,
+    CODE_NOT_PENDING,
     CODE_SOURCE_UNBOUND,
     CODE_SPEC_LINT_BAN,
     GOAL_ENROLL_MECHANISM,
     LINT_WARNING_PINNED_SHA,
+    QUEUE_STATUS_ADMITTED,
+    QUEUE_STATUS_PENDING,
+    QUEUE_STATUS_REJECTED,
+    QUEUE_STATUS_WITHDRAWN,
     GoalEnrollError,
     GoalRosterEntry,
 )
+from fleet_graph.goal_enroll.queue import EnrollQueue
+from fleet_graph.goal_enroll.roster import RealRosterReader
 from fleet_graph.goal_enroll.service import GoalEnrollService
 from fleet_graph.goal_enroll.source import governed_goal_folder_store
 from fleet_graph.goal_enroll.store import GoalEnrollRoster
@@ -217,16 +226,355 @@ class TestRoster:
         assert roster.get("wf-1")["briefing_version"] == BRIEFING_VERSION
 
 
-class TestServiceAndMCP:
-    def test_service_seals_the_engine_versioned_roster_entry(self, tmp_path: Path) -> None:
-        _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
-        service = GoalEnrollService(
-            GoalEnrollValidator(_source(tmp_path)), roster=GoalEnrollRoster(str(tmp_path / "store"))
+class TestEnrollQueueStateMachine:
+    """queue 状态机：pending -> admitted | rejected | withdrawn，终态带
+    decided_by/decision_ref；withdraw 留痕不删行（失败留痕原则）。"""
+
+    def test_a_submission_lands_pending_and_is_idempotent(self, tmp_path: Path) -> None:
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        first = queue.submit(
+            {
+                "folder_id": "wf-1",
+                "alias": "ronin-drill",
+                "seat_hint": "opencode-gpt-sol",
+                "max_rounds": 9999,
+                "briefing_version": BRIEFING_VERSION,
+                "submitted_by": "drill",
+                "submitted_at": "2026-08-31T00:00:00Z",
+            }
         )
-        admitted = service.enroll("wf-1")
-        assert admitted["already_admitted"] is False
-        assert admitted["briefing_version"] == BRIEFING_VERSION
-        assert admitted["mechanism"] == GOAL_ENROLL_MECHANISM
+        second = queue.submit(
+            {
+                "folder_id": "wf-1",
+                "alias": "ronin-drill",
+                "seat_hint": "opencode-gpt-sol",
+                "max_rounds": 9999,
+                "briefing_version": BRIEFING_VERSION,
+                "submitted_by": "drill",
+                "submitted_at": "2026-08-31T00:00:00Z",
+            }
+        )
+        assert first["status"] == QUEUE_STATUS_PENDING
+        assert first["already_pending"] is False
+        assert second["already_pending"] is True
+        assert len(queue) == 1
+
+    def test_withdraw_only_moves_a_pending_entry_and_keeps_the_row(self, tmp_path: Path) -> None:
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        queue.submit(
+            {
+                "folder_id": "wf-1",
+                "alias": "ronin-drill",
+                "briefing_version": BRIEFING_VERSION,
+                "submitted_by": "drill",
+                "submitted_at": "2026-08-31T00:00:00Z",
+            }
+        )
+        withdrawn = queue.withdraw("wf-1", by="drill")
+        assert withdrawn["status"] == QUEUE_STATUS_WITHDRAWN
+        assert queue.get("wf-1")["status"] == QUEUE_STATUS_WITHDRAWN  # 留痕不删行
+        with pytest.raises(GoalEnrollError) as refused:
+            queue.withdraw("wf-1", by="drill")
+        assert refused.value.code == CODE_NOT_PENDING
+
+    def test_admit_and_reject_carry_a_decision_pointer(self, tmp_path: Path) -> None:
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        for folder in ("wf-a", "wf-b"):
+            queue.submit(
+                {
+                    "folder_id": folder,
+                    "alias": f"ronin-{folder}",
+                    "briefing_version": BRIEFING_VERSION,
+                    "submitted_by": "drill",
+                    "submitted_at": "2026-08-31T00:00:00Z",
+                }
+            )
+        admitted = queue.mark_admitted("wf-a", decided_by="supervisor", decision_ref="ref-1")
+        rejected = queue.mark_rejected("wf-b", decided_by="supervisor", decision_ref="ref-2")
+        assert admitted["status"] == QUEUE_STATUS_ADMITTED
+        assert admitted["decided_by"] == "supervisor"
+        assert admitted["decision_ref"] == "ref-1"
+        assert rejected["status"] == QUEUE_STATUS_REJECTED
+        assert rejected["decision_ref"] == "ref-2"
+
+    def test_terminal_transitions_require_a_pending_entry(self, tmp_path: Path) -> None:
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        with pytest.raises(GoalEnrollError) as refused:
+            queue.mark_admitted("wf-absent", decided_by="x", decision_ref="r")
+        assert refused.value.code == CODE_NOT_PENDING
+
+    def test_rejections_are_recorded_for_the_rejection_history(self, tmp_path: Path) -> None:
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        queue.record_rejection("wf-1", code=CODE_ALIAS_TOKEN_MISSING, detail="no token")
+        queue.record_rejection("wf-1", code=CODE_ALIAS_CONFLICT, detail="claimed")
+        assert [r["code"] for r in queue.rejections("wf-1")] == [
+            CODE_ALIAS_TOKEN_MISSING,
+            CODE_ALIAS_CONFLICT,
+        ]
+
+    def test_the_queue_survives_a_reload(self, tmp_path: Path) -> None:
+        root = str(tmp_path / "queue")
+        EnrollQueue(root).submit(
+            {
+                "folder_id": "wf-1",
+                "alias": "ronin-drill",
+                "briefing_version": BRIEFING_VERSION,
+                "submitted_by": "drill",
+                "submitted_at": "2026-08-31T00:00:00Z",
+            }
+        )
+        reloaded = EnrollQueue(root)
+        assert reloaded.get("wf-1")["status"] == QUEUE_STATUS_PENDING
+        assert len(reloaded) == 1
+
+
+class TestRealRosterReader:
+    def _roster(self, tmp_path: Path) -> RealRosterReader:
+        config = tmp_path / "ronin-lines.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "run_root": "/data/fleet-graph/runs",
+                    "lines": [
+                        {
+                            "folder_id": "wf-a",
+                            "seat": "opencode-dsv4pro",
+                            "alias": "ronin-a",
+                            "max_rounds": 9999,
+                            "enabled": True,
+                        },
+                        {
+                            "folder_id": "wf-b",
+                            "seat": "opencode-gpt-sol",
+                            "alias": "ronin-b",
+                            "max_rounds": 1,
+                            "enabled": False,
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return RealRosterReader(config)
+
+    def test_it_reads_the_real_roster_lines(self, tmp_path: Path) -> None:
+        reader = self._roster(tmp_path)
+        assert {e["folder_id"] for e in reader.entries()} == {"wf-a", "wf-b"}
+        assert reader.get("wf-a")["alias"] == "ronin-a"
+        assert reader.has("wf-a") is True
+        assert reader.has("wf-nope") is False
+        assert reader.aliases() == {"ronin-a", "ronin-b"}
+
+    def test_a_missing_roster_degrades_to_empty(self, tmp_path: Path) -> None:
+        reader = RealRosterReader(tmp_path / "absent.json")
+        assert reader.entries() == ()
+        assert reader.aliases() == set()
+        assert reader.has("wf-a") is False
+
+
+class TestValidatorGates6And7:
+    def test_a_missing_alias_token_refuses(self, tmp_path: Path) -> None:
+        _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
+        validator = GoalEnrollValidator(_source(tmp_path), alias_token_check=lambda alias: False)
+        with pytest.raises(GoalEnrollError) as refused:
+            validator.validate("wf-1", alias="ronin-nope")
+        assert refused.value.code == CODE_ALIAS_TOKEN_MISSING
+
+    def test_a_claimed_alias_refuses(self, tmp_path: Path) -> None:
+        _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
+        validator = GoalEnrollValidator(
+            _source(tmp_path),
+            alias_token_check=lambda alias: True,
+            alias_conflict_check=lambda alias: "wf-a" if alias == "ronin-taken" else None,
+        )
+        with pytest.raises(GoalEnrollError) as refused:
+            validator.validate("wf-1", alias="ronin-taken")
+        assert refused.value.code == CODE_ALIAS_CONFLICT
+        assert "wf-a" in refused.value.detail
+
+    def test_a_free_alias_with_a_token_passes_gates_6_and_7(self, tmp_path: Path) -> None:
+        _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
+        validator = GoalEnrollValidator(
+            _source(tmp_path),
+            alias_token_check=lambda alias: True,
+            alias_conflict_check=lambda alias: None,
+        )
+        facts = validator.validate("wf-1", alias="ronin-fresh", seat_hint="opencode-gpt-sol")
+        assert facts["alias"] == "ronin-fresh"
+        assert facts["seat_hint"] == "opencode-gpt-sol"
+        assert facts["briefing_version"] == BRIEFING_VERSION
+
+
+class TestServiceAndMCP:
+    def test_submit_lands_a_pending_application_without_touching_the_roster(
+        self, tmp_path: Path
+    ) -> None:
+        _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        service = GoalEnrollService(
+            GoalEnrollValidator(_source(tmp_path), alias_token_check=lambda alias: True),
+            queue=queue,
+            roster=RealRosterReader(tmp_path / "absent.json"),
+        )
+        submitted = service.submit(
+            "wf-1", "ronin-fresh", seat_hint="opencode-gpt-sol", max_rounds=9999
+        )
+        assert submitted["status"] == QUEUE_STATUS_PENDING
+        assert submitted["already_pending"] is False
+        assert submitted["briefing_version"] == BRIEFING_VERSION
+        assert submitted["mechanism"] == GOAL_ENROLL_MECHANISM
+        assert submitted["board_notify"].startswith("failed:")  # no board bound
+        assert queue.get("wf-1")["status"] == QUEUE_STATUS_PENDING
+
+    def test_a_repeated_pending_submit_answers_already_pending(self, tmp_path: Path) -> None:
+        _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        service = GoalEnrollService(
+            GoalEnrollValidator(_source(tmp_path), alias_token_check=lambda alias: True),
+            queue=queue,
+            roster=RealRosterReader(tmp_path / "absent.json"),
+        )
+        service.submit("wf-1", "ronin-fresh")
+        again = service.submit("wf-1", "ronin-fresh")
+        assert again["already_pending"] is True
+
+    def test_a_folder_already_in_the_real_roster_answers_already_enrolled(
+        self, tmp_path: Path
+    ) -> None:
+        _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
+        config = tmp_path / "ronin-lines.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "lines": [
+                        {
+                            "folder_id": "wf-1",
+                            "seat": "opencode-dsv4pro",
+                            "alias": "ronin-a",
+                            "enabled": True,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        service = GoalEnrollService(
+            GoalEnrollValidator(_source(tmp_path), alias_token_check=lambda alias: True),
+            queue=queue,
+            roster=RealRosterReader(config),
+        )
+        result = service.submit("wf-1", "ronin-a")
+        assert result["already_enrolled"] is True
+        assert len(queue) == 0  # nothing new queued
+
+    def test_goal_withdraw_only_moves_a_pending_entry(self, tmp_path: Path) -> None:
+        _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        service = GoalEnrollService(
+            GoalEnrollValidator(_source(tmp_path), alias_token_check=lambda alias: True),
+            queue=queue,
+            roster=RealRosterReader(tmp_path / "absent.json"),
+        )
+        service.submit("wf-1", "ronin-fresh")
+        withdrawn = service.withdraw("wf-1", by="drill")
+        assert withdrawn["status"] == QUEUE_STATUS_WITHDRAWN
+        with pytest.raises(GoalEnrollError) as refused:
+            service.withdraw("wf-1", by="drill")
+        assert refused.value.code == CODE_NOT_PENDING
+
+    def test_goal_status_returns_the_application_and_its_rejection_history(
+        self, tmp_path: Path
+    ) -> None:
+        _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        service = GoalEnrollService(
+            GoalEnrollValidator(_source(tmp_path), alias_token_check=lambda alias: True),
+            queue=queue,
+            roster=RealRosterReader(tmp_path / "absent.json"),
+        )
+        service.submit("wf-1", "ronin-fresh")
+        detail = service.status("wf-1")
+        assert detail["queue"]["folder_id"] == "wf-1"
+        assert detail["queue"]["status"] == QUEUE_STATUS_PENDING
+        assert detail["roster"] is None
+        assert detail["rejections"] == []
+
+    def test_goal_list_merges_roster_and_queue_with_origins(self, tmp_path: Path) -> None:
+        _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
+        config = tmp_path / "ronin-lines.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "lines": [
+                        {
+                            "folder_id": "wf-a",
+                            "seat": "opencode-dsv4pro",
+                            "alias": "ronin-a",
+                            "enabled": True,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        service = GoalEnrollService(
+            GoalEnrollValidator(_source(tmp_path), alias_token_check=lambda alias: True),
+            queue=queue,
+            roster=RealRosterReader(config),
+        )
+        service.submit("wf-1", "ronin-fresh")
+        view = service.list_all()
+        origins = {entry["folder_id"]: entry["origin"] for entry in view["entries"]}
+        assert origins["wf-a"] == "roster"
+        assert origins["wf-1"] == "pending"
+
+    def test_goal_list_marks_the_two_reconciliation_drifts(self, tmp_path: Path) -> None:
+        config = tmp_path / "ronin-lines.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "lines": [
+                        {
+                            "folder_id": "wf-a",
+                            "seat": "opencode-dsv4pro",
+                            "alias": "ronin-a",
+                            "enabled": True,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        # Drift 1: queue admitted but the roster has no such line.
+        queue.submit(
+            {
+                "folder_id": "wf-admitted",
+                "alias": "ronin-admitted",
+                "briefing_version": BRIEFING_VERSION,
+                "submitted_by": "drill",
+                "submitted_at": "2026-08-31T00:00:00Z",
+            }
+        )
+        queue.mark_admitted("wf-admitted", decided_by="supervisor", decision_ref="ref-1")
+        # Drift 2: the roster has the line but the queue still marks pending.
+        queue.submit(
+            {
+                "folder_id": "wf-a",
+                "alias": "ronin-a",
+                "briefing_version": BRIEFING_VERSION,
+                "submitted_by": "drill",
+                "submitted_at": "2026-08-31T00:00:00Z",
+            }
+        )
+        service = GoalEnrollService(
+            GoalEnrollValidator(None), queue=queue, roster=RealRosterReader(config)
+        )
+        by_folder = {entry["folder_id"]: entry for entry in service.list_all()["entries"]}
+        assert by_folder["wf-admitted"]["drift"] == "admitted_missing_from_roster"
+        assert by_folder["wf-a"]["drift"] == "roster_but_pending"
 
     def test_the_goal_open_prompt_and_briefing_are_versioned(self) -> None:
         text = goal_open_prompt_text()
@@ -237,12 +585,13 @@ class TestServiceAndMCP:
         for constraint in ("never merges to main directly", "dd-evidence", ".dev-dispatch"):
             assert constraint in BRIEFING_TEXT
 
-    def test_the_tool_is_registered_on_the_goal_mcp_surface(self) -> None:
+    def test_the_tool_family_is_registered_on_the_goal_mcp_surface(self) -> None:
         from fleet_graph.goal.service import build_goal_mcp_server
 
         server = build_goal_mcp_server()
         tools = asyncio.run(server.list_tools())
-        assert "goal_enroll" in {tool.name for tool in tools}
+        names = {tool.name for tool in tools}
+        assert {"goal_enroll", "goal_list", "goal_status", "goal_withdraw"} <= names
         prompts = asyncio.run(server.list_prompts())
         assert GOAL_OPEN_PROMPT_NAME in {prompt.name for prompt in prompts}
         resources = asyncio.run(server.list_resources())
@@ -257,6 +606,7 @@ class TestServiceAndMCP:
         server = build_mcp_server(FakeControlPlane())
         tools = asyncio.run(server.list_tools())
         assert "goal_enroll" not in {tool.name for tool in tools}
+        assert "goal_list" not in {tool.name for tool in tools}
         prompts = asyncio.run(server.list_prompts())
         assert GOAL_OPEN_PROMPT_NAME not in {prompt.name for prompt in prompts}
         resources = asyncio.run(server.list_resources())
@@ -276,7 +626,7 @@ class TestServiceAndMCP:
         async def call(url: str) -> str:
             async with Client(url) as client:
                 with pytest.raises(ToolError) as excinfo:
-                    await client.call_tool("goal_enroll", {"folder_id": "wf-1"})
+                    await client.call_tool("goal_enroll", {"folder_id": "wf-1", "alias": "ronin-x"})
                 return str(excinfo.value)
 
         with running_server(server) as url:
@@ -298,7 +648,7 @@ class TestServiceAndMCP:
         async def call(url: str) -> str:
             async with Client(url) as client:
                 with pytest.raises(ToolError) as excinfo:
-                    await client.call_tool("goal_enroll", {"folder_id": "wf-1"})
+                    await client.call_tool("goal_enroll", {"folder_id": "wf-1", "alias": "ronin-x"})
                 return str(excinfo.value)
 
         with running_server(server) as url:
@@ -320,7 +670,7 @@ class TestServiceAndMCP:
         with pytest.raises(RuntimeError, match="GOAL_ENROLL_SOURCE_UNBOUND"):
             serve(host="127.0.0.1", port=0, work_folder_root=None)
 
-    def test_a_valid_admission_over_the_wire(self, tmp_path: Path) -> None:
+    def test_a_valid_submission_over_the_wire(self, tmp_path: Path) -> None:
         from fastmcp import Client
 
         from fleet_graph.goal.service import build_goal_mcp_server
@@ -328,20 +678,59 @@ class TestServiceAndMCP:
 
         _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
         source = _source(tmp_path)
-        roster = GoalEnrollRoster(str(tmp_path / "store"))
-        server = build_goal_mcp_server(goal_folders=source, goal_roster=roster)
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        server = build_goal_mcp_server(
+            goal_folders=source,
+            goal_queue=queue,
+            real_roster=RealRosterReader(tmp_path / "absent.json"),
+            board=None,
+            alias_token_check=lambda alias: True,
+        )
 
         async def call(url: str) -> dict[str, Any]:
             async with Client(url) as client:
-                result = await client.call_tool("goal_enroll", {"folder_id": "wf-1"})
+                result = await client.call_tool(
+                    "goal_enroll",
+                    {"folder_id": "wf-1", "alias": "ronin-fresh", "seat_hint": "opencode-gpt-sol"},
+                )
                 return _payload(result)
 
         with running_server(server) as url:
-            admitted = asyncio.run(call(url))
+            submitted = asyncio.run(call(url))
 
-        assert admitted["already_admitted"] is False
-        assert admitted["briefing_version"] == BRIEFING_VERSION
-        assert admitted["acceptance_argv"] == [["python3", "-c", "print('ok')"]]
+        assert submitted["already_pending"] is False
+        assert submitted["status"] == QUEUE_STATUS_PENDING
+        assert submitted["briefing_version"] == BRIEFING_VERSION
+        assert submitted["acceptance_argv"] == [["python3", "-c", "print('ok')"]]
+
+    def test_alias_token_missing_refusal_reaches_the_client(self, tmp_path: Path) -> None:
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        from fleet_graph.goal.service import build_goal_mcp_server
+        from test_dd_service import running_server
+
+        _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
+        source = _source(tmp_path)
+        server = build_goal_mcp_server(
+            goal_folders=source,
+            goal_queue=EnrollQueue(str(tmp_path / "queue")),
+            real_roster=RealRosterReader(tmp_path / "absent.json"),
+        )
+
+        async def call(url: str) -> str:
+            async with Client(url) as client:
+                with pytest.raises(ToolError) as excinfo:
+                    await client.call_tool(
+                        "goal_enroll", {"folder_id": "wf-1", "alias": "ronin-no-token"}
+                    )
+                return str(excinfo.value)
+
+        with running_server(server) as url:
+            message = asyncio.run(call(url))
+
+        payload = json.loads(message[message.index("{") : message.rindex("}") + 1])
+        assert payload["code"] == CODE_ALIAS_TOKEN_MISSING
 
 
 def _payload(result: Any) -> dict[str, Any]:
