@@ -143,6 +143,21 @@ def derive_research_id(question: str) -> str:
     return f"r-{digest}"
 
 
+def derive_run_instance(run_root: Path | str) -> str:
+    """`run_instance` 由 run_root 内容寻址派生（R3-fix，规格第 1 条）。
+
+    research 的 thread 身份注入稳定的 run 实例分量：同一题两次独立跑（不同 run_root）
+    派生**不同** thread_id/run_id，不再撞 bus 409 IDEMPOTENCY_CONFLICT；同一次 run 的
+    kill-restart（同 run_root）仍得**相同**身份，re-adopt/幂等不回退。
+
+    **稳定非随机**（规格边界硬线）：sha256(resolved run_root 绝对路径) 前 12 hex，
+    前缀 `i-`。绝不掺 uuid4 / 时间戳——掺了就 kill-restart 漂移，re-adopt 失效。
+    """
+    resolved = str(Path(run_root).resolve())
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+    return f"i-{digest}"
+
+
 def derive_clue_id(query: str, source: str | None = None) -> str:
     """clue id 同样内容寻址派生（`c-` + sha256 前 12 hex）。
 
@@ -1043,6 +1058,7 @@ __all__ = [
     "converge",
     "derive_clue_id",
     "derive_research_id",
+    "derive_run_instance",
     "initial_state",
     "synthesis_run_id",
     "worker_run_id",
