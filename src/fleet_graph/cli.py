@@ -1127,7 +1127,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--noop-limit", type=int, default=3)
     run.add_argument("--timeout-limit", type=int, default=2)
     run.add_argument("--turn-timeout", type=int, default=3000)
-    run.add_argument("--coordinator-timeout", type=int, default=2700)
+    # agent-run splits this budget across the role's route chain (perAttempt =
+    # total / legs): with a 2-leg chain a 2700s budget kills the first leg at
+    # 1350s. wf-c106b9 g1-g4 (2026-08-31) died exactly there mid-work -- the
+    # coordinator was actively stepping (12 tool-calling steps) when the leg
+    # budget expired, misread as provider timeout. 5400 keeps the first leg's
+    # effective window at the intended 2700s.
+    run.add_argument("--coordinator-timeout", type=int, default=5400)
     run.add_argument("--alias", default=None, help="agent-bus inbox alias")
     run.add_argument(
         "--board-card",
