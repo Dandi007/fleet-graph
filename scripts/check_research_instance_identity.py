@@ -1,8 +1,8 @@
 """R3-fix acceptance：research run 身份按 run 实例隔离的机器可判定检查。
 
 根因（真机逐字取证）：research run 身份是内容寻址的——同一题两次独立跑（同
-research_id、同 generation）派生**相同** thread_id/run_id，第二遍的终局 agent-run
-发布 `agent.run.exited.v2` 撞 bus 409 `IDEMPOTENCY_CONFLICT` → exit 91 →
+research_id、同 generation）派生**相同** thread_id/run_id，第二遍的 synthesis
+agent-run 发布 `agent.run.exited.v2` 撞 bus 409 `IDEMPOTENCY_CONFLICT` → exit 91 →
 terminal=fault。修复（规格第 1 条）：thread 身份注入**稳定非随机**的 run 实例分量
 （run_root 内容寻址后缀），不同 run_root 隔离、同 run_root kill-restart 不漂移。
 
@@ -36,7 +36,6 @@ from typing import Any
 
 from fleet_graph.executors.agent_run import RunStatus, RunTicket
 from fleet_graph.graphs.research_pipeline import (
-    ADVOCATE_ROLE,
     ARBITER_ROLE,
     DEBATE_ROLES,
     DEFAULT_SOURCE,
@@ -72,13 +71,17 @@ def worker_payload(claim: str) -> dict[str, Any]:
     }
 
 
-def debate_payload(body: str) -> dict[str, Any]:
-    """dr-doc.result.v1 形状：debater（advocate/opponent/judge）的 body 信封。"""
-    return {"state": "succeeded", "exit_code": 0, "structured_result": {"body": body}}
+def debater_payload(body: str) -> dict[str, Any]:
+    """dr-doc.result.v1 形状的成功信封（advocate/opponent/judge）。"""
+    return {
+        "state": "succeeded",
+        "exit_code": 0,
+        "structured_result": {"body": body},
+    }
 
 
 def arbiter_payload() -> dict[str, Any]:
-    """dr-arbiter.result.v1 形状。"""
+    """dr-arbiter.result.v1 形状的成功信封。"""
     return {
         "state": "succeeded",
         "exit_code": 0,
@@ -99,7 +102,7 @@ class FakeTextNode:
 
 
 class FakeLauncher:
-    """确定性 launcher：worker 回放 worker.result.v1，debate 四角色回放固定信封。"""
+    """确定性 launcher：每次 wait 回放固定 worker.result.v1 / synthesis.result.v1。"""
 
     def __init__(self) -> None:
         self._roles: dict[str, str] = {}
@@ -116,11 +119,10 @@ class FakeLauncher:
 
     def wait(self, ticket: RunTicket, **kwargs: Any) -> RunStatus:
         role = self._roles[ticket.run_id]
-        if role == ARBITER_ROLE:
-            return RunStatus("succeeded", arbiter_payload())
         if role in DEBATE_ROLES:
-            body = "# body\n支持。" if role == ADVOCATE_ROLE else "# body\n反驳。"
-            return RunStatus("succeeded", debate_payload(body))
+            if role == ARBITER_ROLE:
+                return RunStatus("succeeded", arbiter_payload())
+            return RunStatus("succeeded", debater_payload(f"#{role} 论证\n实例隔离检查通过。"))
         return RunStatus(
             "succeeded",
             {
@@ -152,12 +154,12 @@ def check_derivation(tmp: Path) -> tuple[bool, bool, bool, bool, str]:
     distinct_threads = a.thread_id != b.thread_id
     distinct_run_ids = worker_run_id(a.thread_id, clue, 0) != worker_run_id(
         b.thread_id, clue, 0
-    ) and debate_run_id(a.thread_id, "judge") != debate_run_id(b.thread_id, "judge")
+    ) and debate_run_id(a.thread_id, "advocate") != debate_run_id(b.thread_id, "advocate")
     # 同 run_root -> 恒同（kill-restart 幂等不变）。
     idempotent_run_ids = (
         a.thread_id == same.thread_id
         and worker_run_id(a.thread_id, clue, 0) == worker_run_id(same.thread_id, clue, 0)
-        and debate_run_id(a.thread_id, "judge") == debate_run_id(same.thread_id, "judge")
+        and debate_run_id(a.thread_id, "advocate") == debate_run_id(same.thread_id, "advocate")
     )
     # run 实例分量必须稳定非随机（规格硬线：不掺 uuid4/时间戳）。
     inst = derive_run_instance(tmp / RUN_ROOT_A)

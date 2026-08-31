@@ -5,6 +5,9 @@
   "run_root": "/data/fleet-graph/runs",
   "probe_via_runtime": true,
   "supervisor_events": true,
+  "harvest_allowlist_path": "/data/fleet-graph/supervisor/harvest-allowlist.json",
+  "harvest_default_branch": "master",
+  "harvest_deploy": ["bash", "scripts/deploy.sh"],
   "lines": [
     {
       "folder_id": "wf-197430",
