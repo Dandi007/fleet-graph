@@ -40,7 +40,7 @@ from typing import Any, Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from fleet_graph.bus.board import NOTE_KIND, WORK_NOTES
+from fleet_graph.bus.board import Board
 from fleet_graph.bus.client import BusClient
 from fleet_graph.dd.control_plane import DEFAULT_DD_ROOT, RECORD_FILE
 from fleet_graph.state.run_artifacts import write_json_durable
@@ -96,8 +96,9 @@ class HarvestOps(Protocol):
     ) -> dict[str, Any]: ...
     def remove_worktree(self, repo: Path, worktree_root: Path) -> dict[str, Any]: ...
     def run_verify(self, worktree: Path, argv: list[str]) -> int: ...
+    def board_card_entity_id(self, development_id: str, dd_root: Path) -> str | None: ...
     def pr_squash_merge(
-        self, repo: Path, head_commit: str, default_branch: str
+        self, repo: Path, development_id: str, head_commit: str, default_branch: str
     ) -> dict[str, Any]: ...
     def ff_only_pull(self, repo: Path, default_branch: str) -> dict[str, Any]: ...
     def deploy(self, command: list[str]) -> int: ...
@@ -115,6 +116,7 @@ class HarvestState(TypedDict, total=False):
     allowlist_auth: dict[str, Any]
     steps: list[dict[str, Any]]
     pr_merged: bool
+    pr_url: str
     verify_exit_code: int
     verify_real_exit_code: int
     deploy_exit_code: int
@@ -398,15 +400,19 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         repo = Path(state.get("repo_path") or "")
         try:
             result = deps.ops.pr_squash_merge(
-                repo, state.get("head_commit") or "", state.get("default_branch") or ""
+                repo,
+                state.get("development_id") or "",
+                state.get("head_commit") or "",
+                state.get("default_branch") or "",
             )
         except Exception as exc:
             return {
                 "steps": _record_step(state, "pr_squash_merge", ok=False, detail=repr(exc)[:300])
             }
         merged = bool(result.get("merged"))
+        pr_url = str(result.get("pr_url") or "")
         steps = _record_step(state, "pr_squash_merge", ok=merged, **result)
-        return {"steps": steps, "pr_merged": merged}
+        return {"steps": steps, "pr_merged": merged, "pr_url": pr_url}
 
     def pull(state: HarvestState) -> HarvestState:
         auth = authorize_harvest_write(
@@ -487,18 +493,28 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             }
         development_id = state.get("development_id") or ""
         head_commit = state.get("head_commit") or ""
+        card_entity_id = deps.ops.board_card_entity_id(development_id, deps.dd_root)
         note = (
             f"harvest {event.type} {event.key}: {state.get('outcome') or 'in_progress'}\n"
             f"development={development_id} head_commit={head_commit}\n"
             f"steps: {[s.get('step') for s in state.get('steps') or []]}"
         )
+        if not card_entity_id:
+            # 该 development 尚无 goal-line board card（dd record 缺 card_entity_id）。
+            # best-effort：如实 skip，绝不把 development_id 当 ref 目标伪造。
+            return {
+                "steps": _record_step(
+                    state,
+                    "evidence_note",
+                    ok=False,
+                    detail="card_entity_id 缺失——note 未挂卡（best-effort）",
+                )
+            }
         try:
-            published = deps.bus.publish(
-                WORK_NOTES,
-                NOTE_KIND,
-                {"card_entity_id": development_id, "note": note, "note_type": "evidence"},
-                f"harvest:{event.key}",
-                refs=[{"target_entity": development_id}] if development_id else [],
+            published = Board(deps.bus).evidence(
+                card_entity_id=card_entity_id,
+                text=note,
+                idempotency_key=f"harvest:{event.key}",
             )
         except Exception as exc:
             return {
@@ -512,11 +528,14 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
     def postconditions(state: HarvestState) -> HarvestState:
         """后置条件代码核验（交付 B.3）：不采信子图自述，只看机械事实。
 
-        PR merged + verify 命令零退出 + evidence note 存在，三缺任一 -> escalated。
+        PR merged（且 PR 链接非空）+ verify 命令零退出 + evidence note 存在，
+        三缺任一 -> escalated。
         """
         missing: list[str] = []
         if not state.get("pr_merged"):
             missing.append("PR merged 未达成")
+        if not state.get("pr_url"):
+            missing.append("PR merged 链接缺失（无真实 forge PR 链接）")
         if state.get("verify_exit_code") != 0:
             missing.append(f"verify 命令退出码 {state.get('verify_exit_code')!r} != 0")
         if not state.get("evidence_note_id"):
@@ -540,6 +559,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "allowlist_auth": state.get("allowlist_auth") or {},
                 "steps": state.get("steps") or [],
                 "pr_merged": state.get("pr_merged"),
+                "pr_url": state.get("pr_url"),
                 "verify_exit_code": state.get("verify_exit_code"),
                 "verify_real_exit_code": state.get("verify_real_exit_code"),
                 "evidence_note_id": state.get("evidence_note_id"),

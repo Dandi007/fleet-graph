@@ -14,11 +14,13 @@ git 一律走 `dd/git.py` 的守卫 argv（`core.fsmonitor=false` / `hooksPath=/
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.dd.control_plane import RECORD_FILE
 from fleet_graph.dd.git import run_git
 
 #: 命令超时（秒）。收割的 verify/deploy 都是全量级操作，给足预算。
@@ -64,6 +66,34 @@ def _run(argv: list[str], cwd: Path | None = None) -> dict[str, Any]:
 def _dd_ref(development_id: str) -> str:
     """一个开发的 durable 集成 ref（与 dd/control_plane 同规则）。"""
     return f"refs/heads/dd/{development_id}"
+
+
+def _origin_url(repo: Path) -> str | None:
+    """repo 的 origin remote url；无 origin -> None（真实 forge 前置条件）。"""
+    proc = run_git(repo, "remote", "get-url", "origin")
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return proc.stdout.strip()
+
+
+def _gh_pr_url(stdout: str) -> str | None:
+    """`gh pr create` stdout 里 parse PR html url。
+
+    `gh` 无 shell（argv 数组 subprocess），stdout 首行即 `https://github.com/…/pull/N`。
+    首行非空即取首行，绝不猜别的来源。
+    """
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        return line
+    return None
+
+
+def _gh_pr_number(pr_url: str) -> str | None:
+    """PR html url 尾段数字作为 `gh pr merge` 的编号；解析不到 -> None。"""
+    tail = pr_url.rstrip("/").rsplit("/", 1)[-1]
+    return tail if tail.isdigit() else None
 
 
 class DefaultHarvestOps:
@@ -157,22 +187,103 @@ class DefaultHarvestOps:
     def run_verify(self, worktree: Path, argv: list[str]) -> int:
         return int(_run(list(argv), cwd=worktree).get("exit_code") or 0)
 
-    def pr_squash_merge(self, repo: Path, head_commit: str, default_branch: str) -> dict[str, Any]:
-        """PR -> squash merge（默认实现：本地 squash merge 进默认分支）。
+    def board_card_entity_id(self, development_id: str, dd_root: Path) -> str | None:
+        """dd 准入 record 的 goal-line board card 实体 id；空/null/缺失/坏档 -> None。
 
-        真实流水线里 PR 由远端 forge 承接；这里把「PR merged」机械地定义为
-        squash merge 落进默认分支成功，供真机环境与测试一致判断。任何失败都
-        是 merged=False（后置条件三要素缺一 -> escalated）。
+        读 `<dd_root>/<development_id>/record.json` 的 `card_entity_id`
+        （`control_plane._publish_card` 持久化；`harvest.py::_resolve_repo` 已读
+        同文件，复用其读取模式）。尚无卡时字段为 null/缺失，必须如实返回 None
+        （evidence 步 best-effort skip），绝不把 development_id 当 ref 伪造。
+        """
+        record_path = Path(dd_root) / development_id / RECORD_FILE
+        try:
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(record, dict):
+            return None
+        value = record.get("card_entity_id")
+        if value is None:
+            return None
+        text = str(value)
+        return text or None
+
+    def pr_squash_merge(
+        self,
+        repo: Path,
+        development_id: str,
+        head_commit: str,
+        default_branch: str,
+    ) -> dict[str, Any]:
+        """PR -> squash merge（真实远端 forge，绝不本地伪装合并）。
+
+        流水线：推 `harvest/<development_id>` 分支 -> `gh pr create` -> `gh pr
+        merge --squash --delete-branch`，返回 merged PR 的 html url。git 子调用
+        沿用 `dd/git.py` 守卫纪律（`run_git`）；`gh` 不经 git 守卫浸泡，独立
+        argv 数组 subprocess（无 shell），cwd=repo。
+
+        任一步非零退出 / 缺 gh / 缺 origin -> merged=False + detail（stderr/stdout
+        tail[:400]），绝不降级回本地 `git merge --squash`、绝不直接 commit 目标
+        repo 生产 checkout 默认分支。
         """
         if not head_commit:
             return {"merged": False, "detail": "无 head_commit 可合"}
-        proc = run_git(repo, "merge", "--squash", head_commit)
-        if proc.returncode != 0:
-            return {"merged": False, "detail": (proc.stderr or proc.stdout).strip()[:400]}
-        committed = run_git(repo, "commit", "-q", "-m", f"harvest: squash-merge {head_commit[:12]}")
-        if committed.returncode != 0:
-            return {"merged": False, "detail": (committed.stderr or committed.stdout).strip()[:400]}
-        return {"merged": True, "method": "squash-merge"}
+        if not development_id:
+            return {"merged": False, "detail": "无 development_id——无法命名 harvest 分支"}
+
+        origin = _origin_url(repo)
+        if origin is None:
+            return {"merged": False, "detail": "缺 origin remote——无法 forge PR"}
+
+        branch = f"harvest/{development_id}"
+        pushed = run_git(repo, "push", "origin", f"{head_commit}:refs/heads/{branch}")
+        if pushed.returncode != 0:
+            return {"merged": False, "detail": (pushed.stderr or pushed.stdout).strip()[:400]}
+
+        created = _run(
+            [
+                "gh",
+                "pr",
+                "create",
+                "--repo",
+                origin,
+                "--base",
+                default_branch,
+                "--head",
+                branch,
+                "--title",
+                f"harvest: {development_id} {head_commit[:12]}",
+                "--body",
+                f"harvest reactor merge of {head_commit} for {development_id}",
+            ],
+            cwd=repo,
+        )
+        if not created.get("ok"):
+            return {
+                "merged": False,
+                "detail": (created.get("stderr_tail") or created.get("stdout_tail"))[:400],
+            }
+        pr_url = _gh_pr_url(str(created.get("stdout_tail") or ""))
+        if not pr_url:
+            return {
+                "merged": False,
+                "detail": "gh pr create 未产出 PR 链接: "
+                + (created.get("stderr_tail") or created.get("stdout_tail"))[:400],
+            }
+        number = _gh_pr_number(pr_url)
+        if not number:
+            return {"merged": False, "detail": f"无法从 PR 链接解析编号: {pr_url}"}
+
+        merged = _run(
+            ["gh", "pr", "merge", number, "--squash", "--delete-branch"],
+            cwd=repo,
+        )
+        if not merged.get("ok"):
+            return {
+                "merged": False,
+                "detail": (merged.get("stderr_tail") or merged.get("stdout_tail"))[:400],
+            }
+        return {"merged": True, "pr_url": pr_url, "method": "gh-pr-squash-merge"}
 
     def ff_only_pull(self, repo: Path, default_branch: str) -> dict[str, Any]:
         proc = run_git(repo, "pull", "--ff-only", "origin", default_branch)
