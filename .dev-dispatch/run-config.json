@@ -1,0 +1,23 @@
+{
+ "development_id": "dev-fg-957c7a1fdc14",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/check_research_coldstart.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
