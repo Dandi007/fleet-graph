@@ -591,6 +591,7 @@ def _goal_serve(args: argparse.Namespace) -> int:
             host=args.host,
             port=args.port,
             work_folder_root=args.work_folder_root,
+            goal_queue_home=args.goal_queue_home,
         )
     except RuntimeError as exc:
         # A startup refusal (root unbound, port taken) is a visible failure,
@@ -602,7 +603,7 @@ def _goal_serve(args: argparse.Namespace) -> int:
 
 def _state_serve(args: argparse.Namespace) -> int:
     """Serve the M1 fleet-state read-model on loopback. Read-only."""
-    from fleet_graph.state.fleet_state import FleetStateConfig, serve
+    from fleet_graph.state.fleet_state import DEFAULT_ENROLL_QUEUE, FleetStateConfig, serve
 
     serve(
         FleetStateConfig(
@@ -613,7 +614,9 @@ def _state_serve(args: argparse.Namespace) -> int:
             lines_config=pathlib.Path(args.lines_config),
             bridge_state_dir=pathlib.Path(args.bridge_state_dir),
             bus_url=args.bus_url,
-            enroll_queue_path=(pathlib.Path(args.enroll_queue) if args.enroll_queue else None),
+            enroll_queue_path=(
+                pathlib.Path(args.enroll_queue) if args.enroll_queue else DEFAULT_ENROLL_QUEUE
+            ),
         )
     )
     return 0
@@ -1514,6 +1517,13 @@ def build_parser() -> argparse.ArgumentParser:
         "required -- without it (or without FLEET_GRAPH_WORK_FOLDER_ROOT) the "
         "service refuses to start (GOAL_ENROLL_SOURCE_UNBOUND family)",
     )
+    goal_serve.add_argument(
+        "--goal-queue-home",
+        default=None,
+        help="independent queue home owning enroll-queue.jsonl and "
+        "enroll-rejections.jsonl; default /data/fleet-graph/goal "
+        "(env FLEET_GRAPH_GOAL_QUEUE_HOME) -- separate from the work-folder-root",
+    )
     goal_serve.set_defaults(func=_goal_serve)
 
     state = subparsers.add_parser(
@@ -1556,7 +1566,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--enroll-queue",
         default=None,
         help="the goal enrollment pending queue (enroll-queue.jsonl) the "
-        "/v1/enrollments view re-reads per request; unset keeps the view empty",
+        "/v1/enrollments view re-reads per request; defaults to the goal "
+        "service's own queue home /data/fleet-graph/goal/enroll-queue.jsonl "
+        "(the same home goal serve writes by default)",
     )
     state_serve.set_defaults(func=_state_serve)
 

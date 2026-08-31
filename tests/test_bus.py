@@ -8,6 +8,7 @@ failure rather than a 422 in production.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -98,6 +99,121 @@ class TestCredentials:
     def test_missing_credential_is_an_error_not_a_default(self) -> None:
         with pytest.raises(RuntimeError, match="no bus credential"):
             load_token({})
+
+
+class TestLineTokenOwnership:
+    """Gate-6 ownership: canonicalized paths + positive secrets boundary.
+
+    A line's token is owned only when its realpath is exactly the canonical
+    ``<secrets_root>/<alias>.token`` regular file -- resolving into the
+    supervision plane, another line's token, outside the boundary, or a
+    symlink masquerade is a refusal (U4 defect 3).
+    """
+
+    def _secrets(self, tmp_path: Path, names: list[str]) -> Path:
+        secrets = tmp_path / "secrets"
+        secrets.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (secrets / name).write_text("token", encoding="utf-8")
+        return secrets
+
+    def test_a_regular_owned_token_is_owned(self, tmp_path: Path) -> None:
+        from fleet_graph.bus.tokens import resolve_line_token_ownership
+
+        secrets = self._secrets(tmp_path, ["ronin-owned.token"])
+        result = resolve_line_token_ownership(
+            "ronin-owned", template=str(secrets / "{alias}.token"), secrets_root=secrets
+        )
+        assert result.owned is True
+        assert result.status == "owned"
+
+    def test_a_missing_token_is_not_owned(self, tmp_path: Path) -> None:
+        from fleet_graph.bus.tokens import resolve_line_token_ownership
+
+        secrets = tmp_path / "secrets"
+        secrets.mkdir()
+        result = resolve_line_token_ownership(
+            "ronin-nope", template=str(secrets / "{alias}.token"), secrets_root=secrets
+        )
+        assert result.owned is False
+        assert result.status == "missing"
+
+    def test_a_directory_token_is_non_regular(self, tmp_path: Path) -> None:
+        from fleet_graph.bus.tokens import resolve_line_token_ownership
+
+        secrets = tmp_path / "secrets"
+        secrets.mkdir()
+        (secrets / "ronin-dir.token").mkdir()
+        result = resolve_line_token_ownership(
+            "ronin-dir", template=str(secrets / "{alias}.token"), secrets_root=secrets
+        )
+        assert result.owned is False
+        assert result.status == "non_regular"
+
+    def test_a_supervision_plane_token_is_not_owned(self, tmp_path: Path) -> None:
+        from fleet_graph.bus.tokens import resolve_line_token_ownership
+
+        secrets = self._secrets(tmp_path, [])
+        supervision = tmp_path / "supervision"
+        supervision.mkdir()
+        (supervision / "fleet-graph.token").write_text("control", encoding="utf-8")
+        (secrets / "ronin-sup.token").symlink_to(supervision / "fleet-graph.token")
+        result = resolve_line_token_ownership(
+            "ronin-sup",
+            template=str(secrets / "{alias}.token"),
+            secrets_root=secrets,
+            supervision_roots=(supervision,),
+        )
+        assert result.owned is False
+        assert result.status == "supervision_plane"
+
+    def test_an_other_line_token_is_not_owned(self, tmp_path: Path) -> None:
+        from fleet_graph.bus.tokens import resolve_line_token_ownership
+
+        secrets = self._secrets(tmp_path, ["ronin-other.token"])
+        (secrets / "ronin-x.token").symlink_to(secrets / "ronin-other.token")
+        result = resolve_line_token_ownership(
+            "ronin-x", template=str(secrets / "{alias}.token"), secrets_root=secrets
+        )
+        assert result.owned is False
+        assert result.status == "other_line"
+
+    def test_a_symlink_masquerade_is_not_owned(self, tmp_path: Path) -> None:
+        from fleet_graph.bus.tokens import resolve_line_token_ownership
+
+        secrets = self._secrets(tmp_path, [])
+        (secrets / "real").mkdir()
+        (secrets / "real" / "ronin-x.token").write_text("real", encoding="utf-8")
+        (secrets / "ronin-x.token").symlink_to(secrets / "real" / "ronin-x.token")
+        result = resolve_line_token_ownership(
+            "ronin-x", template=str(secrets / "{alias}.token"), secrets_root=secrets
+        )
+        assert result.owned is False
+        assert result.status == "symlink_alias"
+
+    def test_an_outside_boundary_token_is_not_owned(self, tmp_path: Path) -> None:
+        from fleet_graph.bus.tokens import resolve_line_token_ownership
+
+        secrets = self._secrets(tmp_path, [])
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "ronin-x.token").write_text("elsewhere", encoding="utf-8")
+        (secrets / "ronin-x.token").symlink_to(outside / "ronin-x.token")
+        result = resolve_line_token_ownership(
+            "ronin-x", template=str(secrets / "{alias}.token"), secrets_root=secrets
+        )
+        assert result.owned is False
+        assert result.status == "outside_boundary"
+
+    def test_an_unsafe_alias_is_refused(self, tmp_path: Path) -> None:
+        from fleet_graph.bus.tokens import resolve_line_token_ownership
+
+        secrets = self._secrets(tmp_path, [])
+        result = resolve_line_token_ownership(
+            "../escape", template=str(secrets / "{alias}.token"), secrets_root=secrets
+        )
+        assert result.owned is False
+        assert result.status == "unsafe"
 
 
 class TestClient:

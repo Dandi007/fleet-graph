@@ -96,8 +96,12 @@ class FleetStateConfig:
     bridge_state_dir: Path = DEFAULT_BRIDGE_STATE_DIR
     bus_url: str | None = None
     #: The goal enrollment pending queue the /v1/enrollments view reads.
-    #: None keeps the view empty (degrade, never 5xx).
-    enroll_queue_path: Path | None = None
+    #: Defaults to the goal service's own queue home
+    #: (``/data/fleet-graph/goal/enroll-queue.jsonl``), the same home goal
+    #: serve writes by default, so the read model observes the actual queue
+    #: rather than going blind. ``None`` keeps the view empty (explicit
+    #: opt-out; degrade, never 5xx).
+    enroll_queue_path: Path | None = DEFAULT_ENROLL_QUEUE
     clock: Callable[[], float] = time.time
     #: E5 收割回执判定，``(card_entity_id) -> bool``，可注入（默认读 bus work-notes；
     #: 任何读取失败降级为「未收割」，绝不 5xx）。
@@ -164,8 +168,9 @@ def _read_enroll_queue(config: FleetStateConfig) -> list[dict[str, Any]]:
     Re-reads ``enroll-queue.jsonl`` on every request (与 ``_read_roster`` 同法):
     each line is one application's current state. A missing queue, an
     unreadable file, or a bad line degrades that entry -- never the whole
-    table. No path configured = no enrollments (the safe reading of not
-    knowing where the goal service writes its queue).
+    table. The default ``enroll_queue_path`` is the goal service's own queue
+    home (``/data/fleet-graph/goal/enroll-queue.jsonl``); an explicit ``None``
+    keeps the view empty (the safe opt-out reading).
     """
     path = config.enroll_queue_path
     if path is None or not path.is_file():

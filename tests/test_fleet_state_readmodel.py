@@ -529,6 +529,23 @@ class TestEnrollmentsView:
         )
         return path
 
+    def test_the_default_queue_path_is_the_goal_queue_home(self) -> None:
+        """U4 defect 2: the read model defaults to the goal service's own queue
+        home (the same /data/fleet-graph/goal/ home goal serve writes), so it
+        observes the actual enrollment queue rather than going blind."""
+        from fleet_graph.state.fleet_state import DEFAULT_ENROLL_QUEUE
+
+        config = FleetStateConfig(
+            host="127.0.0.1",
+            port=0,
+            run_root=Path("/tmp/fg-runs"),
+            dd_root=Path("/tmp/fg-dd"),
+            lines_config=Path("/tmp/missing.json"),
+            bridge_state_dir=Path("/tmp/bridge"),
+        )
+        assert config.enroll_queue_path == DEFAULT_ENROLL_QUEUE
+        assert str(DEFAULT_ENROLL_QUEUE) == "/data/fleet-graph/goal/enroll-queue.jsonl"
+
     def test_returns_schema_version_and_enrollments_list(self, tmp_path: Path) -> None:
         queue = self._queue_file(
             tmp_path,

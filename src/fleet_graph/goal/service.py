@@ -15,6 +15,13 @@ question note) and decides. This surface deliberately offers **no release or
 ignite tool**: ``enabled`` flips, seat finalization and roster writes all stay
 on the supervisory roster-PR path.
 
+The enrollment queue lives in an **independent queue home** (default
+``/data/fleet-graph/goal/``), deliberately separate from the work-folder-root
+that owns goal folders: goal enrollment reads/writes only this queue home and
+never pollutes or consumes another governance warehouse. The state read-model
+(:7494 ``/v1/enrollments``) defaults to the same home so it observes the
+actual enrollment queue.
+
 Fail-fast root binding: ``goal serve`` refuses to start when neither
 ``--work-folder-root`` nor ``FLEET_GRAPH_WORK_FOLDER_ROOT`` is set. A goal MCP
 without a bound goal-folder root would only discover ``GOAL_ENROLL_SOURCE_UNBOUND``
@@ -38,7 +45,7 @@ from fleet_graph.goal_enroll.contract import (
     GOAL_OPEN_PROMPT_NAME,
     GoalEnrollError,
 )
-from fleet_graph.goal_enroll.queue import EnrollQueue
+from fleet_graph.goal_enroll.queue import EnrollQueue, migrate_queue_home
 from fleet_graph.goal_enroll.roster import RealRosterReader
 from fleet_graph.goal_enroll.service import GoalEnrollService
 from fleet_graph.goal_enroll.source import governed_goal_folder_store
@@ -57,6 +64,17 @@ MCP_SERVER_NAME = "fleet-graph-goal"
 #: ``goal serve`` binds the concrete ``goal_enroll`` source from this root (or
 #: the ``--work-folder-root`` flag); a service without it refuses to start.
 WORK_FOLDER_ROOT_ENV = "FLEET_GRAPH_WORK_FOLDER_ROOT"
+
+#: The goal service's *independent* queue home: the directory that owns the
+#: enrollment pending queue (``enroll-queue.jsonl``) and rejection history
+#: (``enroll-rejections.jsonl``). It is deliberately separate from the
+#: work-folder-root (the governance warehouse that owns goal folders), so goal
+#: enrollment reads/writes only this queue home and never pollutes or consumes
+#: another governance warehouse. Overridable via the env var or the
+#: ``--goal-queue-home`` flag; the state read-model (:7494 /v1/enrollments)
+#: defaults to the same home.
+DEFAULT_GOAL_QUEUE_HOME = "/data/fleet-graph/goal"
+GOAL_QUEUE_HOME_ENV = "FLEET_GRAPH_GOAL_QUEUE_HOME"
 
 
 def port_is_available(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> bool:
@@ -111,9 +129,11 @@ def build_goal_mcp_server(
     default, and what ``goal serve`` uses when no bus credential exists) the
     application still queues and the entry records ``board_notify: failed``,
     with E8 as the fallback visibility. ``alias_token_check`` is the gate-6
-    seam (``(alias) -> bool``); when None the validator uses the production
-    default (``/data/ronin/secrets/<alias>.token``, honouring
-    ``FLEET_GRAPH_LINE_TOKEN_PATH``). Drills inject a temp-dir check.
+    seam ``(alias) -> bool``; when None the validator uses the production
+    default (``/data/ronin/secrets/<alias>.token`` ownership, realpath-
+    canonicalized over the secrets boundary, honouring
+    ``FLEET_GRAPH_LINE_TOKEN_PATH``). Drills inject a temp-dir check built
+    over a scratch secrets root and supervision root.
     """
     from fastmcp import FastMCP
     from fastmcp.exceptions import ToolError
@@ -224,6 +244,7 @@ def serve(
     port: int = DEFAULT_PORT,
     *,
     work_folder_root: str | None = None,
+    goal_queue_home: str | None = None,
 ) -> None:
     """Run the standalone goal-driven MCP surface on loopback.
 
@@ -235,6 +256,12 @@ def serve(
       instead of serving a route that fails on first use.
     - **Port taken**: the same ``port_is_available`` discipline the dd surface
       uses -- an occupied :5611 is a visible refusal, not a crash loop.
+
+    The enrollment queue lives in an independent queue home (default
+    ``/data/fleet-graph/goal/``, override via ``--goal-queue-home`` or
+    ``FLEET_GRAPH_GOAL_QUEUE_HOME``) -- never in the work-folder-root. Legacy
+    queue files left under the work-folder-root are relocated into the queue
+    home first (deterministic, idempotent, never duplicated or overwritten).
     """
     root = (
         work_folder_root if work_folder_root is not None else os.environ.get(WORK_FOLDER_ROOT_ENV)
@@ -247,8 +274,14 @@ def serve(
         )
     if not port_is_available(host, port):
         raise RuntimeError(f"fleet-graph goal port {host}:{port} is unavailable")
+    queue_home = (
+        goal_queue_home
+        if goal_queue_home is not None
+        else os.environ.get(GOAL_QUEUE_HOME_ENV, DEFAULT_GOAL_QUEUE_HOME)
+    )
+    migrate_queue_home(legacy_root=root, queue_home=queue_home)
     goal_folders = governed_goal_folder_store(root)
-    goal_queue = EnrollQueue(root)
+    goal_queue = EnrollQueue(queue_home)
     build_goal_mcp_server(
         goal_folders=goal_folders,
         goal_queue=goal_queue,
@@ -258,8 +291,10 @@ def serve(
 
 
 __all__ = [
+    "DEFAULT_GOAL_QUEUE_HOME",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
+    "GOAL_QUEUE_HOME_ENV",
     "MCP_SERVER_NAME",
     "WORK_FOLDER_ROOT_ENV",
     "build_goal_mcp_server",

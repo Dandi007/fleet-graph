@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -37,6 +38,12 @@ LINE_TOKEN_PATH_ENV = "FLEET_GRAPH_LINE_TOKEN_PATH"
 #: An alias is a path component of the token file; anything outside this set
 #: never touches the filesystem.
 _SAFE_ALIAS = re.compile(r"^[A-Za-z0-9._-]+$")
+
+#: The supervision/control plane's own credential root. A governed line's
+#: token must never resolve (realpath) into it: tokens there belong to the
+#: fleet-graph control plane (service / decision publisher), not to a line.
+#: Gate 6 refuses a token that masquerades as a control-plane credential.
+SUPERVISION_TOKEN_ROOT = Path("/data/agent-bus/tokens")
 
 #: Why a line's token could not be resolved, so a degraded drain can say which
 #: of the three distinct causes it was instead of a silent None.
@@ -87,10 +94,145 @@ def resolve_line_token(
     return LineTokenResolution(alias, "ok", token)
 
 
+#: Why an alias's token is or is not owned by the governed line (gate 6).
+#: The negative statuses name the exact clause that refused admission.
+LineTokenOwnershipStatus = Literal[
+    "owned",
+    "unsafe",
+    "missing",
+    "non_regular",
+    "outside_boundary",
+    "supervision_plane",
+    "other_line",
+    "symlink_alias",
+]
+
+
+@dataclass(frozen=True)
+class LineTokenOwnership:
+    """Gate 6's ownership verdict for one alias's line token.
+
+    ``owned`` is the single bool a caller should branch on: the token is a
+    regular file whose canonical (realpath) path is exactly the governed
+    line's own ``<secrets_root>/<alias>.token`` -- it resolves nowhere else
+    (no supervision-plane credential, no other line's token, no symlink
+    masquerade, no escape from the secrets boundary). Every other status names
+    the failing clause so a refusal is explicit, never a silent pass.
+    """
+
+    alias: str
+    status: LineTokenOwnershipStatus
+    path: Path | None = None
+    canonical: Path | None = None
+
+    @property
+    def owned(self) -> bool:
+        return self.status == "owned"
+
+
+def _is_within(child: Path, root: Path) -> bool:
+    """Whether ``child`` is ``root`` or lives under it (both canonicalized)."""
+    try:
+        child.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def resolve_line_token_ownership(
+    alias: str,
+    *,
+    template: str | None = None,
+    env: dict[str, str] | None = None,
+    secrets_root: Path | None = None,
+    supervision_roots: tuple[Path, ...] = (SUPERVISION_TOKEN_ROOT,),
+) -> LineTokenOwnership:
+    """Gate 6's ownership validation for the alias's line token.
+
+    Ownership is a *positive boundary over canonicalized paths*, never filename
+    or token presence: the literal ``<secrets_root>/<alias>.token`` must exist
+    as a regular file, and its ``realpath`` must be exactly that canonical
+    location. The statuses, in check order:
+
+    - ``unsafe`` -- the alias could traverse out of the secrets directory.
+    - ``missing`` -- no token file at the literal path.
+    - ``non_regular`` -- the literal path exists but is not a regular file.
+    - ``supervision_plane`` -- the realpath resolves into a control-plane
+      credential root (``SUPERVISION_TOKEN_ROOT`` or an injected root).
+    - ``outside_boundary`` -- the realpath escapes the canonical secrets root.
+    - ``other_line`` -- the realpath is a *different* alias's token file (a
+      masquerade onto another line's identity).
+    - ``symlink_alias`` -- the literal path is itself a symlink (a symlink
+      masquerade; the owned token is a plain regular file, not a link).
+    - ``owned`` -- a regular file whose realpath is exactly the line's own
+      token path, inside the secrets boundary, in no supervision plane.
+
+    ``secrets_root`` defaults to the literal path's parent (the secrets dir);
+    ``supervision_roots`` defaults to the fleet's control-plane token root.
+    """
+    if not _SAFE_ALIAS.match(alias):
+        return LineTokenOwnership(alias, "unsafe")
+    env = os.environ if env is None else env
+    template_text = template or env.get(LINE_TOKEN_PATH_ENV) or LINE_TOKEN_PATH_TEMPLATE
+    literal = Path(template_text.format(alias=alias))
+    if not literal.exists():
+        return LineTokenOwnership(alias, "missing", path=literal)
+    if not literal.is_file():
+        return LineTokenOwnership(alias, "non_regular", path=literal)
+    canonical = Path(os.path.realpath(literal))
+    secrets_canonical = (
+        Path(os.path.realpath(secrets_root))
+        if secrets_root is not None
+        else Path(os.path.realpath(literal.parent))
+    )
+    for root in supervision_roots:
+        if _is_within(canonical, Path(os.path.realpath(root))):
+            return LineTokenOwnership(alias, "supervision_plane", path=literal, canonical=canonical)
+    if not _is_within(canonical, secrets_canonical):
+        return LineTokenOwnership(alias, "outside_boundary", path=literal, canonical=canonical)
+    if canonical.name != f"{alias}.token":
+        return LineTokenOwnership(alias, "other_line", path=literal, canonical=canonical)
+    if literal.is_symlink():
+        return LineTokenOwnership(alias, "symlink_alias", path=literal, canonical=canonical)
+    return LineTokenOwnership(alias, "owned", path=literal, canonical=canonical)
+
+
+def build_line_token_ownership_check(
+    *,
+    template: str | None = None,
+    env: dict[str, str] | None = None,
+    secrets_root: Path | None = None,
+    supervision_roots: tuple[Path, ...] = (SUPERVISION_TOKEN_ROOT,),
+) -> Callable[[str], bool]:
+    """A gate-6 ownership check ``(alias) -> bool`` over a chosen layout.
+
+    Production binds the fleet's token template, secrets root and supervision
+    root; drills bind a scratch secrets dir and a scratch supervision dir so
+    the negative ownership cases (supervision-plane, other-line, symlink
+    alias) are exercised against the real canonicalization logic.
+    """
+
+    def check(alias: str) -> bool:
+        return resolve_line_token_ownership(
+            alias,
+            template=template,
+            env=env,
+            secrets_root=secrets_root,
+            supervision_roots=supervision_roots,
+        ).owned
+
+    return check
+
+
 __all__ = [
     "LINE_TOKEN_PATH_ENV",
     "LINE_TOKEN_PATH_TEMPLATE",
+    "SUPERVISION_TOKEN_ROOT",
+    "LineTokenOwnership",
+    "LineTokenOwnershipStatus",
     "LineTokenResolution",
     "LineTokenStatus",
+    "build_line_token_ownership_check",
     "resolve_line_token",
+    "resolve_line_token_ownership",
 ]
