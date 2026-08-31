@@ -31,6 +31,13 @@ packages = ["src/fleet_graph"]
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
+# .dev-dispatch/ is the engine-materialized order-protocol directory that only
+# exists inside dd order worktrees (never on main). Spec markdown there may
+# carry python fenced blocks quoted verbatim from defect reports; ruff must not
+# demand reformatting them — that fails `make verify` at the pristine
+# input_commit and blocks every such order before any product change
+# (production instance: dev-fg-86fff73b84bd, 2026-08-31).
+extend-exclude = [".dev-dispatch"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

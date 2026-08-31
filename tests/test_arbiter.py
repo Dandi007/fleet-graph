@@ -23,6 +23,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from fleet_graph.arbiter.a2 import (
     ALLOWED_NOTE_TYPES,
     NOTE_MARKER,
@@ -56,6 +58,8 @@ class FakeBus:
         refs: dict[str, list[str]] | None = None,
         inbox: list[dict[str, Any]] | None = None,
         publish_error_for: dict[str, Exception] | None = None,
+        messages_error_for: dict[str, Exception] | None = None,
+        messages_fail_from: dict[str, int] | None = None,
     ) -> None:
         self.notes = list(notes or [])
         self.cards = list(cards or [])
@@ -63,9 +67,17 @@ class FakeBus:
         self.inbox = list(inbox or [])
         self.published: list[dict[str, Any]] = []
         self.publish_error_for = dict(publish_error_for or {})
+        self.messages_error_for = dict(messages_error_for or {})
+        self.messages_fail_from = dict(messages_fail_from or {})
+        self.message_calls: dict[str, int] = {}
         self._seq = max([m.get("channel_seq", 0) for m in self.notes + self.cards], default=0)
 
     def messages(self, channel: str, *, limit: int = 100, after_seq: int = 0):
+        self.message_calls[channel] = self.message_calls.get(channel, 0) + 1
+        error = self.messages_error_for.get(channel)
+        fail_from = self.messages_fail_from.get(channel, 1)
+        if error is not None and self.message_calls[channel] >= fail_from:
+            raise error
         if channel == WORK_NOTES:
             source = self.notes
         elif channel == WORK_INDEX:
@@ -365,6 +377,99 @@ def test_a_question_with_a_decision_is_not_triaged() -> None:
         refs={"q1": ["d1"]},
     )
     assert collect_subjects(bus) == []
+
+
+# --- board pagination (2026-08-31: 频道破千后裸 limit=1000 必截断摔死) ----------
+
+
+def test_over_thousand_message_channel_triages_every_open_question() -> None:
+    """判据: 频道 >1000 条时仍能正确 triage，而不是「不再 crash」。
+
+    已知阴性: 本单前 main 的裸 limit=1000（升序=最老窗）在 >1000 条频道上必
+    截断并抛 ``RuntimeError: fetch truncated; refusing to triage a partial
+    board``——最老千条窗内读不出尾部的新 question。修复后翻页聚合必须读全，
+    尾部新开放问题照常被 triage，旧已裁决问题照常被排除。
+    """
+    notes: list[dict[str, Any]] = []
+    seq = 1
+    notes.append(note("q-decided", seq, "question", "card-decided", "decided old question?"))
+    seq += 1
+    for i in range(1, 1201):  # 1200 条进度消息把频道推到千条以外
+        notes.append(note(f"progress-{i}", seq, "progress", "card-a", f"progress {i}"))
+        seq += 1
+    notes.append(note("q-tail", seq, "question", "card-a", "question beyond first thousand"))
+    seq += 1
+    notes.append(decision("d-decided", seq, "card-decided"))
+    seq += 1
+    assert seq == 1204  # 最后一个已用 seq 是 1203
+
+    # 已知阴性复述: 旧裸窗口读不到最尾的 q-tail（它在最老千条窗之外）。
+    first_window, head = FakeBus(notes=notes).messages(WORK_NOTES, limit=1000)
+    assert head == 1203
+    assert all(m["channel_seq"] < head for m in first_window)
+    assert "q-tail" not in {m["message_id"] for m in first_window}
+
+    cards = [
+        card("card-a", 1, title="dev", status="doing"),
+        card("card-decided", 2, title="legacy", status="doing"),
+    ]
+    bus = FakeBus(
+        notes=notes,
+        cards=cards,
+        refs={"q-decided": ["d-decided"], "q-tail": []},
+    )
+    subjects = collect_subjects(bus)
+
+    # 翻页真的发生了（>1 页），而不是又退回单窗口。
+    assert bus.message_calls[WORK_NOTES] >= 2
+
+    # 尾部新问题不丢、不被截断少报；旧已裁决问题不重复 triage。
+    assert [s.subject_id for s in subjects] == ["q-tail"]
+    assert subjects[0].kind == "question"
+    assert subjects[0].facts["card_head"] == {"title": "dev", "status": "doing"}
+
+
+def test_sub_hundred_channel_is_byte_identical_to_pre_fix() -> None:
+    """频道 <100 条：单页读全，subjects 与破千前逐字节一致（存量零回归）。"""
+    bus = FakeBus(
+        notes=[note("q1", 1, "question", "card-a", "should we merge?")],
+        cards=[card("card-a", 1, title="dev", status="doing")],
+        refs={"q1": []},
+    )
+    subjects = collect_subjects(bus)
+    assert [s.as_dict() for s in subjects] == [
+        {
+            "kind": "question",
+            "subject_id": "q1",
+            "card_entity_id": "card-a",
+            "source_revision": "q1",
+            "facts": {
+                "question": "should we merge?",
+                "refs": [],
+                "card_head": {"title": "dev", "status": "doing"},
+            },
+        }
+    ]
+    assert bus.message_calls[WORK_NOTES] == 1
+
+
+def test_empty_board_collects_no_subjects() -> None:
+    assert collect_subjects(FakeBus()) == []
+
+
+def test_pagination_interruption_mid_read_refuses_loudly() -> None:
+    """全量翻页中途真实失败（HTTP 5xx）仍响亮拒绝，不静默跳过。"""
+    notes = [note(f"note-{i}", i, "progress", "card-a", f"p{i}") for i in range(1, 1201)]
+    bus = FakeBus(
+        notes=notes,
+        cards=[],
+        messages_error_for={WORK_NOTES: BusError(500, '{"code": "INTERNAL"}')},
+        messages_fail_from={WORK_NOTES: 2},  # 第一页成功，第二页起 HTTP 500
+    )
+    with pytest.raises(BusError) as exc:
+        collect_subjects(bus)
+    assert exc.value.status == 500
+    assert bus.message_calls[WORK_NOTES] == 2
 
 
 # --- static conformance -----------------------------------------------------

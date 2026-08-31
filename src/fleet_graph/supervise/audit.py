@@ -17,6 +17,15 @@ commands whose exit codes go in the report. Three disciplines are load-bearing:
   `verification_record.verification_commands`; both are the audited party's
   own account, so the assertion name and the report mark the degradation
   explicitly. All sources empty is still a failure.
+- **The frozen setup commands provision the sandbox before the rerun (E1).**
+  The record's own `setup_results[].command` argv (verbatim, never invented)
+  run first in the same throwaway worktree; a failing setup is an environment
+  fact, recorded under `setup_results`, never a verdict on the work. When no
+  setup step was frozen and the rerun goes red, the sandbox never provisioned
+  the environment (the `vite: command not found` class of false negative), so
+  the item degrades to `env_unverified` -- advisory, still in the list, but
+  not a `recommend_reject` driver. A red rerun *after* provisioning succeeded
+  is a real failure and keeps driving `recommend_reject` (zero relaxation).
 - **Reads only.** The old engine is consulted over GET; git is driven through
   `dd/git.py`'s guarded argv because the worktrees involved were written by
   agents. The single write this module can perform is an `evidence` note to
@@ -88,6 +97,11 @@ class AuditReport:
     kind: str  # "development" | "goal_line"
     assertions: list[Assertion] = field(default_factory=list)
     acceptance_results: list[dict[str, Any]] = field(default_factory=list)
+    #: The frozen setup commands' rerun results (E1 environment provisioning),
+    #: kept apart from `acceptance_results` on purpose: a failing setup is an
+    #: environment fact, never a verdict on the work, and must not appear where
+    #: a reviewer (or the reproducible-failures walker) reads acceptance facts.
+    setup_results: list[dict[str, Any]] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
     # Set after a successful publish; not part of the audit verdict itself.
     evidence_note_id: str = ""
@@ -107,6 +121,7 @@ class AuditReport:
             "ok": self.ok,
             "assertions": [a.as_dict() for a in self.assertions],
             "acceptance_results": self.acceptance_results,
+            "setup_results": self.setup_results,
             "gaps": self.gaps,
             "evidence_note_id": self.evidence_note_id,
         }
@@ -300,6 +315,23 @@ def _frozen_argvs(frozen: dict[str, Any]) -> tuple[list[list[str]], int]:
         if isinstance(argv, list) and argv:
             argvs.append([str(part) for part in argv])
     return argvs, skipped
+
+
+def _frozen_setup_argvs(frozen: dict[str, Any]) -> list[list[str]]:
+    """The frozen setup command list (E1 environment provisioning), verbatim.
+
+    fleet-graph's own AcceptanceStage writes `setup_results[].command` -- the
+    exact argv its setup ran before acceptance. A record that froze no setup
+    step carries no such key, and the old engine's `command_results[].argv`
+    shape has no setup concept at all; both yield an empty list, which is what
+    makes the env_unverified degradation fire (no provisioning was frozen).
+    """
+    argvs: list[list[str]] = []
+    for record in frozen.get("setup_results") or []:
+        argv = record.get("command")
+        if isinstance(argv, list) and argv:
+            argvs.append([str(part) for part in argv])
+    return argvs
 
 
 def _run_frozen_commands(worktree: Path, argvs: list[list[str]]) -> list[dict[str, Any]]:
@@ -852,9 +884,70 @@ def _rerun_acceptance(
         )
         return
 
+    # E1 environment provisioning: the frozen setup commands run first, in the
+    # same throwaway worktree, verbatim (never invented). Their results are
+    # environment facts and are recorded apart from the acceptance results so
+    # a setup failure can never be mistaken for a verdict on the work.
+    setup_argvs = _frozen_setup_argvs(frozen) if frozen_ref is not None else []
+    if setup_argvs:
+        setup_results = _run_frozen_commands(worktree, setup_argvs)
+        report.setup_results.extend(setup_results)
+        setup_failed = [r for r in setup_results if r["exit_code"] != 0]
+    else:
+        setup_failed = []
+
+    if setup_failed:
+        # Provisioning failed in the audit sandbox: the environment was never
+        # made ready, so the rerun verdict is unjudgeable -- not a verdict on
+        # the work. Advisory (`env_unverified`), never a reject driver.
+        report.record(
+            Assertion(
+                name="acceptance_rerun_env_unverified",
+                ok=False,
+                command="; ".join(" ".join(r["command"]) for r in setup_failed)[:400],
+                exit_code=max((r["exit_code"] for r in setup_failed), default=1),
+                detail=(
+                    "审计沙箱环境供给失败（setup 未全绿），rerun 结果不可判："
+                    + "; ".join(" ".join(r["command"])[:80] for r in setup_failed)
+                ),
+            )
+        )
+        report.gaps.append(
+            "acceptance_rerun 降级为 env_unverified（advisory）：审计沙箱无环境供给，"
+            "rerun 结果不可判，不计入 recommend_reject 驱动因子"
+        )
+        return
+
     results = _run_frozen_commands(worktree, argvs)
-    report.acceptance_results.extend(results)
     failed = [r for r in results if r["exit_code"] != 0]
+
+    if failed and not setup_argvs:
+        # No frozen setup step and the rerun failed: this sandbox never
+        # provisioned the environment, so the red may be a false negative
+        # (e.g. `vite: command not found` on a bun repo). Degrade the item to
+        # `env_unverified` (advisory) -- it still appears in the list, but it
+        # is not an acceptance failure and does not drive recommend_reject.
+        report.record(
+            Assertion(
+                name="acceptance_rerun_env_unverified",
+                ok=False,
+                command="; ".join(" ".join(r["command"]) for r in results)[:400],
+                exit_code=max((r["exit_code"] for r in results), default=1),
+                detail=(
+                    "审计沙箱无环境供给，rerun 结果不可判："
+                    f"{len(failed)}/{len(results)} 条失败: "
+                    + "; ".join(" ".join(r["command"])[:80] for r in failed)
+                    + source_note
+                ),
+            )
+        )
+        report.gaps.append(
+            "acceptance_rerun 降级为 env_unverified（advisory）：审计沙箱无环境供给，"
+            "rerun 结果不可判，不计入 recommend_reject 驱动因子"
+        )
+        return
+
+    report.acceptance_results.extend(results)
     report.record(
         Assertion(
             name="acceptance_rerun",
@@ -998,6 +1091,8 @@ def render_note(report: AuditReport) -> str:
         )
     for result in report.acceptance_results:
         lines.append(f"  rerun: {' '.join(result['command'])[:120]} -> {result['exit_code']}")
+    for result in report.setup_results:
+        lines.append(f"  setup: {' '.join(result['command'])[:120]} -> {result['exit_code']}")
     for gap in report.gaps:
         lines.append(f"[GAP] {gap}")
     return "\n".join(lines)[:3800]

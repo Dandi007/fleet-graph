@@ -44,7 +44,9 @@ class LineConfig:
     noop_limit: int = 3
     timeout_limit: int = 2
     turn_timeout_seconds: int = 3000
-    coordinator_timeout_seconds: int = 2700
+    # Mirrors the CLI default; see cli.py --coordinator-timeout for why 5400
+    # (agent-run divides the budget across route-chain legs).
+    coordinator_timeout_seconds: int = 5400
     alias: str | None = None
     write: bool = False
     generation: int = 1

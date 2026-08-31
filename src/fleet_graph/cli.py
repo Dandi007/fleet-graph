@@ -1,7 +1,7 @@
 """Thin CLI entrypoint.
 
-`version`, `hello`, `line run`, `research run`, `dd run`, `scheduler run`,
-`inbox list`, and `supervise audit`.
+`version`, `hello`, `line run`, `research run`, `dd run`, `goal serve`,
+`scheduler run`, `inbox list`, and `supervise audit`.
 """
 
 from __future__ import annotations
@@ -50,11 +50,23 @@ def _hello(args: argparse.Namespace) -> int:
     return 0
 
 
+def default_research_run_root(question: str) -> str:
+    """默认 run_root 由题面内容寻址派生——R3-fix 误双开保护的锚点。
+
+    不显式给 ``--run-root`` 的两次同题启动落到同一 run_root ⇒ 同一 run instance
+    ⇒ 同一 thread 身份 ⇒ 第二次启动领养而非并跑双烧。显式 ``--run-root`` 才进入
+    「独立实例」语义（那本就该是显式动作）。抽成具名函数以便验收脚本直接断言
+    这条保护，而不是复制派生表达式。
+    """
+    from fleet_graph.graphs.research_pipeline import derive_research_id
+
+    return f"/data/fleet-graph/research/{derive_research_id(question)}"
+
+
 def _research_run(args: argparse.Namespace) -> int:
     """Run one research ticket to termination, printing its terminal record."""
     import pathlib
 
-    from fleet_graph.graphs.research_pipeline import derive_research_id
     from fleet_graph.graphs.research_runner import (
         ResearchConfig,
         default_publisher,
@@ -63,13 +75,12 @@ def _research_run(args: argparse.Namespace) -> int:
 
     config = ResearchConfig(
         question=args.question,
-        run_root=pathlib.Path(
-            args.run_root or f"/data/fleet-graph/research/{derive_research_id(args.question)}"
-        ),
+        run_root=pathlib.Path(args.run_root or default_research_run_root(args.question)),
         generation=args.generation,
         max_clues=args.max_clues,
         concurrency=args.concurrency,
         checkpoint_path=args.checkpoint,
+        instance=args.instance,
     )
     result = run_research(config, publisher=default_publisher())
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
@@ -550,6 +561,24 @@ def _dd_serve(args: argparse.Namespace) -> int:
         auto_resume_interval=args.auto_resume_interval,
         work_folder_root=args.work_folder_root,
     )
+    return 0
+
+
+def _goal_serve(args: argparse.Namespace) -> int:
+    """Serve the goal-driven MCP surface on loopback. It is its own service."""
+    from fleet_graph.goal.service import serve
+
+    try:
+        serve(
+            host=args.host,
+            port=args.port,
+            work_folder_root=args.work_folder_root,
+        )
+    except RuntimeError as exc:
+        # A startup refusal (root unbound, port taken) is a visible failure,
+        # not a crash loop: print the clear reason and exit non-zero.
+        print(f"fleet-graph goal serve: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -1116,7 +1145,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--noop-limit", type=int, default=3)
     run.add_argument("--timeout-limit", type=int, default=2)
     run.add_argument("--turn-timeout", type=int, default=3000)
-    run.add_argument("--coordinator-timeout", type=int, default=2700)
+    # agent-run splits this budget across the role's route chain (perAttempt =
+    # total / legs): with a 2-leg chain a 2700s budget kills the first leg at
+    # 1350s. wf-c106b9 g1-g4 (2026-08-31) died exactly there mid-work -- the
+    # coordinator was actively stepping (12 tool-calling steps) when the leg
+    # budget expired, misread as provider timeout. 5400 keeps the first leg's
+    # effective window at the intended 2700s.
+    run.add_argument("--coordinator-timeout", type=int, default=5400)
     run.add_argument("--alias", default=None, help="agent-bus inbox alias")
     run.add_argument(
         "--board-card",
@@ -1228,6 +1263,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="how many open clues one dispatch wave launches in parallel (R3 fan-out, "
         "default 4); only affects how many run per wave, never clue/run id derivation",
+    )
+    research_run.add_argument(
+        "--instance",
+        default=None,
+        help="explicit run instance (R3-fix); defaults to a stable content-address of "
+        "the run root, so different run roots of the same question stay isolated and "
+        "never collide on the bus 409. Keep it stable across kill-restart",
     )
     research_run.add_argument(
         "--checkpoint",
@@ -1395,6 +1437,25 @@ def build_parser() -> argparse.ArgumentParser:
         "(env FLEET_GRAPH_WORK_FOLDER_ROOT)",
     )
     dd_serve.set_defaults(func=_dd_serve)
+
+    goal = subparsers.add_parser(
+        "goal",
+        help="the goal-driven MCP surface (goal_enroll / goal-open / briefing)",
+    )
+    goal_sub = goal.add_subparsers()
+    goal_serve = goal_sub.add_parser(
+        "serve", help="serve the goal-driven MCP surface (the standalone goal service)"
+    )
+    goal_serve.add_argument("--host", default="127.0.0.1")
+    goal_serve.add_argument("--port", type=int, default=5611)
+    goal_serve.add_argument(
+        "--work-folder-root",
+        default=None,
+        help="directory owning one governed goal-folder repository per folder id; "
+        "required -- without it (or without FLEET_GRAPH_WORK_FOLDER_ROOT) the "
+        "service refuses to start (GOAL_ENROLL_SOURCE_UNBOUND family)",
+    )
+    goal_serve.set_defaults(func=_goal_serve)
 
     state = subparsers.add_parser(
         "state", help="the M1 fleet-state read-model (read-only /v1 views)"

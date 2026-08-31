@@ -257,18 +257,48 @@ class TestFailureModes:
     ) -> None:
         """The poll race: finished-and-exited must never be mistaken for died.
 
-        poll() reads the result, then checks liveness. A run that completes in
-        between looks exactly like one that died -- and reporting `lost` there
-        would discard a real result and invite a duplicate dispatch.
+        poll() reads the result, then checks liveness, then re-reads the result
+        before declaring death. A run whose result lands in the window between
+        the first read and the liveness check looks exactly like one that died
+        -- and reporting `lost` there would discard a real result and invite a
+        duplicate dispatch.
+
+        The timing is constructed, not raced: `find_result` is stubbed to read
+        nothing on its first call (the result has not landed yet) and to return
+        the real result on its second call (it landed during the liveness
+        check). The pid file points at a pid above pid_max that cannot be live,
+        so the liveness branch deterministically sees the process gone. No
+        subprocess, no sleep, no wall-clock dependency -- the old version raced
+        a real fake-agent-run's exit against poll() and flaked under load
+        (observed: `assert 'running' == 'succeeded'`).
+
+        Known negative / reproducibility: delete the second find_result re-read
+        in AgentRunLauncher.poll (the block re-reading the result before
+        declaring death) and this test fails with `lost` -- the run whose
+        result landed mid-check gets misjudged as dead. That mutation is the
+        exact product defect this test pins.
         """
         run_id = derive_run_id("t8", "worker_turn")
-        ticket = launcher.launch(AgentRunSpec(prompt="sleep=0"), run_id)
-        launcher.wait(ticket, poll_interval=0.05, deadline_seconds=60)
+        session_root = launcher.session_root_for(run_id)
+        session_root.mkdir(parents=True)
+        # A pid above pid_max cannot be live, so the liveness branch is
+        # deterministic: poll must fall through to the re-read, never
+        # short-circuit on "running".
+        (session_root / "launcher.pid").write_text(str(4_194_303))
 
         from fleet_graph.executors import agent_run as module
 
         real_find_result = module.find_result
         calls = {"n": 0}
+
+        # Lay down the result.json the real agent-run would have produced.
+        run_dir = session_root / f"2026-08-26-02-30-00-000-{run_id[:6]}"
+        run_dir.mkdir()
+        (run_dir / "result.json").write_text(
+            json.dumps(
+                {"state": "succeeded", "exit_code": 0, "exit_reason": "normal", "run_id": run_id}
+            )
+        )
 
         def racing_find_result(session_root):
             # First read sees nothing (the run had not finished yet); by the
@@ -281,9 +311,10 @@ class TestFailureModes:
         monkeypatch.setattr(module, "find_result", racing_find_result)
 
         # pid is long dead, so poll falls through to the liveness branch.
-        status = launcher.poll(RunTicket(run_id, ticket.session_root, pid=None))
+        status = launcher.poll(RunTicket(run_id, str(session_root), pid=None))
         assert status.state == "succeeded", "a completed run was reported as lost"
         assert status.result is not None
+        assert status.result["run_id"] == run_id
         assert calls["n"] == 2
 
     def test_wait_timeout_raises_and_never_reports_lost(self, launcher: AgentRunLauncher) -> None:

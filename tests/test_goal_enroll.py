@@ -237,11 +237,10 @@ class TestServiceAndMCP:
         for constraint in ("never merges to main directly", "dd-evidence", ".dev-dispatch"):
             assert constraint in BRIEFING_TEXT
 
-    def test_the_tool_is_registered_on_the_mcp_surface(self) -> None:
-        from fleet_graph.dd.service import build_mcp_server
-        from test_dd_service import FakeControlPlane
+    def test_the_tool_is_registered_on_the_goal_mcp_surface(self) -> None:
+        from fleet_graph.goal.service import build_goal_mcp_server
 
-        server = build_mcp_server(FakeControlPlane())
+        server = build_goal_mcp_server()
         tools = asyncio.run(server.list_tools())
         assert "goal_enroll" in {tool.name for tool in tools}
         prompts = asyncio.run(server.list_prompts())
@@ -249,16 +248,30 @@ class TestServiceAndMCP:
         resources = asyncio.run(server.list_resources())
         assert str(BRIEFING_RESOURCE_URI) in {str(res.uri) for res in resources}
 
+    def test_the_goal_surface_is_not_on_the_dd_face(self) -> None:
+        """The goal-driven split: dd carries no goal_enroll / goal-open /
+        briefing; those live on the standalone goal serve surface (:5611)."""
+        from fleet_graph.dd.service import build_mcp_server
+        from test_dd_service import FakeControlPlane
+
+        server = build_mcp_server(FakeControlPlane())
+        tools = asyncio.run(server.list_tools())
+        assert "goal_enroll" not in {tool.name for tool in tools}
+        prompts = asyncio.run(server.list_prompts())
+        assert GOAL_OPEN_PROMPT_NAME not in {prompt.name for prompt in prompts}
+        resources = asyncio.run(server.list_resources())
+        assert str(BRIEFING_RESOURCE_URI) not in {str(res.uri) for res in resources}
+
     def test_the_refusal_reaches_the_client_machine_readably(self, tmp_path: Path) -> None:
         from fastmcp import Client
         from fastmcp.exceptions import ToolError
 
-        from fleet_graph.dd.service import build_mcp_server
-        from test_dd_service import FakeControlPlane, running_server
+        from fleet_graph.goal.service import build_goal_mcp_server
+        from test_dd_service import running_server
 
         _folder(tmp_path, "wf-1", "# no acceptance\n", GOLDEN_ORDER_OK)
         source = _source(tmp_path)
-        server = build_mcp_server(FakeControlPlane(), goal_folders=source)
+        server = build_goal_mcp_server(goal_folders=source)
 
         async def call(url: str) -> str:
             async with Client(url) as client:
@@ -277,10 +290,10 @@ class TestServiceAndMCP:
         from fastmcp import Client
         from fastmcp.exceptions import ToolError
 
-        from fleet_graph.dd.service import build_mcp_server
-        from test_dd_service import FakeControlPlane, running_server
+        from fleet_graph.goal.service import build_goal_mcp_server
+        from test_dd_service import running_server
 
-        server = build_mcp_server(FakeControlPlane(), goal_folders=None)
+        server = build_goal_mcp_server(goal_folders=None)
 
         async def call(url: str) -> str:
             async with Client(url) as client:
@@ -294,16 +307,29 @@ class TestServiceAndMCP:
         payload = json.loads(message[message.index("{") : message.rindex("}") + 1])
         assert payload["code"] == CODE_SOURCE_UNBOUND
 
+    def test_goal_serve_refuses_to_start_without_a_root(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Binding fail-fast: no --work-folder-root and no env root means the
+        goal service refuses to start -- a runtime GOAL_ENROLL_SOURCE_UNBOUND
+        half-broken service is not allowed to exist.
+        """
+        from fleet_graph.goal.service import serve
+
+        monkeypatch.delenv("FLEET_GRAPH_WORK_FOLDER_ROOT", raising=False)
+        with pytest.raises(RuntimeError, match="GOAL_ENROLL_SOURCE_UNBOUND"):
+            serve(host="127.0.0.1", port=0, work_folder_root=None)
+
     def test_a_valid_admission_over_the_wire(self, tmp_path: Path) -> None:
         from fastmcp import Client
 
-        from fleet_graph.dd.service import build_mcp_server
-        from test_dd_service import FakeControlPlane, running_server
+        from fleet_graph.goal.service import build_goal_mcp_server
+        from test_dd_service import running_server
 
         _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
         source = _source(tmp_path)
         roster = GoalEnrollRoster(str(tmp_path / "store"))
-        server = build_mcp_server(FakeControlPlane(), goal_folders=source, goal_roster=roster)
+        server = build_goal_mcp_server(goal_folders=source, goal_roster=roster)
 
         async def call(url: str) -> dict[str, Any]:
             async with Client(url) as client:

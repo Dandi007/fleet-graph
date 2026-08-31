@@ -31,6 +31,7 @@ from fleet_graph.graphs.research_pipeline import (
     ResearchDeps,
     build_research_graph,
     derive_research_id,
+    derive_run_instance,
     initial_state,
 )
 from fleet_graph.state.run_artifacts import iso, write_json_durable
@@ -61,6 +62,10 @@ class ResearchConfig:
     #: 多源矩阵词汇（R2，规格第 8 条）：默认固定顺序，取首元素为默认源。空列表时
     #: 回退到 DEFAULT_SOURCES。
     sources: list[str] = field(default_factory=lambda: list(DEFAULT_SOURCES))
+    #: 显式 run 实例分量（R3-fix，规格第 1 条）：缺省 None = 由 run_root 内容寻址派生
+    #: （`derive_run_instance`，稳定非随机）。显式给定用于跨不同 run_root 也需保持
+    #: 同一身份的边界情况（rare），值必须由调用方保证稳定，不得掺 uuid4/时间戳。
+    instance: str | None = None
 
     @property
     def default_source(self) -> str:
@@ -71,13 +76,24 @@ class ResearchConfig:
         return derive_research_id(self.question)
 
     @property
-    def thread_id(self) -> str:
-        """跨重启稳定的线程身份（规格第 2 条）：`{research_id}:g{generation}`。
+    def run_instance(self) -> str:
+        """稳定的 run 实例分量（R3-fix，规格第 1 条）。
 
-        同 runner.py 的 LineConfig.thread_id 形状。任何随机量都不得进入此串，
-        否则 derived run id 会随重启漂移，re-adopt 失效。
+        缺省由 run_root 内容寻址派生（同 run_root 恒同、不同 run_root 恒不同），
+        显式 ``instance`` 优先。稳定非随机，kill-restart 不漂移。
         """
-        return f"{self.research_id}:g{self.generation}"
+        return self.instance if self.instance is not None else derive_run_instance(self.run_root)
+
+    @property
+    def thread_id(self) -> str:
+        """跨重启稳定的线程身份（规格第 2 条）：`{research_id}:g{generation}:{run_instance}`。
+
+        R3-fix（规格第 1 条）：thread 身份注入 **run 实例**分量——同一题两次独立跑
+        （不同 run_root）派生不同 thread_id/run_id，不再撞 bus 409；同一次 run 的
+        kill-restart（同 run_root）仍得相同身份。任何随机量都不得进入此串，否则
+        derived run id 会随重启漂移，re-adopt 失效。
+        """
+        return f"{self.research_id}:g{self.generation}:{self.run_instance}"
 
     @property
     def resolved_checkpoint_path(self) -> str:
@@ -130,11 +146,16 @@ def default_publisher() -> Any:
     """生产装配真实 ``BusClient``；无凭据/无法构造时返回 None（不发布，降级）。
 
     与 scheduler/board 的惯例一致：能连才发布，连不上不拖垮工作。
+
+    R1-返工（委托头根修）：服务 token 就是 fleet-graph 自身——``agent_id`` 与
+    ``own_agent_id`` 同置 ``fleet-graph``，client 端据此**不发**
+    ``X-Bus-On-Behalf-Of``（发它会被 bus 当成无权委托，403
+    DELEGATION_NOT_PERMITTED，全部 publish 静默吞掉——生产实锤根因）。
     """
     try:
         from fleet_graph.bus.client import BusClient
 
-        return BusClient(agent_id="fleet-graph")
+        return BusClient(agent_id="fleet-graph", own_agent_id="fleet-graph")
     except Exception:
         return None
 
@@ -185,13 +206,19 @@ def run_research(
             # 可观测性不能拖垮它观测的工作。
             pass
 
-    graph, _deps = build_research(
+    graph, deps = build_research(
         config,
         text_node=text_node,
         launcher=launcher,
         observe=persist_event,
         publisher=publisher,
     )
+    # R1-返工：发布目标频道必须已存在（缺失频道 publish 直接 404）——真实 run
+    # 先幂等建好三个 research 频道。创建失败照样 loud（累计进 publish_degraded）。
+    from fleet_graph.research_bus import ensure_research_channels
+
+    ensure_research_channels(publisher, config.research_id, degraded=deps.publish_degraded)
+
     invoke_config: dict[str, Any] = {
         "configurable": {"thread_id": config.thread_id},
         # bounds 才是真上限，这只是失控兜底。
@@ -223,6 +250,7 @@ def run_research(
         "rounds": rounds,
         "report": str(run_root / REPORT_FILE),
         "run_root": str(run_root),
+        "publish_degraded": deps.publish_degraded.as_dict(),
     }
     write_json_durable(run_root / RESULT, {**result, "written_at": iso(now())})
     return result

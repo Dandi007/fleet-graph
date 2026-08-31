@@ -1,7 +1,36 @@
-# 运维：两个闸门
+# 运维：三个闸门
 
-调度器有两个互不替代的闸。搞混它们的代价在事故里才显形，所以这里写清楚
+入口有三个互不替代的闸。搞混它们的代价在事故里才显形，所以这里写清楚
 各自管什么、怎么动、多久生效。
+
+## 闸零：入册申请（goal_enroll @ :5611）—— 哪些线**能**被名册接纳
+
+goal 线从入册申请开始。`goal_enroll` 是 goal-driven MCP 独立面
+（`fleet-graph goal serve`，`:5611`，MCP 注册名 `fleet-graph-goal`）上的
+fail-closed 入册工具：候选 goal 文件夹只有**每一道闸都过**才落 roster 条目，
+任一闸不过就以稳定的机器可读 code（带失败条款）拒绝——绝无半条、绝无
+warning-as-admission。
+
+调用面（goal 面独立于 dd 面，dd 面是纯 dev-dispatch，不含 `goal_enroll`）：
+
+- **`goal_enroll(folder_id)`**：校验闸在 goal 文件夹上逐道跑——文件夹是 goal
+  线（含 `goal.md` 与 `golden-order.md`）、`goal.md` 声明了可执行验收 argv、
+  `golden-order.md` 非空、spec-lint 禁条款干净、声明的验收命令能在一次性
+  liveness probe 里启动。通过才写**引擎版本化** roster 条目（briefing
+  版本 id 在内），此后同 folder 重跑幂等返回既有条目（`already_admitted`）。
+- **`goal-open` prompt / `fleet-graph://goal-open/briefing` resource**：开线
+  交底（Phase-0 opening briefing），随引擎发布版本化，roster 条目记录同一
+  briefing 版本 id——线上能审计到开它时的那版交底。
+- **绑定 fail-fast**：goal 面缺 `--work-folder-root`（或 env
+  `FLEET_GRAPH_WORK_FOLDER_ROOT`）时**拒绝启动**并打印明确错误——不允许起一个
+  运行时才报 `GOAL_ENROLL_SOURCE_UNBOUND` 的半残服务（registered-but-unbound
+  族 bug 的结构性根治）。
+
+- **生效**：调用即生效（roster 条目持久于 work-folder-root 下）
+- **用途**：goal 线入册的唯一入口；名册（闸一）只认已入册的线
+- 失败的入册是**显式拒绝**，不是静默跳过：`NO_ACCEPTANCE_COMMAND`、
+  `GOLDEN_ORDER_EMPTY`、`SPEC_LINT_BAN`、`ACCEPTANCE_ARGV_UNEXECUTABLE` 等
+  稳定 code 逐条可见
 
 ## 闸一：名册（`enabled`）—— 哪些线**允许**跑
 
@@ -474,3 +503,23 @@ role patch 参数——spec 冻在 bootstrap digest 下，改 spec 永远等于�
 - `development_evidence` 每代一个 entry，receipt 链跨代连续：g{n} 的链以
   g{n-1} 的尾 commit + 尾 digest 为种子，revision 跨代累计编号；
   `development_events` 默认读当前代，传 `generation` 读历史代。
+
+## 舰队入口总表
+
+U3（wf-c106b9）统一的是**提交（submit）**，不是**点火（ignite）**：提交面向
+所有 agent 收敛到唯一对外入口，而点火/执行/裁决/收割这些保留面仍然留在监督面。
+下表登记现存六类入口与归宿，每行五列：入口、协议/端点、准入者、归宿（统一|保留）、
+理由。
+
+| 入口 | 协议/端点 | 准入者 | 归宿（统一\|保留） | 理由 |
+|---|---|---|---|---|
+| goal 提交面 | `:5611` `goal_enroll` | 任何 agent | 统一 | 唯一对外提交入口：任何 agent 经 goal MCP 提交入册申请，申请对监督面结构性可见（read-model + E8 + 挂板），放行权仍留监督面 |
+| dd 派单面 | `:5610` `development_*` | roster 线 + 监督面 | 保留 | 内部执行入口且当前健康：dd 面回归纯 dev-dispatch，roster 线与监督面继续专用 |
+| 放行入口 | `roster PR` → `release` → `restart` | 监督面 | 保留 | 放行权不下放：roster `enabled` 永远留监督面；U2 后 queue entry 置 admitted 并留 decision 指针 |
+| 裁决入口 | `board question` → `work.decision.v1` | 有权作出人类裁决者/监督面 | 保留 | 治理裁决路径不变；如实注明 decision-bridge 缺陷已由 wf-216dc3 另案处理，桥修复后 E7 goal 直写退役 |
+| 收割入口 | `supervisor harvest` + `allowlist` | 监督面 | 保留 | allowlist 已激活且仍由监督面管控（fleet-sentinel 唯一仓，09-07 手工期限） |
+| 带外手工入口 | 手工 token 铸造、手工 roster 直编、spec 挂他卷、E7 goal 直写 | 监督面/历史带外操作者 | 统一 | U2 后提交一律收敛到 goal 提交面；token 铸造显式保留为放行 SOP 步骤并在提交期由闸 6 校验，不得把所有带外动作笼统保留 |
+
+一句话记法：**统一提交、保留点火/执行/裁决/收割**。带外动作不是一律豁免——
+只有写进放行 SOP 的 token 铸造步骤保留，其余手工侧门（roster 直编、spec 挂他卷、
+E7 goal 直写）随 U2 收敛并注明 owner 与理由。

@@ -58,6 +58,16 @@ NOTE_MARKER = "[A2 suggestion — not a decision]"
 
 NOTES_LIMIT = 1000
 
+#: Board reads page the channel ascending and aggregate in PAGE_SIZE windows.
+#: PAGE_SIZE stays at the old single-read ceiling so a sub-thousand channel
+#: reads in exactly one page, byte-identical to the pre-fix behaviour.
+PAGE_SIZE = NOTES_LIMIT
+
+#: Paging safety ceiling: a channel cannot need more pages than it has head
+#: seqs per page. Exceeding it means the pages are not catching up to head --
+#: a real pagination interruption, which must be refused loudly, not skipped.
+MAX_PAGES = 1000
+
 #: Default logical model for the read-only reasoning role. Orchestration code
 #: names a logical model; the gateway resolves keys and failover (invariant 3).
 DEFAULT_REASONING_MODEL = "deepseek-v4-flash"
@@ -254,6 +264,46 @@ class ArbiterRun:
 # --- board reading ----------------------------------------------------------
 
 
+def _read_full_channel(
+    client: BusClient,
+    channel_id: str,
+    *,
+    page_size: int = PAGE_SIZE,
+    max_pages: int = MAX_PAGES,
+) -> list[dict[str, Any]]:
+    """Read a whole channel by sequential page aggregation (ascending).
+
+    选型理由: #178 给 decision_for 修的是固定尾窗 (先学 head_seq, 再读
+    after_seq=head-N 的尾部窗口)——那一支只找「最新一条裁决」, 尾窗足够。但
+    arbiter 的板面读取要枚举*全部*未决 question/consultation 与最新卡面,
+    固定尾窗在频道超过窗口后会把旧开放问题丢出窗外——那不是「拒绝残缺」, 是
+    静默漏诊 (缺陷族第九式), 且与破千前 (整条频道落在单个窗口内) 的结果
+    不一致。这里改为顺序翻页聚合: 以当次 GET 返回的 head_seq 为终态判据,
+    翻到本页末 seq 追平 head 为止; 频道任意长都能读全, 翻页间隔里 head 前移
+    则继续追。只有真实读取失败 (HTTP 错误由 client 抛 BusError; 翻页中断 /
+    空窗追不平 head / 超过页数上限) 才触发「残缺板面拒绝」的响亮语义——
+    绝不因频道长度触发。
+    """
+    collected: list[dict[str, Any]] = []
+    after_seq = 0
+    for _ in range(max_pages):
+        page, head_seq = client.messages(channel_id, limit=page_size, after_seq=after_seq)
+        if not page:
+            if head_seq == 0:
+                return collected
+            raise RuntimeError(
+                f"{channel_id} page empty at seq {after_seq} (head {head_seq}); "
+                "refusing to triage a partial board"
+            )
+        collected.extend(page)
+        if page[-1]["channel_seq"] >= head_seq:
+            return collected
+        after_seq = page[-1]["channel_seq"]
+    raise RuntimeError(
+        f"{channel_id} read exceeded {max_pages} pages; refusing to triage a partial board"
+    )
+
+
 def _card_heads(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     heads: dict[str, dict[str, Any]] = {}
     for message in messages:
@@ -283,10 +333,8 @@ def collect_subjects(client: BusClient, *, alias: str | None = None) -> list[Sub
     bodies are treated as untrusted data, never instructions.
     """
     board = Board(client)
-    notes, notes_head = client.messages(WORK_NOTES, limit=NOTES_LIMIT)
-    if notes and notes[-1]["channel_seq"] < notes_head:
-        raise RuntimeError(f"{WORK_NOTES} fetch truncated; refusing to triage a partial board")
-    cards, _ = client.messages(WORK_INDEX, limit=NOTES_LIMIT)
+    notes = _read_full_channel(client, WORK_NOTES)
+    cards = _read_full_channel(client, WORK_INDEX)
     heads = _card_heads(cards)
 
     subjects: list[Subject] = []
@@ -331,7 +379,7 @@ def collect_subjects(client: BusClient, *, alias: str | None = None) -> list[Sub
         )
 
     if alias:
-        inbox_messages, _ = client.messages(f"agent:{alias}", limit=NOTES_LIMIT)
+        inbox_messages = _read_full_channel(client, f"agent:{alias}")
         for message in inbox_messages:
             body = _message_body(message)
             if "arbiter" not in body.lower():
@@ -451,8 +499,8 @@ def run_arbiter(
         subjects = collect_subjects(client, alias=alias)
     publisher = SuggestionPublisher(Board(client))
     run = ArbiterRun(dry_run=not publish)
-    notes, _ = client.messages(WORK_NOTES, limit=NOTES_LIMIT)
-    cards, _ = client.messages(WORK_INDEX, limit=NOTES_LIMIT)
+    notes = _read_full_channel(client, WORK_NOTES)
+    cards = _read_full_channel(client, WORK_INDEX)
     known_entities = _board_entities(notes, cards)
     seen: set[str] = set()
 

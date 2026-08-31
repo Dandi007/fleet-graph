@@ -30,6 +30,7 @@ from fleet_graph.bus.board import Board, GateTicket, normalize_decision
 from fleet_graph.cost_obs import CostDataPlane
 from fleet_graph.cost_obs.classify import LAUNCH, REVIEW
 from fleet_graph.dd.dispatch import derive_attempt_id
+from fleet_graph.dd.git import run_git
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.executors.agent_run import (
     AgentRunLauncher,
@@ -165,6 +166,21 @@ class AgentRunStageActor:
     # None means the data plane is not collecting -- the DD dispatch still
     # runs, it just does not emit the facts.
     cost_plane: CostDataPlane | None = None
+    #: When a fresh dispatch is about to start from a worktree that does not
+    #: satisfy the attempt precondition (HEAD != the attempt's input_commit,
+    #: or a dirty tree), restore it first: `reset --hard <input_commit>` +
+    #: `clean`, the same sanctioned reset the actor contract allows, done here
+    #: so the retry never has to declare BLOCKED on its predecessor's remnant
+    #: commit. The action is recorded as `event=re_prepare` (with the cleared
+    #: HEAD sha) through `observe`, when one is wired. Never runs while
+    #: re-adopting a run still in flight: that run owns its workspace (#167).
+    #: Off by default so the actor stays inert outside the engine that wires
+    #: its worktree -- the runner enables it for the stages that share the
+    #: attempt-context worktree.
+    reprepare_worktree: bool = False
+    #: The runner's event sink (`<run_root>/events.jsonl`). Wired so the
+    #: re-prepare action is auditable like every other stage event.
+    observe: Any = None
 
     def writes(self, stage: Stage) -> bool:
         """Only the stage the contract says produces product code.
@@ -180,6 +196,61 @@ class AgentRunStageActor:
 
     def _timeout(self, stage: Stage) -> int:
         return self.timeouts.get(stage.id, self.default_timeout_seconds)
+
+    def _reprepare_worktree(self, stage: Stage, dispatch: Dispatch) -> None:
+        """Restore the worktree before a fresh dispatch whose precondition fails.
+
+        A previous attempt that did its work but never reported (the
+        contract_violation / no-structured-output exit) leaves a committed
+        remnant at HEAD: the next attempt's exact-commit check would find
+        HEAD != input_commit and refuse (BLOCKED), jamming the retry. This is
+        the same sanctioned reset the actor contract allows -- `reset --hard
+        <input_commit>` plus `clean` -- performed here by the engine so the
+        retry starts from a worktree that satisfies its precondition. The
+        cleared remnant commit is not preserved (git reflog keeps it), and the
+        action is recorded as `event=re_prepare` with the cleaned HEAD sha, so
+        the recovery is auditable.
+
+        Never runs while re-adopting a run still in flight (#167): that run
+        owns its workspace. Only a run that has truly terminally failed (or
+        been lost) earns a fresh dispatch, and only then is its residue
+        cleared. The caller gates on `re_adopt` before invoking this.
+        """
+        if not self.reprepare_worktree:
+            return
+        workspace = Path(self.worktree_path)
+        input_commit = str(dispatch.get("input_commit") or "")
+        if not input_commit:
+            return
+        head = run_git(workspace, "rev-parse", "HEAD")
+        if head.returncode != 0:
+            # Not even resolvable as a repo; leave the actor-side check to
+            # refuse rather than guess.
+            return
+        current = head.stdout.strip()
+        dirty = run_git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
+        if dirty.returncode != 0:
+            return
+        if current == input_commit and not dirty.stdout.strip():
+            # The precondition already holds; nothing to restore.
+            return
+        cleared_head = current
+        reset = run_git(workspace, "reset", "--hard", "--quiet", input_commit)
+        if reset.returncode != 0:
+            return
+        run_git(workspace, "clean", "-fd")
+        if self.observe is not None:
+            self.observe(
+                {
+                    "event": "re_prepare",
+                    "stage": stage.id,
+                    "attempt": int(dispatch.get("attempt", 1)),
+                    "generation": int(dispatch.get("generation", 1)),
+                    "development_id": self.development_id,
+                    "input_commit": input_commit,
+                    "cleaned_head": cleared_head,
+                }
+            )
 
     def role_input(self, stage: Stage, dispatch: Dispatch, run_id: str) -> dict[str, Any]:
         """What the role's own input schema asks for, and nothing more.
@@ -209,6 +280,12 @@ class AgentRunStageActor:
         attempt_tag = f"g{dispatch['generation']}-a{dispatch['attempt']}"
         retry = int(dispatch.get("retry", 0))
         re_adopt = bool(dispatch.get("re_adopt", False))
+        # A fresh dispatch may only start from a worktree that satisfies the
+        # attempt precondition. A run still in flight (re_adopt) owns its
+        # workspace and is never re-prepared; only a genuinely terminal/lost
+        # run earns a fresh dispatch, and only then is its residue cleared.
+        if not re_adopt:
+            self._reprepare_worktree(stage, dispatch)
         # A timeout retry re-adopts the run still in flight: derive the
         # ORIGINAL run id (the retry-0 one), so the idempotent launcher adopts
         # the in-flight run instead of paying for a second one. Only a run

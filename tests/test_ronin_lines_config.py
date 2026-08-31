@@ -91,6 +91,22 @@ ENROLLED = {
     # 彻底重构，R1-R8 严格依赖序为硬约束）：deep-research V4 线。
     # goal/宪法差距表 SSoT：wf-66300e；诊断：wf-b9be03。
     "wf-66300e",
+    # 2026-08-31 第八波（用户拍板「要 goal driven agent 开发」）：calendar-agent
+    # 日程页一键导出打码图片。名册里第一条**产品线**——此前每条线的题目都是
+    # fleet-graph 自己或它的邻居基建，这条改的是一个独立产品仓
+    # (Dandi007/calendar-agent)。验收 harness 先于实现存在（@2b0b8164 两个门
+    # 实测正确变红）。goal/spec/golden-order SSoT：wf-fdd6ac。
+    "wf-fdd6ac",
+    # 2026-08-31 第九波（用户令「彻底全部退役 glm52」）：glm-5.2 退役收尾线。
+    # 调用方全量切 glm-5.3 → 7 天观察窗零成功调用 → 网关摘别名与展开产物；
+    # 互锁五步序不可颠倒，观察窗不得跳过。goal/golden-order/findings SSoT：wf-c22907。
+    "wf-c22907",
+    # 2026-08-31 第十波（用户令「把所有入口进行一个整体统一，然后 goal-driven 来
+    # 自举这个工作」）：舰队入口整体统一线。U1 goal MCP 独立面(:5611) → U2 入册
+    # 流水线（提交→queue→/v1/enrollments→E8→挂板，放行权留监督面）→ U3 入口总表
+    # → U4 自举 e2e（本线为统一入口第一个 dogfood 用户）。原则：统一的是提交不是
+    # 点火。goal/spec/golden-order SSoT：wf-c106b9。
+    "wf-c106b9",
 }
 
 # 2026-08-29 复活：曾在 MIGRATED 里 enabled=false 停摆的线被用户令重新点亮。

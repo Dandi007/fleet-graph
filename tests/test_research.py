@@ -40,6 +40,7 @@ from fleet_graph.graphs.research_pipeline import (
     derive_clue_id,
     derive_research_id,
     initial_state,
+    synthesis_run_id,
     worker_run_id,
 )
 from fleet_graph.graphs.research_runner import (
@@ -226,9 +227,22 @@ class TestIdentity:
         assert derive_research_id(question) == rid
         assert derive_research_id("另一个问题") != rid
 
-    def test_thread_id_is_research_id_and_generation(self, tmp_path: Path) -> None:
+    def test_thread_id_injects_run_instance(self, tmp_path: Path) -> None:
+        # R3-fix：thread 身份注入稳定非随机的 run 实例分量（规格第 1 条）。
         config = ResearchConfig(question="q", run_root=tmp_path, generation=3)
-        assert config.thread_id == f"{config.research_id}:g3"
+        assert config.thread_id.startswith(f"{config.research_id}:g3:i-")
+        # 同 run_root 恒同，不同 run_root 恒不同。
+        same = ResearchConfig(question="q", run_root=tmp_path, generation=3)
+        other = ResearchConfig(question="q", run_root=tmp_path / "run2", generation=3)
+        assert config.thread_id == same.thread_id
+        assert config.thread_id != other.thread_id
+
+    def test_explicit_instance_overrides_run_root_derivation(self, tmp_path: Path) -> None:
+        # 显式 instance 优先于 run_root 内容寻址，且必须稳定（规格第 1 条）。
+        a = ResearchConfig(question="q", run_root=tmp_path / "a", instance="i-abc")
+        b = ResearchConfig(question="q", run_root=tmp_path / "b", instance="i-abc")
+        assert a.thread_id == b.thread_id
+        assert a.thread_id == f"{a.research_id}:g1:i-abc"
 
     def test_checkpoint_defaults_to_disk_under_run_root(self, tmp_path: Path) -> None:
         config = ResearchConfig(question="q", run_root=tmp_path)
@@ -237,16 +251,53 @@ class TestIdentity:
 
 class TestWorkerRunIdDerivation:
     def test_same_thread_clue_retry_derives_the_same_id(self) -> None:
-        thread = "r-abcdef123456:g1"
+        thread = "r-abcdef123456:g1:i-000000000000"
         clue = "c-fedcba654321"
         assert worker_run_id(thread, clue, 0) == worker_run_id(thread, clue, 0)
         assert worker_run_id(thread, clue, 0) == derive_run_id(thread, f"worker/{clue}", 1)
 
     def test_a_retry_bumps_the_derived_attempt(self) -> None:
-        thread = "r-abcdef123456:g1"
+        thread = "r-abcdef123456:g1:i-000000000000"
         clue = "c-fedcba654321"
         assert worker_run_id(thread, clue, 1) == derive_run_id(thread, f"worker/{clue}", 2)
         assert worker_run_id(thread, clue, 0) != worker_run_id(thread, clue, 1)
+
+
+class TestRunInstanceIsolation:
+    """R3-fix：run 身份按 run 实例隔离（规格第 1 条）。
+
+    同一题两次独立跑（不同 run_root）派生不同 run_id——不再撞 bus 409；同一次 run 的
+    kill-restart（同 run_root）仍得相同 run_id——re-adopt/幂等不回退（判据 ③④）。
+    """
+
+    def test_different_run_root_derives_different_run_ids(self, tmp_path: Path) -> None:
+        a = ResearchConfig(question="q", run_root=tmp_path / "run-a")
+        b = ResearchConfig(question="q", run_root=tmp_path / "run-b")
+        # research_id 仍内容寻址（同一题恒同），thread/run_id 才按实例隔离。
+        assert a.research_id == b.research_id
+        assert a.thread_id != b.thread_id
+        clue = derive_clue_id("clue one", DEFAULT_SOURCE)
+        assert worker_run_id(a.thread_id, clue, 0) != worker_run_id(b.thread_id, clue, 0)
+        assert synthesis_run_id(a.thread_id) != synthesis_run_id(b.thread_id)
+
+    def test_same_run_root_derives_same_run_ids(self, tmp_path: Path) -> None:
+        a = ResearchConfig(question="q", run_root=tmp_path / "run")
+        b = ResearchConfig(question="q", run_root=tmp_path / "run")
+        assert a.thread_id == b.thread_id
+        clue = derive_clue_id("clue one", DEFAULT_SOURCE)
+        assert worker_run_id(a.thread_id, clue, 0) == worker_run_id(b.thread_id, clue, 0)
+        assert synthesis_run_id(a.thread_id) == synthesis_run_id(b.thread_id)
+
+    def test_run_instance_is_stable_and_not_random(self, tmp_path: Path) -> None:
+        from fleet_graph.graphs.research_pipeline import derive_run_instance
+
+        inst = derive_run_instance(tmp_path / "run")
+        assert inst.startswith("i-")
+        assert len(inst) == 14  # "i-" + 12 hex
+        assert inst == derive_run_instance(tmp_path / "run")
+        assert inst != derive_run_instance(tmp_path / "run-other")
+        # 稳定非随机：同一 run_root 恒同（kill-restart 不漂移）。
+        assert ResearchConfig(question="q", run_root=tmp_path / "run").run_instance == inst
 
 
 class TestConvergeIsPure:

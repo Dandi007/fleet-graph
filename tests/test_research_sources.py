@@ -29,7 +29,6 @@ from fleet_graph.graphs.research_pipeline import (
     SOURCE_ROLE,
     TERMINAL_CONVERGED,
     derive_clue_id,
-    derive_research_id,
 )
 from fleet_graph.graphs.research_runner import ResearchConfig, run_research
 
@@ -190,7 +189,7 @@ class TestDispatchRoutesBySource:
             {"text": "code-local 线索", "source": "code-local"},
         ]
         launcher = self._run(seed_items, tmp_path)
-        thread = f"{derive_research_id('q')}:g1"
+        thread = ResearchConfig(question="q", run_root=tmp_path / "run").thread_id
 
         # 每个 seed clue 派发到 SOURCE_ROLE[source] 对应角色。
         for item in seed_items:
@@ -206,7 +205,7 @@ class TestDispatchRoutesBySource:
     def test_plain_string_seed_backfills_default_source(self, tmp_path: Path) -> None:
         # 纯字符串 seed 回填默认源（code-local），路由到 dr-worker-code-local。
         launcher = self._run(["plain clue"], tmp_path)
-        thread = f"{derive_research_id('q')}:g1"
+        thread = ResearchConfig(question="q", run_root=tmp_path / "run").thread_id
         clue_id = derive_clue_id("plain clue", DEFAULT_SOURCE)
         run_id = derive_run_id(thread, f"worker/{clue_id}", 1)
         assert launcher.specs[run_id].role == SOURCE_ROLE[DEFAULT_SOURCE]
