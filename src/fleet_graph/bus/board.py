@@ -411,7 +411,13 @@ class Board:
             return None
         candidate_ids = {ref["message_id"] for ref in referencing}
 
-        messages, _ = self.client.messages(self.notes_channel, limit=1000)
+        # bus 分页是升序的：裸 limit=1000 拿到的是最老的 1000 条，频道破千后
+        # 新裁决永远不在窗内（2026-08-31 生产实锤：seq 1020 的 APPROVE 对 gate
+        # 读者不可见，全部 gate 假等）。先学 head 再读尾窗。
+        _, head_seq = self.client.messages(self.notes_channel, limit=1)
+        messages, _ = self.client.messages(
+            self.notes_channel, limit=1000, after_seq=max(0, head_seq - 1000)
+        )
         decisions = [
             m
             for m in messages
