@@ -36,6 +36,7 @@ def fake_ops(
     active_after_stop: bool = False,
     read_model_age: float | None = None,
     stop_exit: int = 0,
+    board_card_entity_id: str | None = None,
 ) -> dict[str, Any]:
     """A recording fake E6 ops: resolve/stop/is-active/read-model all scripted."""
     calls: list[str] = []
@@ -59,7 +60,31 @@ def fake_ops(
             calls.append("line_heartbeat_age_s")
             return read_model_age
 
+        def board_card_entity_id(self, folder_id: str, run_root: Path) -> str | None:
+            calls.append("board_card_entity_id")
+            return board_card_entity_id
+
     return {"ops": Ops(), "calls": calls}
+
+
+class FakeBus:
+    def __init__(self) -> None:
+        self.published: list[dict[str, Any]] = []
+
+    def publish(self, channel, kind, payload, idempotency_key, *, refs=None, **_kw):
+        class _Result:
+            message_id = f"msg_{len(self.published)}"
+
+        self.published.append(
+            {
+                "channel": channel,
+                "kind": kind,
+                "payload": payload,
+                "idempotency_key": idempotency_key,
+                "refs": refs or [],
+            }
+        )
+        return _Result()
 
 
 def config_for(
@@ -193,3 +218,69 @@ class TestVocabularyNegative:
         event = heartbeat_stale_event("wf-a", 600.0, 3, "coordinator")
         assert validate_event(event.as_dict()) == event
         assert event.key == "e6-wf-a"
+
+
+class TestEvidenceNoteRefTarget:
+    """交付 C：evidence note 的 ref 目标必须是真实板实体，缺失即 best-effort skip。"""
+
+    def test_evidence_note_targets_real_board_card_entity(self, tmp_path: Path) -> None:
+        """有卡：card_entity_id 与 refs target 都填真实板实体，绝不填 folder_id。"""
+        bus = FakeBus()
+        fake = fake_ops(unit="fleet-graph-line-wf-fdd6ac-g1", board_card_entity_id="card-xyz")
+        config, fake = config_for(tmp_path, ops=fake, bus=bus, publish_notes=True)
+        config.event = heartbeat_stale_event(
+            folder_id="wf-fdd6ac", heartbeat_age_s=600.0, round=3, phase="coordinator"
+        ).as_dict()
+        result = run_e6_stop(config)
+        assert result["outcome"] == OUTCOME_STOPPED
+        assert len(bus.published) == 1, f"published: {bus.published}"
+        note = bus.published[0]
+        assert note["payload"]["card_entity_id"] == "card-xyz"
+        targets = {ref["target_entity"] for ref in note["refs"]}
+        assert targets == {"card-xyz"}
+        assert "wf-fdd6ac" not in targets
+
+    def test_evidence_note_skips_when_no_board_card(self, tmp_path: Path) -> None:
+        """无卡：零发布 + evidence_note ok=False + detail 含「缺失」。"""
+        bus = FakeBus()
+        fake = fake_ops(board_card_entity_id=None)
+        config, fake = config_for(tmp_path, ops=fake, bus=bus, publish_notes=True)
+        result = run_e6_stop(config)
+        assert result["outcome"] == OUTCOME_STOPPED
+        assert bus.published == [], f"published: {bus.published}"
+        evidence = next(s for s in result["steps"] if s["step"] == "evidence_note")
+        assert evidence["ok"] is False
+        assert "缺失" in evidence["detail"]
+
+
+class TestDefaultOpsBoardCardRead:
+    """交付 A：DefaultE6Ops.board_card_entity_id 读 stall-state 的 board_card_entity_id。"""
+
+    def test_reads_board_card_entity_id_from_stall_state(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.e6_ops import DefaultE6Ops
+
+        run_root = tmp_path / "runs"
+        stall = run_root / ".scheduler"
+        stall.mkdir(parents=True)
+        (stall / "wf-a.json").write_text(
+            json.dumps({"generation": 3, "board_card_entity_id": "card-xyz"})
+        )
+        ops = DefaultE6Ops()
+        assert ops.board_card_entity_id("wf-a", run_root) == "card-xyz"
+
+    def test_missing_or_empty_board_card_entity_id_returns_none(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.e6_ops import DefaultE6Ops
+
+        run_root = tmp_path / "runs"
+        stall = run_root / ".scheduler"
+        stall.mkdir(parents=True)
+        (stall / "wf-a.json").write_text(json.dumps({"generation": 3}))
+        (stall / "wf-b.json").write_text(
+            json.dumps({"generation": 3, "board_card_entity_id": None})
+        )
+        (stall / "wf-c.json").write_text(json.dumps({"generation": 3, "board_card_entity_id": ""}))
+        ops = DefaultE6Ops()
+        assert ops.board_card_entity_id("wf-a", run_root) is None
+        assert ops.board_card_entity_id("wf-b", run_root) is None
+        assert ops.board_card_entity_id("wf-c", run_root) is None
+        assert ops.board_card_entity_id("wf-missing", run_root) is None

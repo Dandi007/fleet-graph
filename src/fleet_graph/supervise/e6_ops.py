@@ -69,6 +69,16 @@ class E6Ops:
         """:7494 `/v1/lines` 该线的 heartbeat_age_s；不可读/缺行 -> None。"""
         raise NotImplementedError
 
+    def board_card_entity_id(self, folder_id: str, run_root: Path) -> str | None:
+        """该线 goal-line board card 的实体 id；空/null/缺失 -> None。
+
+        读 scheduler stall-state `<run_root>/.scheduler/<folder_id>.json` 的
+        `board_card_entity_id`（launcher `--board-card` 线程下发）。尚无卡时该
+        字段为 null/缺失，必须如实返回 None（evidence 步 best-effort skip），
+        绝不把 folder_id 当 ref 伪造。
+        """
+        raise NotImplementedError
+
 
 class DefaultE6Ops(E6Ops):
     def __init__(
@@ -100,8 +110,9 @@ class DefaultE6Ops(E6Ops):
                 units.append(unit)
         return units
 
-    def _stall_generation(self, folder_id: str, run_root: Path) -> int | None:
-        """scheduler stall-state `<run_root>/.scheduler/<folder_id>.json` 的 generation。"""
+    def _stall_state(self, folder_id: str, run_root: Path) -> dict[str, Any] | None:
+        """scheduler stall-state `<run_root>/.scheduler/<folder_id>.json` 的 dict；
+        缺失/坏档 -> None。"""
         path = Path(run_root) / ".scheduler" / f"{folder_id}.json"
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
@@ -109,10 +120,31 @@ class DefaultE6Ops(E6Ops):
             return None
         if not isinstance(raw, dict):
             return None
+        return raw
+
+    def _stall_generation(self, folder_id: str, run_root: Path) -> int | None:
+        """scheduler stall-state 的 generation。"""
+        raw = self._stall_state(folder_id, run_root)
+        if raw is None:
+            return None
         try:
             return int(raw.get("generation") or 0)
         except (TypeError, ValueError):
             return None
+
+    def board_card_entity_id(self, folder_id: str, run_root: Path) -> str | None:
+        """scheduler stall-state `<run_root>/.scheduler/<folder_id>.json` 的 board_card_entity_id。
+
+        空/null/缺失 -> None（尚无卡 -> evidence 步 best-effort skip）。
+        """
+        raw = self._stall_state(folder_id, run_root)
+        if raw is None:
+            return None
+        value = raw.get("board_card_entity_id")
+        if value is None:
+            return None
+        text = str(value)
+        return text or None
 
     def resolve_line_unit(self, folder_id: str, run_root: Path) -> dict[str, Any]:
         prefix = f"{self.line_unit_prefix}-{folder_id}-"
