@@ -41,7 +41,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from fleet_graph.bus.board import NOTE_KIND, WORK_NOTES
+from fleet_graph.bus.board import Board
 from fleet_graph.bus.client import BusClient
 from fleet_graph.state.run_artifacts import iso, write_json_durable
 from fleet_graph.supervise.e6_ops import HEARTBEAT_STALE_THRESHOLD_SECONDS, E6Ops
@@ -293,19 +293,29 @@ def build_e6_stop_graph(deps: E6StopDeps) -> StateGraph:
             }
         folder_id = state.get("folder_id") or ""
         unit = state.get("unit") or ""
+        card_entity_id = deps.ops.board_card_entity_id(folder_id, deps.run_root)
         note = (
             f"E6 处置 {event.type} {event.key}: {state.get('outcome') or 'in_progress'}\n"
             f"folder={folder_id} unit={unit} "
             f"heartbeat_age_s={_event_of(state).payload.get('heartbeat_age_s')}\n"
             f"steps: {[s.get('step') for s in state.get('steps') or []]}"
         )
+        if not card_entity_id:
+            # 该线尚无 goal-line board card（stall-state 缺 board_card_entity_id）。
+            # best-effort：如实 skip，绝不把 folder_id 当 ref 目标伪造。
+            return {
+                "steps": _record_step(
+                    state,
+                    "evidence_note",
+                    ok=False,
+                    detail="board_card_entity_id 缺失——note 未挂卡（best-effort）",
+                )
+            }
         try:
-            published = deps.bus.publish(
-                WORK_NOTES,
-                NOTE_KIND,
-                {"card_entity_id": folder_id, "note": note, "note_type": "evidence"},
-                f"e6-stop:{event.key}",
-                refs=[{"target_entity": folder_id}] if folder_id else [],
+            published = Board(deps.bus).evidence(
+                card_entity_id=card_entity_id,
+                text=note,
+                idempotency_key=f"e6-stop:{event.key}",
             )
         except Exception as exc:
             return {
