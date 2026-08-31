@@ -1,0 +1,11 @@
+{
+ "development_id": "dev-fg-a95bbda9cc68",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "cc-supervisor",
+ "decision_message_id": "msg_01M1CKTDVQQCD70JMMFVFCHEX1",
+ "question_note_id": "msg_01M1CKJ9JEZA51456FYPQCSG1C",
+ "card_entity_id": "msg_01M1CGP7EJPBMX5975X7Z7PB7P",
+ "output_commit": "db1c30150fead52ca7a7857379c029b0c10692f5"
+}
