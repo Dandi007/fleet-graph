@@ -26,8 +26,11 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from fleet_graph.bus.client import BusClient
 from fleet_graph.graphs.research_pipeline import (
+    ADVOCATE_ROLE,
+    ARBITER_ROLE,
     DEFAULT_SOURCE,
-    SYNTHESIS_ROLE,
+    JUDGE_ROLE,
+    OPPONENT_ROLE,
     TERMINAL_CONVERGED,
     derive_clue_id,
     derive_research_id,
@@ -90,15 +93,31 @@ def worker_result(claims: list[str], proposed: list[str]) -> dict[str, Any]:
     }
 
 
-def synthesis_result(report: str) -> dict[str, Any]:
+def debater_result(body: str) -> dict[str, Any]:
+    """dr-doc.result.v1 形状的成功信封。"""
     return {
         "state": "succeeded",
         "exit_code": 0,
-        "structured_result": {
-            "report_markdown": report,
-            "coverage_summary": "全部 clue 有证据支撑",
-            "unresolved": [],
-        },
+        "structured_result": {"body": body},
+    }
+
+
+def arbiter_result() -> dict[str, Any]:
+    """dr-arbiter.result.v1 形状的成功信封。"""
+    return {
+        "state": "succeeded",
+        "exit_code": 0,
+        "structured_result": {"verdict": "enough", "rationale": "证据已充分"},
+    }
+
+
+def default_debate() -> dict[str, Any]:
+    """R4 四角色的回放信封（按角色常量寻址）。"""
+    return {
+        ADVOCATE_ROLE: debater_result("# advocate 论证\n正面。"),
+        OPPONENT_ROLE: debater_result("# opponent 论证\n反驳。"),
+        JUDGE_ROLE: debater_result("# judge 裁定\n暂无分歧。"),
+        ARBITER_ROLE: arbiter_result(),
     }
 
 
@@ -110,12 +129,12 @@ class FakeLauncher:
     def __init__(
         self,
         worker_script: list[Any],
-        synthesis: dict[str, Any],
+        debate: dict[str, Any] | None = None,
         *,
         boom: bool = False,
     ) -> None:
         self.worker_script = list(worker_script)
-        self.synthesis = synthesis
+        self.debate = debate or {}
         self.boom = boom
         self.dispatched: list[str] = []
         self.specs: dict[str, Any] = {}
@@ -139,8 +158,8 @@ class FakeLauncher:
         if self.boom:
             raise Boom("killed during worker run")
         role = self._roles[ticket.run_id]
-        if role == SYNTHESIS_ROLE:
-            return RunStatus("succeeded", self.synthesis)
+        if role in self.debate:
+            return RunStatus("succeeded", self.debate[role])
         item = self.worker_script.pop(0)
         if item == "fail":
             return RunStatus("failed", {"state": "failed", "exit_code": 1})
@@ -266,7 +285,7 @@ class TestPublishing:
                 worker_result(["每轮 tick 检查所有 line"], ["tick 的唤醒源"]),
                 worker_result(["systemd timer 唤醒"], []),
             ],
-            synthesis_result("# 报告\n调度器按 tick 工作。"),
+            default_debate(),
         )
         config = ResearchConfig(question=question, run_root=tmp_path / "run")
 
@@ -294,11 +313,13 @@ class TestPublishing:
         assert set(ev) == {"clue_id", "anchor", "quote", "claim"}
         assert ev["clue_id"] == derive_clue_id("scheduler 的基本循环", DEFAULT_SOURCE)
 
-        # doc payload（leaf）：doc_kind=report / origin / digest。
+        # doc payload（leaf）：doc_kind=report / origin / digest（R4 报告由脚本节点组装）。
         doc = docs_msgs[0]["payload"]
         assert doc["doc_kind"] == "report"
         assert doc["origin"] == rid
-        assert doc["body"] == "# 报告\n调度器按 tick 工作。"
+        local_report = (tmp_path / "run" / "report.md").read_text(encoding="utf-8")
+        assert doc["body"] == local_report
+        assert "## 分歧裁定" in doc["body"]
         from fleet_graph.research_bus import body_digest
 
         assert doc["digest"] == body_digest(doc["body"])
@@ -325,7 +346,7 @@ class TestDualSourceDiff:
         seed = FakeTextNode(json.dumps(["scheduler 的基本循环"]))
         launcher = FakeLauncher(
             [worker_result(["每轮 tick 检查所有 line"], [])],
-            synthesis_result("# 报告\n调度器按 tick 工作。"),
+            default_debate(),
         )
         config = ResearchConfig(question=question, run_root=tmp_path / "run")
         result = run_research(config, text_node=seed, launcher=launcher, publisher=client)
@@ -392,7 +413,7 @@ class TestKillRestartReplay:
         db = str(tmp_path / "run" / "checkpoint.sqlite3")
 
         # 第一次：collect 的 wait 中炸掉，留下指向 collect 的 checkpoint。
-        boom_launcher = FakeLauncher([], synthesis_result("report"), boom=True)
+        boom_launcher = FakeLauncher([], default_debate(), boom=True)
         graph, _deps = build_research(
             config, text_node=seed, launcher=boom_launcher, publisher=client
         )
@@ -411,7 +432,7 @@ class TestKillRestartReplay:
         # 第二次：同 identity 精确续跑（run_research 经 resume_start 续跑并写 result.json）。
         good = FakeLauncher(
             [worker_result(["每轮 tick 检查所有 line"], [])],
-            synthesis_result("# 报告\n调度器按 tick 工作。"),
+            default_debate(),
         )
         result = run_research(config, text_node=seed, launcher=good, publisher=client)
         assert result["terminal"] == TERMINAL_CONVERGED
@@ -527,7 +548,7 @@ class TestPublishDegradation:
         seed = FakeTextNode(json.dumps(["scheduler 的基本循环"]))
         launcher = FakeLauncher(
             [worker_result(["每轮 tick 检查所有 line"], [])],
-            synthesis_result("# 报告\n调度器按 tick 工作。"),
+            default_debate(),
         )
         config = ResearchConfig(question="降级判据问题", run_root=tmp_path / "run")
         result = run_research(config, text_node=seed, launcher=launcher, publisher=Forbidden())
@@ -542,7 +563,7 @@ class TestPublishDegradation:
         seed = FakeTextNode(json.dumps(["clue one"]))
         launcher = FakeLauncher(
             [worker_result(["f1"], [])],
-            synthesis_result("report"),
+            default_debate(),
         )
         config = ResearchConfig(question="q", run_root=tmp_path / "run")
         result = run_research(config, text_node=seed, launcher=launcher)

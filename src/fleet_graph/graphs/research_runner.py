@@ -184,7 +184,7 @@ def run_research(
 ) -> dict[str, Any]:
     """跑一个 research 工单到终态，写 events.jsonl 与 result.json 后返回摘要。
 
-    terminal ∈ {converged, capped, partial} 才算跑通；fault（seed/synthesis 故障、
+    terminal ∈ {converged, capped, partial} 才算跑通；fault（seed/debate 故障、
     意外异常）非零退出由 CLI 侧决定。单 clue 失败绝不 fault 整图——那是图内的
     retry/block 状态机，不是这里的异常路径。
 

@@ -21,17 +21,22 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from fleet_graph.executors.agent_run import RunStatus, RunTicket, RunWaitTimeout, derive_run_id
 from fleet_graph.graphs.research_pipeline import (
+    ADVOCATE_ROLE,
+    ARBITER_ROLE,
     CLUE_BLOCKED,
     CLUE_DONE,
     CLUE_OPEN,
     DEFAULT_SOURCE,
+    JUDGE_ROLE,
+    OPPONENT_ROLE,
     SOURCE_ROLE,
-    SYNTHESIS_ROLE,
     TERMINAL_CAPPED,
     TERMINAL_CONVERGED,
+    TERMINAL_FAULT,
     TERMINAL_PARTIAL,
     ResearchBounds,
     converge,
+    debate_run_id,
     derive_clue_id,
     derive_research_id,
     initial_state,
@@ -98,17 +103,52 @@ def unparseable_worker_result() -> dict[str, Any]:
     return {"state": "succeeded", "exit_code": 0, "result": "工具面不可达的叙述"}
 
 
-def synthesis_result(report: str) -> dict[str, Any]:
-    """research-synth.result.v1 形状的成功信封。"""
+def debater_result(body: str) -> dict[str, Any]:
+    """dr-doc.result.v1 形状的成功信封。"""
     return {
         "state": "succeeded",
         "exit_code": 0,
-        "structured_result": {
-            "report_markdown": report,
-            "coverage_summary": "全部 clue 有证据支撑",
-            "unresolved": [],
-        },
+        "structured_result": {"body": body},
     }
+
+
+def arbiter_result(verdict: str = "enough", rationale: str = "证据已充分") -> dict[str, Any]:
+    """dr-arbiter.result.v1 形状的成功信封。"""
+    return {
+        "state": "succeeded",
+        "exit_code": 0,
+        "structured_result": {"verdict": verdict, "rationale": rationale},
+    }
+
+
+def judge_body(ruled: list[str] | None = None, open_disagreements: list[str] | None = None) -> str:
+    """judge 的 dr-doc body：按 R4 约定输出 RULE: / OPEN DISAGREEMENT: 段行。"""
+    lines = ["# judge 裁定"]
+    for r in ruled or []:
+        lines.append(r)
+    for o in open_disagreements or []:
+        lines.append(f"OPEN DISAGREEMENT: {o}")
+    return "\n".join(lines)
+
+
+def default_debate(
+    ruled: list[str] | None = None,
+    open_disagreements: list[str] | None = None,
+    verdict: str = "enough",
+    rationale: str = "证据已充分",
+) -> dict[str, Any]:
+    """四角色的回放信封（按角色常量寻址）。judge 用 judge_body 结构化产出。"""
+    return {
+        ADVOCATE_ROLE: debater_result("# advocate 论证\n正面支持结论。"),
+        OPPONENT_ROLE: debater_result("# opponent 论证\n对结论路径提出反驳。"),
+        JUDGE_ROLE: debater_result(judge_body(ruled, open_disagreements)),
+        ARBITER_ROLE: arbiter_result(verdict, rationale),
+    }
+
+
+def unparseable_debate_result() -> dict[str, Any]:
+    """成功信封但信封不可解析（缺 structured_result 对象）——debate 角色直接 fault。"""
+    return {"state": "succeeded", "exit_code": 0, "result": "无法解析的叙述"}
 
 
 def legacy_worker_result(claims: list[str], proposed: list[str]) -> dict[str, Any]:
@@ -126,21 +166,22 @@ class Boom(RuntimeError):
 
 
 class FakeLauncher:
-    """worker/synthesis 的替身：按 role 回放脚本，记录派发的 run id。
+    """worker/debate 的替身：按 role 回放脚本，记录派发的 run id。
 
-    ``launch`` 幂等（R3）：同 run_id 重复 launch = re-adopt 在途 run（与真实
-    AgentRunLauncher 一致），只记录第一次 spawn，不重复进 ``dispatched``。
+    ``debate`` 按角色常量寻址（dict[role_str, envelope]，``"fail"`` 哨兵表示 debater
+    run 失败）。``launch`` 幂等（R3）：同 run_id 重复 launch = re-adopt 在途 run（与
+    真实 AgentRunLauncher 一致），只记录第一次 spawn，不重复进 ``dispatched``。
     """
 
     def __init__(
         self,
         worker_script: list[Any],
-        synthesis: dict[str, Any],
+        debate: dict[str, Any] | None = None,
         *,
         boom: bool = False,
     ) -> None:
         self.worker_script = list(worker_script)
-        self.synthesis = synthesis
+        self.debate = debate or {}
         self.boom = boom
         self.dispatched: list[str] = []
         self.specs: dict[str, Any] = {}
@@ -160,8 +201,11 @@ class FakeLauncher:
         if self.boom:
             raise Boom("killed during worker run")
         role = self._roles[ticket.run_id]
-        if role == SYNTHESIS_ROLE:
-            return RunStatus("succeeded", self.synthesis)
+        if role in self.debate:
+            item = self.debate[role]
+            if item == "fail":
+                return RunStatus("failed", {"state": "failed", "exit_code": 1})
+            return RunStatus("succeeded", item)
         item = self.worker_script.pop(0)
         if item == "fail":
             return RunStatus("failed", {"state": "failed", "exit_code": 1})
@@ -301,12 +345,14 @@ class TestEndToEnd:
     def test_one_question_two_rounds_converges(self, tmp_path: Path) -> None:
         question = "fleet-graph 的调度器如何工作?"
         seed = FakeTextNode(json.dumps(["scheduler 的基本循环"]))
+        ruled = ["RULE: 分歧一 裁决：每轮 tick 检查成立 [anchor: wiki@fake.md:1]"]
+        open_disagreements = ["分歧二 双方证据均不足以裁决"]
         launcher = FakeLauncher(
             [
                 worker_result(["每轮 tick 检查所有 line"], ["tick 的唤醒源"]),
                 worker_result(["systemd timer 唤醒"], []),
             ],
-            synthesis_result("# 报告\n调度器按 tick 工作。"),
+            default_debate(ruled=ruled, open_disagreements=open_disagreements),
         )
         config = ResearchConfig(question=question, run_root=tmp_path / "run")
 
@@ -325,10 +371,16 @@ class TestEndToEnd:
         assert all(e["finding"]["locator"] for e in evidence)
         assert all(e["clue_id"] for e in evidence)
 
-        # report.md 由 synthesis 产出（规格：报告正文落 run root 文件）。
-        assert (tmp_path / "run" / "report.md").read_text(
-            encoding="utf-8"
-        ) == "# 报告\n调度器按 tick 工作。"
+        # report.md 由 debate_report 脚本节点从 judge/arbiter 产出组装（零 LLM），
+        # 必须含 `## 分歧裁定` 段、judge 的 OPEN DISAGREEMENT 逐字保留、arbiter 记录。
+        report = (tmp_path / "run" / "report.md").read_text(encoding="utf-8")
+        assert "## 分歧裁定" in report
+        assert (
+            "### 已裁定分歧" in report and "### 开放分歧" in report and "### arbiter 裁决" in report
+        )
+        assert "OPEN DISAGREEMENT: 分歧二 双方证据均不足以裁决" in report
+        assert "RULE: 分歧一 裁决：每轮 tick 检查成立 [anchor: wiki@fake.md:1]" in report
+        assert "- verdict: enough" in report
         persisted = json.loads((tmp_path / "run" / RESULT).read_text(encoding="utf-8"))
         assert persisted["terminal"] == TERMINAL_CONVERGED
         assert persisted["rounds"] == 2
@@ -338,17 +390,29 @@ class TestEndToEnd:
         # seed 纯字符串回填默认源，clue id 带 source 寻址（R2）。
         clue_one = derive_clue_id("scheduler 的基本循环", DEFAULT_SOURCE)
         clue_two = derive_clue_id("tick 的唤醒源", DEFAULT_SOURCE)
+        # R4：debate 子图 run id 用 derive_run_id(thread, "debate/<role>", 1) 派生。
         assert launcher.dispatched == [
             derive_run_id(thread, f"worker/{clue_one}", 1),
             derive_run_id(thread, f"worker/{clue_two}", 1),
-            derive_run_id(thread, "synthesis", 1),
+            debate_run_id(thread, "advocate"),
+            debate_run_id(thread, "opponent"),
+            debate_run_id(thread, "judge"),
+            debate_run_id(thread, "arbiter"),
         ]
+        # 四角色逐字使用已交付角色名（不新造角色）。
+        for role_id, role in (
+            (debate_run_id(thread, "advocate"), ADVOCATE_ROLE),
+            (debate_run_id(thread, "opponent"), OPPONENT_ROLE),
+            (debate_run_id(thread, "judge"), JUDGE_ROLE),
+            (debate_run_id(thread, "arbiter"), ARBITER_ROLE),
+        ):
+            assert launcher.specs[role_id].role == role
 
     def test_events_are_persisted_by_the_runner(self, tmp_path: Path) -> None:
         seed = FakeTextNode(json.dumps(["clue one"]))
         launcher = FakeLauncher(
             [worker_result(["f1"], [])],
-            synthesis_result("report"),
+            default_debate(),
         )
         run_research(
             ResearchConfig(question="q", run_root=tmp_path / "run"),
@@ -356,14 +420,21 @@ class TestEndToEnd:
             launcher=launcher,
         )
         events = read_jsonl(tmp_path / "run" / EVENTS)
+        # R4：四角色各一次 debate 事件 + debate_report（零 LLM 脚本节点）一次。
         assert [e["event"] for e in events] == [
             "seed",
             "dispatch",
             "collect",
             "harvest",
-            "synthesis",
+            "debate",
+            "debate",
+            "debate",
+            "debate",
+            "debate_report",
             "finalise",
         ]
+        arbiter_event = next(e for e in events if e.get("role") == "arbiter")
+        assert arbiter_event["verdict"] == "enough"
 
 
 class TestCapped:
@@ -371,7 +442,7 @@ class TestCapped:
         seed = FakeTextNode(json.dumps(["clue one"]))
         launcher = FakeLauncher(
             [worker_result(["f1"], ["clue two"])],
-            synthesis_result("report"),
+            default_debate(),
         )
         config = ResearchConfig(question="q", run_root=tmp_path / "run", max_clues=2)
 
@@ -386,7 +457,7 @@ class TestCapped:
 class TestPartial:
     def test_retry_exhausted_blocked_clue_terminates_as_partial(self, tmp_path: Path) -> None:
         seed = FakeTextNode(json.dumps(["clue one"]))
-        launcher = FakeLauncher(["fail", "fail"], synthesis_result("report"))
+        launcher = FakeLauncher(["fail", "fail"], default_debate())
         config = ResearchConfig(question="q", run_root=tmp_path / "run")
 
         result = run_research(config, text_node=seed, launcher=launcher)
@@ -410,7 +481,7 @@ class TestWorkerWaitTimeout:
         # 单个 worker wait 超时绝不 fault 整图（规格第 7 条）：两次超时耗尽 retry
         # 后置 blocked，终态 partial，而不是把 RunWaitTimeout 抛穿 collect。
         seed = FakeTextNode(json.dumps(["clue one"]))
-        launcher = FakeLauncher(["timeout", "timeout"], synthesis_result("report"))
+        launcher = FakeLauncher(["timeout", "timeout"], default_debate())
         config = ResearchConfig(question="q", run_root=tmp_path / "run")
 
         result = run_research(config, text_node=seed, launcher=launcher)
@@ -436,7 +507,7 @@ class TestHarvestEnvelope:
                 legacy_worker_result(["f1"], ["child clue"]),
                 worker_result(["f2"], []),
             ],
-            synthesis_result("report"),
+            default_debate(),
         )
         config = ResearchConfig(question=question, run_root=tmp_path / "run")
 
@@ -457,10 +528,13 @@ class TestHarvestEnvelope:
 class TestInputContract:
     """roles 声明 protocol.input 后 agent-run 强制 --input：spec 必须带 input_path。"""
 
-    def test_worker_and_synthesis_runs_carry_input_files(self, tmp_path: Path) -> None:
+    def test_worker_and_debate_runs_carry_input_files(self, tmp_path: Path) -> None:
         question = "fleet-graph 的调度器如何工作?"
         seed = FakeTextNode(json.dumps(["scheduler 的基本循环"]))
-        launcher = FakeLauncher([worker_result(["f1"], [])], synthesis_result("report"))
+        launcher = FakeLauncher(
+            [worker_result(["f1"], [])],
+            default_debate(ruled=["RULE: 分歧一 裁决：f1 成立 [anchor: wiki@fake.md:1]"]),
+        )
         config = ResearchConfig(question=question, run_root=tmp_path / "run")
 
         result = run_research(config, text_node=seed, launcher=launcher)
@@ -480,16 +554,64 @@ class TestInputContract:
         # R2：dispatch 按 clue.source 路由到 SOURCE_ROLE 角色（fake launcher 记录 spec.role）。
         assert worker_spec.role == SOURCE_ROLE[DEFAULT_SOURCE]
 
-        # synthesis：input 只携带题面 manifest（research-synth.input.v1）。
-        synth_spec = launcher.specs[derive_run_id(config.thread_id, "synthesis", 1)]
-        assert synth_spec.input_path
-        manifest = json.loads(Path(synth_spec.input_path).read_text(encoding="utf-8"))
+        thread = config.thread_id
+        # R4 debater：--input 只携带 deep-research.debater-input/v1 manifest，语料走
+        # --prompt-file。advocate/opponent/judge 共用证据形状 {anchor, quote, claim}。
+        advocate_spec = launcher.specs[debate_run_id(thread, "advocate")]
+        assert advocate_spec.role == ADVOCATE_ROLE
+        assert advocate_spec.input_path.endswith("debate-advocate.json")
+        manifest = json.loads(Path(advocate_spec.input_path).read_text(encoding="utf-8"))
         assert manifest["question"] == question
-        assert manifest["clue_ids"] == [clue]
+        assert manifest["evidences"] == [
+            {
+                "anchor": "wiki@fake.md:1",
+                "quote": "f1",
+                "claim": "f1",
+                "clue_id": clue,
+            }
+        ]
+
+        # judge：prior_arguments 逐字携带 advocate/opponent 的 body。
+        judge_spec = launcher.specs[debate_run_id(thread, "judge")]
+        judge_manifest = json.loads(Path(judge_spec.input_path).read_text(encoding="utf-8"))
+        assert judge_manifest["prior_arguments"] == [
+            (tmp_path / "run" / "debate" / "advocate.md").read_text(encoding="utf-8"),
+            (tmp_path / "run" / "debate" / "opponent.md").read_text(encoding="utf-8"),
+        ]
+        judge_prompt = (tmp_path / "run" / "inputs" / "debate-judge-prompt.md").read_text(
+            encoding="utf-8"
+        )
+        # 语料经 --prompt-file 投递（题面 + 证据 + 前序 body）。
+        assert "# advocate 论证\n正面支持结论。" in judge_prompt
+
+        # arbiter：deep-research.arbiter-input/v1 形状（board_stats / clue_titles /
+        # recent_claims / recent_rounds）。
+        arbiter_spec = launcher.specs[debate_run_id(thread, "arbiter")]
+        assert arbiter_spec.role == ARBITER_ROLE
+        arbiter_manifest = json.loads(Path(arbiter_spec.input_path).read_text(encoding="utf-8"))
+        assert arbiter_manifest["question"] == question
+        assert arbiter_manifest["board_stats"] == {
+            "total": 1,
+            "done": 1,
+            "blocked": 0,
+            "open": 0,
+        }
+        assert arbiter_manifest["clue_titles"] == ["scheduler 的基本循环"]
+        assert arbiter_manifest["recent_claims"] == ["f1"]
+        assert arbiter_manifest["recent_rounds"] == 1
+
+        # 四角色产出逐字落 run_root/debate/（advocate.md / opponent.md / judge.md / arbiter.json）。
+        assert (tmp_path / "run" / "debate" / "advocate.md").is_file()
+        assert (tmp_path / "run" / "debate" / "opponent.md").is_file()
+        assert (tmp_path / "run" / "debate" / "judge.md").is_file()
+        arbiter_out = json.loads(
+            (tmp_path / "run" / "debate" / "arbiter.json").read_text(encoding="utf-8")
+        )
+        assert arbiter_out["verdict"] == "enough"
 
     def test_each_retry_dispatch_writes_its_own_input_file(self, tmp_path: Path) -> None:
         seed = FakeTextNode(json.dumps(["clue one"]))
-        launcher = FakeLauncher(["fail", worker_result(["f1"], [])], synthesis_result("report"))
+        launcher = FakeLauncher(["fail", worker_result(["f1"], [])], default_debate())
         config = ResearchConfig(question="q", run_root=tmp_path / "run")
 
         result = run_research(config, text_node=seed, launcher=launcher)
@@ -513,7 +635,7 @@ class TestBlockedWorkerResult:
         # run 失败（status.ok 为假）不是调查完成：走 clue 失败路径
         # （retry -> blocked -> 终态 partial），不得计入 done/coverage。
         seed = FakeTextNode(json.dumps(["clue one"]))
-        launcher = FakeLauncher(["fail", "fail"], synthesis_result("report"))
+        launcher = FakeLauncher(["fail", "fail"], default_debate())
         config = ResearchConfig(question="q", run_root=tmp_path / "run")
 
         result = run_research(config, text_node=seed, launcher=launcher)
@@ -529,7 +651,7 @@ class TestBlockedWorkerResult:
         seed = FakeTextNode(json.dumps(["clue one"]))
         launcher = FakeLauncher(
             [unparseable_worker_result(), unparseable_worker_result()],
-            synthesis_result("report"),
+            default_debate(),
         )
         config = ResearchConfig(question="q", run_root=tmp_path / "run")
 
@@ -540,16 +662,16 @@ class TestBlockedWorkerResult:
 
 
 class TestNoVerdictWorkerResultIsDone:
-    """回归（R2-fix）：无 verdict 的合法 worker.result.v1（evidences 非空）必须判
-    done、coverage 增长、evidences 落 evidence.jsonl 并随 synthesis 投递（synthesis
-    input clue_ids 非空）——而不是被当成 clue 失败 retry/block。
+    """回归（R2-fix，R4 承接）：无 verdict 的合法 worker.result.v1（evidences 非空）
+    必须判 done、coverage 增长、evidences 落 evidence.jsonl 并进入 debate 阶段
+    （advocate manifest 的 evidences 非空）——而不是被当成 clue 失败 retry/block。
     """
 
-    def test_evidences_without_verdict_are_done_and_reach_synthesis(self, tmp_path: Path) -> None:
+    def test_evidences_without_verdict_are_done_and_reach_debate(self, tmp_path: Path) -> None:
         seed = FakeTextNode(json.dumps(["clue one"]))
         launcher = FakeLauncher(
             [worker_result(["事实 A", "事实 B"], [])],
-            synthesis_result("# 报告\n有证据支撑。"),
+            default_debate(),
         )
         config = ResearchConfig(question="q", run_root=tmp_path / "run")
 
@@ -561,12 +683,105 @@ class TestNoVerdictWorkerResultIsDone:
         # evidences 落盘 evidence.jsonl。
         evidence = read_jsonl(tmp_path / "run" / "evidence.jsonl")
         assert [e["finding"]["claim"] for e in evidence] == ["事实 A", "事实 B"]
-        # 随 synthesis 投递：synthesis input clue_ids 非空。
+        # R4：无 verdict 的 evidences 判 done 后进入 debate 阶段（advocate manifest
+        # evidences 非空，逐条带 anchor）。
         manifest = json.loads(
-            (tmp_path / "run" / "inputs" / "synthesis.json").read_text(encoding="utf-8")
+            (tmp_path / "run" / "inputs" / "debate-advocate.json").read_text(encoding="utf-8")
         )
-        clue = derive_clue_id("clue one", DEFAULT_SOURCE)
-        assert manifest["clue_ids"] == [clue]
+        assert [ev["claim"] for ev in manifest["evidences"]] == ["事实 A", "事实 B"]
+        assert all(ev["anchor"] for ev in manifest["evidences"])
+
+
+class TestDebateFault:
+    """R4 边界：四角色 run 失败 / 信封不可解析 → TERMINAL_FAULT（响亮，不静默），
+    且链路立即停止（绝不再往下跑后面的角色）。
+    """
+
+    def test_judge_run_failure_faults_whole_graph(self, tmp_path: Path) -> None:
+        seed = FakeTextNode(json.dumps(["clue one"]))
+        debate = default_debate()
+        debate[JUDGE_ROLE] = "fail"
+        launcher = FakeLauncher([worker_result(["f1"], [])], debate)
+        config = ResearchConfig(question="q", run_root=tmp_path / "run")
+
+        result = run_research(config, text_node=seed, launcher=launcher)
+
+        assert result["terminal"] == TERMINAL_FAULT
+        assert "judge" in result["terminal_reason"]
+        assert not (tmp_path / "run" / "report.md").exists()
+        # judge 失败后不再派 arbiter。
+        thread = config.thread_id
+        assert debate_run_id(thread, "arbiter") not in launcher.dispatched
+
+    def test_arbiter_unparseable_envelope_faults(self, tmp_path: Path) -> None:
+        seed = FakeTextNode(json.dumps(["clue one"]))
+        debate = default_debate()
+        debate[ARBITER_ROLE] = unparseable_debate_result()
+        launcher = FakeLauncher([worker_result(["f1"], [])], debate)
+        config = ResearchConfig(question="q", run_root=tmp_path / "run")
+
+        result = run_research(config, text_node=seed, launcher=launcher)
+
+        assert result["terminal"] == TERMINAL_FAULT
+        assert "arbiter" in result["terminal_reason"]
+
+    def test_arbiter_invalid_verdict_faults(self, tmp_path: Path) -> None:
+        seed = FakeTextNode(json.dumps(["clue one"]))
+        debate = default_debate()
+        debate[ARBITER_ROLE] = {
+            "state": "succeeded",
+            "exit_code": 0,
+            "structured_result": {"verdict": "maybe", "rationale": "??"},
+        }
+        launcher = FakeLauncher([worker_result(["f1"], [])], debate)
+        config = ResearchConfig(question="q", run_root=tmp_path / "run")
+
+        result = run_research(config, text_node=seed, launcher=launcher)
+
+        assert result["terminal"] == TERMINAL_FAULT
+
+
+class TestDebateReport:
+    """R4：report.md 由脚本节点从 judge/arbiter 组装，判据 ① 与「本轮无未决分歧」显式落段。"""
+
+    def test_zero_open_disagreements_still_writes_the_section(self, tmp_path: Path) -> None:
+        seed = FakeTextNode(json.dumps(["clue one"]))
+        launcher = FakeLauncher([worker_result(["f1"], [])], default_debate(ruled=[]))
+        config = ResearchConfig(question="q", run_root=tmp_path / "run")
+
+        result = run_research(config, text_node=seed, launcher=launcher)
+        assert result["terminal"] == TERMINAL_CONVERGED
+
+        report = (tmp_path / "run" / "report.md").read_text(encoding="utf-8")
+        assert "## 分歧裁定" in report
+        assert "### 开放分歧" in report
+        # 判据 ① 的弦外要求：零条未决分歧时「开放分歧」段显式写本轮无未决分歧，不省略。
+        assert "本轮无未决分歧" in report
+        assert "### 已裁定分歧" in report
+        assert "本轮无已裁定分歧" in report
+        assert "### arbiter 裁决" in report
+
+    def test_arbiter_continue_is_recorded_but_does_not_route(self, tmp_path: Path) -> None:
+        """硬线：arbiter verdict=continue 仅记录落盘（report + events），不改动
+        converge 的路由语义——本单仍按 converge 判定收敛为 converged。"""
+        seed = FakeTextNode(json.dumps(["clue one"]))
+        launcher = FakeLauncher(
+            [worker_result(["f1"], [])],
+            default_debate(verdict="continue", rationale="还有未穷尽的线索"),
+        )
+        config = ResearchConfig(question="q", run_root=tmp_path / "run")
+
+        result = run_research(config, text_node=seed, launcher=launcher)
+        assert result["terminal"] == TERMINAL_CONVERGED  # continue 不改动 converge 路由
+
+        report = (tmp_path / "run" / "report.md").read_text(encoding="utf-8")
+        assert "- verdict: continue" in report
+        assert "还有未穷尽的线索" in report
+        events = read_jsonl(tmp_path / "run" / EVENTS)
+        arbiter_event = next(e for e in events if e.get("role") == "arbiter")
+        assert arbiter_event["verdict"] == "continue"
+        report_event = next(e for e in events if e["event"] == "debate_report")
+        assert report_event["verdict"] == "continue"
 
 
 class TestResume:
@@ -579,7 +794,7 @@ class TestResume:
         db = str(tmp_path / "run" / "checkpoint.sqlite3")
 
         # 第一次：collect 的 wait 中炸掉，留下指向 collect 的 checkpoint。
-        boom_launcher = FakeLauncher([], synthesis_result("report"), boom=True)
+        boom_launcher = FakeLauncher([], default_debate(), boom=True)
         graph, _deps = build_research(config, text_node=seed, launcher=boom_launcher)
         with SqliteSaver.from_conn_string(db) as saver:
             compiled = graph.compile(checkpointer=saver)
@@ -594,7 +809,7 @@ class TestResume:
         # 第二次：同一 identity 重跑，必须精确续跑而不是重放 seed。
         good = FakeLauncher(
             [worker_result(["每轮 tick 检查所有 line"], [])],
-            synthesis_result("# 报告\n调度器按 tick 工作。"),
+            default_debate(),
         )
         graph2, _deps2 = build_research(config, text_node=seed, launcher=good)
         with SqliteSaver.from_conn_string(db) as saver:
@@ -611,7 +826,7 @@ class TestResume:
     def test_fresh_thread_starts_from_initial_state(self, tmp_path: Path) -> None:
         config = ResearchConfig(question="q", run_root=tmp_path / "run")
         seed = FakeTextNode(json.dumps(["clue one"]))
-        launcher = FakeLauncher([worker_result(["f1"], [])], synthesis_result("report"))
+        launcher = FakeLauncher([worker_result(["f1"], [])], default_debate())
         graph, _deps = build_research(config, text_node=seed, launcher=launcher)
         cfg = {"configurable": {"thread_id": config.thread_id}, "recursion_limit": 100}
         with SqliteSaver.from_conn_string(str(tmp_path / "cp.sqlite3")) as saver:

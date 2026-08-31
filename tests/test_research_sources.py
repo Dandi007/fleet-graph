@@ -20,10 +20,13 @@ from typing import Any, ClassVar
 
 from fleet_graph.executors.agent_run import RunStatus, RunTicket, derive_run_id
 from fleet_graph.graphs.research_pipeline import (
+    ADVOCATE_ROLE,
+    ARBITER_ROLE,
     DEFAULT_SOURCE,
     DEFAULT_SOURCES,
+    JUDGE_ROLE,
+    OPPONENT_ROLE,
     SOURCE_ROLE,
-    SYNTHESIS_ROLE,
     TERMINAL_CONVERGED,
     derive_clue_id,
 )
@@ -62,15 +65,31 @@ def worker_result(claims: list[str], proposed: list[str]) -> dict[str, Any]:
     }
 
 
-def synthesis_result(report: str) -> dict[str, Any]:
+def debater_result(body: str) -> dict[str, Any]:
+    """dr-doc.result.v1 形状的成功信封。"""
     return {
         "state": "succeeded",
         "exit_code": 0,
-        "structured_result": {
-            "report_markdown": report,
-            "coverage_summary": "全部 clue 有证据支撑",
-            "unresolved": [],
-        },
+        "structured_result": {"body": body},
+    }
+
+
+def arbiter_result() -> dict[str, Any]:
+    """dr-arbiter.result.v1 形状的成功信封。"""
+    return {
+        "state": "succeeded",
+        "exit_code": 0,
+        "structured_result": {"verdict": "enough", "rationale": "证据已充分"},
+    }
+
+
+def default_debate() -> dict[str, Any]:
+    """R4 四角色的回放信封（按角色常量寻址）。"""
+    return {
+        ADVOCATE_ROLE: debater_result("# advocate 论证\n正面。"),
+        OPPONENT_ROLE: debater_result("# opponent 论证\n反驳。"),
+        JUDGE_ROLE: debater_result("# judge 裁定\n暂无分歧。"),
+        ARBITER_ROLE: arbiter_result(),
     }
 
 
@@ -80,9 +99,9 @@ class FakeLauncher:
     ``launch`` 幂等（R3）：同 run_id 重复 launch = re-adopt 在途 run，只记录第一次。
     """
 
-    def __init__(self, worker_script: list[Any], synthesis: dict[str, Any]) -> None:
+    def __init__(self, worker_script: list[Any], debate: dict[str, Any] | None = None) -> None:
         self.worker_script = list(worker_script)
-        self.synthesis = synthesis
+        self.debate = debate or {}
         self.dispatched: list[str] = []
         self.specs: dict[str, Any] = {}
         self._roles: dict[str, str] = {}
@@ -99,8 +118,8 @@ class FakeLauncher:
 
     def wait(self, ticket: RunTicket, **kwargs: Any) -> RunStatus:
         role = self._roles[ticket.run_id]
-        if role == SYNTHESIS_ROLE:
-            return RunStatus("succeeded", self.synthesis)
+        if role in self.debate:
+            return RunStatus("succeeded", self.debate[role])
         item = self.worker_script.pop(0)
         return RunStatus("succeeded", item)
 
@@ -156,7 +175,7 @@ class TestDispatchRoutesBySource:
         seed = FakeTextNode(json.dumps(seed_items))
         launcher = FakeLauncher(
             [worker_result(["f"], []) for _ in seed_items],
-            synthesis_result("report"),
+            default_debate(),
         )
         config = ResearchConfig(question="q", run_root=tmp_path / "run")
         result = run_research(config, text_node=seed, launcher=launcher)
@@ -203,7 +222,7 @@ class TestCollectWorkerResultV1:
                 worker_result(["web 事实"], ["web 子线索"]),
                 worker_result(["web 子事实"], []),
             ],
-            synthesis_result("report"),
+            default_debate(),
         )
         config = ResearchConfig(question="q", run_root=tmp_path / "run")
         result = run_research(config, text_node=seed, launcher=launcher)
@@ -233,7 +252,7 @@ class TestCollectWorkerResultV1:
                 worker_result(["事实 A", "事实 B"], ["子线索 X"]),
                 worker_result(["子事实"], []),
             ],
-            synthesis_result("report"),
+            default_debate(),
         )
         config = ResearchConfig(question="q", run_root=tmp_path / "run")
         result = run_research(config, text_node=seed, launcher=launcher)
@@ -253,7 +272,7 @@ class TestUnknownSourceFallback:
 
     def test_unknown_source_backfills_default_and_run_converges(self, tmp_path: Path) -> None:
         seed = FakeTextNode(json.dumps([{"text": "神秘源线索", "source": "not-a-source"}]))
-        launcher = FakeLauncher([worker_result(["f"], [])], synthesis_result("report"))
+        launcher = FakeLauncher([worker_result(["f"], [])], default_debate())
         config = ResearchConfig(question="q", run_root=tmp_path / "run")
 
         result = run_research(config, text_node=seed, launcher=launcher)
@@ -268,7 +287,7 @@ class TestUnknownSourceFallback:
     def test_missing_source_backfills_default(self, tmp_path: Path) -> None:
         # dict 缺 source 字段：回填默认源（缺失源属 clue 级降级）。
         seed = FakeTextNode(json.dumps([{"text": "无源线索"}]))
-        launcher = FakeLauncher([worker_result(["f"], [])], synthesis_result("report"))
+        launcher = FakeLauncher([worker_result(["f"], [])], default_debate())
         config = ResearchConfig(question="q", run_root=tmp_path / "run")
         result = run_research(config, text_node=seed, launcher=launcher)
         assert result["terminal"] == TERMINAL_CONVERGED

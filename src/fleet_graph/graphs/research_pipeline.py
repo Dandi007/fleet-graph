@@ -1,22 +1,27 @@
 """deep-research 并发 fan-out 闭环图：一张 submit 驱动的 L2 业务图。
 
 一个 research 工单走完
-`seed -> {dispatch -[Send]-> collect* -> harvest -> converge} 循环 -> synthesis -> finalise`，
+`seed -> {dispatch -[Send]-> collect* -> harvest -> converge} 循环 -> debate -> finalise`，
 在 run root 下产出 `report.md` 与 `result.json`。R3 起 dispatch 用 LangGraph Send API
 按 wave 并发派发（缺省 W=4，`concurrency` 可配）：一个 wave 内至多 `concurrency` 个
 open clue 同时 `dispatched`，collect 对每个 clue 单粒度的 launch+wait 并行执行，真实
 时间重叠、wall-clock 下降（而非仅结构并列）。
 
 节点纯度（规格第 5 条）：
-- **script 节点**（dispatch / collect / harvest / converge / finalise）零 LLM 调用，
-  只做计数、落盘与路由——它们不读含义、不写代理结论。
-- **LLM 节点**只有 `seed`（TextNode，纯文本进出，产出初始 clue 列表）与
-  `synthesis`（AgentRunLauncher，一次性 structured run，`write=False`，语料经
-  `--prompt-file` 文件投递）。
+- **script 节点**（dispatch / collect / harvest / converge / debate_report / finalise）
+  零 LLM 调用，只做计数、落盘与路由——它们不读含义、不写代理结论。
+- **LLM 节点**只有 `seed`（TextNode，纯文本进出，产出初始 clue 列表）与 R4 的
+  对抗裁决子图 `debate`（advocate → opponent → judge → arbiter 四段 structured run，
+  全部 `write=False`、语料经 `--prompt-file` 文件投递、`--input` 只携带 manifest）。
+  `report.md` 由脚本节点 `debate_report`（零 LLM）从 judge/arbiter 产出组装，不是
+  任何一个 LLM 角色直接写出的。arbiter 的 `verdict=continue` 只记录并响亮落盘（进
+  report「分歧裁定」段 + events），不改动 converge 的路由语义——循环继续/终止仍由
+  纯函数 `converge()` 决定。
 
 state 只装 id 与计数（规格第 7 条）：clue 板（id/status/depth/retry）与
 coverage/zero_growth_rounds/rounds。findings 逐条 append 到 `evidence.jsonl`、
-报告正文落 `report.md`——正文永不进 checkpoint，kill-restart 后重放不会重复大段文本。
+debate 四角色 body/verdict 逐字落 `run_root/debate/`、报告正文落 `report.md`——
+正文永不进 checkpoint，kill-restart 后重放不会重复大段文本。
 """
 
 from __future__ import annotations
@@ -51,6 +56,7 @@ from fleet_graph.research_bus import (
     evidence_channel,
     evidence_idempotency_key,
     evidence_payload,
+    finding_anchor,
     publish_best_effort,
 )
 from fleet_graph.state.run_artifacts import iso, write_json_durable
@@ -59,7 +65,17 @@ from fleet_graph.state.run_artifacts import iso, write_json_durable
 # launcher/text node，不依赖真实 role 存在。R2 起 dispatch 按 clue 的 source 路由到
 # SOURCE_ROLE 矩阵（6 个 dr-worker 角色），不再用单一 worker 角色。
 WORKER_ROLE = "research_worker_local"
-SYNTHESIS_ROLE = "research_synth"
+
+# R4（对抗裁决）四角色：逐字引用 agent-runtime 已交付角色，绝不新造 / 改名 /
+# 重注册角色。advocate（glm-5.2）/ opponent（gpt-5.6-sol）/ judge（deepseek-v4-pro）
+# 三方三条不同模型腿，满足宪法条5「多模型讨论」；arbiter（claude-opus-5）整板裁决。
+ADVOCATE_ROLE = "dr-debater-advocate"
+OPPONENT_ROLE = "dr-debater-opponent"
+JUDGE_ROLE = "dr-debater-judge"
+ARBITER_ROLE = "dr-arbiter"
+
+# debate 子图的角色顺序（自增链路）：judge/arbiter 的输入依赖前序角色产出。
+DEBATE_ROLES = (ADVOCATE_ROLE, OPPONENT_ROLE, JUDGE_ROLE, ARBITER_ROLE)
 
 # 多源 worker 矩阵（R2）：source 词汇 -> dr-worker 角色。SOURCE_ROLE 是纯库函数常量，
 # dispatch 只读它路由，不做内联 if；value 必须逐字等于 agent-runtime 已交付的 6 个
@@ -83,11 +99,14 @@ DEFAULT_SOURCE: str = DEFAULT_SOURCES[0]
 # - worker result worker.result.v1：{evidences[{quote,claim,source,locator,revision,
 #   range?,uri?,digest?}], proposed_clues[{clue,reason}], materials[{uri,digest?}]}
 #   （无 verdict / 无 clue_id——调查完成与否由 evidences 判定，见 collect 节点）
-# - synth input   research-synth.input.v1：{question[, clue_ids, corpus_note]}
-# - synth result  research-synth.result.v1：{report_markdown, coverage_summary,
-#   unresolved}
+# - debater input deep-research.debater-input/v1：{question, evidences[{anchor,quote,
+#   claim,clue_id?}], prior_arguments[]}
+# - debater output dr-doc.result.v1：{body}
+# - arbiter input deep-research.arbiter-input/v1：{question, board_stats,
+#   clue_titles[], recent_claims[], recent_rounds}
+# - arbiter output dr-arbiter.result.v1：{verdict∈{enough,continue}, rationale}
 # role 声明 protocol.input 后 agent-run 强制要求 --input，缺了直接 CONTRACT_ERROR，
-# 所以 dispatch/synthesis 必须为每个 run 落 input 文件并传 spec.input_path。
+# 所以 dispatch / debate 四角色必须为每个 run 落 input 文件并传 spec.input_path。
 
 DISPATCHER_LABEL = "fleet-graph"
 
@@ -111,11 +130,29 @@ CONVERGE_CONTINUE = "continue"
 MAX_RETRIES = 2
 
 # run root 下的产物文件名。dd 形状（规格第 4 条）：events.jsonl + result.json 由
-# runner 侧写；这里的是节点侧产物。
+# runner 侧写；这里的是节点侧产物。R4 起报告正文由 debate_report 脚本节点从
+# judge/arbiter 产出组装（零 LLM），四角色产出逐字落 run_root/debate/ 下。
 EVIDENCE_FILE = "evidence.jsonl"
 REPORT_FILE = "report.md"
 SEED_FILE = "seed.json"
-SYNTHESIS_FILE = "synthesis.json"
+DEBATE_DIR = "debate"
+ADVOCATE_FILE = "advocate.md"
+OPPONENT_FILE = "opponent.md"
+JUDGE_FILE = "judge.md"
+ARBITER_FILE = "arbiter.json"
+
+# debate 角色 -> run_root/debate/ 下的产出文件名（spec 落地约定，供审计对账）。
+DEBATE_OUTPUT_FILES = {
+    "advocate": ADVOCATE_FILE,
+    "opponent": OPPONENT_FILE,
+    "judge": JUDGE_FILE,
+    "arbiter": ARBITER_FILE,
+}
+
+# judge 正文的机器可判段标记（R4 判据 ②）：judge 逐字保留 OPEN DISAGREEMENT，
+# 脚本节点据此原样搬进 report.md「开放分歧」列表，绝不调和 / 删除 / 改写为共识。
+OPEN_DISAGREEMENT_MARKER = "OPEN DISAGREEMENT:"
+RULE_MARKER = "RULE:"
 
 SEED_SYSTEM = (
     "You plan a deep-research investigation. Answer with a JSON array of clue "
@@ -132,6 +169,36 @@ SEED_PROMPT = (
 WORKER_PROMPT = (
     "研究问题：{question}\n\n调查线索：{clue}\n\n"
     "围绕该线索收集事实 findings，并给出可继续深挖的子线索 new_clues。"
+)
+
+# R4 对抗裁决：debater/arbiter 的 prompt 只投递题面与语料正文，出场契约由角色侧
+# protocol 钉死（不再随 prompt 复述 schema）。语料经 --prompt-file 投递，--input 只
+# 携带 manifest。
+# - debater 正文约定：advocate（正面论证）/ opponent（反驳证伪）每条实质性主张带
+#   [anchor: …]；judge 逐条分歧裁定必须按 RULE: / OPEN DISAGREEMENT: 两段行输出，
+#   让脚本节点能逐字提取进 report.md「分歧裁定」段（机器判据 ②）。
+DEBATER_PROMPT = "研究问题：{question}\n\n证据语料：\n{evidences}\n\n{instruction}"
+ADVOCATE_INSTRUCTION = (
+    "你是 advocate：基于证据对研究问题给出正面论证。每条实质性主张必须标注证据出处"
+    " [anchor: …]。正文仅以 markdown 输出。"
+)
+OPPONENT_INSTRUCTION = (
+    "你是 opponent：基于证据对研究问题给出反驳/证伪路径。每条实质性主张必须标注证据"
+    " 出处 [anchor: …]。正文仅以 markdown 输出。"
+)
+JUDGE_INSTRUCTION = (
+    "你是 judge：逐条裁定 advocate 与 opponent 之间的分歧。\n"
+    "advocate 论证：\n{advocate_body}\n\nopponent 论证：\n{opponent_body}\n\n"
+    "对每一条分歧：\n"
+    "1. 能被既有证据裁决的 → 输出一行「RULE: <分歧> 裁决：<结论> [anchor: <锚点>]」；\n"
+    "2. 不能裁决的 → 输出一行「OPEN DISAGREEMENT: <分歧原文>」逐字保留，不得调和、"
+    "不得改写为共识。\n正文仅以 markdown 输出。"
+)
+ARBITER_PROMPT = (
+    "研究问题：{question}\n\n板面统计：{board_stats}\n关键线索：{clue_titles}\n"
+    "近期主张：{recent_claims}\n已进行轮次：{recent_rounds}\n\n"
+    "对整板给一次裁决：verdict ∈ {{enough, continue}}，并给出 rationale。正文仅以"
+    " JSON 输出。"
 )
 
 
@@ -181,9 +248,13 @@ def worker_run_id(thread_id: str, clue_id: str, retry: int) -> str:
     return derive_run_id(thread_id, f"worker/{clue_id}", retry + 1)
 
 
-def synthesis_run_id(thread_id: str, attempt: int = 1) -> str:
-    """synthesis 的派生 run id：`derive_run_id(thread_id, "synthesis", attempt)`。"""
-    return derive_run_id(thread_id, "synthesis", attempt)
+def debate_run_id(thread_id: str, role: str, attempt: int = 1) -> str:
+    """debate 子图的派生 run id（规格落地约定）：`derive_run_id(thread_id, "debate/{role}", 1)`。
+
+    同 thread 同角色恒得同 id——kill-restart 后同 id 重派即 re-adopt（launcher 幂等），
+    绝不二次派发。``role`` 用角色简称（advocate/opponent/judge/arbiter）。
+    """
+    return derive_run_id(thread_id, f"debate/{role}", attempt)
 
 
 @dataclass(frozen=True)
@@ -275,9 +346,14 @@ class ResearchDeps:
     #: 生产装配 ResearchConfig.sources；测试注入自定义列表验证路由/回填。
     sources: list[str] = field(default_factory=lambda: list(DEFAULT_SOURCES))
     worker_role: str = WORKER_ROLE
-    synthesis_role: str = SYNTHESIS_ROLE
+    #: R4 对抗裁决四角色（逐字 = agent-runtime 已交付角色名，SSoT 在 roles 仓）。
+    advocate_role: str = ADVOCATE_ROLE
+    opponent_role: str = OPPONENT_ROLE
+    judge_role: str = JUDGE_ROLE
+    arbiter_role: str = ARBITER_ROLE
     worker_timeout_seconds: int = 900
-    synthesis_timeout_seconds: int = 900
+    debater_timeout_seconds: int = 900
+    arbiter_timeout_seconds: int = 900
     poll_interval: float = 2.0
     observe: Any = None
     clock: Any = None
@@ -369,8 +445,21 @@ def _worker_input_path(run_root: Path, clue_id: str, retry: int) -> Path:
     return run_root / "inputs" / f"worker-{clue_id}-r{retry}.json"
 
 
-def _synthesis_input_path(run_root: Path) -> Path:
-    return run_root / "inputs" / "synthesis.json"
+def _debate_input_path(run_root: Path, role: str) -> Path:
+    """debate 角色的 --input manifest 文件（deep-research.debater-input/v1 或
+    deep-research.arbiter-input/v1）。与 role 一一对应，落 inputs/ 独立文件。"""
+    return run_root / "inputs" / f"debate-{role}.json"
+
+
+def _debate_prompt_path(run_root: Path, role: str) -> Path:
+    """debate 角色的 --prompt-file 语料文件（正文：题面 + 证据 + 前序角色产出）。"""
+    return run_root / "inputs" / f"debate-{role}-prompt.md"
+
+
+def _debate_output_path(run_root: Path, role: str) -> Path:
+    """debate 角色产出落盘：debater body 逐字落 run_root/debate/<role>.md，
+    arbiter 落 run_root/debate/arbiter.json。"""
+    return run_root / DEBATE_DIR / DEBATE_OUTPUT_FILES[role]
 
 
 def _worker_spec(deps: ResearchDeps, *, clue_id: str, source: str, retry: int) -> AgentRunSpec:
@@ -406,7 +495,7 @@ def _append_evidence(run_root: Path, clue_id: str, depth: int, finding: Any, now
     """逐条 append 一条 evidence（规格第 7 条）：findings 只落盘，不进 state。
 
     finding 是契约里的结构化对象 {claim, source, quote, locator}，原样落盘
-    （不 str() 压平——synthesis 语料与人工复核都要 locator/quote 原文）。"""
+    （不 str() 压平——debate 语料与人工复核都要 locator/quote 原文）。"""
     entry = {"at": iso(now), "clue_id": clue_id, "depth": depth, "finding": finding}
     with (run_root / EVIDENCE_FILE).open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -498,7 +587,8 @@ def _publish_evidence(
 
 
 def _publish_doc(deps: ResearchDeps, *, body: str) -> str | None:
-    """发布 synthesis 报告到 ``research:{research_id}.docs``（research.doc.v2）。
+    """发布 debate_report 组装出的报告到 ``research:{research_id}.docs``
+    （research.doc.v2）。
 
     leaf 实体：``doc_kind=report``，``origin=research_id``，``digest`` = 正文内容
     寻址（全局去重键）。幂等 key 由 digest 派生。best-effort：失败只降级记录。
@@ -964,70 +1054,313 @@ def _converge_node(deps: ResearchDeps):
     return converge_node
 
 
-def _synthesis_node(deps: ResearchDeps):
-    def synthesis(state: ResearchState) -> ResearchState:
-        question = state.get("question") or deps.question
-        corpus = [question]
-        evidence_path = deps.run_root / EVIDENCE_FILE
-        if evidence_path.is_file():
-            corpus.append(evidence_path.read_text(encoding="utf-8"))
-        corpus_path = deps.run_root / "synthesis-prompt.md"
-        corpus_path.parent.mkdir(parents=True, exist_ok=True)
-        corpus_path.write_text("\n".join(corpus), encoding="utf-8")
-        # research-synth.input.v1：--input 只携带题面 manifest（question + done
-        # clue 清单）；语料本体照旧经 --prompt-file 投递。
-        write_json_durable(
-            _synthesis_input_path(deps.run_root),
+def _load_evidences(run_root: Path) -> list[dict[str, Any]]:
+    """读 evidence.jsonl 的 finding 形状（R4：复用既有协议，不新增中间协议）。
+
+    返回 debater-input.v1 的 evidences 形状 {anchor, quote, claim, clue_id?}：
+    anchor 复用 research_bus.finding_anchor（source@locator），quote/claim 原样，
+    clue_id 取 entry 的归属线索 id。
+    """
+    path = run_root / EVIDENCE_FILE
+    if not path.is_file():
+        return []
+    out: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        entry = json.loads(line)
+        finding = entry.get("finding") or {}
+        out.append(
             {
-                "question": question,
-                "clue_ids": [c["id"] for c in state.get("clues", []) if c["status"] == CLUE_DONE],
-            },
+                "anchor": finding_anchor(finding),
+                "quote": finding.get("quote", ""),
+                "claim": finding.get("claim", ""),
+                "clue_id": entry.get("clue_id"),
+            }
+        )
+    return out
+
+
+def _format_evidences(evidences: list[dict[str, Any]]) -> str:
+    """把 evidences 逐条转成 debater --prompt-file 语料的正文段落。"""
+    if not evidences:
+        return "（无证据）"
+    lines: list[str] = []
+    for i, ev in enumerate(evidences, 1):
+        lines.append(f"{i}. [anchor: {ev['anchor']}] {ev['claim']}")
+        if ev.get("quote"):
+            lines.append(f"   quote: {ev['quote']}")
+    return "\n".join(lines)
+
+
+def _debater_input(
+    question: str, evidences: list[dict[str, Any]], prior_arguments: list[str] | None = None
+) -> dict[str, Any]:
+    """deep-research.debater-input/v1 的 manifest。judge 才带 prior_arguments。"""
+    payload: dict[str, Any] = {"question": question, "evidences": evidences}
+    if prior_arguments is not None:
+        payload["prior_arguments"] = prior_arguments
+    return payload
+
+
+def _debater_node(deps: ResearchDeps, *, role: str, role_value: str):
+    """advocate/opponent/judge 三段 debater run 的公共节点工厂。
+
+    语料经 --prompt-file 投递、--input 只携带 manifest（deep-research.debater-input
+    /v1）；``write=False``、structured。产出 ``{body}`` 逐字落 run_root/debate/
+    <role>.md。run 失败 / 信封不可解析 / 无 body → ``TERMINAL_FAULT``（响亮，不
+    静默，沿用 synthesis 的失败语义）。
+    """
+
+    def node(state: ResearchState) -> ResearchState:
+        question = state.get("question") or deps.question
+        evidences = _load_evidences(deps.run_root)
+        prior_arguments: list[str] | None = None
+        if role == "judge":
+            prior_arguments = [
+                _read_debate_body(deps, "advocate"),
+                _read_debate_body(deps, "opponent"),
+            ]
+        input_payload = _debater_input(question, evidences, prior_arguments)
+
+        if role == "advocate":
+            instruction = ADVOCATE_INSTRUCTION
+        elif role == "opponent":
+            instruction = OPPONENT_INSTRUCTION
+        else:
+            instruction = JUDGE_INSTRUCTION.format(
+                advocate_body=prior_arguments[0], opponent_body=prior_arguments[1]
+            )
+        corpus = DEBATER_PROMPT.format(
+            question=question, evidences=_format_evidences(evidences), instruction=instruction
         )
 
-        run_id = synthesis_run_id(deps.thread_id)
+        write_json_durable(_debate_input_path(deps.run_root, role), input_payload)
+        prompt_path = _debate_prompt_path(deps.run_root, role)
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_path.write_text(corpus, encoding="utf-8")
+
+        run_id = debate_run_id(deps.thread_id, role)
         spec = AgentRunSpec(
             prompt="",
-            role=deps.synthesis_role,
-            input_path=str(_synthesis_input_path(deps.run_root)),
-            prompt_file=str(corpus_path),
+            role=role_value,
+            input_path=str(_debate_input_path(deps.run_root, role)),
+            prompt_file=str(prompt_path),
             structured=True,
             write=False,
-            timeout_seconds=deps.synthesis_timeout_seconds,
+            timeout_seconds=deps.debater_timeout_seconds,
             labels={"dispatcher": DISPATCHER_LABEL, "research": deps.research_id},
         )
         ticket = deps.launcher.launch(spec, run_id)
         status = deps.launcher.wait(
             ticket,
             poll_interval=deps.poll_interval,
-            deadline_seconds=deps.synthesis_timeout_seconds + 120,
+            deadline_seconds=deps.debater_timeout_seconds + 120,
         )
-        write_json_durable(deps.run_root / SYNTHESIS_FILE, status.result or {})
 
         if not (status.ok and status.result is not None):
             return {
                 "terminal": TERMINAL_FAULT,
-                "terminal_reason": f"synthesis run {run_id} 结束于 {status.state}",
+                "terminal_reason": f"debate/{role} run {run_id} 结束于 {status.state}",
             }
         try:
             declared = parse_envelope(status.result)
-            # 契约字段是 report_markdown（research-synth.result.v1），不是旧设想的 report。
-            report = declared.get("report_markdown") if isinstance(declared, dict) else None
+            body = declared.get("body") if isinstance(declared, dict) else None
         except Exception as exc:
-            return {"terminal": TERMINAL_FAULT, "terminal_reason": f"synthesis 信封不可解析：{exc}"}
-        if not isinstance(report, str) or not report:
             return {
                 "terminal": TERMINAL_FAULT,
-                "terminal_reason": "synthesis 未返回 report_markdown 正文",
+                "terminal_reason": f"debate/{role} 信封不可解析：{exc}",
+            }
+        if not isinstance(body, str) or not body:
+            return {
+                "terminal": TERMINAL_FAULT,
+                "terminal_reason": f"debate/{role} 未返回 body 正文",
             }
 
-        (deps.run_root / REPORT_FILE).write_text(report, encoding="utf-8")
-        # synthesis 报告 -> research.doc.v2（leaf，doc_kind=report，origin=research_id，
-        # digest = 正文内容寻址）。本地镜像照旧写 report.md。
-        _publish_doc(deps, body=report)
-        _observe(deps, {"event": "synthesis", "run_id": run_id})
+        # 产出逐字落盘（dr-doc.result.v1 的 body），供审计与 agent-run 记录对账。
+        _debate_output_path(deps.run_root, role).parent.mkdir(parents=True, exist_ok=True)
+        _debate_output_path(deps.run_root, role).write_text(body, encoding="utf-8")
+        _observe(deps, {"event": "debate", "role": role, "run_id": run_id})
         return {}
 
-    return synthesis
+    return node
+
+
+def _read_debate_body(deps: ResearchDeps, role: str) -> str:
+    """读前序 debater 已落盘的 body 原文（judge 的 prior_arguments 来源）。"""
+    return _debate_output_path(deps.run_root, role).read_text(encoding="utf-8")
+
+
+def _arbiter_node(deps: ResearchDeps):
+    def arbiter(state: ResearchState) -> ResearchState:
+        question = state.get("question") or deps.question
+        clues = state.get("clues", [])
+        statuses = [c.get("status") for c in clues]
+        done_clues = [c for c in clues if c["status"] == CLUE_DONE]
+        board_stats = {
+            "total": len(statuses),
+            "done": statuses.count(CLUE_DONE),
+            "blocked": statuses.count(CLUE_BLOCKED),
+            "open": statuses.count(CLUE_OPEN),
+        }
+        clue_titles = [_read_clue_query(deps.run_root, c["id"]) for c in done_clues]
+        recent_claims = [ev["claim"] for ev in _load_evidences(deps.run_root)]
+        recent_rounds = state.get("rounds", 0)
+        input_payload = {
+            "question": question,
+            "board_stats": board_stats,
+            "clue_titles": clue_titles,
+            "recent_claims": recent_claims,
+            "recent_rounds": recent_rounds,
+        }
+        corpus = ARBITER_PROMPT.format(
+            question=question,
+            board_stats=json.dumps(board_stats, ensure_ascii=False),
+            clue_titles=", ".join(clue_titles) or "（无）",
+            recent_claims=", ".join(recent_claims) or "（无）",
+            recent_rounds=recent_rounds,
+        )
+
+        write_json_durable(_debate_input_path(deps.run_root, "arbiter"), input_payload)
+        prompt_path = _debate_prompt_path(deps.run_root, "arbiter")
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_path.write_text(corpus, encoding="utf-8")
+
+        run_id = debate_run_id(deps.thread_id, "arbiter")
+        spec = AgentRunSpec(
+            prompt="",
+            role=deps.arbiter_role,
+            input_path=str(_debate_input_path(deps.run_root, "arbiter")),
+            prompt_file=str(prompt_path),
+            structured=True,
+            write=False,
+            timeout_seconds=deps.arbiter_timeout_seconds,
+            labels={"dispatcher": DISPATCHER_LABEL, "research": deps.research_id},
+        )
+        ticket = deps.launcher.launch(spec, run_id)
+        status = deps.launcher.wait(
+            ticket,
+            poll_interval=deps.poll_interval,
+            deadline_seconds=deps.arbiter_timeout_seconds + 120,
+        )
+
+        if not (status.ok and status.result is not None):
+            return {
+                "terminal": TERMINAL_FAULT,
+                "terminal_reason": f"debate/arbiter run {run_id} 结束于 {status.state}",
+            }
+        try:
+            declared = parse_envelope(status.result)
+            verdict = declared.get("verdict") if isinstance(declared, dict) else None
+            rationale = declared.get("rationale") if isinstance(declared, dict) else None
+        except Exception as exc:
+            return {
+                "terminal": TERMINAL_FAULT,
+                "terminal_reason": f"debate/arbiter 信封不可解析：{exc}",
+            }
+        if verdict not in {"enough", "continue"} or not isinstance(rationale, str):
+            return {
+                "terminal": TERMINAL_FAULT,
+                "terminal_reason": "debate/arbiter 未返回合法 {verdict, rationale}",
+            }
+
+        # arbiter 产出逐字落盘（dr-arbiter.result.v1）。verdict=continue 仅记录并
+        # 响亮落盘（进 report + events），不改动 converge 的路由语义（硬线）。
+        arbiter_path = _debate_output_path(deps.run_root, "arbiter")
+        arbiter_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_durable(arbiter_path, {"verdict": verdict, "rationale": rationale})
+        _observe(deps, {"event": "debate", "role": "arbiter", "run_id": run_id, "verdict": verdict})
+        return {}
+
+    return arbiter
+
+
+def _extract_judge_disagreements(body: str) -> tuple[list[str], list[str]]:
+    """从 judge 正文逐字拆出「已裁定分歧」行（RULE:）与「开放分歧」行
+    （OPEN DISAGREEMENT:）。
+
+    R4 判据 ② 依赖「逐字保留」：这些行按原文原样进入 report.md，不调和 / 不删 /
+    不改写为共识。只做行级拆分，不做语义推断（节点零 LLM）。
+    """
+    ruled: list[str] = []
+    open_items: list[str] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if OPEN_DISAGREEMENT_MARKER in stripped:
+            open_items.append(line)
+        elif stripped.startswith(RULE_MARKER):
+            ruled.append(line)
+    return ruled, open_items
+
+
+def _assemble_report(
+    question: str,
+    judge_body: str,
+    ruled: list[str],
+    open_items: list[str],
+    arbiter: dict[str, Any],
+) -> str:
+    """从 judge / arbiter 产出组装 report.md（零 LLM 脚本节点）。
+
+    「分歧裁定」段必须含三小节；judge 零条未决分歧时「开放分歧」段显式写
+    「本轮无未决分歧」——该段不得省略。
+    """
+    lines: list[str] = [f"# {question}", ""]
+    lines.append(judge_body if judge_body.strip() else "（judge 未产出正文）")
+    lines.extend(["", "## 分歧裁定", "", "### 已裁定分歧"])
+    if ruled:
+        lines.extend(ruled)
+    else:
+        lines.append("本轮无已裁定分歧")
+    lines.extend(["", "### 开放分歧"])
+    if open_items:
+        lines.extend(open_items)
+    else:
+        lines.append("本轮无未决分歧")
+    lines.extend(["", "### arbiter 裁决"])
+    lines.append(f"- verdict: {arbiter['verdict']}")
+    lines.append(f"- rationale: {arbiter['rationale']}")
+    return "\n".join(lines)
+
+
+def _debate_report_node(deps: ResearchDeps):
+    def debate_report(state: ResearchState) -> ResearchState:
+        """报告组装节点：零 LLM，纯落盘与发布（规格第 5 条 script 节点）。
+
+        report.md 由 judge 产出组装（附 arbiter 的裁决记录），并发布到
+        research.doc.v2（leaf，doc_kind=report，digest = 正文内容寻址）。
+        """
+        judge_path = _debate_output_path(deps.run_root, "judge")
+        arbiter_path = _debate_output_path(deps.run_root, "arbiter")
+        if not (judge_path.is_file() and arbiter_path.is_file()):
+            return {
+                "terminal": TERMINAL_FAULT,
+                "terminal_reason": "debate_report 缺 judge/arbiter 产出",
+            }
+        judge_body = judge_path.read_text(encoding="utf-8")
+        arbiter = json.loads(arbiter_path.read_text(encoding="utf-8"))
+        ruled, open_items = _extract_judge_disagreements(judge_body)
+        report = _assemble_report(
+            state.get("question") or deps.question,
+            judge_body,
+            ruled,
+            open_items,
+            arbiter,
+        )
+        (deps.run_root / REPORT_FILE).write_text(report, encoding="utf-8")
+        _publish_doc(deps, body=report)
+        # arbiter 的 verdict 响亮落 events（含 continue），供审计对账。
+        _observe(
+            deps,
+            {
+                "event": "debate_report",
+                "open_disagreements": len(open_items),
+                "verdict": arbiter.get("verdict"),
+            },
+        )
+        return {}
+
+    return debate_report
 
 
 def _finalise_node(deps: ResearchDeps):
@@ -1039,8 +1372,8 @@ def _finalise_node(deps: ResearchDeps):
                 "terminal_reason": "图到达 finalise 却没有 terminal",
             }
         if terminal != TERMINAL_FAULT and not (deps.run_root / REPORT_FILE).is_file():
-            # 非 fault 却无 report.md = synthesis 静默缺失，fault 而不是假装成功。
-            return {"terminal": TERMINAL_FAULT, "terminal_reason": "synthesis 未产出 report.md"}
+            # 非 fault 却无 report.md = debate_report 静默缺失，fault 而不是假装成功。
+            return {"terminal": TERMINAL_FAULT, "terminal_reason": "debate_report 未产出 report.md"}
         _observe(deps, {"event": "finalise", "terminal": terminal})
         return {}
 
@@ -1052,18 +1385,47 @@ def _after_seed(state: ResearchState) -> str:
 
 
 def _after_converge(state: ResearchState) -> str:
-    return "synthesis" if state.get("terminal") else "dispatch"
+    return "debate_advocate" if state.get("terminal") else "dispatch"
+
+
+def _after_debate_advocate(state: ResearchState) -> str:
+    return "finalise" if state.get("terminal") == TERMINAL_FAULT else "debate_opponent"
+
+
+def _after_debate_opponent(state: ResearchState) -> str:
+    return "finalise" if state.get("terminal") == TERMINAL_FAULT else "debate_judge"
+
+
+def _after_debate_judge(state: ResearchState) -> str:
+    return "finalise" if state.get("terminal") == TERMINAL_FAULT else "debate_arbiter"
+
+
+def _after_debate_arbiter(state: ResearchState) -> str:
+    return "finalise" if state.get("terminal") == TERMINAL_FAULT else "debate_report"
 
 
 def build_research_graph(deps: ResearchDeps) -> StateGraph:
-    """装配 research 图。节点全部闭包在 deps 上，便于测试注入 fake。"""
+    """装配 research 图。节点全部闭包在 deps 上，便于测试注入 fake。
+
+    R4：converge 判终后进入对抗裁决子图 `debate`（advocate → opponent → judge →
+    arbiter → debate_report），任意一段 run 失败即 fault，绝不再往下走。arbiter
+    的 verdict=continue 只记录落盘，不改动 converge 的路由语义。
+    """
     graph: StateGraph = StateGraph(ResearchState)
     graph.add_node("seed", _seed_node(deps))
     graph.add_node("dispatch", _dispatch_node(deps))
     graph.add_node("collect", _collect_node(deps))
     graph.add_node("harvest", _harvest_node(deps))
     graph.add_node("converge", _converge_node(deps))
-    graph.add_node("synthesis", _synthesis_node(deps))
+    graph.add_node(
+        "debate_advocate", _debater_node(deps, role="advocate", role_value=deps.advocate_role)
+    )
+    graph.add_node(
+        "debate_opponent", _debater_node(deps, role="opponent", role_value=deps.opponent_role)
+    )
+    graph.add_node("debate_judge", _debater_node(deps, role="judge", role_value=deps.judge_role))
+    graph.add_node("debate_arbiter", _arbiter_node(deps))
+    graph.add_node("debate_report", _debate_report_node(deps))
     graph.add_node("finalise", _finalise_node(deps))
 
     graph.add_edge(START, "seed")
@@ -1071,27 +1433,48 @@ def build_research_graph(deps: ResearchDeps) -> StateGraph:
     graph.add_conditional_edges("dispatch", _after_dispatch, {"collect", "converge"})
     graph.add_edge("collect", "harvest")
     graph.add_edge("harvest", "converge")
-    graph.add_conditional_edges("converge", _after_converge, {"dispatch", "synthesis"})
-    graph.add_edge("synthesis", "finalise")
+    graph.add_conditional_edges("converge", _after_converge, {"dispatch", "debate_advocate"})
+    graph.add_conditional_edges(
+        "debate_advocate", _after_debate_advocate, {"debate_opponent", "finalise"}
+    )
+    graph.add_conditional_edges(
+        "debate_opponent", _after_debate_opponent, {"debate_judge", "finalise"}
+    )
+    graph.add_conditional_edges("debate_judge", _after_debate_judge, {"debate_arbiter", "finalise"})
+    graph.add_conditional_edges(
+        "debate_arbiter", _after_debate_arbiter, {"debate_report", "finalise"}
+    )
+    graph.add_edge("debate_report", "finalise")
     graph.add_edge("finalise", END)
     return graph
 
 
 __all__ = [
+    "ADVOCATE_FILE",
+    "ADVOCATE_ROLE",
+    "ARBITER_FILE",
+    "ARBITER_ROLE",
     "CLUE_BLOCKED",
     "CLUE_DISPATCHED",
     "CLUE_DONE",
     "CLUE_OPEN",
     "CONVERGE_CONTINUE",
+    "DEBATE_DIR",
+    "DEBATE_ROLES",
     "DEFAULT_SOURCE",
     "DEFAULT_SOURCES",
     "DISPATCHER_LABEL",
     "EVIDENCE_FILE",
+    "JUDGE_FILE",
+    "JUDGE_ROLE",
     "MAX_RETRIES",
+    "OPEN_DISAGREEMENT_MARKER",
+    "OPPONENT_FILE",
+    "OPPONENT_ROLE",
     "REPORT_FILE",
+    "RULE_MARKER",
     "SEED_FILE",
     "SOURCE_ROLE",
-    "SYNTHESIS_FILE",
     "TERMINAL_CAPPED",
     "TERMINAL_CONVERGED",
     "TERMINAL_FAULT",
@@ -1100,12 +1483,14 @@ __all__ = [
     "ResearchBounds",
     "ResearchDeps",
     "ResearchState",
+    "_assemble_report",
+    "_extract_judge_disagreements",
     "build_research_graph",
     "converge",
+    "debate_run_id",
     "derive_clue_id",
     "derive_research_id",
     "derive_run_instance",
     "initial_state",
-    "synthesis_run_id",
     "worker_run_id",
 ]
