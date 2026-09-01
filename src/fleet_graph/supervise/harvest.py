@@ -106,7 +106,9 @@ class HarvestOps(Protocol):
     一件事并返回机械事实」，编排层据此记录 steps 与后置条件。
     """
 
-    def fetch_dd_ref(self, repo: Path, development_id: str) -> dict[str, Any]: ...
+    def fetch_dd_ref(
+        self, repo: Path, development_id: str, remote_url: str | None = None
+    ) -> dict[str, Any]: ...
     def resolve_canonical_repo(
         self,
         record_repo_path: str,
@@ -147,6 +149,7 @@ class HarvestState(TypedDict, total=False):
     stage: str
     repo_path: str
     record_worktree: str
+    remote_url: str
     default_branch: str
     deploy_command: list[str]
     allowlist_auth: dict[str, Any]
@@ -195,34 +198,35 @@ def _resolve_repo(
     dd_root: Path,
     ops: HarvestOps,
     allowlist_repo_paths: list[str],
-) -> tuple[Path | None, list[str]]:
+) -> tuple[Path | None, list[str], str]:
     """dd 准入 record -> canonical 目标仓，机械解析（与 supervisor 同款链）。
 
     读 record 的 `repo_path`（原始 worktree 路径）+ `remote_url`（纯 JSON 读，
     Guard D 安全），把 canonical 解析委托给 ops 读口 `resolve_canonical_repo`
-    （Guard D 豁免的机械层）。返回 `(canonical_path | None, gaps)`；解析不到
-    可命中 allowlist 的 canonical -> None + 机器可读留痕理由，交由 intake/gate
-    走既有 escalated/refused 路径，绝不 fallback 到 record 原始 worktree 路径
-    去授权或写。
+    （Guard D 豁免的机械层）。返回 `(canonical_path | None, gaps, remote_url)`；
+    解析不到可命中 allowlist 的 canonical -> None + 机器可读留痕理由，交由
+    intake/gate 走既有 escalated/refused 路径，绝不 fallback 到 record 原始
+    worktree 路径去授权或写。`remote_url` 在 `resolve_canonical_repo` 同一处
+    读出并原样透传（供 fetch 步取 dd ref，不引入第二解析）。
     """
     record_path = dd_root / development_id / RECORD_FILE
     try:
         record = json.loads(record_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        return None, [f"dd record 不可读（{record_path}）: {type(exc).__name__}: {exc}"[:300]]
+        return None, [f"dd record 不可读（{record_path}）: {type(exc).__name__}: {exc}"[:300]], ""
     if not isinstance(record, dict):
-        return None, [f"dd record 顶层不是 JSON 对象（{record_path}）"]
+        return None, [f"dd record 顶层不是 JSON 对象（{record_path}）"], ""
     repo_path = str(record.get("repo_path") or "")
     if not repo_path:
-        return None, [f"dd record 缺 repo_path 字段（{record_path}）"]
+        return None, [f"dd record 缺 repo_path 字段（{record_path}）"], ""
     remote_url = record.get("remote_url")
     if remote_url is not None and not isinstance(remote_url, str):
         remote_url = str(remote_url)
     canonical, reason = ops.resolve_canonical_repo(repo_path, remote_url, allowlist_repo_paths)
     if canonical is None:
         message = reason or (f"record repo_path 无法解析到任何白名单 canonical 仓（{record_path}）")
-        return None, [message]
-    return canonical, []
+        return None, [message], str(remote_url or "")
+    return canonical, [], str(remote_url or "")
 
 
 def _record_repo_path(development_id: str, dd_root: Path) -> str:
@@ -345,9 +349,10 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             gaps.append("E5 payload 缺 development_id 或 head_commit——事件不完整")
         repo = deps.repo
         record_worktree = ""
+        remote_url = ""
         if repo is None and development_id:
             allowlist_repo_paths = [entry.repo_path for entry in deps.allowlist.entries]
-            repo, resolve_gaps = _resolve_repo(
+            repo, resolve_gaps, remote_url = _resolve_repo(
                 development_id, deps.dd_root, deps.ops, allowlist_repo_paths
             )
             gaps.extend(resolve_gaps)
@@ -379,6 +384,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             stage=stage,
             repo_path=str(repo) if repo is not None else "",
             record_worktree=record_worktree,
+            remote_url=remote_url,
             **({} if occupied is None else dict(occupied)),
         )
         outcome = None
@@ -390,6 +396,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             "stage": stage,
             "repo_path": str(repo) if repo is not None else "",
             "record_worktree": record_worktree,
+            "remote_url": remote_url,
             "default_branch": deps.default_branch,
             "deploy_command": list(deps.deploy_command),
             "steps": steps,
@@ -428,7 +435,11 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             }
         repo = Path(state.get("repo_path") or "")
         try:
-            result = deps.ops.fetch_dd_ref(repo, state.get("development_id") or "")
+            result = deps.ops.fetch_dd_ref(
+                repo,
+                state.get("development_id") or "",
+                state.get("remote_url") or None,
+            )
         except Exception as exc:
             return {"steps": _record_step(state, "fetch_dd_ref", ok=False, detail=repr(exc)[:300])}
         step = {**result, "ok": bool(result.get("ok"))}
