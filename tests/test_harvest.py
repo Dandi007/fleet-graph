@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -2256,3 +2257,141 @@ class TestResolveVerifyArgv:
         receipt = json.loads(Path(result["receipt_path"]).read_text())
         rv = next(s for s in receipt["steps"] if s["step"] == "run_verify")
         assert rv["argv"] == ["custom", "verify-cmd"]
+
+
+class TestHarvestWorktreeReclaimGuard:
+    """交付 A/B/C/D：主 worktree 判别 + rmtree 护栏 + 真实状态 + 后置校验。
+
+    spec 交付 D：
+    1. 阴性（不可省）：主 worktree 检出 `harvest/<id>`（`.git` 为目录）->
+       回收/清理步 ok:false 且仓完好（生产 checkout 文件与 `.git` 一字未动、
+       `is-inside-work-tree=true`）。未修复时（无判别、rmtree 无护栏）主树被
+       清空 = 失败。
+    2. 反向不抖动：合法 linked worktree 持有 `harvest/<id>` -> 正常 remove+prune、
+       ok:true，主树不受影响。
+    3. 不恒返 ok:true：后置断言（`_assert_repo_valid`）识别被破坏的仓 -> 如实报
+       ok:false；非 git 目标（普通目录）绝不被 rmtree。
+    """
+
+    def test_remove_worktree_refuses_primary_checkout(self, tmp_path: Path) -> None:
+        """阴性：目标是主 checkout（`.git` 是目录）且持 `harvest/<id>` 分支 ->
+        ok:false + 机器可读 detail，生产 checkout 与 `.git` 一字未动。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        git(repo, "checkout", "-q", "-b", "harvest/dev-x")
+        sentinel = repo / "sentinel.bin"
+        sentinel.write_bytes(b"PRIMARY-INTACT\x00\x01")
+        head_before = head(repo)
+
+        ops = DefaultHarvestOps()
+        result = ops.remove_worktree(repo, repo)
+        assert result["ok"] is False, result
+        assert "primary checkout is not reclaimable" in result["detail"], result
+        # 仓完好：文件、`.git` 目录、HEAD、is-inside-work-tree 全部未动。
+        assert sentinel.read_bytes() == b"PRIMARY-INTACT\x00\x01"
+        assert (repo / ".git").is_dir()
+        assert head(repo) == head_before
+        assert git(repo, "rev-parse", "--is-inside-work-tree") == "true"
+
+    def test_worktree_cherry_pick_preclean_refuses_primary(self, tmp_path: Path) -> None:
+        """阴性：worktree_cherry_pick 前置清树把主 checkout 当 worktree_root ->
+        护栏拒绝（ok:false），主 checkout 一字未动、`.git` 未被 rmtree。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        git(repo, "checkout", "-q", "-b", "harvest/dev-x")
+        sentinel = repo / "sentinel.bin"
+        sentinel.write_bytes(b"PRIMARY-INTACT\x00\x01")
+        head_before = head(repo)
+
+        ops = DefaultHarvestOps()
+        result = ops.worktree_cherry_pick(repo, head_before, "main", repo)
+        assert result["ok"] is False, result
+        assert "primary checkout is not reclaimable" in result["detail"], result
+        assert sentinel.read_bytes() == b"PRIMARY-INTACT\x00\x01"
+        assert (repo / ".git").is_dir()
+        assert head(repo) == head_before
+
+    def test_build_harvest_tip_preclean_refuses_primary(self, tmp_path: Path) -> None:
+        """阴性：build_harvest_tip 前置清树同过护栏 -> ok:false，主 checkout 完好。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        git(repo, "checkout", "-q", "-b", "harvest/dev-x")
+        sentinel = repo / "sentinel.bin"
+        sentinel.write_bytes(b"PRIMARY-INTACT\x00\x01")
+        head_before = head(repo)
+
+        ops = DefaultHarvestOps()
+        result = ops.build_harvest_tip(repo, head_before, "main", repo)
+        assert result["ok"] is False, result
+        assert "primary checkout is not reclaimable" in result["detail"], result
+        assert sentinel.read_bytes() == b"PRIMARY-INTACT\x00\x01"
+        assert (repo / ".git").is_dir()
+        assert head(repo) == head_before
+
+    def test_linked_worktree_holding_harvest_branch_is_reclaimed(self, tmp_path: Path) -> None:
+        """反向不抖动：合法 linked worktree（`.git` 是 gitfile）持有 `harvest/<id>`
+        -> 正常 remove+prune、ok:true，主树不受影响。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        worktree = tmp_path / "linked-wt"
+        git(repo, "worktree", "add", "-b", "harvest/dev-x", str(worktree), "main")
+        main_head_before = head(repo)
+        assert (worktree / ".git").is_file(), "linked worktree 的 .git 必须是 gitfile"
+
+        ops = DefaultHarvestOps()
+        result = ops.remove_worktree(repo, worktree)
+        assert result["ok"] is True, result
+        assert not worktree.exists(), "linked worktree 应被正常回收"
+        assert head(repo) == main_head_before
+        assert (repo / ".git").is_dir()
+
+    def test_remove_worktree_refuses_non_git_target(self, tmp_path: Path) -> None:
+        """护栏：非 git 工作树目标（普通目录，非主树非 linked）-> 拒绝清理、ok:false，
+        目录不被 rmtree。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        plain = tmp_path / "plain-dir"
+        plain.mkdir()
+        ops = DefaultHarvestOps()
+        result = ops.remove_worktree(repo, plain)
+        assert result["ok"] is False, result
+        assert plain.is_dir(), "非 git 目标绝不能被 rmtree"
+
+    def test_remove_worktree_reports_false_when_repo_broken(self, tmp_path: Path) -> None:
+        """不恒返 ok:true：主仓 `.git` 被破坏（假绿场景）-> remove_worktree 如实
+        ok:false + detail，绝不报成功。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        worktree = tmp_path / "linked-wt"
+        git(repo, "worktree", "add", "--detach", str(worktree), "main")
+        # 模拟「被删主树的假绿」：主仓 .git 目录被破坏。
+        shutil.rmtree(repo / ".git")
+
+        ops = DefaultHarvestOps()
+        result = ops.remove_worktree(repo, worktree)
+        assert result["ok"] is False, result
+        assert result["detail"], result
+
+    def test_assert_repo_valid_detects_corruption(self, tmp_path: Path) -> None:
+        """交付 C：后置校验能识别被破坏的仓（.git 缺失 / 非 git / HEAD 不可解析）。"""
+        from fleet_graph.supervise.harvest_ops import _assert_repo_valid
+
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        assert _assert_repo_valid(repo) == (True, "")
+        shutil.rmtree(repo / ".git")
+        ok, detail = _assert_repo_valid(repo)
+        assert ok is False
+        assert detail
