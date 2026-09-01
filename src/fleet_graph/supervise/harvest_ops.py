@@ -380,6 +380,85 @@ class DefaultHarvestOps:
             }
         return {"merged": True, "pr_url": pr_url, "method": "gh-pr-squash-merge"}
 
+    def detect_divergence(self, repo: Path, default_branch: str) -> dict[str, Any]:
+        """本地 HEAD 与 origin/<default_branch> 是否分叉（纯读口，零写原语）。
+
+        H3 缺陷修复读口：`git pull --ff-only` 在「本地 HEAD 与 origin 1:1 分叉」
+        时报 `Diverging branches can't be fast-forwarded`。这里在 pull **之前**
+        机械读判：读本地 HEAD 与远端 tip，双向 `merge-base --is-ancestor`：
+
+        - local 是 origin_tip 的祖先（local 落后/相等）→ 未分叉，可 ff-only pull；
+        - origin_tip 是 local 的祖先（local 领先）→ 未分叉（pull 为空操作）；
+        - 双向都不是祖先 → 1:1 分叉。
+
+        任一侧读取失败 / 无 origin remote → 保守按「无法判定」返回
+        `diverged=True` + detail（不留分叉漏检，编排层据此 escalate，绝不带病
+        继续 pull/deploy）。
+
+        返回机器可读 `{"diverged": bool, "local_head": str|None, "origin_head":
+        str|None, "detail": str}`。**本方法只读，不含任何 reset / checkout -f /
+        强制覆盖**——分叉只 escalate，清理残骸由人做（spec 铁律）。
+        """
+        local_proc = run_git(repo, "rev-parse", "HEAD")
+        if local_proc.returncode != 0:
+            return {
+                "diverged": True,
+                "local_head": None,
+                "origin_head": None,
+                "detail": "读取本地 HEAD 失败: "
+                + (local_proc.stderr or local_proc.stdout).strip()[:400],
+            }
+        local_head = local_proc.stdout.strip()
+        origin_ref = f"origin/{default_branch}"
+        origin_proc = run_git(repo, "rev-parse", origin_ref)
+        if origin_proc.returncode != 0:
+            return {
+                "diverged": True,
+                "local_head": local_head,
+                "origin_head": None,
+                "detail": f"读取 {origin_ref} 失败（可能无 origin）: "
+                + (origin_proc.stderr or origin_proc.stdout).strip()[:400],
+            }
+        origin_head = origin_proc.stdout.strip()
+        local_is_ancestor = run_git(repo, "merge-base", "--is-ancestor", local_head, origin_head)
+        if local_is_ancestor.returncode == 0:
+            return {
+                "diverged": False,
+                "local_head": local_head,
+                "origin_head": origin_head,
+                "detail": "local 是 origin 祖先（未分叉，可 ff-only pull）",
+            }
+        if local_is_ancestor.returncode not in (0, 1):
+            return {
+                "diverged": True,
+                "local_head": local_head,
+                "origin_head": origin_head,
+                "detail": "merge-base 判定 local→origin 失败: "
+                + (local_is_ancestor.stderr or local_is_ancestor.stdout).strip()[:400],
+            }
+        origin_is_ancestor = run_git(repo, "merge-base", "--is-ancestor", origin_head, local_head)
+        if origin_is_ancestor.returncode == 0:
+            return {
+                "diverged": False,
+                "local_head": local_head,
+                "origin_head": origin_head,
+                "detail": "origin 是 local 祖先（未分叉，本地领先）",
+            }
+        if origin_is_ancestor.returncode not in (0, 1):
+            return {
+                "diverged": True,
+                "local_head": local_head,
+                "origin_head": origin_head,
+                "detail": "merge-base 判定 origin→local 失败: "
+                + (origin_is_ancestor.stderr or origin_is_ancestor.stdout).strip()[:400],
+            }
+        return {
+            "diverged": True,
+            "local_head": local_head,
+            "origin_head": origin_head,
+            "detail": "local 与 origin 双向非祖先 → 1:1 分叉，不能 ff-only pull",
+        }
+
     def ff_only_pull(self, repo: Path, default_branch: str) -> dict[str, Any]:
         """ff-only pull 默认分支；成功时额外返回 pull 后的 HEAD（字段名 `head`）。
 
