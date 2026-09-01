@@ -56,6 +56,7 @@ def fake_ops(
     divergence: dict[str, Any] | None = None,
     harvest_tip: str = "b" * 40,
     inflight_binding: dict[str, Any] | None = None,
+    resolve_verify_argv: tuple[list[str] | None, str] | None = None,
 ) -> dict[str, Any]:
     """A recording fake ops: every write/execute is recorded, results scripted.
 
@@ -64,6 +65,9 @@ def fake_ops(
     is None`（返回 EXIT_HEAD_MISMATCH），与 DefaultHarvestOps 行为一致。
     `inflight_binding` 非 None 时 `detect_inflight_binding` 返回该绑定事实
     （脚本化，用于 H8 occupancy 用例）；None 时返回「无在飞绑定」（零回归）。
+    `resolve_verify_argv` 脚本化按目标仓解析结果（交付 A）：None 时默认返回
+    `(["make","verify"], "")`（模拟 Makefile 含 verify 目标）；显式传
+    `(None, "no resolvable verify command")` 等可脚本化解析失败路径。
     """
     calls: list[str] = []
     deploy_repos: list[Path] = []
@@ -141,6 +145,12 @@ def fake_ops(
         def run_verify(self, worktree: Path, argv: list[str]) -> int:
             calls.append("run_verify")
             return verify_exit
+
+        def resolve_verify_argv(self, worktree: Path) -> tuple[list[str] | None, str]:
+            # 机械读口：不入 calls（calls 只记录写/执行动作）。
+            if resolve_verify_argv is not None:
+                return resolve_verify_argv[0], resolve_verify_argv[1]
+            return ["make", "verify"], ""
 
         def board_card_entity_id(self, development_id: str, dd_root: Path) -> str | None:
             calls.append("board_card_entity_id")
@@ -2121,3 +2131,128 @@ class TestHarvestTreeOccupancy:
         )
         assert binding["in_flight"] is False, binding
         assert binding["bound_development_id"] is None, binding
+
+
+class TestResolveVerifyArgv:
+    """交付 A/B：verify argv 按目标仓解析（机械口 + 编排层），不再全局硬编码 make verify。
+
+    - 阴性（可红）：合成目标仓无 Makefile（仅任意文件）-> `DefaultHarvestOps
+      .resolve_verify_argv` 返回 `(None, "no resolvable verify command")`；未修复
+      时恒 `argv==["make","verify"] exit 127`，修复后编排层 escalated 且 detail=
+      `no resolvable verify command`，绝不硬跑 make verify 制造误导性 127。
+    - 反向不抖动：合成目标仓含 Makefile + verify 目标 -> 仍 `["make","verify"]`
+      且 `make verify` exit 0（行为不变）。
+    - repo-canonical：无 Makefile 但 pyproject.toml / uv.lock -> uv run pytest -q。
+    """
+
+    def test_no_makefile_only_arbitrary_file_resolves_none(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        (worktree / "arbitrary.txt").write_text("x\n", encoding="utf-8")
+        argv, detail = DefaultHarvestOps().resolve_verify_argv(worktree)
+        assert argv is None
+        assert detail == "no resolvable verify command"
+
+    def test_makefile_with_verify_target_resolves_make(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        (worktree / "Makefile").write_text("verify:\n\t@true\n", encoding="utf-8")
+        argv, detail = DefaultHarvestOps().resolve_verify_argv(worktree)
+        assert argv == ["make", "verify"]
+        assert detail == ""
+
+    def test_makefile_without_verify_but_pyproject_resolves_uv(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        (worktree / "Makefile").write_text("test:\n\t@true\n", encoding="utf-8")
+        (worktree / "pyproject.toml").write_text("", encoding="utf-8")
+        argv, detail = DefaultHarvestOps().resolve_verify_argv(worktree)
+        assert argv == ["uv", "run", "pytest", "-q"]
+        assert detail == ""
+
+    def test_pyproject_only_resolves_uv(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        (worktree / "pyproject.toml").write_text("", encoding="utf-8")
+        argv, _ = DefaultHarvestOps().resolve_verify_argv(worktree)
+        assert argv == ["uv", "run", "pytest", "-q"]
+
+    def test_uv_lock_only_resolves_uv(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        (worktree / "uv.lock").write_text("", encoding="utf-8")
+        argv, _ = DefaultHarvestOps().resolve_verify_argv(worktree)
+        assert argv == ["uv", "run", "pytest", "-q"]
+
+    def test_makefile_verify_target_runs_and_exits_zero(self, tmp_path: Path) -> None:
+        """反向不抖动：Makefile 含 verify 目标 -> 仍 make verify 且 exit 0（真跑）。"""
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        (worktree / "Makefile").write_text("verify:\n\t@true\n", encoding="utf-8")
+        argv, _ = DefaultHarvestOps().resolve_verify_argv(worktree)
+        assert argv == ["make", "verify"]
+        exit_code = DefaultHarvestOps().run_verify(worktree, argv)
+        assert exit_code == 0
+
+    def test_unresolvable_verify_escalates_with_detail_and_no_run(self, tmp_path: Path) -> None:
+        """阴性（编排层）：解析不到 -> run_verify step ok:false + detail，绝无 make 硬跑。"""
+        fake = fake_ops(resolve_verify_argv=(None, "no resolvable verify command"))
+        config, _ = config_for(tmp_path, ops=fake)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        rv = next(s for s in result["steps"] if s["step"] == "run_verify")
+        assert rv["ok"] is False
+        assert rv["detail"] == "no resolvable verify command"
+        assert rv["argv"] is None
+        # 绝不硬跑 make verify：run_verify 从未被调用。
+        assert "run_verify" not in fake["calls"], fake["calls"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+
+    def test_makefile_repo_still_runs_make_verify_and_harvests(self, tmp_path: Path) -> None:
+        """反向不抖动（编排层）：Makefile 仓 -> argv 仍 make verify 且 exit 0 -> harvested。"""
+        fake = fake_ops(resolve_verify_argv=(["make", "verify"], ""))
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        rv = next(s for s in receipt["steps"] if s["step"] == "run_verify")
+        assert rv["argv"] == ["make", "verify"]
+        assert rv["exit_code"] == 0
+
+    def test_real_no_makefile_repo_escalates_no_resolvable(self, tmp_path: Path) -> None:
+        """真实 git：无 Makefile 目标仓 -> verify step escalated + detail，HEAD 不变。"""
+        repo, product = _real_repo_with_origin(tmp_path)
+        before = head(repo)
+        config = HarvestRunConfig(
+            event=approved_unharvested_event(
+                development_id="dev-x", head_commit=product, stage="implement"
+            ).as_dict(),
+            state_root=tmp_path / "supervisor",
+            run_root=tmp_path / "runs",
+            dd_root=dd_record_root(tmp_path, str(repo)),
+            deploy_command=[],
+            allowlist=full_allowlist(str(repo)),
+            ops=DefaultHarvestOps(),
+            publish_notes=False,
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        rv = next(s for s in result["steps"] if s["step"] == "run_verify")
+        assert rv["ok"] is False
+        assert rv["detail"] == "no resolvable verify command"
+        assert rv["argv"] is None
+        assert head(repo) == before, "escalated 后默认分支 HEAD 必须逐字节不变"
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+
+    def test_explicit_verify_argv_override_still_wins(self, tmp_path: Path) -> None:
+        """显式配置（非历史默认）仍是覆盖：resolve 被跳过，直接用配置 argv。"""
+        fake = fake_ops(resolve_verify_argv=(["uv", "run", "pytest", "-q"], ""))
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        config.verify_argv = ["custom", "verify-cmd"]
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        rv = next(s for s in receipt["steps"] if s["step"] == "run_verify")
+        assert rv["argv"] == ["custom", "verify-cmd"]
