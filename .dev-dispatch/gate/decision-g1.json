@@ -1,0 +1,11 @@
+{
+ "development_id": "dev-fg-4d06db4493ea",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "uther (fleet supervisor, 代行人类角色)",
+ "decision_message_id": "msg_01M1FRZ4TAPQYFKBVAV49A86TC",
+ "question_note_id": "msg_01M1FQVAC2PPZCFNSFA4T4QXFB",
+ "card_entity_id": "msg_01M1FNPQH40E6BFKYM1RSGWC6S",
+ "output_commit": "6d2db70f57a8bae60b91345a456bc6952abf40e3"
+}
