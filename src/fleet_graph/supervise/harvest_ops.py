@@ -264,11 +264,48 @@ class DefaultHarvestOps:
         """
         return _resolve_canonical_repo(record_repo_path, record_remote_url, allowlist_repo_paths)
 
-    def fetch_dd_ref(self, repo: Path, development_id: str) -> dict[str, Any]:
+    def fetch_dd_ref(
+        self,
+        repo: Path,
+        development_id: str,
+        remote_url: str | None = None,
+    ) -> dict[str, Any]:
+        """从 record.remote_url 取 dd ref，不硬编码 origin。
+
+        真机根因（e5-dev-fg-2e44f0e61516）：dd 引擎 merger 把 dd ref 推到 record
+        的 `remote_url`。URL remote 时推到 GitHub（`origin` 恰好同源可用）；本地
+        路径 remote_url 时推到本地仓（`refs/heads/dd/<id>` 已在本地 refs 里），而
+        `origin` 指向 GitHub——两者不同源 → `couldn't find remote ref`。
+
+        取 ref 目标恒为 `remote_url`（绝不 fallback 到 `origin` 猜源）：
+        - URL → `git fetch <remote_url> <dd_ref>`；
+        - 本地路径 → `git fetch <本地路径> <dd_ref>`，或直接解析本地
+          `refs/heads/dd/<id>`。
+        两者都解析不到才 ok:false + 机器可读 detail。URL remote 行为不变（此时
+        remote_url==origin 等价）。
+        """
         ref = _dd_ref(development_id)
-        proc = run_git(repo, "fetch", "origin", ref)
+        if not remote_url:
+            return {
+                "ok": False,
+                "detail": "缺 record.remote_url——无法确定 dd ref 来源（绝不 fallback origin 猜源）",
+            }
+        proc = run_git(repo, "fetch", remote_url, ref)
         if proc.returncode != 0:
-            return {"ok": False, "detail": (proc.stderr or proc.stdout).strip()[:400]}
+            # 本地路径 remote_url：dd ref 可能已在该本地仓 `refs/heads/dd/<id>`，
+            # 直接解析本地 ref 兜底（git fetch <本地路径> 也可，这里双保险）。
+            if Path(remote_url).is_dir():
+                local = run_git(Path(remote_url), "rev-parse", "--verify", "--quiet", ref)
+                if local.returncode == 0:
+                    return {
+                        "ok": True,
+                        "ref": ref,
+                        "detail": "本地 refs/heads/dd/<id> 解析命中",
+                    }
+            return {
+                "ok": False,
+                "detail": (proc.stderr or proc.stdout).strip()[:400],
+            }
         return {"ok": True, "ref": ref}
 
     def cherry_equivalent(self, repo: Path, head_commit: str, default_branch: str) -> bool:
@@ -328,7 +365,7 @@ class DefaultHarvestOps:
                 "ok": False,
                 "detail": (added.stderr or added.stdout).strip()[:400],
             }
-        picked = run_git(worktree_root, "cherry-pick", head_commit)
+        picked = run_git(worktree_root, "cherry-pick", head_commit, env=_commit_env())
         if picked.returncode == 0:
             washed = _strip_dd_subtrees(worktree_root)
             if not washed.get("ok"):
@@ -368,7 +405,9 @@ class DefaultHarvestOps:
                         + (reset_merged.stderr or reset_merged.stdout).strip()[:200]
                     ),
                 }
-        retried = run_git(worktree_root, "cherry-pick", "-X", "theirs", head_commit)
+        retried = run_git(
+            worktree_root, "cherry-pick", "-X", "theirs", head_commit, env=_commit_env()
+        )
         if retried.returncode == 0:
             washed = _strip_dd_subtrees(worktree_root)
             if not washed.get("ok"):
@@ -413,7 +452,7 @@ class DefaultHarvestOps:
                 "ok": False,
                 "detail": (added.stderr or added.stdout).strip()[:400],
             }
-        picked = run_git(worktree_root, "cherry-pick", head_commit)
+        picked = run_git(worktree_root, "cherry-pick", head_commit, env=_commit_env())
         if picked.returncode != 0:
             self.remove_worktree(repo, worktree_root)
             return {
