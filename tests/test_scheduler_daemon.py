@@ -230,7 +230,18 @@ class TestItReadsOnlyWhatItNeeds:
 
         source = Path(daemon.__file__).read_text(encoding="utf-8")
         reads = set(re.findall(r'record\.get\("([a-z_]+)"\)', source))
-        allowed = {"terminal", "rounds", "run_id", "waiting_on", "at", "pump_fault"}
+        allowed = {
+            "terminal",
+            "rounds",
+            "run_id",
+            "waiting_on",
+            "at",
+            "pump_fault",
+            # G1: the goal.md content_revision the line consumed at its last
+            # coordinator round -- the parking baseline. Also finalise's own
+            # mechanical hash, never prose.
+            "goal_revision",
+        }
         assert reads - {"reason"} <= allowed, reads
 
         display_only = inspect.getsource(daemon.Scheduler.blocker_summary)

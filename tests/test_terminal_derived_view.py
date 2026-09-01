@@ -277,6 +277,7 @@ class TestReader:
                 "run_id": "run-x",
                 "waiting_on": "decision",
                 "pump_fault": True,
+                "goal_revision": "sha256:rev-1",
             },
             created_at="2026-08-28T10:00:00.123456+00:00",
         )
@@ -287,6 +288,7 @@ class TestReader:
             "waiting_on": "decision",
             "at": "2026-08-28T10:00:00Z",
             "pump_fault": True,
+            "goal_revision": "sha256:rev-1",
         }
 
     def test_to_record_with_no_terminal_is_none(self) -> None:

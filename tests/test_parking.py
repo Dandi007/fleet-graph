@@ -185,6 +185,7 @@ def write_blocked(
     run_id: str = "run-b1",
     at: str = BLOCKED_AT,
     reason: str = "等监督面拍板（L2-5）",
+    goal_revision: str | None = "sha256:rev-1",
 ) -> None:
     record: dict[str, Any] = {
         "terminal": "blocked",
@@ -195,6 +196,12 @@ def write_blocked(
     }
     if waiting_on is not None:
         record["waiting_on"] = waiting_on
+    # G1: the parking baseline is the goal revision the line actually consumed,
+    # written into its own terminal record -- not the live value at registration
+    # time. The default matches FakeWake's live revision so an unedited goal
+    # holds the line parked.
+    if goal_revision is not None:
+        record["goal_revision"] = goal_revision
     path = tmp_path / "runs" / "wf-1" / "terminal.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record), encoding="utf-8")
@@ -207,6 +214,7 @@ def blocked_line(
     wake: Any = None,
     board: Any = None,
     alias: str | None = "canary",
+    goal_revision: str | None = "sha256:rev-1",
 ) -> tuple[Scheduler, Clock, FakeLauncher]:
     """A line the scheduler launched once, which then blocked.
 
@@ -214,11 +222,15 @@ def blocked_line(
     witnessed the launch), which is what makes it park-eligible. The clock ends
     up an hour past the block -- far beyond the streak-1 backoff -- so any
     refusal from here on is parking, not cooldown.
+
+    ``goal_revision`` is the goal revision the line's own terminal record says
+    it consumed (G1). It defaults to FakeWake's live revision so an unedited
+    goal holds the line parked.
     """
     scheduler, clock, launcher = make(tmp_path, wake=wake, board=board, alias=alias)
     assert scheduler.tick()[0].decision.ignite  # the priming launch
     launcher.launched.clear()
-    write_blocked(tmp_path, waiting_on=waiting_on)
+    write_blocked(tmp_path, waiting_on=waiting_on, goal_revision=goal_revision)
     clock.now = TICK_EPOCH
     return scheduler, clock, launcher
 
@@ -422,6 +434,80 @@ class TestFailOpen:
         result = scheduler.tick()[0]
         assert result.decision.refusal is Refusal.PARKED_AWAITING_DECISION
         assert result.park_event == "established:inbox_unavailable:ValueError"
+
+
+class TestG1ConsumedRevisionBaseline:
+    """G1: the parking baseline is the goal.md revision the line *consumed*
+    (its own terminal record's ``goal_revision``), never the live value at
+    registration time. A goal edit inside the race window -- after the line last
+    read goal.md, before the scheduler registers the park -- must wake the line,
+    never be absorbed into the baseline.
+
+    The negative case is the spec's acceptance: line consumed rev=R0 (terminal
+    goal_revision=R0, written earlier), goal.md later written to R1, and the
+    scheduler only ``_establish_park``s after R1 exists. The next tick must be
+    ``woken:goal_revision`` (current R1 != baseline R0). Unfixed -- baseline
+    snapped to the live R1 -- the line parks forever and this turns red.
+    """
+
+    def test_a_goal_edit_before_parking_wakes_the_line(self, tmp_path: Path) -> None:
+        # The line consumed rev-0; goal.md is already rev-1 by the time the
+        # scheduler establishes the park (write happened inside the window).
+        scheduler, clock, _ = blocked_line(
+            tmp_path, wake=FakeWake(revision="sha256:rev-1"), goal_revision="sha256:rev-0"
+        )
+
+        # Establish happens now, after the goal write: the baseline must be the
+        # consumed rev-0, not the live rev-1.
+        result = scheduler.tick()[0]
+        assert result.park_event == "established"
+        state = json.loads(stall_file(tmp_path).read_text(encoding="utf-8"))
+        assert state["parked_goal_revision"] == "sha256:rev-0"
+
+        clock.now += 60.0
+        result = scheduler.tick()[0]
+        assert result.park_event == "woken:goal_revision"
+        assert result.decision.ignite
+
+    def test_the_baseline_never_takes_the_registration_moment_value(self, tmp_path: Path) -> None:
+        """The rollback contrast, pinned: an establish that snapshotted the
+        live revision (the pre-G1 behaviour) would record rev-1 here and the
+        line would never wake. The snapshot must hold the consumed rev-0."""
+        scheduler, _, _ = blocked_line(
+            tmp_path, wake=FakeWake(revision="sha256:rev-1"), goal_revision="sha256:rev-0"
+        )
+        scheduler.tick()
+        state = json.loads(stall_file(tmp_path).read_text(encoding="utf-8"))
+        assert state["parked_goal_revision"] == "sha256:rev-0"
+        assert state["parked_goal_revision"] != "sha256:rev-1"
+
+    def test_no_repeat_wake_on_the_revision_already_consumed(self, tmp_path: Path) -> None:
+        """Reverse, no jitter: the line woke, actually consumed R1, and blocked
+        again with terminal goal_revision=R1. current==R1==baseline, so parking
+        holds and nothing re-wakes."""
+        scheduler, clock, _ = blocked_line(
+            tmp_path, wake=FakeWake(revision="sha256:rev-1"), goal_revision="sha256:rev-1"
+        )
+        assert scheduler.tick()[0].park_event == "established"
+
+        for _ in range(3):
+            clock.now += 60.0
+            result = scheduler.tick()[0]
+            assert result.park_event is None
+            assert result.decision.refusal is Refusal.PARKED_AWAITING_DECISION
+
+    def test_a_terminal_without_a_consumed_revision_fails_open(self, tmp_path: Path) -> None:
+        """Old/anomalous terminal (no goal_revision): no reliable baseline, so
+        never park -- plain backoff keeps the line moving and the event names
+        the reason."""
+        scheduler, _, launcher = blocked_line(
+            tmp_path, wake=FakeWake(revision="sha256:rev-1"), goal_revision=None
+        )
+        result = scheduler.tick()[0]
+        assert result.parked is False
+        assert result.park_event == "not_parked:no_consumed_revision"
+        assert result.decision.ignite
+        assert len(launcher.launched) == 1
 
 
 class TestEscapeHatch:

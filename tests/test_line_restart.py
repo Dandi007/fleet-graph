@@ -183,6 +183,7 @@ class RecordingArtifacts:
         pump_fault: bool = False,
         waiting_on: str = "none",
         waiting_on_declared: str | None = None,
+        goal_revision: str | None = None,
     ) -> str:
         self.terminal = {"terminal": terminal, "rounds": rounds}
         return "terminal.json"
