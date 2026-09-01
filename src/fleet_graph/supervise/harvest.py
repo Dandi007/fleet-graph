@@ -555,7 +555,10 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         """后置条件代码核验（交付 B.3）：不采信子图自述，只看机械事实。
 
         PR merged（且 PR 链接非空）+ verify 命令零退出 + evidence note 存在，
-        三缺任一 -> escalated。
+        三缺任一 -> escalated。此外扫描 `state["steps"]`：任一 step 的 `ok` 为
+        假（机械事实，非自述）也计缺失 -> escalated——「收割链里非零退出必须
+        停下来交人工」落进代码，任何中途 step 的 ok:false 都不再被静默吞掉
+        （H2 终局语义缺口修复）。
         """
         missing: list[str] = []
         if not state.get("pr_merged"):
@@ -566,6 +569,15 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             missing.append(f"verify 命令退出码 {state.get('verify_exit_code')!r} != 0")
         if not state.get("evidence_note_id"):
             missing.append("evidence note 不存在（未挂卡）")
+        for step in state.get("steps") or []:
+            if step.get("ok") is False:
+                name = str(step.get("step") or "?")
+                facts: list[str] = []
+                if step.get("detail") is not None:
+                    facts.append(f"detail={step['detail']!r}")
+                if step.get("exit_code") is not None:
+                    facts.append(f"exit_code={step['exit_code']!r}")
+                missing.append(f"step {name} ok:false（{' '.join(facts)}）")
         steps = _record_step(state, "postconditions", ok=not missing, missing=missing)
         outcome = OUTCOME_HARVESTED if not missing else OUTCOME_ESCALATED
         return {"steps": steps, "outcome": outcome}
