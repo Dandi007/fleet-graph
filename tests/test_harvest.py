@@ -55,17 +55,21 @@ def fake_ops(
     resolve_canonical: Path | None = None,
     divergence: dict[str, Any] | None = None,
     harvest_tip: str = "b" * 40,
+    inflight_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A recording fake ops: every write/execute is recorded, results scripted.
 
     `pull_head` 模拟 `ff_only_pull` 成功后返回的已合并 commit（`head` 字段）；
     `pull_ok=False` 时 head 为 None。`verify_real` 按机械契约拒绝 `expected_head
     is None`（返回 EXIT_HEAD_MISMATCH），与 DefaultHarvestOps 行为一致。
+    `inflight_binding` 非 None 时 `detect_inflight_binding` 返回该绑定事实
+    （脚本化，用于 H8 occupancy 用例）；None 时返回「无在飞绑定」（零回归）。
     """
     calls: list[str] = []
     deploy_repos: list[Path] = []
     verify_real_repos: list[Path] = []
     verify_real_heads: list[str | None] = []
+    binding_probes: list[dict[str, Any]] = []
     if divergence is None:
         divergence = {
             "diverged": False,
@@ -90,6 +94,13 @@ def fake_ops(
             if resolve_canonical is not None:
                 return resolve_canonical, ""
             return Path(record_repo_path), ""
+
+        def detect_inflight_binding(self, tree_path: Path, dd_root: Path) -> dict[str, Any]:
+            # 纯读口：不构成写原语，不入 calls；调用面单独记录（H8 只读判据）。
+            binding_probes.append({"tree_path": str(tree_path), "dd_root": str(dd_root)})
+            if inflight_binding is not None:
+                return dict(inflight_binding)
+            return {"bound_development_id": None, "in_flight": False, "detail": ""}
 
         def cherry_equivalent(self, repo: Path, head_commit: str, default_branch: str) -> bool:
             calls.append("cherry_equivalent")
@@ -166,6 +177,7 @@ def fake_ops(
         "verify_real_repos": verify_real_repos,
         "verify_real_heads": verify_real_heads,
         "pr_merge_args": pr_merge_args,
+        "binding_probes": binding_probes,
     }
 
 
@@ -1564,3 +1576,240 @@ def _add_origin_with_dd_ref(repo: Path, origin: Path, dd_target: str) -> None:
     git(repo, "clone", "--bare", "-q", ".", str(origin))
     git(repo, "remote", "add", "origin", str(origin))
     git(origin, "update-ref", "refs/heads/dd/dev-x", dd_target)
+
+
+#: H8 阴性 fixture 的哨兵文件字节串（内容已知，逐字节比对动树前后）。
+H8_SENTINEL_BYTES = b"H8-OCCUPANCY-SENTINEL\x00\x01\x02\n"
+
+
+def _h8_target_fixture(
+    tmp_path: Path, *, other_terminal: str = "", subject_terminal: str = "complete"
+) -> tuple[Path, Path, bytes, Path]:
+    """真实 git 合成仓：canonical + 目标工作树 `<target>`（linked worktree）。
+
+    在 `<target>` 里放一个未提交的哨兵文件（已知字节串），构造 `dd_root`：
+    `dev-fg-OTHER/record.json`（repo_path=<target>）+ status.json（terminal 可配，
+    默认在飞）+ harness 自己的 `dev-fg-SUBJECT/record.json`（repo_path=<target>，
+    本次 E5 要收割的单）。全部本地合成，禁触真网/生产 checkout。
+    """
+    canonical = tmp_path / "canon"
+    _init_git_repo(canonical)
+    target = tmp_path / "target"
+    git(canonical, "worktree", "add", "--detach", str(target), "main")
+    (target / "sentinel.bin").write_bytes(H8_SENTINEL_BYTES)
+
+    dd_root = tmp_path / "dd"
+    for dev, terminal in (("dev-fg-OTHER", other_terminal), ("dev-fg-SUBJECT", subject_terminal)):
+        dev_dir = dd_root / dev
+        dev_dir.mkdir(parents=True)
+        (dev_dir / "record.json").write_text(
+            json.dumps(
+                {
+                    "development_id": dev,
+                    "repo_path": str(target),
+                    "remote_url": "https://example.invalid/x.git",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (dev_dir / "status.json").write_text(
+            json.dumps(
+                {"development_id": dev, "state": terminal or "running", "terminal": terminal}
+            ),
+            encoding="utf-8",
+        )
+    return canonical, target, H8_SENTINEL_BYTES, dd_root
+
+
+def _h8_config(
+    tmp_path: Path,
+    *,
+    canonical: Path,
+    dd_root: Path,
+    ops: Any,
+) -> HarvestRunConfig:
+    return HarvestRunConfig(
+        event=approved_unharvested_event(
+            development_id="dev-fg-SUBJECT", head_commit="a" * 40, stage="implement"
+        ).as_dict(),
+        state_root=tmp_path / "supervisor",
+        run_root=tmp_path / "runs",
+        dd_root=dd_root,
+        deploy_command=[],
+        allowlist=full_allowlist(str(canonical)),
+        ops=ops,
+        publish_notes=False,
+    )
+
+
+class TestHarvestTreeOccupancy:
+    """H8 交付 C：动树前 occupancy 门——目标树被在飞单绑定 -> 拒绝+escalate 且一字不动。
+
+    阴性 fixture（关键，goal.md 判据）用真实 git 合成仓：目标工作树 `<target>`
+    里的未提交哨兵文件逐字节、`git rev-parse HEAD`、`git status --porcelain` 都
+    必须与运行前完全一致，目录与文件都仍在（未被 rmtree / worktree remove）。
+    正例：终态绑定 / 无绑定 -> 放行走既有链（零回归）。只读判据：occupancy 探测
+    只发生 open/read 类读操作与 `git rev-parse`，没有任何写文件/建目录/登记动作。
+    """
+
+    def test_inflight_foreign_binding_escalates_and_target_untouched(self, tmp_path: Path) -> None:
+        """阴性 fixture（不可省略）：dev-fg-OTHER 在飞绑定 <target> -> intake 立即
+        escalate，写步骤一个没跑，<target> 一字未动（HEAD/status/哨兵字节/目录）。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical, target, sentinel, dd_root = _h8_target_fixture(
+            tmp_path, other_terminal="", subject_terminal="complete"
+        )
+        head_before = head(target)
+        status_before = git(target, "status", "--porcelain")
+
+        config = _h8_config(tmp_path, canonical=canonical, dd_root=dd_root, ops=DefaultHarvestOps())
+        result = run_harvest(config)
+        # a. 立即 escalate。
+        assert result["outcome"] == OUTCOME_ESCALATED
+        # b. intake step ok:false + escalate 码 + bound_development_id 机器可读。
+        intake_step = next(s for s in result["steps"] if s["step"] == "intake")
+        assert intake_step["ok"] is False
+        assert intake_step["escalate"] == "HARVEST_TREE_OCCUPIED_BY_INFLIGHT"
+        assert intake_step["bound_development_id"] == "dev-fg-OTHER"
+        assert intake_step["detail"]
+        # c. 写步骤一个没跑：writes_skipped 含三个写步骤，steps 里没有任何
+        #    worktree_cherry_pick / pr_squash_merge / ff_only_pull ok:true。
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert set(receipt["writes_skipped"]) >= set(WRITE_STEPS)
+        assert not any(
+            s.get("step") in ("worktree_cherry_pick", "pr_squash_merge", "ff_only_pull")
+            and s.get("ok") is True
+            for s in receipt["steps"]
+        )
+        # d. `<target>` 一字未动：HEAD / porcelain / 哨兵字节 / 目录都仍在。
+        assert head(target) == head_before
+        assert git(target, "status", "--porcelain") == status_before
+        assert (target / "sentinel.bin").read_bytes() == sentinel
+        assert target.is_dir() and (target / "sentinel.bin").is_file()
+
+    def test_fake_ops_escalate_facts_are_machine_readable(self, tmp_path: Path) -> None:
+        """fake ops 脚本化在飞绑定 -> intake step 字段精确（escalate/bound/detail）。"""
+        fake = fake_ops(
+            inflight_binding={
+                "bound_development_id": "dev-fg-OTHER",
+                "in_flight": True,
+                "detail": "<target> 被在飞 development dev-fg-OTHER 绑定",
+            }
+        )
+        config, _ = config_for(tmp_path, ops=fake)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        intake_step = next(s for s in result["steps"] if s["step"] == "intake")
+        assert intake_step["ok"] is False
+        assert intake_step["escalate"] == "HARVEST_TREE_OCCUPIED_BY_INFLIGHT"
+        assert intake_step["bound_development_id"] == "dev-fg-OTHER"
+        assert intake_step["detail"]
+        # 零写动作：写原语零调用，直接走 receipt（postconditions 都不跑）。
+        assert "worktree_cherry_pick" not in fake["calls"], fake["calls"]
+        assert "pr_squash_merge" not in fake["calls"], fake["calls"]
+        assert "ff_only_pull" not in fake["calls"], fake["calls"]
+        assert "deploy" not in fake["calls"], fake["calls"]
+        assert "postconditions" not in [s.get("step") for s in result["steps"]]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert set(receipt["writes_skipped"]) >= set(WRITE_STEPS)
+
+    def test_terminal_binding_is_released_not_inflight(self, tmp_path: Path) -> None:
+        """终态绑定（区分在飞）：OTHER terminal="complete" -> in_flight=False。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        _canonical, target, _sentinel, dd_root = _h8_target_fixture(
+            tmp_path, other_terminal="complete", subject_terminal="complete"
+        )
+        binding = DefaultHarvestOps().detect_inflight_binding(target, dd_root)
+        assert binding["in_flight"] is False
+        assert binding["bound_development_id"] is None
+        # 编排层放行：脚本化 in_flight=False -> 走既有链正常收割。
+        fake = fake_ops(
+            inflight_binding={
+                "bound_development_id": "dev-fg-OTHER",
+                "in_flight": False,
+                "detail": "complete",
+            }
+        )
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert "pr_squash_merge" in fake["calls"], fake["calls"]
+
+    def test_no_binding_is_released(self, tmp_path: Path) -> None:
+        """无绑定：dd_root 无任何外部 record 指向 <target> -> in_flight=False，正常收割。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        _canonical, target, _sentinel, _dd_root = _h8_target_fixture(
+            tmp_path, other_terminal="", subject_terminal="complete"
+        )
+        dd_root = tmp_path / "dd-empty"
+        dd_root.mkdir(parents=True)
+        binding = DefaultHarvestOps().detect_inflight_binding(target, dd_root)
+        assert binding["in_flight"] is False
+        assert binding["bound_development_id"] is None
+        # 编排层放行：无绑定脚本 -> 走既有链正常收割。
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert "pr_squash_merge" in fake["calls"], fake["calls"]
+
+    def test_detect_inflight_binding_is_read_only(self, tmp_path: Path, monkeypatch: Any) -> None:
+        """只读判据（不另造账本）：occupancy 探测只 open/read + `git rev-parse`，
+        不写文件/不建目录/不登记。dd_root 目录树逐字节相同、`<target>` 一字未动。"""
+        from fleet_graph.supervise import harvest_ops
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical, target, sentinel, dd_root = _h8_target_fixture(
+            tmp_path, other_terminal="", subject_terminal="complete"
+        )
+        dd_snapshot_before = sorted(
+            (str(p.relative_to(dd_root)), p.read_bytes())
+            for p in sorted(dd_root.rglob("*"))
+            if p.is_file()
+        )
+        head_before = head(target)
+        status_before = git(target, "status", "--porcelain")
+
+        git_calls: list[tuple[str, list[str]]] = []
+        real_run_git = harvest_ops.run_git
+
+        def recording_run_git(repo, *args, **kwargs):
+            git_calls.append((str(repo), list(args)))
+            return real_run_git(repo, *args, **kwargs)
+
+        monkeypatch.setattr(harvest_ops, "run_git", recording_run_git)
+        binding = DefaultHarvestOps().detect_inflight_binding(canonical, dd_root)
+        assert binding["in_flight"] is True
+        assert binding["bound_development_id"] == "dev-fg-OTHER"
+
+        # 只发生 `git rev-parse`（纯读）；没有任何写类 git 命令。
+        assert git_calls, "detect_inflight_binding 未触发任何 git 读口"
+        assert all(args[0] == "rev-parse" for _repo, args in git_calls), git_calls
+        # dd_root 目录树逐字节相同（没有新建/改动任何账本文件）。
+        dd_snapshot_after = sorted(
+            (str(p.relative_to(dd_root)), p.read_bytes())
+            for p in sorted(dd_root.rglob("*"))
+            if p.is_file()
+        )
+        assert dd_snapshot_before == dd_snapshot_after
+        # `<target>` 一字未动。
+        assert head(target) == head_before
+        assert git(target, "status", "--porcelain") == status_before
+        assert (target / "sentinel.bin").read_bytes() == sentinel
+
+    def test_self_binding_inflight_does_not_block(self, tmp_path: Path) -> None:
+        """本单自身归属绑定且在飞 -> 不拒绝（自身归属解析命中走 False 侧）。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical, _target, _sentinel, dd_root = _h8_target_fixture(
+            tmp_path, other_terminal="complete", subject_terminal=""
+        )
+        # 只有本单（dev-fg-SUBJECT）绑定 target 且在飞：intake 探测 record_worktree
+        # 时 detect 返回 bound=dev-fg-SUBJECT == 当前 development_id -> 放行。
+        config = _h8_config(tmp_path, canonical=canonical, dd_root=dd_root, ops=DefaultHarvestOps())
+        result = run_harvest(config)
+        intake_step = next(s for s in result["steps"] if s["step"] == "intake")
+        assert intake_step["ok"] is True

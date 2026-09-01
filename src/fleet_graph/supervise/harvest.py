@@ -79,6 +79,11 @@ DEFAULT_VERIFY_ARGV = ["make", "verify"]
 #: `writes_skipped` 机器可读地记录「哪些写步骤被显式跳过」。
 WRITE_STEPS = ("pr_squash_merge", "ff_only_pull", "deploy")
 
+#: H8 动树前 occupancy 门：目标树被另一张在飞单绑定时，intake 立即拒绝+escalate
+#: 的机器可读 escalate 码（spec 交付 B.3）。写前闸（H7）与本门不互斥——本门在
+#: 更早节点拦（intake 早退 -> receipt），拦不到时 H7 仍在位。
+ESCALATE_TREE_OCCUPIED = "HARVEST_TREE_OCCUPIED_BY_INFLIGHT"
+
 #: SOP 步骤名的封闭枚举——测试据此断言「编排步骤齐全」。
 SOP_STEPS = (
     "fetch_dd_ref",
@@ -122,6 +127,7 @@ class HarvestOps(Protocol):
     def remove_worktree(self, repo: Path, worktree_root: Path) -> dict[str, Any]: ...
     def run_verify(self, worktree: Path, argv: list[str]) -> int: ...
     def board_card_entity_id(self, development_id: str, dd_root: Path) -> str | None: ...
+    def detect_inflight_binding(self, tree_path: Path, dd_root: Path) -> dict[str, Any]: ...
     def pr_squash_merge(
         self, repo: Path, development_id: str, head_commit: str, default_branch: str
     ) -> dict[str, Any]: ...
@@ -138,6 +144,7 @@ class HarvestState(TypedDict, total=False):
     harvest_tip: str
     stage: str
     repo_path: str
+    record_worktree: str
     default_branch: str
     deploy_command: list[str]
     allowlist_auth: dict[str, Any]
@@ -216,6 +223,68 @@ def _resolve_repo(
     return canonical, []
 
 
+def _record_repo_path(development_id: str, dd_root: Path) -> str:
+    """读 dd 准入 record 的 `repo_path`（工作树路径），occupancy 归属锚点。
+
+    H8 交付 B.1：intake 解析 canonical 的同时把 record 的 `repo_path`（原始
+    worktree 路径）保留进 `HarvestState.record_worktree`——这是该链要消费的那棵
+    树的归属锚点，不能丢。纯 JSON 读（Guard D 安全），不可读/缺字段 -> 返回空串。
+    """
+    record_path = dd_root / development_id / RECORD_FILE
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(record, dict):
+        return ""
+    return str(record.get("repo_path") or "")
+
+
+def _detect_occupied_tree(
+    deps: HarvestDeps,
+    *,
+    development_id: str,
+    record_worktree: str,
+    canonical: Path,
+    worktree_root: Path,
+) -> dict[str, Any] | None:
+    """H8 交付 B.2/B.3：动树前对链上每棵将被消费的树做 occupancy 探测（纯读口）。
+
+    对 record 的 `repo_path`（record_worktree）、解析出的 canonical `repo`、以及
+    本次一次性 `worktree_root`（`deps.thread_dir(...)/worktree`）各调用一次
+    `deps.ops.detect_inflight_binding`——凡是要去 rmtree / worktree add / worktree
+    remove / pull / deploy 的树，动之前都过一遍。
+
+    任一调用返回 `in_flight=True` 且 `bound_development_id != 当前 development_id`
+    -> 立即返回机器可读占用事实 `{"escalate": ..., "bound_development_id": ...,
+    "detail": ...}`；否则（无绑定 / 仅终态绑定 / 绑定为本单）-> None，走既有链。
+    探测读口异常 -> 保守按占用 escalate（fail-closed，绝不静默放行）。
+    """
+    probes: list[tuple[str, Path | None]] = [
+        ("record_worktree", Path(record_worktree) if record_worktree else None),
+        ("canonical", canonical),
+        ("worktree_root", worktree_root),
+    ]
+    for name, tree in probes:
+        if tree is None:
+            continue
+        try:
+            binding = deps.ops.detect_inflight_binding(tree, deps.dd_root)
+        except Exception as exc:
+            return {
+                "escalate": ESCALATE_TREE_OCCUPIED,
+                "bound_development_id": None,
+                "detail": f"detect_inflight_binding({name}) 异常，保守 escalate: {repr(exc)[:300]}",
+            }
+        if binding.get("in_flight") and binding.get("bound_development_id") != development_id:
+            return {
+                "escalate": ESCALATE_TREE_OCCUPIED,
+                "bound_development_id": binding.get("bound_development_id"),
+                "detail": binding.get("detail") or f"{name} 被另一张在飞单绑定",
+            }
+    return None
+
+
 def authorize_harvest_write(
     allowlist: HarvestAllowlist,
     *,
@@ -269,31 +338,58 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         if not development_id or not head_commit:
             gaps.append("E5 payload 缺 development_id 或 head_commit——事件不完整")
         repo = deps.repo
+        record_worktree = ""
         if repo is None and development_id:
             allowlist_repo_paths = [entry.repo_path for entry in deps.allowlist.entries]
             repo, resolve_gaps = _resolve_repo(
                 development_id, deps.dd_root, deps.ops, allowlist_repo_paths
             )
             gaps.extend(resolve_gaps)
+            # H8 交付 B.1：record 的 repo_path（工作树路径）是这棵树的归属锚点，
+            # 解析 canonical 后一并保留进 state，供动树前 occupancy 探测消费。
+            record_worktree = _record_repo_path(development_id, deps.dd_root)
+        elif repo is not None:
+            record_worktree = str(repo)
+        # H8 交付 B.2/B.3：_resolve_repo 成功之后、进入 gate 之前，对链上每棵
+        # 将被消费的树（record_worktree / canonical / 本次 worktree_root）做
+        # occupancy 探测。任一在飞且非本单 -> 立即拒绝+escalate，走既有
+        # after_intake（intake 早退 -> receipt），不进入 gate 及其后任何写节点。
+        occupied: dict[str, Any] | None = None
+        if repo is not None:
+            worktree_root = deps.thread_dir(event.key) / "worktree"
+            occupied = _detect_occupied_tree(
+                deps,
+                development_id=development_id,
+                record_worktree=record_worktree,
+                canonical=repo,
+                worktree_root=worktree_root,
+            )
         steps = _record_step(
             state,
             "intake",
-            ok=not gaps,
+            ok=not gaps and occupied is None,
             development_id=development_id,
             head_commit=head_commit,
             stage=stage,
             repo_path=str(repo) if repo is not None else "",
+            record_worktree=record_worktree,
+            **({} if occupied is None else dict(occupied)),
         )
+        outcome = None
+        if gaps or occupied is not None:
+            outcome = OUTCOME_ESCALATED
         return {
             "development_id": development_id,
             "head_commit": head_commit,
             "stage": stage,
             "repo_path": str(repo) if repo is not None else "",
+            "record_worktree": record_worktree,
             "default_branch": deps.default_branch,
             "deploy_command": list(deps.deploy_command),
             "steps": steps,
             "_gaps": gaps,
-            "outcome": OUTCOME_ESCALATED if gaps else None,
+            "outcome": outcome,
+            "writes_skipped": list(WRITE_STEPS) if occupied is not None else None,
         }
 
     def gate(state: HarvestState) -> HarvestState:
@@ -670,6 +766,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "harvest_tip": state.get("harvest_tip"),
                 "stage": state.get("stage"),
                 "repo_path": state.get("repo_path"),
+                "record_worktree": state.get("record_worktree"),
                 "default_branch": state.get("default_branch"),
                 "allowlist_auth": state.get("allowlist_auth") or {},
                 "steps": state.get("steps") or [],
@@ -859,6 +956,7 @@ def run_harvest(config: HarvestRunConfig) -> dict[str, Any]:
 __all__ = [
     "DEFAULT_BRANCH",
     "DEFAULT_VERIFY_ARGV",
+    "ESCALATE_TREE_OCCUPIED",
     "EVENT_APPROVED_UNHARVESTED",
     "OUTCOME_ALREADY_HARVESTED",
     "OUTCOME_ESCALATED",
