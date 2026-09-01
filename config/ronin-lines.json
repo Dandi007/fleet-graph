@@ -194,9 +194,9 @@
       "folder_id": "wf-e7b0dd",
       "seat": "opencode-dsv4pro",
       "max_rounds": 3,
-      "alias": "ronin-mcp",
+      "alias": "ronin-e7b0dd",
       "enabled": true,
-      "_provenance": "2026-09-01 U4 放行入编（用户令：把舰队恢复到全速运转）：wf-c106b9「舰队入口整体统一」线的 U4 自举 e2e 载体——统一入册流水线的第一个 dogfood 用户。前四段（E8 enrollment_pending 发射 / /v1/enrollments 可见 / 板上 question note / 升报 seq 776）该线已真机闭环并驻停 16h 等监督面放行；本条即后三段中的 roster PR。max_rounds=3 沿用入册申请声明（演练线，非常驻），与 wf-a8c7b5 同类。liveness exit 0、lint_warnings 空、alias token /data/ronin/secrets/ronin-mcp.token 就位。goal SSoT：wf-e7b0dd；放行线 SSoT：wf-c106b9。"
+      "_provenance": "2026-09-01 U4 放行入编（用户令：把舰队恢复到全速运转）：wf-c106b9「舰队入口整体统一」线的 U4 自举 e2e 载体。**alias 订正**：PR #214 曾误用 `ronin-mcp`，其 token 是指向监督面自身 /data/agent-bus/tokens/uther-tui.token 的 symlink——该 alias 已于 2026-09-01 03:2x 被监督面以「身份冒用隐患、绝对阻断项」REJECT，我入编时只做了存在性检查未验 realpath，正好复现了 goal_enroll gate 6 的同一缺陷。现改用专属 token 的 `ronin-e7b0dd`（/data/ronin/secrets/ronin-e7b0dd.token，0600 真文件、realpath 专属，2026-09-01 04:56 铸）。max_rounds=3 沿用入册申请声明（演练线，非常驻），与 wf-a8c7b5 同类。goal SSoT：wf-e7b0dd；放行线 SSoT：wf-c106b9。"
     }
   ],
   "line_environment": {
