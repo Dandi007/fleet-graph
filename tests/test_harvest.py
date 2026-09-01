@@ -53,6 +53,7 @@ def fake_ops(
     pull_head: str = "f" * 40,
     resolve_canonical: Path | None = None,
     divergence: dict[str, Any] | None = None,
+    harvest_tip: str = "b" * 40,
 ) -> dict[str, Any]:
     """A recording fake ops: every write/execute is recorded, results scripted.
 
@@ -71,6 +72,7 @@ def fake_ops(
             "origin_head": "b" * 40,
             "detail": "local 是 origin 祖先（未分叉）",
         }
+    pr_merge_args: list[dict[str, Any]] = []
 
     class Ops:
         def fetch_dd_ref(self, repo: Path, development_id: str) -> dict[str, Any]:
@@ -96,7 +98,17 @@ def fake_ops(
             self, repo: Path, head_commit: str, default_branch: str, worktree_root: Path
         ) -> dict[str, Any]:
             calls.append("worktree_cherry_pick")
-            return {"ok": worktree_ok, "method": "cherry-pick"}
+            return {"ok": worktree_ok, "method": "cherry-pick", "harvest_tip": harvest_tip}
+
+        def build_harvest_tip(
+            self,
+            repo: Path,
+            head_commit: str,
+            default_branch: str,
+            worktree_root: Path,
+        ) -> dict[str, Any]:
+            calls.append("build_harvest_tip")
+            return {"ok": worktree_ok, "harvest_tip": harvest_tip}
 
         def remove_worktree(self, repo: Path, worktree_root: Path) -> dict[str, Any]:
             calls.append("remove_worktree")
@@ -114,6 +126,13 @@ def fake_ops(
             self, repo: Path, development_id: str, head_commit: str, default_branch: str
         ) -> dict[str, Any]:
             calls.append("pr_squash_merge")
+            pr_merge_args.append(
+                {
+                    "development_id": development_id,
+                    "head_commit": head_commit,
+                    "default_branch": default_branch,
+                }
+            )
             return {"merged": merged, "pr_url": pr_url, "method": "gh-pr-squash-merge"}
 
         def ff_only_pull(self, repo: Path, default_branch: str) -> dict[str, Any]:
@@ -145,6 +164,7 @@ def fake_ops(
         "deploy_repos": deploy_repos,
         "verify_real_repos": verify_real_repos,
         "verify_real_heads": verify_real_heads,
+        "pr_merge_args": pr_merge_args,
     }
 
 
@@ -1201,3 +1221,128 @@ class TestDefaultHarvestOpsFfOnlyPullHead:
         result = ops.ff_only_pull(canon, "main")
         assert result["ok"] is False, result
         assert result["head"] is None, "失败时 head 应为 None"
+
+
+def _ticket_repo_with_dd_artifacts(tmp_path: Path) -> tuple[Path, str]:
+    """真 git 合成仓构造一张「工单 commit」：产品改动 + 两棵 dd 协议子树。
+
+    `.dev-dispatch/`（development.json / spec/approved.md）与 `.dd-evidence/
+    acceptance.json` 随产品改动一起进同一张工单 commit（dd 协议要求工单分支提交
+    它们）。工单 commit 落在独立 feature 分支（模拟 dd 链，不在默认分支上——
+    否则 cherry-pick 到默认分支会空提交）。全部本地合成，禁触真网/生产 checkout。
+    """
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    git(repo, "checkout", "-q", "-b", "feature")
+
+    dev_dispatch = repo / ".dev-dispatch"
+    dev_dispatch.mkdir()
+    (dev_dispatch / "development.json").write_text(
+        '{"development_id": "dev-x"}\n', encoding="utf-8"
+    )
+    spec_dir = dev_dispatch / "spec"
+    spec_dir.mkdir()
+    (spec_dir / "approved.md").write_text("# approved spec\n", encoding="utf-8")
+
+    evidence = repo / ".dd-evidence"
+    evidence.mkdir()
+    (evidence / "acceptance.json").write_text('{"ok": true}\n', encoding="utf-8")
+
+    (repo / "product.txt").write_text("product change\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "ticket with dd artifacts")
+    ticket = head(repo)
+    git(repo, "checkout", "-q", "main")
+    return repo, ticket
+
+
+class TestHarvestCleanTipExcludesDdArtifacts:
+    """交付 C.1：真实 git 合成仓上，洗树 tip 不含 dd 协议子树、产品改动保留。"""
+
+    def test_build_harvest_tip_excludes_dd_subtrees(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo, ticket = _ticket_repo_with_dd_artifacts(tmp_path)
+        ops = DefaultHarvestOps()
+        worktree_root = tmp_path / "harvest-wt"
+
+        result = ops.build_harvest_tip(repo, ticket, "main", worktree_root)
+        assert result["ok"] is True, result
+        tip = result["harvest_tip"]
+        assert tip and tip != ticket
+
+        paths = git(repo, "ls-tree", "-r", tip, "--name-only").splitlines()
+        assert not any(p.startswith(".dev-dispatch/") or p == ".dev-dispatch" for p in paths), paths
+        assert not any(p.startswith(".dd-evidence/") or p == ".dd-evidence" for p in paths), paths
+        # 产品改动仍保留。
+        assert "product.txt" in paths
+        assert "seed.txt" in paths
+        assert git(repo, "show", f"{tip}:product.txt").strip() == "product change"
+
+    def test_worktree_cherry_pick_returns_clean_tip(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo, ticket = _ticket_repo_with_dd_artifacts(tmp_path)
+        ops = DefaultHarvestOps()
+        worktree_root = tmp_path / "harvest-wt"
+
+        picked = ops.worktree_cherry_pick(repo, ticket, "main", worktree_root)
+        assert picked["ok"] is True, picked
+        tip = picked["harvest_tip"]
+        assert tip and tip != ticket
+
+        paths = git(repo, "ls-tree", "-r", tip, "--name-only").splitlines()
+        assert not any(p.startswith(".dev-dispatch/") or p == ".dev-dispatch" for p in paths), paths
+        assert not any(p.startswith(".dd-evidence/") or p == ".dd-evidence" for p in paths), paths
+        assert "product.txt" in paths
+        assert git(repo, "show", f"{tip}:product.txt").strip() == "product change"
+        # worktree 保留供 verify 用（rc-702098ab 语义不变）。
+        assert worktree_root.is_dir()
+        assert (worktree_root / "product.txt").read_text().strip() == "product change"
+        ops.remove_worktree(repo, worktree_root)
+
+    def test_wash_is_noop_without_dd_subtrees(self, tmp_path: Path) -> None:
+        """正向回归：不含这两棵子树的普通工单 commit——洗树 no-op，tip 不变。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = tmp_path / "repo"
+        _init_git_repo(repo)
+        git(repo, "checkout", "-q", "-b", "feature")
+        (repo / "product.txt").write_text("product change\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "plain ticket")
+        ticket = head(repo)
+        git(repo, "checkout", "-q", "main")
+
+        ops = DefaultHarvestOps()
+        result = ops.build_harvest_tip(repo, ticket, "main", tmp_path / "harvest-wt")
+        assert result["ok"] is True, result
+        assert result["washed"] is False, result
+        assert result["harvest_tip"] == ticket
+
+
+class TestHarvestPrMergeUsesCleanTip:
+    """交付 C.2：编排层 pr_merge 推干净 tip，而非裸 head_commit（fake 记录实参）。"""
+
+    def test_pr_squash_merge_receives_clean_tip_not_raw_head(self, tmp_path: Path) -> None:
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert fake["pr_merge_args"], "pr_squash_merge 未被编排层调用"
+        (merge_args,) = fake["pr_merge_args"]
+        # e5 事件 head_commit 是 "a"*40；fake 干净 tip 是 "b"*40。编排层必须
+        # 把 worktree 步返回的干净 tip 传给 pr_squash_merge，而不是裸 head_commit。
+        assert merge_args["head_commit"] == "b" * 40
+        assert merge_args["head_commit"] != e5_event()["payload"]["head_commit"]
+
+    def test_worktree_step_records_harvest_tip(self, tmp_path: Path) -> None:
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        run_harvest(config)
+        receipt = json.loads(Path(config.state_root / "reports" / "e5-dev-x.json").read_text())
+        worktree_step = next(s for s in receipt["steps"] if s["step"] == "worktree_cherry_pick")
+        assert worktree_step["harvest_tip"] == "b" * 40
+        merge_step = next(s for s in receipt["steps"] if s["step"] == "pr_squash_merge")
+        assert merge_step["commit"] == "b" * 40
+        assert receipt["harvest_tip"] == "b" * 40
