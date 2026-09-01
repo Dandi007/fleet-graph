@@ -35,6 +35,7 @@ from fleet_graph.supervise.harvest import (
     run_harvest,
 )
 from fleet_graph.supervise.harvest_allowlist import HarvestAllowlist, parse_harvest_allowlist
+from fleet_graph.supervise.harvest_ops import EXIT_HEAD_MISMATCH
 
 
 def fake_ops(
@@ -49,10 +50,19 @@ def fake_ops(
     deploy_exit: int = 0,
     fetch_ok: bool = True,
     pull_ok: bool = True,
+    pull_head: str = "f" * 40,
     resolve_canonical: Path | None = None,
 ) -> dict[str, Any]:
-    """A recording fake ops: every write/execute is recorded, results scripted."""
+    """A recording fake ops: every write/execute is recorded, results scripted.
+
+    `pull_head` 模拟 `ff_only_pull` 成功后返回的已合并 commit（`head` 字段）；
+    `pull_ok=False` 时 head 为 None。`verify_real` 按机械契约拒绝 `expected_head
+    is None`（返回 EXIT_HEAD_MISMATCH），与 DefaultHarvestOps 行为一致。
+    """
     calls: list[str] = []
+    deploy_repos: list[Path] = []
+    verify_real_repos: list[Path] = []
+    verify_real_heads: list[str | None] = []
 
     class Ops:
         def fetch_dd_ref(self, repo: Path, development_id: str) -> dict[str, Any]:
@@ -100,17 +110,30 @@ def fake_ops(
 
         def ff_only_pull(self, repo: Path, default_branch: str) -> dict[str, Any]:
             calls.append("ff_only_pull")
-            return {"ok": pull_ok}
+            if not pull_ok:
+                return {"ok": False, "head": None}
+            return {"ok": True, "head": pull_head}
 
-        def deploy(self, command: list[str]) -> int:
+        def deploy(self, command: list[str], repo: Path) -> int:
             calls.append("deploy")
+            deploy_repos.append(repo)
             return deploy_exit
 
-        def verify_real(self, argv: list[str]) -> int:
+        def verify_real(self, argv: list[str], repo: Path, expected_head: str | None) -> int:
             calls.append("verify_real")
+            verify_real_repos.append(repo)
+            verify_real_heads.append(expected_head)
+            if expected_head is None:
+                return EXIT_HEAD_MISMATCH
             return verify_real_exit
 
-    return {"ops": Ops(), "calls": calls}
+    return {
+        "ops": Ops(),
+        "calls": calls,
+        "deploy_repos": deploy_repos,
+        "verify_real_repos": verify_real_repos,
+        "verify_real_heads": verify_real_heads,
+    }
 
 
 def full_allowlist(
@@ -315,6 +338,89 @@ class TestHarvestOrchestration:
         assert result["outcome"] == OUTCOME_HARVESTED
         receipt = json.loads(Path(result["receipt_path"]).read_text())
         assert receipt["repo_path"] == str(config.dd_root.parent / "repos" / "fleet-graph")
+
+
+class TestHarvestCanonicalCwdAndHead:
+    """交付 C：deploy/verify_real 以 canonical 仓为 cwd + verify_real 先断言 HEAD。
+
+    1. **cwd 断言**：fake ops 的 `deploy`/`verify_real` 收到 `repo` == 解析出的
+       canonical 仓（`state["repo_path"]`）；`verify_real` 收到 `expected_head`
+       == fake `ff_only_pull` 返回的 `head`。
+    2. **HEAD 断言（正向）**：pull 成功 + fake `head` 非 None -> `verify_real`
+       执行、exit 0。
+    3. **HEAD 断言（负向）**：`pull_ok=False`（fake 返回 `head=None`）->
+       `verify_real` 收到 `expected_head=None` -> 该步 exit 非 0/ok:false。
+    """
+
+    def test_deploy_and_verify_real_get_canonical_repo(self, tmp_path: Path) -> None:
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            ops=fake,
+            bus=FakeBus(),
+            deploy_command=["make", "deploy"],
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        canonical = str(config.dd_root.parent / "repos" / "fleet-graph")
+        assert fake["deploy_repos"] and all(str(r) == canonical for r in fake["deploy_repos"])
+        assert fake["verify_real_repos"] and all(
+            str(r) == canonical for r in fake["verify_real_repos"]
+        )
+
+    def test_verify_real_gets_pull_head_as_expected_head(self, tmp_path: Path) -> None:
+        fake = fake_ops(pull_head="a" * 40)
+        config, _ = config_for(
+            tmp_path,
+            ops=fake,
+            bus=FakeBus(),
+            deploy_command=["make", "deploy"],
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert fake["verify_real_heads"] == ["a" * 40]
+
+    def test_verify_real_executes_when_pull_head_present(self, tmp_path: Path) -> None:
+        fake = fake_ops(pull_ok=True, pull_head="a" * 40, verify_real_exit=0)
+        config, _ = config_for(
+            tmp_path,
+            ops=fake,
+            bus=FakeBus(),
+            deploy_command=["make", "deploy"],
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert fake["verify_real_heads"] == ["a" * 40]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        verify_real = next(s for s in receipt["steps"] if s["step"] == "verify_real")
+        assert verify_real["exit_code"] == 0
+        assert verify_real["ok"] is True
+
+    def test_verify_real_refuses_when_pull_failed(self, tmp_path: Path) -> None:
+        """负向（不可省略）：pull_ok=False -> head=None -> verify_real 拒绝执行。
+
+        fake 按机械契约：`expected_head=None` -> 返回 EXIT_HEAD_MISMATCH；
+        该步 exit 非 0 / ok:false。
+        """
+        fake = fake_ops(pull_ok=False)
+        config, _ = config_for(
+            tmp_path,
+            ops=fake,
+            bus=FakeBus(),
+            deploy_command=["make", "deploy"],
+        )
+        result = run_harvest(config)
+        assert fake["verify_real_heads"] == [None]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        verify_real = next(s for s in receipt["steps"] if s["step"] == "verify_real")
+        assert verify_real["exit_code"] != 0
+        assert verify_real["ok"] is False
+        assert verify_real["exit_code"] == EXIT_HEAD_MISMATCH
+        assert "拒绝在陈旧树上报绿" in verify_real["detail"]
+        # ff_only_pull 失败也留痕（ok:false + head None）。
+        pull = next(s for s in receipt["steps"] if s["step"] == "ff_only_pull")
+        assert pull["ok"] is False
+        assert pull["head"] is None
 
     def test_finished_event_is_a_no_op_on_rerun(self, tmp_path: Path) -> None:
         fake = fake_ops()
@@ -856,3 +962,74 @@ class TestCanonicalRepoResolution:
         result = run_harvest(config)
         assert result["outcome"] == OUTCOME_ESCALATED
         assert fake["calls"] == []
+
+
+class TestDefaultHarvestOpsVerifyRealHead:
+    """交付 A：DefaultHarvestOps.verify_real 以 canonical 仓为 cwd + 先断言 HEAD。
+
+    真 git 合成仓（禁触真网/生产 checkout）：expected_head 缺失或与当前 HEAD
+    不一致时**不执行** verify 命令并返回 EXIT_HEAD_MISMATCH；相等时才在 repo
+    cwd 下执行。
+    """
+
+    def test_refuses_when_expected_head_none(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import EXIT_HEAD_MISMATCH, DefaultHarvestOps
+
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        marker = repo / "ran.txt"
+        ops = DefaultHarvestOps()
+        exit_code = ops.verify_real(["touch", "ran.txt"], repo, None)
+        assert exit_code == EXIT_HEAD_MISMATCH
+        assert not marker.exists(), "expected_head=None 时仍执行了 verify 命令"
+
+    def test_refuses_when_head_mismatches(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import EXIT_HEAD_MISMATCH, DefaultHarvestOps
+
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        marker = repo / "ran.txt"
+        ops = DefaultHarvestOps()
+        exit_code = ops.verify_real(["touch", "ran.txt"], repo, "0" * 40)
+        assert exit_code == EXIT_HEAD_MISMATCH
+        assert not marker.exists(), "HEAD 与已合并 commit 不一致时仍执行了 verify"
+
+    def test_executes_in_repo_cwd_when_head_matches(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        current_head = head(repo)
+        marker = repo / "ran.txt"
+        ops = DefaultHarvestOps()
+        exit_code = ops.verify_real(["touch", "ran.txt"], repo, current_head)
+        assert exit_code == 0
+        assert marker.exists(), "HEAD 相等时应以 repo 为 cwd 执行 verify"
+
+
+class TestDefaultHarvestOpsFfOnlyPullHead:
+    """交付 A：ff_only_pull 成功时返回 pull 后的 HEAD（字段名 `head`），失败为 None。"""
+
+    def test_returns_head_on_success(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canon = tmp_path / "canon"
+        _init_git_repo(canon)
+        origin = tmp_path / "origin.git"
+        git(canon, "clone", "--bare", "-q", ".", str(origin))
+        git(canon, "remote", "add", "origin", str(origin))
+        ops = DefaultHarvestOps()
+        result = ops.ff_only_pull(canon, "main")
+        assert result["ok"] is True, result
+        assert result["head"] == head(canon), "成功时 head 应为 pull 后的 HEAD"
+
+    def test_head_none_on_failure(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canon = tmp_path / "canon"
+        _init_git_repo(canon)
+        git(canon, "remote", "add", "origin", str(tmp_path / "missing-origin.git"))
+        ops = DefaultHarvestOps()
+        result = ops.ff_only_pull(canon, "main")
+        assert result["ok"] is False, result
+        assert result["head"] is None, "失败时 head 应为 None"

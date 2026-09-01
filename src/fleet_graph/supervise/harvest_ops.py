@@ -29,6 +29,8 @@ COMMAND_TIMEOUT_SECONDS = 3600
 #: 机械操作的合成退出码（shell 惯例）。
 EXIT_TIMEOUT = 124
 EXIT_NOT_FOUND = 127
+#: verify_real 的 HEAD 断言失败合成退出码：拒绝在陈旧树上报绿。
+EXIT_HEAD_MISMATCH = 3
 
 
 def _run(argv: list[str], cwd: Path | None = None) -> dict[str, Any]:
@@ -379,20 +381,51 @@ class DefaultHarvestOps:
         return {"merged": True, "pr_url": pr_url, "method": "gh-pr-squash-merge"}
 
     def ff_only_pull(self, repo: Path, default_branch: str) -> dict[str, Any]:
+        """ff-only pull 默认分支；成功时额外返回 pull 后的 HEAD（字段名 `head`）。
+
+        `head` 是「已合并 commit」的唯一机械来源（pull 成功后在 canonical 仓读
+        `rev-parse HEAD`），绝不猜、不另造。失败时 `head` 为 `None`，保留既有
+        `ok:false` + `detail`。
+        """
         proc = run_git(repo, "pull", "--ff-only", "origin", default_branch)
         if proc.returncode != 0:
-            return {"ok": False, "detail": (proc.stderr or proc.stdout).strip()[:400]}
-        return {"ok": True}
+            return {
+                "ok": False,
+                "head": None,
+                "detail": (proc.stderr or proc.stdout).strip()[:400],
+            }
+        head_proc = run_git(repo, "rev-parse", "HEAD")
+        if head_proc.returncode != 0:
+            return {
+                "ok": False,
+                "head": None,
+                "detail": "pull 成功后无法读取 HEAD: "
+                + (head_proc.stderr or head_proc.stdout).strip()[:400],
+            }
+        return {"ok": True, "head": head_proc.stdout.strip()}
 
-    def deploy(self, command: list[str]) -> int:
-        return int(_run(list(command)).get("exit_code") or 0)
+    def deploy(self, command: list[str], repo: Path) -> int:
+        """在 canonical 仓绝对路径 cwd 下执行部署命令（缺 cwd 是 127 假绿根因）。"""
+        return int(_run(list(command), cwd=repo).get("exit_code") or 0)
 
-    def verify_real(self, argv: list[str]) -> int:
-        return int(_run(list(argv)).get("exit_code") or 0)
+    def verify_real(self, argv: list[str], repo: Path, expected_head: str | None) -> int:
+        """真机 verify，先在 canonical 仓 cwd 断言 HEAD == 已合并 commit。
+
+        `expected_head is None`（pull 未成功、未捕获到已合并 commit）或当前
+        HEAD != `expected_head` 时**不执行** verify 命令，返回合成非零退出码
+        `EXIT_HEAD_MISMATCH`——拒绝在陈旧树上报绿。相等时才在 canonical 仓
+        cwd 下跑 verify。
+        """
+        head_proc = run_git(repo, "rev-parse", "HEAD")
+        current_head = head_proc.stdout.strip() if head_proc.returncode == 0 else None
+        if expected_head is None or current_head != expected_head:
+            return EXIT_HEAD_MISMATCH
+        return int(_run(list(argv), cwd=repo).get("exit_code") or 0)
 
 
 __all__ = [
     "COMMAND_TIMEOUT_SECONDS",
+    "EXIT_HEAD_MISMATCH",
     "EXIT_NOT_FOUND",
     "EXIT_TIMEOUT",
     "DefaultHarvestOps",

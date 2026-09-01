@@ -53,6 +53,7 @@ from fleet_graph.supervise.harvest_allowlist import (
     HarvestAllowlist,
     HarvestAuthorization,
 )
+from fleet_graph.supervise.harvest_ops import EXIT_HEAD_MISMATCH
 
 #: harvest 终态词汇（outcome）。REFUSED / ALREADY_HARVESTED 都是无写动作的合法
 #: 终止；HARVESTED 要求后置条件三要素齐全；ESCALATED = 失败/升报。
@@ -107,8 +108,8 @@ class HarvestOps(Protocol):
         self, repo: Path, development_id: str, head_commit: str, default_branch: str
     ) -> dict[str, Any]: ...
     def ff_only_pull(self, repo: Path, default_branch: str) -> dict[str, Any]: ...
-    def deploy(self, command: list[str]) -> int: ...
-    def verify_real(self, argv: list[str]) -> int: ...
+    def deploy(self, command: list[str], repo: Path) -> int: ...
+    def verify_real(self, argv: list[str], repo: Path, expected_head: str | None) -> int: ...
 
 
 class HarvestState(TypedDict, total=False):
@@ -126,6 +127,7 @@ class HarvestState(TypedDict, total=False):
     verify_exit_code: int
     verify_real_exit_code: int
     deploy_exit_code: int
+    merged_head: str
     evidence_note_id: str
     outcome: str
     receipt_path: str
@@ -459,7 +461,8 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             return {"steps": _record_step(state, "ff_only_pull", ok=False, detail=repr(exc)[:300])}
         step = {**result, "ok": bool(result.get("ok"))}
         steps = _record_step(state, "ff_only_pull", **step)
-        return {"steps": steps}
+        # 已合并 commit 的唯一机械来源：pull 成功后 ops 返回的 HEAD，绝不另造。
+        return {"steps": steps, "merged_head": result.get("head")}
 
     def deploy(state: HarvestState) -> HarvestState:
         command = list(state.get("deploy_command") or ())
@@ -477,8 +480,9 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         steps = _record_step(state, "deploy", command=command)
         if not command:
             return {"steps": steps, "deploy_exit_code": 0}
+        repo = Path(state.get("repo_path") or "")
         try:
-            exit_code = int(deps.ops.deploy(command))
+            exit_code = int(deps.ops.deploy(command, repo))
         except Exception as exc:
             return {"steps": _record_step(state, "deploy", ok=False, detail=repr(exc)[:300])}
         steps = _record_step(state, "deploy", ok=exit_code == 0, exit_code=exit_code)
@@ -496,17 +500,20 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "steps": _record_auth(state, auth, "verify_real"),
                 "outcome": OUTCOME_REFUSED,
             }
+        repo = Path(state.get("repo_path") or "")
+        merged_head = state.get("merged_head")
         try:
-            exit_code = int(deps.ops.verify_real(deps.verify_real_argv))
+            exit_code = int(deps.ops.verify_real(deps.verify_real_argv, repo, merged_head))
         except Exception as exc:
             return {"steps": _record_step(state, "verify_real", ok=False, detail=repr(exc)[:300])}
-        steps = _record_step(
-            state,
-            "verify_real",
-            ok=exit_code == 0,
-            exit_code=exit_code,
-            argv=deps.verify_real_argv,
-        )
+        facts: dict[str, Any] = {
+            "ok": exit_code == 0,
+            "exit_code": exit_code,
+            "argv": deps.verify_real_argv,
+        }
+        if exit_code == EXIT_HEAD_MISMATCH:
+            facts["detail"] = "HEAD 与已合并 commit 不一致——拒绝在陈旧树上报绿"
+        steps = _record_step(state, "verify_real", **facts)
         return {"steps": steps, "verify_real_exit_code": exit_code}
 
     def evidence(state: HarvestState) -> HarvestState:
