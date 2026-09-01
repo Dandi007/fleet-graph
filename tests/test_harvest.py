@@ -50,9 +50,17 @@ def fake_ops(
     fetch_ok: bool = True,
     pull_ok: bool = True,
     resolve_canonical: Path | None = None,
+    divergence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A recording fake ops: every write/execute is recorded, results scripted."""
     calls: list[str] = []
+    if divergence is None:
+        divergence = {
+            "diverged": False,
+            "local_head": "a" * 40,
+            "origin_head": "b" * 40,
+            "detail": "local 是 origin 祖先（未分叉）",
+        }
 
     class Ops:
         def fetch_dd_ref(self, repo: Path, development_id: str) -> dict[str, Any]:
@@ -101,6 +109,10 @@ def fake_ops(
         def ff_only_pull(self, repo: Path, default_branch: str) -> dict[str, Any]:
             calls.append("ff_only_pull")
             return {"ok": pull_ok}
+
+        def detect_divergence(self, repo: Path, default_branch: str) -> dict[str, Any]:
+            # 纯读口：不构成写原语，不入 calls（calls 只记录写/执行动作）。
+            return dict(divergence)
 
         def deploy(self, command: list[str]) -> int:
             calls.append("deploy")
@@ -442,6 +454,162 @@ class TestCherryDedup:
         # SOP 顺序：fetch dd ref -> cherry 判重。判重命中后没有任何写动作
         # （worktree/verify/merge/pull/deploy/verify_real/evidence 都不跑）。
         assert fake["calls"] == ["fetch_dd_ref", "cherry_equivalent"], fake["calls"]
+
+
+class TestPullDivergenceEscalation:
+    """H3 交付 B/C：pull 前分叉检测 -> 立即 escalate，绝不带病继续。
+
+    fake ops 注入 `detect_divergence`：
+    1. 分叉 fixture -> outcome==escalated、`ff_only_pull` step ok:false + escalate
+       字段、calls 里没有任何 reset/checkout 类写动作（deploy/verify_real 不跑）。
+    2. 未分叉 fixture -> 走正常链、outcome==harvested（正向回归）。
+    3. 实现方不得引入任何自动 reset 路径（fake 无 reset/checkout 方法，天然约束）。
+    """
+
+    def test_diverged_local_vs_origin_escalates_without_writes(self, tmp_path: Path) -> None:
+        fake = fake_ops(
+            divergence={
+                "diverged": True,
+                "local_head": "l" * 40,
+                "origin_head": "o" * 40,
+                "detail": "local 与 origin 双向非祖先 → 1:1 分叉",
+            },
+            pull_ok=True,
+        )
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        pull_step = next(s for s in result["steps"] if s["step"] == "ff_only_pull")
+        assert pull_step["ok"] is False
+        assert pull_step["escalate"] == "HARVEST_DIVERGED_LOCAL_VS_ORIGIN"
+        assert pull_step["local_head"] == "l" * 40
+        assert pull_step["origin_head"] == "o" * 40
+        assert pull_step["detail"]
+        # 分叉 -> 立即走 receipt：不跑 ff_only_pull（分叉检测已命中）、不跑
+        # deploy/verify_real，也没有任何 reset/checkout 类写动作。
+        assert "ff_only_pull" not in fake["calls"], fake["calls"]
+        assert "deploy" not in fake["calls"], fake["calls"]
+        assert "verify_real" not in fake["calls"], fake["calls"]
+        assert not any("reset" in c or "checkout" in c for c in fake["calls"])
+        # 立即走 receipt：postconditions 都不跑。
+        assert "postconditions" not in [s.get("step") for s in result["steps"]]
+
+    def test_not_diverged_pull_proceeds_to_normal_chain(self, tmp_path: Path) -> None:
+        fake = fake_ops(divergence={"diverged": False, "detail": "未分叉"}, pull_ok=True)
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        # 未分叉 -> 走既有链：ff_only_pull 执行，deploy/verify_real/evidence/
+        # postconditions 都跑（正向回归）。
+        assert "ff_only_pull" in fake["calls"]
+        assert "verify_real" in fake["calls"]
+        ran_steps = [s["step"] for s in result["steps"]]
+        for step in ("ff_only_pull", "deploy", "verify_real", "evidence_note", "postconditions"):
+            assert step in ran_steps, f"{step} missing from {ran_steps}"
+        assert not any("reset" in c or "checkout" in c for c in fake["calls"])
+
+    def test_indeterminate_divergence_escalates_conservatively(self, tmp_path: Path) -> None:
+        """无法判定分叉（如无 origin）-> 保守 escalate，不留分叉漏检。"""
+        fake = fake_ops(
+            divergence={
+                "diverged": True,
+                "local_head": "l" * 40,
+                "origin_head": None,
+                "detail": "读取 origin/main 失败（可能无 origin）",
+            }
+        )
+        config, _ = config_for(tmp_path, ops=fake)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert "deploy" not in fake["calls"]
+        assert "verify_real" not in fake["calls"]
+
+
+class TestDefaultHarvestOpsDetectDivergence:
+    """H3 交付 A：真实 git 上 `DefaultHarvestOps.detect_divergence` 的机械读判。
+
+    单仓本地合成（HEAD + `git update-ref refs/remotes/origin/main` 构造远端 tip），
+    禁触真网/生产 checkout。断言的判据：
+    - 未分叉（local 是 origin 祖先 / origin 是 local 祖先）-> diverged False；
+    - 1:1 分叉（双向非祖先）-> diverged True；
+    - 无 origin ref / 无本地 HEAD -> 保守 diverged True（不留分叉漏检）。
+    """
+
+    def _repo(self, tmp_path: Path, name: str = "repo") -> Path:
+        repo = tmp_path / name
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "config", "user.email", "test@example.invalid")
+        git(repo, "config", "user.name", "test")
+        (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "seed")
+        return repo
+
+    def _set_origin(self, repo: Path, ref_target: str) -> None:
+        git(repo, "update-ref", "refs/remotes/origin/main", ref_target)
+
+    def _commit(self, repo: Path, filename: str, content: str) -> str:
+        (repo / filename).write_text(content, encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", f"{filename}: {content}")
+        return head(repo)
+
+    def test_local_behind_origin_is_not_diverged(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = self._repo(tmp_path)
+        origin_tip = self._commit(repo, "advance.txt", "advance")
+        self._set_origin(repo, origin_tip)
+        result = DefaultHarvestOps().detect_divergence(repo, "main")
+        assert result["diverged"] is False, result
+        assert result["local_head"] and result["origin_head"] == origin_tip
+
+    def test_identical_heads_are_not_diverged(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = self._repo(tmp_path)
+        tip = head(repo)
+        self._set_origin(repo, tip)
+        result = DefaultHarvestOps().detect_divergence(repo, "main")
+        assert result["diverged"] is False, result
+        assert result["local_head"] == result["origin_head"] == tip
+
+    def test_diverged_local_vs_origin_detected(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = self._repo(tmp_path)
+        base = head(repo)
+        # 本地侧从 base 长出一个 commit（模拟 bb026e3「本地假合并」残骸）。
+        local_tip = self._commit(repo, "local-only.txt", "local")
+        assert head(repo) == local_tip
+        # 回到 base，origin 侧再从 base 长出一个不同 commit -> 与 local 1:1 分叉。
+        git(repo, "reset", "-q", "--hard", base)
+        origin_tip = self._commit(repo, "origin-advance.txt", "origin")
+        git(repo, "reset", "-q", "--hard", local_tip)
+        self._set_origin(repo, origin_tip)
+        result = DefaultHarvestOps().detect_divergence(repo, "main")
+        assert result["diverged"] is True, result
+        assert result["local_head"] == local_tip
+        assert result["origin_head"] == origin_tip
+
+    def test_missing_origin_ref_is_conservative(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = self._repo(tmp_path)
+        result = DefaultHarvestOps().detect_divergence(repo, "main")
+        assert result["diverged"] is True, result
+        assert result["origin_head"] is None
+
+    def test_missing_local_head_is_conservative(self, tmp_path: Path) -> None:
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = tmp_path / "empty"
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        result = DefaultHarvestOps().detect_divergence(repo, "main")
+        assert result["diverged"] is True, result
+        assert result["local_head"] is None
 
 
 class TestUnresolvableEvent:
