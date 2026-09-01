@@ -477,6 +477,11 @@ class Scheduler:
             # observer's E3 scan reads it off this same record, so the fault
             # event costs no extra file read.
             "pump_fault": record.get("pump_fault"),
+            # G1: the goal.md content_revision the line actually consumed at its
+            # last coordinator round -- the parking baseline. Also finalise's own
+            # mechanical hash, never prose. Absent on old/anomalous terminals:
+            # the scheduler then fails open rather than locking the line.
+            "goal_revision": record.get("goal_revision"),
         }
 
     def _line_for(self, folder_id: str) -> LineSpec | None:
@@ -937,14 +942,31 @@ class Scheduler:
         try:
             if self.wake is None:
                 raise RuntimeError("scheduler has no wake signals configured")
-            revision = self.wake.goal_revision(line.folder_id)
+            # G1: the parking baseline is the goal revision the line actually
+            # *consumed*, read off its own terminal record -- not the revision
+            # current at this registration moment. Snapshotting the live value
+            # here is exactly the race that silently swallowed a decision: a
+            # goal edit made after the line last read goal.md would be absorbed
+            # into the baseline and the line would never wake. The live probe is
+            # still performed as the anchor availability check (fail-open
+            # discipline), but its value is deliberately not used as the
+            # baseline.
+            self.wake.goal_revision(line.folder_id)
         except Exception as exc:  # fail open, by design: no anchor, no parking
             self._write_stall_state(line.folder_id, state)
             return ParkOutcome(event=f"not_parked:probe_failed:{probe_error_tag(exc)}")
 
+        consumed = record.get("goal_revision")
+        if not consumed:
+            # Old or anomalous terminal with no line-consumed revision: there is
+            # no reliable baseline to park on, so do not park -- plain backoff
+            # keeps the line moving. Never lock a line on a guessed baseline.
+            self._write_stall_state(line.folder_id, state)
+            return ParkOutcome(event="not_parked:no_consumed_revision")
+
         state["parked_run_id"] = run_id
         state["parked_at"] = now
-        state["parked_goal_revision"] = revision
+        state["parked_goal_revision"] = consumed
         state["parked_inbox_available"] = inbox_available
 
         # Ask the board *before* writing anything: the question materialises

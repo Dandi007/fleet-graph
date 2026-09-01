@@ -200,6 +200,8 @@ def write_blocked(tmp_path: Path) -> None:
         "at": BLOCKED_AT,
         "reason": "等监督面拍板",
         "waiting_on": "decision",
+        # G1: matches FakeWake's live revision so an unedited goal parks.
+        "goal_revision": "sha256:rev-1",
     }
     path = tmp_path / "runs" / FOLDER_ID / "terminal.json"
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -84,6 +84,7 @@ class FakeArtifacts:
         pump_fault: bool = False,
         waiting_on: str = "none",
         waiting_on_declared: str | None = None,
+        goal_revision: str | None = None,
     ) -> str:
         self.terminal = {
             "terminal": terminal,
@@ -91,6 +92,7 @@ class FakeArtifacts:
             "reason": reason,
             "waiting_on": waiting_on,
             "waiting_on_declared": waiting_on_declared,
+            "goal_revision": goal_revision,
         }
         return "terminal.json"
 
