@@ -85,12 +85,23 @@ def build_research_mcp_server(wiki_root: str | None = None) -> Any:
         if not question or not str(question).strip():
             refuse("question is required")
         try:
+            from fleet_graph.research_coldstart import LAUNCH_ENTRY_MCP, mcp_launch_argv
+
             return run_research_ticket(
                 str(question),
                 tier=tier,
                 scale=scale,
                 run_root=Path(run_root) if run_root else None,
                 wiki_root=wiki_root,
+                # R8 判据 ①：MCP 无 sys.argv 语义，落 tool 真实调用签名 + entry=mcp，
+                # 不得用 CLI canonical 重建值冒充。
+                launch_argv=mcp_launch_argv(
+                    str(question),
+                    tier=tier,
+                    scale=scale,
+                    run_root=Path(run_root) if run_root else None,
+                ),
+                launch_entry=LAUNCH_ENTRY_MCP,
             )
         except Exception as exc:
             raise ToolError(

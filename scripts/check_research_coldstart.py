@@ -146,7 +146,13 @@ def run_real_coldstart(tmp: Path, name: str) -> tuple[Path, Path]:
 
     返回 (run_root, wiki_root)。判据脚本只发这一条 ticket，不向 run 注入任何
     题目相关提示/预设线索（seed 线索由 fake text node 的 pipeline 内部产出）。
+
+    R8 判据 ① 记录**真实** argv：DoD 语义是「一条命令 CLI 冷启动」，故这里按
+    ``canonical_launch_argv(QUESTION)`` 传真实发起 argv + entry=cli（即本次冷启动
+    「实际是怎么被发起的」），不再让 ``run_research_ticket`` 内部用重建值冒充。
     """
+    from fleet_graph.research_coldstart import LAUNCH_ENTRY_CLI, canonical_launch_argv
+
     run_root = tmp / name
     wiki = tmp / f"{name}-wiki"
     launcher = FakeLauncher(state_root=run_root / "agent-runs")
@@ -156,6 +162,8 @@ def run_real_coldstart(tmp: Path, name: str) -> tuple[Path, Path]:
         wiki_root=wiki,
         text_node=FakeTextNode(),
         launcher=launcher,
+        launch_argv=canonical_launch_argv(QUESTION),
+        launch_entry=LAUNCH_ENTRY_CLI,
     )
     if result.get("terminal") not in {"converged", "capped", "partial"}:
         raise AssertionError(

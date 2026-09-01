@@ -42,6 +42,13 @@ from fleet_graph.research_entry import DEEP_THOUGHT_DIR, topic_slug
 #: 判据脚本机械记录 CLI argv 的落点（run root 下的 ``launch.json``）。
 LAUNCH_RECORD = "launch.json"
 
+#: 入口种类词汇（R8 判据 ① 真实 argv 落地约定）：CLI（进程真实 sys.argv）、
+#: MCP tool（真实 tool 调用签名）、程序内调用（skill / 测试，真实调用签名）。
+#: ``launch.json`` 用显式 ``entry`` 字段标明入口种类，绝不用 canonical 重建值冒充。
+LAUNCH_ENTRY_CLI = "cli"
+LAUNCH_ENTRY_MCP = "mcp"
+LAUNCH_ENTRY_IN_PROCESS = "in_process"
+
 #: 冷读 subagent 的机器可判 verdict 词汇。
 COLDREAD_PASS = "PASS"
 COLDREAD_FAIL = "FAIL"
@@ -77,18 +84,25 @@ def canonical_launch_argv(question: str) -> list[str]:
     return ["fleet-graph", "research", "run", "--question", question]
 
 
-def record_launch_argv(run_root: Path | str, argv: list[str]) -> Path:
-    """判据脚本机械记录 CLI argv（判据 ①）：落 ``run_root/launch.json``。"""
+def record_launch_argv(
+    run_root: Path | str, argv: list[str], *, entry: str = LAUNCH_ENTRY_CLI
+) -> Path:
+    """判据脚本机械记录**真实** argv（判据 ①）：落 ``run_root/launch.json``。
+
+    ``entry`` 用显式字段标明入口种类（``cli`` / ``mcp`` / ``in_process``），
+    绝不用 canonical 重建值冒充。调用点负责传「这次实际是怎么被发起的」：CLI 传
+    ``sys.argv``，MCP / 程序内调用传各自入口的真实调用签名。
+    """
     run_root = Path(run_root)
     run_root.mkdir(parents=True, exist_ok=True)
     path = run_root / LAUNCH_RECORD
     with path.open("w", encoding="utf-8") as handle:
-        json.dump({"argv": list(argv)}, handle, ensure_ascii=False, indent=2)
+        json.dump({"entry": entry, "argv": list(argv)}, handle, ensure_ascii=False, indent=2)
     return path
 
 
-def load_launch_argv(run_root: Path | str) -> list[str] | None:
-    """读回机械记录的 CLI argv；缺失/畸形返回 None。"""
+def load_launch_record(run_root: Path | str) -> dict[str, Any] | None:
+    """读回 ``launch.json`` 的完整记录（``entry`` + ``argv``）；缺失/畸形返回 None。"""
     path = Path(run_root) / LAUNCH_RECORD
     if not path.is_file():
         return None
@@ -96,26 +110,75 @@ def load_launch_argv(run_root: Path | str) -> list[str] | None:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    argv = data.get("argv") if isinstance(data, dict) else None
-    return list(argv) if isinstance(argv, list) else None
+    if not isinstance(data, dict):
+        return None
+    argv = data.get("argv")
+    if not isinstance(argv, list):
+        return None
+    entry = data.get("entry", LAUNCH_ENTRY_CLI)
+    if not isinstance(entry, str) or entry not in {
+        LAUNCH_ENTRY_CLI,
+        LAUNCH_ENTRY_MCP,
+        LAUNCH_ENTRY_IN_PROCESS,
+    }:
+        entry = LAUNCH_ENTRY_CLI
+    return {"entry": entry, "argv": list(argv)}
+
+
+def load_launch_argv(run_root: Path | str) -> list[str] | None:
+    """读回机械记录的真实 argv；缺失/畸形返回 None。"""
+    record = load_launch_record(run_root)
+    return record["argv"] if record is not None else None
+
+
+def load_launch_entry(run_root: Path | str) -> str | None:
+    """读回入口种类；缺失/畸形返回 None。"""
+    record = load_launch_record(run_root)
+    return record["entry"] if record is not None else None
+
+
+def _launch_shape_matches(argv: list[str] | None, question: str) -> bool:
+    """判据 ① 形状约束：唯一入口、一条命令、无题目相关注入。
+
+    argv 形如 ``[<程序名>, "research", "run", "--question", <question>]``：
+    - ``argv[1:3]`` 逐字是唯一入口 ``research run``（不认其它子命令 / 多命令）；
+    - ``argv[3]`` 逐字是 ``--question``（题目只能经该参数进入，无预设/提示注入）；
+    - ``argv[4]`` 逐字等于题目；
+    - 恰好 5 段（argv[0] 程序名 + 4 段命令），无任何额外 flag / 注入参数。
+    """
+    if not isinstance(argv, list) or not argv:
+        return False
+    if not all(isinstance(tok, str) for tok in argv):
+        return False
+    return (
+        len(argv) == 5
+        and argv[1:3] == ["research", "run"]
+        and argv[3] == "--question"
+        and argv[4] == question
+    )
 
 
 def judge_launch_command(
-    argv: list[str] | None, question: str, historical: frozenset[str] = HISTORICAL_QUESTIONS
+    argv: list[str] | None,
+    question: str,
+    historical: frozenset[str] = HISTORICAL_QUESTIONS,
+    entry: str = LAUNCH_ENTRY_CLI,
 ) -> tuple[bool, dict[str, Any]]:
     """判据 ①：发起命令原文在案 + 全新题目。
 
-    - ``argv`` 逐字等于唯一入口的 canonical argv（单条命令、无任何预设/提示注入）；
+    - 只认唯一 CLI 入口的**真实** argv 形状（``research run --question <q>``，
+      单条命令、无题目相关注入；非 CLI 入口经 ``entry`` 显式标注，不得冒充）；
     - 题目非空且不在历史题目集（复用历史证据/题目 = 判红，防假阴）。
     """
     canonical = canonical_launch_argv(question)
-    exact = list(argv or []) == canonical
+    shape_ok = entry == LAUNCH_ENTRY_CLI and _launch_shape_matches(argv, question)
     fresh = bool(question.strip()) and question not in historical
-    ok = exact and fresh
+    ok = shape_ok and fresh
     verdict: dict[str, Any] = {
         "argv": argv,
         "canonical": canonical,
-        "exact": exact,
+        "entry": entry,
+        "exact": shape_ok,
         "fresh": fresh,
         "pass": ok,
     }
@@ -286,15 +349,19 @@ def judge_coldstart(
     question: str,
     wiki_root: Path | str | None = None,
     argv: list[str] | None = None,
+    entry: str | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """五件套综合判定：①-⑤ 全绿才绿（任一判红即整体红）。"""
     run_root = Path(run_root)
     if argv is None:
         # 判据 ① 只认真实 pipeline 机械记录（run_research_ticket 落 launch.json）。
         # 缺失 launch.json = 该 run 不是经唯一入口发起，不得自动通过（防空转放行）。
-        argv = load_launch_argv(run_root)
+        record = load_launch_record(run_root)
+        if record is not None:
+            argv = record["argv"]
+            entry = record["entry"]
 
-    ok1, v1 = judge_launch_command(argv, question)
+    ok1, v1 = judge_launch_command(argv, question, entry=entry or LAUNCH_ENTRY_CLI)
     ok2, v2 = judge_evidence_chain(run_root)
     ok3, v3 = judge_report_placed(run_root, question, wiki_root=wiki_root)
     ok4, v4 = judge_anchor(run_root)
@@ -311,17 +378,74 @@ def judge_coldstart(
     return ok, verdict
 
 
+def in_process_launch_argv(
+    question: str,
+    *,
+    tier: str | None = None,
+    scale: int | None = None,
+    run_root: Path | str | None = None,
+    max_clues: int | None = None,
+    concurrency: int | None = None,
+    generation: int | None = None,
+) -> list[str]:
+    """程序内调用入口的真实调用签名（判据 ①，entry=``in_process``）。
+
+    不是 CLI argv、也不是 canonical 重建值：如实反映「这次程序内是怎么调用
+    ``run_research_ticket`` 的」（唯一入口名 + 题目 + 显式覆盖的路由参数）。
+    """
+    parts = ["run_research_ticket", f"question={question}"]
+    if tier is not None:
+        parts.append(f"tier={tier}")
+    if scale is not None:
+        parts.append(f"scale={scale}")
+    if run_root is not None:
+        parts.append(f"run_root={run_root}")
+    if max_clues is not None:
+        parts.append(f"max_clues={max_clues}")
+    if concurrency is not None:
+        parts.append(f"concurrency={concurrency}")
+    if generation is not None:
+        parts.append(f"generation={generation}")
+    return parts
+
+
+def mcp_launch_argv(
+    question: str,
+    *,
+    tier: str | None = None,
+    scale: int | None = None,
+    run_root: Path | str | None = None,
+) -> list[str]:
+    """MCP tool 入口的真实调用签名（判据 ①，entry=``mcp``）。
+
+    MCP surface 没有 ``sys.argv`` 语义，如实落 tool 名 + 实际传入的参数，
+    不得用 CLI canonical 重建值冒充。
+    """
+    parts = ["research_run", f"question={question}"]
+    if tier is not None:
+        parts.append(f"tier={tier}")
+    if scale is not None:
+        parts.append(f"scale={scale}")
+    if run_root is not None:
+        parts.append(f"run_root={run_root}")
+    return parts
+
+
 __all__ = [
     "ANCHOR_CHECK_FILE",
     "COLDREAD_FAIL",
     "COLDREAD_PASS",
     "HISTORICAL_QUESTIONS",
+    "LAUNCH_ENTRY_CLI",
+    "LAUNCH_ENTRY_IN_PROCESS",
+    "LAUNCH_ENTRY_MCP",
     "LAUNCH_RECORD",
     "MIN_COLDREAD_BODY_LINES",
     "canonical_launch_argv",
     "check_run",
     "cold_read_report",
     "find_placed_reports",
+    "in_process_launch_argv",
     "judge_anchor",
     "judge_cold_read",
     "judge_coldstart",
@@ -329,5 +453,8 @@ __all__ = [
     "judge_launch_command",
     "judge_report_placed",
     "load_launch_argv",
+    "load_launch_entry",
+    "load_launch_record",
+    "mcp_launch_argv",
     "record_launch_argv",
 ]
