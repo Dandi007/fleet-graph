@@ -69,3 +69,26 @@ class TestFaultBoundary:
         assert terminal["terminal"] == "done"
         assert terminal["log_path"] == str(log_path)
         assert "exception_class" not in terminal
+
+    def test_metrics_are_flushed_to_the_textfile_even_on_a_fault(self, tmp_path: Path) -> None:
+        """D3 effect side: run_line must render the protocol counters to the
+        line's textfile on the way out -- including the fault path -- so the
+        counters survive the process instead of dying with it (the monitoring
+        gap the spec exists to close)."""
+        from fleet_graph.state.line_metrics import line_metrics_filename
+
+        prom_dir = tmp_path / "prom"
+        config = LineConfig(
+            folder_id="wf-fault",
+            seat="s",
+            run_root=tmp_path / "run",
+            checkpoint_path=":memory:",
+            agent_run_bin=_fake_agent_run(tmp_path),
+            metrics_dir=prom_dir,
+        )
+        with pytest.raises(CoordinatorFault):
+            run_line(config)
+
+        target = prom_dir / line_metrics_filename("wf-fault")
+        assert target.exists(), "run_line must flush line metrics even on a fault"
+        assert target.read_text(encoding="utf-8") == ""
