@@ -60,6 +60,11 @@ CONVERGED = {
     "wf-a08949",
     "wf-40fa8d",
     "wf-7bc4d1",
+    # 2026-09-02 监督面闭卷审计退役（#225）：三条 DoD 逐条真机核验后不复活，
+    # enabled=false 留在名册（名册是编成史实，退役靠开关不靠删行）。
+    "wf-7cd0a7",  # ronin-bus-redesign
+    "wf-c106b9",  # ronin-entry-unify
+    "wf-e7b0dd",  # ronin-e7b0dd
 }
 
 # 2026-08-28 监督面第二波扩编收编：9 候选 8 close/fold、1 enroll。唯一入编
