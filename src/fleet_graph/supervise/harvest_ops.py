@@ -299,6 +299,14 @@ class DefaultHarvestOps:
         冲突失败则尝试 `-X theirs`（以默认分支为主）重跑；仍失败则如实报告
         冲突，绝不强行覆盖。
 
+        **H6 清场协议（冲突重试路径）**：首次 cherry-pick 因冲突返回非零时，
+        worktree 索引会残留 unmerged files（MERGING 态）；若不清场直接重试
+        `-X theirs`，git 恒报 `Cherry-picking is not possible because you
+        have unmerged files`——与「首败是否真冲突可解」无关。因此重试前必须先
+        `git cherry-pick --abort`；abort 非零则兜底 `git reset --merge` 把索引
+        从 MERGING 态恢复干净；清场仍失败则如实返回 ok:false + 机器可读 detail，
+        绝不带病继续（不 reset --hard、不动生产主 checkout）。
+
         cherry-pick 成功后在**同一 worktree** 上做同样的剔除并提交（交付 A.4）：
         按顶层路径剔除 `.dev-dispatch/` 与 `.dd-evidence/` 两棵子树，返回干净
         产品树 tip（`harvest_tip`）——保证随后的 `run_verify` 也跑在干净产品树。
@@ -341,6 +349,25 @@ class DefaultHarvestOps:
                 "ok": False,
                 "detail": (picked.stderr or picked.stdout).strip()[:400],
             }
+        # H6：冲突重试路径必须先在原 worktree 上清场（abort / reset --merge），
+        # 否则首败残留的 unmerged files 会让 -X theirs 重试恒报
+        # "Cherry-picking is not possible because you have unmerged files"。
+        # 清场失败则如实 ok:false + 机器可读 detail，绝不带病继续。
+        aborted = run_git(worktree_root, "cherry-pick", "--abort")
+        if aborted.returncode != 0:
+            reset_merged = run_git(worktree_root, "reset", "--merge")
+            if reset_merged.returncode != 0:
+                self.remove_worktree(repo, worktree_root)
+                return {
+                    "ok": False,
+                    "conflicts": True,
+                    "detail": (
+                        "冲突清场失败（cherry-pick --abort 与 git reset --merge 均非零）: "
+                        + (aborted.stderr or aborted.stdout).strip()[:200]
+                        + " / "
+                        + (reset_merged.stderr or reset_merged.stdout).strip()[:200]
+                    ),
+                }
         retried = run_git(worktree_root, "cherry-pick", "-X", "theirs", head_commit)
         if retried.returncode == 0:
             washed = _strip_dd_subtrees(worktree_root)
