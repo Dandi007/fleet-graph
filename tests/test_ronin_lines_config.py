@@ -107,6 +107,16 @@ ENROLLED = {
     # → U4 自举 e2e（本线为统一入口第一个 dogfood 用户）。原则：统一的是提交不是
     # 点火。goal/spec/golden-order SSoT：wf-c106b9。
     "wf-c106b9",
+    # 2026-09-01 第十一波（用户令「两条都入编，别 hold」）：两条经 U2 入册流水线
+    # 提交的候选线，同批放行。
+    # wf-a6cfea = lexicon（agent 输出文本可读性治理）：入编时 M1 三条判据全红、
+    #   判据脚本尚未存在——判据全红是 goal 线的正常起点，不是 hold 理由；
+    #   首轮须把 verify-m1.sh 补成「存在且诚实报红」。
+    # wf-e6560a = agent-session-mcp（Claude Code 会话检索 MCP）：M1 由 dd 单
+    #   dev-fg-67bf15e27dd2 实现中，本线接手 M2/M3；判据脚本已存在且逐条报 FAIL，
+    #   但打印 FAIL 却 exit 0，首轮修成用退出码说话。
+    "wf-a6cfea",
+    "wf-e6560a",
 }
 
 # 2026-08-29 复活：曾在 MIGRATED 里 enabled=false 停摆的线被用户令重新点亮。
