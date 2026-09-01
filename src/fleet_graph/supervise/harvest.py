@@ -15,7 +15,11 @@ SOP（spec 交付 B）逐节点实现，全部是 script 节点（机械判定�
 5. `worktree`     —— 独立 worktree cherry-pick 产品 commit，冲突消解（即兴），
                     并洗掉 `.dev-dispatch/` / `.dd-evidence/` 两棵 dd 协议子树
                     得到干净产品树 tip（harvest_tip）。
-6. `verify`       —— 在 worktree 跑全量套件（make verify），记 exit code。
+6. `verify`       —— 在 worktree 跑全量套件。verify argv 按目标仓解析（交付
+                   A.1：根目录 Makefile 含 verify 目标 -> make verify；无 Makefile
+                   但 pyproject.toml / uv.lock -> repo-canonical 全量套件
+                   uv run pytest -q），解析不到可执行指令 -> ok:false + 机器可读
+                   detail（no resolvable verify command）-> escalated（交付 A.2）。
 7. `cleanup_worktree` —— verify 之后移除一次性 worktree（harvest_ops 成功路径
    保留 worktree 供 verify 使用，见 rc-702098ab）。
 8. `pr_merge`     —— 用干净产品树 tip（harvest_tip，已剔除 .dev-dispatch/.dd-evidence）
@@ -70,7 +74,10 @@ OUTCOME_ESCALATED = "escalated"
 #: 默认分支名（spec 用词）。可用 config 覆盖。
 DEFAULT_BRANCH = "main"
 
-#: 默认全量套件命令（spec 交付 B SOP「全量套件(make verify)」）。
+#: 历史硬编码默认 verify 指令。交付 A 后不再是全局默认——verify_argv 走按目标仓
+#: 解析（`HarvestOps.resolve_verify_argv`：Makefile 含 verify 目标 -> make verify；
+#: pyproject.toml / uv.lock -> uv run pytest -q）；仅当显式配置且不同于本默认值时
+#: 作为覆盖。supervisor 默认透传的 legacy ["make","verify"] 也被视为「未配置」。
 DEFAULT_VERIFY_ARGV = ["make", "verify"]
 
 #: 写步骤名单（H7 写前闸）：worktree_cherry_pick / run_verify 任一判红后，这些
@@ -128,6 +135,7 @@ class HarvestOps(Protocol):
     ) -> dict[str, Any]: ...
     def remove_worktree(self, repo: Path, worktree_root: Path) -> dict[str, Any]: ...
     def run_verify(self, worktree: Path, argv: list[str]) -> int: ...
+    def resolve_verify_argv(self, worktree: Path) -> tuple[list[str] | None, str]: ...
     def board_card_entity_id(self, development_id: str, dd_root: Path) -> str | None: ...
     def detect_inflight_binding(
         self, tree_path: Path, dd_root: Path, current_development_id: str | None = None
@@ -179,7 +187,7 @@ class HarvestDeps:
     repo: Path | None = None
     default_branch: str = DEFAULT_BRANCH
     deploy_command: list[str] = field(default_factory=list)
-    verify_argv: list[str] = field(default_factory=lambda: list(DEFAULT_VERIFY_ARGV))
+    verify_argv: list[str] | None = None
     verify_real_argv: list[str] = field(default_factory=lambda: list(DEFAULT_VERIFY_ARGV))
     ops: HarvestOps | None = None
     bus: BusClient | None = None
@@ -516,8 +524,44 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "outcome": OUTCOME_REFUSED,
             }
         worktree = deps.thread_dir(_event_of(state).key) / "worktree"
+        # 交付 A.1：verify argv 按目标仓解析，不再全局硬编码 make verify。
+        # 显式配置且非历史硬编码默认 -> 直接覆盖（测试/运维注入）；否则（含
+        # supervisor 默认透传的 legacy ["make","verify"]）走 ops 机械口按目标仓
+        # 自身声明解析——根目录 Makefile 含 verify 目标 -> make verify；无 Makefile
+        # 但 pyproject.toml / uv.lock -> repo-canonical 全量套件（uv run pytest -q）。
+        configured = deps.verify_argv
+        if configured is not None and list(configured) != list(DEFAULT_VERIFY_ARGV):
+            argv = list(configured)
+            detail = ""
+        else:
+            try:
+                argv, detail = deps.ops.resolve_verify_argv(worktree)
+            except Exception as exc:
+                return {
+                    "steps": _record_step(state, "run_verify", ok=False, detail=repr(exc)[:300]),
+                    "verify_exit_code": EXIT_NOT_FOUND,
+                    "outcome": OUTCOME_ESCALATED,
+                    "writes_skipped": list(WRITE_STEPS),
+                }
+            if argv is None:
+                # 交付 A.2：解析不到可执行 verify 指令 -> 如实 ok:false + 机器可读
+                # detail（no resolvable verify command）-> escalated；绝不硬跑
+                # make verify 制造误导性 127。
+                steps = _record_step(
+                    state,
+                    "run_verify",
+                    ok=False,
+                    detail=detail or "no resolvable verify command",
+                    argv=None,
+                )
+                return {
+                    "steps": steps,
+                    "verify_exit_code": EXIT_NOT_FOUND,
+                    "outcome": OUTCOME_ESCALATED,
+                    "writes_skipped": list(WRITE_STEPS),
+                }
         try:
-            exit_code = int(deps.ops.run_verify(worktree, deps.verify_argv))
+            exit_code = int(deps.ops.run_verify(worktree, argv))
         except Exception as exc:
             return {
                 "steps": _record_step(state, "run_verify", ok=False, detail=repr(exc)[:300]),
@@ -525,9 +569,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "outcome": OUTCOME_ESCALATED,
                 "writes_skipped": list(WRITE_STEPS),
             }
-        steps = _record_step(
-            state, "run_verify", ok=exit_code == 0, exit_code=exit_code, argv=deps.verify_argv
-        )
+        steps = _record_step(state, "run_verify", ok=exit_code == 0, exit_code=exit_code, argv=argv)
         if exit_code != 0:
             # H7 写前闸：verify 判红 -> 立即停止链（见 after_verify），不执行
             # 任何写步骤；escalate 收尾时回执显式记录 writes_skipped。
@@ -896,7 +938,7 @@ class HarvestRunConfig:
     repo: Path | None = None
     default_branch: str = DEFAULT_BRANCH
     deploy_command: list[str] = field(default_factory=list)
-    verify_argv: list[str] = field(default_factory=lambda: list(DEFAULT_VERIFY_ARGV))
+    verify_argv: list[str] | None = None
     verify_real_argv: list[str] = field(default_factory=lambda: list(DEFAULT_VERIFY_ARGV))
     allowlist: HarvestAllowlist = field(default_factory=HarvestAllowlist.default)
     ops: HarvestOps | None = None
@@ -921,7 +963,7 @@ def build_harvest(config: HarvestRunConfig) -> tuple[Any, HarvestDeps, Superviso
         repo=config.repo,
         default_branch=config.default_branch,
         deploy_command=list(config.deploy_command),
-        verify_argv=list(config.verify_argv),
+        verify_argv=None if config.verify_argv is None else list(config.verify_argv),
         verify_real_argv=list(config.verify_real_argv),
         ops=config.ops or DefaultHarvestOps(),
         bus=config.bus,
