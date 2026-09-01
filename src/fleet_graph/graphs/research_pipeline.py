@@ -108,8 +108,11 @@ DEFAULT_SOURCE: str = DEFAULT_SOURCES[0]
 # - debater input deep-research.debater-input/v1：{question, evidences[{anchor,quote,
 #   claim,clue_id?}], prior_arguments[]}
 # - debater output dr-doc.result.v1：{body}
-# - arbiter input deep-research.arbiter-input/v1：{question, board_stats,
-#   clue_titles[], recent_claims[], recent_rounds}
+# - arbiter input deep-research.arbiter-input/v1：{question, board_stats{
+#   clues_total, clues_explored, clues_pending, clues_dropped, evidence_total,
+#   zero_growth_rounds, rounds_elapsed}, clue_titles[{clue_id,title,status?,depth?}],
+#   recent_claims[{claim,clue_id?,round?}]}（rounds 并入 board_stats.rounds_elapsed，
+#   不再有顶层 recent_rounds）
 # - arbiter output dr-arbiter.result.v1：{verdict∈{enough,continue}, rationale}
 # role 声明 protocol.input 后 agent-run 强制要求 --input，缺了直接 CONTRACT_ERROR，
 # 所以 dispatch / debate 四角色必须为每个 run 落 input 文件并传 spec.input_path。
@@ -1060,12 +1063,29 @@ def _converge_node(deps: ResearchDeps):
     return converge_node
 
 
+def _debater_evidence(entry: dict[str, Any], finding: dict[str, Any]) -> dict[str, Any]:
+    """debater-input.v1 的 evidences 条目：{anchor, quote, claim[, clue_id]}。
+
+    可选键 clue_id 值为 None 时整键省略（不发 null）——契约把它标成可选，就是
+    允许它不存在；null 一律不合法（None is not of type 'string'）。
+    """
+    out: dict[str, Any] = {
+        "anchor": finding_anchor(finding),
+        "quote": finding.get("quote", ""),
+        "claim": finding.get("claim", ""),
+    }
+    clue_id = entry.get("clue_id")
+    if clue_id is not None:
+        out["clue_id"] = clue_id
+    return out
+
+
 def _load_evidences(run_root: Path) -> list[dict[str, Any]]:
     """读 evidence.jsonl 的 finding 形状（R4：复用既有协议，不新增中间协议）。
 
     返回 debater-input.v1 的 evidences 形状 {anchor, quote, claim, clue_id?}：
     anchor 复用 research_bus.finding_anchor（source@locator），quote/claim 原样，
-    clue_id 取 entry 的归属线索 id。
+    clue_id 取 entry 的归属线索 id（缺失时整键省略，不发 null）。
     """
     path = run_root / EVIDENCE_FILE
     if not path.is_file():
@@ -1076,14 +1096,34 @@ def _load_evidences(run_root: Path) -> list[dict[str, Any]]:
             continue
         entry = json.loads(line)
         finding = entry.get("finding") or {}
-        out.append(
-            {
-                "anchor": finding_anchor(finding),
-                "quote": finding.get("quote", ""),
-                "claim": finding.get("claim", ""),
-                "clue_id": entry.get("clue_id"),
-            }
-        )
+        out.append(_debater_evidence(entry, finding))
+    return out
+
+
+def _arbiter_clue_title(clue: dict[str, Any], title: str) -> dict[str, Any]:
+    """arbiter-input.v1 的 clue_titles 条目：{clue_id, title[, status, depth]}。
+
+    可选键 status / depth 值为 None 时整键省略（不发 null）——同 _debater_evidence。
+    """
+    out: dict[str, Any] = {"clue_id": clue["id"], "title": title}
+    status = clue.get("status")
+    if status is not None:
+        out["status"] = status
+    depth = clue.get("depth")
+    if depth is not None:
+        out["depth"] = depth
+    return out
+
+
+def _arbiter_recent_claim(ev: dict[str, Any]) -> dict[str, Any]:
+    """arbiter-input.v1 的 recent_claims 条目：{claim[, clue_id]}。
+
+    可选键 clue_id 值为 None 时整键省略（不发 null）——同 _debater_evidence。
+    """
+    out: dict[str, Any] = {"claim": ev["claim"]}
+    clue_id = ev.get("clue_id")
+    if clue_id is not None:
+        out["clue_id"] = clue_id
     return out
 
 
@@ -1203,27 +1243,37 @@ def _arbiter_node(deps: ResearchDeps):
         clues = state.get("clues", [])
         statuses = [c.get("status") for c in clues]
         done_clues = [c for c in clues if c["status"] == CLUE_DONE]
+        evidences = _load_evidences(deps.run_root)
+        # deep-research.arbiter-input/v1（arbiter-input.v1.json）的 board_stats：
+        # 允许键 = clues_total / clues_explored / clues_pending / clues_dropped /
+        # evidence_total / evidence_added_last_round / zero_growth_rounds /
+        # rounds_elapsed，且 additionalProperties:false。rounds 并入
+        # board_stats.rounds_elapsed，不再作为顶层 recent_rounds 发出。
         board_stats = {
-            "total": len(statuses),
-            "done": statuses.count(CLUE_DONE),
-            "blocked": statuses.count(CLUE_BLOCKED),
-            "open": statuses.count(CLUE_OPEN),
+            "clues_total": len(statuses),
+            "clues_explored": statuses.count(CLUE_DONE),
+            "clues_pending": statuses.count(CLUE_OPEN),
+            "clues_dropped": statuses.count(CLUE_BLOCKED),
+            "evidence_total": len(evidences),
+            "zero_growth_rounds": state.get("zero_growth_rounds", 0),
+            "rounds_elapsed": state.get("rounds", 0),
         }
-        clue_titles = [_read_clue_query(deps.run_root, c["id"]) for c in done_clues]
-        recent_claims = [ev["claim"] for ev in _load_evidences(deps.run_root)]
+        clue_titles = [
+            _arbiter_clue_title(c, _read_clue_query(deps.run_root, c["id"])) for c in done_clues
+        ]
+        recent_claims = [_arbiter_recent_claim(ev) for ev in evidences]
         recent_rounds = state.get("rounds", 0)
         input_payload = {
             "question": question,
             "board_stats": board_stats,
             "clue_titles": clue_titles,
             "recent_claims": recent_claims,
-            "recent_rounds": recent_rounds,
         }
         corpus = ARBITER_PROMPT.format(
             question=question,
             board_stats=json.dumps(board_stats, ensure_ascii=False),
-            clue_titles=", ".join(clue_titles) or "（无）",
-            recent_claims=", ".join(recent_claims) or "（无）",
+            clue_titles=", ".join(t["title"] for t in clue_titles) or "（无）",
+            recent_claims=", ".join(c["claim"] for c in recent_claims) or "（无）",
             recent_rounds=recent_rounds,
         )
 
@@ -1534,7 +1584,10 @@ __all__ = [
     "ResearchDeps",
     "ResearchState",
     "_anchor_check_node",
+    "_arbiter_clue_title",
+    "_arbiter_recent_claim",
     "_assemble_report",
+    "_debater_evidence",
     "_extract_judge_disagreements",
     "build_research_graph",
     "converge",
