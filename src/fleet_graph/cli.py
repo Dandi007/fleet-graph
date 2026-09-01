@@ -131,6 +131,17 @@ def _line_run(args: argparse.Namespace) -> int:
             # on, not something to silently degrade to "not declared".
             raise SystemExit(f"--acceptance-json is not a valid declaration: {exc}") from exc
 
+    # M5: the revival envelope arrives as one JSON argument from the scheduler's
+    # launcher. An unreadable envelope is an operator error worth stopping on.
+    revival = None
+    if args.revival:
+        try:
+            revival = json.loads(args.revival)
+        except (ValueError, TypeError) as exc:
+            raise SystemExit(f"--revival is not a valid JSON object: {exc}") from exc
+        if not isinstance(revival, dict):
+            raise SystemExit("--revival must be a JSON object")
+
     # E4a: the orchestration layer runs wf_resume at generation start and
     # injects the mechanical result into every coordinator round. A BROKEN
     # folder stops the line (the house rule); a transport/protocol failure is
@@ -160,6 +171,11 @@ def _line_run(args: argparse.Namespace) -> int:
         acceptance=acceptance,
         resume_verification=resume_verification_facts,
         board_card_entity_id=args.board_card or "",
+        # M5: the revival envelope threaded through from the scheduler's launcher
+        # (`--revival`, one JSON argument) for a line whose `done` terminal a
+        # valid revoke overturned. An unreadable envelope is an operator error
+        # worth stopping on, not something to silently drop.
+        revival=revival,
     )
     result = run_line(config, run_id=args.run_id)
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
@@ -284,6 +300,150 @@ def _line_set_seat(args: argparse.Namespace) -> int:
     print(
         f"set-seat: {result['folder_id']} {result['from']} -> {result['to']} "
         f"(next launch as generation {result['generation']})",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def perform_line_revive(
+    *,
+    folder_id: str,
+    who: str,
+    basis: str,
+    lines_config: pathlib.Path,
+    run_root: pathlib.Path | None = None,
+    generation: int | None = None,
+    run_id: str | None = None,
+    reason: str | None = None,
+    checkpoints: Any = None,
+    clock: Any = time.time,
+) -> dict[str, Any]:
+    """The line-revive operation, as a plain function so tests can drive it.
+
+    M5's first-class revival entry. Two gates, both mandatory, before anything
+    is written:
+
+    1. **C1 precheck** -- the target line's current checkpoint-authoritative
+       terminal must really be ``done``, and the given ``--generation`` (or
+       ``--run-id``) must match that checkpoint record. Any mismatch is a
+       refusal (`refused: target not terminal_done` / `refused: generation
+       mismatch`) and nothing is written or bumped.
+    2. **C1 write** -- the revoke record must carry who/basis/generation/when;
+       ``validate_revive`` refuses a record missing any of them before it
+       reaches disk.
+
+    Only after both pass is the revoke record written and the persisted
+    generation bumped, so the next scheduler launch cold-starts on a fresh
+    thread (the old `done` thread is spent -- see daemon.py).
+    """
+    from fleet_graph.scheduler.checkpoint_terminal import SqliteCheckpointTerminalReader
+    from fleet_graph.scheduler.daemon import (
+        SchedulerConfig,
+        bump_line_generation,
+        stalled_generation,
+    )
+    from fleet_graph.scheduler.revive import ReviveStore, validate_revive
+    from fleet_graph.state.run_artifacts import iso
+
+    if not folder_id:
+        raise SystemExit("line revive needs a folder_id")
+    if not who:
+        raise SystemExit("line revive needs --who: a revoke without an operator is not auditable")
+    if not basis:
+        raise SystemExit(
+            "line revive needs --basis: a revoke without a mechanical reference "
+            "(goal.md ruling id / board decision id / message reference) is not auditable"
+        )
+    if generation is None and run_id is None:
+        raise SystemExit(
+            "line revive needs --generation or --run-id: a revoke must name the "
+            "generation (or run id) of the `done` terminal it overturns"
+        )
+
+    config = SchedulerConfig.from_json(pathlib.Path(lines_config))
+    line = next((entry for entry in config.lines if entry.folder_id == folder_id), None)
+    if line is None:
+        raise SystemExit(
+            f"line revive refused: {folder_id} is not in the roster at {lines_config}; "
+            "a revoke needs a roster line to name the generation base"
+        )
+
+    effective_run_root = pathlib.Path(run_root) if run_root is not None else config.run_root
+    reader = checkpoints or SqliteCheckpointTerminalReader(effective_run_root)
+    current_generation = stalled_generation(effective_run_root, folder_id, line.generation)
+
+    # C1 precheck: the current checkpoint-authoritative terminal must be `done`,
+    # and the recorded generation must match where that `done` lives. Walk the
+    # same (current, previous) pair the daemon reads, so the CLI and the daemon
+    # can never disagree about which terminal a revoke refers to.
+    done_generation: int | None = None
+    done_record: dict[str, Any] | None = None
+    for candidate in (current_generation, current_generation - 1):
+        if candidate < 1:
+            continue
+        reading = reader.read(folder_id, candidate)
+        if reading.fault is not None:
+            break
+        if reading.authoritative:
+            record = reading.record
+            if record is not None and record.get("terminal") == "done":
+                done_generation = candidate
+                done_record = record
+            break
+    if done_generation is None:
+        raise SystemExit(
+            f"line revive refused: target not terminal_done: {folder_id} is not 'done' "
+            "in its current checkpoint (revival is only legal against a done terminal)"
+        )
+    if generation is not None and generation != done_generation:
+        raise SystemExit(
+            f"line revive refused: generation mismatch: --generation {generation} does not "
+            f"match the checkpoint's done terminal at generation {done_generation}"
+        )
+    if run_id is not None and done_record is not None and done_record.get("run_id") != run_id:
+        raise SystemExit(
+            f"line revive refused: generation mismatch: --run-id {run_id!r} does not match "
+            f"the checkpoint's done terminal run_id {done_record.get('run_id')!r}"
+        )
+
+    when = iso(clock())
+    record = validate_revive(
+        {
+            "folder_id": folder_id,
+            "who": who,
+            "basis": basis,
+            "generation": done_generation,
+            "when": when,
+            "reason": reason or "",
+        }
+    )
+    ReviveStore(effective_run_root).write(record)
+    next_generation = bump_line_generation(effective_run_root, folder_id, line.generation)
+    return {
+        **record.as_dict(),
+        "next_generation": next_generation,
+        "run_root": str(effective_run_root),
+    }
+
+
+def _line_revive(args: argparse.Namespace) -> int:
+    """Revive one done goal line, audited, via the revoke surface."""
+    who = args.who or os.environ.get("USER") or "operator"
+    result = perform_line_revive(
+        folder_id=args.folder,
+        who=who,
+        basis=args.basis,
+        generation=args.generation,
+        run_id=args.run_id,
+        reason=args.reason,
+        lines_config=pathlib.Path(args.lines_config),
+        run_root=pathlib.Path(args.run_root) if args.run_root else None,
+    )
+    json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
+    sys.stdout.write("\n")
+    print(
+        f"line revive: {result['folder_id']} revived by {result['who']} on basis "
+        f"{result['basis']!r} (next launch as generation {result['next_generation']})",
         file=sys.stderr,
     )
     return 0
@@ -1211,6 +1371,15 @@ def build_parser() -> argparse.ArgumentParser:
         "anchor is the roster config's PR review, so its visibility in argv "
         "is acceptable; absence means the line records `not_declared`",
     )
+    run.add_argument(
+        "--revival",
+        default=None,
+        help="M5: the revival envelope as one JSON argument "
+        '({"who": ..., "basis": ..., "generation": ..., "reason": ...}) '
+        "threaded through from the scheduler's launcher for a line whose "
+        "`done` terminal a valid revoke overturned. Absent means a normal "
+        "launch with no revival fact",
+    )
     run.set_defaults(func=_line_run)
 
     set_seat = line_sub.add_parser(
@@ -1245,6 +1414,60 @@ def build_parser() -> argparse.ArgumentParser:
         "a production switch without the precheck is not the spec)",
     )
     set_seat.set_defaults(func=_line_set_seat)
+
+    revive = line_sub.add_parser(
+        "revive",
+        help="M5: revive one done goal line -- write a C1-complete revoke "
+        "record (who/basis/generation/when) to the scheduler's persistent "
+        "surface and bump the generation so the next launch cold-starts on a "
+        "fresh thread. Never rewrites terminal.json, never touches the "
+        "checkpoint. Refused unless the line's current checkpoint terminal is "
+        "really `done` at the recorded generation.",
+    )
+    revive.add_argument("folder", help="the goal line's work folder id (wf-...)")
+    revive.add_argument(
+        "--basis",
+        required=True,
+        help="the mechanical reference for the revoke -- a goal.md ruling "
+        "block id, a board decision id, or a message reference, never free "
+        "prose (C1)",
+    )
+    revive.add_argument(
+        "--who",
+        default=None,
+        help="who is overturning the terminal (C1; defaults to $USER)",
+    )
+    revive.add_argument(
+        "--generation",
+        type=int,
+        default=None,
+        help="the generation of the `done` terminal being overturned; must "
+        "match the checkpoint record (or use --run-id instead)",
+    )
+    revive.add_argument(
+        "--run-id",
+        default=None,
+        help="the run id of the `done` terminal being overturned; must match "
+        "the checkpoint record (or use --generation instead)",
+    )
+    revive.add_argument(
+        "--reason",
+        default=None,
+        help="optional prose; never sufficient on its own (C1 -- `basis` is "
+        "the auditable reference)",
+    )
+    revive.add_argument(
+        "--lines-config",
+        default="config/ronin-lines.json",
+        help="the roster SSoT the generation base is read from",
+    )
+    revive.add_argument(
+        "--run-root",
+        default=None,
+        help="override where the revoke surface and stall-state live "
+        "(default the roster's run_root)",
+    )
+    revive.set_defaults(func=_line_revive)
 
     overrides = line_sub.add_parser(
         "overrides",

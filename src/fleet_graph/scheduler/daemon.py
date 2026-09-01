@@ -85,6 +85,7 @@ from fleet_graph.scheduler.probe import (
     MissingProbeCredential,
     UnknownSeat,
 )
+from fleet_graph.scheduler.revive import ReviveRecord, ReviveStore
 from fleet_graph.scheduler.seat_override import (
     ReconcileResult,
     SeatOverrideStore,
@@ -170,6 +171,11 @@ class TickResult:
     seat_roster: str | None = None
     seat_override: str | None = None
     seat_effective: str | None = None
+    #: M5: the applied revoke's observe event, e.g. `revoked:alice:g2`. Filled
+    #: exactly on the tick a valid revoke took effect (the done latch was
+    #: cleared, the generation bumped, the record consumed). Absent otherwise,
+    #: so an inert or absent revoke leaves no "revived" trace.
+    revoke_event: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -178,6 +184,8 @@ class TickResult:
             "refusal": self.decision.refusal.value if self.decision.refusal else None,
             "detail": self.decision.detail,
         }
+        if self.revoke_event is not None:
+            record["revoke"] = self.revoke_event
         if self.seat_effective is not None:
             record["seat_roster"] = self.seat_roster
             record["seat_override"] = self.seat_override
@@ -325,6 +333,7 @@ class Scheduler:
         supervisor: Any = None,
         checkpoints: Any = None,
         seat_overrides: SeatOverrideStore | None = None,
+        revives: ReviveStore | None = None,
     ) -> None:
         self.config = config
         self.prober = prober
@@ -339,6 +348,14 @@ class Scheduler:
         #: can tell a converged override from real drift.
         self.seat_overrides = seat_overrides or SeatOverrideStore(self.config.run_root)
         self._roster_seat = roster_seat_from(config)
+        #: The revoke surface (M5). Defaults to the scheduler's own persistent
+        #: area; tests inject a store pointed at their run root.
+        self.revives = revives or ReviveStore(self.config.run_root)
+        #: Revive records applied this tick, keyed by folder: the revival
+        #: envelope (who/basis/generation/reason) the launcher must thread into
+        #: the next launch's round-1 coordinator input. Reset at the top of
+        #: every tick so a stale revoke can never leak into a later launch.
+        self._pending_revival: dict[str, dict[str, Any]] = {}
         #: Wake facts for parking. None disables parking outright -- the same
         #: fail-open reading as a probe failure: no way to observe wake facts
         #: means no parking, and the line stays on plain backoff.
@@ -522,6 +539,83 @@ class Scheduler:
         value = record.get("terminal")
         return str(value) if value else None
 
+    # --- revival (M5) -----------------------------------------------------
+    #
+    # A `done` terminal is the one state the scheduler treats as final, and E3
+    # made the checkpoint the authority for that reading. M5 adds the dual: a
+    # legitimate revoke record (see scheduler/revive.py) can overturn `done`
+    # for one new-generation cold start. The aggregation lives here, on the
+    # tick path, and only ever acts on a *match* -- the line's current
+    # checkpoint-authoritative terminal must be `done` at exactly the recorded
+    # generation. Anything else (stale, forged, or a line that is not `done`)
+    # is inert: no ignition, no bump, no "revived" trace.
+
+    def _current_done_generation(self, line: LineSpec) -> int | None:
+        """The generation whose checkpoint holds the authoritative `done`, or None.
+
+        Mirrors the terminal walk in `_checkpoint_terminal_reading` (current
+        generation, then the one before it), but answers a narrower question:
+        *where* is the `done` terminal the revoke must match? An authoritative
+        reading that is not `done` returns None -- a revoke may never act on a
+        line whose current checkpoint terminal is anything but `done`.
+        """
+        if self.checkpoints is None:
+            return None
+        generation = self.generation_of(line)
+        for candidate in (generation, generation - 1):
+            if candidate < 1:
+                continue
+            reading = self.checkpoints.read(line.folder_id, candidate)
+            if reading.fault is not None:
+                return None
+            if reading.authoritative:
+                record = reading.record
+                if record is not None and record.get("terminal") == "done":
+                    return candidate
+                return None
+        return None
+
+    def _force_revive_bump(self, line: LineSpec) -> None:
+        """Persist the generation bump a consumed revoke forces.
+
+        `account_last_run` refuses to bump for a `done` terminal (that thread
+        is final), which is exactly why the revoke path must bump *outside*
+        it: the next launch after an overturn needs a fresh thread, and the
+        bump must survive a daemon restart like every other generation fact.
+        """
+        current = self.generation_of(line)
+        state = self.stall_state(line.folder_id)
+        state["generation"] = self._next_generation(current, "done", revoked=True)
+        self._write_stall_state(line.folder_id, state)
+
+    def _revive_outcome(self, line: LineSpec) -> tuple[bool, str | None, ReviveRecord | None]:
+        """Does a valid revoke apply to this line this tick?
+
+        Returns ``(revived, event, record)``:
+
+        - ``(False, None, None)`` when there is no active revoke, or the
+          active one does not *match* the current checkpoint `done` terminal
+          (wrong generation, or the line is not `done`). Inert: nothing is
+          bumped, nothing is consumed, no "revived" trace is left.
+        - ``(True, "revoked:<who>:g<gen>", record)`` when a valid revoke
+          matches: the record is consumed (moved to the append-only history so
+          it can never re-fire) and the generation is forced to bump. The
+          caller passes `revived=True` into `decide` so the done latch is
+          cleared for this tick, and threads the record into the launch.
+        """
+        record = self.revives.get(line.folder_id)
+        if record is None:
+            return False, None, None
+        done_generation = self._current_done_generation(line)
+        if done_generation is None:
+            return False, None, None
+        if record.generation != done_generation:
+            return False, None, None
+        self.revives.consume(line.folder_id)
+        self._force_revive_bump(line)
+        event = f"revoked:{record.who}:g{record.generation}"
+        return True, event, record
+
     # --- stall bookkeeping ------------------------------------------------
 
     def _stall_path(self, folder_id: str) -> Path:
@@ -612,7 +706,7 @@ class Scheduler:
             return line.generation
         return max(persisted, line.generation)
 
-    def _next_generation(self, current: int, terminal: Any) -> int:
+    def _next_generation(self, current: int, terminal: Any, *, revoked: bool = False) -> int:
         """One accounted terminal -> the generation the *next* launch needs.
 
         `done` deliberately does not bump: a finished line never re-ignites
@@ -620,7 +714,15 @@ class Scheduler:
         with no launch to serve. Every other terminal (blocked/bounds/fault/
         killed) leaves a spent thread behind, and the next ignition needs a
         fresh one.
+
+        `revoked` is the M5 exception, and it is the *only* exception: when a
+        valid revoke overturns a `done` terminal, the very next launch needs a
+        fresh thread (the old `done` thread is spent -- reviving it routes
+        straight to finalise), so this case must bump rather than `return
+        current`.
         """
+        if revoked:
+            return current + 1
         return current if terminal == "done" else current + 1
 
     def account_last_run(self, folder_id: str, *, base_generation: int = 1) -> int:
@@ -1074,6 +1176,13 @@ class Scheduler:
             board_card_entity_id=str(
                 self.stall_state(line.folder_id)["board_card_entity_id"] or ""
             ),
+            # M5: the revival envelope (who/basis/generation/reason) for a line
+            # whose `done` terminal a valid revoke just overturned. The line
+            # process injects it into the round-1 coordinator input alongside
+            # `prior_terminal` (which still carries the old `done` terminal),
+            # so a revived line can read who overturned it, on what basis, and
+            # which generation was overturned. Absent for a normal launch.
+            revival=self._pending_revival.get(line.folder_id),
         )
 
     def acceptance_json_for(self, line: LineSpec) -> str | None:
@@ -1124,6 +1233,8 @@ class Scheduler:
         # C2/C3: fold converged overrides and print any remaining drift loudly,
         # before status_of/spec_for read the effective seat this tick.
         self.reconcile_overrides()
+        # M5: no revoke applied earlier can leak into this tick's launches.
+        self._pending_revival = {}
 
         for line in self.config.lines:
             # Accounting runs first: a terminal observed this tick must bump
@@ -1132,6 +1243,16 @@ class Scheduler:
             # Disabled lines skip the parking probes: no point spending two
             # network calls on a line decide would refuse anyway.
             park = self.park_state(line, now) if line.enabled else ParkOutcome()
+            # M5: a valid revoke matching this line's `done` terminal clears
+            # the latch, forces the generation bump, and consumes the record.
+            # Disabled lines are not revived either: decide would refuse them
+            # first, and consuming a revoke for a line that cannot launch
+            # would waste the one shot.
+            revived, revoke_event, revive_record = (
+                self._revive_outcome(line) if line.enabled else (False, None, None)
+            )
+            if revive_record is not None:
+                self._pending_revival[line.folder_id] = revive_record.as_dict()
             decision = decide(
                 self.status_of(line),
                 now=now,
@@ -1145,6 +1266,7 @@ class Scheduler:
                 total_cap=self.config.total_cap,
                 cap_window_seconds=self.config.cap_window_seconds,
                 backoff_cap_seconds=self.config.backoff_cap_seconds,
+                revived=revived,
             )
             seat_roster, seat_override, seat_effective = self.seat_triple(line)
             result = TickResult(
@@ -1157,6 +1279,7 @@ class Scheduler:
                 seat_roster=seat_roster,
                 seat_override=seat_override,
                 seat_effective=seat_effective,
+                revoke_event=revoke_event,
             )
             if decision.refusal is Refusal.NO_PROBE:
                 result.probe_detail = self.probe_reasons.get(self.effective_seat_for(line))
@@ -1219,6 +1342,26 @@ def lines_from(entries: Iterable[dict[str, Any]]) -> list[LineSpec]:
     return [LineSpec(**entry) for entry in entries]
 
 
+def stalled_generation(run_root: Path, folder_id: str, base_generation: int) -> int:
+    """The persisted per-line generation, or the roster base when unknown.
+
+    The CLI revive precheck needs the same "what generation is the line on
+    now?" answer the scheduler's ``generation_of`` computes, without building a
+    whole ``Scheduler``. A missing or unreadable stall-state file falls back to
+    the roster base; an unreadable file is never a reason to refuse the revoke
+    precheck itself.
+    """
+    path = Path(run_root) / ".scheduler" / f"{folder_id}.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return base_generation
+        persisted = int(raw.get("generation") or 0)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return base_generation
+    return max(persisted, base_generation)
+
+
 def bump_line_generation(run_root: Path, folder_id: str, base_generation: int) -> int:
     """Persist a generation bump so the next launch is a fresh thread.
 
@@ -1268,4 +1411,5 @@ __all__ = [
     "UnitProbe",
     "bump_line_generation",
     "lines_from",
+    "stalled_generation",
 ]

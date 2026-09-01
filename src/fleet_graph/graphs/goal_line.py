@@ -335,6 +335,12 @@ class LineDeps:
     #: The prior generation's terminal.json content, injected into the round-1
     #: coordinator input when present. None means there was no prior terminal.
     prior_terminal: dict[str, Any] | None = None
+    #: M5: the revival envelope (who/basis/generation/reason) for a line whose
+    #: `done` terminal a valid revoke overturned. Injected into the round-1
+    #: coordinator input alongside `prior_terminal` (which still carries the
+    #: old `done` terminal, so the line can see exactly what was overturned).
+    #: None means a normal launch -- the field is then absent, not guessed.
+    revival: dict[str, Any] | None = None
     #: The process run id that names this line's RunArtifacts. Recorded into
     #: the checkpoint terminal state (E3) so the scheduler can read it through
     #: ``get_state`` instead of ``terminal.json``.
@@ -384,6 +390,8 @@ def _coordinator_input(
         coord_input["resume_verification"] = deps.resume_verification
     if round_no == 1 and deps.prior_terminal is not None:
         coord_input["prior_terminal"] = deps.prior_terminal
+    if round_no == 1 and deps.revival is not None:
+        coord_input["revival"] = deps.revival
     if decision is not None:
         coord_input["decision"] = decision.as_dict()
         coord_input["resume_key"] = decision.resume_key
