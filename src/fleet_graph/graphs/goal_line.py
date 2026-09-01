@@ -257,11 +257,19 @@ class LineMetricsPort(Protocol):
     bounded re-ask (D1). Before this single, these were only discoverable by
     grepping line logs -- the alerting surface stayed silent on all 25 of the
     ``worker turn report malformed`` lines across the fleet.
+
+    ``write_exposition`` is the effect side the *runner* owns: the counters
+    are recorded in memory during ``worker_turn``, and it is the runner's job
+    to render them to the node_exporter textfile once the line run is over
+    (mirrors ``cost_obs``'s ``write_exposition``). The graph never flushes;
+    the runner does, at the end of ``run_line``/``resume_goal_line``.
     """
 
     def record_worker_report_protocol_failure(self, line: str, kind: str) -> None: ...
 
     def record_worker_report_protocol_recovered(self, line: str, kind: str) -> None: ...
+
+    def write_exposition(self) -> Any: ...
 
 
 class Verdict(TypedDict, total=False):

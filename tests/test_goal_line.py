@@ -157,6 +157,9 @@ class FakeLineMetrics:
     def record_worker_report_protocol_recovered(self, line: str, kind: str) -> None:
         self.recovered.append((line, kind))
 
+    def write_exposition(self) -> None:
+        return None
+
 
 def run_line(
     script: list[dict[str, Any]],

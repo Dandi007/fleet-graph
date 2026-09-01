@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -239,6 +240,27 @@ def _build_line_metrics(config: LineConfig) -> LineMetrics | None:
     )
 
 
+def _flush_line_metrics(deps: LineDeps) -> None:
+    """Render the D3 protocol counters to this line's textfile after the run.
+
+    The counters are recorded in memory during ``worker_turn`` (goal_line.py);
+    this is the effect side of D3 -- without it the numbers die with the
+    process and never reach the node_exporter textfile the alerting surface
+    scrapes (the monitoring gap the spec exists to close). Mirrors how
+    ``cost_obs`` calls ``plane.write_exposition()`` at the end of a run
+    (dd_runner.py). Observability must never fail the work it observes: a line
+    not wired to a metrics directory has ``deps.metrics is None`` and flushes
+    nothing, and a failed render is swallowed rather than faulting the line.
+    """
+    metrics = deps.metrics
+    if metrics is None:
+        return
+    with suppress(Exception):
+        # A scrape-side write failure is an observability problem, not a line
+        # failure: the line's outcome is already decided.
+        metrics.write_exposition()
+
+
 def _build_interrupt(config: LineConfig, *, run_id: str = "") -> LineInterruptPort | None:
     """The production E2 interrupt port for one line.
 
@@ -398,6 +420,12 @@ def run_line(config: LineConfig, *, run_id: str | None = None) -> dict[str, Any]
         # exception propagate to a non-zero exit.
         deps.artifacts.write_fault_terminal(exception=exc)
         raise
+    finally:
+        # D3 effect side: render the protocol counters recorded during the run
+        # (including those recorded before a fault) to the line's textfile, so
+        # they reach the node_exporter scrape path instead of dying with the
+        # process.
+        _flush_line_metrics(deps)
     return {
         "folder_id": config.folder_id,
         "terminal": state.get("terminal"),
@@ -419,8 +447,9 @@ def resume_goal_line(config: LineConfig, decision: DecisionInput) -> tuple[dict[
     continuation instead of parking.
     """
     store = GoalInterruptStore(config.run_root).open()
+    deps: LineDeps | None = None
     try:
-        graph, _deps = build_line(config)
+        graph, deps = build_line(config)
         invoke_config: dict[str, Any] = {
             "configurable": {"thread_id": config.thread_id},
             "recursion_limit": config.max_rounds * 8 + 20,
@@ -429,6 +458,11 @@ def resume_goal_line(config: LineConfig, decision: DecisionInput) -> tuple[dict[
             compiled = graph.compile(checkpointer=saver)
             return resume_line(compiled, config=invoke_config, decision=decision, store=store)
     finally:
+        # D3 effect side: render the protocol counters recorded during the
+        # resumed rounds to the line's textfile, exactly as run_line does for
+        # a fresh launch. Only when the line was actually built.
+        if deps is not None:
+            _flush_line_metrics(deps)
         store.close()
 
 
