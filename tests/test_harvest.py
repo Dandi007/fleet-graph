@@ -70,6 +70,7 @@ def fake_ops(
     verify_real_repos: list[Path] = []
     verify_real_heads: list[str | None] = []
     binding_probes: list[dict[str, Any]] = []
+    fetch_remote_urls: list[str | None] = []
     if divergence is None:
         divergence = {
             "diverged": False,
@@ -80,8 +81,11 @@ def fake_ops(
     pr_merge_args: list[dict[str, Any]] = []
 
     class Ops:
-        def fetch_dd_ref(self, repo: Path, development_id: str) -> dict[str, Any]:
+        def fetch_dd_ref(
+            self, repo: Path, development_id: str, remote_url: str | None = None
+        ) -> dict[str, Any]:
             calls.append("fetch_dd_ref")
+            fetch_remote_urls.append(remote_url)
             return {"ok": fetch_ok}
 
         def resolve_canonical_repo(
@@ -186,6 +190,7 @@ def fake_ops(
         "verify_real_heads": verify_real_heads,
         "pr_merge_args": pr_merge_args,
         "binding_probes": binding_probes,
+        "fetch_remote_urls": fetch_remote_urls,
     }
 
 
@@ -1086,7 +1091,7 @@ class TestCanonicalRepoResolution:
         git(canonical, "worktree", "add", "--detach", str(worktree), "main")
 
         allowlist = _canonical_allowlist(canonical)
-        resolved, gaps = _resolve_repo(
+        resolved, gaps, _remote_url = _resolve_repo(
             "dev-x",
             dd_record_root(tmp_path, str(worktree)),
             DefaultHarvestOps(),
@@ -1113,7 +1118,7 @@ class TestCanonicalRepoResolution:
         git(other, "remote", "add", "origin", "https://example.invalid/x.git")
 
         allowlist = _canonical_allowlist(canonical)
-        resolved, gaps = _resolve_repo(
+        resolved, gaps, _remote_url = _resolve_repo(
             "dev-x",
             dd_record_root(tmp_path, str(other), None),
             DefaultHarvestOps(),
@@ -1140,7 +1145,7 @@ class TestCanonicalRepoResolution:
         _init_git_repo(standalone)
 
         allowlist = _canonical_allowlist(canonical)
-        resolved, gaps = _resolve_repo(
+        resolved, gaps, _remote_url = _resolve_repo(
             "dev-x",
             dd_record_root_with_remote_url(
                 tmp_path, str(standalone), "https://example.invalid/x.git"
@@ -1209,7 +1214,7 @@ class TestCanonicalRepoResolution:
         _init_git_repo(other_canon)
 
         allowlist = _canonical_allowlist(other_canon)
-        resolved, gaps = _resolve_repo(
+        resolved, gaps, _remote_url = _resolve_repo(
             "dev-x",
             dd_record_root(tmp_path, str(worktree)),
             DefaultHarvestOps(),
@@ -1225,7 +1230,7 @@ class TestCanonicalRepoResolution:
         lone = tmp_path / "lone"
         _init_git_repo(lone)
         allowlist = _canonical_allowlist(tmp_path / "other")
-        resolved, gaps = _resolve_repo(
+        resolved, gaps, _remote_url = _resolve_repo(
             "dev-x",
             dd_record_root(tmp_path, str(lone)),
             DefaultHarvestOps(),
@@ -1404,7 +1409,12 @@ class TestHarvestCleanTipExcludesDdArtifacts:
         ops.remove_worktree(repo, worktree_root)
 
     def test_wash_is_noop_without_dd_subtrees(self, tmp_path: Path) -> None:
-        """正向回归：不含这两棵子树的普通工单 commit——洗树 no-op，tip 不变。"""
+        """正向回归：不含这两棵子树的普通工单 commit——洗树 no-op（washed=False）。
+
+        cherry-pick 落地的是**新 commit**（固定收割身份 `_commit_env()`，身份
+        不再是 repo 本地 user config 的巧合），但洗树步骤没有 dd 子树可剔——
+        `washed` 必须为 False，harvest_tip 是真实可解析 commit（不凭空造）。
+        """
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
         repo = tmp_path / "repo"
@@ -1420,7 +1430,215 @@ class TestHarvestCleanTipExcludesDdArtifacts:
         result = ops.build_harvest_tip(repo, ticket, "main", tmp_path / "harvest-wt")
         assert result["ok"] is True, result
         assert result["washed"] is False, result
-        assert result["harvest_tip"] == ticket
+        assert result["harvest_tip"], result
+        git(repo, "cat-file", "-e", f"{result['harvest_tip']}^{{commit}}")
+
+
+class TestHarvestGitPlumbingNegatives:
+    """交付 C：M3 收割反应器两处原生 git 缺陷的阴性测试（合成本地仓，禁真网）。
+
+    1. 阴性 A（identity）：合成**无全局 identity 环境**（repo 无 user.name/
+       user.email config、`safe_git_environment` 会清空 GIT_AUTHOR/COMMITTER 并
+       禁用 global config）→ `worktree_cherry_pick` 返回 ok:true、`harvest_tip`
+       非空；对照未修复时必然 `Committer identity unknown`（cherry-pick 落地
+       commit 无 committer identity）。
+    2. 阴性 B（remote_url）：合成 record 其 `remote_url` 为**本地路径**仓、dd
+       ref 只推在该本地仓、`origin` 故意指向不含该 dd ref 的远端 → `fetch_dd_ref`
+       ok:true；对照未修复时 `couldn't find remote ref`（origin 与 remote_url
+       不同源）。
+    3. 反向不抖动：URL remote_url 且 `origin` 同源 → 行为不变（既有路径零回归）；
+       有 identity 环境 → cherry-pick/洗树/冲突重试路径不变。
+    """
+
+    def test_cherry_pick_lands_commit_without_global_identity(self, tmp_path: Path) -> None:
+        """阴性 A（identity）：无全局 identity 下 cherry-pick 仍能落地 commit。
+
+        repo 创建时**不写任何 user.name/user.email config**（conftest `git()`
+        每命令 `-c user.email/name` 仅当次生效、不落库）；`run_git` 走
+        `safe_git_environment()`（清空 GIT_*、禁用 global/system config）——
+        未修复时 `git cherry-pick` 必然 `Committer identity unknown`，修复后
+        `_commit_env()` 提供固定收割身份 -> ok:true。
+        """
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "seed")
+        git(repo, "checkout", "-q", "-b", "feature")
+        (repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "product change")
+        product_commit = head(repo)
+        git(repo, "checkout", "-q", "main")
+
+        # 无全局 identity：repo 本地 config 无 user.name/user.email。
+        local_config = git(repo, "config", "--local", "--list")
+        assert "user.email" not in local_config
+        assert "user.name" not in local_config
+
+        ops = DefaultHarvestOps()
+        worktree_root = tmp_path / "harvest-wt"
+        picked = ops.worktree_cherry_pick(repo, product_commit, "main", worktree_root)
+        assert picked["ok"] is True, picked
+        assert picked["harvest_tip"], picked
+        # harvest_tip 必须是真实可解析 commit（不凭空造）。
+        git(repo, "cat-file", "-e", f"{picked['harvest_tip']}^{{commit}}")
+        # 成功路径 worktree 保留供 run_verify（rc-702098ab）。
+        assert worktree_root.is_dir()
+        ops.remove_worktree(repo, worktree_root)
+        assert not worktree_root.exists()
+
+    def test_cherry_pick_theirs_retry_lands_commit_without_global_identity(
+        self, tmp_path: Path
+    ) -> None:
+        """阴性 A（identity）+ H6 冲突重试：无全局 identity 下 -X theirs 重试也落地 commit。
+
+        纯内容冲突清场后 `-X theirs` 重试同样要新建 commit；未修复时重试的
+        cherry-pick 同样 `Committer identity unknown`。修复后 ok:true。
+        """
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        (repo / "shared.txt").write_text("base\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "seed")
+        git(repo, "checkout", "-q", "-b", "feature")
+        (repo / "shared.txt").write_text("feature\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "product change")
+        product_commit = head(repo)
+        git(repo, "checkout", "-q", "main")
+        (repo / "shared.txt").write_text("main changed\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "main change")
+
+        local_config = git(repo, "config", "--local", "--list")
+        assert "user.email" not in local_config
+        assert "user.name" not in local_config
+
+        ops = DefaultHarvestOps()
+        worktree_root = tmp_path / "harvest-wt"
+        result = ops.worktree_cherry_pick(repo, product_commit, "main", worktree_root)
+        assert result["ok"] is True, result
+        assert result.get("harvest_tip"), result
+        git(repo, "cat-file", "-e", f"{result['harvest_tip']}^{{commit}}")
+        ops.remove_worktree(repo, worktree_root)
+
+    def test_fetch_dd_ref_uses_local_path_remote_url(self, tmp_path: Path) -> None:
+        """阴性 B（remote_url）：dd ref 只推在本地路径 remote_url 仓、origin 无它。
+
+        `origin` 指向另一个**不含**该 dd ref 的 bare 远端（对照未修复时
+        `git fetch origin <dd_ref>` 报 `couldn't find remote ref`）；`remote_url`
+        是本地路径仓且持有 `refs/heads/dd/<dev>`。修复后 fetch 走 remote_url ->
+        ok:true。
+        """
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canon = tmp_path / "canon"
+        _init_git_repo(canon)
+        (canon / "product.txt").write_text("product change\n", encoding="utf-8")
+        git(canon, "add", "-A")
+        git(canon, "commit", "-q", "-m", "product change")
+        product = head(canon)
+
+        # remote_url：本地路径 bare 仓，持有 dd ref。
+        local_remote = tmp_path / "local-remote.git"
+        git(canon, "clone", "--bare", "-q", ".", str(local_remote))
+        git(local_remote, "update-ref", "refs/heads/dd/dev-x", product)
+
+        # origin：另一个 bare 仓，不含该 dd ref（未修复时 fetch 会找不到）。
+        origin = tmp_path / "origin.git"
+        git(canon, "clone", "--bare", "-q", ".", str(origin))
+        git(canon, "remote", "add", "origin", str(origin))
+
+        ops = DefaultHarvestOps()
+        result = ops.fetch_dd_ref(canon, "dev-x", str(local_remote))
+        assert result["ok"] is True, result
+        assert result["ref"] == "refs/heads/dd/dev-x"
+
+    def test_fetch_dd_ref_url_remote_url_matches_origin(self, tmp_path: Path) -> None:
+        """反向不抖动：URL remote_url 且 origin 同源 -> 行为不变（既有路径零回归）。
+
+        `remote_url` 与 `origin` 指向同一本地 bare 仓（URL remote 时
+        remote_url==origin 等价），dd ref 就在该仓 -> fetch ok:true，不因本次
+        修复而回归。
+        """
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canon = tmp_path / "canon"
+        _init_git_repo(canon)
+        (canon / "product.txt").write_text("product change\n", encoding="utf-8")
+        git(canon, "add", "-A")
+        git(canon, "commit", "-q", "-m", "product change")
+        product = head(canon)
+
+        origin = tmp_path / "origin.git"
+        git(canon, "clone", "--bare", "-q", ".", str(origin))
+        git(canon, "remote", "add", "origin", str(origin))
+        git(origin, "update-ref", "refs/heads/dd/dev-x", product)
+
+        ops = DefaultHarvestOps()
+        result = ops.fetch_dd_ref(canon, "dev-x", str(origin))
+        assert result["ok"] is True, result
+        assert result["ref"] == "refs/heads/dd/dev-x"
+
+    def test_fetch_dd_ref_local_path_remote_url_works(self, tmp_path: Path) -> None:
+        """阴性 B（本地路径 remote_url，非 bare 仓）：从本地路径取 dd ref -> ok:true。
+
+        本地路径 remote_url 仓（普通仓，非 bare）持有 `refs/heads/dd/<dev>`；
+        `git fetch <本地路径> <dd_ref>`（或直接解析本地 ref）都能取到 -> ok:true，
+        不依赖 origin、不触真网。
+        """
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canon = tmp_path / "canon"
+        _init_git_repo(canon)
+        local_remote = tmp_path / "local-remote"
+        _init_git_repo(local_remote)
+        (local_remote / "product.txt").write_text("product change\n", encoding="utf-8")
+        git(local_remote, "add", "-A")
+        git(local_remote, "commit", "-q", "-m", "product change")
+        product = head(local_remote)
+        git(local_remote, "update-ref", "refs/heads/dd/dev-x", product)
+
+        ops = DefaultHarvestOps()
+        result = ops.fetch_dd_ref(canon, "dev-x", str(local_remote))
+        assert result["ok"] is True, result
+        assert result["ref"] == "refs/heads/dd/dev-x"
+
+    def test_fetch_dd_ref_without_remote_url_is_fail_closed(self, tmp_path: Path) -> None:
+        """反向不抖动：缺 remote_url 时绝不 fallback origin 猜源 -> ok:false + detail。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canon = tmp_path / "canon"
+        _init_git_repo(canon)
+        ops = DefaultHarvestOps()
+        result = ops.fetch_dd_ref(canon, "dev-x", None)
+        assert result["ok"] is False, result
+        assert "remote_url" in result["detail"]
+
+    def test_orchestration_passes_record_remote_url_to_fetch(self, tmp_path: Path) -> None:
+        """编排层把 record 的 remote_url 透传给 ops.fetch_dd_ref（交付 B.1）。"""
+        fake = fake_ops()
+        repo = repo_path_for(tmp_path)
+        remote_url = str(tmp_path / "remote.git")
+        config = HarvestRunConfig(
+            event=e5_event(),
+            state_root=tmp_path / "supervisor",
+            run_root=tmp_path / "runs",
+            dd_root=dd_record_root_with_remote_url(tmp_path, repo, remote_url),
+            deploy_command=[],
+            allowlist=full_allowlist(repo),
+            ops=fake["ops"],
+            publish_notes=False,
+        )
+        run_harvest(config)
+        assert fake["fetch_remote_urls"] == [remote_url]
 
 
 class TestHarvestPrMergeUsesCleanTip:
@@ -1502,7 +1720,9 @@ class TestHarvestWriteGate:
             ).as_dict(),
             state_root=tmp_path / "supervisor",
             run_root=tmp_path / "runs",
-            dd_root=dd_record_root(tmp_path, str(repo)),
+            dd_root=dd_record_root_with_remote_url(
+                tmp_path, str(repo), str(tmp_path / "origin.git")
+            ),
             deploy_command=[],
             allowlist=full_allowlist(str(repo)),
             ops=DefaultHarvestOps(),
@@ -1539,7 +1759,9 @@ class TestHarvestWriteGate:
             ).as_dict(),
             state_root=tmp_path / "supervisor",
             run_root=tmp_path / "runs",
-            dd_root=dd_record_root(tmp_path, str(repo)),
+            dd_root=dd_record_root_with_remote_url(
+                tmp_path, str(repo), str(tmp_path / "origin.git")
+            ),
             deploy_command=[],
             allowlist=full_allowlist(str(repo)),
             ops=DefaultHarvestOps(),
@@ -1623,7 +1845,7 @@ def _h8_target_fixture(
                 {
                     "development_id": dev,
                     "repo_path": str(target),
-                    "remote_url": "https://example.invalid/x.git",
+                    "remote_url": str(tmp_path / "local-remote.git"),
                 }
             ),
             encoding="utf-8",
