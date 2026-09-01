@@ -17,7 +17,9 @@ SOP（spec 交付 B）逐节点实现，全部是 script 节点（机械判定�
 7. `cleanup_worktree` —— verify 之后移除一次性 worktree（harvest_ops 成功路径
    保留 worktree 供 verify 使用，见 rc-702098ab）。
 8. `pr_merge`     —— PR -> squash merge。
-9. `pull`         —— ff-only pull 默认分支。
+9. `pull`         —— 先机器可读检测本地 HEAD 与 origin 是否分叉；分叉/无法判定 ->
+                   立即 outcome=escalated 并直接走 receipt，绝不 ff_only_pull 带病
+                   继续（H3）；未分叉才 ff-only pull 默认分支。
 10. `deploy`      —— 运行 allowlist 允许的部署命令。
 11. `verify_real` —— 真机 verify，记 exit code。
 12. `evidence`    —— evidence note 挂卡。
@@ -107,6 +109,7 @@ class HarvestOps(Protocol):
     def pr_squash_merge(
         self, repo: Path, development_id: str, head_commit: str, default_branch: str
     ) -> dict[str, Any]: ...
+    def detect_divergence(self, repo: Path, default_branch: str) -> dict[str, Any]: ...
     def ff_only_pull(self, repo: Path, default_branch: str) -> dict[str, Any]: ...
     def deploy(self, command: list[str], repo: Path) -> int: ...
     def verify_real(self, argv: list[str], repo: Path, expected_head: str | None) -> int: ...
@@ -455,8 +458,34 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "outcome": OUTCOME_REFUSED,
             }
         repo = Path(state.get("repo_path") or "")
+        default_branch = state.get("default_branch") or ""
+        # H3：pull 前先机器可读判定「本地 HEAD vs origin」是否分叉。分叉/无法判定
+        # -> 立即 escalate，绝不带病 ff_only_pull（其必然报 Diverging branches
+        # 且链上无恢复路径），也不跑 deploy/verify_real。纯读口，零写原语。
         try:
-            result = deps.ops.ff_only_pull(repo, state.get("default_branch") or "")
+            divergence = deps.ops.detect_divergence(repo, default_branch)
+        except Exception as exc:
+            divergence = {
+                "diverged": True,
+                "local_head": None,
+                "origin_head": None,
+                "detail": f"detect_divergence 异常，按无法判定保守 escalate: {repr(exc)[:300]}",
+            }
+        if divergence.get("diverged"):
+            return {
+                "steps": _record_step(
+                    state,
+                    "ff_only_pull",
+                    ok=False,
+                    escalate="HARVEST_DIVERGED_LOCAL_VS_ORIGIN",
+                    local_head=divergence.get("local_head"),
+                    origin_head=divergence.get("origin_head"),
+                    detail=divergence.get("detail") or "local 与 origin 分叉",
+                ),
+                "outcome": OUTCOME_ESCALATED,
+            }
+        try:
+            result = deps.ops.ff_only_pull(repo, default_branch)
         except Exception as exc:
             return {"steps": _record_step(state, "ff_only_pull", ok=False, detail=repr(exc)[:300])}
         step = {**result, "ok": bool(result.get("ok"))}
@@ -619,6 +648,11 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
     def after_cherry(state: HarvestState) -> str:
         return "worktree" if state.get("outcome") is None else "receipt"
 
+    def after_pull(state: HarvestState) -> str:
+        # H3：pull 前分叉检测命中 -> outcome 已设（escalated）-> 直接 receipt，
+        # 不再跑 deploy/verify_real；未分叉 -> 既有链。
+        return "deploy" if state.get("outcome") is None else "receipt"
+
     def after_intake(state: HarvestState) -> str:
         return "gate" if state.get("outcome") is None else "receipt"
 
@@ -647,7 +681,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
     graph.add_edge("verify", "cleanup_worktree")
     graph.add_edge("cleanup_worktree", "pr_merge")
     graph.add_edge("pr_merge", "pull")
-    graph.add_edge("pull", "deploy")
+    graph.add_conditional_edges("pull", after_pull, {"deploy", "receipt"})
     graph.add_edge("deploy", "verify_real")
     graph.add_edge("verify_real", "evidence")
     graph.add_edge("evidence", "postconditions")
