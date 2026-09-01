@@ -1,0 +1,18 @@
+{
+ "development_id": "dev-fg-a2edb3dec7c2",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "python",
+   "scripts/e2_goal_enroll_acceptance.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
