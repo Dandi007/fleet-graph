@@ -3,17 +3,22 @@
 The goal-driven MCP surface is its own service, not a guest of the
 dev-dispatch MCP. It serves exactly the goal-driven family -- the
 ``goal_enroll`` application tool plus the ``goal_list`` / ``goal_status`` /
-``goal_withdraw`` view tools, the versioned ``goal-open`` briefing prompt, and
-the ``fleet-graph://goal-open/briefing`` resource -- on its own port (:5611),
+``goal_withdraw`` view tools, the U4 supervisor-only ``goal_admit`` release
+tool, the versioned ``goal-open`` briefing prompt, and the
+``fleet-graph://goal-open/briefing`` resource -- on its own port (:5611),
 registered as ``fleet-graph-goal``. dd (:5610) carries no goal-driven
 registrations any more.
 
 ``goal_enroll`` is an *application*, not an ignition: a passing submission
 lands in the pending queue (``enroll-queue.jsonl``), where the supervisory
 face sees it (read-model ``/v1/enrollments`` + E8 + the best-effort board
-question note) and decides. This surface deliberately offers **no release or
-ignite tool**: ``enabled`` flips, seat finalization and roster writes all stay
-on the supervisory roster-PR path.
+question note) and decides. ``goal_admit`` is the one supervisor-only release
+edge this surface offers: it marks a decided application ``admitted`` with the
+supervisor release verdict's ``decision_ref`` (the queue's existing
+``mark_admitted`` primitive -- no state-machine rewrite), and refuses every
+non-supervisor identity (``GOAL_ENROLL_NOT_SUPERVISOR``) so the callable
+capability never broadens the authorization boundary. Seat finalization and
+roster writes still stay on the supervisory roster-PR path.
 
 The enrollment queue lives in an **independent queue home** (default
 ``/data/fleet-graph/goal/``), deliberately separate from the work-folder-root
@@ -114,6 +119,7 @@ def build_goal_mcp_server(
     board: Any | None = None,
     submitted_by: str | None = None,
     alias_token_check: Any | None = None,
+    supervisor_identity_check: Any | None = None,
 ) -> Any:
     """Build the standalone goal-driven MCP surface.
 
@@ -132,8 +138,12 @@ def build_goal_mcp_server(
     seam ``(alias) -> bool``; when None the validator uses the production
     default (``/data/ronin/secrets/<alias>.token`` ownership, realpath-
     canonicalized over the secrets boundary, honouring
-    ``FLEET_GRAPH_LINE_TOKEN_PATH``). Drills inject a temp-dir check built
-    over a scratch secrets root and supervision root.
+    ``FLEET_GRAPH_LINE_TOKEN_PATH``). ``supervisor_identity_check`` is the
+    U4 admission seam ``(identity) -> bool``; when None the service uses the
+    production default (a supervision/control-plane credential in
+    ``/data/agent-bus/tokens``), keeping admission authority exclusively with
+    the supervisor plane. Drills inject a temp-dir check built over a scratch
+    secrets root and supervision root.
     """
     from fastmcp import FastMCP
     from fastmcp.exceptions import ToolError
@@ -144,6 +154,7 @@ def build_goal_mcp_server(
         roster=real_roster if real_roster is not None else RealRosterReader(),
         board=board,
         submitted_by=submitted_by or os.environ.get("FLEET_GRAPH_SUBMITTED_BY", "goal-mcp"),
+        supervisor_identity_check=supervisor_identity_check,
     )
     mcp = FastMCP(MCP_SERVER_NAME)
 
@@ -235,6 +246,35 @@ def build_goal_mcp_server(
             return enroll.withdraw(folder_id)
         except GoalEnrollError as exc:
             return refuse_enroll("goal_withdraw", exc)
+
+    @mcp.tool()
+    def goal_admit(
+        folder_id: str,
+        decision_ref: str,
+        decided_by: str,
+    ) -> dict[str, Any]:
+        """Admit one *pending* enrollment from a supervisor release verdict.
+
+        Supervisor-only, fail-closed: ``decided_by`` must be a supervisor-plane
+        principal (default seam = a supervision/control-plane credential in
+        ``/data/agent-bus/tokens``); a non-supervisor identity refuses with
+        ``GOAL_ENROLL_NOT_SUPERVISOR`` and nothing changes -- the callable
+        capability is created without broadening the authorization boundary.
+
+        On success the queue entry becomes ``status='admitted'`` carrying the
+        exact ``decision_ref`` (the supervisor release verdict message id) and
+        appends one history row without deleting or replacing existing rows.
+        Re-admitting an already-admitted enrollment under the *same* decision
+        is idempotent (``already_admitted: True``, no history rewrite); an
+        already-admitted enrollment under a *different* decision, and any
+        ``rejected`` / ``withdrawn`` enrollment, refuses with
+        ``GOAL_ENROLL_NOT_PENDING``. The real roster is NOT written here --
+        roster writes stay on the supervisory roster-PR path.
+        """
+        try:
+            return enroll.admit(folder_id, decision_ref, decided_by=decided_by)
+        except GoalEnrollError as exc:
+            return refuse_enroll("goal_admit", exc)
 
     return mcp
 

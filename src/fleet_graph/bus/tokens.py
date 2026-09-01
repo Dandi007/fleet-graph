@@ -224,6 +224,65 @@ def build_line_token_ownership_check(
     return check
 
 
+def resolve_supervisor_identity(
+    identity: str,
+    *,
+    template: str | None = None,
+    supervision_root: Path | None = None,
+) -> LineTokenOwnership:
+    """Whether an identity is a *supervisor-plane* principal (U4 admission).
+
+    The exact mirror of gate 6's line-token ownership: where a line's token
+    must NOT resolve into a supervision/control-plane credential root, a
+    supervisor identity's credential MUST live there -- the literal
+    ``<supervision_root>/<identity>.token`` must exist as a regular file whose
+    realpath is exactly that canonical location (inside the supervision
+    boundary, not another identity's file, not a symlink masquerade). Any
+    other shape degrades to the naming status, never a guess.
+    """
+    if not _SAFE_ALIAS.match(identity):
+        return LineTokenOwnership(identity, "unsafe")
+    root = Path(supervision_root) if supervision_root is not None else SUPERVISION_TOKEN_ROOT
+    template_text = template or str(root / "{identity}.token")
+    literal = Path(template_text.format(identity=identity))
+    if not literal.exists():
+        return LineTokenOwnership(identity, "missing", path=literal)
+    if not literal.is_file():
+        return LineTokenOwnership(identity, "non_regular", path=literal)
+    canonical = Path(os.path.realpath(literal))
+    root_canonical = Path(os.path.realpath(root))
+    if not _is_within(canonical, root_canonical):
+        return LineTokenOwnership(identity, "outside_boundary", path=literal, canonical=canonical)
+    if canonical.name != f"{identity}.token":
+        return LineTokenOwnership(identity, "other_line", path=literal, canonical=canonical)
+    if literal.is_symlink():
+        return LineTokenOwnership(identity, "symlink_alias", path=literal, canonical=canonical)
+    return LineTokenOwnership(identity, "owned", path=literal, canonical=canonical)
+
+
+def build_supervisor_identity_check(
+    *,
+    template: str | None = None,
+    supervision_root: Path | None = None,
+) -> Callable[[str], bool]:
+    """A supervisor-plane identity check ``(identity) -> bool`` (U4 admission).
+
+    Production binds the fleet's supervision/control-plane credential root
+    (``SUPERVISION_TOKEN_ROOT`` = ``/data/agent-bus/tokens``); drills bind a
+    scratch supervision dir so the negative cases are exercised against the
+    real canonicalization logic. Only an identity whose own credential is a
+    regular file inside that root is a supervisor -- the boundary never
+    broadens.
+    """
+
+    def check(identity: str) -> bool:
+        return resolve_supervisor_identity(
+            identity, template=template, supervision_root=supervision_root
+        ).owned
+
+    return check
+
+
 __all__ = [
     "LINE_TOKEN_PATH_ENV",
     "LINE_TOKEN_PATH_TEMPLATE",
@@ -233,6 +292,8 @@ __all__ = [
     "LineTokenResolution",
     "LineTokenStatus",
     "build_line_token_ownership_check",
+    "build_supervisor_identity_check",
     "resolve_line_token",
     "resolve_line_token_ownership",
+    "resolve_supervisor_identity",
 ]
