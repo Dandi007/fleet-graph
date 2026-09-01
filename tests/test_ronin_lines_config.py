@@ -123,6 +123,16 @@ ENROLLED = {
     "wf-e7b0dd",
 }
 
+# 2026-09-02 监督面退役（commit b1c2f10）：三条已通过闭卷审计的线
+# （wf-7cd0a7 / wf-c106b9 / wf-e7b0dd）使命完成，enabled=false 但留在名册里
+# ——与 CONVERGED 同款「收编靠开关不靠删行」。退役依据逐条写在各线
+# `_retirement` 字段（真机核验，不采信自述）。
+RETIRED = {
+    "wf-7cd0a7",
+    "wf-c106b9",
+    "wf-e7b0dd",
+}
+
 # 2026-08-29 复活：曾在 MIGRATED 里 enabled=false 停摆的线被用户令重新点亮。
 # 与 ENROLLED 分开——它们不是新线，folder 与考卷都是存量，只是驱动引擎从
 # ronin pump 换成本引擎、座位按家族分流令改派。
@@ -200,7 +210,7 @@ class TestTheShippedConfigLoads:
         enabled = {
             line.folder_id for line in SchedulerConfig.from_json(CONFIG).lines if line.enabled
         }
-        expected = (BATCH_TWO | OPENED | ENROLLED | REVIVED) - CONVERGED
+        expected = (BATCH_TWO | OPENED | ENROLLED | REVIVED) - CONVERGED - RETIRED
         assert enabled == expected - CLOSED_BY_SUPERVISOR
 
     def test_the_converged_lines_stay_in_the_roster_but_off(self) -> None:
@@ -209,6 +219,15 @@ class TestTheShippedConfigLoads:
         「金丝雀在后续批次保持在线」的断言随金丝雀本身收编而退役。"""
         lines = {line.folder_id: line for line in SchedulerConfig.from_json(CONFIG).lines}
         for folder_id in CONVERGED:
+            assert folder_id in lines, folder_id
+            assert not lines[folder_id].enabled, folder_id
+
+    def test_the_retired_lines_stay_in_the_roster_but_off(self) -> None:
+        """退役（2026-09-02，b1c2f10）不是删除：wf-7cd0a7 / wf-c106b9 /
+        wf-e7b0dd 三条已通过闭卷审计、enabled=false 但留在名册里——名册同时是
+        编成史实。退役依据逐条写在 `_retirement` 字段。"""
+        lines = {line.folder_id: line for line in SchedulerConfig.from_json(CONFIG).lines}
+        for folder_id in RETIRED:
             assert folder_id in lines, folder_id
             assert not lines[folder_id].enabled, folder_id
 

@@ -180,6 +180,37 @@ def _resolved(path: Path) -> Path:
     return Path(path).expanduser().resolve()
 
 
+def _porcelain_worktree_branches(stdout: str) -> list[tuple[Path, str]]:
+    """解析 `git worktree list --porcelain` 输出，返回 `[(worktree_path, branch_ref)]`。
+
+    每条 worktree 记录形如：
+        worktree /path/to/wt
+        HEAD <sha>
+        branch refs/heads/harvest/dev-x
+    或 detached：
+        worktree /path/to/wt
+        HEAD <sha>
+        detached
+    只关心 `worktree <path>` 与 `branch <ref>` 两行；`detached` / `bare` /
+    `prunable` / `locked` 等其它行不影响解析。解析失败（无任何 `worktree` 行）
+    返回空列表，由调用方对 git 命令本身非零退出兜底。
+    """
+    entries: list[tuple[Path, str]] = []
+    current_path: Path | None = None
+    current_ref = ""
+    for line in stdout.splitlines():
+        if line.startswith("worktree "):
+            if current_path is not None:
+                entries.append((current_path, current_ref))
+            current_path = Path(line[len("worktree ") :].strip())
+            current_ref = ""
+        elif line.startswith("branch ") and current_path is not None:
+            current_ref = line[len("branch ") :].strip()
+    if current_path is not None:
+        entries.append((current_path, current_ref))
+    return entries
+
+
 def _resolve_canonical_repo(
     record_repo_path: str,
     record_remote_url: str | None,
@@ -691,6 +722,54 @@ class DefaultHarvestOps:
             }
         return {"bound_development_id": None, "in_flight": False, "detail": ""}
 
+    def release_stale_harvest_branch(self, repo: Path, development_id: str) -> dict[str, Any]:
+        """merge 前机械回收持有 `harvest/<development_id>` 的残留 worktree 并清本地分支。
+
+        `gh pr merge --squash --delete-branch` 合并后要删**本地** `harvest/<dev>`
+        分支；该分支被任一残留 worktree 检出时删除必然失败（`cannot delete branch
+        ... used by worktree`）。本方法在删本地分支前机械清场：
+
+        1. `git worktree prune` 清陈旧注册（目录已删但注册残留的 worktree）；
+        2. `git worktree list --porcelain` 找出持有 `refs/heads/harvest/<dev>`
+           的 worktree，逐个复用 `remove_worktree` 回收（跳过 canonical 主
+           checkout，绝不 `--force` 硬清生产 checkout）；
+        3. 显式 `git branch -D harvest/<dev>` 清本地分支（确保 `gh pr merge
+           --delete-branch` 能顺利删本地分支）。
+
+        清理失败（主 checkout 持有 / worktree 移除后分支仍被占 / branch -D
+        失败）-> 如实 `ok:false` + 机器可读 detail，绝不带病继续 merge。绝不
+        触碰非 harvest 分支、绝不动任何其它 worktree。
+        """
+        branch = f"harvest/{development_id}"
+        branch_ref = f"refs/heads/{branch}"
+
+        pruned = run_git(repo, "worktree", "prune")
+        if pruned.returncode != 0:
+            return {"ok": False, "detail": (pruned.stderr or pruned.stdout).strip()[:400]}
+
+        listed = run_git(repo, "worktree", "list", "--porcelain")
+        if listed.returncode != 0:
+            return {"ok": False, "detail": (listed.stderr or listed.stdout).strip()[:400]}
+
+        main = _resolved(repo)
+        removed: list[str] = []
+        for wt_path, wt_branch in _porcelain_worktree_branches(listed.stdout):
+            if wt_branch != branch_ref:
+                continue
+            if _resolved(wt_path) == main:
+                return {
+                    "ok": False,
+                    "detail": f"{branch} 被 canonical 主 checkout 持有，拒绝机械移除",
+                }
+            self.remove_worktree(repo, wt_path)
+            removed.append(str(wt_path))
+
+        deleted = run_git(repo, "branch", "-D", branch)
+        if deleted.returncode != 0 and "not found" not in (deleted.stderr or ""):
+            return {"ok": False, "detail": (deleted.stderr or deleted.stdout).strip()[:400]}
+
+        return {"ok": True, "removed_worktrees": removed}
+
     def pr_squash_merge(
         self,
         repo: Path,
@@ -700,14 +779,16 @@ class DefaultHarvestOps:
     ) -> dict[str, Any]:
         """PR -> squash merge（真实远端 forge，绝不本地伪装合并）。
 
-        流水线：推 `harvest/<development_id>` 分支 -> `gh pr create` -> `gh pr
-        merge --squash --delete-branch`，返回 merged PR 的 html url。git 子调用
-        沿用 `dd/git.py` 守卫纪律（`run_git`）；`gh` 不经 git 守卫浸泡，独立
-        argv 数组 subprocess（无 shell），cwd=repo。
+        流水线：推 `harvest/<development_id>` 分支 -> `gh pr create` -> 删本地
+        分支前先 `release_stale_harvest_branch`（回收残留 worktree + 清本地分支，
+        保证 `gh pr merge --delete-branch` 能顺利删本地分支）-> `gh pr merge
+        --squash --delete-branch`，返回 merged PR 的 html url。git 子调用沿用
+        `dd/git.py` 守卫纪律（`run_git`）；`gh` 不经 git 守卫浸泡，独立 argv
+        数组 subprocess（无 shell），cwd=repo。
 
-        任一步非零退出 / 缺 gh / 缺 origin -> merged=False + detail（stderr/stdout
-        tail[:400]），绝不降级回本地 `git merge --squash`、绝不直接 commit 目标
-        repo 生产 checkout 默认分支。
+        任一步非零退出 / 缺 gh / 缺 origin / 残留 worktree 回收失败 ->
+        merged=False + detail（stderr/stdout tail[:400]），绝不降级回本地
+        `git merge --squash`、绝不直接 commit 目标 repo 生产 checkout 默认分支。
         """
         if not head_commit:
             return {"merged": False, "detail": "无 head_commit 可合"}
@@ -756,6 +837,13 @@ class DefaultHarvestOps:
         number = _gh_pr_number(pr_url)
         if not number:
             return {"merged": False, "detail": f"无法从 PR 链接解析编号: {pr_url}"}
+
+        released = self.release_stale_harvest_branch(repo, development_id)
+        if not released.get("ok"):
+            return {
+                "merged": False,
+                "detail": released.get("detail", "merge 前回收残留 worktree/本地分支失败")[:400],
+            }
 
         merged = _run(
             ["gh", "pr", "merge", number, "--squash", "--delete-branch"],

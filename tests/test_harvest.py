@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from conftest import git, head
+from fleet_graph.dd.git import run_git
 from fleet_graph.supervise.events import approved_unharvested_event, validate_event
 from fleet_graph.supervise.harvest import (
     OUTCOME_ALREADY_HARVESTED,
@@ -1064,6 +1065,132 @@ class TestDefaultHarvestOpsWorktreeLifecycle:
         assert result["ok"] is False, result
         assert result.get("conflicts") is True, result
         assert not worktree_root.exists(), "escalated conflict worktree left behind"
+
+
+class TestPrSquashMergeStaleWorktreeCleanup:
+    """M3 缺陷修复：merge 前回收被残留 worktree 占用的 harvest 分支（spec 交付 A/B）。
+
+    真机触因（e5-dev-fg-2e44f0e61516）：残留 worktree `/data/worktrees/
+    fs-harvest-glm53-20260901` 检出 `harvest/<dev>` -> `gh pr merge
+    --squash --delete-branch` 删**本地** `harvest/<dev>` 分支必然
+    `cannot delete branch ... used by worktree`。修复：`pr_squash_merge` 在删
+    本地分支前先 `release_stale_harvest_branch`（prune + 移除持有该分支的
+    worktree + 显式 `git branch -D`）。
+
+    阴性必须能红：fake `_run` 对 `gh pr merge --delete-branch` 忠实回放 gh 的
+    本地分支删除——残留 worktree 在时 `git branch -D harvest/<dev>` 必然失败；
+    修复后 worktree 已回收、本地分支已清，删除变「分支不存在」= gh 语义下的
+    成功。全部合成本地仓（bare origin），禁触真网/生产 checkout。
+    """
+
+    def _repo_with_residual_worktree(self, tmp_path: Path) -> tuple[Path, str, Path]:
+        """合成仓 + 一棵检出 `harvest/dev-x` 的残留 worktree + 本地 bare origin。"""
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        git(repo, "checkout", "-q", "-b", "feature")
+        (repo / "product.txt").write_text("product change\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "product change")
+        product = head(repo)
+        git(repo, "checkout", "-q", "main")
+        _add_origin_with_dd_ref(repo, tmp_path / "origin.git", product)
+        git(repo, "branch", "harvest/dev-x", product)
+        residual = tmp_path / "residual-harvest-wt"
+        git(repo, "worktree", "add", str(residual), "harvest/dev-x")
+        return repo, product, residual
+
+    def _fake_gh_run(self, repo: Path):
+        """fake `_run`：`gh pr create` 恒成功；`gh pr merge --delete-branch`
+        忠实回放 gh 的本地分支删除——`used by worktree` 时如实 ok:false，
+        「分支不存在」视为 gh 语义下的成功（gh 对缺失本地分支跳过删除）。"""
+
+        def fake_run(argv: list[str], cwd: Path | None = None) -> dict[str, Any]:
+            if argv[:3] == ["gh", "pr", "create"]:
+                return {
+                    "ok": True,
+                    "exit_code": 0,
+                    "stdout_tail": "https://github.com/example/repo/pull/7\n",
+                    "stderr_tail": "",
+                }
+            if argv[:3] == ["gh", "pr", "merge"]:
+                proc = run_git(repo, "branch", "-D", "harvest/dev-x")
+                if proc.returncode != 0 and "used by worktree" in proc.stderr:
+                    return {
+                        "ok": False,
+                        "exit_code": proc.returncode,
+                        "stdout_tail": "",
+                        "stderr_tail": proc.stderr[-400:],
+                    }
+                return {
+                    "ok": True,
+                    "exit_code": 0,
+                    "stdout_tail": "Merged pull request #7\n",
+                    "stderr_tail": "",
+                }
+            raise AssertionError(f"unexpected _run argv: {argv}")
+
+        return fake_run
+
+    def test_red_precondition_branch_delete_blocked_by_residual_worktree(
+        self, tmp_path: Path
+    ) -> None:
+        """阴性能红的前置证明：残留 worktree 占住本地分支时，`git branch -D
+        harvest/<dev>` 必然 `used by worktree`（缺陷的失败模式真实存在）。"""
+        repo, _product, _residual = self._repo_with_residual_worktree(tmp_path)
+        proc = run_git(repo, "branch", "-D", "harvest/dev-x")
+        assert proc.returncode != 0
+        assert "used by worktree" in proc.stderr, proc.stderr
+
+    def test_pr_squash_merge_releases_residual_worktree_then_merges(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """阴性转绿：merge 前先回收残留 worktree + 删本地分支，随后 merge 成功
+        （merged:true + pr_url），且残留 worktree 被回收、本地 harvest 分支被清。"""
+        import fleet_graph.supervise.harvest_ops as harvest_ops
+
+        repo, product, residual = self._repo_with_residual_worktree(tmp_path)
+        monkeypatch.setattr(harvest_ops, "_run", self._fake_gh_run(repo))
+
+        result = DefaultHarvestOps().pr_squash_merge(repo, "dev-x", product, "main")
+        assert result["merged"] is True, result
+        assert result["pr_url"] == "https://github.com/example/repo/pull/7"
+        # 残留 worktree 被回收，本地 harvest 分支被清。
+        assert not residual.exists(), "残留 worktree 未被回收"
+        assert "harvest/dev-x" not in git(repo, "branch", "--list")
+
+    def test_pr_squash_merge_normal_path_no_residual_is_unchanged(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """反向不抖动：无残留 worktree 的正常路径行为不变（merged:true + pr_url）。"""
+        import fleet_graph.supervise.harvest_ops as harvest_ops
+
+        repo, product, _ = self._repo_with_residual_worktree(tmp_path)
+        git(repo, "worktree", "remove", "--force", str(tmp_path / "residual-harvest-wt"))
+        monkeypatch.setattr(harvest_ops, "_run", self._fake_gh_run(repo))
+
+        result = DefaultHarvestOps().pr_squash_merge(repo, "dev-x", product, "main")
+        assert result["merged"] is True, result
+        assert result["pr_url"] == "https://github.com/example/repo/pull/7"
+
+    def test_release_stale_harvest_branch_is_noop_without_branch(self, tmp_path: Path) -> None:
+        """无本地 harvest 分支 / 无残留 worktree 时 cleanup 是 no-op（ok:true）。"""
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        result = DefaultHarvestOps().release_stale_harvest_branch(repo, "dev-x")
+        assert result["ok"] is True, result
+        assert result["removed_worktrees"] == []
+
+    def test_release_stale_harvest_branch_refuses_main_checkout(self, tmp_path: Path) -> None:
+        """绝不 `--force` 硬清生产 checkout：canonical 主 checkout 本身检出
+        `harvest/<dev>` -> 如实 ok:false，主 checkout 一字不动。"""
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        git(repo, "checkout", "-q", "-b", "harvest/dev-x")
+        head_before = head(repo)
+        result = DefaultHarvestOps().release_stale_harvest_branch(repo, "dev-x")
+        assert result["ok"] is False, result
+        assert "拒绝机械移除" in result["detail"]
+        assert head(repo) == head_before, "主 checkout 被动了"
 
 
 def _init_git_repo(repo: Path) -> None:
