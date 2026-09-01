@@ -48,6 +48,7 @@ LINE_OBJ_FIELDS = {
     "terminal",
     "parked",
     "wake_facts",
+    "release_id",
 }
 
 
@@ -60,7 +61,13 @@ class FakeClock:
 
 
 def write_heartbeat(
-    run_root: Path, folder_id: str, *, round_no: int, phase: str, updated_at: str
+    run_root: Path,
+    folder_id: str,
+    *,
+    round_no: int,
+    phase: str,
+    updated_at: str,
+    release_id: str | None = None,
 ) -> None:
     (run_root / folder_id).mkdir(parents=True, exist_ok=True)
     (run_root / folder_id / "heartbeat.json").write_text(
@@ -75,6 +82,7 @@ def write_heartbeat(
                 "phase_started_at": updated_at,
                 "updated_at": updated_at,
                 "log_path": f"/data/fleet-graph/logs/{folder_id}.log",
+                "release_id": release_id,
             }
         ),
         encoding="utf-8",
@@ -264,6 +272,69 @@ class TestLinesView:
         payload = FleetStateView(make_config(synthetic)).lines()
         for line in payload["lines"]:
             assert line["generation"] == 2  # roster generation
+
+    def test_release_id_is_read_from_the_persisted_heartbeat(
+        self, synthetic: dict[str, Any]
+    ) -> None:
+        """A 类缺口: /v1/lines exposes the release the generation runs, taken
+        from the persisted heartbeat value the line process froze at startup."""
+        run_root = synthetic["run_root"]
+        write_heartbeat(
+            run_root,
+            "wf-000001",
+            round_no=3,
+            phase="coordinator",
+            updated_at=iso(1_787_000_000.0),
+            release_id="20260902-030934-05dec3709ba0",
+        )
+        payload = FleetStateView(make_config(synthetic)).lines()
+        by_id = {line["folder_id"]: line for line in payload["lines"]}
+        assert by_id["wf-000001"]["release_id"] == "20260902-030934-05dec3709ba0"
+
+    def test_release_id_degrades_to_null_when_absent_or_bad(
+        self, synthetic: dict[str, Any]
+    ) -> None:
+        """A heartbeat that predates the field, or that never had one, exposes
+        null -- never a guess from the deploy `current` symlink."""
+        payload = FleetStateView(make_config(synthetic)).lines()
+        by_id = {line["folder_id"]: line for line in payload["lines"]}
+        assert by_id["wf-000001"]["release_id"] is None
+        assert by_id["wf-000002"]["release_id"] is None
+
+    def test_repointing_the_symlink_does_not_change_the_exposed_value(self, tmp_path: Path) -> None:
+        """Negative: the read model consumes only the persisted value, so a
+        re-pointed deploy `current` symlink mid-generation cannot change what
+        the view reports -- the frozen field is the mechanical fact."""
+        run_root = tmp_path / "runs"
+        write_heartbeat(
+            run_root,
+            "wf-000001",
+            round_no=3,
+            phase="coordinator",
+            updated_at=iso(1_787_000_000.0),
+            release_id="20260902-030934-05dec3709ba0",
+        )
+        lines_config = tmp_path / "ronin-lines.json"
+        write_roster(lines_config, run_root, ["wf-000001"])
+        view = FleetStateView(
+            FleetStateConfig(
+                host="127.0.0.1",
+                port=0,
+                run_root=run_root,
+                dd_root=tmp_path / "dd",
+                lines_config=lines_config,
+                bridge_state_dir=tmp_path / "bridge",
+            )
+        )
+
+        assert view.lines()["lines"][0]["release_id"] == "20260902-030934-05dec3709ba0"
+
+        current = tmp_path / "current"
+        releases = tmp_path / "releases"
+        (releases / "rel-new").mkdir(parents=True)
+        current.symlink_to(releases / "rel-new")
+
+        assert view.lines()["lines"][0]["release_id"] == "20260902-030934-05dec3709ba0"
 
     def test_missing_artifact_degrades_the_entry_not_the_table(
         self, synthetic: dict[str, Any]

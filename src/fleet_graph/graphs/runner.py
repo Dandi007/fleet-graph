@@ -34,7 +34,12 @@ from fleet_graph.graphs.adapters import AgentRunCoordinator, AgentSessionWorker
 from fleet_graph.graphs.goal_line import LineDeps, build_goal_line_graph
 from fleet_graph.graphs.guards import LineBounds, LineGuards
 from fleet_graph.state.line_metrics import LineMetrics, line_metrics_exposition_dir
-from fleet_graph.state.run_artifacts import RunArtifacts, iso, write_json_durable
+from fleet_graph.state.run_artifacts import (
+    RunArtifacts,
+    capture_release_id,
+    iso,
+    write_json_durable,
+)
 
 
 @dataclass
@@ -157,6 +162,7 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         run_id=run_id,
         folder_id=config.folder_id,
         log_path=config.log_path,
+        release_id=capture_release_id(),
     )
 
     launcher_kwargs: dict[str, Any] = {"state_root": str(config.run_root / "agent-runs")}
