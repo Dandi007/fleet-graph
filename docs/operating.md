@@ -47,6 +47,17 @@ code（带失败条款）拒绝——绝无半条、绝无 warning-as-admission�
   重复 admit 幂等（`already_admitted: true`、不重复写 history）；已用不同
   `decision_ref` admit、以及 `rejected`/`withdrawn` 一律
   `GOAL_ENROLL_NOT_PENDING`。真名册仍只在 roster PR（监督面）写入。
+- **`goal_reject(folder_id, decision_ref, decided_by)`**（U2 决策面）：监督面
+  驳回边缘，与 `goal_admit` **同一道身份闸**——把 **pending** 申请机械记账为
+  `rejected` 并持久化 `decision_ref`（监督面裁决消息 id），复用 queue 既有
+  `mark_rejected` 写回原语，不重写状态机；追加一条 history、不删不改既有行。
+  **监督面专属、fail-closed**：`decided_by` 必须是监督面主体（默认 seam 同上）；
+  非监督面身份一律 `GOAL_ENROLL_NOT_SUPERVISOR`。同一 `decision_ref` 重复
+  reject 幂等（`already_rejected: true`、不重复写 history）；已用不同
+  `decision_ref` reject、以及 `admitted`/`withdrawn` 一律
+  `GOAL_ENROLL_NOT_PENDING`。**与 `goal_withdraw` 严格区分**：withdraw 只把
+  pending 标 `withdrawn`，绝不产生 `rejected` 状态，也不是 reject 的别名。
+  真名册仍只在 roster PR（监督面）写入。
 - **`goal-open` prompt / `fleet-graph://goal-open/briefing` resource**：开线
   交底（Phase-0 opening briefing），随引擎发布版本化，queue entry 记录同一
   briefing 版本 id。

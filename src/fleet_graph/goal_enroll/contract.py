@@ -59,15 +59,15 @@ CODE_ALIAS_CONFLICT = "GOAL_ENROLL_ALIAS_CONFLICT"
 #: decided (admitted/rejected) or already withdrawn refuses with this code.
 CODE_NOT_PENDING = "GOAL_ENROLL_NOT_PENDING"
 
-#: ``goal_admit`` (the supervisor release path) is supervisor-only, fail-closed:
-#: the identity invoking admission must be a supervisor-plane principal. A
-#: non-supervisor identity refuses with this code and nothing changes -- the
-#: callable capability is created without ever broadening the authorization
-#: boundary.
+#: ``goal_admit`` / ``goal_reject`` (the supervisor decision edges) are
+#: supervisor-only, fail-closed: the identity invoking a decision must be a
+#: supervisor-plane principal. A non-supervisor identity refuses with this code
+#: and nothing changes -- the callable capability is created without ever
+#: broadening the authorization boundary.
 CODE_NOT_SUPERVISOR = "GOAL_ENROLL_NOT_SUPERVISOR"
 
-#: ``goal_admit`` must persist the supervisor release verdict's message id as
-#: ``decision_ref``; an admission without it refuses fail-closed.
+#: ``goal_admit`` / ``goal_reject`` must persist the supervisor verdict's
+#: message id as ``decision_ref``; a decision without it refuses fail-closed.
 CODE_DECISION_REF_REQUIRED = "GOAL_ENROLL_DECISION_REF_REQUIRED"
 
 #: The real U4 closeout decision reference: the ``work.decision.v1`` release

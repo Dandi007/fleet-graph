@@ -4,7 +4,8 @@ The goal-driven MCP surface is its own service, not a guest of the
 dev-dispatch MCP. It serves exactly the goal-driven family -- the
 ``goal_enroll`` application tool plus the ``goal_list`` / ``goal_status`` /
 ``goal_withdraw`` view tools, the U4 supervisor-only ``goal_admit`` release
-tool, the versioned ``goal-open`` briefing prompt, and the
+tool, the U2 supervisor-only ``goal_reject`` decision tool, the versioned
+``goal-open`` briefing prompt, and the
 ``fleet-graph://goal-open/briefing`` resource -- on its own port (:5611),
 registered as ``fleet-graph-goal``. dd (:5610) carries no goal-driven
 registrations any more.
@@ -17,8 +18,13 @@ edge this surface offers: it marks a decided application ``admitted`` with the
 supervisor release verdict's ``decision_ref`` (the queue's existing
 ``mark_admitted`` primitive -- no state-machine rewrite), and refuses every
 non-supervisor identity (``GOAL_ENROLL_NOT_SUPERVISOR``) so the callable
-capability never broadens the authorization boundary. Seat finalization and
-roster writes still stay on the supervisory roster-PR path.
+capability never broadens the authorization boundary. ``goal_reject`` is the
+mirror-image supervisor-only rejection edge: it marks a *pending* application
+``rejected`` with the supervisor verdict's ``decision_ref`` (the queue's
+existing ``mark_rejected`` primitive) under the exact same authority boundary,
+and stays distinct from ``goal_withdraw`` (which never produces a rejected
+status). Seat finalization and roster writes still stay on the supervisory
+roster-PR path.
 
 The enrollment queue lives in an **independent queue home** (default
 ``/data/fleet-graph/goal/``), deliberately separate from the work-folder-root
@@ -275,6 +281,34 @@ def build_goal_mcp_server(
             return enroll.admit(folder_id, decision_ref, decided_by=decided_by)
         except GoalEnrollError as exc:
             return refuse_enroll("goal_admit", exc)
+
+    @mcp.tool()
+    def goal_reject(
+        folder_id: str,
+        decision_ref: str,
+        decided_by: str,
+    ) -> dict[str, Any]:
+        """Reject one *pending* enrollment from a supervisor verdict.
+
+        Supervisor-only, fail-closed, at the exact same identity guard as
+        ``goal_admit``: ``decided_by`` must be a supervisor-plane principal
+        (default seam = a supervision/control-plane credential in
+        ``/data/agent-bus/tokens``); a non-supervisor identity refuses with
+        ``GOAL_ENROLL_NOT_SUPERVISOR`` and nothing changes.
+
+        On success the queue entry becomes ``status='rejected'`` carrying the
+        exact ``decision_ref`` and appends one history row without deleting or
+        replacing existing rows. Re-rejecting an already-rejected enrollment
+        under the *same* decision is idempotent (``already_rejected: True``,
+        no history rewrite); an already-rejected enrollment under a *different*
+        decision, and any ``admitted`` / ``withdrawn`` enrollment, refuses with
+        ``GOAL_ENROLL_NOT_PENDING``. ``goal_withdraw`` stays distinct: it never
+        produces a ``rejected`` status. The real roster is NOT written here.
+        """
+        try:
+            return enroll.reject(folder_id, decision_ref, decided_by=decided_by)
+        except GoalEnrollError as exc:
+            return refuse_enroll("goal_reject", exc)
 
     return mcp
 

@@ -20,6 +20,15 @@ identity must be a supervisor-plane principal (default seam = the real
 supervision-root credential check), re-admitting an already-admitted
 enrollment under the same ``decision_ref`` is idempotent, and a
 rejected/withdrawn (or differently-admitted) enrollment refuses.
+
+U2 adds the mirror-image supervisor rejection edge:
+:meth:`GoalEnrollService.reject` marks a *pending* application ``rejected``
+from a supervisor verdict, reusing the queue's existing ``mark_rejected``
+primitive (again no state-machine rewrite). It shares the ``admit`` authority
+boundary exactly: supervisor-only, fail-closed, idempotent for the
+already-rejected-same-decision case, and refusing every non-pending (admitted,
+withdrawn, differently-rejected, absent) enrollment with the existing
+not-pending refusal.
 """
 
 from __future__ import annotations
@@ -37,6 +46,7 @@ from fleet_graph.goal_enroll.contract import (
     ORIGIN_ROSTER,
     QUEUE_STATUS_ADMITTED,
     QUEUE_STATUS_PENDING,
+    QUEUE_STATUS_REJECTED,
     GoalEnrollError,
 )
 from fleet_graph.goal_enroll.queue import EnrollQueue
@@ -63,7 +73,7 @@ def _default_supervisor_identity_check() -> Any:
 
 class GoalEnrollService:
     """The one entry point the ``goal_enroll`` / ``goal_list`` / ``goal_status``
-    / ``goal_withdraw`` / ``goal_admit`` MCP tools drive.
+    / ``goal_withdraw`` / ``goal_admit`` / ``goal_reject`` MCP tools drive.
 
     ``queue`` is the pending-queue store (spec deliverable A.1); ``roster`` is
     the read-only real-roster reader (``config/ronin-lines.json``). ``board``
@@ -326,6 +336,57 @@ class GoalEnrollService:
                 "conflicting admission",
             )
         return self._queue.mark_admitted(folder_id, decided_by=identity, decision_ref=decision_ref)
+
+    # --- rejection (U2 supervisor decision path) ---------------------------
+
+    def reject(
+        self,
+        folder_id: str,
+        decision_ref: str,
+        *,
+        decided_by: str | None = None,
+    ) -> dict[str, Any]:
+        """Reject one *pending* enrollment from a supervisor verdict.
+
+        Supervisor-only, fail-closed: the invoking identity must be a
+        supervisor-plane principal (default seam = the real supervision-root
+        credential check); a non-supervisor identity refuses with
+        ``GOAL_ENROLL_NOT_SUPERVISOR`` and nothing changes. The queue state
+        machine is untouched -- this method reuses the existing
+        ``mark_rejected`` write-back primitive and stays distinct from
+        ``withdraw`` (which never produces a ``rejected`` status).
+
+        Idempotency per spec: re-rejecting an enrollment that is *already*
+        ``rejected`` under the **same** ``decision_ref`` returns the existing
+        entry with ``already_rejected: True`` and appends no history row.
+        An already ``rejected`` enrollment under a *different* ``decision_ref``
+        is refused (``GOAL_ENROLL_NOT_PENDING``), as are ``admitted`` /
+        ``withdrawn`` / absent enrollments (the queue's own refusal).
+        """
+        identity = decided_by or self._submitted_by
+        if not self._supervisor_identity_check(identity):
+            raise GoalEnrollError(
+                CODE_NOT_SUPERVISOR,
+                f"identity {identity!r} is not a supervisor-plane principal; "
+                "rejection authority stays exclusively with the supervisor plane",
+            )
+        if not decision_ref or not str(decision_ref).strip():
+            raise GoalEnrollError(
+                CODE_DECISION_REF_REQUIRED,
+                "rejection needs the supervisor verdict message id as decision_ref",
+            )
+
+        existing = self._queue.get(folder_id)
+        if existing is not None and existing.get("status") == QUEUE_STATUS_REJECTED:
+            if existing.get("decision_ref") == decision_ref:
+                return {**existing, "already_rejected": True}
+            raise GoalEnrollError(
+                CODE_NOT_PENDING,
+                f"enrollment {folder_id!r} is already rejected under a different "
+                f"decision_ref {existing.get('decision_ref')!r}; refusing a second, "
+                "conflicting rejection",
+            )
+        return self._queue.mark_rejected(folder_id, decided_by=identity, decision_ref=decision_ref)
 
     # --- withdrawal -------------------------------------------------------
 
