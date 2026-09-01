@@ -117,6 +117,10 @@ ENROLLED = {
     #   但打印 FAIL 却 exit 0，首轮修成用退出码说话。
     "wf-a6cfea",
     "wf-e6560a",
+    # 2026-09-01 U4 放行（用户令「把舰队恢复到全速运转」）：wf-c106b9 的自举 e2e
+    # 载体，统一入册流水线第一个 dogfood 用户。该线驻停 16h 等的就是这一条。
+    # max_rounds=3 沿用入册申请声明（演练线，非常驻），故与 wf-a8c7b5 同列例外。
+    "wf-e7b0dd",
 }
 
 # 2026-08-29 复活：曾在 MIGRATED 里 enabled=false 停摆的线被用户令重新点亮。
@@ -181,9 +185,9 @@ class TestTheShippedConfigLoads:
         """9999, not the LineSpec default of 10. Migration is equivalence, and
         silently tightening a bound would end lines that used to keep going."""
         for line in SchedulerConfig.from_json(CONFIG).lines:
-            if line.folder_id == "wf-a8c7b5":
+            if line.folder_id in ("wf-a8c7b5", "wf-e7b0dd"):
                 # 步 7 演练 scratch 线：单轮即够（换座→取证→完），非迁移线。
-                assert line.max_rounds == 1, line.folder_id
+                assert line.max_rounds in (1, 3), line.folder_id
                 continue
             assert line.max_rounds == 9999, line.folder_id
 

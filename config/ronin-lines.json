@@ -189,6 +189,14 @@
       "alias": "ronin-e6560a",
       "enabled": true,
       "_provenance": "2026-09-01 第十一波入编（用户令『两条都入编，别 hold』）：agent-session-mcp —— Claude Code 会话检索 MCP。M1 由 dd 单 dev-fg-67bf15e27dd2 实现中，本线接手 M2/M3。入编时 scripts/acceptance.sh 存在且诚实报红（M2/M3 未实现，逐条打印 FAIL）——这是判据存在的正确形态。遗留待修：该脚本打印 ACCEPTANCE: FAIL 却 exit 0，验收必须用退出码说话，本线首轮修。goal SSoT：wf-e6560a。"
+    },
+    {
+      "folder_id": "wf-e7b0dd",
+      "seat": "opencode-dsv4pro",
+      "max_rounds": 3,
+      "alias": "ronin-mcp",
+      "enabled": true,
+      "_provenance": "2026-09-01 U4 放行入编（用户令：把舰队恢复到全速运转）：wf-c106b9「舰队入口整体统一」线的 U4 自举 e2e 载体——统一入册流水线的第一个 dogfood 用户。前四段（E8 enrollment_pending 发射 / /v1/enrollments 可见 / 板上 question note / 升报 seq 776）该线已真机闭环并驻停 16h 等监督面放行；本条即后三段中的 roster PR。max_rounds=3 沿用入册申请声明（演练线，非常驻），与 wf-a8c7b5 同类。liveness exit 0、lint_warnings 空、alias token /data/ronin/secrets/ronin-mcp.token 就位。goal SSoT：wf-e7b0dd；放行线 SSoT：wf-c106b9。"
     }
   ],
   "line_environment": {
