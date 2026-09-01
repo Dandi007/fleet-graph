@@ -18,10 +18,12 @@ separate so the policy stays reviewable on its own.
 
 from __future__ import annotations
 
+import json
 import shlex
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 DEFAULT_UNIT_PREFIX = "fleet-graph-line"
 
@@ -60,6 +62,12 @@ class LaunchSpec:
     #: second one. Empty means the line starts with no known card and the
     #: runtime falls back to the shared constructor.
     board_card_entity_id: str = ""
+    #: M5: the revival envelope (who/basis/generation/reason) for a line whose
+    #: `done` terminal a valid revoke overturned. One JSON argument, like
+    #: acceptance_json, so it crosses the systemd-run boundary without quoting
+    #: rules. Absent (None) for a normal launch -- the line then carries no
+    #: `revival` fact into its round-1 coordinator input.
+    revival: dict[str, Any] | None = None
 
     @property
     def log_file(self) -> Path:
@@ -128,6 +136,8 @@ class LaunchSpec:
             argv += ["--timeout-limit", str(self.timeout_limit)]
         if self.board_card_entity_id:
             argv += ["--board-card", self.board_card_entity_id]
+        if self.revival is not None:
+            argv += ["--revival", json.dumps(self.revival, ensure_ascii=False)]
         return argv
 
 

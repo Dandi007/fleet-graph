@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ from fleet_graph.goal_interrupt.store import GoalInterruptStore
 from fleet_graph.graphs.adapters import AgentRunCoordinator, AgentSessionWorker
 from fleet_graph.graphs.goal_line import LineDeps, build_goal_line_graph
 from fleet_graph.graphs.guards import LineBounds, LineGuards
+from fleet_graph.state.line_metrics import LineMetrics, line_metrics_exposition_dir
 from fleet_graph.state.run_artifacts import RunArtifacts, iso, write_json_durable
 
 
@@ -77,11 +79,21 @@ class LineConfig:
     #: left on disk under run_root, which at generation start is the previous
     #: generation's.
     prior_terminal: dict[str, Any] | None = None
+    #: M5: the revival envelope (who/basis/generation/reason) for a line whose
+    #: `done` terminal a valid revoke overturned. Injected into the round-1
+    #: coordinator input alongside `prior_terminal`. None means this is a
+    #: normal launch with no revival fact.
+    revival: dict[str, Any] | None = None
     #: The per-process launch identity (D4). None lets build_line mint one from
     #: a wall-clock start timestamp, so a process restart is a new launch and a
     #: re-adopted run keeps the first dispatch's label (the launcher never
     #: rewrites argv.json for an adopted session root).
     launch_id: str | None = None
+    #: The node_exporter textfile directory for this line's D3 protocol
+    #: counters. None falls back to the ``FLEET_GRAPH_LINE_METRICS_DIR``
+    #: environment variable; where neither names a directory the line does not
+    #: collect (``LineDeps.metrics`` is None and the graph faults identically).
+    metrics_dir: Path | None = None
 
     @property
     def inbox_alias(self) -> str | None:
@@ -200,6 +212,11 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         prior_terminal=config.prior_terminal
         if config.prior_terminal is not None
         else _read_prior_terminal(config.run_root),
+        # M5: the revival envelope is passed through verbatim -- it is never
+        # guessed or re-read from disk. A revoke carries its own audit fields,
+        # and a revived line must read exactly who/basis/generation the revoke
+        # recorded, not whatever terminal.json happens to say.
+        revival=config.revival,
         # The E2 in-graph interrupt port. Wired here so a human-decision wait
         # on a real line routes through the durable interrupt instead of the
         # legacy parking terminal (spec: "replace the normal goal-line parking
@@ -208,8 +225,50 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         # whole run -- parking remains the fallback.
         interrupt=_build_interrupt(config, run_id=run_id),
         run_id=run_id,
+        metrics=_build_line_metrics(config),
     )
     return build_goal_line_graph(deps), deps
+
+
+def _build_line_metrics(config: LineConfig) -> LineMetrics | None:
+    """The D3 line-metric recorder, or ``None`` when no textfile dir is wired.
+
+    Mirrors the cost-observability convention: an explicit ``metrics_dir`` wins,
+    otherwise the ``FLEET_GRAPH_LINE_METRICS_DIR`` environment variable is
+    consulted; where neither names a directory the line is not collecting. A
+    line without a recorder still runs and still faults identically -- the
+    counters just stay silent.
+    """
+    directory = config.metrics_dir
+    if directory is None:
+        directory = line_metrics_exposition_dir()
+    if directory is None:
+        return None
+    return LineMetrics(
+        folder_id=config.folder_id,
+        exposition_dir=Path(directory),
+    )
+
+
+def _flush_line_metrics(deps: LineDeps) -> None:
+    """Render the D3 protocol counters to this line's textfile after the run.
+
+    The counters are recorded in memory during ``worker_turn`` (goal_line.py);
+    this is the effect side of D3 -- without it the numbers die with the
+    process and never reach the node_exporter textfile the alerting surface
+    scrapes (the monitoring gap the spec exists to close). Mirrors how
+    ``cost_obs`` calls ``plane.write_exposition()`` at the end of a run
+    (dd_runner.py). Observability must never fail the work it observes: a line
+    not wired to a metrics directory has ``deps.metrics is None`` and flushes
+    nothing, and a failed render is swallowed rather than faulting the line.
+    """
+    metrics = deps.metrics
+    if metrics is None:
+        return
+    with suppress(Exception):
+        # A scrape-side write failure is an observability problem, not a line
+        # failure: the line's outcome is already decided.
+        metrics.write_exposition()
 
 
 def _build_interrupt(config: LineConfig, *, run_id: str = "") -> LineInterruptPort | None:
@@ -371,6 +430,12 @@ def run_line(config: LineConfig, *, run_id: str | None = None) -> dict[str, Any]
         # exception propagate to a non-zero exit.
         deps.artifacts.write_fault_terminal(exception=exc)
         raise
+    finally:
+        # D3 effect side: render the protocol counters recorded during the run
+        # (including those recorded before a fault) to the line's textfile, so
+        # they reach the node_exporter scrape path instead of dying with the
+        # process.
+        _flush_line_metrics(deps)
     return {
         "folder_id": config.folder_id,
         "terminal": state.get("terminal"),
@@ -392,8 +457,9 @@ def resume_goal_line(config: LineConfig, decision: DecisionInput) -> tuple[dict[
     continuation instead of parking.
     """
     store = GoalInterruptStore(config.run_root).open()
+    deps: LineDeps | None = None
     try:
-        graph, _deps = build_line(config)
+        graph, deps = build_line(config)
         invoke_config: dict[str, Any] = {
             "configurable": {"thread_id": config.thread_id},
             "recursion_limit": config.max_rounds * 8 + 20,
@@ -402,6 +468,11 @@ def resume_goal_line(config: LineConfig, decision: DecisionInput) -> tuple[dict[
             compiled = graph.compile(checkpointer=saver)
             return resume_line(compiled, config=invoke_config, decision=decision, store=store)
     finally:
+        # D3 effect side: render the protocol counters recorded during the
+        # resumed rounds to the line's textfile, exactly as run_line does for
+        # a fresh launch. Only when the line was actually built.
+        if deps is not None:
+            _flush_line_metrics(deps)
         store.close()
 
 

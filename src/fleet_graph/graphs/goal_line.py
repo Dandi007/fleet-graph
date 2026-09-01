@@ -84,8 +84,17 @@ N7_INVALID_ROUND_CODE = "resume_verification_mismatch"
 #: Explicit code recorded on a round a worker turn report fails the v1 protocol
 #: (E4a). The round is invalid by protocol, never a success/blocked inference:
 #: the line faults rather than asking the coordinator to weigh a report that was
-#: never validated -- which would look like a quiet successful round.
+#: never validated -- which would look like a quiet successful round. Since D1,
+#: this only fires after the bounded re-ask was also refused; the ``detail``
+#: carries both error causes.
 WORKER_REPORT_PROTOCOL_FAILURE = "worker_report_protocol_failure"
+
+#: The bounded re-ask upper bound for a worker turn report that fails the v1
+#: protocol (D1). Configurable: ``LineDeps.worker_report_retry_limit`` defaults
+#: to this constant, so an operator can tune the cost/benefit of a re-ask
+#: without editing the default. Re-asking happens inside the same round, same
+#: generation -- never a new coordinator turn, never a new round record.
+WORKER_REPORT_RETRY_LIMIT = 1
 
 #: The report request appended to every worker turn prompt (E4a). The worker
 #: seat is a generic agent driven only by its prompt, so without this explicit
@@ -122,6 +131,24 @@ def _worker_prompt(prompt: str) -> str:
     """
     base = prompt.strip()
     return f"{base}{WORKER_REPORT_REQUEST}" if base else WORKER_REPORT_REQUEST
+
+
+def _worker_report_retry_suffix(exc: ReportProtocolError) -> str:
+    """The mechanical append that turns a failed turn's prompt into the re-ask
+    prompt (D1).
+
+    Deliberately carries **only protocol facts** -- the previous output did not
+    pass the v1 protocol, the exact ``kind``/``detail`` the decoder refused
+    with, and the demand to re-send just the report body. It must never contain
+    task content or steer the conclusion: anything past these protocol facts
+    would be writing the answer for the worker.
+    """
+    return (
+        "\n\nYour previous output did not pass the worker-turn-report/v1 protocol. "
+        f"Protocol error kind={exc.kind!r}, detail={exc.detail!r}. "
+        "Re-send ONLY the report body: a single raw JSON object conforming to the "
+        "schema requested above. No prose, no markdown fences, no commentary."
+    )
 
 
 def claims_resume_verification_broken(reason: str) -> bool:
@@ -220,6 +247,29 @@ class DecisionInterruptPort(Protocol):
     def record_turn_result(self, turn_id: str, result: dict[str, Any]) -> None: ...
 
     def turn_result(self, turn_id: str) -> dict[str, Any] | None: ...
+
+
+class LineMetricsPort(Protocol):
+    """Line-level counters the observation surface can aggregate (D3).
+
+    Two counters, labelled by line and ``exc.kind``: how many worker turn
+    reports failed the v1 protocol, and of those how many were recovered by the
+    bounded re-ask (D1). Before this single, these were only discoverable by
+    grepping line logs -- the alerting surface stayed silent on all 25 of the
+    ``worker turn report malformed`` lines across the fleet.
+
+    ``write_exposition`` is the effect side the *runner* owns: the counters
+    are recorded in memory during ``worker_turn``, and it is the runner's job
+    to render them to the node_exporter textfile once the line run is over
+    (mirrors ``cost_obs``'s ``write_exposition``). The graph never flushes;
+    the runner does, at the end of ``run_line``/``resume_goal_line``.
+    """
+
+    def record_worker_report_protocol_failure(self, line: str, kind: str) -> None: ...
+
+    def record_worker_report_protocol_recovered(self, line: str, kind: str) -> None: ...
+
+    def write_exposition(self) -> Any: ...
 
 
 class Verdict(TypedDict, total=False):
@@ -335,6 +385,12 @@ class LineDeps:
     #: The prior generation's terminal.json content, injected into the round-1
     #: coordinator input when present. None means there was no prior terminal.
     prior_terminal: dict[str, Any] | None = None
+    #: M5: the revival envelope (who/basis/generation/reason) for a line whose
+    #: `done` terminal a valid revoke overturned. Injected into the round-1
+    #: coordinator input alongside `prior_terminal` (which still carries the
+    #: old `done` terminal, so the line can see exactly what was overturned).
+    #: None means a normal launch -- the field is then absent, not guessed.
+    revival: dict[str, Any] | None = None
     #: The process run id that names this line's RunArtifacts. Recorded into
     #: the checkpoint terminal state (E3) so the scheduler can read it through
     #: ``get_state`` instead of ``terminal.json``.
@@ -343,6 +399,15 @@ class LineDeps:
     #: ``blocked + waiting_on=decision`` parking path unchanged; non-None routes
     #: a human-decision wait through a durable in-graph interrupt instead.
     interrupt: DecisionInterruptPort | None = None
+    #: The bounded re-ask upper bound for a worker turn report that fails the
+    #: v1 protocol (D1). A refused report is re-asked at most this many times
+    #: within the same round before the line faults. Configurable per line;
+    #: defaults to the ``WORKER_REPORT_RETRY_LIMIT`` constant.
+    worker_report_retry_limit: int = WORKER_REPORT_RETRY_LIMIT
+    #: The line-level worker-report protocol metric recorder (D3). None means
+    #: the line is not wired to the observation surface; the graph still faults
+    #: identically, the counters just stay silent.
+    metrics: LineMetricsPort | None = None
 
     def now(self) -> float | None:
         return self.clock() if self.clock is not None else None
@@ -384,6 +449,8 @@ def _coordinator_input(
         coord_input["resume_verification"] = deps.resume_verification
     if round_no == 1 and deps.prior_terminal is not None:
         coord_input["prior_terminal"] = deps.prior_terminal
+    if round_no == 1 and deps.revival is not None:
+        coord_input["revival"] = deps.revival
     if decision is not None:
         coord_input["decision"] = decision.as_dict()
         coord_input["resume_key"] = decision.resume_key
@@ -640,49 +707,89 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         deps.artifacts.heartbeat(round_no, "worker")
 
         prompt = _worker_prompt(state.get("pending_prompt", ""))
-        try:
-            output = deps.worker.turn(prompt, round_no)
-            report = decode_report(output)
-        except TimeoutError as exc:
-            deps.guards.record_timeout()
-            deps.artifacts.append_round(
-                {
-                    "round": round_no,
-                    "verdict": "continue",
-                    "reason": "worker_turn_timeout",
-                    "prompt_sha256": state.get("pending_sha", ""),
-                    "injected": True,
-                }
-            )
-            return {
-                "round_no": round_no + 1,
-                "rounds_recorded": state.get("rounds_recorded", 0) + 1,
-                "last_turn_status": {"kind": "turn_timeout", "detail": str(exc)},
-                "last_turn_output": "",
-                "last_turn_report": None,
-            }
+        retry_limit = deps.worker_report_retry_limit
+        #: The bounded re-ask (D1): a report that fails the v1 protocol is
+        #: re-asked within this same round, up to ``retry_limit`` times, with a
+        #: mechanical append that carries only protocol facts. The round stays
+        #: the same round -- no new generation, no coordinator turn, no extra
+        #: round record. Only when the re-ask is also refused does the line
+        #: fault, exactly as before (E4a's first half is untouched: an
+        #: unvalidated report is never success, blocked, or empty success).
+        protocol_failures: list[str] = []
+        retries_used = 0
+        last_exc: ReportProtocolError | None = None
 
-        except ReportProtocolError as exc:
-            # E4a protocol failure: a missing/malformed/unsupported-version/
+        report: Any = None
+        turn_prompt = prompt
+        for attempt in range(retry_limit + 1):
+            try:
+                output = deps.worker.turn(turn_prompt, round_no)
+                report = decode_report(output)
+                break
+            except TimeoutError as exc:
+                deps.guards.record_timeout()
+                deps.artifacts.append_round(
+                    {
+                        "round": round_no,
+                        "verdict": "continue",
+                        "reason": "worker_turn_timeout",
+                        "prompt_sha256": state.get("pending_sha", ""),
+                        "injected": True,
+                    }
+                )
+                return {
+                    "round_no": round_no + 1,
+                    "rounds_recorded": state.get("rounds_recorded", 0) + 1,
+                    "last_turn_status": {"kind": "turn_timeout", "detail": str(exc)},
+                    "last_turn_output": "",
+                    "last_turn_report": None,
+                }
+
+            except ReportProtocolError as exc:
+                last_exc = exc
+                protocol_failures.append(f"{exc.kind}: {exc.detail}")
+                if deps.metrics is not None:
+                    deps.metrics.record_worker_report_protocol_failure(
+                        line=deps.folder_id, kind=exc.kind
+                    )
+                if attempt >= retry_limit:
+                    break
+                retries_used += 1
+                turn_prompt = prompt + _worker_report_retry_suffix(exc)
+
+        if report is None and last_exc is not None:
+            # E4a protocol failure, still a fault after the bounded re-ask was
+            # also refused: a missing/malformed/truncated/unsupported-version/
             # schema-invalid report is never interpreted as success, as blocked,
-            # or as an empty successful turn. Fault the line rather than asking
-            # the coordinator to weigh an unvalidated report -- no extra
-            # coordinator round and no account charge from the retry.
+            # or as an empty successful turn. The `detail` records both error
+            # causes and how many re-asks ran, so the observation surface can
+            # distinguish "rescued" from "twice-refused".
+            detail = f"重问 {retries_used} 次后仍失败；" + "；".join(protocol_failures)
             deps.artifacts.append_round(
                 {
                     "round": round_no,
                     "verdict": "invalid",
                     "reason": WORKER_REPORT_PROTOCOL_FAILURE,
-                    "detail": f"{exc.kind}: {exc.detail}",
+                    "detail": detail,
+                    "protocol_retries": retries_used,
+                    "protocol_failures": protocol_failures,
                     "prompt_sha256": state.get("pending_sha", ""),
                     "injected": True,
                 }
             )
             return {
                 "terminal": TERMINAL_FAULT,
-                "terminal_reason": f"worker turn report {exc.kind}: {exc.detail}",
+                "terminal_reason": f"worker turn report {last_exc.kind}: {last_exc.detail}",
                 "pump_fault": True,
             }
+
+        # A re-ask recovered the report within the round: count it so the
+        # fleet can tell "rescued by re-ask" from "twice-refused" per line and
+        # kind (D3).
+        if retries_used > 0 and deps.metrics is not None and last_exc is not None:
+            deps.metrics.record_worker_report_protocol_recovered(
+                line=deps.folder_id, kind=last_exc.kind
+            )
 
         # Only the structured decoder/projection is consulted for control
         # decisions: decode_report() validated the report at the boundary and
@@ -695,16 +802,21 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         control = project_control(report)
         deps.guards.record_turn_ok()
         deps.artifacts.write_worker_report(round_no, report)
-        deps.artifacts.append_round(
-            {
-                "round": round_no,
-                "verdict": "continue",
-                "reason": "",
-                "report_outcome": report["outcome"],
-                "prompt_sha256": state.get("pending_sha", ""),
-                "injected": True,
-            }
-        )
+        round_record: dict[str, Any] = {
+            "round": round_no,
+            "verdict": "continue",
+            "reason": "",
+            "report_outcome": report["outcome"],
+            "prompt_sha256": state.get("pending_sha", ""),
+            "injected": True,
+        }
+        if retries_used > 0:
+            # Only a round that actually re-asked carries the retry facts; a
+            # clean round keeps the exact record shape it always had, so zero
+            # re-asks stays observable as an unremarkable round.
+            round_record["protocol_retries"] = retries_used
+            round_record["protocol_failures"] = protocol_failures
+        deps.artifacts.append_round(round_record)
 
         progressed: LineState = {
             "round_no": round_no + 1,
@@ -835,9 +947,11 @@ __all__ = [
     "TERMINAL_FAULT",
     "WORKER_REPORT_PROTOCOL_FAILURE",
     "WORKER_REPORT_REQUEST",
+    "WORKER_REPORT_RETRY_LIMIT",
     "AcceptancePort",
     "DecisionInterruptPort",
     "LineDeps",
+    "LineMetricsPort",
     "LineState",
     "acknowledges_decision",
     "build_goal_line_graph",
