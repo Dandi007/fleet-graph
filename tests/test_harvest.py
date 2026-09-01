@@ -920,7 +920,47 @@ class TestDefaultHarvestOpsWorktreeLifecycle:
         assert not worktree_root.exists(), "worktree not cleaned up after verify"
 
     def test_conflict_path_still_reports_conflicts(self, tmp_path: Path) -> None:
-        """冲突路径行为不变：worktree add 失败/冲突都如实报告，不强行覆盖。"""
+        """冲突路径行为不变：worktree add 失败/冲突都如实报告，不强行覆盖。
+
+        H6 后 -X theirs 能解开纯内容冲突（重试收口），这里改用 **modify/delete
+        冲突**（默认分支删文件、工单分支改同文件）——git 连 -X theirs 都无法自动
+        收口，必须诚实 escalate（ok:false / conflicts:true）并就地清理 worktree，
+        绝不把冲突吞成 ok:true。
+        """
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "config", "user.email", "test@example.invalid")
+        git(repo, "config", "user.name", "test")
+        (repo / "shared.txt").write_text("base\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "seed")
+
+        git(repo, "checkout", "-q", "-b", "feature")
+        (repo / "shared.txt").write_text("feature\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "product change")
+        product_commit = head(repo)
+        git(repo, "checkout", "-q", "main")
+        git(repo, "rm", "-q", "shared.txt")
+        git(repo, "commit", "-q", "-m", "main deletes")
+
+        ops = DefaultHarvestOps()
+        worktree_root = tmp_path / "harvest-worktree"
+        result = ops.worktree_cherry_pick(repo, product_commit, "main", worktree_root)
+        assert result.get("conflicts") is True or result["ok"] is False
+        assert not worktree_root.exists(), "failed worktree left behind"
+
+    def test_conflict_retry_closes_via_x_theirs(self, tmp_path: Path) -> None:
+        """H6：纯内容冲突清场后 -X theirs 重试必须收口（ok:true + 真实 harvest_tip）。
+
+        双分支同文件改法（沿用 test_conflict_path_still_reports_conflicts 旧 fixture）：
+        首败冲突后 worktree 索引残留 unmerged files；本实现先 cherry-pick --abort
+        清场再 -X theirs 重试，`-X theirs` 以默认分支为主解得开 -> ok:true 且
+        harvest_tip 非空、成功路径 worktree 保留供 run_verify（rc-702098ab 语义）。
+        """
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
         repo = tmp_path / "repo"
@@ -945,8 +985,49 @@ class TestDefaultHarvestOpsWorktreeLifecycle:
         ops = DefaultHarvestOps()
         worktree_root = tmp_path / "harvest-worktree"
         result = ops.worktree_cherry_pick(repo, product_commit, "main", worktree_root)
-        assert result.get("conflicts") is True or result["ok"] is False
-        assert not worktree_root.exists(), "failed worktree left behind"
+        assert result["ok"] is True, result
+        assert result.get("harvest_tip"), result
+        # harvest_tip 必须是真实可解析 commit（不凭空造）。
+        git(repo, "cat-file", "-e", f"{result['harvest_tip']}^{{commit}}")
+        # 成功路径 worktree 保留供 run_verify（rc-702098ab）。
+        assert worktree_root.is_dir(), "closed conflict worktree must survive for run_verify"
+        verify_exit = ops.run_verify(worktree_root, ["/bin/true"])
+        assert verify_exit == 0
+        ops.remove_worktree(repo, worktree_root)
+        assert not worktree_root.exists()
+
+    def test_conflict_retry_never_fabricates_harvest_tip(self, tmp_path: Path) -> None:
+        """H6 关键负例：不得自报 harvested——失败绝不报 ok:true，也绝不凭空 harvest_tip。
+
+        modify/delete 冲突连 -X theirs 都收不了口 -> 必须诚实 ok:false +
+        conflicts:true（escalate 语义），绝不「失败却报 ok:true / 凭空 harvest_tip」。
+        """
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "config", "user.email", "test@example.invalid")
+        git(repo, "config", "user.name", "test")
+        (repo / "shared.txt").write_text("base\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "seed")
+
+        git(repo, "checkout", "-q", "-b", "feature")
+        (repo / "shared.txt").write_text("feature\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "product change")
+        product_commit = head(repo)
+        git(repo, "checkout", "-q", "main")
+        git(repo, "rm", "-q", "shared.txt")
+        git(repo, "commit", "-q", "-m", "main deletes")
+
+        ops = DefaultHarvestOps()
+        worktree_root = tmp_path / "harvest-worktree"
+        result = ops.worktree_cherry_pick(repo, product_commit, "main", worktree_root)
+        assert result["ok"] is False, result
+        assert result.get("conflicts") is True, result
+        assert not worktree_root.exists(), "escalated conflict worktree left behind"
 
 
 def _init_git_repo(repo: Path) -> None:
