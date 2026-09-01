@@ -1,0 +1,20 @@
+{
+ "development_id": "dev-fg-6d1ce7ec4f2b",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_dd_control_plane.py",
+   "tests/test_dd_service.py"
+  ],
+  [
+   "make",
+   "verify"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
