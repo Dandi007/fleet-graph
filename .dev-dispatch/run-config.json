@@ -1,0 +1,20 @@
+{
+ "development_id": "dev-fg-f7c84e1edb98",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_fleet_state_readmodel.py",
+   "tests/test_run_artifacts.py"
+  ],
+  [
+   "make",
+   "verify"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
