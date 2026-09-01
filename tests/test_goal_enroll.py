@@ -29,11 +29,13 @@ from fleet_graph.goal_enroll.contract import (
     CODE_ACCEPTANCE_DECLARATION_INVALID,
     CODE_ALIAS_CONFLICT,
     CODE_ALIAS_TOKEN_MISSING,
+    CODE_DECISION_REF_REQUIRED,
     CODE_FOLDER_NOT_FOUND,
     CODE_GOLDEN_ORDER_EMPTY,
     CODE_NO_ACCEPTANCE_COMMAND,
     CODE_NOT_A_GOAL_LINE,
     CODE_NOT_PENDING,
+    CODE_NOT_SUPERVISOR,
     CODE_SOURCE_UNBOUND,
     CODE_SPEC_LINT_BAN,
     GOAL_ENROLL_MECHANISM,
@@ -42,6 +44,7 @@ from fleet_graph.goal_enroll.contract import (
     QUEUE_STATUS_PENDING,
     QUEUE_STATUS_REJECTED,
     QUEUE_STATUS_WITHDRAWN,
+    U4_CLOSEOUT_DECISION_REF,
     GoalEnrollError,
     GoalRosterEntry,
 )
@@ -730,11 +733,29 @@ class TestServiceAndMCP:
         server = build_goal_mcp_server()
         tools = asyncio.run(server.list_tools())
         names = {tool.name for tool in tools}
-        assert {"goal_enroll", "goal_list", "goal_status", "goal_withdraw"} <= names
+        assert {
+            "goal_enroll",
+            "goal_list",
+            "goal_status",
+            "goal_withdraw",
+            "goal_admit",
+        } <= names
         prompts = asyncio.run(server.list_prompts())
         assert GOAL_OPEN_PROMPT_NAME in {prompt.name for prompt in prompts}
         resources = asyncio.run(server.list_resources())
         assert str(BRIEFING_RESOURCE_URI) in {str(res.uri) for res in resources}
+
+    def test_the_goal_admit_tool_lists_its_required_arguments(self) -> None:
+        """U4: tools/list exposes the admit capability with its required args."""
+        from fleet_graph.goal.service import build_goal_mcp_server
+
+        server = build_goal_mcp_server()
+        tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
+        admit = tools["goal_admit"]
+        params = set(admit.parameters["properties"])
+        assert {"folder_id", "decision_ref", "decided_by"} <= params
+        required = set(admit.parameters.get("required") or params)
+        assert {"folder_id", "decision_ref", "decided_by"} <= required
 
     def test_the_goal_surface_is_not_on_the_dd_face(self) -> None:
         """The goal-driven split: dd carries no goal_enroll / goal-open /
@@ -886,3 +907,234 @@ def _payload(result: Any) -> dict[str, Any]:
                 except ValueError:
                     continue
     return {}
+
+
+class TestGoalAdmitSupervisorSurface:
+    """U4 closeout: the supervisor admission edge (pending -> admitted).
+
+    Pins the supervisor-only release path: ``goal_admit`` is the one MCP tool
+    that marks a *pending* application ``admitted`` with the supervisor release
+    verdict's ``decision_ref`` (reusing the queue's ``mark_admitted`` -- no
+    state-machine rewrite), refuses every non-supervisor identity, and is
+    idempotent for the already-admitted-same-decision case without duplicating
+    or destructively rewriting history.
+    """
+
+    def _service(
+        self, tmp_path: Path, *, supervisor_check: Any | None = None
+    ) -> tuple[GoalEnrollService, EnrollQueue, Path]:
+        _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        service = GoalEnrollService(
+            GoalEnrollValidator(_source(tmp_path), alias_token_check=lambda alias: True),
+            queue=queue,
+            roster=RealRosterReader(tmp_path / "absent.json"),
+            supervisor_identity_check=supervisor_check
+            or (lambda identity: identity == "supervisor"),
+        )
+        return service, queue, tmp_path
+
+    def test_a_non_supervisor_identity_cannot_invoke_admission(self, tmp_path: Path) -> None:
+        """The authorization boundary holds: only a supervisor-plane principal
+        may admit; a non-supervisor identity refuses with a stable code."""
+        service, queue, _ = self._service(tmp_path)
+        service.submit("wf-1", "ronin-fresh")
+        with pytest.raises(GoalEnrollError) as refused:
+            service.admit("wf-1", U4_CLOSEOUT_DECISION_REF, decided_by="ronin-fresh")
+        assert refused.value.code == CODE_NOT_SUPERVISOR
+        # Nothing changed: the entry stays pending.
+        assert queue.get("wf-1")["status"] == QUEUE_STATUS_PENDING
+
+    def test_admission_of_an_already_rejected_enrollment_is_refused(self, tmp_path: Path) -> None:
+        service, queue, _ = self._service(tmp_path)
+        service.submit("wf-1", "ronin-fresh")
+        queue.mark_rejected("wf-1", decided_by="supervisor", decision_ref="ref-reject")
+        with pytest.raises(GoalEnrollError) as refused:
+            service.admit("wf-1", U4_CLOSEOUT_DECISION_REF, decided_by="supervisor")
+        assert refused.value.code == CODE_NOT_PENDING
+        assert queue.get("wf-1")["status"] == QUEUE_STATUS_REJECTED
+
+    def test_admission_of_an_already_withdrawn_enrollment_is_refused(self, tmp_path: Path) -> None:
+        service, queue, _ = self._service(tmp_path)
+        service.submit("wf-1", "ronin-fresh")
+        queue.withdraw("wf-1", by="ronin-fresh")
+        with pytest.raises(GoalEnrollError) as refused:
+            service.admit("wf-1", U4_CLOSEOUT_DECISION_REF, decided_by="supervisor")
+        assert refused.value.code == CODE_NOT_PENDING
+        assert queue.get("wf-1")["status"] == QUEUE_STATUS_WITHDRAWN
+
+    def test_successful_admission_writes_status_and_decision_ref(self, tmp_path: Path) -> None:
+        service, queue, _ = self._service(tmp_path)
+        service.submit("wf-1", "ronin-fresh")
+        admitted = service.admit("wf-1", U4_CLOSEOUT_DECISION_REF, decided_by="supervisor")
+        assert admitted["status"] == QUEUE_STATUS_ADMITTED
+        assert admitted["decision_ref"] == U4_CLOSEOUT_DECISION_REF
+        assert admitted["decided_by"] == "supervisor"
+        persisted = queue.get("wf-1")
+        assert persisted["status"] == QUEUE_STATUS_ADMITTED
+        assert persisted["decision_ref"] == U4_CLOSEOUT_DECISION_REF
+        # History retained the original pending row and appended the admission.
+        assert [h["status"] for h in persisted["history"]] == [
+            QUEUE_STATUS_PENDING,
+            QUEUE_STATUS_ADMITTED,
+        ]
+
+    def test_repeated_admission_is_idempotent_and_does_not_rewrite_history(
+        self, tmp_path: Path
+    ) -> None:
+        service, queue, _ = self._service(tmp_path)
+        service.submit("wf-1", "ronin-fresh")
+        service.admit("wf-1", U4_CLOSEOUT_DECISION_REF, decided_by="supervisor")
+        again = service.admit("wf-1", U4_CLOSEOUT_DECISION_REF, decided_by="supervisor")
+        assert again["already_admitted"] is True
+        assert again["status"] == QUEUE_STATUS_ADMITTED
+        assert again["decision_ref"] == U4_CLOSEOUT_DECISION_REF
+        # History is neither duplicated nor destructively rewritten.
+        persisted = queue.get("wf-1")
+        assert [h["status"] for h in persisted["history"]] == [
+            QUEUE_STATUS_PENDING,
+            QUEUE_STATUS_ADMITTED,
+        ]
+        assert len(persisted["history"]) == 2
+
+    def test_admission_requires_a_decision_reference(self, tmp_path: Path) -> None:
+        service, queue, _ = self._service(tmp_path)
+        service.submit("wf-1", "ronin-fresh")
+        with pytest.raises(GoalEnrollError) as refused:
+            service.admit("wf-1", "", decided_by="supervisor")
+        assert refused.value.code == CODE_DECISION_REF_REQUIRED
+        assert queue.get("wf-1")["status"] == QUEUE_STATUS_PENDING
+
+    def test_an_already_admitted_enrollment_with_a_different_decision_refuses(
+        self, tmp_path: Path
+    ) -> None:
+        service, _, _ = self._service(tmp_path)
+        service.submit("wf-1", "ronin-fresh")
+        service.admit("wf-1", "ref-old", decided_by="supervisor")
+        with pytest.raises(GoalEnrollError) as refused:
+            service.admit("wf-1", U4_CLOSEOUT_DECISION_REF, decided_by="supervisor")
+        assert refused.value.code == CODE_NOT_PENDING
+
+    def test_successful_admission_exposes_admitted_and_decision_ref_on_the_read_model(
+        self, tmp_path: Path
+    ) -> None:
+        """/v1/enrollments reports the admitted status and exact decision_ref."""
+        service, _, tmp_path = self._service(tmp_path)
+        service.submit("wf-1", "ronin-fresh")
+        service.admit("wf-1", U4_CLOSEOUT_DECISION_REF, decided_by="supervisor")
+
+        from fleet_graph.state.fleet_state import FleetStateConfig, FleetStateView
+
+        view = FleetStateView(
+            FleetStateConfig(
+                host="127.0.0.1",
+                port=0,
+                run_root=tmp_path / "runs",
+                dd_root=tmp_path / "dd",
+                lines_config=tmp_path / "missing.json",
+                bridge_state_dir=tmp_path / "bridge",
+                enroll_queue_path=tmp_path / "queue" / "enroll-queue.jsonl",
+            )
+        )
+        payload = view.enrollments()
+        entry = next(e for e in payload["enrollments"] if e["folder_id"] == "wf-1")
+        assert entry["status"] == QUEUE_STATUS_ADMITTED
+        assert entry["decision_ref"] == U4_CLOSEOUT_DECISION_REF
+
+    def test_goal_admit_over_the_wire_refuses_non_supervisor(self, tmp_path: Path) -> None:
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        from fleet_graph.goal.service import build_goal_mcp_server
+        from test_dd_service import running_server
+
+        _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        server = build_goal_mcp_server(
+            goal_folders=_source(tmp_path),
+            goal_queue=queue,
+            real_roster=RealRosterReader(tmp_path / "absent.json"),
+            board=None,
+            alias_token_check=lambda alias: True,
+            supervisor_identity_check=lambda identity: identity == "supervisor",
+        )
+
+        async def submit_and_admit(url: str) -> dict[str, Any]:
+            async with Client(url) as client:
+                await client.call_tool("goal_enroll", {"folder_id": "wf-1", "alias": "ronin-fresh"})
+                try:
+                    await client.call_tool(
+                        "goal_admit",
+                        {
+                            "folder_id": "wf-1",
+                            "decision_ref": U4_CLOSEOUT_DECISION_REF,
+                            "decided_by": "ronin-fresh",
+                        },
+                    )
+                    return {"refused": False, "code": None}
+                except ToolError as exc:
+                    message = str(exc)
+                    payload = json.loads(message[message.index("{") : message.rindex("}") + 1])
+                    return {"refused": True, "code": payload.get("code")}
+
+        with running_server(server) as url:
+            outcome = asyncio.run(submit_and_admit(url))
+
+        assert outcome["refused"] is True
+        assert outcome["code"] == CODE_NOT_SUPERVISOR
+        assert queue.get("wf-1")["status"] == QUEUE_STATUS_PENDING
+
+    def test_goal_admit_over_the_wire_admits_and_is_idempotent(self, tmp_path: Path) -> None:
+        from fastmcp import Client
+
+        from fleet_graph.goal.service import build_goal_mcp_server
+        from test_dd_service import running_server
+
+        _folder(tmp_path, "wf-1", GOAL_MD_OK, GOLDEN_ORDER_OK)
+        queue = EnrollQueue(str(tmp_path / "queue"))
+        server = build_goal_mcp_server(
+            goal_folders=_source(tmp_path),
+            goal_queue=queue,
+            real_roster=RealRosterReader(tmp_path / "absent.json"),
+            board=None,
+            alias_token_check=lambda alias: True,
+            supervisor_identity_check=lambda identity: identity == "supervisor",
+        )
+
+        async def call(url: str) -> dict[str, Any]:
+            async with Client(url) as client:
+                await client.call_tool("goal_enroll", {"folder_id": "wf-1", "alias": "ronin-fresh"})
+                first = _payload(
+                    await client.call_tool(
+                        "goal_admit",
+                        {
+                            "folder_id": "wf-1",
+                            "decision_ref": U4_CLOSEOUT_DECISION_REF,
+                            "decided_by": "supervisor",
+                        },
+                    )
+                )
+                second = _payload(
+                    await client.call_tool(
+                        "goal_admit",
+                        {
+                            "folder_id": "wf-1",
+                            "decision_ref": U4_CLOSEOUT_DECISION_REF,
+                            "decided_by": "supervisor",
+                        },
+                    )
+                )
+                return {"first": first, "second": second}
+
+        with running_server(server) as url:
+            result = asyncio.run(call(url))
+
+        assert result["first"]["status"] == QUEUE_STATUS_ADMITTED
+        assert result["first"]["decision_ref"] == U4_CLOSEOUT_DECISION_REF
+        assert result["second"]["already_admitted"] is True
+        assert result["second"]["status"] == QUEUE_STATUS_ADMITTED
+        persisted = queue.get("wf-1")
+        assert [h["status"] for h in persisted["history"]] == [
+            QUEUE_STATUS_PENDING,
+            QUEUE_STATUS_ADMITTED,
+        ]

@@ -11,6 +11,15 @@ the fallback visibility); the entry records ``board_notify`` either way.
 Idempotency is per ``folder_id`` and follows the spec: a folder already in the
 real roster answers ``already_enrolled`` (对照真名册判定), a folder already
 ``pending`` in the queue answers ``already_pending``.
+
+U4 closeout adds the supervisor release edge: :meth:`GoalEnrollService.admit`
+marks a *pending* application ``admitted`` from a supervisor release verdict,
+reusing the queue's existing ``mark_admitted`` write-back primitive (no
+state-machine rewrite). It is supervisor-only and fail-closed: the invoking
+identity must be a supervisor-plane principal (default seam = the real
+supervision-root credential check), re-admitting an already-admitted
+enrollment under the same ``decision_ref`` is idempotent, and a
+rejected/withdrawn (or differently-admitted) enrollment refuses.
 """
 
 from __future__ import annotations
@@ -19,6 +28,9 @@ from typing import Any
 
 from fleet_graph.goal_enroll.contract import (
     CODE_ALIAS_CONFLICT,
+    CODE_DECISION_REF_REQUIRED,
+    CODE_NOT_PENDING,
+    CODE_NOT_SUPERVISOR,
     DRIFT_ADMITTED_MISSING_FROM_ROSTER,
     DRIFT_ROSTER_BUT_PENDING,
     ORIGIN_PENDING,
@@ -34,9 +46,24 @@ from fleet_graph.goal_enroll.validator import GoalEnrollValidator
 DEFAULT_SUBMITTED_BY = "goal-mcp"
 
 
+def _default_supervisor_identity_check() -> Any:
+    """The U4 admission gate's production default: a supervisor-plane principal.
+
+    Mirrors gate 6 in reverse: a line's token must NOT resolve into the
+    supervision/control-plane credential root, and a supervisor identity's
+    credential MUST live there. Defaults to the real ownership check over the
+    fleet's supervision token root (``/data/agent-bus/tokens``); drills bind a
+    scratch supervision dir so the negative cases run against the real
+    canonicalization logic.
+    """
+    from fleet_graph.bus.tokens import build_supervisor_identity_check
+
+    return build_supervisor_identity_check()
+
+
 class GoalEnrollService:
     """The one entry point the ``goal_enroll`` / ``goal_list`` / ``goal_status``
-    / ``goal_withdraw`` MCP tools drive.
+    / ``goal_withdraw`` / ``goal_admit`` MCP tools drive.
 
     ``queue`` is the pending-queue store (spec deliverable A.1); ``roster`` is
     the read-only real-roster reader (``config/ronin-lines.json``). ``board``
@@ -53,12 +80,21 @@ class GoalEnrollService:
         *,
         board: Any = None,
         submitted_by: str = DEFAULT_SUBMITTED_BY,
+        supervisor_identity_check: Any = None,
     ) -> None:
         self._validator = validator
         self._queue = queue if queue is not None else EnrollQueue()
         self._roster = roster if roster is not None else RealRosterReader()
         self._board = board
         self._submitted_by = submitted_by
+        #: U4 admission gate: ``(identity) -> bool``, True only for a
+        #: supervisor-plane principal. Defaults to the real supervision-root
+        #: credential check; drills inject a fake.
+        self._supervisor_identity_check = (
+            supervisor_identity_check
+            if supervisor_identity_check is not None
+            else _default_supervisor_identity_check()
+        )
 
     # --- submission -------------------------------------------------------
 
@@ -240,6 +276,56 @@ class GoalEnrollService:
                 else (queue_entry.get("status") if queue_entry is not None else None)
             ),
         }
+
+    # --- admission (U4 supervisor release path) ----------------------------
+
+    def admit(
+        self,
+        folder_id: str,
+        decision_ref: str,
+        *,
+        decided_by: str | None = None,
+    ) -> dict[str, Any]:
+        """Admit one *pending* enrollment from a supervisor release verdict.
+
+        Supervisor-only, fail-closed: the invoking identity must be a
+        supervisor-plane principal (default seam = the real supervision-root
+        credential check); a non-supervisor identity refuses with
+        ``GOAL_ENROLL_NOT_SUPERVISOR`` and nothing changes. The queue state
+        machine is untouched -- this method reuses the existing
+        ``mark_admitted`` write-back primitive.
+
+        Idempotency per spec: re-admitting an enrollment that is *already*
+        ``admitted`` under the **same** ``decision_ref`` returns the existing
+        entry with ``already_admitted: True`` and appends no history row.
+        An already ``admitted`` enrollment under a *different* ``decision_ref``
+        is refused (``GOAL_ENROLL_NOT_PENDING``), as are ``rejected`` /
+        ``withdrawn`` / absent enrollments (the queue's own refusal).
+        """
+        identity = decided_by or self._submitted_by
+        if not self._supervisor_identity_check(identity):
+            raise GoalEnrollError(
+                CODE_NOT_SUPERVISOR,
+                f"identity {identity!r} is not a supervisor-plane principal; "
+                "admission authority stays exclusively with the supervisor plane",
+            )
+        if not decision_ref or not str(decision_ref).strip():
+            raise GoalEnrollError(
+                CODE_DECISION_REF_REQUIRED,
+                "admission needs the supervisor release verdict message id as decision_ref",
+            )
+
+        existing = self._queue.get(folder_id)
+        if existing is not None and existing.get("status") == QUEUE_STATUS_ADMITTED:
+            if existing.get("decision_ref") == decision_ref:
+                return {**existing, "already_admitted": True}
+            raise GoalEnrollError(
+                CODE_NOT_PENDING,
+                f"enrollment {folder_id!r} is already admitted under a different "
+                f"decision_ref {existing.get('decision_ref')!r}; refusing a second, "
+                "conflicting admission",
+            )
+        return self._queue.mark_admitted(folder_id, decided_by=identity, decision_ref=decision_ref)
 
     # --- withdrawal -------------------------------------------------------
 
