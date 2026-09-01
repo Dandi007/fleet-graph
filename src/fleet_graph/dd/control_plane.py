@@ -1121,6 +1121,13 @@ class DdControlPlane:
             "terminal": terminal,
             "terminal_reason": terminal_reason,
             "head_commit": head_commit,
+            #: The bounded principal (a line folder or a human subject) that
+            #: dispatched this development. Copied from the authoritative
+            #: admission record -- never recomputed from worker-run argv
+            #: labels, which are only a label projection -- and fail-soft to
+            #: an empty string when missing. This is what lets the read model
+            #: attribute a development to the line that dispatched it.
+            "dispatched_by": str(record.get("dispatched_by") or ""),
             # The failure record: cause class, one mechanical code, the raw
             # error in the failing collaborator's own words, retryability, and
             # which of the three exits is open. Derived, never stored twice.
@@ -1564,6 +1571,16 @@ class DdControlPlane:
             # non-terminal is recomputed rather than served from the file.
             if status is None or not status.get("terminal"):
                 status = self.rebuild_status(name)
+            elif "dispatched_by" not in status:
+                # A terminal cache written before `dispatched_by` entered the
+                # read model carries no provenance; backfill it from the
+                # authoritative record (never from worker-run labels) so the
+                # row still attributes the development to its dispatching line.
+                status = {
+                    **status,
+                    "dispatched_by": str(self._record(name).get("dispatched_by") or ""),
+                }
+                write_json_durable(status_path, status)
             if state and status.get("state") != state:
                 continue
             rows.append(status)
