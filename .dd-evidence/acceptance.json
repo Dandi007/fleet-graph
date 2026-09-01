@@ -1,0 +1,40 @@
+{
+ "development_id": "dev-fg-476316c7746c",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "uv",
+    "sync",
+    "--frozen"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": "Checked 100 packages in 0.90ms\n"
+  },
+  {
+   "command": [
+    "make",
+    "verify"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "_key_omitted\": true, \"positive_missing_depth_key_omitted\": true, \"positive_missing_fields_payload_green\": true, \"positive_missing_status_key_omitted\": true}, \"positives_green\": true, \"role_checks\": [{\"errors\": [], \"ok\": true, \"role\": \"dr-debater-advocate\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-debater-opponent\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-debater-judge\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-arbiter\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/arbiter-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-code-local\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-code-remote\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-content\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-feishu\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-web\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-wiki\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}], \"roles_root\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles\", \"run_ok\": true}\nresearch-role-contracts self_check: pass\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "pytest",
+    "-q",
+    "tests/test_research.py",
+    "tests/test_research_entry.py",
+    "tests/test_research_coldstart.py"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "........................................................................ [ 84%]\n.............                                                            [100%]\n",
+   "stderr_tail": ""
+  }
+ ]
+}
