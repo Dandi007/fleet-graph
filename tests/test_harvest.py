@@ -27,6 +27,7 @@ from fleet_graph.supervise.harvest import (
     OUTCOME_HARVESTED,
     OUTCOME_REFUSED,
     SOP_STEPS,
+    WRITE_STEPS,
     HarvestDeps,
     HarvestRunConfig,
     _resolve_repo,
@@ -35,7 +36,7 @@ from fleet_graph.supervise.harvest import (
     run_harvest,
 )
 from fleet_graph.supervise.harvest_allowlist import HarvestAllowlist, parse_harvest_allowlist
-from fleet_graph.supervise.harvest_ops import EXIT_HEAD_MISMATCH
+from fleet_graph.supervise.harvest_ops import EXIT_HEAD_MISMATCH, DefaultHarvestOps
 
 
 def fake_ops(
@@ -1427,3 +1428,139 @@ class TestHarvestPrMergeUsesCleanTip:
         merge_step = next(s for s in receipt["steps"] if s["step"] == "pr_squash_merge")
         assert merge_step["commit"] == "b" * 40
         assert receipt["harvest_tip"] == "b" * 40
+
+
+class TestHarvestWriteGate:
+    """H7 写前闸：worktree_cherry_pick / run_verify 任一判红 -> 立即停链，无任何写动作。
+
+    spec 阴性测试 1/2：run_verify 非零 或 worktree_cherry_pick ok:false 的 fixture ->
+    没有任何 PR 被 merge、默认分支 HEAD 与运行前逐字节相同、回执 outcome=escalated
+    且写步骤被显式记为跳过（writes_skipped）。fake ops 记录所有写原语调用，零调用
+    即机械证明「未执行任何写动作」；真实 git fixture 逐字节断言默认分支 HEAD 不变。
+    """
+
+    def test_verify_failure_blocks_all_writes(self, tmp_path: Path) -> None:
+        fake = fake_ops(verify_exit=1)
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        # 没有任何 PR 被 merge：fake 记录的写原语零调用。
+        assert "pr_squash_merge" not in fake["calls"], fake["calls"]
+        assert "ff_only_pull" not in fake["calls"], fake["calls"]
+        assert "deploy" not in fake["calls"], fake["calls"]
+        assert "verify_real" not in fake["calls"], fake["calls"]
+        # housekeeping cleanup 仍会跑（收掉一次性 worktree），不算写默认分支。
+        assert "remove_worktree" in fake["calls"], fake["calls"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["outcome"] == OUTCOME_ESCALATED
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+        # 写步骤本身不进回执（没执行）。
+        assert "pr_squash_merge" not in [s.get("step") for s in receipt["steps"]]
+
+    def test_cherry_pick_failure_blocks_all_writes(self, tmp_path: Path) -> None:
+        fake = fake_ops(worktree_ok=False)
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        # cherry-pick 失败 -> 无任何 PR 被 merge（D2：fallback 不存在，钉死无 merge）。
+        assert "pr_squash_merge" not in fake["calls"], fake["calls"]
+        assert "ff_only_pull" not in fake["calls"], fake["calls"]
+        assert "deploy" not in fake["calls"], fake["calls"]
+        assert "verify_real" not in fake["calls"], fake["calls"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["outcome"] == OUTCOME_ESCALATED
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+        assert "pr_squash_merge" not in [s.get("step") for s in receipt["steps"]]
+
+    def test_verify_failure_leaves_default_branch_head_untouched(self, tmp_path: Path) -> None:
+        """真实 git：run_verify 判红 -> 默认分支 HEAD 与运行前逐字节相同。"""
+        repo, product = _real_repo_with_origin(tmp_path)
+        before = head(repo)
+        config = HarvestRunConfig(
+            event=approved_unharvested_event(
+                development_id="dev-x", head_commit=product, stage="implement"
+            ).as_dict(),
+            state_root=tmp_path / "supervisor",
+            run_root=tmp_path / "runs",
+            dd_root=dd_record_root(tmp_path, str(repo)),
+            deploy_command=[],
+            allowlist=full_allowlist(str(repo)),
+            ops=DefaultHarvestOps(),
+            verify_argv=["false"],
+            verify_real_argv=["false"],
+            publish_notes=False,
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert head(repo) == before, "verify 判红后默认分支 HEAD 必须逐字节不变"
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+
+    def test_cherry_pick_failure_leaves_default_branch_head_untouched(self, tmp_path: Path) -> None:
+        """真实 git：worktree_cherry_pick 判红（modify/delete 冲突）-> HEAD 不变。"""
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        (repo / "shared.txt").write_text("base\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "add shared")
+        git(repo, "checkout", "-q", "-b", "feature")
+        (repo / "shared.txt").write_text("feature\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "product change")
+        product = head(repo)
+        git(repo, "checkout", "-q", "main")
+        git(repo, "rm", "-q", "shared.txt")
+        git(repo, "commit", "-q", "-m", "main deletes")
+        before = head(repo)
+        _add_origin_with_dd_ref(repo, tmp_path / "origin.git", product)
+        config = HarvestRunConfig(
+            event=approved_unharvested_event(
+                development_id="dev-x", head_commit=product, stage="implement"
+            ).as_dict(),
+            state_root=tmp_path / "supervisor",
+            run_root=tmp_path / "runs",
+            dd_root=dd_record_root(tmp_path, str(repo)),
+            deploy_command=[],
+            allowlist=full_allowlist(str(repo)),
+            ops=DefaultHarvestOps(),
+            verify_argv=["true"],
+            verify_real_argv=["true"],
+            publish_notes=False,
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert head(repo) == before, "cherry-pick 判红后默认分支 HEAD 必须逐字节不变"
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+
+    def test_all_ok_still_harvests_and_merges(self, tmp_path: Path) -> None:
+        """正向回归：全链每步 ok:true 仍正常 harvested，PR 正常 merge（不是永不写）。"""
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert "pr_squash_merge" in fake["calls"], fake["calls"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["pr_merged"] is True
+        assert receipt["writes_skipped"] == []
+
+
+def _real_repo_with_origin(tmp_path: Path) -> tuple[Path, str]:
+    """真实可收割仓：main + feature 产品 commit + origin + dd ref（本地合成，禁真网）。"""
+    repo = tmp_path / "canon"
+    _init_git_repo(repo)
+    git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "product.txt").write_text("product change\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "product change")
+    product = head(repo)
+    git(repo, "checkout", "-q", "main")
+    _add_origin_with_dd_ref(repo, tmp_path / "origin.git", product)
+    return repo, product
+
+
+def _add_origin_with_dd_ref(repo: Path, origin: Path, dd_target: str) -> None:
+    """把 repo 做成 bare origin，并建立 `refs/heads/dd/<dev>` 指向产品 commit。"""
+    git(repo, "clone", "--bare", "-q", ".", str(origin))
+    git(repo, "remote", "add", "origin", str(origin))
+    git(origin, "update-ref", "refs/heads/dd/dev-x", dd_target)
