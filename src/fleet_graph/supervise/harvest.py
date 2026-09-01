@@ -127,7 +127,9 @@ class HarvestOps(Protocol):
     def remove_worktree(self, repo: Path, worktree_root: Path) -> dict[str, Any]: ...
     def run_verify(self, worktree: Path, argv: list[str]) -> int: ...
     def board_card_entity_id(self, development_id: str, dd_root: Path) -> str | None: ...
-    def detect_inflight_binding(self, tree_path: Path, dd_root: Path) -> dict[str, Any]: ...
+    def detect_inflight_binding(
+        self, tree_path: Path, dd_root: Path, current_development_id: str | None = None
+    ) -> dict[str, Any]: ...
     def pr_squash_merge(
         self, repo: Path, development_id: str, head_commit: str, default_branch: str
     ) -> dict[str, Any]: ...
@@ -269,7 +271,11 @@ def _detect_occupied_tree(
         if tree is None:
             continue
         try:
-            binding = deps.ops.detect_inflight_binding(tree, deps.dd_root)
+            # rc-3d12fbbe：传入 current_development_id，让 ops 层跳过本单自身在飞
+            # 绑定并继续扫描（防止本单 dev id 排序靠前时遮蔽更靠后的外来在飞单）。
+            binding = deps.ops.detect_inflight_binding(
+                tree, deps.dd_root, current_development_id=development_id
+            )
         except Exception as exc:
             return {
                 "escalate": ESCALATE_TREE_OCCUPIED,

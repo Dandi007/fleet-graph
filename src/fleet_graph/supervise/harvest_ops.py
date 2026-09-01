@@ -509,7 +509,12 @@ class DefaultHarvestOps:
             return "", False
         return str(status.get("terminal") or ""), True
 
-    def detect_inflight_binding(self, tree_path: Path, dd_root: Path) -> dict[str, Any]:
+    def detect_inflight_binding(
+        self,
+        tree_path: Path,
+        dd_root: Path,
+        current_development_id: str | None = None,
+    ) -> dict[str, Any]:
         """H8 交付 A：只读 occupancy 判定——`tree_path` 是否被另一张在飞单绑定。
 
         返回机器可读 `{"bound_development_id": str|None, "in_flight": bool,
@@ -532,6 +537,13 @@ class DefaultHarvestOps:
         5. **本方法只读**：零 `rmtree`/`worktree remove`/`reset`/`checkout`/
            `clean`，绝不写/建/登记任何文件——所有输入都来自既有
            `record.json`/`status.json`/git 读口，不另造所有权账本。
+
+        **rc-3d12fbbe 修复（排序遮蔽）**：当 `current_development_id` 非 None
+        时，本单自身在飞绑定**不构成外来占用**——跳过并继续扫描其余 record，
+        绝不因「先命中自身绑定」而停止枚举。这样即使本单 dev id 在
+        `<dd_root>/` 枚举顺序上排序靠前（如 dev-fg-644942a367ae 先于
+        dev-fg-cfe509fa9c23）、且两单都绑定到同一棵 canonical 树，也能继续
+        扫到更靠后的外来在飞单并如实返回它，不再被自身绑定遮蔽漏检。
         """
         tree = _resolved(tree_path)
         if not dd_root.is_dir():
@@ -541,6 +553,9 @@ class DefaultHarvestOps:
             if not child.is_dir():
                 continue
             dev_id = child.name
+            if current_development_id is not None and dev_id == current_development_id:
+                # 本单自身绑定 = 该链要消费的树，不构成外来占用；跳过，继续扫描。
+                continue
             record_path = child / RECORD_FILE
             try:
                 record = json.loads(record_path.read_text(encoding="utf-8"))
