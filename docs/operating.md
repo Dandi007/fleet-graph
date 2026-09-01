@@ -37,6 +37,16 @@ code（带失败条款）拒绝——绝无半条、绝无 warning-as-admission�
 - **`goal_status(folder_id)`**：单条详情（roster/pending entry + 拒绝史）。
 - **`goal_withdraw(folder_id)`**：撤回 **pending** 申请（仅 pending 态可撤，
   落 `withdrawn` 留痕不删行）。
+- **`goal_admit(folder_id, decision_ref, decided_by)`**（U4 收尾）：监督面唯一
+  放行边缘——把 **pending** 申请机械记账为 `admitted` 并持久化
+  `decision_ref`（监督面放行裁决消息 id），复用 queue 既有 `mark_admitted`
+  写回原语，不重写状态机；追加一条 history、不删不改既有行。**监督面专属、
+  fail-closed**：`decided_by` 必须是监督面主体（默认 seam = 监督面凭证根
+  `/data/agent-bus/tokens` 内的自有常规文件）；非监督面身份一律
+  `GOAL_ENROLL_NOT_SUPERVISOR`，调用能力不放大授权边界。同一 `decision_ref`
+  重复 admit 幂等（`already_admitted: true`、不重复写 history）；已用不同
+  `decision_ref` admit、以及 `rejected`/`withdrawn` 一律
+  `GOAL_ENROLL_NOT_PENDING`。真名册仍只在 roster PR（监督面）写入。
 - **`goal-open` prompt / `fleet-graph://goal-open/briefing` resource**：开线
   交底（Phase-0 opening briefing），随引擎发布版本化，queue entry 记录同一
   briefing 版本 id。
@@ -53,8 +63,9 @@ code（带失败条款）拒绝——绝无半条、绝无 warning-as-admission�
   `GOLDEN_ORDER_EMPTY`、`SPEC_LINT_BAN`、`ACCEPTANCE_ARGV_UNEXECUTABLE`、
   `GOAL_ENROLL_ALIAS_TOKEN_MISSING`、`GOAL_ENROLL_ALIAS_CONFLICT` 等稳定 code
   逐条可见
-- **本面不提供任何放行/点火工具**：`enabled` 翻转、seat 终定、roster 写入均
-  不在 MCP 面——放行仍走 roster PR（监督面）
+- **放行权不下放**：`enabled` 翻转、seat 终定、roster 写入均不在 MCP 面——
+  放行仍走 roster PR（监督面）；`goal_admit` 只是放行落定后的机械记账步，
+  且只接受监督面身份
 
 ### 闸零完整流水线（提交 → 挂板 → 放行）
 
@@ -75,10 +86,14 @@ code（带失败条款）拒绝——绝无半条、绝无 warning-as-admission�
    `false`），**同步更新 `tests/test_ronin_lines_config.py` 的 ENROLLED 集合**，
    走 PR。
 5. **release → restart fleet-graphd**：`deploy/release.sh` → 重启调度器。
-6. **queue entry 置 `admitted`**：放行落定后，把对应 queue entry 标
-   `admitted` 并记 decision 指针（`decided_by` / `decision_ref`）——这是放行
-   后的机械记账步（queue 状态机 `pending → admitted | rejected | withdrawn`，
-   终态必带 decision 指针）。
+6. **queue entry 置 `admitted`**：放行落定后，监督面以 `goal_admit`（:5611）
+   把对应 queue entry 标 `admitted` 并记 decision 指针（`decided_by` /
+   `decision_ref` = 放行裁决消息 id）——这是放行后的机械记账步（queue 状态机
+   `pending → admitted | rejected | withdrawn`，终态必带 decision 指针）。
+   非监督面身份被拒（`GOAL_ENROLL_NOT_SUPERVISOR`），同一裁决重复 admit
+   幂等。U4 真实 closeout 裁决引用 `msg_01M1EK40MW5PKWB8HKQF1EH9HJ`
+   （`work.decision.v1`，board seq 1564）即通过本步写入 wf-e7b0dd 的 queue
+   entry。
 
 存量线不回填：roster 里已存在但 queue 无记录的线，保持现状，不补一条 queue
 entry。

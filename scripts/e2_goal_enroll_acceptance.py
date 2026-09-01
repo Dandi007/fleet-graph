@@ -32,6 +32,13 @@ root, real-roster file and alias-token dir under a temp dir.
 - ``e8-observable-enrollment`` -- a valid enrollment through the aligned queue
   home is visible on ``/v1/enrollments`` and the supervisor observer emits an
   ``enrollment_pending`` (E8) event for it.
+- ``admit-end-to-end`` -- the U4 supervisor release edge: the live MCP surface
+  exposes ``goal_admit`` (tools/list), refuses a non-supervisor identity with
+  ``GOAL_ENROLL_NOT_SUPERVISOR``, admits a pending application with the real
+  U4 closeout ``decision_ref``, reports ``status='admitted'`` with that exact
+  ``decision_ref`` through the queue and ``/v1/enrollments``, keeps the
+  original history rows and appends the admission transition, and is
+  idempotent for the same-decision re-admit.
 
 Evidence is one JSON object per scenario on stdout; the process exits non-zero
 when the scenario does not pass.
@@ -60,9 +67,12 @@ from fleet_graph.goal_enroll.contract import (
     BRIEFING_VERSION,
     CODE_ALIAS_TOKEN_MISSING,
     CODE_NO_ACCEPTANCE_COMMAND,
+    CODE_NOT_SUPERVISOR,
     GOAL_ENROLL_MECHANISM,
+    QUEUE_STATUS_ADMITTED,
     QUEUE_STATUS_PENDING,
     QUEUE_STATUS_WITHDRAWN,
+    U4_CLOSEOUT_DECISION_REF,
 )
 from fleet_graph.goal_enroll.queue import QUEUE_FILE, REJECTIONS_FILE, EnrollQueue
 from fleet_graph.goal_enroll.roster import RealRosterReader
@@ -637,6 +647,135 @@ def scenario_e8_observable_enrollment(work_dir: Path) -> dict[str, Any]:
         state_server.server_close()
 
 
+def scenario_submit_admit_end_to_end(work_dir: Path) -> dict[str, Any]:
+    """U4: submit -> goal_admit (supervisor-only) -> /v1/enrollments admitted.
+
+    Drives the real MCP surface: tools/list exposes ``goal_admit``, a
+    non-supervisor identity is refused with ``GOAL_ENROLL_NOT_SUPERVISOR``, a
+    supervisor identity admits a pending application with the real U4 closeout
+    ``decision_ref``, the queue entry and ``/v1/enrollments`` report
+    ``status='admitted'`` with that exact ``decision_ref``, history keeps the
+    original pending row and appends the admission transition, and the same-
+    decision re-admit is idempotent.
+    """
+    from fleet_graph.goal.service import build_goal_mcp_server
+
+    folder_root = work_dir / "folders"
+    queue_root = work_dir / "queue-admit"
+    roster_file = work_dir / "ronin-lines.json"
+    roster_file.write_text(
+        json.dumps({"run_root": "/data/fleet-graph/runs", "lines": []}), encoding="utf-8"
+    )
+    secrets_dir = work_dir / "secrets-admit"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    (secrets_dir / "ronin-owned.token").write_text("owned-token", encoding="utf-8")
+
+    _goal_folder(folder_root, "wf-1")
+    queue = EnrollQueue(str(queue_root))
+    server = build_goal_mcp_server(
+        goal_folders=governed_goal_folder_store(str(folder_root)),
+        goal_queue=queue,
+        real_roster=RealRosterReader(roster_file),
+        board=None,
+        alias_token_check=lambda alias: (secrets_dir / f"{alias}.token").is_file(),
+        supervisor_identity_check=lambda identity: identity == "supervisor",
+    )
+
+    async def call(url: str) -> dict[str, Any]:
+        from fastmcp.exceptions import ToolError
+
+        async with Client(url) as client:
+            tools = await client.list_tools()
+            tool_names = {getattr(t, "name", None) for t in tools}
+            await client.call_tool("goal_enroll", {"folder_id": "wf-1", "alias": "ronin-owned"})
+            non_supervisor = {"refused": False, "code": None}
+            try:
+                await client.call_tool(
+                    "goal_admit",
+                    {
+                        "folder_id": "wf-1",
+                        "decision_ref": U4_CLOSEOUT_DECISION_REF,
+                        "decided_by": "ronin-owned",
+                    },
+                )
+            except ToolError as exc:
+                message = str(exc)
+                payload = json.loads(message[message.index("{") : message.rindex("}") + 1])
+                non_supervisor = {"refused": True, "code": payload.get("code")}
+            first = _payload(
+                await client.call_tool(
+                    "goal_admit",
+                    {
+                        "folder_id": "wf-1",
+                        "decision_ref": U4_CLOSEOUT_DECISION_REF,
+                        "decided_by": "supervisor",
+                    },
+                )
+            )
+            second = _payload(
+                await client.call_tool(
+                    "goal_admit",
+                    {
+                        "folder_id": "wf-1",
+                        "decision_ref": U4_CLOSEOUT_DECISION_REF,
+                        "decided_by": "supervisor",
+                    },
+                )
+            )
+            return {
+                "tools": sorted(tool_names),
+                "non_supervisor": non_supervisor,
+                "first": first,
+                "second": second,
+            }
+
+    with running_server(server) as url:
+        outcome = asyncio.run(call(url))
+
+    persisted = queue.get("wf-1") or {}
+    state_server, state_port = _state_read_model(work_dir, roster_file, queue_root / QUEUE_FILE)
+    visible = {}
+    try:
+        resp = httpx.get(f"http://127.0.0.1:{state_port}/v1/enrollments", timeout=5)
+        body = resp.json()
+        entry = next((e for e in body.get("enrollments", []) if e.get("folder_id") == "wf-1"), {})
+        visible = {
+            "status_code": resp.status_code,
+            "entry": entry,
+        }
+    finally:
+        state_server.shutdown()
+        state_server.server_close()
+
+    passed = bool(
+        "goal_admit" in outcome["tools"]
+        and outcome["non_supervisor"]["refused"]
+        and outcome["non_supervisor"]["code"] == CODE_NOT_SUPERVISOR
+        and outcome["first"].get("status") == QUEUE_STATUS_ADMITTED
+        and outcome["first"].get("decision_ref") == U4_CLOSEOUT_DECISION_REF
+        and outcome["second"].get("already_admitted") is True
+        and persisted.get("status") == QUEUE_STATUS_ADMITTED
+        and persisted.get("decision_ref") == U4_CLOSEOUT_DECISION_REF
+        and [h.get("status") for h in persisted.get("history", [])]
+        == [QUEUE_STATUS_PENDING, QUEUE_STATUS_ADMITTED]
+        and visible.get("status_code") == 200
+        and visible["entry"].get("status") == QUEUE_STATUS_ADMITTED
+        and visible["entry"].get("decision_ref") == U4_CLOSEOUT_DECISION_REF
+    )
+    return evidence(
+        "admit-end-to-end",
+        passed,
+        tools=outcome["tools"],
+        non_supervisor=outcome["non_supervisor"],
+        first_admit=outcome["first"],
+        second_admit=outcome["second"],
+        persisted_status=persisted.get("status"),
+        persisted_decision_ref=persisted.get("decision_ref"),
+        persisted_history=[h.get("status") for h in persisted.get("history", [])],
+        enrollments_visible=visible,
+    )
+
+
 # --- cli ---------------------------------------------------------------------
 
 
@@ -652,6 +791,7 @@ def build_parser() -> argparse.ArgumentParser:
             "gate6-token-ownership",
             "queue-home-isolation",
             "e8-observable-enrollment",
+            "admit-end-to-end",
         ],
         help="run one scenario only; default runs all (the full acceptance)",
     )
@@ -676,6 +816,7 @@ def main(argv: list[str] | None = None) -> int:
             "gate6-token-ownership",
             "queue-home-isolation",
             "e8-observable-enrollment",
+            "admit-end-to-end",
         ]
 
     results: list[dict[str, Any]] = []
@@ -690,6 +831,8 @@ def main(argv: list[str] | None = None) -> int:
             result = scenario_gate6_token_ownership(work_dir)
         elif scenario == "queue-home-isolation":
             result = scenario_queue_home_isolation(work_dir)
+        elif scenario == "admit-end-to-end":
+            result = scenario_submit_admit_end_to_end(work_dir)
         else:
             result = scenario_e8_observable_enrollment(work_dir)
         results.append(result)

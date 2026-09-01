@@ -59,6 +59,23 @@ CODE_ALIAS_CONFLICT = "GOAL_ENROLL_ALIAS_CONFLICT"
 #: decided (admitted/rejected) or already withdrawn refuses with this code.
 CODE_NOT_PENDING = "GOAL_ENROLL_NOT_PENDING"
 
+#: ``goal_admit`` (the supervisor release path) is supervisor-only, fail-closed:
+#: the identity invoking admission must be a supervisor-plane principal. A
+#: non-supervisor identity refuses with this code and nothing changes -- the
+#: callable capability is created without ever broadening the authorization
+#: boundary.
+CODE_NOT_SUPERVISOR = "GOAL_ENROLL_NOT_SUPERVISOR"
+
+#: ``goal_admit`` must persist the supervisor release verdict's message id as
+#: ``decision_ref``; an admission without it refuses fail-closed.
+CODE_DECISION_REF_REQUIRED = "GOAL_ENROLL_DECISION_REF_REQUIRED"
+
+#: The real U4 closeout decision reference: the ``work.decision.v1`` release
+#: verdict message id (board seq 1564) for wf-e7b0dd. The supervisor release
+#: path persists exactly this message id as the queue entry's ``decision_ref``
+#: when the real U4 closeout is harvested.
+U4_CLOSEOUT_DECISION_REF = "msg_01M1EK40MW5PKWB8HKQF1EH9HJ"
+
 #: The reserved identity paths the spec-lint bans from product code and tests.
 #: References here are a refusal, not a warning: these namespaces are the
 #: controller's identity boundary, and a goal that routes work into them is
@@ -152,10 +169,12 @@ __all__ = [
     "CODE_ACCEPTANCE_DECLARATION_INVALID",
     "CODE_ALIAS_CONFLICT",
     "CODE_ALIAS_TOKEN_MISSING",
+    "CODE_DECISION_REF_REQUIRED",
     "CODE_FOLDER_NOT_FOUND",
     "CODE_GOLDEN_ORDER_EMPTY",
     "CODE_NOT_A_GOAL_LINE",
     "CODE_NOT_PENDING",
+    "CODE_NOT_SUPERVISOR",
     "CODE_NO_ACCEPTANCE_COMMAND",
     "CODE_SOURCE_UNBOUND",
     "CODE_SPEC_LINT_BAN",
@@ -171,6 +190,7 @@ __all__ = [
     "QUEUE_STATUS_REJECTED",
     "QUEUE_STATUS_WITHDRAWN",
     "RESERVED_PATHS",
+    "U4_CLOSEOUT_DECISION_REF",
     "GoalEnrollError",
     "GoalRosterEntry",
     "iso_timestamp",
