@@ -95,9 +95,17 @@ def fake_ops(
                 return resolve_canonical, ""
             return Path(record_repo_path), ""
 
-        def detect_inflight_binding(self, tree_path: Path, dd_root: Path) -> dict[str, Any]:
+        def detect_inflight_binding(
+            self, tree_path: Path, dd_root: Path, current_development_id: str | None = None
+        ) -> dict[str, Any]:
             # 纯读口：不构成写原语，不入 calls；调用面单独记录（H8 只读判据）。
-            binding_probes.append({"tree_path": str(tree_path), "dd_root": str(dd_root)})
+            binding_probes.append(
+                {
+                    "tree_path": str(tree_path),
+                    "dd_root": str(dd_root),
+                    "current_development_id": current_development_id,
+                }
+            )
             if inflight_binding is not None:
                 return dict(inflight_binding)
             return {"bound_development_id": None, "in_flight": False, "detail": ""}
@@ -1583,14 +1591,22 @@ H8_SENTINEL_BYTES = b"H8-OCCUPANCY-SENTINEL\x00\x01\x02\n"
 
 
 def _h8_target_fixture(
-    tmp_path: Path, *, other_terminal: str = "", subject_terminal: str = "complete"
+    tmp_path: Path,
+    *,
+    other_dev: str = "dev-fg-OTHER",
+    subject_dev: str = "dev-fg-SUBJECT",
+    other_terminal: str = "",
+    subject_terminal: str = "complete",
 ) -> tuple[Path, Path, bytes, Path]:
     """真实 git 合成仓：canonical + 目标工作树 `<target>`（linked worktree）。
 
     在 `<target>` 里放一个未提交的哨兵文件（已知字节串），构造 `dd_root`：
-    `dev-fg-OTHER/record.json`（repo_path=<target>）+ status.json（terminal 可配，
-    默认在飞）+ harness 自己的 `dev-fg-SUBJECT/record.json`（repo_path=<target>，
+    `other_dev/record.json`（repo_path=<target>）+ status.json（terminal 可配，
+    默认在飞）+ harness 自己的 `subject_dev/record.json`（repo_path=<target>，
     本次 E5 要收割的单）。全部本地合成，禁触真网/生产 checkout。
+
+    dev id 可配：rc-3d12fbbe 回归需要构造「本单 id 在 dd_root 枚举中排序靠前」
+    的形态（真实 incident 里 dev-fg-644942a367ae 先于 dev-fg-cfe509fa9c23）。
     """
     canonical = tmp_path / "canon"
     _init_git_repo(canonical)
@@ -1599,7 +1615,7 @@ def _h8_target_fixture(
     (target / "sentinel.bin").write_bytes(H8_SENTINEL_BYTES)
 
     dd_root = tmp_path / "dd"
-    for dev, terminal in (("dev-fg-OTHER", other_terminal), ("dev-fg-SUBJECT", subject_terminal)):
+    for dev, terminal in ((other_dev, other_terminal), (subject_dev, subject_terminal)):
         dev_dir = dd_root / dev
         dev_dir.mkdir(parents=True)
         (dev_dir / "record.json").write_text(
@@ -1627,10 +1643,11 @@ def _h8_config(
     canonical: Path,
     dd_root: Path,
     ops: Any,
+    development_id: str = "dev-fg-SUBJECT",
 ) -> HarvestRunConfig:
     return HarvestRunConfig(
         event=approved_unharvested_event(
-            development_id="dev-fg-SUBJECT", head_commit="a" * 40, stage="implement"
+            development_id=development_id, head_commit="a" * 40, stage="implement"
         ).as_dict(),
         state_root=tmp_path / "supervisor",
         run_root=tmp_path / "runs",
@@ -1813,3 +1830,72 @@ class TestHarvestTreeOccupancy:
         result = run_harvest(config)
         intake_step = next(s for s in result["steps"] if s["step"] == "intake")
         assert intake_step["ok"] is True
+
+    def test_self_sorts_first_does_not_mask_foreign_inflight(self, tmp_path: Path) -> None:
+        """rc-3d12fbbe 阻塞项回归：本单 dev id 排序靠前时不得遮蔽更靠后的外来在飞单。
+
+        本单 dev-fg-SUBJECT 与外来 dev-fg-ZED-OTHER 同在飞且都绑定 `<target>`
+        （其 canonical 与本次收割目标 canonical 同一棵），而本单 id 在
+        `<dd_root>/` 枚举顺序（sorted）中先于外来单。旧实现 detect 返回第一条
+        在飞绑定（=本单），`_detect_occupied_tree` 判定 bound==本单即丢弃、不继续
+        扫 -> 外来在飞占用被静默漏检，树仍被 rmtree/pull/deploy。修复后 detect
+        跳过本单自身绑定继续扫描，必须返回外来单并 escalate（bound=dev-fg-ZED-OTHER）。
+        """
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        # 本单 SUBJECT 排序在 ZED-OTHER 之前（'S' < 'Z'），且两单都在飞绑定同一棵树。
+        canonical, target, sentinel, dd_root = _h8_target_fixture(
+            tmp_path,
+            other_dev="dev-fg-ZED-OTHER",
+            subject_dev="dev-fg-SUBJECT",
+            other_terminal="",
+            subject_terminal="",
+        )
+        # ops 层先验证：跳过本单、返回外来单（排序遮蔽被修复）。
+        binding = DefaultHarvestOps().detect_inflight_binding(
+            canonical, dd_root, current_development_id="dev-fg-SUBJECT"
+        )
+        assert binding["in_flight"] is True
+        assert binding["bound_development_id"] == "dev-fg-ZED-OTHER", binding
+
+        head_before = head(target)
+        status_before = git(target, "status", "--porcelain")
+        config = _h8_config(tmp_path, canonical=canonical, dd_root=dd_root, ops=DefaultHarvestOps())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        intake_step = next(s for s in result["steps"] if s["step"] == "intake")
+        assert intake_step["ok"] is False
+        assert intake_step["escalate"] == "HARVEST_TREE_OCCUPIED_BY_INFLIGHT"
+        assert intake_step["bound_development_id"] == "dev-fg-ZED-OTHER"
+        assert intake_step["detail"]
+        # 写步骤一个没跑，`<target>` 一字未动。
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert set(receipt["writes_skipped"]) >= set(WRITE_STEPS)
+        assert not any(
+            s.get("step") in ("worktree_cherry_pick", "pr_squash_merge", "ff_only_pull")
+            and s.get("ok") is True
+            for s in receipt["steps"]
+        )
+        assert head(target) == head_before
+        assert git(target, "status", "--porcelain") == status_before
+        assert (target / "sentinel.bin").read_bytes() == sentinel
+        assert target.is_dir() and (target / "sentinel.bin").is_file()
+
+    def test_self_inflight_plus_terminal_other_is_released(self, tmp_path: Path) -> None:
+        """rc-3d12fbbe 相邻回归：本单在飞 + 外来已终态 -> 放行（外来不构成在飞占用）。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        # 本单排序靠前、在飞；外来排序靠后、终态（complete）。detect 跳过本单后
+        # 只看到终态外来 -> in_flight=False -> 编排层放行走既有链。
+        canonical, _target, _sentinel, dd_root = _h8_target_fixture(
+            tmp_path,
+            other_dev="dev-fg-ZED-OTHER",
+            subject_dev="dev-fg-SUBJECT",
+            other_terminal="complete",
+            subject_terminal="",
+        )
+        binding = DefaultHarvestOps().detect_inflight_binding(
+            canonical, dd_root, current_development_id="dev-fg-SUBJECT"
+        )
+        assert binding["in_flight"] is False, binding
+        assert binding["bound_development_id"] is None, binding
