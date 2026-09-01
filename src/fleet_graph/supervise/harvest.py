@@ -58,7 +58,7 @@ from fleet_graph.supervise.harvest_allowlist import (
     HarvestAllowlist,
     HarvestAuthorization,
 )
-from fleet_graph.supervise.harvest_ops import EXIT_HEAD_MISMATCH
+from fleet_graph.supervise.harvest_ops import EXIT_HEAD_MISMATCH, EXIT_NOT_FOUND
 
 #: harvest 终态词汇（outcome）。REFUSED / ALREADY_HARVESTED 都是无写动作的合法
 #: 终止；HARVESTED 要求后置条件三要素齐全；ESCALATED = 失败/升报。
@@ -72,6 +72,12 @@ DEFAULT_BRANCH = "main"
 
 #: 默认全量套件命令（spec 交付 B SOP「全量套件(make verify)」）。
 DEFAULT_VERIFY_ARGV = ["make", "verify"]
+
+#: 写步骤名单（H7 写前闸）：worktree_cherry_pick / run_verify 任一判红后，这些
+#: 写步骤绝不允许执行——pr_squash_merge（push/merge 进默认分支）、ff_only_pull
+#: （pull）、deploy（部署）即 spec D1 明确列出的写动作。escalate 收尾时回执用
+#: `writes_skipped` 机器可读地记录「哪些写步骤被显式跳过」。
+WRITE_STEPS = ("pr_squash_merge", "ff_only_pull", "deploy")
 
 #: SOP 步骤名的封闭枚举——测试据此断言「编排步骤齐全」。
 SOP_STEPS = (
@@ -145,6 +151,7 @@ class HarvestState(TypedDict, total=False):
     evidence_note_id: str
     outcome: str
     receipt_path: str
+    writes_skipped: list[str]
     _gaps: list[str]
 
 
@@ -366,13 +373,18 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             return {
                 "steps": _record_step(
                     state, "worktree_cherry_pick", ok=False, detail=repr(exc)[:300]
-                )
+                ),
+                "outcome": OUTCOME_ESCALATED,
+                "writes_skipped": list(WRITE_STEPS),
             }
         steps = _record_step(state, "worktree_cherry_pick", **result)
         if not result.get("ok"):
+            # H7 写前闸：cherry-pick 判红 -> 立即停止链（见 after_worktree），
+            # 不执行任何写步骤；escalate 收尾时回执显式记录 writes_skipped。
             return {
                 "steps": steps,
                 "outcome": OUTCOME_ESCALATED,
+                "writes_skipped": list(WRITE_STEPS),
             }
         # 干净产品树 tip（worktree_cherry_pick 已剔除 .dev-dispatch/.dd-evidence）。
         harvest_tip = str(result.get("harvest_tip") or "")
@@ -394,10 +406,24 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         try:
             exit_code = int(deps.ops.run_verify(worktree, deps.verify_argv))
         except Exception as exc:
-            return {"steps": _record_step(state, "run_verify", ok=False, detail=repr(exc)[:300])}
+            return {
+                "steps": _record_step(state, "run_verify", ok=False, detail=repr(exc)[:300]),
+                "verify_exit_code": EXIT_NOT_FOUND,
+                "outcome": OUTCOME_ESCALATED,
+                "writes_skipped": list(WRITE_STEPS),
+            }
         steps = _record_step(
             state, "run_verify", ok=exit_code == 0, exit_code=exit_code, argv=deps.verify_argv
         )
+        if exit_code != 0:
+            # H7 写前闸：verify 判红 -> 立即停止链（见 after_verify），不执行
+            # 任何写步骤；escalate 收尾时回执显式记录 writes_skipped。
+            return {
+                "steps": steps,
+                "verify_exit_code": exit_code,
+                "outcome": OUTCOME_ESCALATED,
+                "writes_skipped": list(WRITE_STEPS),
+            }
         return {"steps": steps, "verify_exit_code": exit_code}
 
     def cleanup_worktree(state: HarvestState) -> HarvestState:
@@ -653,6 +679,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "verify_real_exit_code": state.get("verify_real_exit_code"),
                 "evidence_note_id": state.get("evidence_note_id"),
                 "outcome": state.get("outcome"),
+                "writes_skipped": state.get("writes_skipped") or [],
             },
         )
         return {"receipt_path": str(path)}
@@ -667,6 +694,41 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         # H3：pull 前分叉检测命中 -> outcome 已设（escalated）-> 直接 receipt，
         # 不再跑 deploy/verify_real；未分叉 -> 既有链。
         return "deploy" if state.get("outcome") is None else "receipt"
+
+    def after_worktree(state: HarvestState) -> str:
+        # H7 写前闸：worktree_cherry_pick 判红 -> outcome=escalated -> 直接 escalate
+        # 收尾（postconditions 只读记缺失 -> receipt），绝不进入
+        # verify/cleanup/pr_merge/pull/deploy 等后续步骤（无一写动作执行）。
+        # outcome=refused（per-write 门拒绝）-> 直接 receipt，不经过 postconditions
+        # （refused 是独立合法终态，不得被 postconditions 覆盖成 escalated）。
+        if state.get("outcome") is None:
+            return "verify"
+        if state.get("outcome") == OUTCOME_REFUSED:
+            return "receipt"
+        return "postconditions"
+
+    def after_verify(state: HarvestState) -> str:
+        # H7 写前闸：run_verify 判红 -> 仍走 cleanup_worktree 收掉一次性 worktree
+        # （housekeeping：清理失败路径遗留的临时 worktree，避免下一次收割被陈旧
+        # 注册卡死；cleanup 不是 push/merge/部署类写步骤，spec 写前闸不禁止），
+        # 但绝不进入 pr_merge/pull/deploy/verify_real——真正的写闸在
+        # after_cleanup：outcome 已设 -> 直接 postconditions escalate 收尾。
+        # outcome=refused -> 直接 receipt（语义同上）。
+        if state.get("outcome") is None:
+            return "cleanup_worktree"
+        if state.get("outcome") == OUTCOME_REFUSED:
+            return "receipt"
+        return "cleanup_worktree"
+
+    def after_cleanup(state: HarvestState) -> str:
+        # H7 写前闸（真正的闸口）：verify 判红后 cleanup 已完成 housekeeping，
+        # 这里 outcome 已设（escalated）-> 绝不进入 pr_merge（写默认分支），
+        # 直接 postconditions escalate 收尾；未判红 -> 既有链进 pr_merge。
+        if state.get("outcome") is None:
+            return "pr_merge"
+        if state.get("outcome") == OUTCOME_REFUSED:
+            return "receipt"
+        return "postconditions"
 
     def after_intake(state: HarvestState) -> str:
         return "gate" if state.get("outcome") is None else "receipt"
@@ -692,9 +754,11 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
     graph.add_conditional_edges("gate", after_gate, {"fetch", "receipt"})
     graph.add_edge("fetch", "cherry")
     graph.add_conditional_edges("cherry", after_cherry, {"worktree", "receipt"})
-    graph.add_edge("worktree", "verify")
-    graph.add_edge("verify", "cleanup_worktree")
-    graph.add_edge("cleanup_worktree", "pr_merge")
+    graph.add_conditional_edges("worktree", after_worktree, {"verify", "postconditions", "receipt"})
+    graph.add_conditional_edges("verify", after_verify, {"cleanup_worktree", "receipt"})
+    graph.add_conditional_edges(
+        "cleanup_worktree", after_cleanup, {"pr_merge", "postconditions", "receipt"}
+    )
     graph.add_edge("pr_merge", "pull")
     graph.add_conditional_edges("pull", after_pull, {"deploy", "receipt"})
     graph.add_edge("deploy", "verify_real")
