@@ -1,0 +1,24 @@
+{
+ "development_id": "dev-fg-dfba96d6f8d0",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_harvest.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
