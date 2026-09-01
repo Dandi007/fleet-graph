@@ -586,20 +586,30 @@ class TestInputContract:
         assert "# advocate 论证\n正面支持结论。" in judge_prompt
 
         # arbiter：deep-research.arbiter-input/v1 形状（board_stats / clue_titles /
-        # recent_claims / recent_rounds）。
+        # recent_claims，rounds 并入 board_stats.rounds_elapsed）。
         arbiter_spec = launcher.specs[debate_run_id(thread, "arbiter")]
         assert arbiter_spec.role == ARBITER_ROLE
         arbiter_manifest = json.loads(Path(arbiter_spec.input_path).read_text(encoding="utf-8"))
         assert arbiter_manifest["question"] == question
         assert arbiter_manifest["board_stats"] == {
-            "total": 1,
-            "done": 1,
-            "blocked": 0,
-            "open": 0,
+            "clues_total": 1,
+            "clues_explored": 1,
+            "clues_pending": 0,
+            "clues_dropped": 0,
+            "evidence_total": 1,
+            "zero_growth_rounds": 0,
+            "rounds_elapsed": 1,
         }
-        assert arbiter_manifest["clue_titles"] == ["scheduler 的基本循环"]
-        assert arbiter_manifest["recent_claims"] == ["f1"]
-        assert arbiter_manifest["recent_rounds"] == 1
+        assert arbiter_manifest["clue_titles"] == [
+            {
+                "clue_id": clue,
+                "title": "scheduler 的基本循环",
+                "status": CLUE_DONE,
+                "depth": 0,
+            }
+        ]
+        assert arbiter_manifest["recent_claims"] == [{"claim": "f1", "clue_id": clue}]
+        assert "recent_rounds" not in arbiter_manifest
 
         # 四角色产出逐字落 run_root/debate/（advocate.md / opponent.md / judge.md / arbiter.json）。
         assert (tmp_path / "run" / "debate" / "advocate.md").is_file()
