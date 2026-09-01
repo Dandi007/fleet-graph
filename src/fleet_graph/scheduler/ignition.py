@@ -101,6 +101,14 @@ def decide(
     total_cap: int = DEFAULT_TOTAL_CAP,
     cap_window_seconds: float = DEFAULT_CAP_WINDOW_SECONDS,
     backoff_cap_seconds: float = DEFAULT_BACKOFF_CAP_SECONDS,
+    #: M5: a valid revoke record matching this line's `done` terminal cleared
+    #: the done latch for this tick. The done branch is the *only* branch this
+    #: flag touches: with it set, `done` falls through to the normal gates
+    #: instead of refusing, so the line can cold-start on a fresh generation.
+    #: The daemon is the only caller that sets it, and only after the mechanical
+    #: revoke match described in scheduler/revive.py. Without it, `done` stays
+    #: final (Refusal.TERMINAL_DONE) -- there is no "silent pass" path.
+    revived: bool = False,
 ) -> IgnitionDecision:
     """Decide whether to ignite `status`, in the babysitter's order.
 
@@ -133,10 +141,14 @@ def decide(
             False, Refusal.ALREADY_RUNNING, f"{status.folder_id} is already running"
         )
 
-    if status.terminal == "done":
+    if status.terminal == "done" and not revived:
         # A finished line stays finished. Restarting it would re-run work that
         # already passed acceptance.
         return IgnitionDecision(False, Refusal.TERMINAL_DONE, f"{status.folder_id} terminated done")
+    # M5: a legitimate revoke (see scheduler/revive.py) can clear the done
+    # latch for this tick (revived=True), so a `done` terminal falls through to
+    # the remaining gates below and the line cold-starts on a fresh generation.
+    # Every other refusal below still applies in the unchanged order.
 
     if parked:
         # Before the backoff branch on purpose. A line whose last terminal was

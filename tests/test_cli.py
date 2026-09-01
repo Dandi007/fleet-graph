@@ -446,6 +446,38 @@ class TestTheOtherSubcommandsStillParse:
         )
         assert args.generation == 2
 
+    def test_line_revive_parses(self) -> None:
+        args = build_parser().parse_args(
+            ["line", "revive", "wf-1", "--basis", "goal-md-ruling-42", "--generation", "2"]
+        )
+        assert args.folder == "wf-1"
+        assert args.basis == "goal-md-ruling-42"
+        assert args.generation == 2
+        assert args.run_id is None
+
+    def test_line_revive_parses_a_run_id(self) -> None:
+        args = build_parser().parse_args(
+            ["line", "revive", "wf-1", "--basis", "b", "--run-id", "run-done"]
+        )
+        assert args.run_id == "run-done"
+        assert args.generation is None
+
+    def test_line_run_revival_is_parsed(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "line",
+                "run",
+                "--folder",
+                "wf-1",
+                "--seat",
+                "s",
+                "--revival",
+                '{"who": "alice", "basis": "b", "generation": 1}',
+            ]
+        )
+        assert args.revival is not None
+        assert '"who": "alice"' in args.revival
+
     def test_hello(self) -> None:
         assert build_parser().parse_args(["hello"]).topic
 

@@ -77,6 +77,11 @@ class LineConfig:
     #: left on disk under run_root, which at generation start is the previous
     #: generation's.
     prior_terminal: dict[str, Any] | None = None
+    #: M5: the revival envelope (who/basis/generation/reason) for a line whose
+    #: `done` terminal a valid revoke overturned. Injected into the round-1
+    #: coordinator input alongside `prior_terminal`. None means this is a
+    #: normal launch with no revival fact.
+    revival: dict[str, Any] | None = None
     #: The per-process launch identity (D4). None lets build_line mint one from
     #: a wall-clock start timestamp, so a process restart is a new launch and a
     #: re-adopted run keeps the first dispatch's label (the launcher never
@@ -200,6 +205,11 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         prior_terminal=config.prior_terminal
         if config.prior_terminal is not None
         else _read_prior_terminal(config.run_root),
+        # M5: the revival envelope is passed through verbatim -- it is never
+        # guessed or re-read from disk. A revoke carries its own audit fields,
+        # and a revived line must read exactly who/basis/generation the revoke
+        # recorded, not whatever terminal.json happens to say.
+        revival=config.revival,
         # The E2 in-graph interrupt port. Wired here so a human-decision wait
         # on a real line routes through the durable interrupt instead of the
         # legacy parking terminal (spec: "replace the normal goal-line parking
