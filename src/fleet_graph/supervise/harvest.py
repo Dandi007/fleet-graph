@@ -12,11 +12,14 @@ SOP（spec 交付 B）逐节点实现，全部是 script 节点（机械判定�
 3. `fetch`        —— fetch dd ref（refs/heads/dd/<development_id>）。
 4. `cherry`       —— cherry 判重：产品 commit 是否已 cherry 等价进默认分支。
                    已等价 -> outcome=already_harvested，无写动作。
-5. `worktree`     —— 独立 worktree cherry-pick 产品 commit，冲突消解（即兴）。
+5. `worktree`     —— 独立 worktree cherry-pick 产品 commit，冲突消解（即兴），
+                    并洗掉 `.dev-dispatch/` / `.dd-evidence/` 两棵 dd 协议子树
+                    得到干净产品树 tip（harvest_tip）。
 6. `verify`       —— 在 worktree 跑全量套件（make verify），记 exit code。
 7. `cleanup_worktree` —— verify 之后移除一次性 worktree（harvest_ops 成功路径
    保留 worktree 供 verify 使用，见 rc-702098ab）。
-8. `pr_merge`     —— PR -> squash merge。
+8. `pr_merge`     —— 用干净产品树 tip（harvest_tip，已剔除 .dev-dispatch/.dd-evidence）
+                   建 harvest 分支 -> PR -> squash merge（H5）。
 9. `pull`         —— 先机器可读检测本地 HEAD 与 origin 是否分叉；分叉/无法判定 ->
                    立即 outcome=escalated 并直接走 receipt，绝不 ff_only_pull 带病
                    继续（H3）；未分叉才 ff-only pull 默认分支。
@@ -103,6 +106,13 @@ class HarvestOps(Protocol):
     def worktree_cherry_pick(
         self, repo: Path, head_commit: str, default_branch: str, worktree_root: Path
     ) -> dict[str, Any]: ...
+    def build_harvest_tip(
+        self,
+        repo: Path,
+        head_commit: str,
+        default_branch: str,
+        worktree_root: Path,
+    ) -> dict[str, Any]: ...
     def remove_worktree(self, repo: Path, worktree_root: Path) -> dict[str, Any]: ...
     def run_verify(self, worktree: Path, argv: list[str]) -> int: ...
     def board_card_entity_id(self, development_id: str, dd_root: Path) -> str | None: ...
@@ -119,6 +129,7 @@ class HarvestState(TypedDict, total=False):
     event: dict[str, Any]
     development_id: str
     head_commit: str
+    harvest_tip: str
     stage: str
     repo_path: str
     default_branch: str
@@ -363,7 +374,9 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "steps": steps,
                 "outcome": OUTCOME_ESCALATED,
             }
-        return {"steps": steps}
+        # 干净产品树 tip（worktree_cherry_pick 已剔除 .dev-dispatch/.dd-evidence）。
+        harvest_tip = str(result.get("harvest_tip") or "")
+        return {"steps": steps, "harvest_tip": harvest_tip}
 
     def verify(state: HarvestState) -> HarvestState:
         auth = authorize_harvest_write(
@@ -429,11 +442,12 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "outcome": OUTCOME_REFUSED,
             }
         repo = Path(state.get("repo_path") or "")
+        harvest_tip = state.get("harvest_tip") or state.get("head_commit") or ""
         try:
             result = deps.ops.pr_squash_merge(
                 repo,
                 state.get("development_id") or "",
-                state.get("head_commit") or "",
+                harvest_tip,
                 state.get("default_branch") or "",
             )
         except Exception as exc:
@@ -442,7 +456,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             }
         merged = bool(result.get("merged"))
         pr_url = str(result.get("pr_url") or "")
-        steps = _record_step(state, "pr_squash_merge", ok=merged, **result)
+        steps = _record_step(state, "pr_squash_merge", ok=merged, commit=harvest_tip, **result)
         return {"steps": steps, "pr_merged": merged, "pr_url": pr_url}
 
     def pull(state: HarvestState) -> HarvestState:
@@ -627,6 +641,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "thread_id": deps.thread_id,
                 "development_id": state.get("development_id"),
                 "head_commit": state.get("head_commit"),
+                "harvest_tip": state.get("harvest_tip"),
                 "stage": state.get("stage"),
                 "repo_path": state.get("repo_path"),
                 "default_branch": state.get("default_branch"),
