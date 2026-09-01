@@ -1063,12 +1063,29 @@ def _converge_node(deps: ResearchDeps):
     return converge_node
 
 
+def _debater_evidence(entry: dict[str, Any], finding: dict[str, Any]) -> dict[str, Any]:
+    """debater-input.v1 的 evidences 条目：{anchor, quote, claim[, clue_id]}。
+
+    可选键 clue_id 值为 None 时整键省略（不发 null）——契约把它标成可选，就是
+    允许它不存在；null 一律不合法（None is not of type 'string'）。
+    """
+    out: dict[str, Any] = {
+        "anchor": finding_anchor(finding),
+        "quote": finding.get("quote", ""),
+        "claim": finding.get("claim", ""),
+    }
+    clue_id = entry.get("clue_id")
+    if clue_id is not None:
+        out["clue_id"] = clue_id
+    return out
+
+
 def _load_evidences(run_root: Path) -> list[dict[str, Any]]:
     """读 evidence.jsonl 的 finding 形状（R4：复用既有协议，不新增中间协议）。
 
     返回 debater-input.v1 的 evidences 形状 {anchor, quote, claim, clue_id?}：
     anchor 复用 research_bus.finding_anchor（source@locator），quote/claim 原样，
-    clue_id 取 entry 的归属线索 id。
+    clue_id 取 entry 的归属线索 id（缺失时整键省略，不发 null）。
     """
     path = run_root / EVIDENCE_FILE
     if not path.is_file():
@@ -1079,14 +1096,34 @@ def _load_evidences(run_root: Path) -> list[dict[str, Any]]:
             continue
         entry = json.loads(line)
         finding = entry.get("finding") or {}
-        out.append(
-            {
-                "anchor": finding_anchor(finding),
-                "quote": finding.get("quote", ""),
-                "claim": finding.get("claim", ""),
-                "clue_id": entry.get("clue_id"),
-            }
-        )
+        out.append(_debater_evidence(entry, finding))
+    return out
+
+
+def _arbiter_clue_title(clue: dict[str, Any], title: str) -> dict[str, Any]:
+    """arbiter-input.v1 的 clue_titles 条目：{clue_id, title[, status, depth]}。
+
+    可选键 status / depth 值为 None 时整键省略（不发 null）——同 _debater_evidence。
+    """
+    out: dict[str, Any] = {"clue_id": clue["id"], "title": title}
+    status = clue.get("status")
+    if status is not None:
+        out["status"] = status
+    depth = clue.get("depth")
+    if depth is not None:
+        out["depth"] = depth
+    return out
+
+
+def _arbiter_recent_claim(ev: dict[str, Any]) -> dict[str, Any]:
+    """arbiter-input.v1 的 recent_claims 条目：{claim[, clue_id]}。
+
+    可选键 clue_id 值为 None 时整键省略（不发 null）——同 _debater_evidence。
+    """
+    out: dict[str, Any] = {"claim": ev["claim"]}
+    clue_id = ev.get("clue_id")
+    if clue_id is not None:
+        out["clue_id"] = clue_id
     return out
 
 
@@ -1222,15 +1259,9 @@ def _arbiter_node(deps: ResearchDeps):
             "rounds_elapsed": state.get("rounds", 0),
         }
         clue_titles = [
-            {
-                "clue_id": c["id"],
-                "title": _read_clue_query(deps.run_root, c["id"]),
-                "status": c.get("status"),
-                "depth": c.get("depth"),
-            }
-            for c in done_clues
+            _arbiter_clue_title(c, _read_clue_query(deps.run_root, c["id"])) for c in done_clues
         ]
-        recent_claims = [{"claim": ev["claim"], "clue_id": ev.get("clue_id")} for ev in evidences]
+        recent_claims = [_arbiter_recent_claim(ev) for ev in evidences]
         recent_rounds = state.get("rounds", 0)
         input_payload = {
             "question": question,
@@ -1553,7 +1584,10 @@ __all__ = [
     "ResearchDeps",
     "ResearchState",
     "_anchor_check_node",
+    "_arbiter_clue_title",
+    "_arbiter_recent_claim",
     "_assemble_report",
+    "_debater_evidence",
     "_extract_judge_disagreements",
     "build_research_graph",
     "converge",
