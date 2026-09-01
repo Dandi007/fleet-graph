@@ -1,0 +1,7 @@
+{
+ "development_id": "dev-fg-25fe5ee272a9",
+ "result": "MERGED",
+ "subject_commit": "ff383de69054b61445d587f82b76eb8c5a410553",
+ "target_ref": "refs/heads/dd/dev-fg-25fe5ee272a9",
+ "previous_target_head": "ff383de69054b61445d587f82b76eb8c5a410553"
+}
