@@ -71,6 +71,7 @@ TERMINAL_FIELDS = frozenset(
         "pid",
         "waiting_on",
         "waiting_on_declared",
+        "goal_revision",
         "log_path",
     }
 )
@@ -257,6 +258,7 @@ class RunArtifacts:
         pump_fault: bool = False,
         waiting_on: str = WAITING_ON_DEFAULT,
         waiting_on_declared: str | None = None,
+        goal_revision: str | None = None,
     ) -> Path:
         """Record the terminal event locally. Call this *before* any publish.
 
@@ -270,6 +272,14 @@ class RunArtifacts:
         this line. Always written (default "none") so the field set stays
         exact; `waiting_on_declared` preserves whatever raw value the
         coordinator actually declared, unknown values included.
+
+        `goal_revision` is the goal.md ``content_revision`` the line actually
+        *consumed* at its last coordinator round (G1) -- never the revision
+        current at the moment the terminal is written. It is a mechanical hash,
+        never prose, and it is optional: a terminal written without a consumed
+        revision (an old terminal, or a read that failed) simply carries
+        ``None``, which the scheduler reads as "no reliable parking baseline"
+        and fails open rather than locking the line.
         """
         event = {
             "run_id": self.run_id,
@@ -282,6 +292,7 @@ class RunArtifacts:
             "pid": self._pid,
             "waiting_on": waiting_on,
             "waiting_on_declared": waiting_on_declared,
+            "goal_revision": goal_revision,
             "log_path": self.log_path,
         }
         with self._terminal_path.open("w", encoding="utf-8") as handle:

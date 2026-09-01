@@ -314,6 +314,13 @@ class LineState(TypedDict, total=False):
     # consuming it; never persisted anywhere durable.
     pending_prompt: str
     pending_sha: str
+    #: The goal.md ``content_revision`` this line actually *consumed* at its
+    #: last coordinator round (G1). A mechanical hash, never prose. Captured by
+    #: the coordinator turn from the injected reader and carried through the
+    #: state to ``finalise``, which lands it in terminal.json so the scheduler
+    #: parks on the line-consumed revision instead of the one current at
+    #: registration time. Absent when no reader is wired or the read fails.
+    goal_revision: str
 
 
 class Coordinator(Protocol):
@@ -359,6 +366,7 @@ class ArtifactsPort(Protocol):
         pump_fault: bool = ...,
         waiting_on: str = ...,
         waiting_on_declared: str | None = ...,
+        goal_revision: str | None = ...,
     ) -> Any: ...
 
 
@@ -408,6 +416,15 @@ class LineDeps:
     #: the line is not wired to the observation surface; the graph still faults
     #: identically, the counters just stay silent.
     metrics: LineMetricsPort | None = None
+    #: The goal.md ``content_revision`` reader (G1). A callable returning the
+    #: work folder's current ``content_revision`` for this line, or None when it
+    #: cannot be read. The coordinator turn calls it exactly once -- the moment
+    #: the line consumes goal.md -- and carries the value through LineState to
+    #: ``finalise``, which lands it in terminal.json so the scheduler parks on
+    #: the line-consumed revision. None means no reader is wired: the field is
+    #: then absent, and the scheduler fails open (never locks) on the missing
+    #: baseline.
+    goal_revision: Any = None
 
     def now(self) -> float | None:
         return self.clock() if self.clock is not None else None
@@ -574,8 +591,25 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
 
         deps.inbox.drain_then_ack(persist)
 
+        # G1: the moment this round consumes goal.md. The coordinator reads the
+        # goal; the revision we snapshot here is the one this round actually
+        # saw, carried through LineState to finalise so terminal.json records
+        # the line-consumed revision -- never one current at some later moment.
+        # A missing/unreadable reader degrades to None (fail-open): the field is
+        # then absent and the scheduler must not lock the line on a guessed
+        # baseline.
+        consumed_revision = None
+        if deps.goal_revision is not None:
+            try:
+                consumed_revision = deps.goal_revision()
+            except Exception:
+                consumed_revision = None
+
         result = deps.coordinator.turn(round_no, coord_input)
-        return _verdict_update(deps, state, round_no, result)
+        update = _verdict_update(deps, state, round_no, result)
+        if consumed_revision:
+            update["goal_revision"] = consumed_revision
+        return update
 
     def decision_interrupt(state: LineState) -> LineState:
         """E2: park an open human question as a durable in-graph interrupt.
@@ -623,6 +657,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
                 reason=blocker,
                 waiting_on="decision",
                 waiting_on_declared=state.get("waiting_on_declared"),
+                goal_revision=state.get("goal_revision"),
             )
 
         # First execution suspends here; a resume returns the marker and falls
@@ -888,6 +923,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             pump_fault=bool(state.get("pump_fault", False)),
             waiting_on=state.get("waiting_on") or WAITING_ON_DEFAULT,
             waiting_on_declared=state.get("waiting_on_declared"),
+            goal_revision=state.get("goal_revision"),
         )
         # E3: the terminal is authoritative through the checkpoint, so the run
         # id that terminal.json attributes is recorded into state too -- the

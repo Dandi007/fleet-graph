@@ -280,7 +280,9 @@ class TestEquivalenceWithTheRealPump:
     #: will never grow them; the equivalence check below covers the
     #: transcribed core, and additions here must be additive-only so
     #: fleet-sentinel's reads of the old fields keep working.
-    FLEET_GRAPH_ADDITIONS = frozenset({"waiting_on", "waiting_on_declared", "log_path"})
+    FLEET_GRAPH_ADDITIONS = frozenset(
+        {"waiting_on", "waiting_on_declared", "log_path", "goal_revision"}
+    )
 
     @pytest.mark.parametrize(
         ("filename", "expected"),
