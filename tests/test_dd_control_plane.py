@@ -490,6 +490,99 @@ class TestDispatchedByForwarding:
         assert argv[argv.index("--dispatched-by") + 1] == "wf-goal-line"
 
 
+class TestDispatchedByReadModel:
+    """The `dispatched_by` provenance reaches the read model: `status.json`
+    carries it, `development_list`/`development_get` rows carry it, absent
+    provenance is an empty string, pre-existing orders backfill it from the
+    authoritative record, and the negative consistency holds -- status.json
+    never drifts from record.json."""
+
+    def test_status_json_carries_dispatched_by(self, scratch: Path, tmp_path: Path) -> None:
+        plane = make_plane(tmp_path)
+        dev = plane.create(str(scratch), spec_text=SPEC, dispatched_by="wf-goal-line")[
+            "development_id"
+        ]
+        status = json.loads((plane.root / dev / STATUS_FILE).read_text())
+        assert status["dispatched_by"] == "wf-goal-line"
+
+    def test_status_json_defaults_to_empty_string(self, scratch: Path, tmp_path: Path) -> None:
+        plane = make_plane(tmp_path)
+        dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
+        status = json.loads((plane.root / dev / STATUS_FILE).read_text())
+        assert status["dispatched_by"] == ""
+
+    def test_get_carries_dispatched_by(self, scratch: Path, tmp_path: Path) -> None:
+        plane = make_plane(tmp_path)
+        dev = plane.create(str(scratch), spec_text=SPEC, dispatched_by="wf-goal-line")[
+            "development_id"
+        ]
+        row = plane.get(dev)
+        assert row["dispatched_by"] == "wf-goal-line"
+
+    def test_list_rows_carry_dispatched_by(self, scratch: Path, tmp_path: Path) -> None:
+        plane = make_plane(tmp_path)
+        dev = plane.create(str(scratch), spec_text=SPEC, dispatched_by="wf-goal-line")[
+            "development_id"
+        ]
+        rows = plane.list()["developments"]
+        assert [row["development_id"] for row in rows] == [dev]
+        assert all("dispatched_by" in row for row in rows)
+        assert rows[0]["dispatched_by"] == "wf-goal-line"
+
+    def test_list_backfills_a_terminal_cache_missing_dispatched_by(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        """A terminal `status.json` written before `dispatched_by` entered the
+        read model carries no provenance; the list fast-path backfills it from
+        the authoritative record so the row still attributes the development."""
+        plane = make_plane(tmp_path)
+        dev = plane.create(str(scratch), spec_text=SPEC, dispatched_by="wf-goal-line")[
+            "development_id"
+        ]
+        dev_root = plane.root / dev
+        (dev_root / RESULT_FILE).write_text(
+            json.dumps(
+                {
+                    "development_id": dev,
+                    "terminal": "complete",
+                    "terminal_reason": "merger is the last declared stage",
+                    "stage": "merger",
+                    "head_commit": head(scratch),
+                    "awaiting": None,
+                    "history": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        before = plane.rebuild_status(dev)
+        assert before["state"] == "complete"
+        legacy = {k: v for k, v in before.items() if k != "dispatched_by"}
+        assert "dispatched_by" not in legacy
+        (dev_root / STATUS_FILE).write_text(json.dumps(legacy), encoding="utf-8")
+        rows = plane.list()["developments"]
+        assert rows[0]["state"] == "complete"
+        assert rows[0]["dispatched_by"] == "wf-goal-line"
+        assert json.loads((dev_root / STATUS_FILE).read_text())["dispatched_by"] == "wf-goal-line"
+
+    def test_status_never_drifts_from_the_record(self, scratch: Path, tmp_path: Path) -> None:
+        """Negative consistency: `status.json`'s `dispatched_by` always equals
+        `record.json`'s same-named field. A hand-edited status that drifts is
+        corrected by the next rebuild from the authoritative record."""
+        plane = make_plane(tmp_path)
+        dev = plane.create(str(scratch), spec_text=SPEC, dispatched_by="wf-goal-line")[
+            "development_id"
+        ]
+        dev_root = plane.root / dev
+        drifted = json.loads((dev_root / STATUS_FILE).read_text())
+        drifted["dispatched_by"] = "some-other-line"
+        (dev_root / STATUS_FILE).write_text(json.dumps(drifted), encoding="utf-8")
+        rebuilt = plane.rebuild_status(dev)
+        assert rebuilt["dispatched_by"] == "wf-goal-line"
+        assert json.loads((dev_root / STATUS_FILE).read_text())["dispatched_by"] == "wf-goal-line"
+        record = json.loads((dev_root / RECORD_FILE).read_text())
+        assert rebuilt["dispatched_by"] == record["dispatched_by"]
+
+
 class TestGate:
     def _suspended(self, plane: DdControlPlane, scratch: Path) -> str:
         dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
