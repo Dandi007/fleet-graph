@@ -168,6 +168,38 @@ def _strip_dd_subtrees(worktree: Path) -> dict[str, Any]:
     return {"ok": True, "harvest_tip": tip.stdout.strip(), "washed": True}
 
 
+def _worktrees_holding_branch(repo: Path, branch: str) -> list[Path]:
+    """`git worktree list --porcelain` 里持有 `refs/heads/<branch>` 的 worktree 路径。
+
+    返回绝对路径列表（原样自 porcelain 的 `worktree <path>` 行）。porcelain 按
+    「worktree 块」排版：每块以 `worktree <path>` 行开头，块内 `branch <ref>` 行
+    标记该 worktree 检出的分支；detached HEAD 块无 branch 行（或 `detached`）。
+    只收集块内 branch == `refs/heads/<branch>` 的块。git 失败 -> 空列表（保守：
+    不删任何 worktree，宁可在后续显式删分支时如实报错 escalate）。
+    """
+    target_ref = f"refs/heads/{branch}"
+    proc = run_git(repo, "worktree", "list", "--porcelain")
+    if proc.returncode != 0:
+        return []
+    paths: list[Path] = []
+    current_path: str | None = None
+    current_branch: str | None = None
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("worktree "):
+            if current_path is not None and current_branch == target_ref:
+                paths.append(Path(current_path))
+            current_path = stripped[len("worktree ") :]
+            current_branch = None
+        elif stripped.startswith("branch "):
+            current_branch = stripped[len("branch ") :]
+        elif stripped == "detached":
+            current_branch = None
+    if current_path is not None and current_branch == target_ref:
+        paths.append(Path(current_path))
+    return paths
+
+
 def _resolved(path: Path) -> Path:
     """规范化绝对路径（用于 allowlist 命中判定；不用于返回授权对象）。"""
     return Path(path).expanduser().resolve()
@@ -590,6 +622,61 @@ class DefaultHarvestOps:
             }
         return {"bound_development_id": None, "in_flight": False, "detail": ""}
 
+    def reclaim_stale_harvest_branch(self, repo: Path, development_id: str) -> dict[str, Any]:
+        """merge 前机械回收被残留 worktree 占用的本地 `harvest/<development_id>` 分支。
+
+        M3 根因修复：`gh pr merge --squash --delete-branch` 合并后要删**本地**
+        `harvest/<development_id>` 分支；若该分支被任一残留 worktree 检出，git
+        必然报 `cannot delete branch '...' used by worktree` -> `pr_squash_merge`
+        ok:false -> 收割 escalated。这里在删本地分支之前回收：
+
+        1. `git worktree prune` 清陈旧注册（目录已删但仍被登记的残留 worktree）。
+        2. `git worktree list --porcelain` 找出持有该分支的 worktree 路径。
+        3. 逐个复用 `remove_worktree` 移除。
+        4. 移除后复验仍持有该分支的 worktree -> 清理失败，如实 ok:false + 机器可读
+           detail，绝不 `--force` 硬清生产 checkout、绝不在脏树上继续 merge。
+        5. 本地分支存在则显式 `git branch -D`（不存在即无残留，跳过）。
+
+        返回 `{ok, detail}`。无残留 worktree / 无本地分支 -> ok:true no-op
+        （反向不抖动：正常路径行为不变）。
+        """
+        branch = f"harvest/{development_id}"
+        pruned = run_git(repo, "worktree", "prune")
+        if pruned.returncode != 0:
+            return {
+                "ok": False,
+                "detail": "worktree prune 失败: " + (pruned.stderr or pruned.stdout).strip()[:400],
+            }
+        holders = _worktrees_holding_branch(repo, branch)
+        for path in holders:
+            removed = self.remove_worktree(repo, path)
+            if not removed.get("ok"):
+                return {
+                    "ok": False,
+                    "detail": f"移除持有 {branch} 的残留 worktree {path} 失败",
+                }
+        still = _worktrees_holding_branch(repo, branch)
+        if still:
+            return {
+                "ok": False,
+                "detail": (
+                    f"移除后仍存在持有 {branch} 的残留 worktree: "
+                    + ", ".join(str(p) for p in still)
+                ),
+            }
+        exists = run_git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
+        if exists.returncode == 0:
+            deleted = run_git(repo, "branch", "-D", branch)
+            if deleted.returncode != 0:
+                return {
+                    "ok": False,
+                    "detail": (
+                        f"删除本地分支 {branch} 失败: "
+                        + (deleted.stderr or deleted.stdout).strip()[:400]
+                    ),
+                }
+        return {"ok": True, "detail": f"已回收 {len(holders)} 棵持有 {branch} 的残留 worktree"}
+
     def pr_squash_merge(
         self,
         repo: Path,
@@ -604,6 +691,13 @@ class DefaultHarvestOps:
         沿用 `dd/git.py` 守卫纪律（`run_git`）；`gh` 不经 git 守卫浸泡，独立
         argv 数组 subprocess（无 shell），cwd=repo。
 
+        **M3 修复（merge 前回收残留 worktree）**：`gh pr merge --delete-branch`
+        合并后要删本地 `harvest/<development_id>` 分支；被任一残留 worktree 检出
+        时 git 必然 `cannot delete branch ... used by worktree` -> 收割 escalated。
+        因此推分支之前先 `reclaim_stale_harvest_branch`（prune + 移除持有该分支的
+        残留 worktree + 显式删本地分支）；回收失败 -> merged=False + 机器可读
+        detail，绝不在脏树上继续 merge。
+
         任一步非零退出 / 缺 gh / 缺 origin -> merged=False + detail（stderr/stdout
         tail[:400]），绝不降级回本地 `git merge --squash`、绝不直接 commit 目标
         repo 生产 checkout 默认分支。
@@ -616,6 +710,14 @@ class DefaultHarvestOps:
         origin = _origin_url(repo)
         if origin is None:
             return {"merged": False, "detail": "缺 origin remote——无法 forge PR"}
+
+        reclaimed = self.reclaim_stale_harvest_branch(repo, development_id)
+        if not reclaimed.get("ok"):
+            return {
+                "merged": False,
+                "detail": "merge 前回收残留 harvest worktree/分支失败: "
+                + str(reclaimed.get("detail") or ""),
+            }
 
         branch = f"harvest/{development_id}"
         pushed = run_git(repo, "push", "origin", f"{head_commit}:refs/heads/{branch}")
