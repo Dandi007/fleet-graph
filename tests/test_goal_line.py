@@ -144,6 +144,20 @@ class FakeAcceptance:
         return self.facts
 
 
+class FakeLineMetrics:
+    """A LineMetricsPort recording every (line, kind) it is told about (D3)."""
+
+    def __init__(self) -> None:
+        self.failures: list[tuple[str, str]] = []
+        self.recovered: list[tuple[str, str]] = []
+
+    def record_worker_report_protocol_failure(self, line: str, kind: str) -> None:
+        self.failures.append((line, kind))
+
+    def record_worker_report_protocol_recovered(self, line: str, kind: str) -> None:
+        self.recovered.append((line, kind))
+
+
 def run_line(
     script: list[dict[str, Any]],
     *,
@@ -151,6 +165,8 @@ def run_line(
     worker: FakeWorker | None = None,
     inbox: FakeInbox | None = None,
     acceptance: Any = None,
+    metrics: FakeLineMetrics | None = None,
+    worker_report_retry_limit: int | None = None,
 ) -> tuple[FakeArtifacts, LineDeps]:
     artifacts = FakeArtifacts()
     deps = LineDeps(
@@ -161,6 +177,10 @@ def run_line(
         guards=LineGuards(bounds=bounds or LineBounds()),
         folder_id="wf-3f30cd",
         acceptance=acceptance,
+        metrics=metrics,
+        worker_report_retry_limit=worker_report_retry_limit
+        if worker_report_retry_limit is not None
+        else 1,
     )
     compiled = build_goal_line_graph(deps).compile(checkpointer=InMemorySaver())
     compiled.invoke(
@@ -635,9 +655,13 @@ class TestWorkerTurnReport:
         assert "waiting on a service" in artifacts.terminal["reason"]
 
     def test_protocol_failure_is_a_fault_without_inference_or_extra_round(self) -> None:
+        """E4a's first half survives D1: a report that fails the v1 protocol on
+        both the turn and the bounded re-ask is a fault -- never a guessed
+        success/blocked, no worker report persisted, and no extra coordinator
+        round or charge from the re-ask."""
         artifacts, deps = run_line(
             [{"verdict": "continue", "next_prompt": "go"}],
-            worker=FakeWorker(reports=["this is not a report"]),
+            worker=FakeWorker(reports=["this is not a report", "still not a report"]),
         )
         assert artifacts.terminal["terminal"] == TERMINAL_FAULT
         assert artifacts.terminal["pump_fault"] is True
@@ -645,13 +669,14 @@ class TestWorkerTurnReport:
         assert artifacts.worker_reports == [], "an unvalidated report is never persisted"
         invalid = [r for r in artifacts.rounds if r["verdict"] == "invalid"]
         assert invalid and invalid[0]["reason"] == WORKER_REPORT_PROTOCOL_FAILURE
+        assert invalid[0]["protocol_retries"] == 1, "the bounded re-ask ran exactly once"
 
     def test_unsupported_version_is_a_protocol_failure(self) -> None:
         bad = completed_report()
         bad["schema_version"] = "fleet-graph.worker-turn-report/v2"
         artifacts, _ = run_line(
             [{"verdict": "continue", "next_prompt": "go"}],
-            worker=FakeWorker(reports=[bad]),
+            worker=FakeWorker(reports=[dict(bad), dict(bad)]),
         )
         assert artifacts.terminal["terminal"] == TERMINAL_FAULT
 
@@ -660,7 +685,7 @@ class TestWorkerTurnReport:
         bad["verdict"] = "done"
         artifacts, _ = run_line(
             [{"verdict": "continue", "next_prompt": "go"}],
-            worker=FakeWorker(reports=[bad]),
+            worker=FakeWorker(reports=[dict(bad), dict(bad)]),
         )
         assert artifacts.terminal["terminal"] == TERMINAL_FAULT
 
@@ -705,3 +730,110 @@ class TestWorkerTurnReport:
             _artifacts_with.worker_reports[0]["report"]["prose_attachment"]["content"]
             == "for your eyes only"
         )
+
+    def test_malformed_report_is_recovered_by_a_bounded_reask_in_round(self) -> None:
+        """D1 阴性 1: an unescaped-quote report fails the first parse, the re-ask
+        returns a valid report, and the round does NOT fault / is NOT invalid."""
+        bad = (
+            '{"schema_version": "' + SCHEMA_VERSION + '", "turn_id": "t-1", '
+            '"outcome": "completed", "summary": "he said "hi" and left", '
+            '"did": ["x"], "files": [], "self_tests": [], "blocker": null}'
+        )
+        metrics = FakeLineMetrics()
+        worker = FakeWorker(reports=[bad, completed_report(summary="retried ok")])
+        artifacts, deps = run_line(
+            [
+                {"verdict": "continue", "next_prompt": "go"},
+                {"verdict": "done", "reason": "ok"},
+            ],
+            worker=worker,
+            metrics=metrics,
+        )
+        assert artifacts.terminal["terminal"] == TERMINAL_DONE
+        assert artifacts.terminal["pump_fault"] is False
+        assert not [r for r in artifacts.rounds if r["verdict"] == "invalid"]
+        assert len(worker.prompts) == 2, "one original turn + one re-ask"
+        assert worker.prompts[1].startswith(worker.prompts[0])
+        assert "Protocol error kind='malformed'" in worker.prompts[1]
+        assert "Re-send ONLY the report body" in worker.prompts[1]
+        assert metrics.failures == [("wf-3f30cd", "malformed")]
+        assert metrics.recovered == [("wf-3f30cd", "malformed")]
+        ok_round = [r for r in artifacts.rounds if r["verdict"] == "continue"][-1]
+        assert ok_round["protocol_retries"] == 1
+        assert ok_round["protocol_failures"][0].startswith("malformed:")
+        assert deps.coordinator.calls[1]["last_turn_report"]["summary"] == "retried ok"
+
+    def test_twice_failed_report_still_faults_with_both_causes_recorded(self) -> None:
+        """D1 阴性 2: two bad reports exhaust the bounded re-ask; the line still
+        faults with WORKER_REPORT_PROTOCOL_FAILURE and the round carries both
+        causes and the re-ask count."""
+        metrics = FakeLineMetrics()
+        artifacts, deps = run_line(
+            [{"verdict": "continue", "next_prompt": "go"}],
+            worker=FakeWorker(reports=["first bad", "second bad"]),
+            metrics=metrics,
+        )
+        assert artifacts.terminal["terminal"] == TERMINAL_FAULT
+        assert artifacts.terminal["pump_fault"] is True
+        assert len(deps.coordinator.calls) == 1
+        assert artifacts.worker_reports == []
+        invalid = [r for r in artifacts.rounds if r["verdict"] == "invalid"]
+        assert invalid and invalid[0]["reason"] == WORKER_REPORT_PROTOCOL_FAILURE
+        assert invalid[0]["protocol_retries"] == 1
+        assert len(invalid[0]["protocol_failures"]) == 2
+        assert "重问 1 次后仍失败" in invalid[0]["detail"]
+        assert metrics.failures == [("wf-3f30cd", "malformed"), ("wf-3f30cd", "malformed")]
+        assert metrics.recovered == []
+
+    def test_truncated_report_is_classified_and_recovered_by_reask(self) -> None:
+        """D2 + D1: a truncated report is labelled 'truncated' (not the generic
+        'malformed'), and a re-ask recovers it within the same round."""
+        truncated = (
+            '{"schema_version": "' + SCHEMA_VERSION + '", "turn_id": "t-1", '
+            '"outcome": "completed", "summary": "cut off at the tok'
+        )
+        metrics = FakeLineMetrics()
+        artifacts, _ = run_line(
+            [
+                {"verdict": "continue", "next_prompt": "go"},
+                {"verdict": "done", "reason": "ok"},
+            ],
+            worker=FakeWorker(reports=[truncated, completed_report(summary="full report")]),
+            metrics=metrics,
+        )
+        assert artifacts.terminal["terminal"] == TERMINAL_DONE
+        assert metrics.failures == [("wf-3f30cd", "truncated")]
+        assert metrics.recovered == [("wf-3f30cd", "truncated")]
+
+    def test_valid_report_passes_with_zero_reasks(self) -> None:
+        """D1 阴性 4: a valid report passes on the first turn -- the re-ask must
+        never become routine overhead."""
+        metrics = FakeLineMetrics()
+        worker = FakeWorker()
+        artifacts, _ = run_line(
+            [
+                {"verdict": "continue", "next_prompt": "go"},
+                {"verdict": "done", "reason": "ok"},
+            ],
+            worker=worker,
+            metrics=metrics,
+        )
+        assert len(worker.prompts) == 1
+        assert metrics.failures == [] and metrics.recovered == []
+        ok_rounds = [r for r in artifacts.rounds if r["verdict"] == "continue"]
+        assert ok_rounds and "protocol_retries" not in ok_rounds[0]
+        assert artifacts.terminal["terminal"] == TERMINAL_DONE
+
+    def test_retry_limit_zero_disables_the_reask(self) -> None:
+        """D1: the re-ask upper bound is configurable; a limit of 0 keeps the
+        pre-D1 behaviour -- a single protocol failure faults immediately."""
+        metrics = FakeLineMetrics()
+        artifacts, _ = run_line(
+            [{"verdict": "continue", "next_prompt": "go"}],
+            worker=FakeWorker(reports=["this is not a report"]),
+            metrics=metrics,
+            worker_report_retry_limit=0,
+        )
+        assert artifacts.terminal["terminal"] == TERMINAL_FAULT
+        assert metrics.failures == [("wf-3f30cd", "malformed")]
+        assert metrics.recovered == []

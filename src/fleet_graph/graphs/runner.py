@@ -32,6 +32,7 @@ from fleet_graph.goal_interrupt.store import GoalInterruptStore
 from fleet_graph.graphs.adapters import AgentRunCoordinator, AgentSessionWorker
 from fleet_graph.graphs.goal_line import LineDeps, build_goal_line_graph
 from fleet_graph.graphs.guards import LineBounds, LineGuards
+from fleet_graph.state.line_metrics import LineMetrics, line_metrics_exposition_dir
 from fleet_graph.state.run_artifacts import RunArtifacts, iso, write_json_durable
 
 
@@ -82,6 +83,11 @@ class LineConfig:
     #: re-adopted run keeps the first dispatch's label (the launcher never
     #: rewrites argv.json for an adopted session root).
     launch_id: str | None = None
+    #: The node_exporter textfile directory for this line's D3 protocol
+    #: counters. None falls back to the ``FLEET_GRAPH_LINE_METRICS_DIR``
+    #: environment variable; where neither names a directory the line does not
+    #: collect (``LineDeps.metrics`` is None and the graph faults identically).
+    metrics_dir: Path | None = None
 
     @property
     def inbox_alias(self) -> str | None:
@@ -208,8 +214,29 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         # whole run -- parking remains the fallback.
         interrupt=_build_interrupt(config, run_id=run_id),
         run_id=run_id,
+        metrics=_build_line_metrics(config),
     )
     return build_goal_line_graph(deps), deps
+
+
+def _build_line_metrics(config: LineConfig) -> LineMetrics | None:
+    """The D3 line-metric recorder, or ``None`` when no textfile dir is wired.
+
+    Mirrors the cost-observability convention: an explicit ``metrics_dir`` wins,
+    otherwise the ``FLEET_GRAPH_LINE_METRICS_DIR`` environment variable is
+    consulted; where neither names a directory the line is not collecting. A
+    line without a recorder still runs and still faults identically -- the
+    counters just stay silent.
+    """
+    directory = config.metrics_dir
+    if directory is None:
+        directory = line_metrics_exposition_dir()
+    if directory is None:
+        return None
+    return LineMetrics(
+        folder_id=config.folder_id,
+        exposition_dir=Path(directory),
+    )
 
 
 def _build_interrupt(config: LineConfig, *, run_id: str = "") -> LineInterruptPort | None:
