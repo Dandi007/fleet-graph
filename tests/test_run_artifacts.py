@@ -18,6 +18,7 @@ from fleet_graph.state.run_artifacts import (
     HEARTBEAT_INTERVAL_SECONDS,
     TERMINAL_FIELDS,
     RunArtifacts,
+    capture_release_id,
     iso,
     signal_terminal_name,
 )
@@ -281,7 +282,13 @@ class TestEquivalenceWithTheRealPump:
     #: transcribed core, and additions here must be additive-only so
     #: fleet-sentinel's reads of the old fields keep working.
     FLEET_GRAPH_ADDITIONS = frozenset(
-        {"waiting_on", "waiting_on_declared", "log_path", "goal_revision"}
+        {
+            "waiting_on",
+            "waiting_on_declared",
+            "log_path",
+            "goal_revision",
+            "release_id",
+        }
     )
 
     @pytest.mark.parametrize(
@@ -346,6 +353,105 @@ class TestNormalizeWaitingOn:
 
         assert normalize_waiting_on("human") == ("none", "human")
         assert normalize_waiting_on(42) == ("none", "42")
+
+
+class TestReleaseId:
+    """A-类可观测缺口: heartbeat carries the release this generation runs,
+    frozen once at construction -- never re-resolved from the deploy `current`
+    symlink, and fail-soft null when it cannot be read."""
+
+    def test_frozen_at_construction_and_written_to_heartbeat(self, tmp_path: Path) -> None:
+        artifacts = RunArtifacts(
+            tmp_path / "run",
+            run_id="run-1",
+            folder_id="wf-x",
+            release_id="20260902-030934-05dec3709ba0",
+        )
+        artifacts.heartbeat(1, "coordinator")
+        heartbeat = read_json(artifacts.heartbeat_path)
+        assert heartbeat["release_id"] == "20260902-030934-05dec3709ba0"
+
+    def test_written_on_every_heartbeat_write(self, tmp_path: Path, clock: FakeClock) -> None:
+        artifacts = RunArtifacts(
+            tmp_path / "run",
+            run_id="run-1",
+            folder_id="wf-x",
+            clock=clock,
+            release_id="rel-a",
+        )
+        artifacts.heartbeat(1, "coordinator")
+        clock.advance(HEARTBEAT_INTERVAL_SECONDS + 1)
+        artifacts.heartbeat(1, "coordinator")
+        assert read_json(artifacts.heartbeat_path)["release_id"] == "rel-a"
+
+    def test_defaults_to_null(self, tmp_path: Path) -> None:
+        artifacts = RunArtifacts(tmp_path / "run", run_id="run-1", folder_id="wf-x")
+        artifacts.heartbeat(1, "coordinator")
+        assert read_json(artifacts.heartbeat_path)["release_id"] is None
+
+    def test_repointing_the_symlink_does_not_change_the_frozen_value(self, tmp_path: Path) -> None:
+        """Negative: this generation's process exec'd through `current` once;
+        re-pointing it mid-generation must not change the persisted value."""
+        current = tmp_path / "current"
+        releases = tmp_path / "releases"
+        (releases / "rel-a").mkdir(parents=True)
+        (releases / "rel-b").mkdir()
+        current.symlink_to(releases / "rel-a")
+
+        artifacts = RunArtifacts(
+            tmp_path / "run",
+            run_id="run-1",
+            folder_id="wf-x",
+            release_id=capture_release_id(current),
+        )
+        artifacts.heartbeat(1, "coordinator")
+        assert read_json(artifacts.heartbeat_path)["release_id"] == "rel-a"
+
+        current.unlink()
+        current.symlink_to(releases / "rel-b")
+        artifacts.heartbeat(2, "coordinator")
+        assert read_json(artifacts.heartbeat_path)["release_id"] == "rel-a"
+
+
+class TestCaptureReleaseId:
+    """The one-shot startup resolution behind the frozen heartbeat field."""
+
+    def test_resolves_the_current_symlink_basename(self, tmp_path: Path) -> None:
+        (tmp_path / "releases" / "rel-1").mkdir(parents=True)
+        current = tmp_path / "current"
+        current.symlink_to(tmp_path / "releases" / "rel-1")
+        assert capture_release_id(current) == "rel-1"
+
+    def test_missing_path_is_fail_soft_null(self, tmp_path: Path) -> None:
+        assert capture_release_id(tmp_path / "no-such-current") is None
+
+    def test_broken_symlink_is_fail_soft_null(self, tmp_path: Path) -> None:
+        current = tmp_path / "current"
+        current.symlink_to(tmp_path / "releases" / "missing")
+        assert capture_release_id(current) is None
+
+    def test_symlink_loop_is_fail_soft_null(self, tmp_path: Path) -> None:
+        (tmp_path / "releases").mkdir()
+        loop_a = tmp_path / "releases" / "loop-a"
+        loop_b = tmp_path / "releases" / "loop-b"
+        loop_a.symlink_to(loop_b)
+        loop_b.symlink_to(loop_a)
+        current = tmp_path / "current"
+        current.symlink_to(loop_a)
+        assert capture_release_id(current) is None
+
+    def test_a_resolvable_release_always_names_itself(self, tmp_path: Path) -> None:
+        """Even an unreadable *content* target still names the release the
+        process exec'd through -- unreadability of the release body is not a
+        failure to identify it."""
+        (tmp_path / "releases" / "rel-x").mkdir(parents=True)
+        current = tmp_path / "current"
+        current.symlink_to(tmp_path / "releases" / "rel-x")
+        (tmp_path / "releases" / "rel-x").chmod(0)
+        try:
+            assert capture_release_id(current) == "rel-x"
+        finally:
+            (tmp_path / "releases" / "rel-x").chmod(0o755)
 
 
 class TestAcceptancePhaseHeartbeat:
