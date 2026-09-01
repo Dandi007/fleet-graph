@@ -22,6 +22,7 @@ from typing import Any
 
 from fleet_graph.dd.control_plane import RECORD_FILE
 from fleet_graph.dd.git import run_git
+from fleet_graph.dd.vendor import git_ops
 
 #: 命令超时（秒）。收割的 verify/deploy 都是全量级操作，给足预算。
 COMMAND_TIMEOUT_SECONDS = 3600
@@ -29,6 +30,13 @@ COMMAND_TIMEOUT_SECONDS = 3600
 #: 机械操作的合成退出码（shell 惯例）。
 EXIT_TIMEOUT = 124
 EXIT_NOT_FOUND = 127
+
+#: 收割时必须从产品树里剔除的两棵顶层 dd 协议子树。绝不全局 gitignore——
+#: dd 协议要求工单分支继续提交这些文件，排除只发生在收割侧、按顶层路径精确作用。
+DD_EXCLUDED_PATHS = (".dev-dispatch", ".dd-evidence")
+
+#: 洗树重提交的 commit message。
+DD_WASH_COMMIT_MESSAGE = "harvest: exclude dd protocol subtrees from product tree"
 
 
 def _run(argv: list[str], cwd: Path | None = None) -> dict[str, Any]:
@@ -94,6 +102,68 @@ def _gh_pr_number(pr_url: str) -> str | None:
     """PR html url 尾段数字作为 `gh pr merge` 的编号；解析不到 -> None。"""
     tail = pr_url.rstrip("/").rsplit("/", 1)[-1]
     return tail if tail.isdigit() else None
+
+
+def _commit_env() -> dict[str, str]:
+    """洗树重提交的隔离环境：dd/git.py 守卫环境 + 固定收割身份。"""
+    env = git_ops.safe_git_environment()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "fleet-graph harvest",
+            "GIT_AUTHOR_EMAIL": "harvest@fleet-graph.local",
+            "GIT_COMMITTER_NAME": "fleet-graph harvest",
+            "GIT_COMMITTER_EMAIL": "harvest@fleet-graph.local",
+        }
+    )
+    return env
+
+
+def _strip_dd_subtrees(worktree: Path) -> dict[str, Any]:
+    """机械洗树：从 worktree HEAD 剔除 `.dev-dispatch/` 与 `.dd-evidence/` 两棵
+    顶层子树并重提交，返回 `{ok, harvest_tip, detail}`。
+
+    按顶层路径精确绑定并剔除（pathspec `:(exclude).dev-dispatch` /
+    `:(exclude).dd-evidence` 的等价机械原语：洗树后重提交），绝不靠全局
+    `.gitignore`。只剔这两棵顶层子树，不动任何产品文件、不动其它点前缀目录。
+    worktree 若无这两棵子树（普通工单 commit），则洗树是 no-op——harvest_tip
+    即 cherry-pick 后原 tip，不叠一层空提交。
+    """
+    removed = run_git(
+        worktree,
+        "rm",
+        "-r",
+        "--ignore-unmatch",
+        "--quiet",
+        "--",
+        *DD_EXCLUDED_PATHS,
+    )
+    if removed.returncode != 0:
+        return {
+            "ok": False,
+            "detail": (removed.stderr or removed.stdout).strip()[:400],
+        }
+    # 仅当确有剔除（index 有变更）才重提交；无变更时 tip 就是当前 HEAD。
+    staged = run_git(worktree, "diff", "--cached", "--quiet")
+    if staged.returncode == 0:
+        tip = run_git(worktree, "rev-parse", "HEAD")
+        if tip.returncode != 0 or not tip.stdout.strip():
+            return {"ok": False, "detail": "洗树后无法解析 tip commit"}
+        return {"ok": True, "harvest_tip": tip.stdout.strip(), "washed": False}
+    if staged.returncode != 1:
+        return {
+            "ok": False,
+            "detail": (staged.stderr or staged.stdout).strip()[:400],
+        }
+    committed = run_git(worktree, "commit", "-q", "-m", DD_WASH_COMMIT_MESSAGE, env=_commit_env())
+    if committed.returncode != 0:
+        return {
+            "ok": False,
+            "detail": (committed.stderr or committed.stdout).strip()[:400],
+        }
+    tip = run_git(worktree, "rev-parse", "HEAD")
+    if tip.returncode != 0 or not tip.stdout.strip():
+        return {"ok": False, "detail": "洗树后无法解析 tip commit"}
+    return {"ok": True, "harvest_tip": tip.stdout.strip(), "washed": True}
 
 
 def _resolved(path: Path) -> Path:
@@ -221,11 +291,15 @@ class DefaultHarvestOps:
         default_branch: str,
         worktree_root: Path,
     ) -> dict[str, Any]:
-        """独立 worktree 上 cherry-pick 产品 commit。
+        """独立 worktree 上 cherry-pick 产品 commit，并洗掉 dd 协议子树。
 
         一次性 detached worktree，冲突即兴消解：先尝试直接 cherry-pick，若因
         冲突失败则尝试 `-X theirs`（以默认分支为主）重跑；仍失败则如实报告
         冲突，绝不强行覆盖。
+
+        cherry-pick 成功后在**同一 worktree** 上做同样的剔除并提交（交付 A.4）：
+        按顶层路径剔除 `.dev-dispatch/` 与 `.dd-evidence/` 两棵子树，返回干净
+        产品树 tip（`harvest_tip`）——保证随后的 `run_verify` 也跑在干净产品树。
 
         **worktree 生命周期（rc-702098ab 回归）**：成功路径保留 worktree，供
         下一步 `run_verify` 在真实目录上跑全量套件（若 here 提前删除目录，
@@ -246,7 +320,16 @@ class DefaultHarvestOps:
             }
         picked = run_git(worktree_root, "cherry-pick", head_commit)
         if picked.returncode == 0:
-            return {"ok": True, "method": "cherry-pick"}
+            washed = _strip_dd_subtrees(worktree_root)
+            if not washed.get("ok"):
+                self.remove_worktree(repo, worktree_root)
+                return washed
+            return {
+                "ok": True,
+                "method": "cherry-pick",
+                "harvest_tip": washed["harvest_tip"],
+                "washed": washed["washed"],
+            }
         if (
             picked.returncode != 0
             and b"conflict" not in (picked.stderr + picked.stdout).encode("utf-8").lower()
@@ -258,12 +341,65 @@ class DefaultHarvestOps:
             }
         retried = run_git(worktree_root, "cherry-pick", "-X", "theirs", head_commit)
         if retried.returncode == 0:
-            return {"ok": True, "method": "cherry-pick -X theirs"}
+            washed = _strip_dd_subtrees(worktree_root)
+            if not washed.get("ok"):
+                self.remove_worktree(repo, worktree_root)
+                return washed
+            return {
+                "ok": True,
+                "method": "cherry-pick -X theirs",
+                "harvest_tip": washed["harvest_tip"],
+                "washed": washed["washed"],
+            }
         self.remove_worktree(repo, worktree_root)
         return {
             "ok": False,
             "conflicts": True,
             "detail": (retried.stderr or retried.stdout).strip()[:400],
+        }
+
+    def build_harvest_tip(
+        self,
+        repo: Path,
+        head_commit: str,
+        default_branch: str,
+        worktree_root: Path,
+    ) -> dict[str, Any]:
+        """机械写口：从产品 commit 派生一棵「去 dd 协议子树」的干净产品树。
+
+        只做机械事：读 `head_commit`、洗树、产出 tip（交付 A.3，不做 allowlist
+        判定——判定在编排层 gate）。在一次性 worktree 上 cherry-pick 后用
+        `_strip_dd_subtrees` 剔除 `.dev-dispatch/` / `.dd-evidence/` 两棵顶层
+        子树并重提交，返回 `{ok, harvest_tip, detail}`。worktree 用后即清，
+        不保留（此口不承担 verify 职责）。
+        """
+        if worktree_root.exists():
+            shutil.rmtree(worktree_root, ignore_errors=True)
+        worktree_root.mkdir(parents=True, exist_ok=True)
+
+        added = run_git(repo, "worktree", "add", "--detach", str(worktree_root), default_branch)
+        if added.returncode != 0:
+            self.remove_worktree(repo, worktree_root)
+            return {
+                "ok": False,
+                "detail": (added.stderr or added.stdout).strip()[:400],
+            }
+        picked = run_git(worktree_root, "cherry-pick", head_commit)
+        if picked.returncode != 0:
+            self.remove_worktree(repo, worktree_root)
+            return {
+                "ok": False,
+                "detail": (picked.stderr or picked.stdout).strip()[:400],
+            }
+        washed = _strip_dd_subtrees(worktree_root)
+        self.remove_worktree(repo, worktree_root)
+        if not washed.get("ok"):
+            return washed
+        return {
+            "ok": True,
+            "harvest_tip": washed["harvest_tip"],
+            "washed": washed["washed"],
+            "detail": "washed",
         }
 
     def remove_worktree(self, repo: Path, worktree_root: Path) -> dict[str, Any]:
@@ -393,6 +529,8 @@ class DefaultHarvestOps:
 
 __all__ = [
     "COMMAND_TIMEOUT_SECONDS",
+    "DD_EXCLUDED_PATHS",
+    "DD_WASH_COMMIT_MESSAGE",
     "EXIT_NOT_FOUND",
     "EXIT_TIMEOUT",
     "DefaultHarvestOps",
