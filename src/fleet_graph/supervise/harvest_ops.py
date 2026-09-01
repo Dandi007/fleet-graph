@@ -173,6 +173,138 @@ def _resolved(path: Path) -> Path:
     return Path(path).expanduser().resolve()
 
 
+def _probe_worktree_kind(repo: Path, worktree_root: Path) -> dict[str, Any]:
+    """只读判别 `worktree_root` 的种类（主 worktree / linked worktree / 未知）。
+
+    机械判别（监督面判据①）：主 worktree 根下 `.git` 是**目录**；linked
+    worktree 的 `.git` 是**文件**（gitfile 指向 common-dir）。兜底读 `git
+    rev-parse --git-common-dir`：等于 `worktree_root/.git` 即主树。
+
+    - `primary`：`.git` 是目录（或 common-dir 即自身）——**绝不清理**；
+    - `linked`：`.git` 是 gitfile 且 common-dir 解析到别处——可回收；
+    - `missing`：`worktree_root` 不存在（无目录可清）；
+    - `unknown`：其它（`.git` 缺失 / 非 git 工作树 / common-dir 不可解析）。
+
+    返回 `{"kind": ..., "detail": str}`。**本函数只读**：零 `rmtree` /
+    `worktree remove` / `prune` / 切分支。
+    """
+    git_entry = worktree_root / ".git"
+    if not worktree_root.exists():
+        return {"kind": "missing", "detail": f"{worktree_root} 不存在——无可回收目录"}
+    if git_entry.is_dir():
+        return {"kind": "primary", "detail": f"{worktree_root}/.git 是目录（主 worktree）"}
+    if git_entry.is_file():
+        common = run_git(worktree_root, "rev-parse", "--git-common-dir")
+        if common.returncode == 0 and common.stdout.strip():
+            common_dir = Path(common.stdout.strip())
+            if not common_dir.is_absolute():
+                common_dir = worktree_root / common_dir
+            if common_dir.resolve() == git_entry.resolve():
+                return {
+                    "kind": "primary",
+                    "detail": f"{worktree_root} common-dir 等于自身 .git（主 worktree）",
+                }
+            return {
+                "kind": "linked",
+                "detail": (
+                    f"{worktree_root}/.git 是 gitfile（linked worktree，common-dir={common_dir}）"
+                ),
+            }
+        return {
+            "kind": "unknown",
+            "detail": f"{worktree_root}/.git 是文件但 common-dir 不可解析",
+        }
+    return {"kind": "unknown", "detail": f"{worktree_root} 缺 .git 入口（非 git 工作树）"}
+
+
+def _assert_repo_valid(repo: Path) -> tuple[bool, str]:
+    """后置校验：任何回收/清理动作后断言 `<repo>` 仍是有效 git 仓。
+
+    - `<repo>/.git` 仍在；
+    - `git -C <repo> rev-parse --is-inside-work-tree` == true；
+    - `--show-toplevel` == 仓目录（规范化后相等）；
+    - `HEAD` 可解析（`rev-parse HEAD` 非零即失败）。
+
+    任一不满足 -> `(False, 机器可读 detail)`。绝不把「目标目录已不存在」当成功
+    （那正是被删主树的假绿）。
+    """
+    if not (repo / ".git").exists():
+        return False, f"{repo} 的 .git 缺失——仓已被破坏"
+    inside = run_git(repo, "rev-parse", "--is-inside-work-tree")
+    if inside.returncode != 0 or inside.stdout.strip().lower() != "true":
+        return False, (
+            f"{repo} rev-parse --is-inside-work-tree 非 true: "
+            + (inside.stderr or inside.stdout).strip()[:200]
+        )
+    top = run_git(repo, "rev-parse", "--show-toplevel")
+    if top.returncode != 0 or not top.stdout.strip():
+        return False, (
+            f"{repo} rev-parse --show-toplevel 失败: " + (top.stderr or top.stdout).strip()[:200]
+        )
+    if _resolved(top.stdout.strip()) != _resolved(repo):
+        return False, f"{repo} --show-toplevel 不等于仓目录（{top.stdout.strip()}）"
+    head_proc = run_git(repo, "rev-parse", "HEAD")
+    if head_proc.returncode != 0 or not head_proc.stdout.strip():
+        return False, (
+            f"{repo} HEAD 不可解析: " + (head_proc.stderr or head_proc.stdout).strip()[:200]
+        )
+    return True, ""
+
+
+def _guard_rmtree(repo: Path, worktree_root: Path) -> dict[str, Any]:
+    """rmtree 前置护栏：仅当目标确认为 linked worktree 才允许 rmtree。
+
+    判据（交付 B.1）：`.git` 为 gitfile（linked）+ common-dir 不等自身 + 不落在
+    主 checkout 路径内（也不覆盖主 checkout）。目标不存在 -> allowed（无目录可
+    清）。主 worktree / 未知目标 -> 拒绝删除 + 机器可读 detail，调用方必须如实
+    报错，绝不 rmtree。
+
+    返回 `{"allowed": bool, "detail": str}`。
+    """
+    probe = _probe_worktree_kind(repo, worktree_root)
+    if probe["kind"] == "missing":
+        return {"allowed": True, "detail": probe["detail"]}
+    if probe["kind"] == "primary":
+        return {
+            "allowed": False,
+            "detail": "primary checkout is not reclaimable",
+        }
+    if probe["kind"] != "linked":
+        return {
+            "allowed": False,
+            "detail": f"拒绝 rmtree：{probe['detail']}（仅 linked worktree 可回收）",
+        }
+    resolved_root = _resolved(worktree_root)
+    resolved_repo = _resolved(repo)
+    if (
+        resolved_root == resolved_repo
+        or resolved_repo.is_relative_to(resolved_root)
+        or resolved_root.is_relative_to(resolved_repo)
+    ):
+        return {
+            "allowed": False,
+            "detail": f"拒绝 rmtree：{worktree_root} 落在主 checkout（{repo}）路径内",
+        }
+    return {"allowed": True, "detail": probe["detail"]}
+
+
+def _preclean_worktree(repo: Path, worktree_root: Path) -> dict[str, Any]:
+    """前置清树的统一护栏：存在才清；仅 linked worktree 可清；清后断言主仓有效。
+
+    返回 `{"ok": bool, "detail": str}`。`ok=False` 时调用方必须立即停止并如实报错
+    （不达标即不删），绝不继续 `worktree add`。
+    """
+    guard = _guard_rmtree(repo, worktree_root)
+    if not guard["allowed"]:
+        return {"ok": False, "detail": guard["detail"]}
+    if worktree_root.exists():
+        shutil.rmtree(worktree_root, ignore_errors=True)
+        valid, detail = _assert_repo_valid(repo)
+        if not valid:
+            return {"ok": False, "detail": detail}
+    return {"ok": True, "detail": ""}
+
+
 def _resolve_canonical_repo(
     record_repo_path: str,
     record_remote_url: str | None,
@@ -355,8 +487,12 @@ class DefaultHarvestOps:
         `remove_worktree` 统一负责。失败/冲突路径无可验证内容，在此立即清理，
         不留给编排层。
         """
-        if worktree_root.exists():
-            shutil.rmtree(worktree_root, ignore_errors=True)
+        preclean = _preclean_worktree(repo, worktree_root)
+        if not preclean.get("ok"):
+            return {
+                "ok": False,
+                "detail": preclean.get("detail") or "前置清树护栏拒绝清理",
+            }
         worktree_root.mkdir(parents=True, exist_ok=True)
 
         added = run_git(repo, "worktree", "add", "--detach", str(worktree_root), default_branch)
@@ -441,8 +577,12 @@ class DefaultHarvestOps:
         子树并重提交，返回 `{ok, harvest_tip, detail}`。worktree 用后即清，
         不保留（此口不承担 verify 职责）。
         """
-        if worktree_root.exists():
-            shutil.rmtree(worktree_root, ignore_errors=True)
+        preclean = _preclean_worktree(repo, worktree_root)
+        if not preclean.get("ok"):
+            return {
+                "ok": False,
+                "detail": preclean.get("detail") or "前置清树护栏拒绝清理",
+            }
         worktree_root.mkdir(parents=True, exist_ok=True)
 
         added = run_git(repo, "worktree", "add", "--detach", str(worktree_root), default_branch)
@@ -474,11 +614,42 @@ class DefaultHarvestOps:
         """移除 verify 之后的一次性 detached worktree（编排层 cleanup 步骤调用）。
 
         `git worktree remove` 失败时兜底：删目录 + `git worktree prune` 清注册。
+
+        **主树/linked 判别 + rmtree 护栏（交付 A/B）**：目标为主 worktree
+        （`.git` 是目录，即生产主 checkout）-> 拒绝清理并返回
+        `{"ok": False, "detail": "primary checkout is not reclaimable"}`，绝不
+        `rmtree` / `worktree remove` / `prune` / 切分支。兜底 rmtree 一律过
+        `_guard_rmtree`：仅当目标确认为 linked worktree 才允许删除。
+
+        **不再恒返 ok:true（交付 B.3）**：真实反映 `worktree remove` 结果——
+        失败返回 `ok:false` + detail。任何回收/清理动作后跑后置校验
+        （`_assert_repo_valid`，交付 C）：主仓 `.git` 仍在、`is-inside-work-tree`
+        =true、`--show-toplevel`=仓目录、`HEAD` 可解析，任一不满足 -> `ok:false`。
+        绝不把「目标目录已不存在」当成功（那正是被删主树的假绿）。
         """
+        guard = _guard_rmtree(repo, worktree_root)
+        if not guard["allowed"]:
+            return {"ok": False, "detail": guard["detail"]}
+        if not worktree_root.exists():
+            # 目标不存在：不能直接 ok:true（假绿）——先做后置校验确认主仓完好。
+            run_git(repo, "worktree", "prune")
+            valid, detail = _assert_repo_valid(repo)
+            if not valid:
+                return {"ok": False, "detail": detail}
+            return {"ok": True, "detail": "worktree 目录已不存在——主仓校验通过"}
         removed = run_git(repo, "worktree", "remove", "--force", str(worktree_root))
         if removed.returncode != 0:
             shutil.rmtree(worktree_root, ignore_errors=True)
             run_git(repo, "worktree", "prune")
+        valid, detail = _assert_repo_valid(repo)
+        if not valid:
+            return {"ok": False, "detail": detail}
+        if removed.returncode != 0:
+            return {
+                "ok": False,
+                "detail": "worktree remove 失败（兜底 rmtree+prune 已执行）: "
+                + (removed.stderr or removed.stdout).strip()[:400],
+            }
         return {"ok": True}
 
     def run_verify(self, worktree: Path, argv: list[str]) -> int:
