@@ -108,6 +108,11 @@ def to_record(values: dict[str, Any], *, created_at: Any) -> dict[str, Any] | No
         "waiting_on": waiting_on,
         "at": at,
         "pump_fault": bool(values.get("pump_fault", False)),
+        # G1: the goal.md content_revision the line consumed at its last
+        # coordinator round, carried in LineState and checkpointed like every
+        # other control field. The scheduler's parking reads it off this record;
+        # absent on old generations -> fail open, never lock.
+        "goal_revision": values.get("goal_revision"),
     }
 
 

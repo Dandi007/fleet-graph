@@ -115,6 +115,7 @@ class FakeArtifacts:
         pump_fault: bool = False,
         waiting_on: str = "none",
         waiting_on_declared: str | None = None,
+        goal_revision: str | None = None,
     ) -> str:
         self.terminal = {
             "terminal": terminal,
@@ -123,6 +124,7 @@ class FakeArtifacts:
             "pump_fault": pump_fault,
             "waiting_on": waiting_on,
             "waiting_on_declared": waiting_on_declared,
+            "goal_revision": goal_revision,
         }
         return "terminal.json"
 
@@ -151,6 +153,7 @@ def run_line(
     worker: FakeWorker | None = None,
     inbox: FakeInbox | None = None,
     acceptance: Any = None,
+    goal_revision: Any = None,
 ) -> tuple[FakeArtifacts, LineDeps]:
     artifacts = FakeArtifacts()
     deps = LineDeps(
@@ -161,6 +164,7 @@ def run_line(
         guards=LineGuards(bounds=bounds or LineBounds()),
         folder_id="wf-3f30cd",
         acceptance=acceptance,
+        goal_revision=goal_revision,
     )
     compiled = build_goal_line_graph(deps).compile(checkpointer=InMemorySaver())
     compiled.invoke(
@@ -431,6 +435,45 @@ class TestAcceptanceStep:
             acceptance=acceptance,
         )
         assert acceptance.calls == 1
+
+
+class TestGoalRevisionConsumed:
+    """G1: the terminal records the goal.md revision the line actually consumed
+    at its last coordinator round -- never the revision current at some later
+    moment. The coordinator turn captures it once, carries it through LineState,
+    and finalise lands it in the terminal record for the scheduler's parking
+    baseline."""
+
+    def test_the_consumed_revision_reaches_the_terminal(self) -> None:
+        artifacts, _ = run_line(
+            [{"verdict": "blocked", "reason": "needs a human", "waiting_on": "decision"}],
+            goal_revision=lambda: "sha256:rev-0",
+        )
+        assert artifacts.terminal["goal_revision"] == "sha256:rev-0"
+
+    def test_a_read_failure_records_no_revision(self) -> None:
+        """A reader that fails must not fabricate a baseline: the field is then
+        absent (None), and the scheduler fails open rather than locking."""
+        artifacts, _ = run_line(
+            [{"verdict": "blocked", "reason": "needs a human", "waiting_on": "decision"}],
+            goal_revision=lambda: (_ for _ in ()).throw(RuntimeError("mcp down")),
+        )
+        assert artifacts.terminal["goal_revision"] is None
+
+    def test_no_reader_wired_records_no_revision(self) -> None:
+        artifacts, _ = run_line(
+            [{"verdict": "blocked", "reason": "needs a human", "waiting_on": "decision"}]
+        )
+        assert artifacts.terminal["goal_revision"] is None
+
+    def test_a_done_terminal_carries_the_same_consumed_revision(self) -> None:
+        """Line-consumed, not any time current: a done terminal records whatever
+        the last coordinator round consumed."""
+        artifacts, _ = run_line(
+            [{"verdict": "done", "reason": "acceptance passed"}],
+            goal_revision=lambda: "sha256:rev-0",
+        )
+        assert artifacts.terminal["goal_revision"] == "sha256:rev-0"
 
 
 class TestWaitingOn:

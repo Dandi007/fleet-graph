@@ -72,6 +72,13 @@ class LineConfig:
     #: by the orchestration layer, injected into every coordinator input. None
     #: means none were captured (the field is then absent from the envelope).
     resume_verification: dict[str, Any] | None = None
+    #: The goal.md ``content_revision`` reader (G1). A callable returning the
+    #: work folder's current content_revision for this line, or None when it
+    #: cannot be read. The coordinator turn calls it at the moment it consumes
+    #: goal.md and the revision rides through LineState to terminal.json, so the
+    #: scheduler parks on the line-consumed revision. None falls back to a
+    #: default best-effort reader over the work-folder MCP.
+    goal_revision: Any = None
     #: The prior generation's terminal.json content, injected into the round-1
     #: coordinator input when present. None lets build_line read the terminal
     #: left on disk under run_root, which at generation start is the previous
@@ -208,8 +215,36 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         # whole run -- parking remains the fallback.
         interrupt=_build_interrupt(config, run_id=run_id),
         run_id=run_id,
+        # G1: the coordinator round's goal.md content_revision reader. Falls
+        # back to a best-effort default over the work-folder MCP when the config
+        # does not inject one.
+        goal_revision=config.goal_revision or _build_goal_revision_reader(config),
     )
     return build_goal_line_graph(deps), deps
+
+
+def _build_goal_revision_reader(config: LineConfig) -> Any:
+    """The default goal.md content_revision reader for one line (G1).
+
+    Returns the work folder's ``content_revision`` for ``goal.md``, or None
+    when it cannot be read (MCP down, statless answer). The coordinator turn
+    treats a failure as "no consumed revision recorded" -- the field is then
+    absent from terminal.json and the scheduler fails open rather than locking
+    the line on a guessed baseline.
+    """
+    from fleet_graph.state.work_folder import FastMCPCaller, WorkFolder
+
+    folder_id = config.folder_id
+
+    def read() -> str | None:
+        try:
+            stat = WorkFolder(folder_id, FastMCPCaller()).stat("goal.md")
+            revision = str(stat.get("content_revision") or "")
+            return revision or None
+        except Exception:
+            return None
+
+    return read
 
 
 def _build_interrupt(config: LineConfig, *, run_id: str = "") -> LineInterruptPort | None:
