@@ -45,7 +45,7 @@ from fleet_graph.goal_enroll.contract import (
     GoalEnrollError,
     GoalRosterEntry,
 )
-from fleet_graph.goal_enroll.queue import EnrollQueue
+from fleet_graph.goal_enroll.queue import EnrollQueue, migrate_queue_home
 from fleet_graph.goal_enroll.roster import RealRosterReader
 from fleet_graph.goal_enroll.service import GoalEnrollService
 from fleet_graph.goal_enroll.source import governed_goal_folder_store
@@ -403,6 +403,145 @@ class TestValidatorGates6And7:
         assert facts["alias"] == "ronin-fresh"
         assert facts["seat_hint"] == "opencode-gpt-sol"
         assert facts["briefing_version"] == BRIEFING_VERSION
+
+    def test_a_supervision_plane_token_is_not_owned(self, tmp_path: Path) -> None:
+        """Gate 6 ownership: a token whose realpath resolves into the
+        supervision plane (control-plane credential root) is not owned."""
+        from fleet_graph.bus.tokens import resolve_line_token_ownership
+
+        secrets = tmp_path / "secrets"
+        supervision = tmp_path / "supervision"
+        secrets.mkdir()
+        supervision.mkdir()
+        (supervision / "supervisor.token").write_text("control", encoding="utf-8")
+        (secrets / "ronin-sup.token").symlink_to(supervision / "supervisor.token")
+        ownership = resolve_line_token_ownership(
+            "ronin-sup",
+            template=str(secrets / "{alias}.token"),
+            secrets_root=secrets,
+            supervision_roots=(supervision,),
+        )
+        assert not ownership.owned
+        assert ownership.status == "supervision_plane"
+
+    def test_an_other_line_token_is_not_owned(self, tmp_path: Path) -> None:
+        """Gate 6 ownership: a token whose realpath is another line's token
+        (a different basename) is not owned."""
+        from fleet_graph.bus.tokens import resolve_line_token_ownership
+
+        secrets = tmp_path / "secrets"
+        secrets.mkdir()
+        (secrets / "ronin-other.token").write_text("other", encoding="utf-8")
+        (secrets / "ronin-x.token").symlink_to(secrets / "ronin-other.token")
+        ownership = resolve_line_token_ownership(
+            "ronin-x",
+            template=str(secrets / "{alias}.token"),
+            secrets_root=secrets,
+        )
+        assert not ownership.owned
+        assert ownership.status == "other_line"
+
+    def test_a_symlink_alias_token_is_not_owned(self, tmp_path: Path) -> None:
+        """Gate 6 ownership: a symlink masquerading as the line's own token is
+        not owned even when it resolves within the secrets boundary."""
+        from fleet_graph.bus.tokens import resolve_line_token_ownership
+
+        secrets = tmp_path / "secrets"
+        secrets.mkdir()
+        (secrets / "real").mkdir()
+        (secrets / "real" / "ronin-link.token").write_text("real", encoding="utf-8")
+        (secrets / "ronin-link.token").symlink_to(secrets / "real" / "ronin-link.token")
+        ownership = resolve_line_token_ownership(
+            "ronin-link",
+            template=str(secrets / "{alias}.token"),
+            secrets_root=secrets,
+        )
+        assert not ownership.owned
+        assert ownership.status == "symlink_alias"
+
+    def test_a_missing_token_is_not_owned(self, tmp_path: Path) -> None:
+        from fleet_graph.bus.tokens import resolve_line_token_ownership
+
+        secrets = tmp_path / "secrets"
+        secrets.mkdir()
+        ownership = resolve_line_token_ownership(
+            "ronin-nope",
+            template=str(secrets / "{alias}.token"),
+            secrets_root=secrets,
+        )
+        assert not ownership.owned
+        assert ownership.status == "missing"
+
+    def test_a_regular_owned_token_is_owned(self, tmp_path: Path) -> None:
+        """Gate 6 ownership: a plain regular file at the canonical path is
+        genuinely owned (positive case)."""
+        from fleet_graph.bus.tokens import resolve_line_token_ownership
+
+        secrets = tmp_path / "secrets"
+        secrets.mkdir()
+        (secrets / "ronin-owned.token").write_text("owned", encoding="utf-8")
+        ownership = resolve_line_token_ownership(
+            "ronin-owned",
+            template=str(secrets / "{alias}.token"),
+            secrets_root=secrets,
+        )
+        assert ownership.owned
+        assert ownership.status == "owned"
+
+
+class TestQueueHomeIsolation:
+    """U4 defect 1: goal serve's queue lives in an independent queue home
+    (default /data/fleet-graph/goal/), never inside the work-folder-root."""
+
+    def test_default_goal_queue_home_is_the_fleet_goal_dir(self) -> None:
+        from fleet_graph.goal.service import DEFAULT_GOAL_QUEUE_HOME, GOAL_QUEUE_HOME_ENV
+
+        assert DEFAULT_GOAL_QUEUE_HOME == "/data/fleet-graph/goal"
+        assert GOAL_QUEUE_HOME_ENV == "FLEET_GRAPH_GOAL_QUEUE_HOME"
+
+    def test_migrate_queue_home_moves_legacy_files_out_of_work_records(
+        self, tmp_path: Path
+    ) -> None:
+        """Legacy queue files under the work-folder-root are relocated into the
+        goal queue home, deterministically and idempotently."""
+        legacy = tmp_path / "work-records"
+        home = tmp_path / "goal"
+        legacy.mkdir(parents=True)
+        (legacy / "enroll-queue.jsonl").write_text("legacy-queue\n", encoding="utf-8")
+        (legacy / "enroll-rejections.jsonl").write_text("legacy-rej\n", encoding="utf-8")
+
+        assert migrate_queue_home(legacy, home) == (
+            "enroll-queue.jsonl",
+            "enroll-rejections.jsonl",
+        )
+        assert (home / "enroll-queue.jsonl").read_text(encoding="utf-8") == "legacy-queue\n"
+        assert (home / "enroll-rejections.jsonl").read_text(encoding="utf-8") == "legacy-rej\n"
+        assert not (legacy / "enroll-queue.jsonl").exists()
+        # Idempotent: re-running is a no-op.
+        assert migrate_queue_home(legacy, home) == ()
+
+    def test_migrate_queue_home_never_overwrites_existing_queue_files(self, tmp_path: Path) -> None:
+        """When both locations hold a file, the queue home is authoritative:
+        the legacy copy is left untouched (retain data, never overwrite)."""
+        legacy = tmp_path / "work-records"
+        home = tmp_path / "goal"
+        legacy.mkdir(parents=True)
+        home.mkdir(parents=True)
+        (legacy / "enroll-queue.jsonl").write_text("legacy\n", encoding="utf-8")
+        (home / "enroll-queue.jsonl").write_text("authoritative\n", encoding="utf-8")
+        assert migrate_queue_home(legacy, home) == ()
+        assert (home / "enroll-queue.jsonl").read_text(encoding="utf-8") == "authoritative\n"
+
+    def test_goal_serve_refuses_to_start_without_a_queue_migration_source(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """serve() keeps its fail-fast root binding; the queue home is separate
+        but never replaces the required work-folder-root."""
+        from fleet_graph.goal.service import serve
+
+        monkeypatch.delenv("FLEET_GRAPH_WORK_FOLDER_ROOT", raising=False)
+        with pytest.raises(RuntimeError, match="GOAL_ENROLL_SOURCE_UNBOUND"):
+            serve(host="127.0.0.1", port=0, work_folder_root=None, goal_queue_home="/tmp/q")
 
 
 class TestServiceAndMCP:

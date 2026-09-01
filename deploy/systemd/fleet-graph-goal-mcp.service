@@ -19,6 +19,11 @@
 # ExecStart therefore passes --work-folder-root explicitly; the site value is
 # filled in by the deployer (this repo never hardcodes a host path).
 #
+# The enrollment queue lives in an independent queue home (default
+# /data/fleet-graph/goal/), separate from the work-folder-root, so goal
+# enrollment never pollutes the governance warehouse that owns goal folders.
+# The state read-model's /v1/enrollments defaults to this same home.
+#
 # Port 5611 was bind-tested free on the fleet host (2026-08-31) and collides
 # with none of the reserved ports (5606/7455/7460/8113/5601/5602/5605/5608/
 # 7490/9090/9093/3300/8101/3002). The service itself refuses to start when the
@@ -33,7 +38,8 @@ Type=simple
 WorkingDirectory=/data/apps/fleet-graph/current
 ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph goal serve \
     --host 127.0.0.1 --port 5611 \
-    --work-folder-root <work-folder-root>
+    --work-folder-root <work-folder-root> \
+    --goal-queue-home /data/fleet-graph/goal
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

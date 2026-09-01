@@ -20,6 +20,13 @@ rewritten atomically on change), under a store root -- the same shape the
 state read-model already reads for the roster, so ``/v1/enrollments`` can
 re-read this file per request. Rejections (拒绝史) are kept in a separate
 append-only file keyed by folder.
+
+The store root is the goal service's **independent queue home** (default
+``/data/fleet-graph/goal/``), deliberately separate from the work-folder-root
+that owns goal folders: goal enrollment reads/writes only this queue home and
+never pollutes another governance warehouse. ``migrate_queue_home`` relocates
+legacy queue files out of an old root into the queue home deterministically
+and idempotently.
 """
 
 from __future__ import annotations
@@ -46,12 +53,39 @@ REJECTIONS_FILE = "enroll-rejections.jsonl"
 _TERMINAL = (QUEUE_STATUS_ADMITTED, QUEUE_STATUS_REJECTED, QUEUE_STATUS_WITHDRAWN)
 
 
+def migrate_queue_home(legacy_root: str | Path | None, queue_home: str | Path) -> tuple[str, ...]:
+    """Relocate legacy queue files out of the old root into the goal queue home.
+
+    Deterministic and idempotent: for each queue file (``enroll-queue.jsonl``
+    and ``enroll-rejections.jsonl``), if it exists at ``legacy_root`` and the
+    destination does not already exist, it is moved (never copied/duplicated,
+    never overwritten) into ``queue_home``. Re-running is a no-op: an already
+    relocated file is no longer at the legacy root, and a file already present
+    at the destination is left untouched. Returns the file names moved.
+    """
+    if legacy_root in (None, ""):
+        return ()
+    base = Path(legacy_root)
+    home = Path(queue_home)
+    moved: list[str] = []
+    for name in (QUEUE_FILE, REJECTIONS_FILE):
+        src = base / name
+        dst = home / name
+        if src.is_file() and not dst.exists():
+            home.mkdir(parents=True, exist_ok=True)
+            src.replace(dst)
+            moved.append(name)
+    return tuple(moved)
+
+
 class EnrollQueue:
     """One current application per ``folder_id``, with its state machine.
 
     ``root=None`` keeps an in-memory queue (tests and the acceptance drill use
-    this); a real root persists ``enroll-queue.jsonl`` next to the goal-roster
-    store the goal service already owns.
+    this); a real root persists ``enroll-queue.jsonl`` and
+    ``enroll-rejections.jsonl`` under the goal service's independent queue
+    home (default ``/data/fleet-graph/goal/``), never inside the
+    work-folder-root.
     """
 
     def __init__(self, root: str | Path | None = None, *, clock: Any = time.time) -> None:
@@ -235,4 +269,4 @@ class EnrollQueue:
         return len(self._by_folder)
 
 
-__all__ = ["QUEUE_FILE", "REJECTIONS_FILE", "EnrollQueue"]
+__all__ = ["QUEUE_FILE", "REJECTIONS_FILE", "EnrollQueue", "migrate_queue_home"]

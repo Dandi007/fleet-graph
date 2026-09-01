@@ -22,6 +22,13 @@ enough to refuse and the earliest one is the least misleading):
    in a throwaway environment to prove the commands can start (exit code
    reachable). A command that cannot even start is refused with
    ``ACCEPTANCE_ARGV_UNEXECUTABLE``.
+6. **alias token ownership** -- the applicant's alias token must be owned by
+   the governed line (realpath-canonicalized: a regular file exactly at the
+   canonical ``<secrets_root>/<alias>.token``, inside the secrets boundary,
+   resolving into neither the supervision plane nor another line's token, and
+   not a symlink masquerade).
+7. **alias uniqueness** -- the alias must not already be claimed by a roster
+   line or a pending application.
 
 The validator is deliberately deterministic and self-contained: it reads goal
 folder text through an injectable ``GoalFolderSource`` seam and runs argv
@@ -216,10 +223,11 @@ class GoalEnrollValidator:
 
     Gates 6 and 7 are the application-face gates the spec adds. They take
     injectable seams so the validator stays deterministic and self-contained:
-    the alias-token check (the ``/data/ronin/secrets/<alias>.token`` existence)
-    and the alias-uniqueness check (against the real roster and the pending
-    queue) are both supplied by the caller -- the service wires them to the
-    real token store and the queue/roster readers, tests inject fakes.
+    the alias-token ownership check (the ``/data/ronin/secrets/<alias>.token``
+    ownership, realpath-canonicalized) and the alias-uniqueness check (against
+    the real roster and the pending queue) are both supplied by the caller --
+    the service wires them to the real token store and the queue/roster
+    readers, tests inject fakes.
     """
 
     def __init__(
@@ -237,8 +245,9 @@ class GoalEnrollValidator:
         self._clock = clock
         self._probe = probe
         #: Gate 6 seam: ``(alias) -> bool``, True when the alias's line token
-        #: already exists. Defaults to a real existence check against the
-        #: fleet's token template (the same one bus/tokens.py resolves).
+        #: is owned by the governed line. Defaults to a real ownership check
+        #: against the fleet's token template (the same one bus/tokens.py
+        #: resolves), realpath-canonicalized over the secrets boundary.
         self._alias_token_check = alias_token_check or _default_alias_token_check()
         #: Gate 7 seam: ``(alias) -> str | None``, the folder_id already
         #: claiming the alias (roster or pending queue), or None when free.
@@ -311,14 +320,21 @@ class GoalEnrollValidator:
                     f"{result.get('detail', 'unexecutable')}",
                 )
 
-        # Gate 6: the applicant's alias token must already exist. Only runs
-        # when an alias is supplied (the MCP tool always supplies one).
+        # Gate 6: the applicant's alias token must be *owned* by the governed
+        # line. Only runs when an alias is supplied (the MCP tool always
+        # supplies one). Ownership is a positive boundary over canonicalized
+        # paths: the token must be a regular file whose realpath is exactly
+        # `<secrets_root>/<alias>.token`, inside the secrets boundary, and
+        # must not resolve into the supervision plane, another line's token,
+        # or a symlink masquerade.
         if alias is not None and not self._alias_token_check(alias):
             raise GoalEnrollError(
                 CODE_ALIAS_TOKEN_MISSING,
-                f"alias token for {alias!r} does not exist "
+                f"alias token for {alias!r} is not owned by the governed line "
                 f"({_ALIAS_TOKEN_TEMPLATE.format(alias=alias)}); "
-                "enrollment refuses closed so the line never starts half-broken",
+                "the token must be the line's own regular file at the canonical "
+                "path, not a supervision-plane credential, another line's token, "
+                "or a symlink masquerade",
             )
 
         # Gate 7: the alias must not already be claimed by a roster line or a
@@ -347,19 +363,22 @@ class GoalEnrollValidator:
 
 
 def _default_alias_token_check() -> Any:
-    """Gate 6's production default: the alias's line token file exists.
+    """Gate 6's production default: the alias's token is *owned* by the line.
 
     Reuses the exact template bus/tokens.py resolves (``LINE_TOKEN_PATH_TEMPLATE``
     = ``/data/ronin/secrets/{alias}.token``) so the validator and the line's
     inbox/board credential agree on the same path -- and honours the
     ``FLEET_GRAPH_LINE_TOKEN_PATH`` env override (drills use it to point at a
-    scratch secrets dir). The check is *existence* only -- the token bytes
-    never leave the file.
+    scratch secrets dir). The check is **ownership**, not presence: the token
+    must be a regular file whose realpath is exactly the governed line's own
+    token path, inside the secrets boundary, resolving into neither the
+    supervision plane nor another line's token, and not a symlink masquerade.
+    The token bytes never leave the file.
     """
-    from fleet_graph.bus.tokens import resolve_line_token
+    from fleet_graph.bus.tokens import resolve_line_token_ownership
 
     def check(alias: str) -> bool:
-        return resolve_line_token(alias).present
+        return resolve_line_token_ownership(alias).owned
 
     return check
 
