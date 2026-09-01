@@ -86,6 +86,9 @@ def _research_run(args: argparse.Namespace) -> int:
         checkpoint=args.checkpoint,
         instance=args.instance,
         publisher=default_publisher(),
+        # R8 判据 ①：CLI 入口记录进程真实 argv（sys.argv），不是 canonical 重建值。
+        launch_argv=list(sys.argv),
+        launch_entry="cli",
     )
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
     sys.stdout.write("\n")

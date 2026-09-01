@@ -55,7 +55,14 @@ TIER_BOUNDS: dict[str, ResearchBounds] = {
         concurrency=2,
     ),
     TIER_HEAVY: ResearchBounds(
-        max_clues=24,
+        # R8：重档 clue 预算 24 -> 96（只调数值，不改 converge 判定语义/优先级）。
+        # 定值依据（真机实测 r-eb92da8f3974）：seed 一步扇出 17（concurrency=8），
+        # 原 24 预算被 seed 吃掉 17 后，第 1 波 collect 合计提出 ≥7 条子线索即
+        # total >= 24 触发触顶先行，重档结构性无法收敛。96 ≈ seed 上界 20 +
+        # 至少 8 波各 8-10 条子线索的余量，使「轮次预算 / 零增长 / 线索树耗尽」
+        # 三条正常收敛路径有机会先于 clue 触顶生效。max_depth / zero_growth_rounds
+        # / max_rounds / concurrency 一律不动。
+        max_clues=96,
         max_depth=10,
         zero_growth_rounds=3,
         max_rounds=48,
@@ -183,6 +190,8 @@ def run_research_ticket(
     clock: Any = None,
     checkpoint: str | None = None,
     instance: str | None = None,
+    launch_argv: list[str] | None = None,
+    launch_entry: str | None = None,
 ) -> dict[str, Any]:
     """三面共享的 research 入口：CLI / MCP tool / skill 全部落在这里。
 
@@ -192,16 +201,35 @@ def run_research_ticket(
     - 跑 ``run_research``（同一既有 runner + 12 个 dr-* 角色，无新 route）；
     - finalise 侧归位：终验 report 落 ``DeepThought/<topic>/``（wiki 域可检索）。
     返回 ``run_research`` 的 result，追加 ``tier`` 与 ``wiki`` 归位记录。
+
+    R8 判据 ① 记录**真实** argv：``launch_argv`` / ``launch_entry`` 由入口层传入
+    （CLI 传 ``sys.argv`` + ``cli``，MCP 传 tool 真实调用签名 + ``mcp``）；未给时
+    记录本入口的真实程序内调用签名（``in_process``）。绝不再用 canonical 重建值
+    冒充——落盘的就是「这次实际是怎么被发起的」。
     """
     resolved = resolve_tier(scale=scale, tier=tier)
     bounds = tier_bounds(resolved)
     run_root = Path(run_root) if run_root is not None else default_run_root(question)
-    # R8 判据 ①：唯一入口机械记录 CLI argv（落 run_root/launch.json）。三面
-    # （CLI/MCP/skill）都经本函数发起，这里记录即覆盖全部真实入口，不再是判据
-    # 脚本 fixture 或测试专属。
-    from fleet_graph.research_coldstart import canonical_launch_argv, record_launch_argv
+    # R8 判据 ①：唯一入口机械记录真实 argv（落 run_root/launch.json）。三面
+    # （CLI/MCP/skill）都经本函数发起，这里记录即覆盖全部真实入口。
+    from fleet_graph.research_coldstart import (
+        LAUNCH_ENTRY_IN_PROCESS,
+        in_process_launch_argv,
+        record_launch_argv,
+    )
 
-    record_launch_argv(run_root, canonical_launch_argv(question))
+    if launch_argv is None:
+        launch_argv = in_process_launch_argv(
+            question,
+            tier=resolved,
+            scale=scale,
+            run_root=str(run_root),
+            max_clues=max_clues,
+            concurrency=concurrency,
+            generation=generation,
+        )
+        launch_entry = launch_entry or LAUNCH_ENTRY_IN_PROCESS
+    record_launch_argv(run_root, launch_argv, entry=launch_entry or LAUNCH_ENTRY_IN_PROCESS)
     src = list(sources) if sources is not None else list(DEFAULT_SOURCES)
     config = ResearchConfig(
         question=question,

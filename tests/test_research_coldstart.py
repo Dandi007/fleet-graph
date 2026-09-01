@@ -29,13 +29,20 @@ from fleet_graph.research_coldstart import (
     COLDREAD_FAIL,
     COLDREAD_PASS,
     HISTORICAL_QUESTIONS,
+    LAUNCH_ENTRY_CLI,
+    LAUNCH_ENTRY_IN_PROCESS,
+    LAUNCH_ENTRY_MCP,
     canonical_launch_argv,
     cold_read_report,
+    in_process_launch_argv,
     judge_cold_read,
     judge_coldstart,
     judge_evidence_chain,
     judge_launch_command,
     judge_report_placed,
+    load_launch_entry,
+    load_launch_record,
+    mcp_launch_argv,
     record_launch_argv,
 )
 from fleet_graph.research_entry import DEEP_THOUGHT_DIR, topic_slug
@@ -139,6 +146,66 @@ class TestLaunchCommand:
         from fleet_graph.research_coldstart import load_launch_argv
 
         assert load_launch_argv(tmp_path) == ARGV
+
+
+class TestRealLaunchArgvRecording:
+    """R8 D2：判据 ① 记录**真实** argv + 显式入口种类，形状不符必须判红。
+
+    原实现落盘 canonical 重建值，判据① 恒绿、零鉴别力；现在三面入口各落真实
+    调用签名（CLI=sys.argv / MCP=tool 签名 / 程序内=真实调用签名），judge 只认
+    唯一 CLI 入口的一条命令形状。
+    """
+
+    def test_record_writes_entry_kind(self, tmp_path: Path) -> None:
+        record_launch_argv(tmp_path, ARGV, entry=LAUNCH_ENTRY_CLI)
+        record = load_launch_record(tmp_path)
+        assert record == {"entry": LAUNCH_ENTRY_CLI, "argv": list(ARGV)}
+        assert load_launch_entry(tmp_path) == LAUNCH_ENTRY_CLI
+
+    def test_in_process_signature_is_red_not_cli_shape(self) -> None:
+        # 程序内调用签名（含 run_research_ticket + 题目参数）不是 CLI 唯一入口形状。
+        sig = in_process_launch_argv(QUESTION, tier="heavy", run_root="/tmp/r")
+        assert sig[0] == "run_research_ticket"
+        ok, verdict = judge_launch_command(sig, QUESTION, entry=LAUNCH_ENTRY_IN_PROCESS)
+        assert ok is False
+        assert verdict["exact"] is False
+        assert verdict["entry"] == LAUNCH_ENTRY_IN_PROCESS
+
+    def test_mcp_signature_is_red_not_cli_shape(self) -> None:
+        sig = mcp_launch_argv(QUESTION, tier="heavy")
+        assert sig[0] == "research_run"
+        ok, verdict = judge_launch_command(sig, QUESTION, entry=LAUNCH_ENTRY_MCP)
+        assert ok is False
+        assert verdict["exact"] is False
+
+    def test_cli_entry_with_extra_flag_is_red(self) -> None:
+        # 一条命令之上多了 flag = 形状不符（题目相关注入/多参数）必须判红。
+        real_argv = ["fleet-graph", "research", "run", "--question", QUESTION, "--tier", "heavy"]
+        ok, verdict = judge_launch_command(real_argv, QUESTION, entry=LAUNCH_ENTRY_CLI)
+        assert ok is False
+        assert verdict["exact"] is False
+
+    def test_programmatic_ticket_records_in_process_signature(self, tmp_path: Path) -> None:
+        # 程序内直接调 run_research_ticket（不传 launch_argv）-> 落 in_process 真实签名。
+        from fleet_graph.research_entry import run_research_ticket
+        from test_research_entry import FakeLauncher, FakeTextNode
+
+        run_root = tmp_path / "run"
+        run_research_ticket(
+            "R8 冷启动：程序内调用记录真实签名",
+            tier="light",
+            run_root=run_root,
+            text_node=FakeTextNode(seed_text='["单一线索"]'),
+            launcher=FakeLauncher(),
+        )
+        record = load_launch_record(run_root)
+        assert record is not None
+        assert record["entry"] == LAUNCH_ENTRY_IN_PROCESS
+        assert record["argv"][0] == "run_research_ticket"
+        assert "question=R8 冷启动：程序内调用记录真实签名" in record["argv"]
+        # 判据 ① 只认 CLI 形状：程序内真实签名判红（不再是重建 canonical 恒绿）。
+        _, verdict = judge_coldstart(run_root, "R8 冷启动：程序内调用记录真实签名")
+        assert verdict["launch_command"]["pass"] is False
 
 
 class TestEvidenceChain:

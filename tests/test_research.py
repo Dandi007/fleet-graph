@@ -26,6 +26,7 @@ from fleet_graph.graphs.research_pipeline import (
     CLUE_BLOCKED,
     CLUE_DONE,
     CLUE_OPEN,
+    CONVERGE_CONTINUE,
     DEFAULT_SOURCE,
     JUDGE_ROLE,
     OPPONENT_ROLE,
@@ -297,6 +298,62 @@ class TestRunInstanceIsolation:
         assert inst != derive_run_instance(tmp_path / "run-other")
         # 稳定非随机：同一 run_root 恒同（kill-restart 不漂移）。
         assert ResearchConfig(question="q", run_root=tmp_path / "run").run_instance == inst
+
+
+class TestHeavyBudgetRegression:
+    """R8：重档 clue 预算可达性（24 -> 96）的回归测试。
+
+    阳性钉住「seed 扇出 17 + 两波各 8 条子线索（total=33）在重档 bounds 下
+    不得 capped，应为 continue」；阴性（变异枪）把 max_clues 改回 24 跑同一
+    fixture 必须转红——证明测试钉住的是预算而非别的；守护用例证明触顶语义未改。
+    """
+
+    def _seed_fanout_state(self) -> dict[str, Any]:
+        """seed 产出 17 条 clue（done），随后两波各新增 8 条子线索（open, depth 1）。"""
+        clues: list[dict[str, Any]] = [
+            {"id": f"c{i}", "status": CLUE_DONE, "depth": 0, "retry": 0} for i in range(17)
+        ]
+        for base in (17, 25):
+            for j in range(8):
+                clues.append({"id": f"c{base + j}", "status": CLUE_OPEN, "depth": 1, "retry": 0})
+        return {"clues": clues, "rounds": 2, "coverage": 17, "zero_growth_rounds": 0}
+
+    def test_heavy_budget_absorbs_seed_fanout_positive(self) -> None:
+        from fleet_graph.research_entry import TIER_BOUNDS, TIER_HEAVY
+
+        # 阳性：33 条 clue 在重档 bounds 下不触顶，正常继续。若 max_clues 被改回
+        # 24，total=33 >= 24 即触发触顶先行 -> 本用例转红。
+        assert converge(self._seed_fanout_state(), TIER_BOUNDS[TIER_HEAVY]) == CONVERGE_CONTINUE
+
+    def test_mutation_gun_reverting_to_24_turns_red(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fleet_graph import research_entry
+
+        # 变异枪：把重档 max_clues 临时 monkeypatch 回 24 跑同一 fixture，该用例必须
+        # 转红（capped）——证明测试钉住的是预算而不是别的（24 < 33 时唯一变化的就是
+        # 触顶判定）。
+        reverted = ResearchBounds(
+            max_clues=24,
+            max_depth=research_entry.TIER_BOUNDS[research_entry.TIER_HEAVY].max_depth,
+            zero_growth_rounds=research_entry.TIER_BOUNDS[
+                research_entry.TIER_HEAVY
+            ].zero_growth_rounds,
+            max_rounds=research_entry.TIER_BOUNDS[research_entry.TIER_HEAVY].max_rounds,
+            concurrency=research_entry.TIER_BOUNDS[research_entry.TIER_HEAVY].concurrency,
+        )
+        monkeypatch.setitem(research_entry.TIER_BOUNDS, research_entry.TIER_HEAVY, reverted)
+        mutated = research_entry.TIER_BOUNDS[research_entry.TIER_HEAVY]
+        assert converge(self._seed_fanout_state(), mutated) == TERMINAL_CAPPED
+
+    def test_max_clues_cap_semantics_kept(self) -> None:
+        from fleet_graph.research_entry import TIER_BOUNDS, TIER_HEAVY
+
+        # 守护：total >= max_clues 时仍必须 capped（本单没有把触顶语义改坏）。
+        clues = [
+            {"id": f"c{i}", "status": CLUE_OPEN, "depth": 0, "retry": 0}
+            for i in range(TIER_BOUNDS[TIER_HEAVY].max_clues)
+        ]
+        state = {"clues": clues, "rounds": 0, "coverage": 0, "zero_growth_rounds": 0}
+        assert converge(state, TIER_BOUNDS[TIER_HEAVY]) == TERMINAL_CAPPED
 
 
 class TestConvergeIsPure:
