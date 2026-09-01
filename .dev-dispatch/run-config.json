@@ -1,0 +1,26 @@
+{
+ "development_id": "dev-fg-476316c7746c",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_research.py",
+   "tests/test_research_entry.py",
+   "tests/test_research_coldstart.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
