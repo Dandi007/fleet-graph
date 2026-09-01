@@ -1,0 +1,26 @@
+{
+ "development_id": "dev-fg-b65bfb6effae",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_work_report.py",
+   "tests/test_work_report_conformance.py",
+   "tests/test_goal_line.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
