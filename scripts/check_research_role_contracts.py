@@ -21,6 +21,10 @@
    （矩阵全覆盖，不只查本次 run 实际路由到的那个 worker 角色）；
 4. 自检阴性：把 arbiter payload 的 ``clue_titles`` 退回字符串数组 / 把
    ``board_stats`` 退回旧键，必须判红。
+5. R8-fix 续（缺字段形状）：可选字段值为 None 时必须整键省略（不发 null）。
+   用与图相同的构造函数从「缺 depth / 缺 status / evidence 缺 clue_id」fixture
+   产出 payload，必须通过真 schema（阳性）；旧形状带 ``depth: null`` 等必须判红
+   （阴性）。
 
 roles 仓定位：优先 ``--roles-root`` CLI 参数，其次 ``FLEET_GRAPH_ROLES_ROOT`` 环境
 变量，最后缺省从 ``DEFAULT_AGENT_RUN_BIN``（agent-runtime-current）推导
@@ -49,9 +53,13 @@ from fleet_graph.executors.agent_run import (
 from fleet_graph.graphs.research_pipeline import (
     ADVOCATE_ROLE,
     ARBITER_ROLE,
+    CLUE_DONE,
     JUDGE_ROLE,
     OPPONENT_ROLE,
     SOURCE_ROLE,
+    _arbiter_clue_title,
+    _arbiter_recent_claim,
+    _debater_evidence,
 )
 from fleet_graph.graphs.research_runner import ResearchConfig, run_research
 
@@ -252,11 +260,74 @@ def self_check(roles_root: Path) -> tuple[bool, dict[str, Any]]:
     }
     negatives["negative_board_stats_old_keys_red"] = not validate_payload(schema, bad_stats)[0]
 
+    # 4. R8-fix 续：可选字段值为 None 时整键省略（不发 null）——「缺字段」这一形状。
+    #    阳性：构造缺 depth（且另造一个缺 status、一个 evidence 缺 clue_id）的输入，
+    #    用与图相同的构造函数（_arbiter_clue_title / _arbiter_recent_claim /
+    #    _debater_evidence）产出 payload，必须通过真 schema（那些键被正确省略）。
+    positives: dict[str, bool] = {}
+
+    missing_depth = _arbiter_clue_title({"id": "c1", "status": CLUE_DONE}, "无 depth 的线索")
+    positives["positive_missing_depth_key_omitted"] = "depth" not in missing_depth
+    missing_status = _arbiter_clue_title({"id": "c2", "depth": 1}, "无 status 的线索")
+    positives["positive_missing_status_key_omitted"] = "status" not in missing_status
+    missing_clue = _arbiter_recent_claim({"claim": "无 clue_id 的主张"})
+    positives["positive_missing_clue_id_key_omitted"] = "clue_id" not in missing_clue
+
+    # 把缺字段形状组装成合法 arbiter payload，用真 schema 校验必须全绿。
+    board_stats_full = {
+        "clues_total": 2,
+        "clues_explored": 2,
+        "clues_pending": 0,
+        "clues_dropped": 0,
+        "evidence_total": 1,
+        "zero_growth_rounds": 0,
+        "rounds_elapsed": 1,
+    }
+    missing_ok = {
+        "question": "缺字段判据",
+        "board_stats": board_stats_full,
+        "clue_titles": [missing_depth, missing_status],
+        "recent_claims": [missing_clue],
+    }
+    positives["positive_missing_fields_payload_green"] = validate_payload(schema, missing_ok)[0]
+
+    # 同一形状对 debater-input 的 evidences 也成立：evidence 缺 clue_id 必须通过真 schema。
+    debater_schema, _ = load_input_schema(roles_root, ADVOCATE_ROLE)
+    evidence_missing_clue = _debater_evidence({}, {"source": "wiki", "locator": "f.md:1"})
+    positives["positive_evidence_missing_clue_id_key_omitted"] = (
+        "clue_id" not in evidence_missing_clue
+    )
+    debater_ok = {
+        "question": "缺字段判据",
+        "evidences": [
+            {
+                "anchor": "wiki@f.md:1",
+                "quote": "q",
+                "claim": "c",
+            },
+            evidence_missing_clue,
+        ],
+    }
+    positives["positive_debater_missing_clue_id_green"] = validate_payload(
+        debater_schema, debater_ok
+    )[0]
+
+    #    阴性：旧形状带 depth:null（/ status:null / clue_id:null）必须判红。
+    bad_null = dict(missing_ok)
+    bad_null["clue_titles"] = [
+        {"clue_id": "c1", "title": "旧形状", "status": "done", "depth": None},
+    ]
+    bad_null["recent_claims"] = [{"claim": "旧形状", "clue_id": None}]
+    negatives["negative_null_depth_red"] = not validate_payload(schema, bad_null)[0]
+
+    results["positives"] = positives
     results["negatives"] = negatives
+    positives_green = all(positives.values())
     negatives_red = all(negatives.values())
 
-    passed = all_roles_green and negatives_red
+    passed = all_roles_green and positives_green and negatives_red
     results["all_roles_green"] = all_roles_green
+    results["positives_green"] = positives_green
     results["negatives_red"] = negatives_red
     results["pass"] = passed
     return passed, results
