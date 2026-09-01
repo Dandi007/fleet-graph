@@ -1,0 +1,11 @@
+{
+ "development_id": "dev-fg-a2edb3dec7c2",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "agent:cc-supervisor（用户 2026-08-20 全权授权，full-auto 代拍）",
+ "decision_message_id": "msg_01M1F29QQVBRQ1AQBD17JFSV8T",
+ "question_note_id": "msg_01M1F1HCR2AHZBRW77M5R8BAHZ",
+ "card_entity_id": "msg_01M1EP7QAWNGCCEN3CHP2Z3BNA",
+ "output_commit": "8f0d4e0d96d465799702e9dd069819acd660a36b"
+}
