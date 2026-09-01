@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import traceback
 from collections.abc import Callable
@@ -55,6 +56,7 @@ HEARTBEAT_FIELDS = frozenset(
         "started_at",
         "phase_started_at",
         "updated_at",
+        "last_tick_at",
         "log_path",
         "release_id",
     }
@@ -178,7 +180,17 @@ class RunArtifacts:
         self._hb_phase: str | None = None
         self._hb_phase_started_at = self.started_at
         self._hb_last_write = 0.0
+        self._hb_last_tick_at: float | None = None
         self._hb_warned = False
+
+        #: Guard for heartbeat.json writes: the periodic ticker thread and the
+        #: graph's phase-boundary writes share this one lock so a tick never
+        #: races or tears a write the graph is making (and vice versa).
+        self._hb_lock = threading.Lock()
+        #: The daemon periodic ticker (in-phase heartbeat refresh). Started
+        #: when the line process boots, stopped at terminal/shutdown.
+        self._ticker_stop: threading.Event | None = None
+        self._ticker_thread: threading.Thread | None = None
 
         self.run_root.mkdir(parents=True, exist_ok=True)
 
@@ -189,29 +201,56 @@ class RunArtifacts:
 
         Returns whether a write happened. `updated_at` must advance on every
         write: it is the only thing standing between a SIGKILLed pump and
-        looking alive forever.
+        looking alive forever. `last_tick_at` is the periodic ticker's mark,
+        advanced only by ``tick()`` -- a phase-boundary write never moves it,
+        so monitoring can tell a phase write from an in-phase tick.
         """
         if phase not in VALID_PHASES:
             raise ValueError(f"phase must be one of {sorted(VALID_PHASES)}, got {phase!r}")
 
-        now = self._clock()
-        changed = round_no != self._hb_round or phase != self._hb_phase
-        if changed:
-            self._hb_phase_started_at = now
-        elif not force and now - self._hb_last_write < HEARTBEAT_INTERVAL_SECONDS:
-            return False
+        with self._hb_lock:
+            now = self._clock()
+            changed = round_no != self._hb_round or phase != self._hb_phase
+            if changed:
+                self._hb_phase_started_at = now
+            elif not force and now - self._hb_last_write < HEARTBEAT_INTERVAL_SECONDS:
+                return False
 
-        self._hb_round = round_no
-        self._hb_phase = phase
+            self._hb_round = round_no
+            self._hb_phase = phase
+            last_tick = self._hb_last_tick_at if self._hb_last_tick_at is not None else now
+            return self._write_heartbeat(now, last_tick=last_tick)
+
+    def tick(self) -> bool:
+        """One periodic in-phase heartbeat refresh (the A-类 fix).
+
+        A no-op until a phase is decided (the first phase-boundary write has
+        happened): before that there is nothing to refresh. Once set, re-writes
+        the current round/phase with force so `updated_at` and the file mtime
+        keep advancing through a long worker/coordinator turn instead of
+        freezing at the phase boundary. `phase_started_at` is never touched --
+        a tick is not a phase change. Fail-soft exactly like every heartbeat
+        write (OSError -> one warning, never raise, never block the caller).
+        """
+        with self._hb_lock:
+            if self._hb_phase is None:
+                return False
+            now = self._clock()
+            self._hb_last_tick_at = now
+            return self._write_heartbeat(now, last_tick=now)
+
+    def _write_heartbeat(self, now: float, *, last_tick: float) -> bool:
+        """Write the heartbeat payload for ``now``. Caller holds ``_hb_lock``."""
         payload = {
             "run_id": self.run_id,
             "folder_id": self.folder_id,
-            "round": round_no,
-            "phase": phase,
+            "round": self._hb_round,
+            "phase": self._hb_phase,
             "pid": self._pid,
             "started_at": iso(self.started_at),
             "phase_started_at": iso(self._hb_phase_started_at),
             "updated_at": iso(now),
+            "last_tick_at": iso(last_tick),
             "log_path": self.log_path,
             "release_id": self.release_id,
         }
@@ -228,6 +267,51 @@ class RunArtifacts:
                 log.warning("heartbeat write failed (not blocking the loop): %s", exc)
                 self._hb_warned = True
             return False
+
+    # --- in-phase periodic ticker -----------------------------------------
+
+    def start_ticker(self) -> None:
+        """Start the daemon periodic heartbeat ticker (idempotent).
+
+        Launched when the line process boots. The daemon re-writes the
+        heartbeat every ``HEARTBEAT_INTERVAL_SECONDS`` once a phase is set, so
+        the file mtime keeps moving through a long turn. A real stop (process
+        death / hang) kills the daemon with the process, so mtime freezes and
+        ``PumpHeartbeatStale`` still fires -- the negative semantics the fix
+        must preserve.
+        """
+        if self._ticker_thread is not None and self._ticker_thread.is_alive():
+            return
+        stop = threading.Event()
+        self._ticker_stop = stop
+        thread = threading.Thread(
+            target=self._ticker_loop,
+            name=f"heartbeat-tick-{self.folder_id}",
+            daemon=True,
+        )
+        self._ticker_thread = thread
+        thread.start()
+
+    def stop_ticker(self) -> None:
+        """Stop the ticker and wait for it to exit (idempotent)."""
+        stop = self._ticker_stop
+        if stop is not None:
+            stop.set()
+        thread = self._ticker_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=HEARTBEAT_INTERVAL_SECONDS * 2 + 1)
+        self._ticker_thread = None
+        self._ticker_stop = None
+
+    def _ticker_loop(self) -> None:
+        stop = self._ticker_stop
+        while not stop.wait(HEARTBEAT_INTERVAL_SECONDS):
+            try:
+                self.tick()
+            except Exception:
+                # fail-soft: a tick failure must never kill the daemon nor the
+                # line; log once per occurrence and keep the cadence going.
+                log.warning("heartbeat tick failed (not blocking the loop)", exc_info=True)
 
     # --- rounds ----------------------------------------------------------
 

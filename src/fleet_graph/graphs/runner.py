@@ -459,6 +459,12 @@ def run_line(config: LineConfig, *, run_id: str | None = None) -> dict[str, Any]
         "recursion_limit": config.max_rounds * 8 + 20,
     }
 
+    # The in-phase periodic heartbeat ticker (A-类 fix): once a phase is set it
+    # keeps heartbeat.json's mtime moving through long turns, so fleet-sentinel
+    # does not false-alarm PumpHeartbeatStale on a live line. Started here with
+    # the line and stopped in the same finally as the metric flush -- terminal
+    # or fault alike.
+    deps.artifacts.start_ticker()
     try:
         with SqliteSaver.from_conn_string(config.resolved_checkpoint_path) as saver:
             compiled = graph.compile(checkpointer=saver)
@@ -472,6 +478,7 @@ def run_line(config: LineConfig, *, run_id: str | None = None) -> dict[str, Any]
         deps.artifacts.write_fault_terminal(exception=exc)
         raise
     finally:
+        deps.artifacts.stop_ticker()
         # D3 effect side: render the protocol counters recorded during the run
         # (including those recorded before a fault) to the line's textfile, so
         # they reach the node_exporter scrape path instead of dying with the
@@ -505,6 +512,7 @@ def resume_goal_line(config: LineConfig, decision: DecisionInput) -> tuple[dict[
             "configurable": {"thread_id": config.thread_id},
             "recursion_limit": config.max_rounds * 8 + 20,
         }
+        deps.artifacts.start_ticker()
         with SqliteSaver.from_conn_string(config.resolved_checkpoint_path) as saver:
             compiled = graph.compile(checkpointer=saver)
             return resume_line(compiled, config=invoke_config, decision=decision, store=store)
@@ -513,6 +521,7 @@ def resume_goal_line(config: LineConfig, decision: DecisionInput) -> tuple[dict[
         # resumed rounds to the line's textfile, exactly as run_line does for
         # a fresh launch. Only when the line was actually built.
         if deps is not None:
+            deps.artifacts.stop_ticker()
             _flush_line_metrics(deps)
         store.close()
 

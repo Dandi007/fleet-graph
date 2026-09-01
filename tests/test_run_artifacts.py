@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -288,6 +289,7 @@ class TestEquivalenceWithTheRealPump:
             "log_path",
             "goal_revision",
             "release_id",
+            "last_tick_at",
         }
     )
 
@@ -461,3 +463,93 @@ class TestAcceptancePhaseHeartbeat:
     def test_acceptance_is_a_valid_heartbeat_phase(self, tmp_path):
         artifacts = RunArtifacts(tmp_path, run_id="r", folder_id="wf-x")
         assert artifacts.heartbeat(1, "acceptance", force=True)
+
+
+class TestHeartbeatPeriodicTick:
+    """A-类 fix: phase 内周期 tick 持续推进 updated_at / last_tick_at。
+
+    The heartbeat.json mtime must keep moving through a long worker turn so
+    fleet-sentinel stops false-alarming PumpHeartbeatStale on a live line --
+    while `phase_started_at` stays put (a tick is not a phase change) and a
+    tick never writes before a phase is decided.
+    """
+
+    def test_last_tick_at_is_in_the_exact_field_set(self, artifacts: RunArtifacts) -> None:
+        assert "last_tick_at" in HEARTBEAT_FIELDS
+        artifacts.heartbeat(1, "coordinator")
+        assert set(read_json(artifacts.heartbeat_path)) == HEARTBEAT_FIELDS
+
+    def test_tick_advances_last_tick_at_and_updated_at(
+        self, artifacts: RunArtifacts, clock: FakeClock
+    ) -> None:
+        """Within a phase, a tick pushes updated_at and last_tick_at forward."""
+        artifacts.heartbeat(1, "worker")
+        before = read_json(artifacts.heartbeat_path)
+        clock.advance(HEARTBEAT_INTERVAL_SECONDS + 1)
+        assert artifacts.tick() is True
+        after = read_json(artifacts.heartbeat_path)
+        assert after["updated_at"] != before["updated_at"]
+        assert after["last_tick_at"] != before["last_tick_at"]
+
+    def test_tick_does_not_reset_phase_started_at(
+        self, artifacts: RunArtifacts, clock: FakeClock
+    ) -> None:
+        """A tick is not a phase change: phase_started_at stays frozen."""
+        artifacts.heartbeat(1, "worker")
+        before = read_json(artifacts.heartbeat_path)["phase_started_at"]
+        clock.advance(HEARTBEAT_INTERVAL_SECONDS + 1)
+        artifacts.tick()
+        after = read_json(artifacts.heartbeat_path)["phase_started_at"]
+        assert after == before
+
+    def test_tick_before_a_phase_is_decided_does_not_write(
+        self, tmp_path: Path, clock: FakeClock
+    ) -> None:
+        """The very first tick on a fresh run root has no phase to refresh: it
+        must not fabricate a heartbeat with no round/phase."""
+        artifacts = RunArtifacts(tmp_path / "run", run_id="run-1", folder_id="wf-x", clock=clock)
+        clock.advance(HEARTBEAT_INTERVAL_SECONDS + 1)
+        assert artifacts.tick() is False
+        assert not artifacts.heartbeat_path.exists()
+
+    def test_tick_write_failure_is_fail_soft(
+        self, artifacts: RunArtifacts, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A full disk degrades the tick to nothing; it must not raise, and a
+        line mid-worker-turn must not crash because its heartbeat could not be
+        refreshed."""
+
+        def boom(*_args, **_kwargs):
+            raise OSError("disk full")
+
+        artifacts.heartbeat(1, "coordinator")
+        monkeypatch.setattr(Path, "open", boom)
+        assert artifacts.tick() is False
+
+    def test_start_and_stop_ticker(self, tmp_path: Path) -> None:
+        """The daemon starts and stops cleanly, and stop is idempotent."""
+        artifacts = RunArtifacts(tmp_path / "run", run_id="run-1", folder_id="wf-x")
+        artifacts.start_ticker()
+        thread = artifacts._ticker_thread
+        assert thread is not None and thread.is_alive()
+        artifacts.stop_ticker()
+        artifacts.stop_ticker()  # idempotent
+        assert not thread.is_alive()
+        assert artifacts._ticker_thread is None
+
+    def test_ticker_daemon_writes_during_a_long_phase(self, tmp_path: Path) -> None:
+        """End-to-end: once a phase is set, the daemon refreshes heartbeat.json
+        within a bounded window (proves the wiring the graph relies on)."""
+        artifacts = RunArtifacts(tmp_path / "run", run_id="run-1", folder_id="wf-x")
+        artifacts.heartbeat(1, "worker")
+        first_mtime = artifacts.heartbeat_path.stat().st_mtime_ns
+        artifacts.start_ticker()
+        try:
+            deadline = time.monotonic() + HEARTBEAT_INTERVAL_SECONDS * 3
+            while time.monotonic() < deadline:
+                if artifacts.heartbeat_path.stat().st_mtime_ns > first_mtime:
+                    return
+                time.sleep(0.05)
+            pytest.fail("ticker daemon did not refresh heartbeat.json in time")
+        finally:
+            artifacts.stop_ticker()
