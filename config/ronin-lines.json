@@ -173,6 +173,22 @@
       "max_rounds": 9999,
       "enabled": true,
       "_provenance": "2026-08-31 第十波（用户令「把所有入口进行一个整体统一，然后 goal-driven 来自举这个工作」）。舰队入口整体统一线：U1 goal MCP 独立面切分（:5611，dd 面回纯 dev-dispatch）→ U2 入册流水线（提交→pending queue→/v1/enrollments→E8→挂板，放行权留监督面）→ U3 入口总表 → U4 自举 e2e（本线为统一入口第一个 dogfood 用户）。设计原则（用户拍板）：统一的是提交不是点火；goal MCP 不寄居 dd 面。spec 随卷（goal-mcp-surface-split / goal-enroll-pipeline，源 wf-216dc3 15:17 挂单）。座位选 opencode-gpt-sol：dsv4pro 集中度 11/12 不再加，terra 留 memory-mcp 线，sol 第二线兼供网关熵实测样本。"
+    },
+    {
+      "folder_id": "wf-a6cfea",
+      "seat": "opencode-dsv4pro",
+      "max_rounds": 9999,
+      "alias": "ronin-a6cfea",
+      "enabled": true,
+      "_provenance": "2026-09-01 第十一波入编（用户令『两条都入编，别 hold』）：lexicon —— agent 输出文本可读性治理线。经 goal-mcp 提交入册（U2 流水线），gate 1-6 全过、lint_warnings 空、alias token 就位。入编时 M1 三条机读验收全红且判据脚本 scripts/verify-m1.sh 尚不存在——判据全红是 goal 线的正常起点，不构成 hold 理由；但本线首轮须把 verify-m1.sh 补成『存在且诚实报红』的形态（对标 wf-e6560a 的 acceptance.sh），并用退出码说话。goal/design SSoT：wf-a6cfea。"
+    },
+    {
+      "folder_id": "wf-e6560a",
+      "seat": "opencode-dsv4pro",
+      "max_rounds": 9999,
+      "alias": "ronin-e6560a",
+      "enabled": true,
+      "_provenance": "2026-09-01 第十一波入编（用户令『两条都入编，别 hold』）：agent-session-mcp —— Claude Code 会话检索 MCP。M1 由 dd 单 dev-fg-67bf15e27dd2 实现中，本线接手 M2/M3。入编时 scripts/acceptance.sh 存在且诚实报红（M2/M3 未实现，逐条打印 FAIL）——这是判据存在的正确形态。遗留待修：该脚本打印 ACCEPTANCE: FAIL 却 exit 0，验收必须用退出码说话，本线首轮修。goal SSoT：wf-e6560a。"
     }
   ],
   "line_environment": {
