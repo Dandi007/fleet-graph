@@ -40,6 +40,13 @@ DD_EXCLUDED_PATHS = (".dev-dispatch", ".dd-evidence")
 #: 洗树重提交的 commit message。
 DD_WASH_COMMIT_MESSAGE = "harvest: exclude dd protocol subtrees from product tree"
 
+#: 目标仓 verify 指令解析（交付 A.1）：根目录 Makefile 含 `verify` 目标 -> make verify。
+MAKE_VERIFY_ARGV = ["make", "verify"]
+#: 无 Makefile 但由 uv 管理的仓（pyproject.toml / uv.lock）-> repo-canonical 全量套件。
+UV_PYTEST_ARGV = ["uv", "run", "pytest", "-q"]
+#: 解析不到可执行 verify 指令时的机器可读 detail（交付 A.2）。
+NO_RESOLVABLE_VERIFY = "no resolvable verify command"
+
 
 def _run(argv: list[str], cwd: Path | None = None) -> dict[str, Any]:
     """执行一条机械命令并返回 {ok, exit_code, stdout_tail, stderr_tail}。"""
@@ -223,6 +230,52 @@ def _resolve_canonical_repo(
                     return entry, ""
 
     return None, f"record repo_path {record_repo_path!r} 无法解析到任何白名单 canonical 仓"
+
+
+def _makefile_has_verify_target(worktree: Path) -> bool:
+    """机械判定：目标仓根目录 `Makefile` 是否声明 `verify` 目标。
+
+    只读文件，绝不执行 make。目标声明形如 `verify:` / `verify: deps` /
+    `verify::`（首列目标，允许 `: ` 前有空白）；`.PHONY: verify` 也算声明。
+    `verify = <value>` 变量赋值不算目标。
+    """
+    makefile = worktree / "Makefile"
+    if not makefile.is_file():
+        return False
+    try:
+        text = makefile.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    for raw in text.splitlines():
+        line = raw.lstrip()
+        if line.startswith("verify"):
+            rest = line[len("verify") :].lstrip()
+            if rest.startswith(":"):
+                return True
+        if line.startswith(".PHONY:"):
+            rest = line[len(".PHONY:") :]
+            if "verify" in rest.split():
+                return True
+    return False
+
+
+def _resolve_verify_argv(worktree: Path) -> tuple[list[str] | None, str]:
+    """按目标仓自身声明解析 verify 指令（交付 A.1 机械口）。
+
+    优先目标仓自身声明：
+    1. 根目录 `Makefile` 含 `verify` 目标 -> `["make","verify"]`；
+    2. 无 Makefile 但存在 `pyproject.toml` / `uv.lock` -> repo-canonical 全量套件
+       `["uv","run","pytest","-q"]`（如 fleet-sentinel：pyproject.toml + uv.lock +
+       tests/，其全量套件不是 make）；
+    3. 解析不到可执行 verify 指令 -> `(None, "no resolvable verify command")`。
+
+    纯机械读口（只读目标仓根目录文件，绝不执行任何命令）；测试注入 fake。
+    """
+    if _makefile_has_verify_target(worktree):
+        return list(MAKE_VERIFY_ARGV), ""
+    if (worktree / "pyproject.toml").is_file() or (worktree / "uv.lock").is_file():
+        return list(UV_PYTEST_ARGV), ""
+    return None, NO_RESOLVABLE_VERIFY
 
 
 class DefaultHarvestOps:
@@ -444,6 +497,15 @@ class DefaultHarvestOps:
 
     def run_verify(self, worktree: Path, argv: list[str]) -> int:
         return int(_run(list(argv), cwd=worktree).get("exit_code") or 0)
+
+    def resolve_verify_argv(self, worktree: Path) -> tuple[list[str] | None, str]:
+        """目标仓 verify 指令解析（交付 A.1 机械口，测试注入 fake）。
+
+        见模块级 `_resolve_verify_argv`：优先目标仓自身声明（Makefile 含 verify
+        目标 / pyproject.toml / uv.lock），解析不到 -> `(None, "no resolvable
+        verify command")`。纯读口，绝不执行任何命令。
+        """
+        return _resolve_verify_argv(worktree)
 
     def board_card_entity_id(self, development_id: str, dd_root: Path) -> str | None:
         """dd 准入 record 的 goal-line board card 实体 id；空/null/缺失/坏档 -> None。
@@ -796,5 +858,8 @@ __all__ = [
     "EXIT_HEAD_MISMATCH",
     "EXIT_NOT_FOUND",
     "EXIT_TIMEOUT",
+    "MAKE_VERIFY_ARGV",
+    "NO_RESOLVABLE_VERIFY",
+    "UV_PYTEST_ARGV",
     "DefaultHarvestOps",
 ]
