@@ -19,6 +19,9 @@ dd status / decision-bridge 的 bridge.sqlite3，以及可选的 agent-bus
 - 机械事实只读：``heartbeat_age_s`` = 现在 - heartbeat.json 的 ``updated_at``；
   ``parked`` = ``waiting_on == "decision"``（见 ``normalize_waiting_on``）；
   ``wake_facts`` 至少含 ``waiting_on`` 等机械事实。
+- ``release_id`` 只消费 heartbeat.json 已持久化的值（line 进程启动时冻结），
+  read 路径**绝不**重新 realpath 部署 ``current`` 符号链接——那是进程 exec 时
+  解析一次的机械事实，不是链接当下指向。
 
 HTTP 用标准库 ``ThreadingHTTPServer`` 实现，不引入新的依赖。
 """
@@ -393,6 +396,12 @@ class FleetStateView:
                     "terminal": terminal.get("terminal") if terminal else None,
                     "parked": waiting_on == "decision",
                     "wake_facts": wake_facts,
+                    # The release this generation actually runs, frozen by the
+                    # line process at startup. The read model only consumes the
+                    # persisted heartbeat value -- it never re-resolves the
+                    # deploy `current` symlink (that would report what the
+                    # symlink points at *now*, not what the process exec'd).
+                    "release_id": heartbeat.get("release_id") if heartbeat else None,
                 }
             )
         return {"schema_version": SCHEMA_VERSION, "lines": line_objs}

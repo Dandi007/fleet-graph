@@ -56,6 +56,7 @@ HEARTBEAT_FIELDS = frozenset(
         "phase_started_at",
         "updated_at",
         "log_path",
+        "release_id",
     }
 )
 
@@ -89,6 +90,13 @@ WAITING_ON_DEFAULT = "none"
 #: operator to know a parallel path by heart.
 LOG_ROOT = Path("/data/fleet-graph/logs")
 
+#: The deploy root's `current` symlink that every line unit execs through
+#: (`/data/apps/fleet-graph/current/.venv/bin/fleet-graph`). The process
+#: resolves the symlink once at exec and never re-resolves it, so the release
+#: this generation actually runs is frozen at startup -- never what the
+#: symlink happens to point at later.
+RELEASE_CURRENT_PATH = Path("/data/apps/fleet-graph/current")
+
 #: The fault terminal keeps a traceback summary for a human, not forever: a
 #: single badly-behaved agent can produce a multi-megabyte exception. The first
 #: frames and the message are the useful part.
@@ -116,6 +124,25 @@ def iso(ts: float) -> str:
     return time.strftime(ISO_FORMAT, time.gmtime(ts))
 
 
+def capture_release_id(path: str | Path = RELEASE_CURRENT_PATH) -> str | None:
+    """The release_id this generation actually runs, frozen at startup.
+
+    The line unit execs through ``/data/apps/fleet-graph/current/.venv/bin/
+    fleet-graph``, and the process resolves that symlink exactly once at exec.
+    This mirrors that freeze: read the symlink target's basename once and
+    return it as the release_id. Missing/unreadable/unresolvable -> ``None``
+    (fail-soft: a line that cannot name its release still runs; only the
+    observable field goes null). The read model must never call this -- it
+    only consumes the persisted value.
+    """
+    try:
+        resolved = Path(path).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    basename = resolved.name
+    return basename or None
+
+
 class RunArtifacts:
     def __init__(
         self,
@@ -127,6 +154,7 @@ class RunArtifacts:
         clock: Callable[[], float] = time.time,
         pid: int | None = None,
         log_path: str | Path | None = None,
+        release_id: str | None = None,
     ) -> None:
         self.run_root = Path(run_root)
         self.run_id = run_id
@@ -137,6 +165,10 @@ class RunArtifacts:
         self.log_path = (
             str(log_path) if log_path is not None else str(LOG_ROOT / f"{folder_id}.log")
         )
+        #: Frozen once at construction (line process start). The caller passes
+        #: the startup-captured value; it is never re-resolved here, so a
+        #: re-pointed `current` symlink mid-generation leaves this unchanged.
+        self.release_id = release_id
 
         self._rounds_path = self.run_root / "rounds.jsonl"
         self._heartbeat_path = self.run_root / "heartbeat.json"
@@ -181,6 +213,7 @@ class RunArtifacts:
             "phase_started_at": iso(self._hb_phase_started_at),
             "updated_at": iso(now),
             "log_path": self.log_path,
+            "release_id": self.release_id,
         }
         try:
             with self._heartbeat_path.open("w", encoding="utf-8") as handle:
@@ -363,10 +396,12 @@ __all__ = [
     "HEARTBEAT_FIELDS",
     "HEARTBEAT_INTERVAL_SECONDS",
     "ISO_FORMAT",
+    "RELEASE_CURRENT_PATH",
     "TERMINAL_FIELDS",
     "WAITING_ON_DEFAULT",
     "WAITING_ON_VALUES",
     "RunArtifacts",
+    "capture_release_id",
     "iso",
     "normalize_waiting_on",
     "signal_terminal_name",
