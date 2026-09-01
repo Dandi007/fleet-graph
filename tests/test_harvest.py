@@ -433,6 +433,62 @@ class TestPostconditions:
         assert "未挂卡" in evidence["detail"]
 
 
+def _missing_of(receipt: dict[str, Any]) -> list[str]:
+    return [item for s in receipt["steps"] for item in (s.get("missing") or [])]
+
+
+class TestPostconditionsStepScan:
+    """H2：任一 step ok:false -> postconditions 必红、outcome 不得为 harvested。
+
+    交付 B.2/B.3 阴性：`ff_only_pull` / `deploy` / `verify_real` 任一机械
+    失败（fake ops 注入）都必须让 outcome 离开 harvested，即使四要素（PR
+    merged + verify 零退出 + evidence note）都齐。postconditions 扫描 steps
+    机械事实，不采信任何子图自述。
+    """
+
+    def test_pull_failure_escalates_with_step_facts(self, tmp_path: Path) -> None:
+        fake = fake_ops(pull_ok=False)
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert result["outcome"] != OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        missing = _missing_of(receipt)
+        assert any("ff_only_pull" in item for item in missing), missing
+        post = next(s for s in receipt["steps"] if s["step"] == "postconditions")
+        assert post["ok"] is False
+        pull_step = next(s for s in receipt["steps"] if s["step"] == "ff_only_pull")
+        assert pull_step["ok"] is False
+
+    def test_deploy_failure_escalates(self, tmp_path: Path) -> None:
+        fake = fake_ops(deploy_exit=1)
+        config, _ = config_for(tmp_path, ops=fake, deploy_command=["make", "deploy"], bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert result["outcome"] != OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert any("deploy" in item for item in _missing_of(receipt))
+
+    def test_verify_real_failure_escalates(self, tmp_path: Path) -> None:
+        fake = fake_ops(verify_real_exit=1)
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert result["outcome"] != OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert any("verify_real" in item for item in _missing_of(receipt))
+
+    def test_all_ok_still_harvests(self, tmp_path: Path) -> None:
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        post = next(s for s in receipt["steps"] if s["step"] == "postconditions")
+        assert post["ok"] is True
+        assert _missing_of(receipt) == []
+
+
 class TestCherryDedup:
     def test_already_harvested_is_a_no_op(self, tmp_path: Path) -> None:
         fake = fake_ops(cherry_equivalent=True)
