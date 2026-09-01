@@ -1,0 +1,37 @@
+{
+ "development_id": "dev-fg-d24245d5cab6",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "uv",
+    "sync",
+    "--frozen"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": "Checked 100 packages in 1ms\n"
+  },
+  {
+   "command": [
+    "make",
+    "verify"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "r-debater-opponent\", \"dr-worker-code-local\"], \"negatives\": {\"negative_board_stats_old_keys_red\": true, \"negative_clue_titles_strings_red\": true}, \"negatives_red\": true, \"pass\": true, \"role_checks\": [{\"errors\": [], \"ok\": true, \"role\": \"dr-debater-advocate\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-debater-opponent\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-debater-judge\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-arbiter\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/arbiter-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-code-local\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-code-remote\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-content\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-feishu\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-web\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-wiki\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}], \"roles_root\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles\", \"run_ok\": true}\nresearch-role-contracts self_check: pass\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/check_research_role_contracts.py"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "r-debater-opponent\", \"dr-worker-code-local\"], \"negatives\": {\"negative_board_stats_old_keys_red\": true, \"negative_clue_titles_strings_red\": true}, \"negatives_red\": true, \"pass\": true, \"role_checks\": [{\"errors\": [], \"ok\": true, \"role\": \"dr-debater-advocate\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-debater-opponent\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-debater-judge\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-arbiter\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/arbiter-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-code-local\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-code-remote\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-content\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-feishu\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-web\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-wiki\", \"schema\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles/schemas/worker-input.v1.json\"}], \"roles_root\": \"/data/code/self/agent-runtime-releases/ffb397494ef9/profiles/roles\", \"run_ok\": true}\nresearch-role-contracts self_check: pass\n",
+   "stderr_tail": ""
+  }
+ ]
+}
