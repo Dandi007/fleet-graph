@@ -223,3 +223,45 @@ class TestDecodeRejects:
             decode_report(report(did=[1]))
         with pytest.raises(ReportProtocolError):
             decode_report(report(did=[""]))
+
+
+class TestTruncatedClassification:
+    """D2: the ``Unterminated string`` family is a distinct ``truncated`` kind,
+    not the generic ``malformed`` -- truncation is an output-budget problem the
+    bounded re-ask (D1) usually recovers from, and the observation surface has
+    to be able to tell the two apart. Classification only: the payload is still
+    refused, never repaired."""
+
+    def test_a_cut_off_report_is_truncated_not_malformed(self) -> None:
+        import json
+
+        body = json.dumps(report())
+        truncated = body[: body.index("built the thing") + 5]
+        assert truncated.endswith('"built')  # cut lands inside a string value
+        with pytest.raises(ReportProtocolError) as caught:
+            decode_report(truncated)
+        assert caught.value.kind == "truncated"
+        assert "Unterminated string" in caught.value.detail
+
+    def test_a_report_cut_off_mid_string_is_truncated(self) -> None:
+        truncated = (
+            '{"schema_version": "' + SCHEMA_VERSION + '", "turn_id": "t-1", '
+            '"outcome": "completed", "summary": "still going'
+        )
+        with pytest.raises(ReportProtocolError) as caught:
+            decode_report(truncated)
+        assert caught.value.kind == "truncated"
+
+    def test_plain_non_json_stays_malformed(self) -> None:
+        """Only the truncation family gets the dedicated kind; a payload that is
+        not JSON at all remains malformed."""
+        with pytest.raises(ReportProtocolError) as caught:
+            decode_report("this is just prose, no report here")
+        assert caught.value.kind == "malformed"
+
+    def test_a_fenced_truncated_report_is_still_truncated(self) -> None:
+        truncated_body = '{"schema_version": "' + SCHEMA_VERSION + '", "summary": "truncated'
+        fenced = f"```json\n{truncated_body}\n```"
+        with pytest.raises(ReportProtocolError) as caught:
+            decode_report(fenced)
+        assert caught.value.kind == "truncated"

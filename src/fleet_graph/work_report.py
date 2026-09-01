@@ -7,11 +7,11 @@ never from any human-facing prose. Prose survives solely as an optional
 ``prose_attachment`` carrying ``media_type``/``content`` -- inspectable, never a
 control surface.
 
-The decoder is strict on purpose. A missing, malformed, unsupported-version,
-unknown-field, bad-enum, bad-path or bad-exit-code report is a
-:class:`ReportProtocolError`, not something to half-heal: every bounded value is
-*rejected* when it exceeds its limit rather than truncated, so the persisted
-record stays unambiguous about what the worker actually said.
+The decoder is strict on purpose. A missing, malformed, truncated,
+unsupported-version, unknown-field, bad-enum, bad-path or bad-exit-code report
+is a :class:`ReportProtocolError`, not something to half-heal: every bounded
+value is *rejected* when it exceeds its limit rather than truncated, so the
+persisted record stays unambiguous about what the worker actually said.
 
 Limits are explicit constants so the boundary's own code is the documentation of
 the schema's bounds (spec: "Attachment size limits must be explicit in code").
@@ -79,10 +79,13 @@ class ReportProtocolError(Exception):
     """A worker turn report failed the v1 protocol, with a stable ``kind``.
 
     ``kind`` is one of ``missing`` (a required field is absent), ``malformed``
-    (the payload is not a JSON object), ``unsupported_version`` (``schema_version``
-    is present but not the one literal) or ``schema_invalid`` (any other shape,
-    enum, path or size violation). The kind is the machine-facing discriminator
-    ``worker_turn`` uses to name the round it refuses; ``detail`` is for humans.
+    (the payload is not a JSON object), ``truncated`` (the payload is a
+    cut-off JSON object -- the ``Unterminated string`` family, an output-budget
+    problem rather than a shape error), ``unsupported_version``
+    (``schema_version`` is present but not the one literal) or
+    ``schema_invalid`` (any other shape, enum, path or size violation). The kind
+    is the machine-facing discriminator ``worker_turn`` uses to name the round
+    it refuses; ``detail`` is for humans.
     """
 
     def __init__(self, kind: str, detail: str) -> None:
@@ -129,6 +132,21 @@ def _extract_embedded_report(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _json_error_kind(exc: json.JSONDecodeError) -> str:
+    """Classify a JSON decode failure into a stable protocol ``kind`` (D2).
+
+    The ``Unterminated string`` family means the payload was cut off mid-string
+    -- an output-budget problem the bounded re-ask (D1) usually recovers from --
+    so it is labelled ``truncated`` rather than the generic ``malformed``, so
+    the observation surface can tell a truncation apart from a formatting error.
+    Classification only, never repair: the payload is still refused, no quotes,
+    brackets or continuations are guessed in.
+    """
+    if "Unterminated string" in exc.msg:
+        return "truncated"
+    return "malformed"
+
+
 def _coerce_object(raw: Any) -> dict[str, Any]:
     """A report dict, or a JSON-string report decoded to one -- else malformed."""
     if isinstance(raw, dict):
@@ -139,7 +157,9 @@ def _coerce_object(raw: Any) -> dict[str, Any]:
         except json.JSONDecodeError as exc:
             embedded = _extract_embedded_report(raw)
             if embedded is None:
-                raise ReportProtocolError("malformed", f"report is not valid JSON: {exc}") from exc
+                raise ReportProtocolError(
+                    _json_error_kind(exc), f"report is not valid JSON: {exc}"
+                ) from exc
             parsed = embedded
         if isinstance(parsed, dict):
             return parsed
