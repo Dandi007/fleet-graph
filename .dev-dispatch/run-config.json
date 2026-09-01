@@ -1,0 +1,19 @@
+{
+ "development_id": "dev-fg-f5f271c90e0e",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_run_artifacts.py"
+  ],
+  [
+   "make",
+   "verify"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
