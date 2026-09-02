@@ -38,6 +38,7 @@ from fleet_graph.decision_mcp import (
     DECISION_APPROVE,
     DECISION_REJECT,
     DEFAULT_PORT,
+    DEFAULT_STATE_DIR,
     MCP_SERVER_NAME,
     OUTCOME_DELIVERED,
     OUTCOME_REFUSED,
@@ -298,6 +299,74 @@ class TestMcpSurface:
         assert payload["outcome"] == "consumed"
         assert payload["line"] == "wf-1"
         assert payload["decision"] == "APPROVE"
+
+    def test_built_without_a_ledger_never_touches_the_production_state_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """Health-isolation guard (2026-09-02 spec): a server built without an
+        explicit ledger must never write to ``DEFAULT_STATE_DIR``.
+
+        ``build_decision_mcp_server`` used to fall back to
+        ``DeliveryLedger()`` (whose default is the production
+        ``DEFAULT_STATE_DIR``), so a plain test server appending to the real
+        ledger was the production-pollution bug this spec fixes. Only
+        ``serve()``, which always injects an explicit ledger, may write
+        production files.
+        """
+        from fastmcp import Client
+
+        from test_dd_service import running_server
+
+        production_ledger = DEFAULT_STATE_DIR / "deliveries.jsonl"
+        before = production_ledger.read_bytes() if production_ledger.exists() else None
+        _stall(tmp_path, "wf-1")
+        server = build_decision_mcp_server(tmp_path, ROSTER)
+
+        async def call(url: str) -> dict[str, Any]:
+            async with Client(url) as client:
+                result = await client.call_tool(
+                    "decision_deliver",
+                    {"line": "wf-1", "decision": "APPROVE", "reason": "guard"},
+                )
+                return json.loads(result.content[0].text)
+
+        with running_server(server) as url:
+            payload = asyncio.run(call(url))
+        assert payload["status"] == OUTCOME_DELIVERED
+        after = production_ledger.read_bytes() if production_ledger.exists() else None
+        assert after == before, (
+            f"server built without an explicit ledger wrote to the production "
+            f"state dir {DEFAULT_STATE_DIR}"
+        )
+
+    def test_an_injected_ledger_records_calls_from_the_tool(self, tmp_path: Path) -> None:
+        """A server with an explicit scratch ledger records every call into
+        that ledger (never anywhere else)."""
+        from fastmcp import Client
+
+        from test_dd_service import running_server
+
+        _stall(tmp_path, "wf-1")
+        ledger = DeliveryLedger(state_dir=tmp_path / "state")
+        server = build_decision_mcp_server(tmp_path, ROSTER, ledger=ledger)
+
+        async def call(url: str) -> dict[str, Any]:
+            async with Client(url) as client:
+                result = await client.call_tool(
+                    "decision_deliver",
+                    {"line": "wf-1", "decision": "APPROVE", "reason": "recorded"},
+                )
+                return json.loads(result.content[0].text)
+
+        with running_server(server) as url:
+            payload = asyncio.run(call(url))
+        assert payload["status"] == OUTCOME_DELIVERED
+        assert payload["action_key"] == "mcp:wf-1:g2:APPROVE"
+        entries = ledger.entries()
+        assert len(entries) == 1
+        assert entries[0]["status"] == OUTCOME_DELIVERED
+        assert entries[0]["line"] == "wf-1"
+        assert (tmp_path / "state" / "deliveries.jsonl").exists()
 
 
 class TestPortR2:
