@@ -65,6 +65,9 @@ CONVERGED = {
     "wf-7cd0a7",  # ronin-bus-redesign
     "wf-c106b9",  # ronin-entry-unify
     "wf-e7b0dd",  # ronin-e7b0dd
+    # 2026-09-02 第二批闭卷审计退役：同样逐条真机核验后不复活。
+    "wf-66300e",  # ronin-dr-v4（deep-research V4；R8 判据脚本原样重跑 pass=true）
+    "wf-e6560a",  # Claude Code 会话检索 MCP（生产 checkout 亲跑 ACCEPTANCE: PASS）
 }
 
 # 2026-08-28 监督面第二波扩编收编：9 候选 8 close/fold、1 enroll。唯一入编
