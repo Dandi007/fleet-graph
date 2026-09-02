@@ -1,0 +1,49 @@
+# systemd *user* unit for the standalone read-only line-state MCP surface.
+#
+# The line-state family (list_line_states / get_line_state) lives on its own
+# surface (`fleet-graph line-state serve`, :5615) -- the M1 read-model leg that
+# turns the `:7494 /v1/lines` field surface into narrow, read-only MCP tools.
+# It is a standalone service, not a guest of the dev-dispatch / goal /
+# research / decision MCP.
+#
+# Template only: shipped in the repo, deliberately not enabled or installed by
+# any script here -- deployment is a supervision-plane decision (same
+# convention and comment discipline as fleet-graph-decision-mcp.service).
+#
+# `line-state serve` is a real subcommand, checked by
+# tests/test_m1_line_state_mcp.py the same way the other MCP unit templates
+# are: an invented subcommand plus Restart=always is a silent crash loop, not a
+# visible failure.
+#
+# ExecStart passes --lines-config (the roster SSoT that decides which lines the
+# surface covers). The site value for --lines-config is filled in by the
+# deployer (this repo never hardcodes a host path beyond the /data fleet roots).
+#
+# Port discipline (R1/R2, 2026-09-02): the line-state MCP default is 5615
+# (5602-5614 continuous occupied -- 5614 taken by the decision MCP;
+# 5615/5616 scanned free). The occupied/reserved loopback ports are the
+# committed single source `config/line-state-mcp-reserved-ports.json`; the
+# red-able port assertion in tests/test_m1_line_state_mcp.py fails the suite if
+# the default ever drifts into it. This is a CI/acceptance-time assertion, not
+# a runtime "probe the port at startup" behavior (spec item 0 R2).
+[Unit]
+Description=fleet-graph line-state MCP surface (read-only M1 line runtime state)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/apps/fleet-graph/current
+ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph line-state serve \
+    --host 127.0.0.1 --port 5615 \
+    --lines-config <lines-config>
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+# Credentials are env-only; never commit a token into this unit. The optional
+# marker (`-` after the `=`) matches fleet-graphd.service: a missing env file
+# must not be an unexplained start failure.
+EnvironmentFile=-%h/.config/fleet-graph/env
+Environment=PATH=%h/.bun/bin:%h/.local/bin:%h/.opencode/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+[Install]
+WantedBy=default.target
