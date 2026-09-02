@@ -19,7 +19,10 @@ SOP（spec 交付 B）逐节点实现，全部是 script 节点（机械判定�
                    A.1：根目录 Makefile 含 verify 目标 -> make verify；无 Makefile
                    但 pyproject.toml / uv.lock -> repo-canonical 全量套件
                    uv run pytest -q），解析不到可执行指令 -> ok:false + 机器可读
-                   detail（no resolvable verify command）-> escalated（交付 A.2）。
+                   detail（指名缺 verify 的目标仓）-> escalated（案A④ escalate
+                   契约：在任何写步骤 pr_squash_merge / ff_only_pull / deploy
+                   **之前** escalate，writes_skipped 覆盖全部写步骤，绝不放行任何
+                   后续写节点产生写原语）。
 7. `cleanup_worktree` —— verify 之后移除一次性 worktree（harvest_ops 成功路径
    保留 worktree 供 verify 使用，见 rc-702098ab）。
 8. `pr_merge`     —— 用干净产品树 tip（harvest_tip，已剔除 .dev-dispatch/.dd-evidence）
@@ -63,7 +66,11 @@ from fleet_graph.supervise.harvest_allowlist import (
     HarvestAllowlist,
     HarvestAuthorization,
 )
-from fleet_graph.supervise.harvest_ops import EXIT_HEAD_MISMATCH, EXIT_NOT_FOUND
+from fleet_graph.supervise.harvest_ops import (
+    EXIT_HEAD_MISMATCH,
+    EXIT_NOT_FOUND,
+    NO_RESOLVABLE_VERIFY,
+)
 
 #: harvest 终态词汇（outcome）。REFUSED / ALREADY_HARVESTED 都是无写动作的合法
 #: 终止；HARVESTED 要求后置条件三要素齐全；ESCALATED = 失败/升报。
@@ -130,6 +137,12 @@ class HarvestOps(Protocol):
         record_remote_url: str | None,
         allowlist_repo_paths: list[str],
     ) -> tuple[Path | None, str]: ...
+    def resolve_canonical_repo_unfiltered(
+        self,
+        record_repo_path: str,
+        record_remote_url: str | None,
+        candidate_repo_paths: list[str] | None = None,
+    ) -> tuple[Path | None, str]: ...
     def cherry_equivalent(self, repo: Path, head_commit: str, default_branch: str) -> bool: ...
     def worktree_cherry_pick(
         self, repo: Path, head_commit: str, default_branch: str, worktree_root: Path
@@ -166,6 +179,8 @@ class HarvestState(TypedDict, total=False):
     repo_path: str
     record_worktree: str
     remote_url: str
+    would_resolve_canonical: str
+    would_do: list[str]
     default_branch: str
     deploy_command: list[str]
     allowlist_auth: dict[str, Any]
@@ -386,6 +401,28 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             record_worktree = _record_repo_path(development_id, deps.dd_root)
         elif repo is not None:
             record_worktree = str(repo)
+        # 案A改写③：归属解析与 allowlist 授权判定解耦——record 归属的 canonical
+        # 不在 allowlist（`resolve_canonical_repo` 解析不到 -> None）时，用纯读
+        # unfiltered 口解析「本会归属的 canonical 仓」+「本会执行的写步骤」，把
+        # dry-run 留痕写进 e5 报告（would_resolve_canonical / would_do）——
+        # 不授予任何写权限，writes_skipped 覆盖全部写步、真机零写（不进入任何
+        # 写节点）。授权与否由 gate 另行判定，这里只做观测。
+        would_resolve_canonical = ""
+        would_do: list[str] = []
+        if repo is None and record_worktree:
+            try:
+                would_canonical, _reason = deps.ops.resolve_canonical_repo_unfiltered(
+                    record_worktree, remote_url or None
+                )
+            except Exception:
+                would_canonical = None
+            if would_canonical is not None:
+                would_resolve_canonical = str(would_canonical)
+                # 本会执行的写步骤 = 收割链的写步骤名单（与 writes_skipped 同源，
+                # 先观测后授权：只留痕，不执行）。只有解析出「本会归属的 canonical
+                # 仓」才记 would_do——解析不到（纯读 unfiltered 也 None）时没有
+                # 「本会怎么写」，绝不伪造写步骤清单。
+                would_do = list(WRITE_STEPS)
         # H8 交付 B.2/B.3：_resolve_repo 成功之后、进入 gate 之前，对链上每棵
         # 将被消费的树（record_worktree / canonical / 本次 worktree_root）做
         # occupancy 探测。任一在飞且非本单 -> 立即拒绝+escalate，走既有
@@ -424,12 +461,16 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             "repo_path": str(repo) if repo is not None else "",
             "record_worktree": record_worktree,
             "remote_url": remote_url,
+            "would_resolve_canonical": would_resolve_canonical,
+            "would_do": list(would_do),
             "default_branch": deps.default_branch,
             "deploy_command": list(deps.deploy_command),
             "steps": steps,
             "_gaps": gaps,
             "outcome": outcome,
-            "writes_skipped": list(WRITE_STEPS) if occupied is not None else None,
+            # 案A改写③：不在 allowlist（解析不出授权 canonical）或动树被占用时，
+            # writes_skipped 覆盖全部写步骤（先观测后授权，真机零写）。
+            "writes_skipped": list(WRITE_STEPS) if (occupied is not None or would_do) else None,
         }
 
     def gate(state: HarvestState) -> HarvestState:
@@ -563,14 +604,16 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                     "writes_skipped": list(WRITE_STEPS),
                 }
             if argv is None:
-                # 交付 A.2：解析不到可执行 verify 指令 -> 如实 ok:false + 机器可读
-                # detail（no resolvable verify command）-> escalated；绝不硬跑
-                # make verify 制造误导性 127。
+                # 案A④ escalate 契约：解析不到可执行 verify 指令 -> 如实 ok:false +
+                # 机器可读 detail（指名缺 verify 的目标仓）-> outcome=escalated +
+                # writes_skipped 覆盖全部写步骤；绝不硬跑 make verify 制造误导性
+                # 127，也绝不放行任何后续写节点（pr_squash_merge / ff_only_pull /
+                # deploy）。
                 steps = _record_step(
                     state,
                     "run_verify",
                     ok=False,
-                    detail=detail or "no resolvable verify command",
+                    detail=detail or f"{NO_RESOLVABLE_VERIFY}: {worktree}",
                     argv=None,
                 )
                 return {
@@ -774,21 +817,24 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                     "steps": _record_step(state, "verify_real", ok=False, detail=repr(exc)[:300]),
                     "verify_real_exit_code": EXIT_NOT_FOUND,
                     "outcome": OUTCOME_ESCALATED,
+                    "writes_skipped": list(WRITE_STEPS),
                 }
             if argv is None:
-                # 解析不到可执行 verify 指令 -> 如实 ok:false + 机器可读 detail
-                # （no resolvable verify command）-> escalated；绝不硬跑
-                # make verify 制造误导性退出码。
+                # 案A④ escalate 契约：解析不到可执行 verify 指令 -> 如实 ok:false +
+                # 机器可读 detail（指名缺 verify 的目标仓）-> outcome=escalated +
+                # writes_skipped 覆盖全部写步骤；绝不硬跑 make verify 制造误导性
+                # 退出码，也绝不放行任何后续写节点。
                 steps = _record_step(
                     state,
                     "verify_real",
                     ok=False,
-                    detail=detail or "no resolvable verify command",
+                    detail=detail or f"{NO_RESOLVABLE_VERIFY}: {repo}",
                 )
                 return {
                     "steps": steps,
                     "verify_real_exit_code": EXIT_NOT_FOUND,
                     "outcome": OUTCOME_ESCALATED,
+                    "writes_skipped": list(WRITE_STEPS),
                 }
         try:
             exit_code = int(deps.ops.verify_real(argv, repo, merged_head))
@@ -939,6 +985,8 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "stage": state.get("stage"),
                 "repo_path": state.get("repo_path"),
                 "record_worktree": state.get("record_worktree"),
+                "would_resolve_canonical": state.get("would_resolve_canonical"),
+                "would_do": state.get("would_do") or [],
                 "default_branch": state.get("default_branch"),
                 "allowlist_auth": state.get("allowlist_auth") or {},
                 "steps": state.get("steps") or [],
