@@ -366,6 +366,69 @@ def _resolve_canonical_repo(
     return None, f"record repo_path {record_repo_path!r} 无法解析到任何白名单 canonical 仓"
 
 
+def _resolve_canonical_repo_unfiltered(
+    record_repo_path: str,
+    record_remote_url: str | None,
+    candidate_repo_paths: list[str] | None = None,
+) -> tuple[Path | None, str]:
+    """纯读归属解析：不做 allowlist 授权收口，只解析「本会归属的 canonical 仓」。
+
+    与 `_resolve_canonical_repo` 同构的四条机械解析路径（直接命中 /
+    linked-worktree 归属 / origin 本地路径 / origin URL 映射），但**收口不依赖
+    allowlist**——只要机械上能解析出 canonical 目录就返回它，即使该仓不在
+    allowlist（授权与否由编排层 gate 另行判定）。用于「先观测后授权」：不在
+    allowlist 的仓也能算出「本会归属哪个 canonical 仓」，使 e5 报告能留下
+    would-resolve + would-do 的 dry-run 留痕，而真机零写（本函数全程只读，零
+    git/部署写原语）。
+
+    `candidate_repo_paths` 仅在 origin URL 映射（第 4 条）用作候选枚举（读其
+    origin 精确匹配），不是授权集合；不提供则 URL 映射无法本地化（如实返回
+    `(None, 理由)`，绝不猜、绝不 fallback 到 record repo_path 本身）。
+    """
+    record = Path(record_repo_path)
+    record_resolved = _resolved(record)
+
+    # 1. 直接命中：record repo_path 本身就是 canonical 主 checkout（.git 是目录）。
+    if record_resolved.is_dir() and (record / ".git").is_dir():
+        return record_resolved, ""
+
+    # 2. linked worktree 归属：common-dir 指向 <canonical>/.git。
+    common = run_git(record, "rev-parse", "--git-common-dir")
+    if common.returncode == 0 and common.stdout.strip():
+        common_dir = Path(common.stdout.strip())
+        if not common_dir.is_absolute():
+            common_dir = record / common_dir
+        common_resolved = _resolved(common_dir)
+        if common_resolved.name == ".git" and common_resolved != (record / ".git").resolve():
+            canonical = common_resolved.parent
+            if canonical.is_dir():
+                return canonical, ""
+
+    # 3. origin 本地路径。
+    origin = record_remote_url
+    if not origin:
+        origin_proc = run_git(record, "remote", "get-url", "origin")
+        if origin_proc.returncode == 0 and origin_proc.stdout.strip():
+            origin = origin_proc.stdout.strip()
+    if origin:
+        if Path(origin).is_absolute() and Path(origin).is_dir():
+            return _resolved(origin), ""
+        # 4. origin URL 映射（候选枚举，非授权集合）。
+        if candidate_repo_paths:
+            for entry_path in candidate_repo_paths:
+                entry = Path(entry_path)
+                if not entry.is_dir():
+                    continue
+                proc = run_git(entry, "remote", "get-url", "origin")
+                if proc.returncode == 0 and proc.stdout.strip() == origin:
+                    return entry, ""
+
+    return (
+        None,
+        f"record repo_path {record_repo_path!r} 无法解析到任何 canonical 仓（纯读 dry-run 解析）",
+    )
+
+
 def _makefile_has_verify_target(worktree: Path) -> bool:
     """机械判定：目标仓根目录 `Makefile` 是否声明 `verify` 目标。
 
@@ -452,6 +515,23 @@ class DefaultHarvestOps:
         静默放行、绝不 fallback 到 record repo_path（worktree 路径）本身去授权。
         """
         return _resolve_canonical_repo(record_repo_path, record_remote_url, allowlist_repo_paths)
+
+    def resolve_canonical_repo_unfiltered(
+        self,
+        record_repo_path: str,
+        record_remote_url: str | None,
+        candidate_repo_paths: list[str] | None = None,
+    ) -> tuple[Path | None, str]:
+        """纯读归属解析口（无 allowlist 授权收口），见 `_resolve_canonical_repo_unfiltered`。
+
+        与 `resolve_canonical_repo` 同构的四条机械解析路径，但收口**不要求命中
+        allowlist**——即使该仓不在 allowlist，也能在**不授予写权限**的前提下解析出
+        「这个 record 本会归属哪个 canonical 仓」（先观测后授权）。编排层据此把
+        would-resolve + would-do 落进 e5 报告，真机零写（本方法只读）。
+        """
+        return _resolve_canonical_repo_unfiltered(
+            record_repo_path, record_remote_url, candidate_repo_paths
+        )
 
     def fetch_dd_ref(
         self,
