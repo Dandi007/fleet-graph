@@ -289,6 +289,8 @@ class TestReader:
             "at": "2026-08-28T10:00:00Z",
             "pump_fault": True,
             "goal_revision": "sha256:rev-1",
+            "dd_development_id": None,
+            "line_state": "waiting_decision",
         }
 
     def test_to_record_with_no_terminal_is_none(self) -> None:
