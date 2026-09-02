@@ -44,7 +44,9 @@ DD_WASH_COMMIT_MESSAGE = "harvest: exclude dd protocol subtrees from product tre
 MAKE_VERIFY_ARGV = ["make", "verify"]
 #: 无 Makefile 但由 uv 管理的仓（pyproject.toml / uv.lock）-> repo-canonical 全量套件。
 UV_PYTEST_ARGV = ["uv", "run", "pytest", "-q"]
-#: 解析不到可执行 verify 指令时的机器可读 detail（交付 A.2）。
+#: 解析不到可执行 verify 指令时的机器可读 detail 前缀（交付 A.2）。完整 detail
+#: 由 `_resolve_verify_argv` 追加目标仓路径（案A④ 契约：指名缺 verify 的目标仓），
+#: 编排层据此 ok:false + outcome=escalated + writes_skipped。
 NO_RESOLVABLE_VERIFY = "no resolvable verify command"
 
 
@@ -399,7 +401,9 @@ def _resolve_verify_argv(worktree: Path) -> tuple[list[str] | None, str]:
     2. 无 Makefile 但存在 `pyproject.toml` / `uv.lock` -> repo-canonical 全量套件
        `["uv","run","pytest","-q"]`（如 fleet-sentinel：pyproject.toml + uv.lock +
        tests/，其全量套件不是 make）；
-    3. 解析不到可执行 verify 指令 -> `(None, "no resolvable verify command")`。
+    3. 解析不到可执行 verify 指令 -> `(None, "no resolvable verify command:
+       <worktree>")`——detail 指名缺 verify 的目标仓（案A④ escalate 契约的
+       detail 锚点），绝不硬编码默认指令制造误导性 127。
 
     纯机械读口（只读目标仓根目录文件，绝不执行任何命令）；测试注入 fake。
     """
@@ -407,7 +411,7 @@ def _resolve_verify_argv(worktree: Path) -> tuple[list[str] | None, str]:
         return list(MAKE_VERIFY_ARGV), ""
     if (worktree / "pyproject.toml").is_file() or (worktree / "uv.lock").is_file():
         return list(UV_PYTEST_ARGV), ""
-    return None, NO_RESOLVABLE_VERIFY
+    return None, f"{NO_RESOLVABLE_VERIFY}: {_resolved(worktree)}"
 
 
 class DefaultHarvestOps:
