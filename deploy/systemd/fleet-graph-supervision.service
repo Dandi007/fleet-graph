@@ -1,0 +1,57 @@
+# systemd *user* unit for the M5 supervision cold-start handoff MCP surface.
+#
+# The supervision handoff family (supervision_handoff) lives on its own
+# read-only surface (`fleet-graph supervision serve`, :5615, registered as
+# `fleet-graph-supervision`) -- one zero-argument tool returns the whole
+# cold-start handoff. It is a standalone service, not a guest of the
+# dev-dispatch / goal / research / decision MCP (2026-09-02 监督面 goal.md M5).
+#
+# Read-only: the surface only pulls existing artifacts through the :7494 read
+# model and the dd / roster sources; it exposes no write tool and never writes
+# to any observed artifact (阴性① tools/list carries zero write primitives).
+#
+# Template only: shipped in the repo, deliberately not enabled or installed by
+# any script here -- deployment is a supervision-plane decision (same
+# convention and comment discipline as fleet-graph-dd-mcp.service).
+#
+# `supervision serve` is a real subcommand, checked by tests/test_deploy_unit.py
+# the same way the other MCP unit templates are: an invented subcommand plus
+# Restart=always is a silent crash loop, not a visible failure.
+#
+# ExecStart passes --repo-path, which binds the authoritative 「当前 main」 fact
+# (git rev-parse HEAD of the deployed main checkout). The site value for
+# --repo-path is filled in by the deployer (this repo never hardcodes a host
+# path beyond the /data fleet roots) -- same convention as decision-mcp's
+# --lines-config placeholder. Without it (or an unreadable repo) releases.main
+# is reported unavailable (读不到), never faked, so 判「修复到底生效没有」 never
+# silently degrades into a guess.
+#
+# Port discipline (R1/R2, 2026-09-02): the supervision surface default is 5615,
+# outside the committed single source config/decision-mcp-reserved-ports.json
+# (5602-5613 continuous occupied, 5614/5615/5616 scanned free). The red-able
+# port assertion in tests/test_m5_supervision_handoff.py fails the suite if the
+# default ever drifts into that list. This is a CI/acceptance-time assertion,
+# not a runtime "probe the port at startup" behavior.
+[Unit]
+Description=fleet-graph supervision cold-start handoff MCP surface (read-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/apps/fleet-graph/current
+ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph supervision serve \
+    --host 127.0.0.1 --port 5615 \
+    --lines-config /data/apps/fleet-graph/current/config/ronin-lines.json \
+    --repo-path <repo-path> \
+    --supervise-folder-id <supervise-folder-id>
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+# Credentials are env-only; never commit a token into this unit. The optional
+# marker (`-` after the `=`) matches fleet-graphd.service: a missing env file
+# must not be an unexplained start failure.
+EnvironmentFile=-%h/.config/fleet-graph/env
+Environment=PATH=%h/.bun/bin:%h/.local/bin:%h/.opencode/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+[Install]
+WantedBy=default.target

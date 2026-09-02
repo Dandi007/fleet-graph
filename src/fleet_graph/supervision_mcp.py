@@ -27,7 +27,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -448,16 +447,18 @@ class SupervisionHandoff:
 
 
 def _git_main_head(repo_path: Path) -> str | None:
-    """The repo's ``HEAD`` commit, fail-soft (read-only, never a crash)."""
+    """The repo's ``HEAD`` commit, fail-soft (read-only, never a crash).
+
+    Goes through :func:`fleet_graph.dd.git.run_git` (the same guarded git
+    helper the rest of the fleet uses): a raw ``subprocess`` git call would
+    re-open the repo-local ``core.fsmonitor`` exploit the source invariant in
+    ``tests/test_dd_git.py`` exists to prevent.
+    """
+    from fleet_graph.dd.git import run_git
+
     try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        proc = run_git(repo_path, "rev-parse", "HEAD")
+    except OSError:
         return None
     if proc.returncode != 0:
         return None
@@ -509,6 +510,7 @@ def serve(
     dd_root: str | None = None,
     supervise_folder_id: str | None = None,
     authorization_mode: str | None = None,
+    repo_path: str | None = None,
 ) -> None:
     """Run the standalone supervision handoff MCP surface on loopback.
 
@@ -518,6 +520,11 @@ def serve(
     ``supervise_folder_id`` / ``authorization_mode`` source the supervision
     face's own handoff facts; a missing authorization mode fail-safes to
     ``semi-auto``, a missing folder_id is reported as such in the snapshot.
+    ``repo_path`` binds the authoritative 「当前 main」 fact (the deployed git
+    checkout whose ``HEAD`` is the main head). It is wired through to
+    :class:`SupervisionConfig` so the serving path can answer ``releases.main``
+    rather than structurally returning it unavailable; when absent or
+    unresolvable it is reported as 读不到 (``unavailable``), never faked.
     """
     state = FleetStateConfig(
         lines_config=Path(lines_config) if lines_config else DEFAULT_LINES_CONFIG,
@@ -528,6 +535,7 @@ def serve(
         state=state,
         supervision_folder_id=supervise_folder_id,
         authorization_mode=authorization_mode,
+        repo_path=Path(repo_path) if repo_path else None,
     )
     build_supervision_mcp_server(lambda: SupervisionHandoff(config).build()).run(
         transport="streamable-http", host=host, port=port, path="/mcp"

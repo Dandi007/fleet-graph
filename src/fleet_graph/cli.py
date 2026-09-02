@@ -811,6 +811,37 @@ def _state_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _supervision_serve(args: argparse.Namespace) -> int:
+    """Serve the supervision handoff MCP surface on loopback. It is its own service.
+
+    Read-only (M5): one zero-argument tool ``supervision_handoff`` returns the
+    whole cold-start handoff (supervision volume, authorization mode, roster,
+    line status, awaiting-decision, harvestable, maintenance window, and the
+    main / deployed / running release facts). No write capability is exposed
+    (阴性①); any unreadable item is explicitly marked unavailable (阴性②), and
+    an unreachable upstream is reported as 不可判定 rather than silently green.
+    """
+    from fleet_graph.supervision_mcp import serve
+
+    try:
+        serve(
+            host=args.host,
+            port=args.port,
+            lines_config=args.lines_config,
+            run_root=args.run_root,
+            dd_root=args.dd_root,
+            supervise_folder_id=args.supervise_folder_id,
+            authorization_mode=args.authorization_mode,
+            repo_path=args.repo_path,
+        )
+    except RuntimeError as exc:
+        # A startup refusal (port taken) is a visible failure, not a crash loop:
+        # print the clear reason and exit non-zero.
+        print(f"fleet-graph supervision serve: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _scheduler_run(args: argparse.Namespace) -> int:
     """Run the resident scheduler: look at each line, ask, start or record why not."""
     import pathlib
@@ -1867,6 +1898,53 @@ def build_parser() -> argparse.ArgumentParser:
         "(the same home goal serve writes by default)",
     )
     state_serve.set_defaults(func=_state_serve)
+
+    supervision = subparsers.add_parser(
+        "supervision",
+        help="the M5 supervision cold-start handoff MCP surface (read-only)",
+    )
+    supervision_sub = supervision.add_subparsers()
+    supervision_serve = supervision_sub.add_parser(
+        "serve",
+        help="serve the supervision handoff MCP surface "
+        "(read-only, one call returns the whole handoff)",
+    )
+    supervision_serve.add_argument("--host", default="127.0.0.1")
+    supervision_serve.add_argument("--port", type=int, default=5615)
+    supervision_serve.add_argument(
+        "--lines-config",
+        default=None,
+        help="the roster SSoT (aliases/seats/enabled); defaults to config/ronin-lines.json",
+    )
+    supervision_serve.add_argument(
+        "--run-root",
+        default=None,
+        help="line run root for line status; defaults to /data/fleet-graph/runs",
+    )
+    supervision_serve.add_argument(
+        "--dd-root",
+        default=None,
+        help="dd development state root; defaults to /data/fleet-graph/dd",
+    )
+    supervision_serve.add_argument(
+        "--repo-path",
+        default=None,
+        help="git checkout whose HEAD is the authoritative 'current main' fact; "
+        "absent, releases.main is reported unavailable (读不到), never faked",
+    )
+    supervision_serve.add_argument(
+        "--supervise-folder-id",
+        default=None,
+        help="the supervision volume folder_id (the homework account a cold start "
+        "hands over); absent it is reported as missing",
+    )
+    supervision_serve.add_argument(
+        "--authorization-mode",
+        default=None,
+        choices=("full-auto", "semi-auto"),
+        help="the supervision authorization mode; default/missing fail-safes to semi-auto",
+    )
+    supervision_serve.set_defaults(func=_supervision_serve)
 
     scheduler = subparsers.add_parser("scheduler", help="the resident line scheduler")
     scheduler_sub = scheduler.add_subparsers()

@@ -43,6 +43,12 @@ ARBITER_UNIT = (
 STATE_UNIT = (
     Path(__file__).resolve().parent.parent / "deploy" / "systemd" / "fleet-graph-state.service"
 )
+SUPERVISION_UNIT = (
+    Path(__file__).resolve().parent.parent
+    / "deploy"
+    / "systemd"
+    / "fleet-graph-supervision.service"
+)
 ARBITER_TIMER = (
     Path(__file__).resolve().parent.parent / "deploy" / "systemd" / "fleet-graph-arbiter.timer"
 )
@@ -472,6 +478,89 @@ class TestTheStateUnitRunsSomethingThatExists:
         with tempfile.TemporaryDirectory() as tmp:
             staged = Path(tmp) / STATE_UNIT.name
             staged.write_text(STATE_UNIT.read_text(encoding="utf-8"), encoding="utf-8")
+            done = subprocess.run(
+                [analyze, "--user", "verify", str(staged)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        noise = done.stderr + done.stdout
+        assert "Unknown key" not in noise, noise
+
+
+class TestTheSupervisionUnitRunsSomethingThatExists:
+    """Same discipline as the decision-mcp unit, applied to the standalone M5
+    supervision cold-start handoff surface (also shipped, deliberately not
+    enabled)."""
+
+    def test_the_subcommand_is_one_the_cli_accepts(self) -> None:
+        argv = exec_start(SUPERVISION_UNIT.read_text(encoding="utf-8"))
+        assert argv[0].endswith("fleet-graph"), argv[0]
+        parsed = build_parser().parse_args(argv[1:])
+        assert parsed.func is not None
+
+    def test_it_serves_the_agreed_loopback_port(self) -> None:
+        argv = exec_start(SUPERVISION_UNIT.read_text(encoding="utf-8"))
+        assert argv[1:3] == ["supervision", "serve"], argv
+        assert "--port" in argv and argv[argv.index("--port") + 1] == "5615", argv
+        assert "--host" in argv and argv[argv.index("--host") + 1] == "127.0.0.1", argv
+
+    def test_it_passes_repo_path_explicitly(self) -> None:
+        """Wiring gap guard: serve() must bind the authoritative 「当前 main」 fact
+        through --repo-path, so releases.main is not structurally unavailable on
+        the deployed path."""
+        argv = exec_start(SUPERVISION_UNIT.read_text(encoding="utf-8"))
+        assert "--repo-path" in argv, argv
+
+    def test_it_passes_supervise_folder_id_explicitly(self) -> None:
+        """The handoff volume folder_id is the homework account a cold start
+        cannot reconstruct; the unit passes it so the deployed surface answers it
+        instead of reporting it missing."""
+        argv = exec_start(SUPERVISION_UNIT.read_text(encoding="utf-8"))
+        assert "--supervise-folder-id" in argv, argv
+
+    def test_it_restarts_and_runs_from_the_current_snapshot(self) -> None:
+        text = SUPERVISION_UNIT.read_text(encoding="utf-8")
+        assert "Restart=always" in text
+        assert "WorkingDirectory=/data/apps/fleet-graph/current" in text
+        argv = exec_start(text)
+        assert argv[0].startswith("/data/apps/fleet-graph/current/"), argv[0]
+
+    def test_a_missing_env_file_is_tolerated(self) -> None:
+        text = SUPERVISION_UNIT.read_text(encoding="utf-8")
+        assert re.search(r"^EnvironmentFile=-", text, re.MULTILINE)
+        assert not re.search(r"^-\w+=", text, re.MULTILINE)
+
+    def test_no_credential_is_baked_into_the_unit(self) -> None:
+        for line in SUPERVISION_UNIT.read_text(encoding="utf-8").splitlines():
+            if line.startswith("Environment="):
+                assert "TOKEN" not in line.upper(), line
+                assert "KEY" not in line.upper(), line
+
+    def test_the_unit_port_is_not_reserved(self) -> None:
+        """R2: the unit serves the port the red-able assertion guarantees is
+        outside config/decision-mcp-reserved-ports.json."""
+        import json
+
+        from fleet_graph.supervision_mcp import DEFAULT_PORT
+
+        assert DEFAULT_PORT == 5615
+        argv = exec_start(SUPERVISION_UNIT.read_text(encoding="utf-8"))
+        unit_port = int(argv[argv.index("--port") + 1])
+        assert unit_port == DEFAULT_PORT
+        reserved_path = (
+            Path(__file__).resolve().parent.parent / "config" / "decision-mcp-reserved-ports.json"
+        )
+        reserved = json.loads(reserved_path.read_text(encoding="utf-8"))["reserved_ports"]
+        assert unit_port not in reserved
+
+    def test_systemd_itself_accepts_every_key(self) -> None:
+        analyze = shutil.which("systemd-analyze")
+        if analyze is None:
+            pytest.skip("systemd-analyze not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = Path(tmp) / SUPERVISION_UNIT.name
+            staged.write_text(SUPERVISION_UNIT.read_text(encoding="utf-8"), encoding="utf-8")
             done = subprocess.run(
                 [analyze, "--user", "verify", str(staged)],
                 capture_output=True,
