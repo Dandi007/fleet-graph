@@ -1,0 +1,18 @@
+{
+ "development_id": "dev-fg-a7fa9717d4e2",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "bash",
+   "-lc",
+   "uv sync --frozen && uv run pytest -q tests/test_m1_waiting_park.py"
+  ],
+  [
+   "bash",
+   "-lc",
+   "make verify"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
