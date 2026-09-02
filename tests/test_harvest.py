@@ -400,10 +400,11 @@ class TestHarvestAllowlistRefusal:
         `allowed_deploy` 白名单内（声明与白名单不符）-> gate 必须拒
         （granted=false + reasons 指名 offending 命令与缺失授权），整单不走。"""
         fake = fake_ops()
+        repo = repo_path_for(tmp_path)
         allowlist = full_allowlist(
             entries=[
                 {
-                    "repo_path": "/data/code/self/fleet-graph",
+                    "repo_path": repo,
                     "allowed_branches": ["refs/heads/main"],
                     "allowed_deploy": [["make", "deploy"]],
                 }
@@ -411,6 +412,7 @@ class TestHarvestAllowlistRefusal:
         )
         config, _ = config_for(
             tmp_path,
+            repo_path=repo,
             allowlist=allowlist,
             deploy_command=["make", "undeploy"],
             ops=fake,
@@ -474,9 +476,7 @@ class TestMergeOnlyHarvest:
         # 生效 deploy 命令取自条目而非全局：全局 deploy_command 被忽略。
         assert receipt["steps"]
 
-    def test_merge_only_effective_command_comes_from_entry_not_global(
-        self, tmp_path: Path
-    ) -> None:
+    def test_merge_only_effective_command_comes_from_entry_not_global(self, tmp_path: Path) -> None:
         """生效命令取自条目 allowed_deploy（空）而非全局 deps.deploy_command。"""
         fake = fake_ops()
         repo = repo_path_for(tmp_path)

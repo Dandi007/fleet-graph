@@ -987,6 +987,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "pr_url": state.get("pr_url"),
                 "verify_exit_code": state.get("verify_exit_code"),
                 "verify_real_exit_code": state.get("verify_real_exit_code"),
+                "deploy_exit_code": state.get("deploy_exit_code"),
                 "evidence_note_id": state.get("evidence_note_id"),
                 "outcome": state.get("outcome"),
                 "writes_skipped": state.get("writes_skipped") or [],
