@@ -82,12 +82,31 @@ E5_BASELINE_FILE = "e5-baseline.json"
 #: bridge receipt status → 送达链状态 +（swallowed 时）reason。
 #: ``intent_recorded`` 即 bridge 已见过该裁决（bridged）；``resumed`` 即已送达
 #: 消费（consumed）；``noop`` / ``refused`` 即被吞（swallowed，带 reason）。
+#: 终结态不再由这张快照单独拍板：consumed/swallowed 还会拿单据侧对账兜一道
+#: （见 ``_receipt_to_decision`` / ``_document_gate_consumed``）。
 _RECEIPT_STATE: dict[str, tuple[str, str | None]] = {
     "intent_recorded": (STATE_BRIDGED, None),
     "resumed": (STATE_CONSUMED, None),
     "noop": (STATE_SWALLOWED, None),
     "refused": (STATE_SWALLOWED, None),
 }
+
+#: dd 单据侧对账的机械事实词汇。human gate 走完（events.jsonl ``human_gate`` +
+#: ``success``）或 status.json 离开 ``awaiting_gate``，都证明该裁决真被消费，
+#: 而不是 bridge receipt 在某个评估瞬间看到的快照。
+GATE_STAGE = "human_gate"
+GATE_SUCCESS_EVENT = "success"
+DD_AWAITING_GATE = "awaiting_gate"
+
+#: 对账 basis 词汇（closed）。前两者 = 单据侧证明被消费；``document_awaiting``
+#: = 单据侧可读但仍停留在 waiting（真没消费）；``unreconciled`` = 有 dd 目标
+#: 但单据侧缺失/不可读，显式标注、不静默归 consumed 或 swallowed；``receipt``
+#: = 无 dd 目标（或非终结态），沿用 bridge receipt 快照。
+BASIS_HUMAN_GATE_SUCCESS = "human_gate_success"
+BASIS_LEFT_AWAITING_GATE = "left_awaiting_gate"
+BASIS_DOCUMENT_AWAITING = "document_awaiting"
+BASIS_UNRECONCILED = "unreconciled"
+BASIS_RECEIPT = "receipt"
 
 
 @dataclass
@@ -123,6 +142,59 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     except (OSError, ValueError):
         return None
     return raw if isinstance(raw, dict) else None
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """One JSONL artifact, fail-soft: bad lines degrade away, never a crash."""
+    try:
+        raw = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    for line in raw:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            out.append(record)
+    return out
+
+
+def _generation_events_path(dd_root: Path, development_id: str, generation: int) -> Path:
+    """Where one generation's ``events.jsonl`` lives (g1 at the dev root)."""
+    dev_root = dd_root / development_id
+    if generation and generation <= 1:
+        return dev_root / "events.jsonl"
+    return dev_root / f"g{generation}" / "events.jsonl"
+
+
+def _document_gate_consumed(dd_root: Path, development_id: str, generation: int) -> str:
+    """对账单个 dd 单据：该裁决是否真被消费（而非 receipt 瞬时快照）。
+
+    Returns one of the ``BASIS_*`` tokens:
+      - ``human_gate_success`` / ``left_awaiting_gate`` → 单据侧证明消费；
+      - ``document_awaiting`` → 单据侧可读、仍在等待，真没消费；
+      - ``unreconciled`` → 单据侧缺失/不可读，显式标注对不上。
+    顺序：先看 status.json（权威重建态）是否已离开 ``awaiting_gate``，再看
+    events.jsonl 是否记了 ``human_gate`` + ``success``。
+    """
+    dev_root = dd_root / development_id
+    if not dev_root.is_dir():
+        return BASIS_UNRECONCILED
+    status = _read_json(dev_root / "status.json")
+    state = str(status.get("state") or "") if status else ""
+    if state and state != DD_AWAITING_GATE:
+        return BASIS_LEFT_AWAITING_GATE
+    for entry in _read_jsonl(_generation_events_path(dd_root, development_id, generation)):
+        if entry.get("stage") == GATE_STAGE and entry.get("event") == GATE_SUCCESS_EVENT:
+            return BASIS_HUMAN_GATE_SUCCESS
+    if status is not None and state == DD_AWAITING_GATE:
+        return BASIS_DOCUMENT_AWAITING
+    return BASIS_UNRECONCILED
 
 
 def _parse_iso(value: Any) -> float | None:
@@ -227,12 +299,29 @@ def _read_receipts(config: FleetStateConfig) -> list[dict[str, Any]]:
         return []
 
 
-def _receipt_to_decision(receipt: dict[str, Any]) -> dict[str, Any]:
+def _receipt_to_decision(receipt: dict[str, Any], *, dd_root: Path | None = None) -> dict[str, Any]:
     status = str(receipt.get("status") or "")
     state, reason = _RECEIPT_STATE.get(status, (STATE_SWALLOWED, f"unknown_status:{status}"))
+    basis = BASIS_RECEIPT
+
+    # 终结对账：bridge receipt 定终结态不再单凭快照——有 dd 目标时拿单据侧
+    # （events.jsonl human_gate success / status.json 离开 awaiting_gate）再对
+    # 一声。单据侧证明被消费 → 提升为 consumed（修正「已送达且被消费却误记
+    # swallowed」）；可读但仍 waiting → 维持 swallowed 并标注；对不上 → 显式
+    # 标注 unreconciled，不静默归 consumed 或 swallowed。
+    if dd_root is not None and state in (STATE_CONSUMED, STATE_SWALLOWED):
+        target_kind = str(receipt.get("target_kind") or "")
+        target_id = str(receipt.get("target_id") or "")
+        if target_kind == "dd" and target_id:
+            basis = _document_gate_consumed(dd_root, target_id, int(receipt.get("generation") or 1))
+            if basis in (BASIS_HUMAN_GATE_SUCCESS, BASIS_LEFT_AWAITING_GATE):
+                state = STATE_CONSUMED
+                reason = None
+
     obj: dict[str, Any] = {
         "source_message_id": str(receipt.get("source_message_id") or ""),
         "state": state,
+        "basis": basis,
         "owner": {
             "kind": str(receipt.get("target_kind") or ""),
             "id": str(receipt.get("target_id") or ""),
@@ -439,7 +528,7 @@ class FleetStateView:
 
     def decisions(self) -> dict[str, Any]:
         receipts = _read_receipts(self.config)
-        decision_objs = [_receipt_to_decision(r) for r in receipts]
+        decision_objs = [_receipt_to_decision(r, dd_root=self.config.dd_root) for r in receipts]
         seen = {obj["source_message_id"] for obj in decision_objs}
         decision_objs.extend(_read_published(self.config, seen))
         return {"schema_version": SCHEMA_VERSION, "decisions": decision_objs}
