@@ -421,7 +421,10 @@ def _resolve_canonical_repo_unfiltered(
                 if proc.returncode == 0 and proc.stdout.strip() == origin:
                     return entry, ""
 
-    return None, f"record repo_path {record_repo_path!r} 无法解析到任何 canonical 仓（纯读 dry-run 解析）"
+    return (
+        None,
+        f"record repo_path {record_repo_path!r} 无法解析到任何 canonical 仓（纯读 dry-run 解析）",
+    )
 
 
 def _makefile_has_verify_target(worktree: Path) -> bool:

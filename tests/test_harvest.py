@@ -57,6 +57,7 @@ def fake_ops(
     pull_ok: bool = True,
     pull_head: str = "f" * 40,
     resolve_canonical: Path | None = None,
+    resolve_unfiltered: Path | None = None,
     divergence: dict[str, Any] | None = None,
     harvest_tip: str = "b" * 40,
     inflight_binding: dict[str, Any] | None = None,
@@ -115,6 +116,17 @@ def fake_ops(
             if resolve_canonical is not None:
                 return resolve_canonical, ""
             return Path(record_repo_path), ""
+
+        def resolve_canonical_repo_unfiltered(
+            self,
+            record_repo_path: str,
+            record_remote_url: str | None,
+            candidate_repo_paths: list[str] | None = None,
+        ) -> tuple[Path | None, str]:
+            # 纯读口：不构成写原语，不入 calls。脚本化「本会解析到的 canonical」。
+            if resolve_unfiltered is not None:
+                return resolve_unfiltered, ""
+            return None, "unresolvable"
 
         def detect_inflight_binding(
             self, tree_path: Path, dd_root: Path, current_development_id: str | None = None
@@ -1289,6 +1301,106 @@ class TestCanonicalRepoResolution:
         result = run_harvest(config)
         assert result["outcome"] == OUTCOME_ESCALATED
         assert fake["calls"] == []
+
+
+class TestDryRunUnfilteredAttribution:
+    """案A改写③：归属解析与 allowlist 授权判定解耦（先观测后授权）。
+
+    不在 allowlist 的仓（`resolve_canonical_repo` 解析不到 -> intake escalated）
+    必须仍能通过纯读 `resolve_canonical_repo_unfiltered` 解析出「本会归属的
+    canonical 仓」，并把 would-resolve canonical + would-do 写步骤清单 +
+    writes_skipped 落进 e5 报告，且真机零写（不执行任何写原语）。全程禁触
+    真网/生产 checkout。
+    """
+
+    def test_unfiltered_resolves_non_allowlist_primary_checkout(self, tmp_path: Path) -> None:
+        """纯读口不依赖 allowlist：direct 命中 canonical 主 checkout。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        resolved, reason = DefaultHarvestOps().resolve_canonical_repo_unfiltered(
+            str(canonical), None, []
+        )
+        assert resolved == canonical, f"unfiltered resolved {resolved!r}"
+        assert reason == ""
+
+    def test_unfiltered_resolves_linked_worktree_to_canonical(self, tmp_path: Path) -> None:
+        """纯读口把 linked worktree 归属到 canonical 主 checkout（无 allowlist 收口）。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        worktree = tmp_path / "linked-wt"
+        git(canonical, "worktree", "add", "--detach", str(worktree), "main")
+
+        resolved, reason = DefaultHarvestOps().resolve_canonical_repo_unfiltered(
+            str(worktree), None
+        )
+        assert resolved == canonical, f"unfiltered resolved {resolved!r}"
+        assert reason == ""
+
+    def test_unfiltered_unresolvable_returns_none(self, tmp_path: Path) -> None:
+        """解析不到任何 canonical 时纯读口如实返回 None + 理由，绝不伪造。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        missing = tmp_path / "does-not-exist"
+        resolved, reason = DefaultHarvestOps().resolve_canonical_repo_unfiltered(str(missing), None)
+        assert resolved is None
+        assert reason
+
+    def test_non_allowlist_repo_dryrun_records_attribution_zero_writes(
+        self, tmp_path: Path
+    ) -> None:
+        """正向判据：不在 allowlist 的仓 -> e5 报告记 would-resolve + would-do +
+        writes_skipped 覆盖全部写步，真机零写（断言无任何写原语被调用）。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        before = head(canonical)
+        allowlist = _canonical_allowlist(tmp_path / "other")
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            allowlist=allowlist,
+            repo_path=str(canonical),
+            ops=fake,
+        )
+        config.ops = DefaultHarvestOps()
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        # 归属如实记录：本会解析到的 canonical + 本会执行的写步骤清单。
+        assert receipt["would_resolve_canonical"] == str(canonical)
+        assert receipt["would_do"] == list(WRITE_STEPS)
+        # writes_skipped 覆盖全部写步骤（三写步一个不漏）。
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+        # 真机零写：intake 直接收束，无任何写步骤执行，canonical HEAD 未动。
+        assert fake["calls"] == [], f"write primitives executed: {fake['calls']}"
+        assert [s["step"] for s in receipt["steps"]] == ["intake"]
+        assert head(canonical) == before
+
+    def test_unresolvable_repo_dryrun_does_not_fabricate_would_do(self, tmp_path: Path) -> None:
+        """解析不到 canonical（纯读 unfiltered 也 None）时不伪造 would_do / writes_skipped。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        missing = tmp_path / "does-not-exist"
+        allowlist = _canonical_allowlist(tmp_path / "other")
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            allowlist=allowlist,
+            repo_path=str(missing),
+            ops=fake,
+        )
+        config.ops = DefaultHarvestOps()
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["would_resolve_canonical"] == ""
+        assert receipt["would_do"] == []
+        assert receipt["writes_skipped"] == []
 
 
 class TestDefaultHarvestOpsVerifyRealHead:

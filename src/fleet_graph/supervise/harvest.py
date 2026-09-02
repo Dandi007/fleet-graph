@@ -411,9 +411,11 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 would_canonical = None
             if would_canonical is not None:
                 would_resolve_canonical = str(would_canonical)
-            # 本会执行的写步骤 = 收割链的写步骤名单（与 writes_skipped 同源，
-            # 先观测后授权：只留痕，不执行）。
-            would_do = list(WRITE_STEPS)
+                # 本会执行的写步骤 = 收割链的写步骤名单（与 writes_skipped 同源，
+                # 先观测后授权：只留痕，不执行）。只有解析出「本会归属的 canonical
+                # 仓」才记 would_do——解析不到（纯读 unfiltered 也 None）时没有
+                # 「本会怎么写」，绝不伪造写步骤清单。
+                would_do = list(WRITE_STEPS)
         # H8 交付 B.2/B.3：_resolve_repo 成功之后、进入 gate 之前，对链上每棵
         # 将被消费的树（record_worktree / canonical / 本次 worktree_root）做
         # occupancy 探测。任一在飞且非本单 -> 立即拒绝+escalate，走既有
@@ -452,12 +454,16 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             "repo_path": str(repo) if repo is not None else "",
             "record_worktree": record_worktree,
             "remote_url": remote_url,
+            "would_resolve_canonical": would_resolve_canonical,
+            "would_do": list(would_do),
             "default_branch": deps.default_branch,
             "deploy_command": list(deps.deploy_command),
             "steps": steps,
             "_gaps": gaps,
             "outcome": outcome,
-            "writes_skipped": list(WRITE_STEPS) if occupied is not None else None,
+            # 案A改写③：不在 allowlist（解析不出授权 canonical）或动树被占用时，
+            # writes_skipped 覆盖全部写步骤（先观测后授权，真机零写）。
+            "writes_skipped": list(WRITE_STEPS) if (occupied is not None or would_do) else None,
         }
 
     def gate(state: HarvestState) -> HarvestState:
@@ -967,6 +973,8 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "stage": state.get("stage"),
                 "repo_path": state.get("repo_path"),
                 "record_worktree": state.get("record_worktree"),
+                "would_resolve_canonical": state.get("would_resolve_canonical"),
+                "would_do": state.get("would_do") or [],
                 "default_branch": state.get("default_branch"),
                 "allowlist_auth": state.get("allowlist_auth") or {},
                 "steps": state.get("steps") or [],
