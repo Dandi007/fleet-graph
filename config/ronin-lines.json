@@ -97,7 +97,7 @@
       "alias": "ronin-bus-redesign",
       "max_rounds": 9999,
       "enabled": false,
-      "_retirement": "2026-09-02 05:5x 闭卷审计判定不复活（监督面）：agent-bus 重构线，A2 arbiter 真机确认在役、剩余 DoD 缺口可由后续线承接，闭卷裁决站得住。LineDoneAwaitingRosterRetirement 据此收口。"
+      "_retirement": "2026-09-02 05:5x 闭卷审计判定不复活（监督面）：agent-bus 重构线，A2 arbiter 真机确认在役、剩余 DoD 缺口可由后续线承接，闭卷裁决站得住。LineDoneAwaitingRosterRetirement 据此收口。RETIRED 集合（2026-09-02 监督面闭卷审计 #225）成员，与 CONVERGED 严格互斥，enabled=false 留名册。"
     },
     {
       "folder_id": "wf-9b5931",
@@ -173,7 +173,7 @@
       "alias": "ronin-entry-unify",
       "max_rounds": 9999,
       "enabled": false,
-      "_retirement": "2026-09-02 05:4x 闭卷审计判定不复活（监督面）：舰队入口统一线，U1/U2/U3/U4 七项判据逐条真机核验全绿（验收在已部署 release 上跑、非 worktree）。其补的 goal_reject 边已由监督面首次真实使用收口 wf-e7b0dd。",
+      "_retirement": "2026-09-02 05:4x 闭卷审计判定不复活（监督面）：舰队入口统一线，U1/U2/U3/U4 七项判据逐条真机核验全绿（验收在已部署 release 上跑、非 worktree）。其补的 goal_reject 边已由监督面首次真实使用收口 wf-e7b0dd。RETIRED 集合（2026-09-02 监督面闭卷审计 #225）成员，与 CONVERGED 严格互斥，enabled=false 留名册。",
       "_provenance": "2026-08-31 第十波（用户令「把所有入口进行一个整体统一，然后 goal-driven 来自举这个工作」）。舰队入口整体统一线：U1 goal MCP 独立面切分（:5611，dd 面回纯 dev-dispatch）→ U2 入册流水线（提交→pending queue→/v1/enrollments→E8→挂板，放行权留监督面）→ U3 入口总表 → U4 自举 e2e（本线为统一入口第一个 dogfood 用户）。设计原则（用户拍板）：统一的是提交不是点火；goal MCP 不寄居 dd 面。spec 随卷（goal-mcp-surface-split / goal-enroll-pipeline，源 wf-216dc3 15:17 挂单）。座位选 opencode-gpt-sol：dsv4pro 集中度 11/12 不再加，terra 留 memory-mcp 线，sol 第二线兼供网关熵实测样本。"
     },
     {
@@ -198,7 +198,7 @@
       "max_rounds": 3,
       "alias": "ronin-e7b0dd",
       "enabled": false,
-      "_retirement": "2026-09-02 05:5x 闭卷审计判定退役（监督面）：U4 自举 e2e 的真实入册候选，max_rounds=3 跑完即验完。声明验收自跑 exit 0；终态理由「真实 enroll 已提交、E8 已发射、三项 U4 缺陷经 dev-fg-a598e9f38bce 修复并合并」经核属实；其 ronin-mcp 入册申请已由 goal_reject 落 rejected（decision_ref=msg_01M1CJHJJB3FV07E1ZAEHK4S58）。使命已尽。",
+      "_retirement": "2026-09-02 05:5x 闭卷审计判定退役（监督面）：U4 自举 e2e 的真实入册候选，max_rounds=3 跑完即验完。声明验收自跑 exit 0；终态理由「真实 enroll 已提交、E8 已发射、三项 U4 缺陷经 dev-fg-a598e9f38bce 修复并合并」经核属实；其 ronin-mcp 入册申请已由 goal_reject 落 rejected（decision_ref=msg_01M1CJHJJB3FV07E1ZAEHK4S58）。使命已尽。RETIRED 集合（2026-09-02 监督面闭卷审计 #225）成员，与 CONVERGED 严格互斥，enabled=false 留名册。",
       "_provenance": "2026-09-01 U4 放行入编（用户令：把舰队恢复到全速运转）：wf-c106b9「舰队入口整体统一」线的 U4 自举 e2e 载体。**alias 订正**：PR #214 曾误用 `ronin-mcp`，其 token 是指向监督面自身 /data/agent-bus/tokens/uther-tui.token 的 symlink——该 alias 已于 2026-09-01 03:2x 被监督面以「身份冒用隐患、绝对阻断项」REJECT，我入编时只做了存在性检查未验 realpath，正好复现了 goal_enroll gate 6 的同一缺陷。现改用专属 token 的 `ronin-e7b0dd`（/data/ronin/secrets/ronin-e7b0dd.token，0600 真文件、realpath 专属，2026-09-01 04:56 铸）。max_rounds=3 沿用入册申请声明（演练线，非常驻），与 wf-a8c7b5 同类。goal SSoT：wf-e7b0dd；放行线 SSoT：wf-c106b9。"
     }
   ],
