@@ -205,6 +205,20 @@
       "enabled": false,
       "_retirement": "2026-09-02 05:5x 闭卷审计判定退役（监督面）：U4 自举 e2e 的真实入册候选，max_rounds=3 跑完即验完。声明验收自跑 exit 0；终态理由「真实 enroll 已提交、E8 已发射、三项 U4 缺陷经 dev-fg-a598e9f38bce 修复并合并」经核属实；其 ronin-mcp 入册申请已由 goal_reject 落 rejected（decision_ref=msg_01M1CJHJJB3FV07E1ZAEHK4S58）。使命已尽。RETIRED 集合（2026-09-02 监督面闭卷审计 #225）成员，与 CONVERGED 严格互斥，enabled=false 留名册。",
       "_provenance": "2026-09-01 U4 放行入编（用户令：把舰队恢复到全速运转）：wf-c106b9「舰队入口整体统一」线的 U4 自举 e2e 载体。**alias 订正**：PR #214 曾误用 `ronin-mcp`，其 token 是指向监督面自身 /data/agent-bus/tokens/uther-tui.token 的 symlink——该 alias 已于 2026-09-01 03:2x 被监督面以「身份冒用隐患、绝对阻断项」REJECT，我入编时只做了存在性检查未验 realpath，正好复现了 goal_enroll gate 6 的同一缺陷。现改用专属 token 的 `ronin-e7b0dd`（/data/ronin/secrets/ronin-e7b0dd.token，0600 真文件、realpath 专属，2026-09-01 04:56 铸）。max_rounds=3 沿用入册申请声明（演练线，非常驻），与 wf-a8c7b5 同类。goal SSoT：wf-e7b0dd；放行线 SSoT：wf-c106b9。"
+    },
+    {
+      "folder_id": "wf-525fd4",
+      "seat": "opencode-dsv4pro",
+      "max_rounds": 9999,
+      "alias": "ronin-mcp-only",
+      "enabled": true
+    },
+    {
+      "folder_id": "wf-3ffd90",
+      "seat": "opencode-gpt-sol",
+      "max_rounds": 9999,
+      "alias": "ronin-decom",
+      "enabled": true
     }
   ],
   "line_environment": {
