@@ -46,3 +46,17 @@ class TestMcpOnlyScaffold:
             "the scaffold must produce real per-criterion output, not substitute "
             "'No such file or directory' for a missing script"
         )
+
+    def test_m4_section_calls_the_availability_oracle(self) -> None:
+        text = SCRIPT.read_text(encoding="utf-8")
+        assert "judge_mcp_availability" in text, (
+            "M4 must drive the fleet_graph.mcp_availability oracle, not a keyword "
+            "scan of src/config (goal.md M4 wants a real determination)"
+        )
+        assert "FastMcpSurface" in text, (
+            "M4 must point the oracle at a real surface via FastMcpSurface, not "
+            "substitute a text grep for the availability determination"
+        )
+        assert "grep_paths" not in text, (
+            "the old M4 keyword-grep detection must be replaced by the oracle"
+        )
