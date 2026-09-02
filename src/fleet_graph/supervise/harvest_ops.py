@@ -20,7 +20,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from fleet_graph.dd.control_plane import RECORD_FILE, STATUS_FILE
+from fleet_graph.dd.control_plane import RECORD_FILE, RESULT_FILE, STATUS_FILE
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.vendor import git_ops
 
@@ -775,21 +775,62 @@ class DefaultHarvestOps:
                 return True
         return False
 
-    def _terminal_of(self, dev_dir: Path) -> tuple[str, bool]:
-        """读 `<dd_root>/<dev>/status.json` 的 terminal 字段；不可读/坏档 -> 按在飞。
+    def _terminal_of(self, dev_dir: Path) -> dict[str, Any]:
+        """H-B：终态判定以权威结果为准——先读 `result.json`，`status.json` 退居缓存兜底。
 
-        返回 `(terminal, status_ok)`：status_ok=True 表示文件可读且顶层为 JSON 对象
-        （此时 terminal 空/缺失/falsy = 在飞）；status_ok=False 表示缺失/坏档
-        （fail-closed，调用方按在飞处理）。
+        返回机器可读结构 `{"terminal": str, "terminal_ok": bool, "determinable":
+        bool, "source": str}`：
+
+        - `terminal`：读到的非空 terminal（否则 `""`）；
+        - `terminal_ok`：是否从任一来源读到非空 terminal（= 该单已终态，不持有树）；
+        - `determinable`：是否至少一个来源可读且顶层为 JSON 对象（可判定在飞）；
+          两个来源都缺失/坏档/非对象 -> False（fail-closed，调用方按在飞处理）；
+        - `source`：提供 terminal 的来源（`"result.json"` / `"status.json"` /
+          `""`）。
+
+        读取顺序（H-B）：先读 `<dev_dir>/result.json`（权威事实源，g1 即
+        `<dd_root>/<dev>/result.json`），顶层 JSON 对象且 `terminal` 非空 ->
+        已终态；result.json 缺失/坏档/无 terminal 时退回读 `status.json` 的
+        `terminal`（status.json 只是可重建缓存，不是第二事实源）。**不得**因为
+        status.json 缺失/不可读就 fall back 成「无法判定」——只要有终态的
+        result.json，答案就是「不持有」，绝不再判红。
         """
+        result_path = dev_dir / RESULT_FILE
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result_ok = isinstance(result, dict)
+        except (OSError, ValueError):
+            result_ok = False
+        if result_ok:
+            terminal = str(result.get("terminal") or "")
+            if terminal:
+                return {
+                    "terminal": terminal,
+                    "terminal_ok": True,
+                    "determinable": True,
+                    "source": RESULT_FILE,
+                }
         status_path = dev_dir / STATUS_FILE
         try:
             status = json.loads(status_path.read_text(encoding="utf-8"))
+            status_ok = isinstance(status, dict)
         except (OSError, ValueError):
-            return "", False
-        if not isinstance(status, dict):
-            return "", False
-        return str(status.get("terminal") or ""), True
+            status_ok = False
+        if status_ok:
+            terminal = str(status.get("terminal") or "")
+            if terminal:
+                return {
+                    "terminal": terminal,
+                    "terminal_ok": True,
+                    "determinable": True,
+                    "source": STATUS_FILE,
+                }
+        return {
+            "terminal": "",
+            "terminal_ok": False,
+            "determinable": result_ok or status_ok,
+            "source": "",
+        }
 
     def detect_inflight_binding(
         self,
@@ -800,25 +841,30 @@ class DefaultHarvestOps:
         """H8 交付 A：只读 occupancy 判定——`tree_path` 是否被另一张在飞单绑定。
 
         返回机器可读 `{"bound_development_id": str|None, "in_flight": bool,
-        "detail": str}`，语义闭合：
+        "detail": str, "repo_path": str}`，语义闭合：
 
         1. 规范化 `tree_path`（`Path(...).resolve()`，同 `_resolved`）。
         2. 枚举 `<dd_root>/<development_id>/record.json`，读 `repo_path`
            （=worktree 绑定），规范化后与 `tree_path` 比对；不等时若 record
            `repo_path` 是 linked worktree，用 `git rev-parse --git-common-dir`
            解析其 canonical 再判等（覆盖 record 直接指向 canonical 与
-           worktree -> canonical 两种情况）。任一条 record 不可读/坏档 ->
-           记为「无法判定」，不静默跳过（fail-closed）。
-        3. 命中绑定（含自身归属解析命中）时读 `<dd_root>/<id>/status.json` 的
-           `terminal` 字段：空/缺失/falsy -> `in_flight=true`；非空 -> 终态
-           `in_flight=false`。status.json 缺失/不可读 -> 保守按 `in_flight=true`
-           （fail-closed）。
+           worktree -> canonical 两种情况）。**H-A**：缺 `record.json` /
+           JSON 坏档 / 顶层非 JSON 对象 -> 读不到任何 `repo_path`，无法构成
+           对 `tree_path` 的绑定 -> 跳过（out of scope），**绝不**进任何
+           「阻断所有树」的全局 `indeterminate` 聚合。
+        3. 命中绑定（含自身归属解析命中）时走 **H-B** 终态判定：先读
+           `<dd_root>/<id>/result.json` 的 `terminal`（权威结果），非空 ->
+           已终态 `in_flight=false`；result.json 缺失/坏档/无 terminal 时退回
+           读 `status.json` 的 `terminal`（status.json 只是可重建缓存，不是
+           第二事实源）；两者都拿不到非空 terminal -> 按在飞处理（fail-closed）。
         4. 命中且在飞 -> 返回 `{"bound_development_id": <该id>, "in_flight":
-           True, "detail": ...}`。没有任何在飞单绑定（含只被终态单绑定）->
-           `{"bound_development_id": None, "in_flight": False, "detail": ""}`。
+           True, "repo_path": <规范化 tree_path>, "detail": ...}`（**H-C**：
+           `detail` 非空且同时包含 dev id 与规范化树路径；`repo_path` 非空）。
+           没有任何在飞单绑定（含只被终态单绑定）-> `{"bound_development_id":
+           None, "in_flight": False, "detail": "", "repo_path": ""}`。
         5. **本方法只读**：零 `rmtree`/`worktree remove`/`reset`/`checkout`/
            `clean`，绝不写/建/登记任何文件——所有输入都来自既有
-           `record.json`/`status.json`/git 读口，不另造所有权账本。
+           `record.json`/`result.json`/`status.json`/git 读口，不另造所有权账本。
 
         **rc-3d12fbbe 修复（排序遮蔽）**：当 `current_development_id` 非 None
         时，本单自身在飞绑定**不构成外来占用**——跳过并继续扫描其余 record，
@@ -829,8 +875,12 @@ class DefaultHarvestOps:
         """
         tree = _resolved(tree_path)
         if not dd_root.is_dir():
-            return {"bound_development_id": None, "in_flight": False, "detail": ""}
-        indeterminate: list[str] = []
+            return {
+                "bound_development_id": None,
+                "in_flight": False,
+                "detail": "",
+                "repo_path": "",
+            }
         for child in sorted(dd_root.iterdir()):
             if not child.is_dir():
                 continue
@@ -842,35 +892,39 @@ class DefaultHarvestOps:
             try:
                 record = json.loads(record_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
-                indeterminate.append(f"{dev_id}: record.json 不可读/坏档（无法判定）")
+                # H-A：缺/坏 record.json 读不到任何 repo_path，无法构成对
+                # tree_path 的绑定 -> out of scope，跳过（绝不进全局 indeterminate）。
                 continue
             if not isinstance(record, dict):
-                indeterminate.append(f"{dev_id}: record.json 顶层非 JSON 对象（无法判定）")
+                # H-A：顶层非 JSON 对象同样读不到 repo_path -> out of scope，跳过。
                 continue
             repo_path = str(record.get("repo_path") or "")
             if not repo_path:
                 continue
             if not self._binding_matches(tree, _resolved(Path(repo_path))):
                 continue
-            terminal, status_ok = self._terminal_of(child)
-            if not status_ok or not terminal:
-                return {
-                    "bound_development_id": dev_id,
-                    "in_flight": True,
-                    "detail": (
-                        f"{tree_path} 被在飞 development {dev_id} 绑定"
-                        f"（status.json terminal={terminal!r}"
-                        + ("，status.json 缺失/不可读 fail-closed" if not status_ok else "")
-                        + "）"
-                    ),
-                }
-        if indeterminate:
+            # H-B：命中绑定先走权威结果终态判定（result.json 优先，status.json 兜底）。
+            terminal_info = self._terminal_of(child)
+            if terminal_info["terminal_ok"]:
+                # 已终态 -> 不持有树，继续扫描其余 record。
+                continue
+            # 非终态 / 无法判定 -> 按在飞处理（fail-closed），H-C 给机器可读理由。
+            if terminal_info["determinable"]:
+                reason = "result.json 与 status.json 均无非空 terminal（在飞）"
+            else:
+                reason = "result.json 与 status.json 均缺失/坏档，无法判定（fail-closed）"
             return {
-                "bound_development_id": None,
+                "bound_development_id": dev_id,
                 "in_flight": True,
-                "detail": "；".join(indeterminate),
+                "repo_path": str(tree),
+                "detail": f"{tree} 被在飞 development {dev_id} 绑定（{reason}）",
             }
-        return {"bound_development_id": None, "in_flight": False, "detail": ""}
+        return {
+            "bound_development_id": None,
+            "in_flight": False,
+            "detail": "",
+            "repo_path": "",
+        }
 
     def _branch_occupied_by_worktree(self, repo: Path, branch: str) -> dict[str, Any]:
         """只读占用检测：`git worktree list --porcelain` 找检出 `branch` 的 worktree。

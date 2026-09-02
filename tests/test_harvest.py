@@ -2198,6 +2198,109 @@ class TestHarvestTreeOccupancy:
         assert binding["in_flight"] is False, binding
         assert binding["bound_development_id"] is None, binding
 
+    def test_unrelated_dev_missing_record_json_with_terminal_result_proceeds(
+        self, tmp_path: Path
+    ) -> None:
+        """①——无关单缺 record.json 且 result 终态 -> 收割照常进行（H-A + H-B）。
+
+        构造 dd_root 含一个与本次要收割的树**无关**的发展目录：缺 record.json
+        （也无 status.json），但带终态 result.json（terminal 非空）。未修复时
+        detect 因该无关目录进全局 `indeterminate` -> 恒 in_flight=True 误 escalate；
+        修复后必须 out of scope 跳过 -> in_flight=False、收割照常进行。
+        """
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        target = tmp_path / "target"
+        git(canonical, "worktree", "add", "--detach", str(target), "main")
+
+        dd_root = tmp_path / "dd"
+        # 无关目录：缺 record.json（也无 status.json），带终态 result.json（fault）。
+        stray = dd_root / "dev-fg-STRAY"
+        stray.mkdir(parents=True)
+        (stray / "result.json").write_text(
+            json.dumps({"development_id": "dev-fg-STRAY", "terminal": "fault"}),
+            encoding="utf-8",
+        )
+        # 本次要收割的树归属：subject 单 record 绑定 target，终态。
+        subject = dd_root / "dev-fg-SUBJECT"
+        subject.mkdir(parents=True)
+        (subject / "record.json").write_text(
+            json.dumps(
+                {
+                    "development_id": "dev-fg-SUBJECT",
+                    "repo_path": str(target),
+                    "remote_url": str(tmp_path / "local-remote.git"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        (subject / "status.json").write_text(
+            json.dumps({"development_id": "dev-fg-SUBJECT", "terminal": "complete"}),
+            encoding="utf-8",
+        )
+
+        # H-A + H-B：缺 record.json 的无关目录 out of scope -> detect 放行。
+        binding = DefaultHarvestOps().detect_inflight_binding(target, dd_root)
+        assert binding["in_flight"] is False, binding
+        assert binding["bound_development_id"] is None, binding
+
+        # 编排层照常进行：occupancy 放行 -> outcome 不是 escalated、intake ok True。
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        intake_step = next(s for s in result["steps"] if s["step"] == "intake")
+        assert intake_step["ok"] is True
+        assert intake_step.get("escalate") != "HARVEST_TREE_OCCUPIED_BY_INFLIGHT"
+
+    def test_inflight_foreign_binding_escalates_with_machine_readable_reason(
+        self, tmp_path: Path
+    ) -> None:
+        """②——本次要动的树确被另一在飞单绑定 -> refuse+escalate 且 detail 含单 id 与树路径（H-C）。
+
+        构造 dev-fg-OTHER 的 record repo_path 绑定 <target> 且在飞（status.json
+        terminal 空 + 无终态 result.json）。断言 detect 返回 in_flight=True、
+        bound=dev-fg-OTHER、`repo_path` 非空、`detail` 同时含 dev id 与树路径；
+        编排层 outcome=escalated、intake step escalate 码正确、写步骤一个没跑、
+        `<target>` 一字未动。
+        """
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical, target, sentinel, dd_root = _h8_target_fixture(
+            tmp_path, other_terminal="", subject_terminal="complete"
+        )
+        # H-C：detect 返回体必带非空 repo_path + 同时含 dev id 与树路径的 detail。
+        binding = DefaultHarvestOps().detect_inflight_binding(target, dd_root)
+        assert binding["in_flight"] is True, binding
+        assert binding["bound_development_id"] == "dev-fg-OTHER", binding
+        assert binding["repo_path"], "detect 返回体 repo_path 不得为空"
+        assert binding["detail"] and "dev-fg-OTHER" in binding["detail"]
+        assert binding["detail"] and str(target.resolve()) in binding["detail"]
+
+        # 编排层：outcome=escalated + intake step 原样落进 repo_path/detail/bound。
+        config = _h8_config(tmp_path, canonical=canonical, dd_root=dd_root, ops=DefaultHarvestOps())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        intake_step = next(s for s in result["steps"] if s["step"] == "intake")
+        assert intake_step["ok"] is False
+        assert intake_step["escalate"] == "HARVEST_TREE_OCCUPIED_BY_INFLIGHT"
+        assert intake_step["bound_development_id"] == "dev-fg-OTHER"
+        assert intake_step["repo_path"], "intake step repo_path 不得为空"
+        assert intake_step["detail"] and "dev-fg-OTHER" in intake_step["detail"]
+        assert intake_step["detail"] and str(target.resolve()) in intake_step["detail"]
+        # 写步骤一个没跑 + `<target>` 一字未动（HEAD/porcelain/哨兵字节/目录）。
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert set(receipt["writes_skipped"]) >= set(WRITE_STEPS)
+        assert not any(
+            s.get("step") in ("worktree_cherry_pick", "pr_squash_merge", "ff_only_pull")
+            and s.get("ok") is True
+            for s in receipt["steps"]
+        )
+        assert (target / "sentinel.bin").read_bytes() == sentinel
+        assert target.is_dir()
+
 
 class TestResolveVerifyArgv:
     """交付 A/B：verify argv 按目标仓解析（机械口 + 编排层），不再全局硬编码 make verify。

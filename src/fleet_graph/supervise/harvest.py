@@ -278,8 +278,10 @@ def _detect_occupied_tree(
 
     任一调用返回 `in_flight=True` 且 `bound_development_id != 当前 development_id`
     -> 立即返回机器可读占用事实 `{"escalate": ..., "bound_development_id": ...,
-    "detail": ...}`；否则（无绑定 / 仅终态绑定 / 绑定为本单）-> None，走既有链。
-    探测读口异常 -> 保守按占用 escalate（fail-closed，绝不静默放行）。
+    "repo_path": ..., "detail": ...}`；否则（无绑定 / 仅终态绑定 / 绑定为本单）->
+    None，走既有链。探测读口异常 -> 保守按占用 escalate（fail-closed，绝不静默
+    放行）。`repo_path` 与 `detail` 均不得为空（H-C：机器可读理由必须落进
+    intake step 与 receipt）。
     """
     probes: list[tuple[str, Path | None]] = [
         ("record_worktree", Path(record_worktree) if record_worktree else None),
@@ -299,12 +301,14 @@ def _detect_occupied_tree(
             return {
                 "escalate": ESCALATE_TREE_OCCUPIED,
                 "bound_development_id": None,
+                "repo_path": str(tree),
                 "detail": f"detect_inflight_binding({name}) 异常，保守 escalate: {repr(exc)[:300]}",
             }
         if binding.get("in_flight") and binding.get("bound_development_id") != development_id:
             return {
                 "escalate": ESCALATE_TREE_OCCUPIED,
                 "bound_development_id": binding.get("bound_development_id"),
+                "repo_path": binding.get("repo_path") or str(tree),
                 "detail": binding.get("detail") or f"{name} 被另一张在飞单绑定",
             }
     return None
@@ -390,18 +394,20 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 canonical=repo,
                 worktree_root=worktree_root,
             )
-        steps = _record_step(
-            state,
-            "intake",
-            ok=not gaps and occupied is None,
-            development_id=development_id,
-            head_commit=head_commit,
-            stage=stage,
-            repo_path=str(repo) if repo is not None else "",
-            record_worktree=record_worktree,
-            remote_url=remote_url,
-            **({} if occupied is None else dict(occupied)),
-        )
+        intake_facts: dict[str, Any] = {
+            "ok": not gaps and occupied is None,
+            "development_id": development_id,
+            "head_commit": head_commit,
+            "stage": stage,
+            "repo_path": str(repo) if repo is not None else "",
+            "record_worktree": record_worktree,
+            "remote_url": remote_url,
+        }
+        if occupied is not None:
+            # H-C：_detect_occupied_tree 返回的 repo_path（本次判定的树的规范化路径）/
+            # detail / bound_development_id 原样落进 intake step，不被上面基础字段吞掉。
+            intake_facts.update(occupied)
+        steps = _record_step(state, "intake", **intake_facts)
         outcome = None
         if gaps or occupied is not None:
             outcome = OUTCOME_ESCALATED
