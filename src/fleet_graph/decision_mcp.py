@@ -58,6 +58,7 @@ from fleet_graph.cost_obs.exposition import Sample, render
 from fleet_graph.decision_bridge.owners import (
     OWNER_KIND_LINE,
     RESUME_REFUSED,
+    DdOwnerSource,
     LineOwnerSource,
     OwnerTarget,
 )
@@ -102,6 +103,14 @@ DECISION_APPROVE = "APPROVE"
 DECISION_REJECT = "REJECT"
 ALLOWED_DECISIONS = frozenset({DECISION_APPROVE, DECISION_REJECT})
 
+#: Target kinds the surface distinguishes. ``line`` is the historic parked-goal-line
+#: path (the backward-compatible three-arg delivery); ``dd`` names a dd development
+#: gate. The two are explicitly distinct in ``inputSchema`` -- never one target
+#: string silently swallowing both semantics.
+TARGET_KIND_LINE = "line"
+TARGET_KIND_DD = "dd"
+ALLOWED_TARGET_KINDS = frozenset({TARGET_KIND_LINE, TARGET_KIND_DD})
+
 #: Outcome vocabulary of the surface. ``delivered`` is the only success; every
 #: refusal carries a stable ``code`` and, where applicable, ``retryable``.
 OUTCOME_DELIVERED = "delivered"
@@ -115,6 +124,12 @@ CODE_NO_WAITING_PARTY = "NO_WAITING_PARTY"
 CODE_QUESTION_CARD_UNRESOLVED = "QUESTION_CARD_UNRESOLVED"
 CODE_OWNER_REFUSED = "OWNER_REFUSED"
 
+#: dd-specific refusals. A dd target that is not admitted at all, and one that is
+#: admitted but not awaiting the gate, each get their own closed code -- a dd gate
+#: is never folded into the line vocabulary and never silently swallowed.
+CODE_DD_NOT_FOUND = "DD_NOT_FOUND"
+CODE_DD_NOT_AWAITING_GATE = "DD_NOT_AWAITING_GATE"
+
 #: Prometheus metric names emitted by the ledger's textfile.
 METRIC_DELIVERED = "fleet_graph_decision_delivered_total"
 METRIC_REFUSED = "fleet_graph_decision_refused_total"
@@ -126,6 +141,10 @@ STALL_SUBDIR = ".scheduler"
 
 #: Where the surface's durable ledger and metrics textfile live.
 DEFAULT_STATE_DIR = Path("/data/fleet-graph/decision-mcp")
+
+#: The dd control plane's root; where ``target_kind=dd`` deliveries resolve the
+#: waiting development (the same default ``DdOwnerSource`` reads).
+DEFAULT_DD_ROOT = Path("/data/fleet-graph/dd")
 
 
 class DecisionPayloadError(RuntimeError):
@@ -171,8 +190,36 @@ class DeliveryResult:
         return payload
 
 
+def _validate_verdict(decision: str, reason: str) -> tuple[str, str]:
+    """Validate ``decision`` + ``reason`` at the call point; raise on any defect.
+
+    Shared by the line and dd paths: the verdict vocabulary is the same closed
+    set regardless of which kind of owner receives it.
+    """
+    if not isinstance(decision, str) or not decision.strip():
+        raise DecisionPayloadError("decision is required (APPROVE or REJECT)")
+    normalized = decision.strip().upper()
+    if normalized not in ALLOWED_DECISIONS:
+        raise DecisionPayloadError(f"decision must be APPROVE or REJECT, got {decision!r}")
+    if not isinstance(reason, str):
+        raise DecisionPayloadError("reason is required and must be a string")
+    if not reason.strip():
+        raise DecisionPayloadError("reason is required")
+    return normalized, reason.strip()
+
+
+def _normalize_target_kind(target_kind: str) -> str:
+    """Reduce ``target_kind`` to its canonical token or refuse at the call point."""
+    if not isinstance(target_kind, str) or not target_kind.strip():
+        raise DecisionPayloadError("target_kind is required ('line' or 'dd')")
+    kind = target_kind.strip()
+    if kind not in ALLOWED_TARGET_KINDS:
+        raise DecisionPayloadError(f"target_kind must be 'line' or 'dd', got {target_kind!r}")
+    return kind
+
+
 def _validate(line: str, decision: str, reason: str) -> tuple[str, str, str]:
-    """Validate the minimal payload at the call point; raise on any defect.
+    """Validate the minimal line payload at the call point; raise on any defect.
 
     Spec item 4: the payload must be legal *here*, not rejected downstream.
     ``decision`` accepts only the exact tokens ``APPROVE`` / ``REJECT``
@@ -183,16 +230,8 @@ def _validate(line: str, decision: str, reason: str) -> tuple[str, str, str]:
     if not isinstance(line, str) or not line.strip():
         raise DecisionPayloadError("line is required")
     line = line.strip()
-    if not isinstance(decision, str) or not decision.strip():
-        raise DecisionPayloadError("decision is required (APPROVE or REJECT)")
-    normalized = decision.strip().upper()
-    if normalized not in ALLOWED_DECISIONS:
-        raise DecisionPayloadError(f"decision must be APPROVE or REJECT, got {decision!r}")
-    if not isinstance(reason, str):
-        raise DecisionPayloadError("reason is required and must be a string")
-    if not reason.strip():
-        raise DecisionPayloadError("reason is required")
-    return line, normalized, reason.strip()
+    normalized, reason = _validate_verdict(decision, reason)
+    return line, normalized, reason
 
 
 def _roster_ids(lines: list[Any]) -> set[str]:
@@ -243,15 +282,29 @@ def deliver_decision(
     run_root: Path,
     lines: list[Any],
     clock: Callable[[], float] = time.time,
+    target_kind: str = TARGET_KIND_LINE,
+    target_id: str = "",
+    dd_source: DdOwnerSource | None = None,
 ) -> DeliveryResult:
     """The synchronous delivery core, testable without the MCP transport.
 
-    Returns a :class:`DeliveryResult` for every input; only an invalid payload
-    raises :class:`DecisionPayloadError` (the call-point refusal). Never
-    silently swallows: a parked, resolvable line is woken through the registered
-    control entry and reported ``delivered``, and every refusal names its
-    reason.
+    ``target_kind`` selects the owner surface: ``line`` (the default) is the
+    historic parked-goal-line path, and ``dd`` delivers to a dd development's
+    gate. Returns a :class:`DeliveryResult` for every input; only an invalid
+    payload raises :class:`DecisionPayloadError` (the call-point refusal).
+    Never silently swallows: a parked, resolvable line is woken through the
+    registered control entry, an awaiting dd gate is resumed through the dd
+    control plane, and every refusal names its reason.
     """
+    kind = _normalize_target_kind(target_kind)
+    if kind == TARGET_KIND_DD:
+        return deliver_decision_dd(
+            target_id=target_id,
+            decision=decision,
+            reason=reason,
+            dd_source=dd_source if dd_source is not None else DdOwnerSource(DEFAULT_DD_ROOT),
+        )
+
     line, decision, reason = _validate(line, decision, reason)
 
     if line not in _roster_ids(lines):
@@ -338,6 +391,117 @@ def deliver_decision(
             "card_entity_id": target.card_entity_id,
             "resume_status": owner_result.status,
         },
+    )
+
+
+def deliver_decision_dd(
+    *,
+    target_id: str,
+    decision: str,
+    reason: str,
+    dd_source: DdOwnerSource,
+) -> DeliveryResult:
+    """Deliver one decision to a dd development gate, synchronously.
+
+    The caller names the dd development by id; the server resolves the pending
+    question/card from the dd control plane's ``awaiting_gate`` record and
+    delivers the verdict through ``DdControlPlane.gate(development_id,
+    resume=True)``. An unknown dd, a dd that is not awaiting the gate, or an
+    owner-side refusal each map to a distinct, explicit refusal -- never a
+    silent HTTP-200 swallow.
+    """
+    if not isinstance(target_id, str) or not target_id.strip():
+        raise DecisionPayloadError("target_id is required for a dd target")
+    target_id = target_id.strip()
+    decision, reason = _validate_verdict(decision, reason)
+
+    try:
+        target, refusal = _resolve_dd_target(dd_source, target_id)
+    except Exception as exc:
+        return DeliveryResult(
+            status=OUTCOME_REFUSED,
+            code=CODE_OWNER_REFUSED,
+            message=f"dd control plane unavailable: {type(exc).__name__}: {exc}",
+            line=target_id,
+            decision=decision,
+        )
+    if refusal is not None:
+        return DeliveryResult(
+            status=OUTCOME_REFUSED,
+            code=refusal,
+            message=_dd_refusal_message(refusal, target_id),
+            line=target_id,
+            decision=decision,
+        )
+
+    action_key = f"mcp:dd:{target.id}:g{target.generation}:{decision}"
+    owner_result = dd_source.resume(target, action_key)
+    if owner_result.status == RESUME_REFUSED:
+        return DeliveryResult(
+            status=OUTCOME_REFUSED,
+            code=CODE_OWNER_REFUSED,
+            message=f"owner refused delivery: {owner_result.detail}",
+            line=target_id,
+            decision=decision,
+            generation=target.generation,
+            question_note_id=target.question_note_id,
+            card_entity_id=target.card_entity_id,
+        )
+
+    return DeliveryResult(
+        status=OUTCOME_DELIVERED,
+        line=target_id,
+        decision=decision,
+        generation=target.generation,
+        question_note_id=target.question_note_id,
+        card_entity_id=target.card_entity_id,
+        action_key=action_key,
+        message=(
+            f"delivered and consumed: dd gate {target.id} resumed through the "
+            f"control plane ({owner_result.status})"
+        ),
+        target={
+            "kind": target.kind,
+            "id": target.id,
+            "generation": target.generation,
+            "question_note_id": target.question_note_id,
+            "card_entity_id": target.card_entity_id,
+            "resume_status": owner_result.status,
+        },
+    )
+
+
+def _resolve_dd_target(
+    dd_source: DdOwnerSource, target_id: str
+) -> tuple[OwnerTarget | None, str | None]:
+    """(awaiting dd target, None) or (None, closed refusal code).
+
+    The awaiting owner is found by development id among the control plane's
+    ``awaiting_gate`` rows; when the id is absent from those rows, the control
+    plane is asked whether the development exists at all, so an unknown dd
+    (``DD_NOT_FOUND``) is distinguished from a dd that is admitted but not
+    awaiting the gate (``DD_NOT_AWAITING_GATE``).
+    """
+    from fleet_graph.dd.control_plane import ControlPlaneError
+
+    for target in dd_source.discover_all():
+        if target.id == target_id:
+            return target, None
+    try:
+        dd_source._control_plane().get(target_id)
+    except ControlPlaneError as exc:
+        if exc.code == "DEVELOPMENT_NOT_FOUND":
+            return None, CODE_DD_NOT_FOUND
+        raise
+    return None, CODE_DD_NOT_AWAITING_GATE
+
+
+def _dd_refusal_message(code: str, target_id: str) -> str:
+    if code == CODE_DD_NOT_FOUND:
+        return f"no such dd development: {target_id!r} is not admitted"
+    return (
+        f"dd development {target_id!r} is not awaiting the gate; "
+        "deliver only to a development in awaiting_gate state"
     )
 
 
@@ -490,14 +654,18 @@ def build_decision_mcp_server(
     *,
     ledger: DeliveryLedger | None = None,
     deliver: Callable[..., DeliveryResult] | None = None,
+    dd_source: DdOwnerSource | None = None,
 ) -> Any:
     """Build the standalone decision MCP surface.
 
     ``run_root`` + ``lines`` bind the server-side parked-state resolution;
-    ``ledger`` / ``deliver`` are seams so tests can drive the surface against a
-    scratch state dir and an injectable deliverer. The one tool,
-    ``decision_deliver(line, decision, reason)``, is the synchronous delivery
-    contract described in the module docstring.
+    ``ledger`` / ``deliver`` / ``dd_source`` are seams so tests can drive the
+    surface against a scratch state dir, an injectable deliverer, and an
+    isolated dd owner. The one tool, ``decision_deliver``, is the synchronous
+    delivery contract described in the module docstring: ``target_kind``
+    explicitly separates the ``line`` path (the historic ``line`` + ``decision``
+    + ``reason`` three-arg delivery, still accepted) from the ``dd`` path
+    (``decision`` + ``reason`` + ``target_id``).
 
     Health-isolation rule (2026-09-02): the ledger is **never** silently
     defaulted to ``DEFAULT_STATE_DIR``. A server built without an explicit
@@ -510,12 +678,15 @@ def build_decision_mcp_server(
 
     ledger = ledger if ledger is not None else _NullLedger()
     deliverer = deliver or (
-        lambda line, decision, reason: deliver_decision(
+        lambda line, decision, reason, target_kind=TARGET_KIND_LINE, target_id="": deliver_decision(
             line=line,
             decision=decision,
             reason=reason,
             run_root=run_root,
             lines=lines,
+            target_kind=target_kind,
+            target_id=target_id,
+            dd_source=dd_source,
         )
     )
 
@@ -530,19 +701,31 @@ def build_decision_mcp_server(
         )
 
     @mcp.tool()
-    def decision_deliver(line: str, decision: str, reason: str) -> dict[str, Any]:
-        """Deliver one decision to a parked goal line, synchronously.
+    def decision_deliver(
+        decision: str,
+        reason: str,
+        line: str = "",
+        target_kind: str = TARGET_KIND_LINE,
+        target_id: str = "",
+    ) -> dict[str, Any]:
+        """Deliver one decision to a parked goal line or a dd gate, synchronously.
 
-        Minimal, unambiguous input (spec item 2): only ``line`` + ``decision``
-        (``APPROVE`` / ``REJECT``) + ``reason``. The question/card
-        correspondence is resolved server-side from the line's parked state.
-        Returns either ``delivered``/``consumed`` (the line was woken and its
-        parking lifted) or an explicit refusal with a stable code -- never a
-        silent success. An invalid payload (a decision other than
-        APPROVE/REJECT, or a missing field) is refused at the call point.
+        ``target_kind`` is explicit: ``line`` (default) delivers to the parked
+        line named by ``line``; ``dd`` delivers to the dd development named by
+        ``target_id``. The question/card correspondence is resolved server-side
+        (the line's parked state, or the dd control plane's ``awaiting_gate``
+        record). Returns either ``delivered``/``consumed`` or an explicit
+        refusal with a stable code -- never a silent success. An invalid payload
+        is refused at the call point.
         """
         try:
-            result = deliverer(line=line, decision=decision, reason=reason)
+            result = deliverer(
+                line=line,
+                decision=decision,
+                reason=reason,
+                target_kind=target_kind,
+                target_id=target_id,
+            )
         except DecisionPayloadError as exc:
             refuse(f"invalid payload: {exc}")
         ledger.record(result)
@@ -558,6 +741,7 @@ def serve(
     run_root: str | None = None,
     lines_config: str | None = None,
     state_dir: str | None = None,
+    dd_root: str | None = None,
 ) -> None:
     """Run the standalone decision MCP surface on loopback.
 
@@ -580,19 +764,24 @@ def serve(
         state.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise RuntimeError(f"decision MCP state dir unusable at {state}: {exc}") from exc
-    build_decision_mcp_server(effective_run_root, lines, ledger=ledger).run(
+    dd_source = DdOwnerSource(Path(dd_root) if dd_root else DEFAULT_DD_ROOT)
+    build_decision_mcp_server(effective_run_root, lines, ledger=ledger, dd_source=dd_source).run(
         transport="streamable-http", host=host, port=port, path="/mcp"
     )
 
 
 __all__ = [
     "ALLOWED_DECISIONS",
+    "ALLOWED_TARGET_KINDS",
+    "CODE_DD_NOT_AWAITING_GATE",
+    "CODE_DD_NOT_FOUND",
     "CODE_LINE_NOT_PARKED",
     "CODE_NO_WAITING_PARTY",
     "CODE_OWNER_REFUSED",
     "CODE_QUESTION_CARD_UNRESOLVED",
     "DECISION_APPROVE",
     "DECISION_REJECT",
+    "DEFAULT_DD_ROOT",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
     "DEFAULT_STATE_DIR",
@@ -602,11 +791,14 @@ __all__ = [
     "OUTCOME_DELIVERED",
     "OUTCOME_REFUSED",
     "RESERVED_PORTS_FILE",
+    "TARGET_KIND_DD",
+    "TARGET_KIND_LINE",
     "DecisionPayloadError",
     "DeliveryLedger",
     "DeliveryResult",
     "build_decision_mcp_server",
     "deliver_decision",
+    "deliver_decision_dd",
     "load_reserved_ports",
     "serve",
 ]
