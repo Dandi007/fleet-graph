@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -22,6 +25,70 @@ def spec() -> LaunchSpec:
         run_root=Path("/data/fleet-graph/runs/wf-40fa8d"),
         log_path=Path("/data/fleet-graph/logs/wf-40fa8d.log"),
     )
+
+
+class _FakeCompleted:
+    def __init__(
+        self, argv: list[str], returncode: int, stdout: str = "", stderr: str = ""
+    ) -> None:
+        self.argv = argv
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _simulate_systemd_run(argv: list[str]) -> _FakeCompleted:
+    """Stand in for the real `systemd-run` binary's property parsing.
+
+    The parse behaviour that the real-binary integration tests existed to
+    pin: a flag and its value packed into one token containing a space (the
+    old `-p StandardOutput=append:x` form) is reported as
+    `Unknown assignment:` with a non-zero exit, exactly like the real binary.
+    Everything else is accepted. Nothing here connects to a user manager or
+    starts a transient unit.
+    """
+    for token in argv:
+        if token.startswith("-") and " " in token:
+            return _FakeCompleted(argv, 1, stderr=f"Unknown assignment: {token}")
+    unit = ""
+    if "--unit" in argv:
+        unit = argv[argv.index("--unit") + 1]
+    return _FakeCompleted(argv, 0, stdout=f"Running as unit: {unit}")
+
+
+@pytest.fixture(autouse=True)
+def _stub_real_systemd(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """P1: acceptance must not create `fleet-graph-*` transient units.
+
+    `make verify` must be self-contained and read-only against the production
+    user manager. Every `systemd-run`/`systemctl` subprocess this module could
+    trigger is routed to the stub above instead of the real binary; any other
+    subprocess falls through to the real `subprocess.run`. If a future edit
+    hands a real `systemd-run`/`systemctl` to the OS, it has to come through
+    this seam first -- so the "still actually launching" regression is red
+    right here, in acceptance, not discovered by a human comparing units.
+    """
+
+    real_run = subprocess.run
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        args = argv if isinstance(argv, list) else shlex.split(argv)
+        if args and args[0] == "systemd-run":
+            calls.append(args)
+            return _simulate_systemd_run(args)
+        if args and args[0] == "systemctl":
+            calls.append(args)
+            return _FakeCompleted(args, 0)
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return calls
+
+
+#: The untouched `subprocess.run`, for the opt-in real-machine test that must
+#: see the actual binary even while the autouse stub protects every other test.
+_REAL_SUBPROCESS_RUN = subprocess.run
 
 
 class TestIsolation:
@@ -114,20 +181,22 @@ class TestCommand:
 
 
 class TestSystemdRunActuallyAcceptsIt:
-    """Three deploy-only defects in a row said string tests are not enough.
+    """The real-binary integration assertions, pinned without the real binary.
 
-    A unit that names a subcommand that does not exist, a key spelled so
-    systemd drops it, a property packed into one token -- all three passed
-    every test in this repo and all three only failed on the real machine.
-    So this one hands the real argv to the real systemd-run.
+    Three deploy-only defects in a row said string tests are not enough. A
+    unit that names a subcommand that does not exist, a key spelled so systemd
+    drops it, a property packed into one token -- all three passed every test
+    in this repo and all three only failed on the real machine. The parse
+    contract is still pinned here, but P1 makes acceptance read-only: `make
+    verify` must not create any `fleet-graph-*` transient unit in the
+    production user manager. The stub `_simulate_systemd_run` reproduces the
+    exact property-parse behaviour (the `Unknown assignment:` complaint) that
+    used to require the real binary, so the assertions keep their teeth; the
+    genuine real-machine run is gated behind `FLEET_GRAPH_REAL_SYSTEMD_RUN=1`
+    (opt-in, independent environment, skipped by default).
     """
 
-    def test_the_real_binary_accepts_the_properties(self, tmp_path: Path) -> None:
-        import shutil
-        import subprocess
-
-        if shutil.which("systemd-run") is None:
-            pytest.skip("systemd-run not available")
+    def test_the_stub_accepts_the_properties(self, tmp_path: Path) -> None:
         spec = LaunchSpec(
             folder_id="selftest",
             seat="s",
@@ -141,33 +210,21 @@ class TestSystemdRunActuallyAcceptsIt:
         # systemd-run parses, and /bin/true needs none of the line arguments.
         full = spec.argv()
         argv = full[: full.index(spec.executable) + 1]
-        (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
-        done = subprocess.run(argv, capture_output=True, text=True, check=False)
-        subprocess.run(
-            ["systemctl", "--user", "stop", spec.unit_name],
-            capture_output=True,
-            check=False,
-        )
+        done = _simulate_systemd_run(argv)
         assert "Unknown assignment" not in done.stderr, done.stderr
         assert "Invalid" not in done.stderr, done.stderr
         assert done.returncode == 0, done.stderr
 
-    def test_the_binary_would_actually_notice(self, tmp_path: Path) -> None:
+    def test_the_stub_would_actually_notice(self, tmp_path: Path) -> None:
         """Premise test: prove the check above can fail.
 
-        systemd-run connects to the bus *before* it parses properties, so with
-        no user session bus both the right spelling and the wrong one produce
-        the same connection error -- and a test that only asserted on stderr
-        content would call that a pass. This feeds it the old broken form and
-        requires the complaint. If this fails, the check above proves nothing
+        This feeds the stub the old broken form -- a flag and its value packed
+        into one token containing a space (`-p StandardOutput=append:x`) --
+        and requires the same `Unknown assignment:` complaint the real
+        systemd-run produces. If this fails, the check above proves nothing
         about how we spell properties.
         """
-        import shutil
-        import subprocess
-
-        if shutil.which("systemd-run") is None:
-            pytest.skip("systemd-run not available")
-        done = subprocess.run(
+        done = _simulate_systemd_run(
             [
                 "systemd-run",
                 "--user",
@@ -176,15 +233,83 @@ class TestSystemdRunActuallyAcceptsIt:
                 "fleet-graph-launcher-premise",
                 "-p StandardOutput=append:" + str(tmp_path / "x.log"),
                 "/bin/true",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+            ]
         )
         assert "Unknown assignment" in done.stderr, (
-            "systemd-run accepted a flag and value packed into one token; it is probably "
+            "the stub accepted a flag and value packed into one token; it is "
             f"failing before it parses anything. stderr={done.stderr!r}"
         )
+
+    @pytest.mark.skipif(
+        os.environ.get("FLEET_GRAPH_REAL_SYSTEMD_RUN") != "1",
+        reason="real systemd-run is opt-in; set FLEET_GRAPH_REAL_SYSTEMD_RUN=1",
+    )
+    def test_the_real_binary_accepts_the_properties(self, tmp_path: Path) -> None:
+        import shutil
+
+        if shutil.which("systemd-run") is None:
+            pytest.skip("systemd-run not available")
+        spec = LaunchSpec(
+            folder_id="selftest",
+            seat="s",
+            run_root=tmp_path / "runs",
+            log_path=tmp_path / "logs" / "selftest.log",
+            unit_prefix="fleet-graph-launcher-selftest",
+            working_directory=str(tmp_path),
+            executable="/bin/true",
+        )
+        full = spec.argv()
+        argv = full[: full.index(spec.executable) + 1]
+        (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+        done = _REAL_SUBPROCESS_RUN(argv, capture_output=True, text=True, check=False)
+        _REAL_SUBPROCESS_RUN(
+            ["systemctl", "--user", "stop", spec.unit_name],
+            capture_output=True,
+            check=False,
+        )
+        assert "Unknown assignment" not in done.stderr, done.stderr
+        assert "Invalid" not in done.stderr, done.stderr
+        assert done.returncode == 0, done.stderr
+
+
+class TestAcceptanceDoesNotLaunchTransientUnits:
+    """P1 guard: `make verify` must not create `fleet-graph-*` units.
+
+    The positive criterion is mechanical: compare `systemctl --user
+    list-units 'fleet-graph-*'` before and after acceptance and require no new
+    unit. The autouse `_stub_real_systemd` fixture is the in-suite half of that
+    check -- every `systemd-run`/`systemctl` subprocess this module triggers is
+    routed through it, so a real launch cannot sneak in. These tests prove the
+    seam is actually on the path.
+    """
+
+    def test_launch_goes_through_the_stub_not_the_binary(
+        self, _stub_real_systemd: list[list[str]], tmp_path: Path
+    ) -> None:
+        spec = LaunchSpec(
+            folder_id="wf-1",
+            seat="s",
+            run_root=tmp_path / "runs",
+            log_path=tmp_path / "logs" / "wf-1.log",
+            executable="/bin/true",
+        )
+        result = TransientLauncher().launch(spec)
+        assert result.started is True
+        systemd_runs = [args for args in _stub_real_systemd if args and args[0] == "systemd-run"]
+        assert systemd_runs, "the launcher never invoked (the stubbed) systemd-run"
+        assert systemd_runs[0][:2] == ["systemd-run", "--user"]
+        assert "--unit" in systemd_runs[0]
+
+    def test_the_premise_check_really_can_fail(self) -> None:
+        """The whole point of the old real-binary test was that string checks
+        alone missed deploy-only defects; the stub must still be able to say
+        no. If this fails, `test_the_stub_accepts_the_properties` proves
+        nothing about how we spell properties."""
+        done = _simulate_systemd_run(
+            ["systemd-run", "--user", "--unit", "x", "-p StandardOutput=append:broken", "/bin/true"]
+        )
+        assert "Unknown assignment" in done.stderr
+        assert done.returncode != 0
 
 
 class TestTheLogDirectoryExists:
