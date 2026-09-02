@@ -298,6 +298,85 @@ class TestStartAndReAdopt:
         assert len(launcher.specs) == 1
 
 
+class TestTransientUnitIsolation:
+    """dev-fg-a4624cb34677: the dd-side launch entry.
+
+    Positive: in the test/acceptance context (the FLEET_GRAPH_TRANSIENT_NOOP
+    guard conftest sets), a ``DdControlPlane`` constructed *without* an
+    explicit launcher defaults to a no-op one -- ``start`` records the full
+    verifiable argv (unit name, args frozen) but never hands ``systemd-run
+    --user`` to the real user manager. Negative: the production default (guard
+    unset) keeps real launch semantics, and the accepted `--target-base` /
+    frozen args survive unchanged.
+    """
+
+    def _plane(self, tmp_path: Path, **overrides: Any) -> DdControlPlane:
+        binding = tmp_path / "plugin-binding.json"
+        if not binding.exists():
+            binding.write_text('{"plugin_producer": {}}', encoding="utf-8")
+        return DdControlPlane(
+            root=tmp_path / "dd",
+            plugin_binding=binding,
+            worktree_roots=(str(tmp_path),),
+            working_directory=str(tmp_path),
+            executable="/usr/local/bin/fleet-graph",
+            unit_probe=lambda unit: False,
+            board_factory=lambda: None,
+            clock=lambda: 1_700_000_000.0,
+            **overrides,
+        )
+
+    def test_the_default_plane_launcher_is_noop_in_the_test_context(self, tmp_path: Path) -> None:
+        """No explicit launcher, no injection: the default TransientLauncher
+        resolves through the no-op guard, so the plane's launcher is no-op."""
+        assert self._plane(tmp_path).launcher.dry_run is True
+
+    def test_start_records_the_full_argv_without_a_real_launch(
+        self, scratch: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Positive: `start` on the default plane records the complete argv --
+        systemd-run --user, the frozen unit name and the admitted args -- while
+        subprocess is never reached."""
+        plane = self._plane(tmp_path)
+        dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
+        # Only after admission (which needs git) do we prove the launch itself
+        # never hands anything to subprocess.
+        called: list[list[str]] = []
+        monkeypatch.setattr(
+            "fleet_graph.scheduler.launcher.subprocess.run",
+            lambda argv, **kwargs: (
+                called.append(argv) or pytest.fail("no-op dd launch must never call systemd-run")
+            ),
+        )
+        started = plane.start(dev)
+        assert started["started"] is False
+        assert called == []
+        record = json.loads((plane.root / dev / RECORD_FILE).read_text(encoding="utf-8"))
+        frozen = record["target_base_commit"]
+        launches = json.loads((plane.root / dev / "launches.jsonl").read_text().splitlines()[-1])
+        argv = launches["argv"]
+        assert argv[:2] == ["systemd-run", "--user"]
+        assert argv[argv.index("--unit") + 1] == f"fleet-graph-dd-{dev}-r1"
+        assert argv[argv.index("--target-base") + 1] == frozen
+        # The acceptance argv crosses the boundary with quoting intact.
+        import shlex
+
+        accepted = [argv[i + 1] for i, a in enumerate(argv) if a == "--accept"]
+        assert [shlex.split(a) for a in accepted] == [
+            ["python3", "-m", "pytest", "-q"],
+            ["sh", "-c", "echo 'quoted argument'"],
+        ]
+
+    def test_the_production_default_launcher_is_real_without_the_guard(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Negative: with the guard unset the production default keeps the real
+        launch semantics. Weaving a no-op into the production default makes
+        this test go red (real launch lost)."""
+        monkeypatch.delenv("FLEET_GRAPH_TRANSIENT_NOOP", raising=False)
+        assert self._plane(tmp_path).launcher.dry_run is False
+
+
 class TestFrozenTargetBaseForwarding:
     """The admitted, persisted `target_base_commit` crosses into the runner's
     argv as an explicit `--target-base`, never re-inferred from the worktree.

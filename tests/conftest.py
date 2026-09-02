@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,21 @@ from typing import Any
 import pytest
 
 from fleet_graph.dd.upstream_constants import ATTEMPT_CONTEXT_CONTRACT_VERSION
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _transient_noop_guard() -> None:
+    """The test/acceptance context default: no ``TransientLauncher()`` may hand
+    ``systemd-run --user`` to the real user manager.
+
+    scheduler/launcher.py resolves an unspecified ``dry_run`` through this env
+    guard, so a default-constructed launcher -- in both the scheduler and the
+    dd control plane -- is a no-op that records the full argv instead of
+    launching. Tests that exercise the production launch path construct
+    ``TransientLauncher(dry_run=False)`` explicitly.
+    """
+    os.environ["FLEET_GRAPH_TRANSIENT_NOOP"] = "1"
+
 
 DEVELOPMENT_ID = "dev-001"
 SPEC_PATH = ".dev-dispatch/spec/approved.md"

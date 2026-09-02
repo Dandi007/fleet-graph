@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from fleet_graph.cli import build_parser
 from fleet_graph.scheduler.launcher import (
+    TRANSIENT_NOOP_ENV,
     LaunchSpec,
     TransientLauncher,
 )
@@ -120,14 +125,28 @@ class TestSystemdRunActuallyAcceptsIt:
     systemd drops it, a property packed into one token -- all three passed
     every test in this repo and all three only failed on the real machine.
     So this one hands the real argv to the real systemd-run.
+
+    Deploy-only by construction: under the test-context no-op guard
+    (``FLEET_GRAPH_TRANSIENT_NOOP``, set by tests/conftest.py) these are
+    skipped, because a test/acceptance run must never hand ``systemd-run
+    --user`` to the real user manager. They run only on a real machine with
+    the guard explicitly unset.
     """
+
+    def _require_real_launch(self) -> None:
+        if os.environ.get(TRANSIENT_NOOP_ENV, ""):
+            pytest.skip(
+                "real-systemd-run smoke tests are excluded under the "
+                "test/acceptance no-op guard; run with "
+                f"{TRANSIENT_NOOP_ENV}= unset on a real user manager"
+            )
 
     def test_the_real_binary_accepts_the_properties(self, tmp_path: Path) -> None:
         import shutil
-        import subprocess
 
         if shutil.which("systemd-run") is None:
             pytest.skip("systemd-run not available")
+        self._require_real_launch()
         spec = LaunchSpec(
             folder_id="selftest",
             seat="s",
@@ -163,10 +182,10 @@ class TestSystemdRunActuallyAcceptsIt:
         about how we spell properties.
         """
         import shutil
-        import subprocess
 
         if shutil.which("systemd-run") is None:
             pytest.skip("systemd-run not available")
+        self._require_real_launch()
         done = subprocess.run(
             [
                 "systemd-run",
@@ -188,18 +207,31 @@ class TestSystemdRunActuallyAcceptsIt:
 
 
 class TestTheLogDirectoryExists:
-    def test_launch_creates_it(self, tmp_path: Path) -> None:
+    def test_launch_creates_it(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """`append:` does not create the directory -- systemd fails the unit
         and the line never starts. /data/fleet-graph/logs did not exist on the
-        first real launch, waiting directly behind the property bug."""
+        first real launch, waiting directly behind the property bug.
+
+        The production path (``dry_run=False``) is what creates the directory;
+        the ``systemd-run`` subprocess is stubbed so this test never hands it
+        to the real user manager (the test/acceptance isolation rule).
+        """
+        calls: list[list[str]] = []
+        monkeypatch.setattr(
+            "fleet_graph.scheduler.launcher.subprocess.run",
+            lambda argv, **kwargs: (
+                calls.append(argv) or subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            ),
+        )
         spec = LaunchSpec(
             folder_id="wf-1",
             seat="s",
             log_path=tmp_path / "deep" / "nested" / "wf-1.log",
             executable="/bin/false",
         )
-        TransientLauncher().launch(spec)
+        TransientLauncher(dry_run=False).launch(spec)
         assert (tmp_path / "deep" / "nested").is_dir()
+        assert calls and calls[0][:2] == ["systemd-run", "--user"]
 
 
 class TestDryRun:
@@ -207,6 +239,70 @@ class TestDryRun:
         result = TransientLauncher(dry_run=True).launch(spec)
         assert result.started is False
         assert "systemd-run" in result.detail
+
+
+class TestTransientNoopIsolation:
+    """dev-fg-a4624cb34677: the scheduler-side launch entry.
+
+    Positive (isolation holds): in the test/acceptance context the default
+    ``TransientLauncher`` is no-op -- building a ``LaunchSpec`` and validating
+    its argv never hands ``systemd-run --user`` to the real user manager, and
+    the argv stays fully verifiable. Negative (not blinded): the production
+    path with no no-op injection still goes through ``systemd-run --user``
+    with real launch semantics unchanged.
+    """
+
+    def test_the_test_context_default_launcher_is_noop(self) -> None:
+        """conftest sets FLEET_GRAPH_TRANSIENT_NOOP, so a default-constructed
+        launcher is no-op without any explicit injection."""
+        assert TransientLauncher().dry_run is True
+
+    def test_a_noop_launch_records_the_full_argv_without_starting(self, spec: LaunchSpec) -> None:
+        result = TransientLauncher(dry_run=True).launch(spec)
+        assert result.started is False
+        # The argv stays complete and verifiable: unit name, --user, and the
+        # line's own args all survive the no-op seam.
+        assert "--user" in result.detail
+        assert spec.unit_name in result.detail
+        assert result.detail == shlex.join(spec.argv())
+
+    def test_the_production_default_is_real_without_the_guard(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Negative: no guard, no injection -> the production default keeps
+        the real launch semantics. Weaving a no-op into the production default
+        makes this test go red (real launch lost)."""
+        monkeypatch.delenv("FLEET_GRAPH_TRANSIENT_NOOP", raising=False)
+        assert TransientLauncher().dry_run is False
+
+    def test_the_real_path_hands_systemd_run_to_the_user_manager(
+        self, spec: LaunchSpec, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Negative: an explicit ``dry_run=False`` (or guard unset) still hands
+        ``systemd-run --user`` to the real user manager. The subprocess is
+        faked so the test itself never launches a unit."""
+        argv_sent: list[list[str]] = []
+
+        class FakeProc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(argv: list[str], **kwargs: Any) -> FakeProc:
+            argv_sent.append(argv)
+            return FakeProc()
+
+        monkeypatch.setattr("fleet_graph.scheduler.launcher.subprocess.run", fake_run)
+        result = TransientLauncher(dry_run=False).launch(spec)
+        assert result.started is True
+        assert argv_sent and argv_sent[0][:2] == ["systemd-run", "--user"]
+
+    def test_the_guard_is_an_explicit_default_not_a_global_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit ``dry_run=`` always wins over the guard."""
+        monkeypatch.setenv("FLEET_GRAPH_TRANSIENT_NOOP", "1")
+        assert TransientLauncher(dry_run=False).dry_run is False
 
 
 class TestCli:
