@@ -790,6 +790,30 @@ def _decision_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _line_state_serve(args: argparse.Namespace) -> int:
+    """Serve the read-only line-state MCP surface on loopback.
+
+    The M1 line runtime state surface: read-only narrow tools over the same
+    ``:7494`` read-model view (same field surface, same data source -- never a
+    second reader). It is its own service on :5615.
+    """
+    from fleet_graph.line_state_mcp import serve
+
+    try:
+        serve(
+            host=args.host,
+            port=args.port,
+            run_root=args.run_root,
+            lines_config=args.lines_config,
+        )
+    except RuntimeError as exc:
+        # A startup refusal (port taken) is a visible failure, not a crash
+        # loop: print the clear reason and exit non-zero.
+        print(f"fleet-graph line-state serve: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _state_serve(args: argparse.Namespace) -> int:
     """Serve the M1 fleet-state read-model on loopback. Read-only."""
     from fleet_graph.state.fleet_state import DEFAULT_ENROLL_QUEUE, FleetStateConfig, serve
@@ -1821,6 +1845,31 @@ def build_parser() -> argparse.ArgumentParser:
         "/data/fleet-graph/decision-mcp (env FLEET_GRAPH_DECISION_MCP_STATE_DIR)",
     )
     decision_serve.set_defaults(func=_decision_serve)
+
+    line_state = subparsers.add_parser(
+        "line-state",
+        help="the read-only line-state MCP surface (M1 line runtime state)",
+    )
+    line_state_sub = line_state.add_subparsers()
+    line_state_serve = line_state_sub.add_parser(
+        "serve",
+        help="serve the read-only line-state MCP surface (M1 line runtime state)",
+    )
+    line_state_serve.add_argument("--host", default="127.0.0.1")
+    line_state_serve.add_argument("--port", type=int, default=5615)
+    line_state_serve.add_argument(
+        "--run-root",
+        default=None,
+        help="where the lines' heartbeat.json / terminal.json live; defaults to "
+        "the same /data/fleet-graph/runs the :7494 read model serves",
+    )
+    line_state_serve.add_argument(
+        "--lines-config",
+        default=None,
+        help="the roster SSoT that decides which lines /v1/lines (and the "
+        "line-state MCP) covers; defaults to config/ronin-lines.json",
+    )
+    line_state_serve.set_defaults(func=_line_state_serve)
 
     state = subparsers.add_parser(
         "state", help="the M1 fleet-state read-model (read-only /v1 views)"
