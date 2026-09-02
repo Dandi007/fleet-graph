@@ -168,6 +168,16 @@ ENROLLED = {
     #   但打印 FAIL 却 exit 0，首轮修成用退出码说话。
     "wf-a6cfea",
     "wf-e6560a",
+    # 2026-09-02 第十二波入编（用户开线令两条：「都走 MCP 不要走 native port，MCP 只需要
+    # 保证工具对就好，native port 就可能调用错误」+「过时的基建都下线——比如老的 loop
+    # engine 的」，以「开 line 来开发吧」收尾）。经 goal MCP 走完 goal_enroll -> goal_admit，
+    # 放行裁决 msg_01M1GGC30C72MHYR5WXQ2WF82Q（板 seq 2053）。
+    # wf-525fd4 = 全舰入口收敛到 MCP。立线证据：同一能力经 native 面恒 FORBIDDEN、
+    #   经 MCP 网关一次通过，监督面曾据前者把 wf-818a89 误记为「唯一在等管理员」数日。
+    # wf-3ffd90 = 过时基建下线。⚠️ 其 goal 已钉住依赖陷阱：/data/ronin/secrets/ 是现役
+    #   令牌根（入编门禁 6 硬编码指向它），不可随 /data/ronin 整目录删除。
+    "wf-525fd4",
+    "wf-3ffd90",
     # 2026-09-01 U4 放行（用户令「把舰队恢复到全速运转」）：wf-c106b9 的自举 e2e
     # 载体，统一入册流水线第一个 dogfood 用户。该线驻停 16h 等的就是这一条。
     # max_rounds=3 沿用入册申请声明（演练线，非常驻），故与 wf-a8c7b5 同列例外。
