@@ -276,6 +276,9 @@ class SchedulerConfig:
     harvest_default_branch: str | None = None
     harvest_deploy: list[str] = field(default_factory=list)
     repo: str | None = None
+    #: M4 E7: 纯配置透传（无业务逻辑）。缺省 None → 不发射 --e7-allowlist，
+    #: E7 goal.md 直写保持 deny-all 默认拒绝语义零放宽。
+    e7_allowlist_path: str | None = None
 
     @classmethod
     def from_json(cls, path: Path) -> SchedulerConfig:
@@ -314,6 +317,7 @@ class SchedulerConfig:
             harvest_default_branch=raw.get("harvest_default_branch"),
             harvest_deploy=list(raw.get("harvest_deploy") or []),
             repo=raw.get("repo"),
+            e7_allowlist_path=raw.get("e7_allowlist_path"),
         )
 
 

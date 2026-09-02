@@ -863,6 +863,8 @@ def _scheduler_run(args: argparse.Namespace) -> int:
                 harvest_default_branch=config.harvest_default_branch,
                 harvest_deploy=config.harvest_deploy,
                 repo=config.repo,
+                # M4 E7: 纯配置透传，无业务逻辑。
+                e7_allowlist_path=config.e7_allowlist_path,
             ),
             launcher=TransientLauncher(dry_run=args.dry_run),
             bus=board.client if board is not None else None,

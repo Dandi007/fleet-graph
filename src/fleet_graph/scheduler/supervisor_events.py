@@ -154,6 +154,10 @@ class SupervisorLaunchSpec:
     harvest_default_branch: str | None = None
     harvest_deploy: tuple[str, ...] = ()
     repo: str | None = None
+    #: M4 E7: observer-side passthrough of the `supervisor run` E7 goal.md
+    #: direct-write allowlist flag. Default None -- an unconfigured observer
+    #: emits no --e7-allowlist, so the run keeps its deny-all default (零放宽).
+    e7_allowlist_path: str | None = None
 
     @property
     def unit_name(self) -> str:
@@ -195,6 +199,11 @@ class SupervisorLaunchSpec:
         # deny-all 默认拒绝语义零放宽。
         if self.harvest_allowlist_path is not None:
             argv += ["--harvest-allowlist", self.harvest_allowlist_path]
+        # M4 E7: 在 --state-root 之后、与 --harvest-allowlist 并列按需追加
+        # （词法顺序稳定，测试按 `in argv` 断言）。缺省 None → 不发射，E7 直写
+        # 保持 deny-all 默认拒绝语义零放宽（E7WriteAllowlist.default()）。
+        if self.e7_allowlist_path is not None:
+            argv += ["--e7-allowlist", self.e7_allowlist_path]
         if self.harvest_default_branch is not None:
             argv += ["--harvest-default-branch", self.harvest_default_branch]
         for word in self.harvest_deploy:
@@ -235,6 +244,9 @@ class ObserverConfig:
     harvest_default_branch: str | None = None
     harvest_deploy: list[str] = field(default_factory=list)
     repo: str | None = None
+    #: M4 E7: 透传给 SupervisorLaunchSpec（argv）。缺省 None → 不发射
+    #: --e7-allowlist，E7 直写保持 deny-all 默认拒绝语义零放宽。
+    e7_allowlist_path: str | None = None
 
     @property
     def resolved_cursor_path(self) -> Path:
@@ -718,6 +730,7 @@ class SupervisorObserver:
             harvest_default_branch=self.config.harvest_default_branch,
             harvest_deploy=tuple(self.config.harvest_deploy),
             repo=self.config.repo,
+            e7_allowlist_path=self.config.e7_allowlist_path,
         )
 
     def _log_dedup(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
