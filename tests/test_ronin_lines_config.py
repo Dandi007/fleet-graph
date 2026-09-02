@@ -77,7 +77,27 @@ RETIRED = {
     # 2026-09-02 第二批闭卷审计退役：同样逐条真机核验后不复活。
     "wf-66300e",  # ronin-dr-v4（deep-research V4；R8 判据脚本原样重跑 pass=true）
     "wf-e6560a",  # Claude Code 会话检索 MCP（生产 checkout 亲跑 ACCEPTANCE: PASS）
+    # 2026-09-02 第三批：逐条核「产物是否真在生产分支上」后退役（用户口径：
+    # 真做完了就应该能合并-部署-上线）。核法是把产物 diff 的特征行拿去生产分支
+    # grep，而不是 merge-base --is-ancestor（squash merge 会让后者全面假阴）。
+    "wf-386b2f",  # ronin-cost-observ（生产 Prometheus 上 cost_obs:*:ratio 五条全有值）
+    "wf-fa53cb",  # ronin-ds-quota（quota-api main@8bd7caf4 含 ds-collect.sh；timer active）
+    "wf-fdd6ac",  # ronin-cal-export（calendar-agent master 含 a1f6089d 与 web/export-image.ts）
+    "wf-a6cfea",  # lexicon 术语锚定（lexicon main#9 含 S1 铺仓码，2 个 lexicon timer active）
+    "wf-e313be",  # ronin-cgspec（chatgroup-daemon main 含 P1/P2/P3/P4 四批产物）
+    #             ⚠️ 遗留：promotion 放行本身仍悬置等用户拍板（该线 terminal 原文
+    #             「promotion 放行属用户单独拍板、不在本线 terminal 内」）。退役不代表已上线。
 }
+
+# 2026-09-02 监督面明确【不】退役的四条，理由逐条写死，防下一班误收：
+# - wf-197430 / wf-5664e5：它们的开发单派在 record.json 的 dispatched_by 字段上线之前，
+#   归不到线上，**我没能核产物去向**。未审不入 RETIRED（该集合断言的是「闭卷审计通过」）。
+# - wf-9b5931：两个单的 README 表格行未在生产分支命中（文档漂移），代码本身在产；
+#   未核清是被后续版本有意改掉还是漏了，先不退役。
+# - wf-d002a6：其单 dev-fg-ef0706e1962a 的产物（tests/test_protocol_entry_normalization.py）
+#   确实未上线，本 PR 一并收割；产物落地后再随下一批退役。
+# - wf-c22907：2026-09-08 定期复活，**名册当前没有「定期复活」这种终点语义**，
+#   按 CONVERGED 或 RETIRED 任一种退役都会把它错误固化。已立案补该语义。
 
 # 2026-08-28 监督面第二波扩编收编：9 候选 8 close/fold、1 enroll。唯一入编
 # wf-7cd0a7（agent-bus 通信层重设计，wf-7cd0a7/goal.md 2026-08-28 re-scope），
@@ -146,9 +166,22 @@ ENROLLED = {
 # 2026-08-31 监督面收线：C5 五次冷启动终验失败取证完备，B 拍板由 wf-66300e 承接，
 # 本线历史使命结束（progress 终局代账 + wf_save 归档在案）。成员资格保留（全集断言），
 # enabled 期望移除。
-CLOSED_BY_SUPERVISOR = {
-    "wf-3f87f3",
-}
+CLOSED_BY_SUPERVISOR: set[str] = set()
+# 2026-09-02 监督面推翻上一任的收口判断：wf-3f87f3 移出本集合，故此处为空
+# （集合本身保留，语义仍在，供日后再有需要时使用）。
+#
+# 推翻理由（机械可核，不是改主意）：收口时该线并非「历史使命结束」，而是还剩
+# 一项交付未落——其 goal 第 20-22 行写明「C5 五件套逐字落 progress …这是本线
+# 最后一项交付」，而它 2026-08-31 03:17:20 驻停，等 C5 终验 run（pid 802798）
+# 自然跑完。真机核验：
+#   ps -p 802798                → 进程不存在
+#   .../08b7fe38/drain.json     → {"status":"done","ended":1788118289592}
+#                                 （= 2026-08-31 03:31:29 CST）
+#   .../loop-events.jsonl 末条  → {"kind":"round_end","round":68,"errors":0}
+# 即它驻停 14 分钟后那个 run 就终态了，此后 2 天 10 小时无人唤醒；而目前没有
+# 任何告警覆盖「blocked 等一个已消失的外部事件」这一类（已立案 wf-6475fd）。
+# 唤醒依据：板 seq 2022 / msg_01M1G8MGYTKYKC5F8EBCHPNQTA。
+# 该线落完五件套后按 done 纪律自行收线，届时再进 RETIRED，不是提前塞回本集合。
 
 REVIVED = {
     "wf-3f87f3",  # deep-research 平台化收口（C1-C6），DS 智能位

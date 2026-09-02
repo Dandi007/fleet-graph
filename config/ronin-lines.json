@@ -7,7 +7,10 @@
   "supervisor_events": true,
   "harvest_allowlist_path": "/data/fleet-graph/supervisor/harvest-allowlist.json",
   "harvest_default_branch": "master",
-  "harvest_deploy": ["bash", "scripts/deploy.sh"],
+  "harvest_deploy": [
+    "bash",
+    "scripts/deploy.sh"
+  ],
   "lines": [
     {
       "folder_id": "wf-197430",
@@ -36,14 +39,14 @@
       "seat": "opencode-dsv4pro",
       "max_rounds": 9999,
       "alias": "ronin-cost-observ",
-      "enabled": true
+      "enabled": false
     },
     {
       "folder_id": "wf-3f87f3",
       "seat": "opencode-dsv4pro",
       "max_rounds": 9999,
       "alias": "ronin-platform-pump",
-      "enabled": false,
+      "enabled": true,
       "_provenance": "2026-08-29 复活（用户令「Deep research…重构开始」+ /loop 端到端授权）：接盘 goal.md C1–C6（部署契约/入口统一/失败语义基座/契约单源化/冷启动终验/宪法归档），DS 智能位。Phase 0 刷新见 folder golden-order 2026-08-29 节。"
     },
     {
@@ -135,7 +138,7 @@
       "seat": "opencode-dsv4pro",
       "alias": "ronin-cgspec",
       "max_rounds": 9999,
-      "enabled": true,
+      "enabled": false,
       "_provenance": "2026-08-29 复活入编（用户令「chat group…重构开始」+ /loop 端到端授权）：chatgroup-daemon 重构实施线（pre-P0→P4→promotion 就绪），GLM 智能位（覆盖 08-22 opus5 点名，代行裁决见 folder golden-order 2026-08-29 节）。P0-net loopback 绑定修复编入最高优先级。"
     },
     {
@@ -143,7 +146,7 @@
       "seat": "opencode-dsv4pro",
       "alias": "ronin-ds-quota",
       "max_rounds": 9999,
-      "enabled": true
+      "enabled": false
     },
     {
       "folder_id": "wf-a8c7b5",
@@ -157,7 +160,7 @@
       "seat": "opencode-gpt-sol",
       "alias": "ronin-cal-export",
       "max_rounds": 9999,
-      "enabled": true,
+      "enabled": false,
       "_provenance": "2026-08-31 用户拍板「要 goal driven agent 开发」。calendar-agent 日程页一键导出打码图片：goal/spec/golden-order SSoT 在 wf-fdd6ac，验收 harness 已先于实现落在 Dandi007/calendar-agent@2b0b8164（scripts/check-acceptance.sh 静态门 A1-A4、check-export-privacy.sh 真机门 A5-A6，两门实测正确变红）。三条用户拍板（只糊内容留时间骨架 / 纯色块非像素马赛克 / 只导当前可见范围）写在 golden-order，实现方不得改动。座位选 opencode-gpt-sol 而非 dsv4pro：入编前 12 条 enabled 线有 11 条挤在 dsv4pro，gpt-sol/gpt-terra/glm53 三座全空，遵 2026-08-29 家族分流令（三家族分开用防单订阅撑爆）；terra 座留给需要 katana-memory-mcp 的线，本线不需要。本线是产品线不是引擎线，唯一非 fleet-graph 自身的题目。"
     },
     {
@@ -182,7 +185,7 @@
       "seat": "opencode-dsv4pro",
       "max_rounds": 9999,
       "alias": "ronin-a6cfea",
-      "enabled": true,
+      "enabled": false,
       "_provenance": "2026-09-01 第十一波入编（用户令『两条都入编，别 hold』）：lexicon —— agent 输出文本可读性治理线。经 goal-mcp 提交入册（U2 流水线），gate 1-6 全过、lint_warnings 空、alias token 就位。入编时 M1 三条机读验收全红且判据脚本 scripts/verify-m1.sh 尚不存在——判据全红是 goal 线的正常起点，不构成 hold 理由；但本线首轮须把 verify-m1.sh 补成『存在且诚实报红』的形态（对标 wf-e6560a 的 acceptance.sh），并用退出码说话。goal/design SSoT：wf-a6cfea。"
     },
     {
