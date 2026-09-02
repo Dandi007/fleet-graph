@@ -24,6 +24,8 @@ from conftest import git, head
 from fleet_graph.supervise.events import approved_unharvested_event, validate_event
 from fleet_graph.supervise.harvest import (
     ESCALATE_BRANCH_OCCUPIED,
+    ESCALATE_EMPTY_NET_DIFF,
+    ESCALATE_NON_ANCESTOR_HEAD,
     OUTCOME_ALREADY_HARVESTED,
     OUTCOME_ESCALATED,
     OUTCOME_HARVESTED,
@@ -64,6 +66,12 @@ def fake_ops(
     resolve_verify_argv: tuple[list[str] | None, str] | None = None,
     resolve_verify_argv_calls: list[tuple[list[str] | None, str]] | None = None,
     pr_merge_result: dict[str, Any] | None = None,
+    base_head: str = "0" * 40,
+    net_files: list[str] | None = None,
+    net_ok: bool = True,
+    is_ancestor_result: bool | None = None,
+    net_files_calls: list[list[str]] | None = None,
+    is_ancestor_calls: list[bool] | None = None,
 ) -> dict[str, Any]:
     """A recording fake ops: every write/execute is recorded, results scripted.
 
@@ -81,6 +89,12 @@ def fake_ops(
     `pr_merge_result` 非 None 时 `pr_squash_merge` 返回该完整结果（脚本化，
     用于 M3 分支占用 refuse+escalate 编排短路口用例）；None 时返回默认
     `{"merged": ..., "pr_url": ...}`。
+    `base_head` 脚本化 `branch_head`（默认分支 tip）返回值（净 diff 的 base）。
+    `net_files` / `net_ok` 脚本化 `net_product_files` 的返回；默认非空
+    `["product.txt"]`（阳性收割）。`net_files_calls` 按调用序脚本化（net_diff
+    先、postconditions 对账后），用于分别验证净 diff 与回执对账两条路径。
+    `is_ancestor_result` 脚本化 `is_ancestor`；默认 True（阳性）。`is_ancestor_calls`
+    按调用序脚本化（worktree 祖先判定先、postconditions 对账后）。
     """
     calls: list[str] = []
     deploy_repos: list[Path] = []
@@ -89,6 +103,8 @@ def fake_ops(
     verify_real_argvs: list[list[str]] = []
     binding_probes: list[dict[str, Any]] = []
     fetch_remote_urls: list[str | None] = []
+    net_product_argvs: list[tuple[str, str]] = []
+    is_ancestor_argvs: list[tuple[str, str]] = []
     if divergence is None:
         divergence = {
             "diverged": False,
@@ -151,7 +167,7 @@ def fake_ops(
             self, repo: Path, head_commit: str, default_branch: str, worktree_root: Path
         ) -> dict[str, Any]:
             calls.append("worktree_cherry_pick")
-            return {"ok": worktree_ok, "method": "cherry-pick", "harvest_tip": harvest_tip}
+            return {"ok": worktree_ok, "method": "merge", "harvest_tip": harvest_tip}
 
         def build_harvest_tip(
             self,
@@ -185,6 +201,29 @@ def fake_ops(
         def board_card_entity_id(self, development_id: str, dd_root: Path) -> str | None:
             calls.append("board_card_entity_id")
             return board_card_entity_id
+
+        def branch_head(self, repo: Path, branch: str) -> str | None:
+            # 纯读口：不构成写原语，不入 calls。
+            return base_head
+
+        def net_product_files(self, repo: Path, base: str, head: str) -> dict[str, Any]:
+            # 纯读口：不构成写原语，不入 calls（调用面单独记录，用于对账断言）。
+            net_product_argvs.append((base, head))
+            if net_files_calls is not None:
+                files = net_files_calls.pop(0)
+                return {"ok": True, "files": list(files), "detail": ""}
+            if net_files is not None:
+                return {"ok": net_ok, "files": list(net_files), "detail": ""}
+            return {"ok": net_ok, "files": ["product.txt"], "detail": ""}
+
+        def is_ancestor(self, repo: Path, ancestor: str, descendant: str) -> dict[str, Any]:
+            # 纯读口：不构成写原语，不入 calls（调用面单独记录，用于祖先判定断言）。
+            is_ancestor_argvs.append((ancestor, descendant))
+            if is_ancestor_calls is not None:
+                value = is_ancestor_calls.pop(0)
+                return {"ok": True, "is_ancestor": value, "detail": ""}
+            value = True if is_ancestor_result is None else is_ancestor_result
+            return {"ok": True, "is_ancestor": value, "detail": ""}
 
         def pr_squash_merge(
             self, repo: Path, development_id: str, head_commit: str, default_branch: str
@@ -235,6 +274,8 @@ def fake_ops(
         "pr_merge_args": pr_merge_args,
         "binding_probes": binding_probes,
         "fetch_remote_urls": fetch_remote_urls,
+        "net_product_argvs": net_product_argvs,
+        "is_ancestor_argvs": is_ancestor_argvs,
     }
 
 
@@ -949,13 +990,11 @@ class TestDefaultHarvestOpsWorktreeLifecycle:
 
     rc-702098ab：`worktree_cherry_pick` 的 finally 无条件删除 worktree，但
     `run_verify` 要在同一路径跑 make verify -> 必然 127，子图永远到不了
-    HARVESTED。这里用真实 git 验证：cherry-pick 成功后 worktree 仍在，
+    HARVESTED。这里用真实 git 验证：merge 成功后 worktree 仍在，
     run_verify 对同一目录能 0 退出，之后 remove_worktree 才清理。
     """
 
-    def test_worktree_survives_cherry_pick_through_verify_then_is_removed(
-        self, tmp_path: Path
-    ) -> None:
+    def test_worktree_survives_merge_through_verify_then_is_removed(self, tmp_path: Path) -> None:
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
         repo = tmp_path / "repo"
@@ -990,11 +1029,11 @@ class TestDefaultHarvestOpsWorktreeLifecycle:
         assert not worktree_root.exists(), "worktree not cleaned up after verify"
 
     def test_conflict_path_still_reports_conflicts(self, tmp_path: Path) -> None:
-        """冲突路径行为不变：worktree add 失败/冲突都如实报告，不强行覆盖。
+        """冲突路径行为不变：merge 冲突如实报告，不强行覆盖。
 
-        H6 后 -X theirs 能解开纯内容冲突（重试收口），这里改用 **modify/delete
-        冲突**（默认分支删文件、工单分支改同文件）——git 连 -X theirs 都无法自动
-        收口，必须诚实 escalate（ok:false / conflicts:true）并就地清理 worktree，
+        `git merge -X theirs` 能解开纯内容冲突，这里改用 **modify/delete 冲突**
+        （默认分支删文件、工单分支改同文件）——git 连 -X theirs 都无法自动收口，
+        必须诚实 escalate（ok:false / conflicts:true）并就地清理 worktree，
         绝不把冲突吞成 ok:true。
         """
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
@@ -1023,13 +1062,12 @@ class TestDefaultHarvestOpsWorktreeLifecycle:
         assert result.get("conflicts") is True or result["ok"] is False
         assert not worktree_root.exists(), "failed worktree left behind"
 
-    def test_conflict_retry_closes_via_x_theirs(self, tmp_path: Path) -> None:
-        """H6：纯内容冲突清场后 -X theirs 重试必须收口（ok:true + 真实 harvest_tip）。
+    def test_content_conflict_closes_via_x_theirs(self, tmp_path: Path) -> None:
+        """merge -X theirs 对纯内容冲突必须收口（ok:true + 真实 harvest_tip）。
 
-        双分支同文件改法（沿用 test_conflict_path_still_reports_conflicts 旧 fixture）：
-        首败冲突后 worktree 索引残留 unmerged files；本实现先 cherry-pick --abort
-        清场再 -X theirs 重试，`-X theirs` 以默认分支为主解得开 -> ok:true 且
-        harvest_tip 非空、成功路径 worktree 保留供 run_verify（rc-702098ab 语义）。
+        双分支同文件改法：`git merge -X theirs` 以被合入的放行 head 为主自动
+        解得开 -> ok:true 且 harvest_tip 非空（merge commit，approved_head 后代）、
+        成功路径 worktree 保留供 run_verify（rc-702098ab 语义）。
         """
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
@@ -1066,8 +1104,8 @@ class TestDefaultHarvestOpsWorktreeLifecycle:
         ops.remove_worktree(repo, worktree_root)
         assert not worktree_root.exists()
 
-    def test_conflict_retry_never_fabricates_harvest_tip(self, tmp_path: Path) -> None:
-        """H6 关键负例：不得自报 harvested——失败绝不报 ok:true，也绝不凭空 harvest_tip。
+    def test_modify_delete_conflict_fails_honestly(self, tmp_path: Path) -> None:
+        """关键负例：不得自报 harvested——失败绝不报 ok:true，也绝不凭空 harvest_tip。
 
         modify/delete 冲突连 -X theirs 都收不了口 -> 必须诚实 ok:false +
         conflicts:true（escalate 语义），绝不「失败却报 ok:true / 凭空 harvest_tip」。
@@ -1474,16 +1512,20 @@ class TestDefaultHarvestOpsFfOnlyPullHead:
         assert result["head"] is None, "失败时 head 应为 None"
 
 
-def _ticket_repo_with_dd_artifacts(tmp_path: Path) -> tuple[Path, str]:
-    """真 git 合成仓构造一张「工单 commit」：产品改动 + 两棵 dd 协议子树。
+def _ticket_repo_with_dd_artifacts(
+    tmp_path: Path, *, with_product: bool = True
+) -> tuple[Path, str, str]:
+    """真 git 合成仓构造一张「工单 commit」：产品改动（可选）+ 两棵 dd 协议子树。
 
     `.dev-dispatch/`（development.json / spec/approved.md）与 `.dd-evidence/
-    acceptance.json` 随产品改动一起进同一张工单 commit（dd 协议要求工单分支提交
-    它们）。工单 commit 落在独立 feature 分支（模拟 dd 链，不在默认分支上——
-    否则 cherry-pick 到默认分支会空提交）。全部本地合成，禁触真网/生产 checkout。
+    acceptance.json` 随产品改动（可选）一起进同一张工单 commit（dd 协议要求
+    工单分支提交它们）。`with_product=False` 时只改协议子树（构造「净 diff 为空」
+    的空收割场景）。工单 commit 落在独立 feature 分支（模拟 dd 链），返回
+    `(repo, ticket, base)`，base = 默认分支 main tip。全部本地合成，禁触真网。
     """
     repo = tmp_path / "repo"
     _init_git_repo(repo)
+    base = head(repo)
     git(repo, "checkout", "-q", "-b", "feature")
 
     dev_dispatch = repo / ".dev-dispatch"
@@ -1499,83 +1541,89 @@ def _ticket_repo_with_dd_artifacts(tmp_path: Path) -> tuple[Path, str]:
     evidence.mkdir()
     (evidence / "acceptance.json").write_text('{"ok": true}\n', encoding="utf-8")
 
-    (repo / "product.txt").write_text("product change\n", encoding="utf-8")
+    if with_product:
+        (repo / "product.txt").write_text("product change\n", encoding="utf-8")
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "ticket with dd artifacts")
     ticket = head(repo)
     git(repo, "checkout", "-q", "main")
-    return repo, ticket
+    return repo, ticket, base
 
 
-class TestHarvestCleanTipExcludesDdArtifacts:
-    """交付 C.1：真实 git 合成仓上，洗树 tip 不含 dd 协议子树、产品改动保留。"""
+class TestHarvestNetDiffAndMerge:
+    """判据②/③ 机械层 + merge 语义（真实 git 合成仓，禁触真网）。
 
-    def test_build_harvest_tip_excludes_dd_subtrees(self, tmp_path: Path) -> None:
+    - 净 diff 只在 diff 计算里排除协议子树（`:(exclude)` pathspec），非空判定
+      正确、纯协议改动被判空；
+    - `worktree_cherry_pick` 改为 **merge**：`harvest_tip` 是 `approved_head`
+      的后代（回执三头对账判据③），产品改动保留、不再落「exclude 提交」。
+    """
+
+    def test_net_product_files_excludes_protocol_subtrees(self, tmp_path: Path) -> None:
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
-        repo, ticket = _ticket_repo_with_dd_artifacts(tmp_path)
+        repo, ticket, base = _ticket_repo_with_dd_artifacts(tmp_path)
+        result = DefaultHarvestOps().net_product_files(repo, base, ticket)
+        assert result["ok"] is True, result
+        assert result["files"] == ["product.txt"], result
+
+    def test_net_product_files_empty_when_only_protocol_dirs(self, tmp_path: Path) -> None:
+        """判据② 机械层：只改协议子树 -> 净 diff 为空（空收割必须 escalate）。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo, ticket, base = _ticket_repo_with_dd_artifacts(tmp_path, with_product=False)
+        result = DefaultHarvestOps().net_product_files(repo, base, ticket)
+        assert result["ok"] is True, result
+        assert result["files"] == [], result
+
+    def test_is_ancestor_of_merge_tip(self, tmp_path: Path) -> None:
+        """判据①/③ 机械层：merge tip 是 approved_head 后代；反向非祖先。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo, ticket, _base = _ticket_repo_with_dd_artifacts(tmp_path)
         ops = DefaultHarvestOps()
         worktree_root = tmp_path / "harvest-wt"
+        picked = ops.worktree_cherry_pick(repo, ticket, "main", worktree_root)
+        assert picked["ok"] is True, picked
+        tip = picked["harvest_tip"]
 
-        result = ops.build_harvest_tip(repo, ticket, "main", worktree_root)
-        assert result["ok"] is True, result
-        tip = result["harvest_tip"]
-        assert tip and tip != ticket
+        assert ops.is_ancestor(repo, ticket, tip)["is_ancestor"] is True
+        assert ops.is_ancestor(repo, tip, ticket)["is_ancestor"] is False
+        ops.remove_worktree(repo, worktree_root)
 
-        paths = git(repo, "ls-tree", "-r", tip, "--name-only").splitlines()
-        assert not any(p.startswith(".dev-dispatch/") or p == ".dev-dispatch" for p in paths), paths
-        assert not any(p.startswith(".dd-evidence/") or p == ".dd-evidence" for p in paths), paths
-        # 产品改动仍保留。
-        assert "product.txt" in paths
-        assert "seed.txt" in paths
-        assert git(repo, "show", f"{tip}:product.txt").strip() == "product change"
-
-    def test_worktree_cherry_pick_returns_clean_tip(self, tmp_path: Path) -> None:
+    def test_worktree_merge_keeps_product_and_preserves_ancestry(self, tmp_path: Path) -> None:
+        """merge 语义：harvest_tip 保留产品改动、approved_head 为其祖先，
+        协议子树不再作为「exclude 提交」被剔除（产物本身不动）。"""
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
-        repo, ticket = _ticket_repo_with_dd_artifacts(tmp_path)
+        repo, ticket, _base = _ticket_repo_with_dd_artifacts(tmp_path)
         ops = DefaultHarvestOps()
         worktree_root = tmp_path / "harvest-wt"
 
         picked = ops.worktree_cherry_pick(repo, ticket, "main", worktree_root)
         assert picked["ok"] is True, picked
+        assert picked["method"] == "merge", picked
         tip = picked["harvest_tip"]
         assert tip and tip != ticket
-
-        paths = git(repo, "ls-tree", "-r", tip, "--name-only").splitlines()
-        assert not any(p.startswith(".dev-dispatch/") or p == ".dev-dispatch" for p in paths), paths
-        assert not any(p.startswith(".dd-evidence/") or p == ".dd-evidence" for p in paths), paths
-        assert "product.txt" in paths
+        # approved_head 是 harvest_tip 的祖先（merge commit 的第二父）。
+        assert ops.is_ancestor(repo, ticket, tip)["is_ancestor"] is True
+        # 产品改动保留。
         assert git(repo, "show", f"{tip}:product.txt").strip() == "product change"
         # worktree 保留供 verify 用（rc-702098ab 语义不变）。
         assert worktree_root.is_dir()
         assert (worktree_root / "product.txt").read_text().strip() == "product change"
         ops.remove_worktree(repo, worktree_root)
 
-    def test_wash_is_noop_without_dd_subtrees(self, tmp_path: Path) -> None:
-        """正向回归：不含这两棵子树的普通工单 commit——洗树 no-op（washed=False）。
-
-        cherry-pick 落地的是**新 commit**（固定收割身份 `_commit_env()`，身份
-        不再是 repo 本地 user config 的巧合），但洗树步骤没有 dd 子树可剔——
-        `washed` 必须为 False，harvest_tip 是真实可解析 commit（不凭空造）。
-        """
+    def test_build_harvest_tip_merges_and_is_descendant(self, tmp_path: Path) -> None:
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
-        repo = tmp_path / "repo"
-        _init_git_repo(repo)
-        git(repo, "checkout", "-q", "-b", "feature")
-        (repo / "product.txt").write_text("product change\n", encoding="utf-8")
-        git(repo, "add", "-A")
-        git(repo, "commit", "-q", "-m", "plain ticket")
-        ticket = head(repo)
-        git(repo, "checkout", "-q", "main")
-
+        repo, ticket, _base = _ticket_repo_with_dd_artifacts(tmp_path)
         ops = DefaultHarvestOps()
         result = ops.build_harvest_tip(repo, ticket, "main", tmp_path / "harvest-wt")
         assert result["ok"] is True, result
-        assert result["washed"] is False, result
         assert result["harvest_tip"], result
         git(repo, "cat-file", "-e", f"{result['harvest_tip']}^{{commit}}")
+        assert ops.is_ancestor(repo, ticket, result["harvest_tip"])["is_ancestor"] is True
 
 
 class TestHarvestGitPlumbingNegatives:
@@ -1584,23 +1632,23 @@ class TestHarvestGitPlumbingNegatives:
     1. 阴性 A（identity）：合成**无全局 identity 环境**（repo 无 user.name/
        user.email config、`safe_git_environment` 会清空 GIT_AUTHOR/COMMITTER 并
        禁用 global config）→ `worktree_cherry_pick` 返回 ok:true、`harvest_tip`
-       非空；对照未修复时必然 `Committer identity unknown`（cherry-pick 落地
+       非空；对照未修复时必然 `Committer identity unknown`（merge 落地 merge
        commit 无 committer identity）。
     2. 阴性 B（remote_url）：合成 record 其 `remote_url` 为**本地路径**仓、dd
        ref 只推在该本地仓、`origin` 故意指向不含该 dd ref 的远端 → `fetch_dd_ref`
        ok:true；对照未修复时 `couldn't find remote ref`（origin 与 remote_url
        不同源）。
     3. 反向不抖动：URL remote_url 且 `origin` 同源 → 行为不变（既有路径零回归）；
-       有 identity 环境 → cherry-pick/洗树/冲突重试路径不变。
+       有 identity 环境 → merge/冲突路径不变。
     """
 
-    def test_cherry_pick_lands_commit_without_global_identity(self, tmp_path: Path) -> None:
-        """阴性 A（identity）：无全局 identity 下 cherry-pick 仍能落地 commit。
+    def test_merge_lands_commit_without_global_identity(self, tmp_path: Path) -> None:
+        """阴性 A（identity）：无全局 identity 下 merge 仍能落地 commit。
 
         repo 创建时**不写任何 user.name/user.email config**（conftest `git()`
         每命令 `-c user.email/name` 仅当次生效、不落库）；`run_git` 走
         `safe_git_environment()`（清空 GIT_*、禁用 global/system config）——
-        未修复时 `git cherry-pick` 必然 `Committer identity unknown`，修复后
+        未修复时 `git merge --no-ff` 必然 `Committer identity unknown`，修复后
         `_commit_env()` 提供固定收割身份 -> ok:true。
         """
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
@@ -1635,13 +1683,11 @@ class TestHarvestGitPlumbingNegatives:
         ops.remove_worktree(repo, worktree_root)
         assert not worktree_root.exists()
 
-    def test_cherry_pick_theirs_retry_lands_commit_without_global_identity(
-        self, tmp_path: Path
-    ) -> None:
-        """阴性 A（identity）+ H6 冲突重试：无全局 identity 下 -X theirs 重试也落地 commit。
+    def test_merge_theirs_lands_commit_without_global_identity(self, tmp_path: Path) -> None:
+        """阴性 A（identity）+ 内容冲突：无全局 identity 下 -X theirs merge 也落地 commit。
 
-        纯内容冲突清场后 `-X theirs` 重试同样要新建 commit；未修复时重试的
-        cherry-pick 同样 `Committer identity unknown`。修复后 ok:true。
+        纯内容冲突 `git merge -X theirs` 同样要新建 merge commit；未修复时 merge
+        的 commit 同样 `Committer identity unknown`。修复后 ok:true。
         """
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
@@ -1839,12 +1885,12 @@ class TestHarvestWriteGate:
         # 写步骤本身不进回执（没执行）。
         assert "pr_squash_merge" not in [s.get("step") for s in receipt["steps"]]
 
-    def test_cherry_pick_failure_blocks_all_writes(self, tmp_path: Path) -> None:
+    def test_merge_failure_blocks_all_writes(self, tmp_path: Path) -> None:
         fake = fake_ops(worktree_ok=False)
         config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
         result = run_harvest(config)
         assert result["outcome"] == OUTCOME_ESCALATED
-        # cherry-pick 失败 -> 无任何 PR 被 merge（D2：fallback 不存在，钉死无 merge）。
+        # merge 失败 -> 无任何 PR 被 merge（D2：fallback 不存在，钉死无 merge）。
         assert "pr_squash_merge" not in fake["calls"], fake["calls"]
         assert "ff_only_pull" not in fake["calls"], fake["calls"]
         assert "deploy" not in fake["calls"], fake["calls"]
@@ -1880,7 +1926,7 @@ class TestHarvestWriteGate:
         receipt = json.loads(Path(result["receipt_path"]).read_text())
         assert receipt["writes_skipped"] == list(WRITE_STEPS)
 
-    def test_cherry_pick_failure_leaves_default_branch_head_untouched(self, tmp_path: Path) -> None:
+    def test_merge_failure_leaves_default_branch_head_untouched(self, tmp_path: Path) -> None:
         """真实 git：worktree_cherry_pick 判红（modify/delete 冲突）-> HEAD 不变。"""
         repo = tmp_path / "canon"
         _init_git_repo(repo)
@@ -1915,7 +1961,7 @@ class TestHarvestWriteGate:
         )
         result = run_harvest(config)
         assert result["outcome"] == OUTCOME_ESCALATED
-        assert head(repo) == before, "cherry-pick 判红后默认分支 HEAD 必须逐字节不变"
+        assert head(repo) == before, "merge 判红后默认分支 HEAD 必须逐字节不变"
         receipt = json.loads(Path(result["receipt_path"]).read_text())
         assert receipt["writes_skipped"] == list(WRITE_STEPS)
 
@@ -3099,3 +3145,98 @@ class TestHarvestWikiReport:
         graph, deps, _event = build_harvest(config)
         assert deps.wiki is config.wiki
         assert graph is not None
+
+
+class TestEmptyHarvestFix:
+    """空收割修复四判据：exact-head 祖先 / 净 diff 空判 escalated / 回执三头对账 /
+    空收割不部署。每条判据都有阳性+阴性（去掉护栏/对账后必有一例变红）。"""
+
+    def _receipt(self, result: dict[str, Any]) -> dict[str, Any]:
+        return json.loads(Path(result["receipt_path"]).read_text())
+
+    def test_approved_head_bound_and_checked_ancestor(self, tmp_path: Path) -> None:
+        """判据①阳性：approved_head = E5 head_commit，worktree 祖先判定对
+        (approved_head, harvest_tip) 读取，回执三头齐全 -> harvested。"""
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        # worktree 祖先判定读取的是 (approved_head="a"*40, harvest_tip="b"*40)。
+        assert fake["is_ancestor_argvs"], "worktree 祖先判定未被读取"
+        ancestor, descendant = fake["is_ancestor_argvs"][0]
+        assert ancestor == "a" * 40
+        assert descendant == "b" * 40
+        receipt = self._receipt(result)
+        assert receipt["approved_head"] == "a" * 40
+        assert receipt["harvested_head"] == "b" * 40
+        assert receipt["net_product_files"] == ["product.txt"]
+
+    def test_non_ancestor_head_escalates_without_writes(self, tmp_path: Path) -> None:
+        """判据①阴性：approved_head 非 harvest_tip 祖先 -> escalate + 非祖先码，
+        绝不 pr_merge/pull/deploy（去掉祖先护栏后本用例必红）。"""
+        fake = fake_ops(is_ancestor_result=False)
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        worktree_step = next(s for s in result["steps"] if s["step"] == "worktree_cherry_pick")
+        assert worktree_step["ok"] is False
+        assert worktree_step["escalate"] == ESCALATE_NON_ANCESTOR_HEAD
+        assert "pr_squash_merge" not in fake["calls"], fake["calls"]
+        assert "ff_only_pull" not in fake["calls"], fake["calls"]
+        assert "deploy" not in fake["calls"], fake["calls"]
+        receipt = self._receipt(result)
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+
+    def test_empty_net_diff_escalates(self, tmp_path: Path) -> None:
+        """判据②阴性：净 diff 为空 -> escalate + 空判据码，绝不记 harvested
+        （去掉空判据后本用例必红）。"""
+        fake = fake_ops(net_files=[])
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert result["outcome"] != OUTCOME_HARVESTED
+        net_step = next(s for s in result["steps"] if s["step"] == "net_diff")
+        assert net_step["ok"] is False
+        assert net_step["escalate"] == ESCALATE_EMPTY_NET_DIFF
+        receipt = self._receipt(result)
+        assert receipt["net_product_files"] == []
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+
+    def test_empty_net_diff_never_deploys(self, tmp_path: Path) -> None:
+        """判据④阴性：净 diff 为空 -> deploy 绝不执行（写步被跳过、零部署发生）。"""
+        fake = fake_ops(net_files=[])
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), deploy_command=["make", "deploy"])
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert "deploy" not in fake["calls"], fake["calls"]
+        assert "pr_squash_merge" not in fake["calls"], fake["calls"]
+        assert "ff_only_pull" not in fake["calls"], fake["calls"]
+        assert not any(s.get("step") == "deploy" for s in result["steps"])
+
+    def test_reconciliation_rejects_non_descendant_harvested_head(self, tmp_path: Path) -> None:
+        """判据③阴性：worktree 祖先判定过、回执对账时 harvested_head 非后代 ->
+        escalate（去掉三头对账后本用例必红）。"""
+        fake = fake_ops(is_ancestor_calls=[True, False])
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        receipt = self._receipt(result)
+        assert any("harvested_head 非 approved_head 后代" in m for m in _missing_of(receipt))
+
+    def test_reconciliation_rejects_net_files_mismatch(self, tmp_path: Path) -> None:
+        """判据③阴性：net_product_files 写错/漏写去对账 -> 不一致 -> escalate。"""
+        fake = fake_ops(net_files_calls=[["product.txt"], ["different.txt"]])
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        receipt = self._receipt(result)
+        assert any("net_product_files 不一致" in m for m in _missing_of(receipt))
+
+    def test_non_empty_net_diff_records_files_on_success(self, tmp_path: Path) -> None:
+        """判据②阳性：净 diff 非空 -> harvested 且 net_product_files 非空。"""
+        fake = fake_ops(net_files=["product.txt", "README.md"])
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = self._receipt(result)
+        assert receipt["net_product_files"] == ["product.txt", "README.md"]

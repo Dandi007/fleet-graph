@@ -45,6 +45,7 @@ SOP（spec 交付 B）逐节点实现，全部是 script 节点（机械判定�
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -106,10 +107,20 @@ ESCALATE_TREE_OCCUPIED = "HARVEST_TREE_OCCUPIED_BY_INFLIGHT"
 #: verify_real 任何写步（spec 交付 A.2：走既有 escalate 收尾）。
 ESCALATE_BRANCH_OCCUPIED = "HARVEST_BRANCH_OCCUPIED"
 
+#: 空收割 escalate 码（判据②/④）：净产品 diff（`git diff base..head` 排除
+#: `.dev-dispatch` / `.dd-evidence` 后）为空 -> 立即 outcome=escalated +
+#: writes_skipped，**不得记 harvested、绝不串上自动部署**。
+ESCALATE_EMPTY_NET_DIFF = "HARVEST_EMPTY_NET_PRODUCT_DIFF"
+
+#: 非祖先 escalate 码（判据①）：`approved_head` 不是待收 head 的祖先 ->
+#: 立即 outcome=escalated + writes_skipped，绝不收（「分支 head 是什么就收什么」被拒）。
+ESCALATE_NON_ANCESTOR_HEAD = "HARVEST_APPROVED_HEAD_NOT_ANCESTOR"
+
 #: SOP 步骤名的封闭枚举——测试据此断言「编排步骤齐全」。
 SOP_STEPS = (
     "fetch_dd_ref",
     "cherry_check",
+    "net_diff",
     "worktree_cherry_pick",
     "run_verify",
     "cleanup_worktree",
@@ -158,6 +169,9 @@ class HarvestOps(Protocol):
     def run_verify(self, worktree: Path, argv: list[str]) -> int: ...
     def resolve_verify_argv(self, worktree: Path) -> tuple[list[str] | None, str]: ...
     def board_card_entity_id(self, development_id: str, dd_root: Path) -> str | None: ...
+    def branch_head(self, repo: Path, branch: str) -> str | None: ...
+    def is_ancestor(self, repo: Path, ancestor: str, descendant: str) -> dict[str, Any]: ...
+    def net_product_files(self, repo: Path, base: str, head: str) -> dict[str, Any]: ...
     def detect_inflight_binding(
         self, tree_path: Path, dd_root: Path, current_development_id: str | None = None
     ) -> dict[str, Any]: ...
@@ -174,6 +188,10 @@ class HarvestState(TypedDict, total=False):
     event: dict[str, Any]
     development_id: str
     head_commit: str
+    approved_head: str
+    base_commit: str
+    harvested_head: str
+    net_product_files: list[str]
     harvest_tip: str
     stage: str
     repo_path: str
@@ -374,6 +392,39 @@ def _record_auth(
     )
 
 
+def _reconcile_harvest_heads(state: HarvestState, ops: HarvestOps, *, repo: Path) -> str | None:
+    """判据③：回执三头对账的机械复核（纯读口，零写原语）。
+
+    `harvested_head` 必须是 `approved_head` 的后代、`net_product_files` 必须等于
+    `git diff base..harvested_head` 排除协议目录后的文件清单。三者对不上 -> 返回
+    机器可读缺失串（红）；无法判定（三头未齐）-> None（前序节点已各自 escalate）。
+    """
+    approved_head = state.get("approved_head") or ""
+    harvested_head = state.get("harvested_head") or ""
+    base = state.get("base_commit") or ""
+    stored_files = sorted(str(p) for p in (state.get("net_product_files") or []))
+    if not approved_head or not harvested_head:
+        return None
+    try:
+        anc = ops.is_ancestor(repo, approved_head, harvested_head)
+    except Exception as exc:
+        return f"回执三头对账：is_ancestor 异常 {repr(exc)[:200]}"
+    if not (anc.get("ok") and anc.get("is_ancestor")):
+        return "回执三头对账：harvested_head 非 approved_head 后代"
+    if not base:
+        return None
+    try:
+        net = ops.net_product_files(repo, base, harvested_head)
+    except Exception as exc:
+        return f"回执三头对账：net_product_files 异常 {repr(exc)[:200]}"
+    if not net.get("ok"):
+        return "回执三头对账：净 diff 重算失败"
+    recomputed = sorted(str(p) for p in (net.get("files") or []))
+    if recomputed != stored_files:
+        return f"回执三头对账：net_product_files 不一致（记 {stored_files!r}，重算 {recomputed!r}）"
+    return None
+
+
 # --- the graph --------------------------------------------------------------
 
 
@@ -441,6 +492,10 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             "ok": not gaps and occupied is None,
             "development_id": development_id,
             "head_commit": head_commit,
+            # 判据①：收割绑定放行的 exact head（线被 gate 放行的 commit），不采信
+            # 「分支 head 是什么就收什么」。approved_head 与 head_commit 同源（E5
+            # payload.head_commit），但作为独立回执字段落进三头对账。
+            "approved_head": head_commit,
             "stage": stage,
             "repo_path": str(repo) if repo is not None else "",
             "record_worktree": record_worktree,
@@ -457,6 +512,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         return {
             "development_id": development_id,
             "head_commit": head_commit,
+            "approved_head": head_commit,
             "stage": stage,
             "repo_path": str(repo) if repo is not None else "",
             "record_worktree": record_worktree,
@@ -529,6 +585,121 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             return {"steps": steps, "outcome": OUTCOME_ALREADY_HARVESTED}
         return {"steps": steps}
 
+    def net_diff(state: HarvestState) -> HarvestState:
+        """判据②/④：净产品 diff —— `git diff base..approved_head` 排除
+        `.dev-dispatch` / `.dd-evidence` 两棵协议子树后的文件清单。
+
+        纯读口（branch_head / net_product_files 都是机械读判，无写原语）。净 diff
+        为空 -> 立即 outcome=escalated + writes_skipped（绝不记 harvested、绝不
+        串上 pr_merge/pull/deploy）。净 diff 非空 -> 记录 net_product_files /
+        base_commit，进 worktree 收。
+        """
+        repo = Path(state.get("repo_path") or "")
+        approved_head = state.get("approved_head") or state.get("head_commit") or ""
+        default_branch = state.get("default_branch") or DEFAULT_BRANCH
+        # 缺 approved_head / default_branch 无法算净 diff -> escalate（fail-closed）。
+        if not approved_head:
+            steps = _record_step(
+                state, "net_diff", ok=False, detail="缺 approved_head——无法算净 diff"
+            )
+            return {
+                "steps": steps,
+                "outcome": OUTCOME_ESCALATED,
+                "writes_skipped": list(WRITE_STEPS),
+            }
+        try:
+            base = deps.ops.branch_head(repo, default_branch)
+        except Exception as exc:
+            steps = _record_step(
+                state,
+                "net_diff",
+                ok=False,
+                detail=f"branch_head 异常，保守 escalate: {repr(exc)[:200]}",
+            )
+            return {
+                "steps": steps,
+                "outcome": OUTCOME_ESCALATED,
+                "writes_skipped": list(WRITE_STEPS),
+            }
+        if not base:
+            steps = _record_step(
+                state,
+                "net_diff",
+                ok=False,
+                detail="无法解析默认分支 tip（缺 base）",
+                approved_head=approved_head,
+            )
+            return {
+                "steps": steps,
+                "outcome": OUTCOME_ESCALATED,
+                "writes_skipped": list(WRITE_STEPS),
+            }
+        try:
+            net = deps.ops.net_product_files(repo, base, approved_head)
+        except Exception as exc:
+            steps = _record_step(
+                state,
+                "net_diff",
+                ok=False,
+                detail=f"net_product_files 异常，保守 escalate: {repr(exc)[:200]}",
+                approved_head=approved_head,
+                base=base,
+            )
+            return {
+                "steps": steps,
+                "outcome": OUTCOME_ESCALATED,
+                "writes_skipped": list(WRITE_STEPS),
+            }
+        if not net.get("ok"):
+            steps = _record_step(
+                state,
+                "net_diff",
+                ok=False,
+                detail=net.get("detail") or "净 diff 计算失败",
+                approved_head=approved_head,
+                base=base,
+            )
+            return {
+                "steps": steps,
+                "outcome": OUTCOME_ESCALATED,
+                "writes_skipped": list(WRITE_STEPS),
+            }
+        files = list(net.get("files") or [])
+        if not files:
+            # 判据②/④：净 diff 为空 -> escalated，绝不记 harvested、绝不 deploy。
+            steps = _record_step(
+                state,
+                "net_diff",
+                ok=False,
+                escalate=ESCALATE_EMPTY_NET_DIFF,
+                detail="净产品 diff 为空——不得 harvest/deploy",
+                approved_head=approved_head,
+                base=base,
+                net_product_files=[],
+            )
+            return {
+                "steps": steps,
+                "outcome": OUTCOME_ESCALATED,
+                "writes_skipped": list(WRITE_STEPS),
+                "net_product_files": [],
+                "approved_head": approved_head,
+                "base_commit": base,
+            }
+        steps = _record_step(
+            state,
+            "net_diff",
+            ok=True,
+            approved_head=approved_head,
+            base=base,
+            net_product_files=files,
+        )
+        return {
+            "steps": steps,
+            "net_product_files": files,
+            "approved_head": approved_head,
+            "base_commit": base,
+        }
+
     def worktree(state: HarvestState) -> HarvestState:
         auth = authorize_harvest_write(
             deps.allowlist,
@@ -543,10 +714,11 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             }
         repo = Path(state.get("repo_path") or "")
         worktree_root = deps.thread_dir(_event_of(state).key) / "worktree"
+        approved_head = state.get("approved_head") or state.get("head_commit") or ""
         try:
             result = deps.ops.worktree_cherry_pick(
                 repo,
-                state.get("head_commit") or "",
+                approved_head,
                 state.get("default_branch") or "",
                 worktree_root,
             )
@@ -558,18 +730,54 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "outcome": OUTCOME_ESCALATED,
                 "writes_skipped": list(WRITE_STEPS),
             }
-        steps = _record_step(state, "worktree_cherry_pick", **result)
         if not result.get("ok"):
-            # H7 写前闸：cherry-pick 判红 -> 立即停止链（见 after_worktree），
+            # H7 写前闸：merge 判红 -> 立即停止链（见 after_worktree），
             # 不执行任何写步骤；escalate 收尾时回执显式记录 writes_skipped。
+            steps = _record_step(state, "worktree_cherry_pick", **result)
             return {
                 "steps": steps,
                 "outcome": OUTCOME_ESCALATED,
                 "writes_skipped": list(WRITE_STEPS),
             }
-        # 干净产品树 tip（worktree_cherry_pick 已剔除 .dev-dispatch/.dd-evidence）。
         harvest_tip = str(result.get("harvest_tip") or "")
-        return {"steps": steps, "harvest_tip": harvest_tip}
+        # 判据①：exact-head 祖先判定——approved_head 必须是 harvest_tip 的祖先。
+        # 非祖先（洗树/exclude 提交、或「分支 head 是什么就收什么」）-> escalate，
+        # 绝不收。is_ancestor 是纯读口；merge 已成功落地，这里先回收 worktree 再
+        # 判红，避免泄漏一次性 worktree。
+        try:
+            anc = deps.ops.is_ancestor(repo, approved_head, harvest_tip)
+        except Exception as exc:
+            anc = {
+                "ok": False,
+                "is_ancestor": False,
+                "detail": f"is_ancestor 异常: {repr(exc)[:200]}",
+            }
+        if not (anc.get("ok") and anc.get("is_ancestor")):
+            with contextlib.suppress(Exception):
+                deps.ops.remove_worktree(repo, worktree_root)
+            steps = _record_step(
+                state,
+                "worktree_cherry_pick",
+                ok=False,
+                escalate=ESCALATE_NON_ANCESTOR_HEAD,
+                harvest_tip=harvest_tip,
+                approved_head=approved_head,
+                detail=anc.get("detail") or "approved_head 非 harvest_tip 祖先——非祖先不收",
+            )
+            return {
+                "steps": steps,
+                "outcome": OUTCOME_ESCALATED,
+                "writes_skipped": list(WRITE_STEPS),
+            }
+        # 非祖先被拦；自洽 -> 记录 product tree tip（merge commit，approved_head 后代）。
+        steps = _record_step(
+            state,
+            "worktree_cherry_pick",
+            **result,
+            approved_head=approved_head,
+            is_ancestor=anc.get("is_ancestor"),
+        )
+        return {"steps": steps, "harvest_tip": harvest_tip, "harvested_head": harvest_tip}
 
     def verify(state: HarvestState) -> HarvestState:
         auth = authorize_harvest_write(
@@ -923,6 +1131,15 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 if step.get("exit_code") is not None:
                     facts.append(f"exit_code={step['exit_code']!r}")
                 missing.append(f"step {name} ok:false（{' '.join(facts)}）")
+        # 判据③：回执三头对账——harvested_head 必须是 approved_head 的后代、
+        # net_product_files 必须等于 `git diff base..harvested_head` 排除协议目录
+        # 后的文件清单。三者对不上 -> 红（escalate）。这里是收尾前的机械复核，
+        # 与 worktree 节点的祖先判定互为双保险（净化写错/漏写 net_product_files）。
+        _reconcile = _reconcile_harvest_heads(
+            state, deps.ops, repo=Path(state.get("repo_path") or "")
+        )
+        if _reconcile:
+            missing.append(_reconcile)
         steps = _record_step(state, "postconditions", ok=not missing, missing=missing)
         outcome = OUTCOME_HARVESTED if not missing else OUTCOME_ESCALATED
         return {"steps": steps, "outcome": outcome}
@@ -981,6 +1198,10 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "thread_id": deps.thread_id,
                 "development_id": state.get("development_id"),
                 "head_commit": state.get("head_commit"),
+                "approved_head": state.get("approved_head"),
+                "harvested_head": state.get("harvested_head"),
+                "base_commit": state.get("base_commit"),
+                "net_product_files": state.get("net_product_files") or [],
                 "harvest_tip": state.get("harvest_tip"),
                 "stage": state.get("stage"),
                 "repo_path": state.get("repo_path"),
@@ -1005,6 +1226,11 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         return "fetch" if state.get("outcome") is None else "receipt"
 
     def after_cherry(state: HarvestState) -> str:
+        return "net_diff" if state.get("outcome") is None else "receipt"
+
+    def after_net_diff(state: HarvestState) -> str:
+        # 净 diff 为空/算败 -> outcome 已设（escalated）-> 直接 receipt（不 touch
+        # worktree/merge/pull/deploy 任何写步）；非空 -> 既有链进 worktree 收。
         return "worktree" if state.get("outcome") is None else "receipt"
 
     def after_pull(state: HarvestState) -> str:
@@ -1066,6 +1292,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
     graph.add_node("gate", gate)
     graph.add_node("fetch", fetch)
     graph.add_node("cherry", cherry)
+    graph.add_node("net_diff", net_diff)
     graph.add_node("worktree", worktree)
     graph.add_node("verify", verify)
     graph.add_node("cleanup_worktree", cleanup_worktree)
@@ -1081,7 +1308,8 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
     graph.add_conditional_edges("intake", after_intake, {"gate", "receipt"})
     graph.add_conditional_edges("gate", after_gate, {"fetch", "receipt"})
     graph.add_edge("fetch", "cherry")
-    graph.add_conditional_edges("cherry", after_cherry, {"worktree", "receipt"})
+    graph.add_conditional_edges("cherry", after_cherry, {"net_diff", "receipt"})
+    graph.add_conditional_edges("net_diff", after_net_diff, {"worktree", "receipt"})
     graph.add_conditional_edges("worktree", after_worktree, {"verify", "postconditions", "receipt"})
     graph.add_conditional_edges("verify", after_verify, {"cleanup_worktree", "receipt"})
     graph.add_conditional_edges(
@@ -1191,6 +1419,9 @@ def run_harvest(config: HarvestRunConfig) -> dict[str, Any]:
 __all__ = [
     "DEFAULT_BRANCH",
     "DEFAULT_VERIFY_ARGV",
+    "ESCALATE_BRANCH_OCCUPIED",
+    "ESCALATE_EMPTY_NET_DIFF",
+    "ESCALATE_NON_ANCESTOR_HEAD",
     "ESCALATE_TREE_OCCUPIED",
     "EVENT_APPROVED_UNHARVESTED",
     "OUTCOME_ALREADY_HARVESTED",
@@ -1198,6 +1429,7 @@ __all__ = [
     "OUTCOME_HARVESTED",
     "OUTCOME_REFUSED",
     "SOP_STEPS",
+    "WRITE_STEPS",
     "HarvestDeps",
     "HarvestOps",
     "HarvestRunConfig",
