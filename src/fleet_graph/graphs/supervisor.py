@@ -952,6 +952,7 @@ def run_supervisor(config: SupervisorRunConfig) -> dict[str, Any]:
             ops=config.harvest_ops,
             bus=config.bus,
             publish_notes=config.publish_notes,
+            wiki=config.wiki,
         )
         return run_harvest(harvest_config)
 

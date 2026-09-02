@@ -1010,6 +1010,15 @@ def _supervisor_run(args: argparse.Namespace) -> int:
             # report still lands in the supervisor's own run root.
             bus = None
 
+    # M4 wiki 人话账 (交付 B)：`--wiki` 可选 enable 开关。off（默认）-> wiki=None
+    # 零回归（E5/E6/E7 的 deps.wiki 保持 None）；on -> 构造 DefaultWikiClient()
+    # （katana-wiki-mcp :8113）注入 E5/E6/E7 三路 config.wiki。
+    wiki = None
+    if args.wiki:
+        from fleet_graph.supervise.wiki_report import DefaultWikiClient
+
+        wiki = DefaultWikiClient()
+
     config = SupervisorRunConfig(
         event=event.as_dict(),
         state_root=pathlib.Path(args.state_root),
@@ -1035,6 +1044,8 @@ def _supervisor_run(args: argparse.Namespace) -> int:
         harvest_verify_real_argv=args.harvest_verify_real,
         # M4 E7: goal.md 直写目标线白名单（deny-all 默认）。
         e7_allowlist_path=args.e7_allowlist,
+        # M4 wiki 人话账 (交付 B)：None 或 DefaultWikiClient()。
+        wiki=wiki,
     )
     result = run_supervisor(config)
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
@@ -2079,6 +2090,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="M4 E7 (decision_swallowed): E7 goal.md 直写目标线白名单 config file. "
         "Deny-all when unset -- E7 then refuses every goal.md direct write and "
         "records the refusal",
+    )
+    supervisor_run.add_argument(
+        "--wiki",
+        action="store_true",
+        help="M4 wiki 人话账 (交付 B): enable the katana-wiki-mcp client "
+        "(DEFAULT_WIKI_MCP_URL) so E5/E6/E7 append achievement sections on "
+        "successful closure. Off by default: deps.wiki stays None (零回归)",
     )
     supervisor_run.set_defaults(func=_supervisor_run)
 

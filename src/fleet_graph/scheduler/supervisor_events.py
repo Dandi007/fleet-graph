@@ -158,6 +158,10 @@ class SupervisorLaunchSpec:
     #: direct-write allowlist flag. Default None -- an unconfigured observer
     #: emits no --e7-allowlist, so the run keeps its deny-all default (零放宽).
     e7_allowlist_path: str | None = None
+    #: M4 wiki 人话账 (交付 B): observer-side passthrough of the `supervisor run`
+    #: --wiki enable flag. Default False -- an unconfigured observer emits no
+    #: --wiki, so the run keeps deps.wiki=None (零回归).
+    wiki: bool = False
 
     @property
     def unit_name(self) -> str:
@@ -211,6 +215,9 @@ class SupervisorLaunchSpec:
             argv += ["--harvest-deploy", word]
         if self.repo is not None:
             argv += ["--repo", self.repo]
+        # M4 wiki 人话账 (交付 B)：启用时发 `--wiki`（默认不发、词法稳定）。
+        if self.wiki:
+            argv += ["--wiki"]
         return argv
 
 
@@ -247,6 +254,9 @@ class ObserverConfig:
     #: M4 E7: 透传给 SupervisorLaunchSpec（argv）。缺省 None → 不发射
     #: --e7-allowlist，E7 直写保持 deny-all 默认拒绝语义零放宽。
     e7_allowlist_path: str | None = None
+    #: M4 wiki 人话账 (交付 B): 透传给 SupervisorLaunchSpec（argv）。缺省 False
+    #: → 不发射 --wiki，supervisor run 保持 deps.wiki=None 零回归。
+    wiki: bool = False
 
     @property
     def resolved_cursor_path(self) -> Path:
@@ -731,6 +741,7 @@ class SupervisorObserver:
             harvest_deploy=tuple(self.config.harvest_deploy),
             repo=self.config.repo,
             e7_allowlist_path=self.config.e7_allowlist_path,
+            wiki=self.config.wiki,
         )
 
     def _log_dedup(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:

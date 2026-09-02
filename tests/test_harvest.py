@@ -34,11 +34,13 @@ from fleet_graph.supervise.harvest import (
     HarvestRunConfig,
     _resolve_repo,
     authorize_harvest_write,
+    build_harvest,
     build_harvest_graph,
     run_harvest,
 )
 from fleet_graph.supervise.harvest_allowlist import HarvestAllowlist, parse_harvest_allowlist
 from fleet_graph.supervise.harvest_ops import EXIT_HEAD_MISMATCH, DefaultHarvestOps
+from fleet_graph.supervise.wiki_report import DefaultWikiClient, WikiReportError
 
 
 def fake_ops(
@@ -2661,3 +2663,117 @@ class TestHarvestPrSquashMergeBranchOccupied:
         assert any(argv[:3] == ["gh", "pr", "merge"] for argv in gh_argv), gh_argv
         # push 已执行：origin 上存在 harvest/dev-x ref。
         assert git(repo, "ls-remote", "--heads", "origin", "harvest/dev-x") != ""
+
+
+class TestHarvestWikiReport:
+    """交付 D.1/D.2/D.3：harvest 生产晋级分节接线（fake wiki 注入，禁触真网）。
+
+    1. 【v2 新增·阴性守卫，必须能红】fake wiki 注入，harvest 终局 != HARVESTED
+       （escalated / no-op）→ `record_production_promotion` **0 次调用**。验收标准=
+       去掉 receipt 里 `and state.get("outcome") == OUTCOME_HARVESTED` 守卫后本用例
+       必须变红（当前缺失该守卫时全绿=阴性面没钉住）。
+    2. harvest 生产晋级触发：fake wiki + outcome==HARVESTED → 调用 1 次、入参带
+       non-empty 证据指针；未修复时 0 次（阴性能红）。
+    3. harvest wiki 失败不咬主链：fake wiki 抛 WikiReportError → outcome 仍
+       HARVESTED、`wiki_report` step ok=false、绝不 escalate。
+    """
+
+    def test_negative_guard_escalated_never_calls_production_promotion(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        calls: list[tuple[Any, ...]] = []
+
+        def recording(*_a: Any, **_kw: Any) -> dict[str, Any]:
+            calls.append((_a, _kw))
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            "fleet_graph.supervise.wiki_report.record_production_promotion", recording
+        )
+        fake = fake_ops(merged=False)  # -> escalated
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), wiki=object())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert calls == [], f"未收割成功却追加了生产晋级分节: {calls}"
+
+    def test_negative_guard_noop_terminal_never_calls_production_promotion(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        calls: list[tuple[Any, ...]] = []
+
+        def recording(*_a: Any, **_kw: Any) -> dict[str, Any]:
+            calls.append((_a, _kw))
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            "fleet_graph.supervise.wiki_report.record_production_promotion", recording
+        )
+        fake = fake_ops(cherry_equivalent=True)  # -> already_harvested no-op 终态
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), wiki=object())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ALREADY_HARVESTED
+        assert calls == [], f"no-op 终态却追加了生产晋级分节: {calls}"
+
+    def test_harvested_calls_production_promotion_once_with_evidence(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        seen: list[dict[str, Any]] = []
+
+        def recording(client: Any, **kwargs: Any) -> dict[str, Any]:
+            seen.append({"client": client, **kwargs})
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            "fleet_graph.supervise.wiki_report.record_production_promotion", recording
+        )
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), wiki=object())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert len(seen) == 1, seen
+        assert seen[0]["development_name"] == "dev-x"
+        assert seen[0]["evidence"], "证据指针不得为空"
+        # 证据指针 = PR 链接 / commit / event key 至少一项在场。
+        assert any("github.com" in str(p) for p in seen[0]["evidence"])
+
+    def test_wiki_failure_does_not_flip_outcome(self, tmp_path: Path, monkeypatch: Any) -> None:
+        def boom(*_a: Any, **_kw: Any) -> dict[str, Any]:
+            raise WikiReportError("mock wiki down")
+
+        monkeypatch.setattr("fleet_graph.supervise.wiki_report.record_production_promotion", boom)
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), wiki=object())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED, "wiki 失败绝不能翻转 outcome"
+        steps = result["steps"] or []
+        wiki_report = [s for s in steps if s.get("step") == "wiki_report"]
+        assert wiki_report, steps
+        assert wiki_report[0]["ok"] is False
+        assert "wiki" in wiki_report[0]["detail"]
+
+    def test_wiki_none_is_zero_regression(self, tmp_path: Path, monkeypatch: Any) -> None:
+        """wiki 缺省 None -> 无 wiki_report step、无任何追加（零回归）。"""
+        calls: list[tuple[Any, ...]] = []
+
+        def recording(*_a: Any, **_kw: Any) -> dict[str, Any]:
+            calls.append((_a, _kw))
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            "fleet_graph.supervise.wiki_report.record_production_promotion", recording
+        )
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert calls == []
+        assert not any(s.get("step") == "wiki_report" for s in (result["steps"] or []))
+
+    def test_default_wiki_client_is_injected_via_config(self, tmp_path: Path) -> None:
+        """HarvestRunConfig.wiki 注入 DefaultWikiClient（交付 A.2）。"""
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), wiki=DefaultWikiClient())
+        assert isinstance(config.wiki, DefaultWikiClient)
+        graph, deps, _event = build_harvest(config)
+        assert deps.wiki is config.wiki
+        assert graph is not None

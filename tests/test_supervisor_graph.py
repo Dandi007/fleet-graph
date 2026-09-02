@@ -993,3 +993,100 @@ class TestE6E7Dispatch:
         )
         assert result["outcome"] == OUTCOME_REFUSED
         assert result["receipt_path"]
+
+    def test_e6_wiki_passthrough_constructs_default_client(self, tmp_path: Path) -> None:
+        """交付 B.1：config.wiki 启用 -> E6 三路注入 DefaultWikiClient（非 None）。"""
+        from fleet_graph.supervise.e6_stop import E6StopRunConfig, build_e6_stop
+        from fleet_graph.supervise.events import heartbeat_stale_event
+        from fleet_graph.supervise.wiki_report import DefaultWikiClient
+
+        event = heartbeat_stale_event(
+            folder_id="wf-a", heartbeat_age_s=600.0, round=3, phase="coordinator"
+        ).as_dict()
+        config = SupervisorRunConfig(
+            event=event,
+            state_root=tmp_path / "supervisor",
+            run_root=tmp_path / "runs",
+            publish_notes=False,
+            e6_ops=self.FakeE6Ops(),
+            wiki=DefaultWikiClient(),
+        )
+        _, deps, _ = build_e6_stop(
+            E6StopRunConfig(
+                event=event,
+                state_root=tmp_path / "supervisor",
+                run_root=tmp_path / "runs",
+                ops=self.FakeE6Ops(),
+                wiki=config.wiki,
+            )
+        )
+        assert isinstance(deps.wiki, DefaultWikiClient)
+
+    def test_e7_wiki_passthrough_constructs_default_client(self, tmp_path: Path) -> None:
+        """交付 B.1：config.wiki 启用 -> E7 三路注入 DefaultWikiClient（非 None）。"""
+        from fleet_graph.supervise.e7_allowlist import E7WriteAllowlist
+        from fleet_graph.supervise.e7_write import E7WriteRunConfig, build_e7_write
+        from fleet_graph.supervise.events import decision_swallowed_event
+        from fleet_graph.supervise.wiki_report import DefaultWikiClient
+
+        event = decision_swallowed_event(source_message_id="msg_sw", reason="noop").as_dict()
+        config = SupervisorRunConfig(
+            event=event,
+            state_root=tmp_path / "supervisor",
+            run_root=tmp_path / "runs",
+            publish_notes=False,
+            e7_ops=self.FakeE7Ops(),
+            e7_allowlist=E7WriteAllowlist(folder_ids=("wf-a",)),
+            wiki=DefaultWikiClient(),
+        )
+        _, deps, _ = build_e7_write(
+            E7WriteRunConfig(
+                event=event,
+                state_root=tmp_path / "supervisor",
+                run_root=tmp_path / "runs",
+                allowlist=E7WriteAllowlist(folder_ids=("wf-a",)),
+                ops=self.FakeE7Ops(),
+                wiki=config.wiki,
+            )
+        )
+        assert isinstance(deps.wiki, DefaultWikiClient)
+
+    def test_run_supervisor_e5_passes_wiki_into_harvest_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """交付 B.1：run_supervisor 把 config.wiki 注入 E5 harvest 配置。"""
+        from fleet_graph.supervise.events import approved_unharvested_event
+
+        event = approved_unharvested_event(
+            development_id="dev-x", head_commit="a" * 40, stage="implement"
+        ).as_dict()
+
+        captured: dict[str, Any] = {}
+
+        def fake_run_harvest(cfg: Any) -> dict[str, Any]:
+            captured["cfg"] = cfg
+            return {"outcome": "harvested", "steps": [], "receipt_path": ""}
+
+        monkeypatch.setattr("fleet_graph.supervise.harvest.run_harvest", fake_run_harvest)
+        wiki_client = object()
+        run_supervisor(
+            SupervisorRunConfig(
+                event=event,
+                state_root=tmp_path / "supervisor",
+                run_root=tmp_path / "runs",
+                publish_notes=False,
+                wiki=wiki_client,
+            )
+        )
+        assert captured["cfg"].wiki is wiki_client
+
+        monkeypatch.setattr("fleet_graph.supervise.harvest.run_harvest", fake_run_harvest)
+        run_supervisor(
+            SupervisorRunConfig(
+                event=event,
+                state_root=tmp_path / "supervisor",
+                run_root=tmp_path / "runs",
+                publish_notes=False,
+            )
+        )
+        assert captured["cfg"].wiki is None
