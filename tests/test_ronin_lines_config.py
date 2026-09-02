@@ -182,6 +182,15 @@ ENROLLED = {
     # 载体，统一入册流水线第一个 dogfood 用户。该线驻停 16h 等的就是这一条。
     # max_rounds=3 沿用入册申请声明（演练线，非常驻），故与 wf-a8c7b5 同列例外。
     "wf-e7b0dd",
+    # 2026-09-02 第十三波（用户原话：「从『模型可用性』的角度去增强建设比较好」/
+    # 「模型-链路 可用性 消耗 一系列的」/「派发一条 goal 线，就参考他，但是是
+    # new-api-gateway 整体的，而不是之前 scnet only 的」/「impl use dsv4pro」）：
+    # New API 网关**整体**的 model x channel 可用性与消耗建设线。
+    # 立线事故 = 09-02 deepseek-v4-flash 网关侧 7098 成功/0 失败（请求级 0.0%）、
+    # 面板全绿，而 TTFT P90 67.7s / P99 444.7s 使其对 agentic 负载事实不可用
+    # ——「请求成功率 100% 的模型可以事实上不可用」。
+    # 判据已先行冻结在 token-plan-report PR #1（合 main，当前诚实报红）。
+    "wf-c8bce9",
 }
 
 # 2026-08-29 复活：曾在 MIGRATED 里 enabled=false 停摆的线被用户令重新点亮。

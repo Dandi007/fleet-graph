@@ -219,6 +219,13 @@
       "max_rounds": 9999,
       "alias": "ronin-decom",
       "enabled": true
+    },
+    {
+      "folder_id": "wf-c8bce9",
+      "seat": "opencode-dsv4pro",
+      "max_rounds": 9999,
+      "alias": "ronin-model-avail",
+      "enabled": true
     }
   ],
   "line_environment": {
