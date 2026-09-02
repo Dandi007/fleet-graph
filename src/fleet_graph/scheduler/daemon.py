@@ -94,6 +94,7 @@ from fleet_graph.scheduler.seat_override import (
     roster_seat_from,
 )
 from fleet_graph.scheduler.wake import WakeSignals, parse_bus_timestamp, probe_error_tag
+from fleet_graph.state.completion import METHOD_UNVERIFIED, CompletionVerdict
 
 DEFAULT_MAINTENANCE_STOP = Path("/data/fleet-graph/maintenance-stop")
 DEFAULT_INTERVAL_SECONDS = 60.0
@@ -176,6 +177,11 @@ class TickResult:
     #: cleared, the generation bumped, the record consumed). Absent otherwise,
     #: so an inert or absent revoke leaves no "revived" trace.
     revoke_event: str | None = None
+    #: G2: the completion gate's verdict for a line whose terminal is `done`.
+    #: Absent when no gate is configured or the line is not `done`. Present on
+    #: both outcomes so a retired line shows *why* it retired (reverse-apply or
+    #: feature-grep) and a held line shows what is missing.
+    completion: CompletionVerdict | None = None
 
     def as_dict(self) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -186,6 +192,8 @@ class TickResult:
         }
         if self.revoke_event is not None:
             record["revoke"] = self.revoke_event
+        if self.completion is not None:
+            record["completion_gate"] = self.completion.as_dict()
         if self.seat_effective is not None:
             record["seat_roster"] = self.seat_roster
             record["seat_override"] = self.seat_override
@@ -221,6 +229,20 @@ class UnitProbe(Protocol):
     """Is the transient unit for this line currently up?"""
 
     def is_active(self, unit_name: str) -> bool: ...
+
+
+class CompletionGate(Protocol):
+    """The G2 line-completion gate: confirm a `done` line's product is on the
+    default branch before the scheduler retires it.
+
+    None means no gate -- a `done` line retires exactly as before (legacy). The
+    gate is consulted only on a line whose terminal is `done`, and its answer is
+    a `CompletionVerdict`: positive retires, negative holds the line in pending
+    acceptance (the refusal names the development and the missing lines). A
+    gate that cannot answer must fail closed -- no confirmation, no retirement.
+    """
+
+    def verdict_for(self, folder_id: str, terminal: dict[str, Any]) -> CompletionVerdict: ...
 
 
 class SystemdUnitProbe:
@@ -338,6 +360,7 @@ class Scheduler:
         checkpoints: Any = None,
         seat_overrides: SeatOverrideStore | None = None,
         revives: ReviveStore | None = None,
+        completion: CompletionGate | None = None,
     ) -> None:
         self.config = config
         self.prober = prober
@@ -371,6 +394,11 @@ class Scheduler:
         #: parasitic on this tick. None means no supervision events -- the
         #: fleet schedules exactly as before. Duck-typed on `after_tick`.
         self.supervisor = supervisor
+        #: The G2 completion gate: consulted on a `done` line before the
+        #: scheduler retires it. None keeps the legacy "done is final" reading
+        #: unchanged; non-None holds a line whose product is not confirmed on
+        #: the default branch in pending acceptance (Refusal.PENDING_DEFAULT_BRANCH).
+        self.completion = completion
         #: The durable checkpoint terminal reader (E3). None keeps the legacy
         #: terminal.json decision path unchanged; non-None makes checkpoint
         #: state authoritative for terminal/account/parking decisions.
@@ -547,6 +575,53 @@ class Scheduler:
             return None
         value = record.get("terminal")
         return str(value) if value else None
+
+    # --- completion gate (G2) ---------------------------------------------
+    #
+    # A `done` terminal is retirement, and retirement used to be the line's own
+    # word. The completion gate adds the mechanical check the line level never
+    # had: before a `done` line retires, its product must be confirmed on the
+    # default branch (reverse-apply or feature-grep). The gate is consulted only
+    # on `done` lines; with no gate configured, `done` stays final exactly as
+    # before. Unlike the parking probes' fail-open, this gate fails *closed*:
+    # no confirmation means no retirement, because a wrong retirement here is
+    # precisely the silent "approved, complete, never merged" defect G2 exists
+    # to stop.
+
+    def _completion_verdict(self, line: LineSpec) -> CompletionVerdict | None:
+        """The gate's answer for a `done` line, or None when the gate is bypassed."""
+        if self.completion is None:
+            return None
+        terminal = self.terminal_record(line.folder_id)
+        if terminal is None or terminal.get("terminal") != "done":
+            return None
+        try:
+            return self.completion.verdict_for(line.folder_id, terminal)
+        except Exception:
+            # Fail closed: the gate could not confirm the product is on the
+            # default branch, so the line must not retire on an unverified
+            # "done". The unverified verdict names the line and records that
+            # the check itself failed, never a silent pass.
+            return CompletionVerdict(
+                development_id=line.folder_id,
+                on_default_branch=False,
+                found=0,
+                total=0,
+                method=METHOD_UNVERIFIED,
+            )
+
+    def _pending_default_branch_detail(self, verdict: CompletionVerdict) -> str:
+        """The refusal text an operator actually reads: which line, what's missing."""
+        missing = (
+            ", ".join(verdict.missing)
+            if verdict.missing
+            else ("gate could not verify" if verdict.method == METHOD_UNVERIFIED else "all")
+        )
+        return (
+            f"{verdict.development_id} declared done but its product is not confirmed "
+            f"on the default branch ({verdict.found}/{verdict.total} feature lines "
+            f"found); missing: {missing}"
+        )
 
     # --- revival (M5) -----------------------------------------------------
     #
@@ -1295,6 +1370,21 @@ class Scheduler:
                 revived=revived,
             )
             seat_roster, seat_override, seat_effective = self.seat_triple(line)
+            # G2 line-completion gate: a `done` line whose product is not
+            # confirmed on the default branch must not retire. The gate is
+            # consulted only when `decide` returned TERMINAL_DONE -- every other
+            # refusal (and every ignition) is untouched.
+            completion_verdict = self._completion_verdict(line)
+            if (
+                completion_verdict is not None
+                and not completion_verdict.on_default_branch
+                and decision.refusal is Refusal.TERMINAL_DONE
+            ):
+                decision = IgnitionDecision(
+                    False,
+                    Refusal.PENDING_DEFAULT_BRANCH,
+                    self._pending_default_branch_detail(completion_verdict),
+                )
             result = TickResult(
                 line.folder_id,
                 decision,
@@ -1306,6 +1396,7 @@ class Scheduler:
                 seat_override=seat_override,
                 seat_effective=seat_effective,
                 revoke_event=revoke_event,
+                completion=completion_verdict,
             )
             if decision.refusal is Refusal.NO_PROBE:
                 result.probe_detail = self.probe_reasons.get(self.effective_seat_for(line))
