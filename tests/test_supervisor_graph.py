@@ -993,3 +993,115 @@ class TestE6E7Dispatch:
         )
         assert result["outcome"] == OUTCOME_REFUSED
         assert result["receipt_path"]
+
+
+class TestWikiEffectiveResolution:
+    """交付 B/D：`run_supervisor` 的 --wiki 开关解析（`_effective_wiki`）。
+
+    - off（默认）-> None：deps.wiki=None 字节不变，零回归。
+    - on -> DefaultWikiClient()：注入 E5/E6/E7 三路 config.wiki。
+    - 显式 `wiki=`（测试注入 fake）优先于开关。
+    """
+
+    def _config(self, tmp_path: Path, **overrides: Any) -> SupervisorRunConfig:
+        event = line_fault_event("wf-a", "run-1").as_dict()
+        defaults: dict[str, Any] = {
+            "event": event,
+            "state_root": tmp_path / "supervisor",
+            "run_root": tmp_path / "runs",
+        }
+        defaults.update(overrides)
+        return SupervisorRunConfig(**defaults)
+
+    def test_wiki_off_defaults_to_none(self, tmp_path: Path) -> None:
+        from fleet_graph.graphs.supervisor import _effective_wiki
+
+        assert _effective_wiki(self._config(tmp_path)) is None
+
+    def test_wiki_enabled_constructs_default_wiki_client(self, tmp_path: Path) -> None:
+        from fleet_graph.graphs.supervisor import _effective_wiki
+        from fleet_graph.supervise.wiki_report import DefaultWikiClient
+
+        wiki = _effective_wiki(self._config(tmp_path, wiki_enabled=True))
+        assert isinstance(wiki, DefaultWikiClient)
+        assert wiki.url == "http://127.0.0.1:8113/mcp"
+
+    def test_explicit_wiki_injection_wins_over_the_switch(self, tmp_path: Path) -> None:
+        from fleet_graph.graphs.supervisor import _effective_wiki
+
+        fake = object()
+        wiki = _effective_wiki(self._config(tmp_path, wiki_enabled=True, wiki=fake))
+        assert wiki is fake
+
+    def test_explicit_wiki_none_with_switch_off_stays_none(self, tmp_path: Path) -> None:
+        from fleet_graph.graphs.supervisor import _effective_wiki
+
+        assert _effective_wiki(self._config(tmp_path, wiki=None)) is None
+
+
+class TestWikiDispatch:
+    """交付 B：--wiki 启用时 E6/E7 处置反应器收到非 None 的 deps.wiki（缺陷闭环
+    分节被激活）；缺省时零回归（deps.wiki=None，不发 wiki）。"""
+
+    class FakeE6Ops:
+        def resolve_line_unit(self, folder_id: str, run_root: Path) -> dict[str, Any]:
+            return {"ok": True, "unit": f"fleet-graph-line-{folder_id}-g1", "source": "list-units"}
+
+        def is_active(self, unit_name: str) -> bool:
+            return False
+
+        def stop_unit(self, unit_name: str) -> int:
+            return 0
+
+        def line_heartbeat_age_s(self, folder_id: str) -> float | None:
+            return None
+
+    def test_e6_wiki_on_receives_non_none_deps_wiki(self, tmp_path: Path, monkeypatch: Any) -> None:
+        from fleet_graph.supervise import wiki_report
+        from fleet_graph.supervise.e6_stop import OUTCOME_STOPPED
+        from fleet_graph.supervise.events import heartbeat_stale_event
+        from fleet_graph.supervise.wiki_report import DefaultWikiClient
+
+        seen: list[Any] = []
+        monkeypatch.setattr(
+            wiki_report, "record_defect_closed", lambda *a, **kw: seen.append(a) or {"ok": True}
+        )
+        event = heartbeat_stale_event(
+            folder_id="wf-a", heartbeat_age_s=600.0, round=3, phase="coordinator"
+        ).as_dict()
+        config = SupervisorRunConfig(
+            event=event,
+            state_root=tmp_path / "supervisor",
+            run_root=tmp_path / "runs",
+            publish_notes=False,
+            e6_ops=self.FakeE6Ops(),
+            wiki_enabled=True,
+        )
+        result = run_supervisor(config)
+        assert result["outcome"] == OUTCOME_STOPPED
+        # --wiki on：record_defect_closed 被触发，且收到的是 DefaultWikiClient。
+        assert len(seen) == 1, seen
+        assert isinstance(seen[0][0], DefaultWikiClient)
+
+    def test_e6_wiki_off_is_zero_regression(self, tmp_path: Path, monkeypatch: Any) -> None:
+        from fleet_graph.supervise import wiki_report
+        from fleet_graph.supervise.e6_stop import OUTCOME_STOPPED
+        from fleet_graph.supervise.events import heartbeat_stale_event
+
+        seen: list[Any] = []
+        monkeypatch.setattr(
+            wiki_report, "record_defect_closed", lambda *a, **kw: seen.append(a) or {"ok": True}
+        )
+        event = heartbeat_stale_event(
+            folder_id="wf-a", heartbeat_age_s=600.0, round=3, phase="coordinator"
+        ).as_dict()
+        config = SupervisorRunConfig(
+            event=event,
+            state_root=tmp_path / "supervisor",
+            run_root=tmp_path / "runs",
+            publish_notes=False,
+            e6_ops=self.FakeE6Ops(),
+        )
+        result = run_supervisor(config)
+        assert result["outcome"] == OUTCOME_STOPPED
+        assert seen == [], "wiki off：deps.wiki=None，record_defect_closed 不得触发（零回归）"

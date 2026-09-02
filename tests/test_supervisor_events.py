@@ -1481,3 +1481,54 @@ class TestE7AllowlistWiring:
         )
         config = SchedulerConfig.from_json(path)
         assert config.e7_allowlist_path == "/data/fleet-graph/supervisor/e7-write-allowlist.json"
+
+
+class TestWikiWiring:
+    """M4 wiki 人话账 argv 透传：observer 侧把 --wiki 补传进 `supervisor run`
+    argv（spec 契约：带 wiki_enabled 的 ObserverConfig + SupervisorObserver →
+    spec.argv() 含 --wiki；未配置时该旗标不出现——deps.wiki=None 零回归）。"""
+
+    def _observer(
+        self, tmp_path: Path, **wiki: Any
+    ) -> tuple[SupervisorObserver, RecordingLauncher]:
+        launcher = RecordingLauncher()
+        observer = SupervisorObserver(
+            ObserverConfig(
+                run_root=tmp_path / "runs",
+                supervisor_state_root=tmp_path / "supervisor",
+                **wiki,
+            ),
+            launcher=launcher,  # type: ignore[arg-type]
+            read_model=read_model_for(EMPTY_READ_MODEL),
+        )
+        return observer, launcher
+
+    def test_unconfigured_observer_emits_no_wiki_flag(self, tmp_path: Path) -> None:
+        observer, launcher = self._observer(tmp_path)
+        tick(observer, {"wf-a": terminal("fault", "run-1")})
+        [spec] = launcher.specs
+        assert "--wiki" not in spec.argv()
+
+    def test_configured_observer_emits_wiki_flag(self, tmp_path: Path) -> None:
+        observer, launcher = self._observer(tmp_path, wiki_enabled=True)
+        tick(observer, {"wf-a": terminal("fault", "run-1")})
+        [spec] = launcher.specs
+        assert "--wiki" in spec.argv()
+
+    def test_launch_spec_without_wiki_field_emits_no_flag(self, tmp_path: Path) -> None:
+        # 阴性（零回归）：SupervisorLaunchSpec 不带 wiki_enabled 时 argv() 无 --wiki。
+        spec = SupervisorLaunchSpec(
+            event=line_fault_event("wf-a", "run-1"),
+            run_root=tmp_path / "runs",
+            state_root=tmp_path / "supervisor",
+        )
+        assert "--wiki" not in spec.argv()
+
+    def test_launch_spec_with_wiki_enabled_emits_flag(self, tmp_path: Path) -> None:
+        spec = SupervisorLaunchSpec(
+            event=line_fault_event("wf-a", "run-1"),
+            run_root=tmp_path / "runs",
+            state_root=tmp_path / "supervisor",
+            wiki_enabled=True,
+        )
+        assert "--wiki" in spec.argv()

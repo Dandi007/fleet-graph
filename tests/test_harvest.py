@@ -2395,3 +2395,88 @@ class TestHarvestWorktreeReclaimGuard:
         ok, detail = _assert_repo_valid(repo)
         assert ok is False
         assert detail
+
+
+class TestHarvestWikiWiring:
+    """M4 交付 A/D：harvest 生产晋级分节接线（fake wiki 注入，禁触真网）。
+
+    D.1 【v2 新增·阴性守卫，必须能红】：fake wiki 注入 + outcome != HARVESTED
+    （escalated / already_harvested）-> record_production_promotion 0 次调用。
+    去掉 `and outcome == OUTCOME_HARVESTED` 守卫后本用例必须变红（当前缺失该
+    守卫时全绿=阴性面没钉住）。
+    D.2 触发：fake wiki + outcome==HARVESTED -> 调用 1 次、证据指针 non-empty。
+    D.3 失败不咬主链：fake wiki 抛 WikiReportError -> outcome 仍 HARVESTED、
+    wiki_report step ok=false、绝不 escalate。
+    """
+
+    @staticmethod
+    def _record_promotion(monkeypatch: Any) -> list[dict[str, Any]]:
+        calls: list[dict[str, Any]] = []
+
+        def recording(client: Any, **kwargs: Any) -> dict[str, Any]:
+            calls.append({"client": client, **kwargs})
+            return {"ok": True, "readback_present": True}
+
+        monkeypatch.setattr(
+            "fleet_graph.supervise.wiki_report.record_production_promotion", recording
+        )
+        return calls
+
+    def test_negative_guard_escalated_never_calls_promotion(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """D.1 阴性守卫：outcome=escalated（verify 判红）-> 0 次调用。
+
+        去守卫验证：删掉 receipt 里 `and outcome == OUTCOME_HARVESTED` 后，本用例
+        因 escalated 也会调 record_production_promotion -> 断言 calls==[] 必红。
+        """
+        calls = self._record_promotion(monkeypatch)
+        fake = fake_ops(verify_exit=1)
+        config, _ = config_for(tmp_path, ops=fake, wiki=object())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert calls == [], f"escalated 收割不应触发生产晋级: {calls}"
+
+    def test_negative_guard_already_harvested_never_calls_promotion(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """D.1 阴性守卫（no-op 终态）：outcome=already_harvested -> 0 次调用。"""
+        calls = self._record_promotion(monkeypatch)
+        fake = fake_ops(cherry_equivalent=True)
+        config, _ = config_for(tmp_path, ops=fake, wiki=object())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ALREADY_HARVESTED
+        assert calls == [], f"already_harvested 收割不应触发生产晋级: {calls}"
+
+    def test_harvested_trigger_calls_promotion_once_with_evidence(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """D.2 触发：outcome==HARVESTED -> record_production_promotion 恰 1 次、
+        证据指针 non-empty、development_name 透传。"""
+        calls = self._record_promotion(monkeypatch)
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), wiki=object())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert len(calls) == 1, f"应恰 1 次: {calls}"
+        assert calls[0]["development_name"] == "dev-x"
+        assert calls[0]["evidence"], "证据指针必须 non-empty"
+        assert all(str(p).strip() for p in calls[0]["evidence"])
+
+    def test_wiki_failure_does_not_bite_main_chain(self, tmp_path: Path) -> None:
+        """D.3：fake wiki 抛 WikiReportError -> outcome 仍 HARVESTED、wiki_report
+        step ok=false、绝不 escalate（telemetry 可以失败、不可以撒谎）。"""
+        from fleet_graph.supervise.wiki_report import WikiReportError
+
+        class RaisingWiki:
+            def search(self, title: str) -> list[dict[str, Any]]:
+                raise WikiReportError("katana-wiki-mcp down")
+
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), wiki=RaisingWiki())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        wiki_step = next(s for s in receipt["steps"] if s["step"] == "wiki_report")
+        assert wiki_step["ok"] is False
+        assert "wiki 追加失败" in wiki_step["detail"]

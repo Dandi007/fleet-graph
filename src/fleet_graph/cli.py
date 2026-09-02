@@ -865,6 +865,8 @@ def _scheduler_run(args: argparse.Namespace) -> int:
                 repo=config.repo,
                 # M4 E7: 纯配置透传，无业务逻辑。
                 e7_allowlist_path=config.e7_allowlist_path,
+                # M4 wiki 人话账: 纯配置透传，无业务逻辑。
+                wiki_enabled=args.wiki,
             ),
             launcher=TransientLauncher(dry_run=args.dry_run),
             bus=board.client if board is not None else None,
@@ -1009,6 +1011,8 @@ def _supervisor_run(args: argparse.Namespace) -> int:
         harvest_verify_real_argv=args.harvest_verify_real,
         # M4 E7: goal.md 直写目标线白名单（deny-all 默认）。
         e7_allowlist_path=args.e7_allowlist,
+        # M4 wiki 人话账: --wiki 开关（缺省不发、deps.wiki=None 零回归）。
+        wiki_enabled=args.wiki,
     )
     result = run_supervisor(config)
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
@@ -1814,6 +1818,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="run without a gateway probe. Every line then refuses on no_probe, "
         "which is the honest reading of not being able to ask",
     )
+    sched_run.add_argument(
+        "--wiki",
+        action="store_true",
+        help="M4 wiki 人话账: emit --wiki to each supervisor run launch so "
+        "E5/E6/E7 successful closes append their sections (default off: "
+        "deps.wiki=None, zero regression)",
+    )
     sched_run.set_defaults(func=_scheduler_run)
 
     from fleet_graph.bus.client import DEFAULT_BUS_URL
@@ -2022,6 +2033,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="M4 E7 (decision_swallowed): E7 goal.md 直写目标线白名单 config file. "
         "Deny-all when unset -- E7 then refuses every goal.md direct write and "
         "records the refusal",
+    )
+    supervisor_run.add_argument(
+        "--wiki",
+        action="store_true",
+        help="M4 wiki 人话账 (交付 B): enable katana-wiki-mcp 汇报 -- E5 harvest "
+        "HARVESTED / E6 stopped / E7 delivered 成功收口时向「舰队开发阶段性成果"
+        "报告」页追加分节. Off by default: deps.wiki stays None (零回归)",
     )
     supervisor_run.set_defaults(func=_supervisor_run)
 

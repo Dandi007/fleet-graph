@@ -43,6 +43,7 @@ SOP（spec 交付 B）逐节点实现，全部是 script 节点（机械判定�
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypedDict
@@ -52,7 +53,7 @@ from langgraph.graph import END, START, StateGraph
 from fleet_graph.bus.board import Board
 from fleet_graph.bus.client import BusClient
 from fleet_graph.dd.control_plane import DEFAULT_DD_ROOT, RECORD_FILE
-from fleet_graph.state.run_artifacts import write_json_durable
+from fleet_graph.state.run_artifacts import iso, write_json_durable
 from fleet_graph.supervise.events import (
     EVENT_APPROVED_UNHARVESTED,
     SupervisorEvent,
@@ -192,6 +193,10 @@ class HarvestDeps:
     ops: HarvestOps | None = None
     bus: BusClient | None = None
     publish_notes: bool = True
+    #: katana-wiki-mcp 客户端（可选）。outcome==OUTCOME_HARVESTED 时向「舰队开发
+    #: 阶段性成果报告」页追加生产晋级分节；None -> 不汇报（默认）。wiki 是
+    #: telemetry，失败绝不咬收割主链（best-effort，仅记 wiki_report step ok:false）。
+    wiki: Any | None = None
 
     def thread_dir(self, key: str) -> Path:
         return self.state_root / "threads" / key
@@ -815,6 +820,48 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
 
     def receipt(state: HarvestState) -> HarvestState:
         event = _event_of(state)
+        outcome = state.get("outcome")
+        # 交付 A：生产晋级分节挂在收割终局路径。best-effort——wiki 是 telemetry，
+        # 失败绝不咬主链（吞掉并仅留痕）。守卫 outcome==OUTCOME_HARVESTED：
+        # record_production_promotion 写的是「已 HARVESTED」正文，未收割成功的单
+        # 绝不能被写成已上线（telemetry 可以失败、不可以撒谎）。
+        if deps.wiki is not None and outcome == OUTCOME_HARVESTED:
+            try:
+                from fleet_graph.supervise.wiki_report import record_production_promotion
+
+                development_id = state.get("development_id") or ""
+                evidence: list[str] = []
+                pr_url = state.get("pr_url")
+                if pr_url:
+                    evidence.append(f"PR {pr_url}")
+                merged = state.get("merged_head") or state.get("harvest_tip") or ""
+                if merged:
+                    evidence.append(f"commit {merged}")
+                record_production_promotion(
+                    deps.wiki,
+                    development_name=development_id,
+                    background=(
+                        f"开发单 {development_id} 完成 implement 阶段并通过验收，"
+                        "harvest 将其产品 commit 收割进默认分支并部署。"
+                    ),
+                    delivery=(
+                        f"harvest HARVESTED，产品 commit 已 squash merge 进默认分支，"
+                        f"outcome={outcome}。"
+                    ),
+                    evidence=tuple(evidence),
+                    at=iso(time.time()),
+                    skeleton="# 舰队开发阶段性成果报告\n\n按「报告更新约定」追加分节。\n",
+                )
+            except Exception as exc:  # telemetry must not bite
+                steps = list(state.get("steps") or [])
+                steps.append(
+                    {
+                        "step": "wiki_report",
+                        "ok": False,
+                        "detail": f"wiki 追加失败: {repr(exc)[:200]}",
+                    }
+                )
+                state = {**state, "steps": steps}
         path = write_json_durable(
             deps.state_root / "reports" / f"{event.key}.json",
             {
@@ -944,6 +991,9 @@ class HarvestRunConfig:
     ops: HarvestOps | None = None
     bus: BusClient | None = None
     publish_notes: bool = True
+    #: katana-wiki-mcp 客户端（可选）。outcome==OUTCOME_HARVESTED 时追加生产晋级
+    #: 分节；None -> 不汇报（默认）。wiki 是 telemetry，失败绝不咬收割主链。
+    wiki: Any | None = None
 
     @property
     def resolved_checkpoint_path(self) -> str:
@@ -968,6 +1018,7 @@ def build_harvest(config: HarvestRunConfig) -> tuple[Any, HarvestDeps, Superviso
         ops=config.ops or DefaultHarvestOps(),
         bus=config.bus,
         publish_notes=config.publish_notes,
+        wiki=config.wiki,
     )
     return build_harvest_graph(deps), deps, event
 

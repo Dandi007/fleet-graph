@@ -875,6 +875,12 @@ class SupervisorRunConfig:
     #: katana-wiki-mcp 客户端。E6/E7 成功收口时向「舰队开发阶段性成果报告」页追加
     #: 缺陷闭环分节；None -> 不汇报（默认）。wiki 是 telemetry，失败不咬反应器。
     wiki: Any | None = None
+    # --- M4 wiki 人话账 (交付 B) ---
+    #: --wiki 可选 enable 开关。off（默认）时注入的 wiki 恒 None（deps.wiki=None
+    #: 字节不变，零回归）；on 时构造 `DefaultWikiClient()`（DEFAULT_WIKI_MCP_URL=
+    #: http://127.0.0.1:8113/mcp）注入 E5/E6/E7 三路 config.wiki。显式传入的
+    #: `wiki` 优先于本开关（测试注入 fake 用）。
+    wiki_enabled: bool = False
 
     @property
     def resolved_checkpoint_path(self) -> str:
@@ -904,6 +910,18 @@ def build_supervisor(config: SupervisorRunConfig) -> tuple[Any, SupervisorDeps, 
     return build_supervisor_graph(deps), deps, event
 
 
+def _effective_wiki(config: SupervisorRunConfig) -> Any | None:
+    """--wiki 开关解析：显式注入的 `config.wiki` 优先；否则 on 时构造
+    `DefaultWikiClient()`，off 时 None（零回归——deps.wiki 字节不变）。"""
+    if config.wiki is not None:
+        return config.wiki
+    if config.wiki_enabled:
+        from fleet_graph.supervise.wiki_report import DefaultWikiClient
+
+        return DefaultWikiClient()
+    return None
+
+
 def run_supervisor(config: SupervisorRunConfig) -> dict[str, Any]:
     """Run one supervisor turn to its receipt, resuming if the thread exists.
 
@@ -923,6 +941,7 @@ def run_supervisor(config: SupervisorRunConfig) -> dict[str, Any]:
     from langgraph.checkpoint.sqlite import SqliteSaver
 
     event = validate_event(config.event)
+    wiki = _effective_wiki(config)
     if event.type == EVENT_APPROVED_UNHARVESTED:
         from fleet_graph.supervise.harvest import HarvestRunConfig, run_harvest
 
@@ -952,6 +971,7 @@ def run_supervisor(config: SupervisorRunConfig) -> dict[str, Any]:
             ops=config.harvest_ops,
             bus=config.bus,
             publish_notes=config.publish_notes,
+            wiki=wiki,
         )
         return run_harvest(harvest_config)
 
@@ -967,7 +987,7 @@ def run_supervisor(config: SupervisorRunConfig) -> dict[str, Any]:
                 ops=config.e6_ops,
                 bus=config.bus,
                 publish_notes=config.publish_notes,
-                wiki=config.wiki,
+                wiki=wiki,
             )
         )
 
@@ -991,7 +1011,7 @@ def run_supervisor(config: SupervisorRunConfig) -> dict[str, Any]:
                 ops=config.e7_ops,
                 bus=config.bus,
                 publish_notes=config.publish_notes,
-                wiki=config.wiki,
+                wiki=wiki,
             )
         )
 
