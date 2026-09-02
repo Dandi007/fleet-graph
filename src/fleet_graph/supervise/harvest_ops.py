@@ -751,29 +751,12 @@ class DefaultHarvestOps:
     def _binding_matches(self, tree: Path, record_tree: Path) -> bool:
         """record 的 repo_path（规范化后）是否绑定 tree（规范化后）。
 
-        两种情况都覆盖：
-        1. record repo_path 与 tree 直接相等（record 直接指向 canonical / 独立 init）；
-        2. record repo_path 是 linked worktree -> `git rev-parse --git-common-dir`
-           解析其 canonical，判 canonical 是否等于 tree（worktree -> canonical）。
-
-        只读：`git rev-parse` 是纯读口，零写原语。
+        H8 case 2 收敛：只保留 case 1 —— record repo_path 与 tree **直接相等**
+        （纯路径比较）。linked-worktree -> canonical 归属判定已删除：同仓另一棵
+        linked worktree 在飞不构成对 canonical 或本次树的绑定，否则收割护栏会
+        退化成全局收割锁。纯路径比较，零 git 读口（`--git-common-dir` 不再需要）。
         """
-        if tree == record_tree:
-            return True
-        if not record_tree.is_dir():
-            return False
-        common = run_git(record_tree, "rev-parse", "--git-common-dir")
-        if common.returncode != 0 or not common.stdout.strip():
-            return False
-        common_dir = Path(common.stdout.strip())
-        if not common_dir.is_absolute():
-            common_dir = record_tree / common_dir
-        common_resolved = _resolved(common_dir)
-        if common_resolved.name == ".git" and common_resolved != (record_tree / ".git").resolve():
-            canonical = _resolved(common_resolved.parent)
-            if canonical == tree:
-                return True
-        return False
+        return tree == record_tree
 
     def _terminal_of(self, dev_dir: Path) -> dict[str, Any]:
         """H-B：终态判定以权威结果为准——先读 `result.json`，`status.json` 退居缓存兜底。
@@ -845,10 +828,10 @@ class DefaultHarvestOps:
 
         1. 规范化 `tree_path`（`Path(...).resolve()`，同 `_resolved`）。
         2. 枚举 `<dd_root>/<development_id>/record.json`，读 `repo_path`
-           （=worktree 绑定），规范化后与 `tree_path` 比对；不等时若 record
-           `repo_path` 是 linked worktree，用 `git rev-parse --git-common-dir`
-           解析其 canonical 再判等（覆盖 record 直接指向 canonical 与
-           worktree -> canonical 两种情况）。**H-A**：缺 `record.json` /
+           （=worktree 绑定），规范化后与 `tree_path` **直接**比对（H8 case 2
+           收敛：只判直接路径相等，不再做 linked-worktree -> canonical 归属
+           解析——同仓另一棵 linked worktree 在飞不构成对 canonical 或本次
+           树的绑定，护栏不再锁死整仓收割）。**H-A**：缺 `record.json` /
            JSON 坏档 / 顶层非 JSON 对象 -> 读不到任何 `repo_path`，无法构成
            对 `tree_path` 的绑定 -> 跳过（out of scope），**绝不**进任何
            「阻断所有树」的全局 `indeterminate` 聚合。
