@@ -112,6 +112,31 @@ _EMPTY_PARK_FIELDS: dict[str, Any] = {
 }
 
 
+def _terminal_resets_streak(record: dict[str, Any]) -> bool:
+    """Should this accounted terminal zero the no-progress streak rather than feed it?
+
+    ``rounds > 0`` and ``done`` have always reset -- the stall guard exists for
+    lines going *nowhere*, not for lines ending unhappily. The 2026-09-02
+    ruling adds a third reset: a ``blocked`` terminal waiting on a *human
+    decision* (``waiting_on == "decision"``) is legitimate waiting, not a stall
+    -- the line is parked on it (see ``park_state``), and feeding the parked
+    run into the streak hands the wake a backoff it did not earn, which was the
+    observed production bug: a line woken by a decision stayed dragged in the
+    NO_PROGRESS window instead of igniting.
+
+    The exemption is deliberately as narrow as the parking definition:
+    ``external``/``none`` waits and legacy terminals without the field still
+    count, so the anti-spin guard is not blinded by widening the reset to
+    "every blocked terminal".
+    """
+    advanced = int(record.get("rounds") or 0) > 0
+    finished = record.get("terminal") == "done"
+    awaiting_decision = (
+        record.get("terminal") == "blocked" and record.get("waiting_on") == "decision"
+    )
+    return advanced or finished or awaiting_decision
+
+
 @dataclass(frozen=True)
 class LineSpec:
     """One line the scheduler is responsible for."""
@@ -799,9 +824,7 @@ class Scheduler:
         if run_id is None or run_id == state["accounted_run_id"]:
             return int(state["streak"])
 
-        advanced = int(record.get("rounds") or 0) > 0
-        finished = record.get("terminal") == "done"
-        streak = 0 if (advanced or finished) else int(state["streak"]) + 1
+        streak = 0 if _terminal_resets_streak(record) else int(state["streak"]) + 1
         try:
             current_generation = max(int(state["generation"]), base_generation)
         except (TypeError, ValueError):

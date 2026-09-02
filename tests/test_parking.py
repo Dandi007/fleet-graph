@@ -25,6 +25,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from fleet_graph.bus.board import parked_question_key
 from fleet_graph.scheduler.daemon import LineSpec, Scheduler, SchedulerConfig
 from fleet_graph.scheduler.ignition import Refusal
@@ -508,6 +510,75 @@ class TestG1ConsumedRevisionBaseline:
         assert result.park_event == "not_parked:no_consumed_revision"
         assert result.decision.ignite
         assert len(launcher.launched) == 1
+
+
+class TestDecisionParkDoesNotFeedTheStreak:
+    """The 2026-09-02 ruling: a run parked waiting on a *human decision* is
+    legitimate waiting, not a stall -- it must not feed the no-progress streak,
+    or the wake would land in a NO_PROGRESS backoff it never earned.
+
+    The positive criterion is a real tick sequence: line parks waiting on a
+    decision (asked the board) -> decision wake clears the parked fields -> the
+    next decide tick ignites directly, no NO_PROGRESS, no backoff wait.
+    """
+
+    def test_a_decision_wake_ignites_the_next_tick(self, tmp_path: Path) -> None:
+        wake = FakeWake()
+        board = FakeBoard()
+        scheduler, clock, launcher = make(tmp_path, wake=wake, board=board)
+
+        # Seed: two fruitless non-decision runs have already put the streak at 2.
+        scheduler.record_start("wf-1", 1000.0)
+        write_blocked(tmp_path, waiting_on="external", run_id="run-x1")
+        assert scheduler.account_last_run("wf-1") == 1
+        write_blocked(tmp_path, waiting_on="external", run_id="run-x2")
+        assert scheduler.account_last_run("wf-1") == 2
+
+        # Now the line blocks waiting on a human decision and parks.
+        write_blocked(tmp_path, run_id="run-b1")
+        clock.now = 1300.0
+        result = scheduler.tick()[0]
+        assert result.decision.refusal is Refusal.PARKED_AWAITING_DECISION
+
+        # The decision arrives (a wake fact); the next decide tick must launch
+        # directly -- streak was reset by the parked run, not fed.
+        wake.inbox = True
+        clock.now = 1400.0
+        result = scheduler.tick()[0]
+        assert result.park_event == "woken:inbox"
+        assert result.decision.ignite is True
+        assert result.decision.refusal is None
+        assert len(launcher.launched) == 1
+
+    def test_mutation_gun_dropping_the_exemption_hits_no_progress(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """变异枪（阳性）：把豁免去掉（恒 `advanced or finished` 才复位），同一
+        场景在 wake 后落 NO_PROGRESS -- 证明上面那条用例钉住的是豁免本身。"""
+        from fleet_graph.scheduler import daemon
+
+        def no_exemption(record: dict[str, Any]) -> bool:
+            return int(record.get("rounds") or 0) > 0 or record.get("terminal") == "done"
+
+        monkeypatch.setattr(daemon, "_terminal_resets_streak", no_exemption)
+
+        wake = FakeWake()
+        scheduler, clock, launcher = make(tmp_path, wake=wake, board=FakeBoard())
+        scheduler.record_start("wf-1", 1000.0)
+        write_blocked(tmp_path, waiting_on="external", run_id="run-x1")
+        scheduler.account_last_run("wf-1")
+        write_blocked(tmp_path, waiting_on="external", run_id="run-x2")
+        scheduler.account_last_run("wf-1")
+
+        write_blocked(tmp_path, run_id="run-b1")
+        clock.now = 1300.0
+        assert scheduler.tick()[0].decision.refusal is Refusal.PARKED_AWAITING_DECISION
+
+        wake.inbox = True
+        clock.now = 1400.0
+        result = scheduler.tick()[0]
+        assert result.decision.refusal is Refusal.NO_PROGRESS  # 变异后：退避拖住
+        assert launcher.launched == []
 
 
 class TestEscapeHatch:

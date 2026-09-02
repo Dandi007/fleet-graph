@@ -249,21 +249,25 @@ class TestItReadsOnlyWhatItNeeds:
 
 
 def write_terminal_record(
-    tmp_path: Path, folder_id: str, terminal: str, rounds: int, run_id: str
+    tmp_path: Path,
+    folder_id: str,
+    terminal: str,
+    rounds: int,
+    run_id: str,
+    *,
+    waiting_on: str | None = None,
 ) -> None:
     path = tmp_path / "runs" / folder_id / "terminal.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "terminal": terminal,
-                "rounds": rounds,
-                "run_id": run_id,
-                "reason": "prose the scheduler must not act on",
-            }
-        ),
-        encoding="utf-8",
-    )
+    record: dict[str, Any] = {
+        "terminal": terminal,
+        "rounds": rounds,
+        "run_id": run_id,
+        "reason": "prose the scheduler must not act on",
+    }
+    if waiting_on is not None:
+        record["waiting_on"] = waiting_on
+    path.write_text(json.dumps(record), encoding="utf-8")
 
 
 class TestTheStallStreak:
@@ -313,6 +317,94 @@ class TestTheStallStreak:
         scheduler.account_last_run("wf-1")
         write_terminal_record(tmp_path, "wf-1", "done", 0, "run-2")
         assert scheduler.account_last_run("wf-1") == 0
+
+    def test_a_run_waiting_on_a_decision_resets_the_streak(self, tmp_path: Path) -> None:
+        """2026-09-02 ruling: a run that blocked waiting on a *human decision*
+        is legitimate waiting, not a stall -- it must zero the streak, not feed
+        it. Folding it into the streak hands the decision-wake a NO_PROGRESS
+        backoff it never earned (the observed bug)."""
+        scheduler = make(tmp_path)
+        scheduler.record_start("wf-1", 1000.0)
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1", waiting_on="decision")
+        assert scheduler.account_last_run("wf-1") == 0
+
+    def test_a_run_waiting_on_a_decision_clears_an_existing_streak(self, tmp_path: Path) -> None:
+        """The parked run must also clear a streak already earned, so the wake
+        is not handed the backoff the *earlier* stalls earned."""
+        scheduler = make(tmp_path)
+        scheduler.record_start("wf-1", 1000.0)
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1")
+        assert scheduler.account_last_run("wf-1") == 1
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-2", waiting_on="decision")
+        assert scheduler.account_last_run("wf-1") == 0
+
+    def test_an_external_wait_still_counts_toward_the_streak(self, tmp_path: Path) -> None:
+        """The guard stays sharp for anything that is not a human decision: an
+        external blocker that can clear on its own still feeds the streak."""
+        scheduler = make(tmp_path)
+        scheduler.record_start("wf-1", 1000.0)
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1", waiting_on="external")
+        assert scheduler.account_last_run("wf-1") == 1
+
+    def test_a_none_wait_still_counts_toward_the_streak(self, tmp_path: Path) -> None:
+        scheduler = make(tmp_path)
+        scheduler.record_start("wf-1", 1000.0)
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1", waiting_on="none")
+        assert scheduler.account_last_run("wf-1") == 1
+
+    def test_a_legacy_terminal_without_the_field_still_counts(self, tmp_path: Path) -> None:
+        """Every terminal written before `waiting_on` existed has no field;
+        those must keep feeding the streak exactly as they always did."""
+        scheduler = make(tmp_path)
+        scheduler.record_start("wf-1", 1000.0)
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1")
+        assert scheduler.account_last_run("wf-1") == 1
+
+    def test_three_external_waiting_runs_still_back_off(self, tmp_path: Path) -> None:
+        """The negative criterion: `waiting_on != decision`, `rounds == 0`,
+        `terminal != done`, three times -- the streak must still reach 3 and
+        the line must back off."""
+        scheduler = make(tmp_path, now=1000.0)
+        scheduler.record_start("wf-1", 1000.0 - 400)
+        for n in (1, 2, 3):
+            write_terminal_record(tmp_path, "wf-1", "blocked", 0, f"run-{n}", waiting_on="external")
+            assert scheduler.account_last_run("wf-1") == n
+        assert scheduler.tick()[0].decision.refusal is Refusal.NO_PROGRESS
+
+    def test_mutation_gun_removing_the_exemption_turns_positive_red(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """变异枪（阳性）：把豁免去掉（恒 `advanced or finished` 才复位），决策等待的
+        run 重新喂 streak——阳性用例应红。证明测试钉住的是豁免本身。"""
+        from fleet_graph.scheduler import daemon
+
+        def no_exemption(record: dict[str, Any]) -> bool:
+            return int(record.get("rounds") or 0) > 0 or record.get("terminal") == "done"
+
+        monkeypatch.setattr(daemon, "_terminal_resets_streak", no_exemption)
+        scheduler = make(tmp_path)
+        scheduler.record_start("wf-1", 1000.0)
+        write_terminal_record(tmp_path, "wf-1", "blocked", 0, "run-1", waiting_on="decision")
+        assert scheduler.account_last_run("wf-1") == 1  # 变异后：决策等待被计为 streak
+
+    def test_mutation_gun_widening_to_all_blocked_turns_negative_red(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """变异枪（阴性）：把豁免放宽成「所有 blocked 都复位」，external 等待不再
+        累计——阴性用例应红。证明测试钉住的是「只豁免 decision」。"""
+        from fleet_graph.scheduler import daemon
+
+        def all_blocked(record: dict[str, Any]) -> bool:
+            advanced = int(record.get("rounds") or 0) > 0
+            finished = record.get("terminal") == "done"
+            return advanced or finished or record.get("terminal") == "blocked"
+
+        monkeypatch.setattr(daemon, "_terminal_resets_streak", all_blocked)
+        scheduler = make(tmp_path)
+        scheduler.record_start("wf-1", 1000.0)
+        for n in (1, 2, 3):
+            write_terminal_record(tmp_path, "wf-1", "blocked", 0, f"run-{n}", waiting_on="external")
+            assert scheduler.account_last_run("wf-1") == 0  # 变异后：护栏变瞎
 
     def test_the_streak_survives_a_restart(self, tmp_path: Path) -> None:
         """The daemon restarts on every release. A counter that reset on deploy
