@@ -1,0 +1,11 @@
+{
+ "development_id": "dev-fg-247aa47fe878",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "wf-216dc3 监督面 line-gate 座位（本线 gate 裁决座位，依监督面授权行使本线裁决权；本轮机械自核后裁定，非 human:qinglin 逐条拍板）",
+ "decision_message_id": "msg_01M1HXJTH0W2A6H5Z01CW70QGB",
+ "question_note_id": "msg_01M1HVJ4XYHFV2PX3B6VG04Q9D",
+ "card_entity_id": "msg_01M1HSS28ZEH8265AXZFFX52B0",
+ "output_commit": "f0ed98b19977ddbf38dc2e4777fcdc6c92f80646"
+}
