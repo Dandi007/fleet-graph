@@ -764,6 +764,32 @@ def _goal_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _decision_serve(args: argparse.Namespace) -> int:
+    """Serve the decision MCP surface on loopback. It is its own service.
+
+    The synchronous decision-delivery surface: one call proves the verdict was
+    delivered and consumed by the parked owner, or returns an explicit refusal
+    (line not parked / no such waiting party / invalid payload) -- never a
+    silent swallow after HTTP 200.
+    """
+    from fleet_graph.decision_mcp import serve
+
+    try:
+        serve(
+            host=args.host,
+            port=args.port,
+            run_root=args.run_root,
+            lines_config=args.lines_config,
+            state_dir=args.state_dir,
+        )
+    except RuntimeError as exc:
+        # A startup refusal (port taken, state dir unusable) is a visible
+        # failure, not a crash loop: print the clear reason and exit non-zero.
+        print(f"fleet-graph decision serve: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _state_serve(args: argparse.Namespace) -> int:
     """Serve the M1 fleet-state read-model on loopback. Read-only."""
     from fleet_graph.state.fleet_state import DEFAULT_ENROLL_QUEUE, FleetStateConfig, serve
@@ -1751,6 +1777,37 @@ def build_parser() -> argparse.ArgumentParser:
         "(env FLEET_GRAPH_GOAL_QUEUE_HOME) -- separate from the work-folder-root",
     )
     goal_serve.set_defaults(func=_goal_serve)
+
+    decision = subparsers.add_parser(
+        "decision",
+        help="the decision MCP surface (synchronous verdict delivery to parked lines)",
+    )
+    decision_sub = decision.add_subparsers()
+    decision_serve = decision_sub.add_parser(
+        "serve",
+        help="serve the decision MCP surface (the standalone decision service)",
+    )
+    decision_serve.add_argument("--host", default="127.0.0.1")
+    decision_serve.add_argument("--port", type=int, default=5613)
+    decision_serve.add_argument(
+        "--run-root",
+        default=None,
+        help="where the lines' stall-state lives; defaults to the roster's run_root",
+    )
+    decision_serve.add_argument(
+        "--lines-config",
+        default=None,
+        help="JSON config listing the goal-line roster (a `lines` array plus an "
+        "optional `run_root`). Absent/malformed degrades to 'no registered "
+        "lines' (every delivery answers NO_WAITING_PARTY)",
+    )
+    decision_serve.add_argument(
+        "--state-dir",
+        default=None,
+        help="where the delivery ledger and metrics textfile live; defaults to "
+        "/data/fleet-graph/decision-mcp (env FLEET_GRAPH_DECISION_MCP_STATE_DIR)",
+    )
+    decision_serve.set_defaults(func=_decision_serve)
 
     state = subparsers.add_parser(
         "state", help="the M1 fleet-state read-model (read-only /v1 views)"
