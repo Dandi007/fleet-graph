@@ -1,0 +1,21 @@
+{
+ "development_id": "dev-fg-82a67e9325f4",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_mcp_only_scaffold.py",
+   "tests/test_m4_availability.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
