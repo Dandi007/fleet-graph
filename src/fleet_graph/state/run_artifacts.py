@@ -73,6 +73,8 @@ TERMINAL_FIELDS = frozenset(
         "waiting_on",
         "waiting_on_declared",
         "goal_revision",
+        "line_state",
+        "dd_development_id",
         "log_path",
     }
 )
@@ -80,9 +82,62 @@ TERMINAL_FIELDS = frozenset(
 #: The machine-readable values of `waiting_on`. Anything else the coordinator
 #: declares is preserved verbatim in `waiting_on_declared` and *normalised* to
 #: "none" -- parking is an optimisation, not a judgement, so an unknown value
-#: must never fault a line (R0c ruling).
-WAITING_ON_VALUES = frozenset({"decision", "external", "none"})
+#: must never fault a line (R0c ruling). "dd" is the M1 addition: a dispatch
+#: line waiting on the development it just created parks as `waiting_dd`.
+WAITING_ON_VALUES = frozenset({"decision", "external", "dd", "none"})
 WAITING_ON_DEFAULT = "none"
+
+#: The closed externally-facing line-state vocabulary (design.md §6.3). The
+#: projection lives in ``derive_line_state``; the constants are spelled out so a
+#: line-state word is never invented prose.
+LINE_STATE_WORKING = "working"
+LINE_STATE_WAITING_DD = "waiting_dd"
+LINE_STATE_WAITING_DECISION = "waiting_decision"
+LINE_STATE_WAITING_EXTERNAL = "waiting_external"
+LINE_STATE_DONE = "done"
+LINE_STATE_FAILED = "failed"
+
+LINE_STATE_VALUES = frozenset(
+    {
+        LINE_STATE_WORKING,
+        LINE_STATE_WAITING_DD,
+        LINE_STATE_WAITING_DECISION,
+        LINE_STATE_WAITING_EXTERNAL,
+        LINE_STATE_DONE,
+        LINE_STATE_FAILED,
+    }
+)
+
+#: `waiting_on` -> line-state word, when the terminal is `blocked`.
+_WAITING_ON_LINE_STATE = {
+    "dd": LINE_STATE_WAITING_DD,
+    "decision": LINE_STATE_WAITING_DECISION,
+    "external": LINE_STATE_WAITING_EXTERNAL,
+}
+
+
+def derive_line_state(terminal: Any, waiting_on: Any = None) -> str:
+    """Project the mechanical ``terminal`` + ``waiting_on`` into the closed
+    externally-facing vocabulary (design.md §6.3).
+
+    The six words are a *semantic* status, the mechanical ``terminal`` field a
+    separate truth. ``done`` and ``failed`` (self-judged, distinct from the
+    mechanical ``fault``) project from the terminal alone; a ``blocked``
+    terminal projects to ``waiting_*`` by the waiting reason its coordinator
+    declared. A missing terminal or a mechanical terminal (``fault``/``bounds``/
+    ``killed``) projects to ``working`` -- there is no semantic terminal to
+    state, and ``fault`` is deliberately *not* merged into ``failed``.
+    """
+    term = str(terminal or "")
+    if term == "done":
+        return LINE_STATE_DONE
+    if term == "failed":
+        return LINE_STATE_FAILED
+    if term == "blocked":
+        waiting, _ = normalize_waiting_on(waiting_on)
+        return _WAITING_ON_LINE_STATE.get(waiting, LINE_STATE_WORKING)
+    return LINE_STATE_WORKING
+
 
 #: Where the launcher sends a line's stdout/stderr (scheduler/launcher.py
 #: `log_file`, defaulting to /data/fleet-graph/logs/{folder_id}.log). The run
@@ -292,6 +347,7 @@ class RunArtifacts:
         waiting_on: str = WAITING_ON_DEFAULT,
         waiting_on_declared: str | None = None,
         goal_revision: str | None = None,
+        dd_development_id: str | None = None,
     ) -> Path:
         """Record the terminal event locally. Call this *before* any publish.
 
@@ -302,7 +358,8 @@ class RunArtifacts:
 
         `waiting_on` is the machine field the scheduler's parking reads: for a
         `blocked` terminal, "decision" means only a human ruling can unblock
-        this line. Always written (default "none") so the field set stays
+        this line, and "dd" (M1) means the line parked on the development it
+        just dispatched. Always written (default "none") so the field set stays
         exact; `waiting_on_declared` preserves whatever raw value the
         coordinator actually declared, unknown values included.
 
@@ -313,6 +370,14 @@ class RunArtifacts:
         revision (an old terminal, or a read that failed) simply carries
         ``None``, which the scheduler reads as "no reliable parking baseline"
         and fails open rather than locking the line.
+
+        `dd_development_id` is the development id the line dispatched and is
+        now parked on (`waiting_on: "dd"`). It is the scheduler's anchor for
+        the two dd wake facts; absent for every other terminal.
+
+        `line_state` is the closed externally-facing line-state word derived
+        from ``terminal`` + ``waiting_on`` (design.md §6.3). Always written so
+        the field set stays exact.
         """
         event = {
             "run_id": self.run_id,
@@ -326,6 +391,8 @@ class RunArtifacts:
             "waiting_on": waiting_on,
             "waiting_on_declared": waiting_on_declared,
             "goal_revision": goal_revision,
+            "line_state": derive_line_state(terminal, waiting_on),
+            "dd_development_id": dd_development_id,
             "log_path": self.log_path,
         }
         with self._terminal_path.open("w", encoding="utf-8") as handle:
@@ -360,6 +427,8 @@ class RunArtifacts:
             "pid": self._pid,
             "waiting_on": WAITING_ON_DEFAULT,
             "waiting_on_declared": None,
+            "line_state": derive_line_state("fault", WAITING_ON_DEFAULT),
+            "dd_development_id": None,
             "log_path": self.log_path,
             "exception_class": type(exception).__name__,
             "message": _one_line(message),
@@ -396,12 +465,20 @@ __all__ = [
     "HEARTBEAT_FIELDS",
     "HEARTBEAT_INTERVAL_SECONDS",
     "ISO_FORMAT",
+    "LINE_STATE_DONE",
+    "LINE_STATE_FAILED",
+    "LINE_STATE_VALUES",
+    "LINE_STATE_WAITING_DD",
+    "LINE_STATE_WAITING_DECISION",
+    "LINE_STATE_WAITING_EXTERNAL",
+    "LINE_STATE_WORKING",
     "RELEASE_CURRENT_PATH",
     "TERMINAL_FIELDS",
     "WAITING_ON_DEFAULT",
     "WAITING_ON_VALUES",
     "RunArtifacts",
     "capture_release_id",
+    "derive_line_state",
     "iso",
     "normalize_waiting_on",
     "signal_terminal_name",
