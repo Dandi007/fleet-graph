@@ -8,6 +8,7 @@ the violation named -- and the real tree must pass.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -15,10 +16,23 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).parent.parent
 GUARD = REPO_ROOT / "scripts" / "check_supervisor_conformance.py"
 
+#: wf-6475fd 两张 self-adjudication 裁决的 rationale 形态样本：一正一反。
+#: 正样本是 dev-fg-e760435f2a6d / dev-fg-977e5280d628 这类带完整机械回显的
+#: 合法 self-adjudication；反样本是 REJECT 但 rationale 无逐字返工指令。
+SELF_ADJUDICATION_FIXTURES = REPO_ROOT / "tests" / "fixtures"
+
 
 def run_guard(src_root: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(GUARD), "--src-root", str(src_root)],
+        capture_output=True,
+        text=True,
+    )
+
+
+def run_guard_record(record_path: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(GUARD), "--adjudication-record", str(record_path)],
         capture_output=True,
         text=True,
     )
@@ -501,3 +515,142 @@ class TestGuardEE7GoalWrites:
         )
         proc = run_guard(src)
         assert proc.returncode == 0, proc.stderr
+
+
+class TestGuardFSelfAdjudicationRationale:
+    """G3: a self-adjudication ruling's rationale must carry the full mechanical echo.
+
+    wf-6475fd 两张 self-adjudication 裁决的 rationale 形态（含一正一反样本）
+    硬编码在 tests/fixtures/；本守卫把它们回收成可机读判据——一条合法
+    self-adjudication 的 rationale 必须携带三方验收逐字相等、产品 diff 未越
+    spec 边界、既有测试未删除（comm -23）、亲跑验收退出码与尾部回显；REJECT
+    的 rationale 还必须含逐字返工指令。变异自检：把判定改成「decision 字段
+    非空即通过」→ 必须有用例转红。
+    """
+
+    def _write_record(self, tmp_path: Path, record: dict) -> Path:
+        path = tmp_path / "record.json"
+        path.write_text(json.dumps(record, ensure_ascii=False))
+        return path
+
+    def test_approve_rationale_with_full_echo_passes(self) -> None:
+        record = SELF_ADJUDICATION_FIXTURES / "wf-6475fd-approve-rationale.json"
+        proc = run_guard_record(record)
+        assert proc.returncode == 0, proc.stderr
+
+    def test_approve_with_empty_rationale_is_rejected(self, tmp_path: Path) -> None:
+        """阴性用例 1：只有 decision: APPROVE、rationale 为空的裁决不得通过。"""
+        record = self._write_record(tmp_path, {"decision": "APPROVE", "rationale": ""})
+        proc = run_guard_record(record)
+        assert proc.returncode == 1
+        assert "rationale must not be empty" in proc.stderr
+
+    def test_reject_without_rework_instruction_is_rejected(self) -> None:
+        """阴性用例 2：REJECT 但 rationale 无返工指令的裁决不得通过。"""
+        record = SELF_ADJUDICATION_FIXTURES / "wf-6475fd-reject-no-rework.json"
+        proc = run_guard_record(record)
+        assert proc.returncode == 1
+        assert "返工指令" in proc.stderr
+
+    def test_reject_rationale_whose_rework_names_no_point_is_rejected(self, tmp_path: Path) -> None:
+        """REJECT 的返工指令必须指名返工点，否则同样不得通过。"""
+        record = self._write_record(
+            tmp_path,
+            {
+                "decision": "REJECT",
+                "rationale": (
+                    "spec dd-acceptance: uv sync --frozen; make verify\n"
+                    "run-config: uv sync --frozen; make verify\n"
+                    "record acceptance_commands: uv sync --frozen; make verify\n"
+                    "产品 diff: scripts/check_supervisor_conformance.py\n"
+                    "既有测试: LC_ALL=C comm -23 无删除 0\n"
+                    "亲跑验收退出码: 0\n"
+                    "尾部回显: make verify 全绿\n"
+                    "返工指令: 请修改。"
+                ),
+            },
+        )
+        proc = run_guard_record(record)
+        assert proc.returncode == 1
+        assert "name the rework point" in proc.stderr
+
+    def test_reject_with_verbatim_rework_passes(self, tmp_path: Path) -> None:
+        """REJECT 带逐字返工指令且指名返工点 → 通过。"""
+        record = self._write_record(
+            tmp_path,
+            {
+                "decision": "REJECT",
+                "rationale": (
+                    "spec dd-acceptance: uv sync --frozen; make verify\n"
+                    "run-config: uv sync --frozen; make verify\n"
+                    "record acceptance_commands: uv sync --frozen; make verify\n"
+                    "产品 diff: scripts/check_supervisor_conformance.py\n"
+                    "既有测试: LC_ALL=C comm -23 无删除 0\n"
+                    "亲跑验收退出码: 1\n"
+                    "尾部回显: FAILED tests/test_supervisor_conformance.py\n"
+                    "返工指令: 在 tests/test_supervisor_conformance.py 补齐 Guard F 用例。"
+                ),
+            },
+        )
+        proc = run_guard_record(record)
+        assert proc.returncode == 0, proc.stderr
+
+    def test_three_party_acceptance_drift_is_rejected(self, tmp_path: Path) -> None:
+        """三方验收必须逐字相等：spec dd-acceptance == run-config == record。"""
+        record = self._write_record(
+            tmp_path,
+            {
+                "decision": "APPROVE",
+                "rationale": (
+                    "spec dd-acceptance: make verify\n"
+                    "run-config: uv sync --frozen; make verify\n"
+                    "record acceptance_commands: make verify\n"
+                    "产品 diff: scripts/check_supervisor_conformance.py\n"
+                    "既有测试: LC_ALL=C comm -23 无删除 0\n"
+                    "亲跑验收退出码: 0\n"
+                    "尾部回显: make verify 全绿\n"
+                ),
+            },
+        )
+        proc = run_guard_record(record)
+        assert proc.returncode == 1
+        assert "verbatim equal" in proc.stderr
+
+    def test_diff_crossing_reserved_namespace_is_rejected(self, tmp_path: Path) -> None:
+        """产品 diff 未越 spec 边界：碰 .dev-dispatch/ 就是越界。"""
+        record = self._write_record(
+            tmp_path,
+            {
+                "decision": "APPROVE",
+                "rationale": (
+                    "spec dd-acceptance: uv sync --frozen; make verify\n"
+                    "run-config: uv sync --frozen; make verify\n"
+                    "record acceptance_commands: uv sync --frozen; make verify\n"
+                    "产品 diff: .dev-dispatch/feedback/index.json\n"
+                    "既有测试: LC_ALL=C comm -23 无删除 0\n"
+                    "亲跑验收退出码: 0\n"
+                    "尾部回显: make verify 全绿\n"
+                ),
+            },
+        )
+        proc = run_guard_record(record)
+        assert proc.returncode == 1
+        assert "reserved" in proc.stderr
+
+    def test_mutation_decision_nonempty_is_not_sufficient(self, tmp_path: Path) -> None:
+        """变异：把判定改成「decision 字段非空即通过」→ 必须有用例转红。
+
+        APPROVE + 空 rationale 用真实守卫判必须红；若实现退化成只看 decision
+        字段非空，该用例会绿 —— 变异用例转红意味着退化被测试钉死。
+        """
+        record_path = self._write_record(tmp_path, {"decision": "APPROVE", "rationale": ""})
+        record = {"decision": "APPROVE", "rationale": ""}
+
+        def mutated(rec: dict) -> int:
+            return 0 if rec.get("decision") else 1
+
+        assert mutated(record) == 0, "变异判定把空 rationale 的 APPROVE 判绿"
+
+        proc = run_guard_record(record_path)
+        assert proc.returncode == 1, "真实守卫必须判红，变异用例才真正转红"
+        assert "rationale must not be empty" in proc.stderr

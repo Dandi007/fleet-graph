@@ -57,6 +57,21 @@ performs a goal.md write primitive (`append_delivery_fail_block` / `fs_write` /
 (`supervise/e6_ops.py`, `supervise/e7_ops.py`) and the allowlist module are
 exempt, exactly like `harvest_ops.py` is under Guard D.
 
+Guard F -- **a self-adjudication ruling's rationale must carry the full
+mechanical echo** (G3, goal.md 2026-09-02 16:4x). The dispatch line may judge
+its own gate tickets (wf-6475fd judged dev-fg-e760435f2a6d's ledger outcome and
+dev-fg-977e5280d628's metrics zero-I/O ticket itself), but that self-judging
+must not degrade into a one-word APPROVE. A legal self-adjudication
+APPROVE/REJECT ``rationale`` must echo, in machine-readable form: the
+three-party acceptance verbatim equal (``spec dd-acceptance`` == ``run-config``
+== ``record acceptance_commands``), the product diff staying within the spec
+boundary (never the reserved ``.dev-dispatch/`` namespace), the existing tests
+not deleted (``LC_ALL=C comm -23`` per-name comparison), and the personally-run
+acceptance exit code plus tail echo. A REJECT ``rationale`` must additionally
+carry a verbatim rework instruction that is non-empty and names the rework
+point. Fed via ``--adjudication-record <json>``; the fixtures hardcode the
+wf-6475fd two-vote rationale morphology samples (one positive, one negative).
+
 The technique is lifted from the old supervisor's check_no_local_scheduler.py,
 and so is its delivery discipline: tests/test_supervisor_conformance.py feeds
 this script deliberately violating samples and asserts a non-zero exit
@@ -70,6 +85,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import sys
 from pathlib import Path
 
@@ -384,6 +400,130 @@ def check_e7_write_gating(path: Path, relpath: str, tree: ast.AST) -> list[str]:
     )
 
 
+# --- Guard F: self-adjudication rationale morphology (G3) -------------------
+#
+# A self-adjudication must not degrade into a one-word APPROVE. A legal
+# APPROVE/REJECT ruling's `rationale` must echo, in machine-readable form:
+# the three-party acceptance verbatim equal, the product diff within the spec
+# boundary, the existing tests not deleted (comm -23 per-name comparison), and
+# the personally-run acceptance exit code plus tail. A REJECT rationale must
+# additionally carry a verbatim rework instruction naming the rework point.
+
+SELF_ADJUDICATION_VOTES = ("APPROVE", "REJECT")
+
+ACCEPTANCE_SPEC_LABEL = "spec dd-acceptance"
+ACCEPTANCE_RUN_LABEL = "run-config"
+ACCEPTANCE_RECORD_LABEL = "record acceptance_commands"
+PRODUCT_DIFF_LABEL = "产品 diff"
+TESTS_INTACT_LABEL = "既有测试"
+ACCEPTANCE_EXIT_LABEL = "亲跑验收退出码"
+ACCEPTANCE_TAIL_LABEL = "尾部回显"
+REWORK_LABEL = "返工指令"
+
+#: The reserved namespace that no product diff may touch, whatever the spec.
+RESERVED_NAMESPACE_PREFIX = ".dev-dispatch/"
+
+#: A rework instruction that names no location is a rework instruction that
+#: tells the next implement nothing. At least one location hint is required.
+REWORK_POINT_HINTS = ("/", ".py", "tests/", "src/", "scripts/")
+
+
+def _labeled_value(rationale: str, label: str) -> str | None:
+    """The value of the first line ``label: value`` in `rationale`, or None."""
+    prefix = f"{label}:"
+    for line in rationale.splitlines():
+        line = line.strip()
+        if line.startswith(prefix):
+            return line[len(prefix) :].strip()
+    return None
+
+
+def _names_rework_point(rework: str) -> bool:
+    """Whether a rework instruction names at least one concrete rework point."""
+    return any(hint in rework for hint in REWORK_POINT_HINTS)
+
+
+def check_self_adjudication_rationale(record: dict) -> list[str]:
+    """Guard F (G3): the mechanical-echo morphology of one self-adjudication.
+
+    `record` is one ruling: ``{"decision": "APPROVE"|"REJECT", "rationale": str}``.
+    Returns the list of violations; empty means the ruling is a legal
+    self-adjudication.
+    """
+    errors: list[str] = []
+    decision = record.get("decision")
+    rationale = record.get("rationale")
+    if decision not in SELF_ADJUDICATION_VOTES:
+        errors.append(f"decision must be one of {SELF_ADJUDICATION_VOTES}, got {decision!r}")
+        return errors
+    if not rationale or not rationale.strip():
+        errors.append("rationale must not be empty for a self-adjudication")
+        return errors
+
+    spec = _labeled_value(rationale, ACCEPTANCE_SPEC_LABEL)
+    run = _labeled_value(rationale, ACCEPTANCE_RUN_LABEL)
+    record_cmd = _labeled_value(rationale, ACCEPTANCE_RECORD_LABEL)
+    if not (spec and run and record_cmd):
+        errors.append(
+            "rationale must echo the three-party acceptance "
+            f"( {ACCEPTANCE_SPEC_LABEL} / {ACCEPTANCE_RUN_LABEL} / {ACCEPTANCE_RECORD_LABEL} )"
+        )
+    elif not (spec == run == record_cmd):
+        errors.append(
+            "three-party acceptance must be verbatim equal "
+            f"( {ACCEPTANCE_SPEC_LABEL} == {ACCEPTANCE_RUN_LABEL} == {ACCEPTANCE_RECORD_LABEL} )"
+        )
+
+    diff = _labeled_value(rationale, PRODUCT_DIFF_LABEL)
+    if diff is None:
+        errors.append(f"rationale must echo the product diff ({PRODUCT_DIFF_LABEL})")
+    else:
+        paths = [p.strip() for p in diff.split(",") if p.strip()]
+        if not paths:
+            errors.append(f"{PRODUCT_DIFF_LABEL} echo must name at least one changed product path")
+        for path in paths:
+            if path.startswith(RESERVED_NAMESPACE_PREFIX):
+                errors.append(
+                    f"product diff crosses the spec boundary into the reserved namespace: {path}"
+                )
+
+    tests = _labeled_value(rationale, TESTS_INTACT_LABEL)
+    if tests is None or "comm -23" not in tests:
+        errors.append(
+            f"rationale must echo the existing-tests-not-deleted check "
+            f"({TESTS_INTACT_LABEL} LC_ALL=C comm -23 per-name comparison)"
+        )
+    elif not any(marker in tests for marker in ("0", "无删除", "no deletion", "deleted 0")):
+        errors.append(f"{TESTS_INTACT_LABEL} echo must show zero deleted tests")
+
+    exit_code = _labeled_value(rationale, ACCEPTANCE_EXIT_LABEL)
+    tail = _labeled_value(rationale, ACCEPTANCE_TAIL_LABEL)
+    if exit_code is None or tail is None or not tail.strip():
+        errors.append(
+            "rationale must echo the personally-run acceptance "
+            f"({ACCEPTANCE_EXIT_LABEL} and {ACCEPTANCE_TAIL_LABEL})"
+        )
+    else:
+        codes = [c.strip() for c in exit_code.split(",") if c.strip()]
+        if not codes:
+            errors.append(f"{ACCEPTANCE_EXIT_LABEL} must carry at least one exit code")
+        elif decision == "APPROVE" and any(c != "0" for c in codes):
+            errors.append(
+                f"APPROVE must report an all-zero personally-run acceptance exit code, "
+                f"got {exit_code!r}"
+            )
+
+    if decision == "REJECT":
+        rework = _labeled_value(rationale, REWORK_LABEL)
+        if not rework:
+            errors.append(
+                f"REJECT rationale must carry a verbatim rework instruction ({REWORK_LABEL})"
+            )
+        elif not _names_rework_point(rework):
+            errors.append(f"REJECT rework instruction must name the rework point, got {rework!r}")
+    return errors
+
+
 def run(src_root: Path) -> list[str]:
     if not src_root.is_dir():
         raise SystemExit(f"not a directory: {src_root}")
@@ -412,7 +552,29 @@ def main(argv: list[str] | None = None) -> int:
         default=str(Path(__file__).resolve().parent.parent / "src"),
         help="source tree to check (tests point this at sabotage samples)",
     )
+    parser.add_argument(
+        "--adjudication-record",
+        default=None,
+        metavar="JSON",
+        help="validate one self-adjudication ruling record (Guard F / G3)",
+    )
     args = parser.parse_args(argv)
+
+    if args.adjudication_record is not None:
+        try:
+            record = json.loads(Path(args.adjudication_record).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"adjudication record could not be read: {exc}", file=sys.stderr)
+            return 2
+        errors = check_self_adjudication_rationale(record)
+        for error in errors:
+            print(error, file=sys.stderr)
+        if errors:
+            print(f"{len(errors)} self-adjudication rationale violation(s)", file=sys.stderr)
+            return 1
+        print("self-adjudication rationale: clean")
+        return 0
+
     try:
         errors = run(Path(args.src_root))
     except (OSError, SyntaxError) as exc:
