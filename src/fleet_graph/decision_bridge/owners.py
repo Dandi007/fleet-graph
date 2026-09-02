@@ -58,6 +58,11 @@ class OwnerTarget:
     question_note_id: str
     card_entity_id: str
     state: str
+    #: The bounded principal (a line folder or a human subject) that dispatched
+    #: this owner. Carried on dd targets so a consumed dd decision can wake the
+    #: parked line that dispatched it (the 4th wake fact); empty means no
+    #: dispatch provenance was recorded.
+    dispatched_by: str = ""
 
 
 @dataclass(frozen=True)
@@ -130,9 +135,29 @@ class DdOwnerSource:
                     question_note_id=question_note_id,
                     card_entity_id=card_entity_id,
                     state=str(row.get("state") or ""),
+                    #: The bounded principal that dispatched this development
+                    #: (a line folder or a human subject), from the authoritative
+                    #: status row -- the same fact the gate holds. Carried so a
+                    #: consumed decision can wake the parked line that dispatched
+                    #: this dd single (the 4th wake fact).
+                    dispatched_by=str(row.get("dispatched_by") or ""),
                 )
             )
         return targets
+
+    def dispatched_by(self, development_id: str) -> str:
+        """The development's `dispatched_by` provenance, straight from the
+        admission record. Empty when absent. A cheap read (one file), so the
+        bridge can attribute a consumed decision to the line that dispatched it
+        even on the replay path, where the reconstructed target carries no
+        provenance.
+        """
+        record_path = self.dd_root / development_id / "record.json"
+        try:
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ""
+        return str(record.get("dispatched_by") or "")
 
     def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
         from fleet_graph.dd.control_plane import ControlPlaneError
@@ -358,10 +383,30 @@ class LineOwnerSource:
             "parked_at": None,
             "parked_goal_revision": None,
             "parked_inbox_available": None,
+            "dispatched_decision_consumed_at": None,
         }
         path = self._stall_path(folder_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(cleared, sort_keys=True), encoding="utf-8")
+
+    def record_decision_consumed(self, folder_id: str, at: float) -> bool:
+        """Wake fact 4: mark that a ``work.decision.v1`` for a dd development
+        this line dispatched has been consumed.
+
+        Best-effort and never raises: this is a mechanical fact the scheduler
+        reads on its next tick to wake the parked line (``_check_wake``). The
+        bridge must never fail a decision's terminal seal because a wake-fact
+        write could not land. Returns whether the fact was recorded.
+        """
+        state = self._read_state(folder_id)
+        state["dispatched_decision_consumed_at"] = at
+        try:
+            path = self._stall_path(folder_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+        except OSError:
+            return False
+        return True
 
 
 class CompositeOwnerSource:
@@ -392,11 +437,43 @@ class CompositeOwnerSource:
             targets.extend(source.discover_all())
         return targets
 
+    def dispatched_by(self, development_id: str) -> str:
+        """The dd admission record's `dispatched_by`, routed to the dd owner.
+
+        Exists so the bridge can attribute a consumed decision to the line that
+        dispatched it even on the replay path, where the reconstructed target
+        carries no provenance (see ``DdOwnerSource.dispatched_by``). The line
+        owner has nothing to say about dd provenance, so only the dd source is
+        asked; a missing dd source reads as no provenance.
+        """
+        source = self.kinds.get(OWNER_KIND_DD)
+        read = getattr(source, "dispatched_by", None)
+        if read is None:
+            return ""
+        try:
+            return str(read(development_id) or "")
+        except Exception:  # a provenance read must never break a resume
+            return ""
+
     def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
         source = self.kinds.get(target.kind)
         if source is None:
             return OwnerResult(RESUME_REFUSED, f"no owner source for kind {target.kind!r}")
         return source.resume(target, action_key)
+
+    def record_decision_consumed(self, folder_id: str, at: float) -> bool:
+        """Wake fact 4, routed to the line owner: record that a decision for a
+        dd development this line dispatched was consumed. The scheduler reads
+        the fact on its next tick and wakes the parked line. A missing line
+        owner reads as nothing recorded (best-effort)."""
+        source = self.kinds.get(OWNER_KIND_LINE)
+        write = getattr(source, "record_decision_consumed", None)
+        if write is None:
+            return False
+        try:
+            return bool(write(folder_id, at))
+        except Exception:  # a wake-fact write must never break a resume
+            return False
 
 
 __all__ = [

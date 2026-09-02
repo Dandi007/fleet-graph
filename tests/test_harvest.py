@@ -25,7 +25,7 @@ from fleet_graph.supervise.events import approved_unharvested_event, validate_ev
 from fleet_graph.supervise.harvest import (
     ESCALATE_BRANCH_OCCUPIED,
     ESCALATE_EMPTY_NET_DIFF,
-    ESCALATE_NON_ANCESTOR_HEAD,
+    ESCALATE_NON_EQUIVALENT_PATCH,
     OUTCOME_ALREADY_HARVESTED,
     OUTCOME_ESCALATED,
     OUTCOME_HARVESTED,
@@ -69,9 +69,9 @@ def fake_ops(
     base_head: str = "0" * 40,
     net_files: list[str] | None = None,
     net_ok: bool = True,
-    is_ancestor_result: bool | None = None,
     net_files_calls: list[list[str]] | None = None,
-    is_ancestor_calls: list[bool] | None = None,
+    product_patch_result: dict[str, Any] | None = None,
+    product_patch_calls: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """A recording fake ops: every write/execute is recorded, results scripted.
 
@@ -93,8 +93,10 @@ def fake_ops(
     `net_files` / `net_ok` 脚本化 `net_product_files` 的返回；默认非空
     `["product.txt"]`（阳性收割）。`net_files_calls` 按调用序脚本化（net_diff
     先、postconditions 对账后），用于分别验证净 diff 与回执对账两条路径。
-    `is_ancestor_result` 脚本化 `is_ancestor`；默认 True（阳性）。`is_ancestor_calls`
-    按调用序脚本化（worktree 祖先判定先、postconditions 对账后）。
+    `product_patch_result` 脚本化 `product_patch_equivalent` 的返回；默认
+    `{"ok": True, "equivalent": True, "raw_files": net_files or ["product.txt"],
+    "detail": ""}`（阳性）。`product_patch_calls` 按调用序脚本化（worktree 等价
+    判定先、postconditions 对账后），用于分别验证等价与非等价两条路径。
     """
     calls: list[str] = []
     deploy_repos: list[Path] = []
@@ -104,7 +106,7 @@ def fake_ops(
     binding_probes: list[dict[str, Any]] = []
     fetch_remote_urls: list[str | None] = []
     net_product_argvs: list[tuple[str, str]] = []
-    is_ancestor_argvs: list[tuple[str, str]] = []
+    product_patch_argvs: list[tuple[str, str, str]] = []
     if divergence is None:
         divergence = {
             "diverged": False,
@@ -167,7 +169,7 @@ def fake_ops(
             self, repo: Path, head_commit: str, default_branch: str, worktree_root: Path
         ) -> dict[str, Any]:
             calls.append("worktree_cherry_pick")
-            return {"ok": worktree_ok, "method": "merge", "harvest_tip": harvest_tip}
+            return {"ok": worktree_ok, "method": "patch", "harvest_tip": harvest_tip}
 
         def build_harvest_tip(
             self,
@@ -216,14 +218,18 @@ def fake_ops(
                 return {"ok": net_ok, "files": list(net_files), "detail": ""}
             return {"ok": net_ok, "files": ["product.txt"], "detail": ""}
 
-        def is_ancestor(self, repo: Path, ancestor: str, descendant: str) -> dict[str, Any]:
-            # 纯读口：不构成写原语，不入 calls（调用面单独记录，用于祖先判定断言）。
-            is_ancestor_argvs.append((ancestor, descendant))
-            if is_ancestor_calls is not None:
-                value = is_ancestor_calls.pop(0)
-                return {"ok": True, "is_ancestor": value, "detail": ""}
-            value = True if is_ancestor_result is None else is_ancestor_result
-            return {"ok": True, "is_ancestor": value, "detail": ""}
+        def product_patch_equivalent(
+            self, repo: Path, base: str, approved_head: str, harvested_head: str
+        ) -> dict[str, Any]:
+            # 纯读口：不构成写原语，不入 calls（调用面单独记录，用于等价判定断言）。
+            product_patch_argvs.append((base, approved_head, harvested_head))
+            if product_patch_calls is not None:
+                value = product_patch_calls.pop(0)
+                return dict(value)
+            if product_patch_result is not None:
+                return dict(product_patch_result)
+            default_files = list(net_files) if net_files is not None else ["product.txt"]
+            return {"ok": True, "equivalent": True, "raw_files": default_files, "detail": ""}
 
         def pr_squash_merge(
             self, repo: Path, development_id: str, head_commit: str, default_branch: str
@@ -275,7 +281,7 @@ def fake_ops(
         "binding_probes": binding_probes,
         "fetch_remote_urls": fetch_remote_urls,
         "net_product_argvs": net_product_argvs,
-        "is_ancestor_argvs": is_ancestor_argvs,
+        "product_patch_argvs": product_patch_argvs,
     }
 
 
@@ -1028,46 +1034,26 @@ class TestDefaultHarvestOpsWorktreeLifecycle:
         assert removed["ok"] is True, removed
         assert not worktree_root.exists(), "worktree not cleaned up after verify"
 
-    def test_conflict_path_still_reports_conflicts(self, tmp_path: Path) -> None:
-        """冲突路径行为不变：merge 冲突如实报告，不强行覆盖。
-
-        `git merge -X theirs` 能解开纯内容冲突，这里改用 **modify/delete 冲突**
-        （默认分支删文件、工单分支改同文件）——git 连 -X theirs 都无法自动收口，
-        必须诚实 escalate（ok:false / conflicts:true）并就地清理 worktree，
-        绝不把冲突吞成 ok:true。
-        """
+    def test_empty_net_diff_build_fails_closed(self, tmp_path: Path) -> None:
+        """产品补丁形态的 fail-closed：净产品 diff 为空（只改协议子树）-> ok:false，
+        不凭空 harvest_tip，就地清理 worktree。"""
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
-        repo = tmp_path / "repo"
-        repo.mkdir()
-        git(repo, "init", "-q", "-b", "main")
-        git(repo, "config", "user.email", "test@example.invalid")
-        git(repo, "config", "user.name", "test")
-        (repo / "shared.txt").write_text("base\n", encoding="utf-8")
-        git(repo, "add", "-A")
-        git(repo, "commit", "-q", "-m", "seed")
-
-        git(repo, "checkout", "-q", "-b", "feature")
-        (repo / "shared.txt").write_text("feature\n", encoding="utf-8")
-        git(repo, "add", "-A")
-        git(repo, "commit", "-q", "-m", "product change")
-        product_commit = head(repo)
-        git(repo, "checkout", "-q", "main")
-        git(repo, "rm", "-q", "shared.txt")
-        git(repo, "commit", "-q", "-m", "main deletes")
-
+        repo, ticket, _base = _ticket_repo_with_dd_artifacts(tmp_path, with_product=False)
         ops = DefaultHarvestOps()
         worktree_root = tmp_path / "harvest-worktree"
-        result = ops.worktree_cherry_pick(repo, product_commit, "main", worktree_root)
-        assert result.get("conflicts") is True or result["ok"] is False
-        assert not worktree_root.exists(), "failed worktree left behind"
+        result = ops.worktree_cherry_pick(repo, ticket, "main", worktree_root)
+        assert result["ok"] is False, result
+        assert not result.get("harvest_tip"), result
+        assert not worktree_root.exists(), "empty-diff worktree left behind"
 
-    def test_content_conflict_closes_via_x_theirs(self, tmp_path: Path) -> None:
-        """merge -X theirs 对纯内容冲突必须收口（ok:true + 真实 harvest_tip）。
+    def test_content_divergence_yields_product_content_patch(self, tmp_path: Path) -> None:
+        """产品补丁形态取代 merge：默认分支与工单分支同文件改法时，产品补丁把
+        `git diff base..approved_head` 落在 base 上——结果内容 = 放行 head 的产品
+        内容（不再有 merge 冲突、也不再夹带协议文件）。
 
-        双分支同文件改法：`git merge -X theirs` 以被合入的放行 head 为主自动
-        解得开 -> ok:true 且 harvest_tip 非空（merge commit，approved_head 后代）、
-        成功路径 worktree 保留供 run_verify（rc-702098ab 语义）。
+        双分支同文件改法，产品补丁结果 shared.txt == "feature"（approved_head 内容），
+        成功路径 worktree 保留供 run_verify（rc-702098ab 语义不变）。
         """
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
@@ -1094,22 +1080,21 @@ class TestDefaultHarvestOpsWorktreeLifecycle:
         worktree_root = tmp_path / "harvest-worktree"
         result = ops.worktree_cherry_pick(repo, product_commit, "main", worktree_root)
         assert result["ok"] is True, result
+        assert result.get("method") == "patch", result
         assert result.get("harvest_tip"), result
-        # harvest_tip 必须是真实可解析 commit（不凭空造）。
         git(repo, "cat-file", "-e", f"{result['harvest_tip']}^{{commit}}")
+        assert git(repo, "show", f"{result['harvest_tip']}:shared.txt").strip() == "feature"
         # 成功路径 worktree 保留供 run_verify（rc-702098ab）。
-        assert worktree_root.is_dir(), "closed conflict worktree must survive for run_verify"
+        assert worktree_root.is_dir(), "patch worktree must survive for run_verify"
         verify_exit = ops.run_verify(worktree_root, ["/bin/true"])
         assert verify_exit == 0
         ops.remove_worktree(repo, worktree_root)
         assert not worktree_root.exists()
 
-    def test_modify_delete_conflict_fails_honestly(self, tmp_path: Path) -> None:
-        """关键负例：不得自报 harvested——失败绝不报 ok:true，也绝不凭空 harvest_tip。
-
-        modify/delete 冲突连 -X theirs 都收不了口 -> 必须诚实 ok:false +
-        conflicts:true（escalate 语义），绝不「失败却报 ok:true / 凭空 harvest_tip」。
-        """
+    def test_modify_delete_builds_clean_product_patch(self, tmp_path: Path) -> None:
+        """产品补丁形态：modify/delete（默认分支删文件、工单分支改同文件）不再是
+        merge 冲突——产品补丁即 `git diff base..approved_head` =「新增 shared.txt
+        (feature)」，干净落成新提交，绝不凭空 harvest_tip、也绝不夹带协议文件。"""
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
         repo = tmp_path / "repo"
@@ -1133,9 +1118,17 @@ class TestDefaultHarvestOpsWorktreeLifecycle:
         ops = DefaultHarvestOps()
         worktree_root = tmp_path / "harvest-worktree"
         result = ops.worktree_cherry_pick(repo, product_commit, "main", worktree_root)
-        assert result["ok"] is False, result
-        assert result.get("conflicts") is True, result
-        assert not worktree_root.exists(), "escalated conflict worktree left behind"
+        assert result["ok"] is True, result
+        assert result.get("method") == "patch", result
+        tip = result["harvest_tip"]
+        assert git(repo, "show", f"{tip}:shared.txt").strip() == "feature"
+        # 产品补丁只写产品文件：base..harvest_tip 不带排除口径的文件清单 == ["shared.txt"]。
+        base = head(repo)
+        names = git(repo, "diff", "--name-only", f"{base}..{tip}")
+        assert names.splitlines() == ["shared.txt"], names
+        assert not any(p.startswith((".dev-dispatch", ".dd-evidence")) for p in names.splitlines())
+        ops.remove_worktree(repo, worktree_root)
+        assert not worktree_root.exists()
 
 
 def _init_git_repo(repo: Path) -> None:
@@ -1551,12 +1544,14 @@ def _ticket_repo_with_dd_artifacts(
 
 
 class TestHarvestNetDiffAndMerge:
-    """判据②/③ 机械层 + merge 语义（真实 git 合成仓，禁触真网）。
+    """判据②/③/⑤ 机械层 + 产品补丁语义（真实 git 合成仓，禁触真网）。
 
     - 净 diff 只在 diff 计算里排除协议子树（`:(exclude)` pathspec），非空判定
       正确、纯协议改动被判空；
-    - `worktree_cherry_pick` 改为 **merge**：`harvest_tip` 是 `approved_head`
-      的后代（回执三头对账判据③），产品改动保留、不再落「exclude 提交」。
+    - `worktree_cherry_pick` 改为 **产品补丁**：`harvest_tip` 父系 = 默认分支
+      tip（base），`approved_head` 不再是其祖先；等价契约（`product_patch_equivalent`
+      逐字节内容等价 + 不带排除口径文件清单 == net_product_files）取代旧
+      `is_ancestor`，产品改动保留、协议子树绝不写进默认分支。
     """
 
     def test_net_product_files_excludes_protocol_subtrees(self, tmp_path: Path) -> None:
@@ -1576,54 +1571,64 @@ class TestHarvestNetDiffAndMerge:
         assert result["ok"] is True, result
         assert result["files"] == [], result
 
-    def test_is_ancestor_of_merge_tip(self, tmp_path: Path) -> None:
-        """判据①/③ 机械层：merge tip 是 approved_head 后代；反向非祖先。"""
+    def test_product_patch_equivalent_of_patch_tip(self, tmp_path: Path) -> None:
+        """判据①/③ 机械层：产品补丁 tip 相对 base 与 approved_head 相对 base 的内容
+        逐字节等价，`raw_files` == 净产品文件清单（不带排除口径）。"""
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
-        repo, ticket, _base = _ticket_repo_with_dd_artifacts(tmp_path)
+        repo, ticket, base = _ticket_repo_with_dd_artifacts(tmp_path)
         ops = DefaultHarvestOps()
         worktree_root = tmp_path / "harvest-wt"
         picked = ops.worktree_cherry_pick(repo, ticket, "main", worktree_root)
         assert picked["ok"] is True, picked
         tip = picked["harvest_tip"]
 
-        assert ops.is_ancestor(repo, ticket, tip)["is_ancestor"] is True
-        assert ops.is_ancestor(repo, tip, ticket)["is_ancestor"] is False
+        eq = ops.product_patch_equivalent(repo, base, ticket, tip)
+        assert eq["ok"] is True, eq
+        assert eq["equivalent"] is True, eq
+        assert sorted(eq["raw_files"]) == ["product.txt"], eq
         ops.remove_worktree(repo, worktree_root)
 
-    def test_worktree_merge_keeps_product_and_preserves_ancestry(self, tmp_path: Path) -> None:
-        """merge 语义：harvest_tip 保留产品改动、approved_head 为其祖先，
-        协议子树不再作为「exclude 提交」被剔除（产物本身不动）。"""
+    def test_worktree_patch_keeps_product_without_protocol_files(self, tmp_path: Path) -> None:
+        """产品补丁语义：harvest_tip 只打净产品 diff（保留产品改动、不夹带协议子树），
+        不带排除口径的文件清单恰好等于 net_product_files。"""
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
-        repo, ticket, _base = _ticket_repo_with_dd_artifacts(tmp_path)
+        repo, ticket, base = _ticket_repo_with_dd_artifacts(tmp_path)
         ops = DefaultHarvestOps()
         worktree_root = tmp_path / "harvest-wt"
 
         picked = ops.worktree_cherry_pick(repo, ticket, "main", worktree_root)
         assert picked["ok"] is True, picked
-        assert picked["method"] == "merge", picked
+        assert picked["method"] == "patch", picked
         tip = picked["harvest_tip"]
         assert tip and tip != ticket
-        # approved_head 是 harvest_tip 的祖先（merge commit 的第二父）。
-        assert ops.is_ancestor(repo, ticket, tip)["is_ancestor"] is True
         # 产品改动保留。
         assert git(repo, "show", f"{tip}:product.txt").strip() == "product change"
+        # 不带排除口径的文件清单 == ["product.txt"]（判据⑤：多写一个文件即红）。
+        names = git(repo, "diff", "--name-only", f"{base}..{tip}")
+        assert names.splitlines() == ["product.txt"], names
+        assert not any(p.startswith((".dev-dispatch", ".dd-evidence")) for p in names.splitlines())
         # worktree 保留供 verify 用（rc-702098ab 语义不变）。
         assert worktree_root.is_dir()
         assert (worktree_root / "product.txt").read_text().strip() == "product change"
+        # 协议子树没有落进产品树。
+        assert not (worktree_root / ".dev-dispatch").exists()
+        assert not (worktree_root / ".dd-evidence").exists()
         ops.remove_worktree(repo, worktree_root)
 
-    def test_build_harvest_tip_merges_and_is_descendant(self, tmp_path: Path) -> None:
+    def test_build_harvest_tip_patch_is_equivalent(self, tmp_path: Path) -> None:
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
-        repo, ticket, _base = _ticket_repo_with_dd_artifacts(tmp_path)
+        repo, ticket, base = _ticket_repo_with_dd_artifacts(tmp_path)
         ops = DefaultHarvestOps()
         result = ops.build_harvest_tip(repo, ticket, "main", tmp_path / "harvest-wt")
         assert result["ok"] is True, result
+        assert result.get("method") == "patch", result
         assert result["harvest_tip"], result
         git(repo, "cat-file", "-e", f"{result['harvest_tip']}^{{commit}}")
-        assert ops.is_ancestor(repo, ticket, result["harvest_tip"])["is_ancestor"] is True
+        eq = ops.product_patch_equivalent(repo, base, ticket, result["harvest_tip"])
+        assert eq["ok"] is True and eq["equivalent"] is True, eq
 
 
 class TestHarvestGitPlumbingNegatives:
@@ -1632,14 +1637,14 @@ class TestHarvestGitPlumbingNegatives:
     1. 阴性 A（identity）：合成**无全局 identity 环境**（repo 无 user.name/
        user.email config、`safe_git_environment` 会清空 GIT_AUTHOR/COMMITTER 并
        禁用 global config）→ `worktree_cherry_pick` 返回 ok:true、`harvest_tip`
-       非空；对照未修复时必然 `Committer identity unknown`（merge 落地 merge
-       commit 无 committer identity）。
+       非空；对照未修复时必然 `Committer identity unknown`（产品补丁落地新提交
+       无 committer identity）。
     2. 阴性 B（remote_url）：合成 record 其 `remote_url` 为**本地路径**仓、dd
        ref 只推在该本地仓、`origin` 故意指向不含该 dd ref 的远端 → `fetch_dd_ref`
        ok:true；对照未修复时 `couldn't find remote ref`（origin 与 remote_url
        不同源）。
     3. 反向不抖动：URL remote_url 且 `origin` 同源 → 行为不变（既有路径零回归）；
-       有 identity 环境 → merge/冲突路径不变。
+       有 identity 环境 → 产品补丁路径不变。
     """
 
     def test_merge_lands_commit_without_global_identity(self, tmp_path: Path) -> None:
@@ -1926,8 +1931,10 @@ class TestHarvestWriteGate:
         receipt = json.loads(Path(result["receipt_path"]).read_text())
         assert receipt["writes_skipped"] == list(WRITE_STEPS)
 
-    def test_merge_failure_leaves_default_branch_head_untouched(self, tmp_path: Path) -> None:
-        """真实 git：worktree_cherry_pick 判红（modify/delete 冲突）-> HEAD 不变。"""
+    def test_patch_build_never_touches_default_branch(self, tmp_path: Path) -> None:
+        """产品补丁形态写隔离：worktree_cherry_pick 只改一次性 linked worktree，
+        modify/delete（默认分支删文件、工单分支改同文件）不再有 merge 冲突——补丁
+        干净落成，且默认分支 HEAD 逐字节不变（写默认分支只在 pr_merge/pull 发生）。"""
         repo = tmp_path / "canon"
         _init_git_repo(repo)
         (repo / "shared.txt").write_text("base\n", encoding="utf-8")
@@ -1942,28 +1949,15 @@ class TestHarvestWriteGate:
         git(repo, "rm", "-q", "shared.txt")
         git(repo, "commit", "-q", "-m", "main deletes")
         before = head(repo)
-        _add_origin_with_dd_ref(repo, tmp_path / "origin.git", product)
-        config = HarvestRunConfig(
-            event=approved_unharvested_event(
-                development_id="dev-x", head_commit=product, stage="implement"
-            ).as_dict(),
-            state_root=tmp_path / "supervisor",
-            run_root=tmp_path / "runs",
-            dd_root=dd_record_root_with_remote_url(
-                tmp_path, str(repo), str(tmp_path / "origin.git")
-            ),
-            deploy_command=[],
-            allowlist=full_allowlist(str(repo)),
-            ops=DefaultHarvestOps(),
-            verify_argv=["true"],
-            verify_real_argv=["true"],
-            publish_notes=False,
-        )
-        result = run_harvest(config)
-        assert result["outcome"] == OUTCOME_ESCALATED
-        assert head(repo) == before, "merge 判红后默认分支 HEAD 必须逐字节不变"
-        receipt = json.loads(Path(result["receipt_path"]).read_text())
-        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+
+        ops = DefaultHarvestOps()
+        worktree_root = tmp_path / "harvest-wt"
+        picked = ops.worktree_cherry_pick(repo, product, "main", worktree_root)
+        assert picked["ok"] is True, picked
+        assert head(repo) == before, "产品补丁构建后默认分支 HEAD 必须逐字节不变"
+        assert worktree_root.is_dir()
+        ops.remove_worktree(repo, worktree_root)
+        assert not worktree_root.exists()
 
     def test_all_ok_still_harvests_and_merges(self, tmp_path: Path) -> None:
         """正向回归：全链每步 ok:true 仍正常 harvested，PR 正常 merge（不是永不写）。"""
@@ -3148,39 +3142,71 @@ class TestHarvestWikiReport:
 
 
 class TestEmptyHarvestFix:
-    """空收割修复四判据：exact-head 祖先 / 净 diff 空判 escalated / 回执三头对账 /
-    空收割不部署。每条判据都有阳性+阴性（去掉护栏/对账后必有一例变红）。"""
+    """空收割修复五判据：exact-head 等价（产品补丁）/ 净 diff 空判 escalated / 回执
+    三头对账 / 空收割不部署 / 实际写入集合 == net_product_files（多写一个文件即红）。
+    每条判据都有阳性+阴性（去掉护栏/对账后必有一例变红）。"""
 
     def _receipt(self, result: dict[str, Any]) -> dict[str, Any]:
         return json.loads(Path(result["receipt_path"]).read_text())
 
-    def test_approved_head_bound_and_checked_ancestor(self, tmp_path: Path) -> None:
-        """判据①阳性：approved_head = E5 head_commit，worktree 祖先判定对
-        (approved_head, harvest_tip) 读取，回执三头齐全 -> harvested。"""
+    def test_approved_head_bound_and_checked_equivalence(self, tmp_path: Path) -> None:
+        """判据①阳性：approved_head = E5 head_commit，worktree 产品补丁等价判定对
+        (base, approved_head, harvest_tip) 读取，回执三头齐全 -> harvested。"""
         fake = fake_ops()
         config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
         result = run_harvest(config)
         assert result["outcome"] == OUTCOME_HARVESTED
-        # worktree 祖先判定读取的是 (approved_head="a"*40, harvest_tip="b"*40)。
-        assert fake["is_ancestor_argvs"], "worktree 祖先判定未被读取"
-        ancestor, descendant = fake["is_ancestor_argvs"][0]
-        assert ancestor == "a" * 40
-        assert descendant == "b" * 40
+        # worktree 等价判定读取 (base="0"*40, approved_head="a"*40, harvest_tip="b"*40)。
+        assert fake["product_patch_argvs"], "worktree 产品补丁等价判定未被读取"
+        base, approved_head, harvested_head = fake["product_patch_argvs"][0]
+        assert base == "0" * 40
+        assert approved_head == "a" * 40
+        assert harvested_head == "b" * 40
         receipt = self._receipt(result)
         assert receipt["approved_head"] == "a" * 40
         assert receipt["harvested_head"] == "b" * 40
         assert receipt["net_product_files"] == ["product.txt"]
 
-    def test_non_ancestor_head_escalates_without_writes(self, tmp_path: Path) -> None:
-        """判据①阴性：approved_head 非 harvest_tip 祖先 -> escalate + 非祖先码，
-        绝不 pr_merge/pull/deploy（去掉祖先护栏后本用例必红）。"""
-        fake = fake_ops(is_ancestor_result=False)
+    def test_non_equivalent_patch_escalates_without_writes(self, tmp_path: Path) -> None:
+        """判据①阴性：harvest_tip 产品内容与 approved_head 不等价 -> escalate +
+        非等价码，绝不 pr_merge/pull/deploy（去掉等价护栏后本用例必红）。"""
+        fake = fake_ops(
+            product_patch_result={
+                "ok": True,
+                "equivalent": False,
+                "raw_files": ["product.txt"],
+                "detail": "harvested_head 产品内容与 approved_head 不等价",
+            }
+        )
         config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
         result = run_harvest(config)
         assert result["outcome"] == OUTCOME_ESCALATED
         worktree_step = next(s for s in result["steps"] if s["step"] == "worktree_cherry_pick")
         assert worktree_step["ok"] is False
-        assert worktree_step["escalate"] == ESCALATE_NON_ANCESTOR_HEAD
+        assert worktree_step["escalate"] == ESCALATE_NON_EQUIVALENT_PATCH
+        assert "pr_squash_merge" not in fake["calls"], fake["calls"]
+        assert "ff_only_pull" not in fake["calls"], fake["calls"]
+        assert "deploy" not in fake["calls"], fake["calls"]
+        receipt = self._receipt(result)
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+
+    def test_worktree_rejects_extra_file_in_written_set(self, tmp_path: Path) -> None:
+        """判据⑤阴性：实际写入集合多出 net_product_files 之外的路径（如夹带协议
+        文件）-> worktree 立即 escalate，绝不 pr_merge/pull/deploy。"""
+        fake = fake_ops(
+            product_patch_result={
+                "ok": True,
+                "equivalent": True,
+                "raw_files": ["product.txt", ".dev-dispatch/development.json"],
+                "detail": "",
+            }
+        )
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        worktree_step = next(s for s in result["steps"] if s["step"] == "worktree_cherry_pick")
+        assert worktree_step["ok"] is False
+        assert worktree_step["escalate"] == ESCALATE_NON_EQUIVALENT_PATCH
         assert "pr_squash_merge" not in fake["calls"], fake["calls"]
         assert "ff_only_pull" not in fake["calls"], fake["calls"]
         assert "deploy" not in fake["calls"], fake["calls"]
@@ -3213,24 +3239,37 @@ class TestEmptyHarvestFix:
         assert "ff_only_pull" not in fake["calls"], fake["calls"]
         assert not any(s.get("step") == "deploy" for s in result["steps"])
 
-    def test_reconciliation_rejects_non_descendant_harvested_head(self, tmp_path: Path) -> None:
-        """判据③阴性：worktree 祖先判定过、回执对账时 harvested_head 非后代 ->
-        escalate（去掉三头对账后本用例必红）。"""
-        fake = fake_ops(is_ancestor_calls=[True, False])
+    def test_reconciliation_rejects_inequivalent_harvested_head(self, tmp_path: Path) -> None:
+        """判据③阴性：worktree 等价判定过、回执对账时 harvested_head 产品内容与
+        approved_head 不等价 -> escalate（去掉三头对账后本用例必红）。"""
+        fake = fake_ops(
+            product_patch_calls=[
+                {"ok": True, "equivalent": True, "raw_files": ["product.txt"], "detail": ""},
+                {"ok": True, "equivalent": False, "raw_files": ["different.txt"], "detail": ""},
+            ]
+        )
         config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
         result = run_harvest(config)
         assert result["outcome"] == OUTCOME_ESCALATED
         receipt = self._receipt(result)
-        assert any("harvested_head 非 approved_head 后代" in m for m in _missing_of(receipt))
+        assert any(
+            "harvested_head 产品内容与 approved_head 不等价" in m for m in _missing_of(receipt)
+        )
 
     def test_reconciliation_rejects_net_files_mismatch(self, tmp_path: Path) -> None:
-        """判据③阴性：net_product_files 写错/漏写去对账 -> 不一致 -> escalate。"""
-        fake = fake_ops(net_files_calls=[["product.txt"], ["different.txt"]])
+        """判据⑤阴性：实际写入文件集合与 net_product_files 不一致（多写一个文件）
+        -> escalate（去掉收尾等价对账后本用例必红）。"""
+        fake = fake_ops(
+            product_patch_calls=[
+                {"ok": True, "equivalent": True, "raw_files": ["product.txt"], "detail": ""},
+                {"ok": True, "equivalent": True, "raw_files": ["different.txt"], "detail": ""},
+            ]
+        )
         config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
         result = run_harvest(config)
         assert result["outcome"] == OUTCOME_ESCALATED
         receipt = self._receipt(result)
-        assert any("net_product_files 不一致" in m for m in _missing_of(receipt))
+        assert any("实际写入集合与 net_product_files 不一致" in m for m in _missing_of(receipt))
 
     def test_non_empty_net_diff_records_files_on_success(self, tmp_path: Path) -> None:
         """判据②阳性：净 diff 非空 -> harvested 且 net_product_files 非空。"""
