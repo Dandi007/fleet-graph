@@ -87,15 +87,29 @@ RETIRED = {
     "wf-e313be",  # ronin-cgspec（chatgroup-daemon main 含 P1/P2/P3/P4 四批产物）
     #             ⚠️ 遗留：promotion 放行本身仍悬置等用户拍板（该线 terminal 原文
     #             「promotion 放行属用户单独拍板、不在本线 terminal 内」）。退役不代表已上线。
+    # 2026-09-02 第四批：核法同第三批（特征行 grep 生产分支），但**先按 remote_url
+    # 推 canonical**——上一轮我用 `git rev-parse --git-common-dir` 推，对「从 worktree
+    # 再切出的 worktree」会指到中间那棵树，据此得出的「未上线」结论是假的。
+    "wf-3f87f3",  # ronin-platform-pump。名下 4 单在 loop-engine-deep-research-plugin
+    #             canonical 特征行各 8/8 命中。它 08-31 驻停等的那个 run 早已终态，
+    #             09-02 13:19 复活后 38 分钟落完 C5 五件套并自行收线（13:57 terminal）。
+    #             ——即第 170 行那条「落完五件套后再进 RETIRED」的预告已兑现。
+    "wf-a87b04",  # ronin-wf-robust。3 单：2 单反向撤销干净应用，1 单特征行 6/6 命中。
+    "wf-d002a6",  # ronin-eventify。6 单：2 单反向撤销干净应用、3 单特征行各 6/6 命中、
+    #             1 单产品 diff 为空（纯协议单）。上一批注记的 dev-fg-ef0706e1962a
+    #             已随 PR #233 收割，本轮复核确认在产。
 }
 
 # 2026-09-02 监督面明确【不】退役的四条，理由逐条写死，防下一班误收：
 # - wf-197430 / wf-5664e5：它们的开发单派在 record.json 的 dispatched_by 字段上线之前，
 #   归不到线上，**我没能核产物去向**。未审不入 RETIRED（该集合断言的是「闭卷审计通过」）。
-# - wf-9b5931：两个单的 README 表格行未在生产分支命中（文档漂移），代码本身在产；
-#   未核清是被后续版本有意改掉还是漏了，先不退役。
-# - wf-d002a6：其单 dev-fg-ef0706e1962a 的产物（tests/test_protocol_entry_normalization.py）
-#   确实未上线，本 PR 一并收割；产物落地后再随下一批退役。
+# - wf-9b5931：**上一轮我把它写成「README 表格行未命中的文档漂移」，那句是错的。**
+#   本轮按 remote_url 推真 canonical 重核，两笔产物是整体缺失、不是文档漂移：
+#     dev-fg-81dbb77434fa（goal-agent，新增 253 行）→ 命中 0/8，**本轮已补收割**
+#       （goal-agent PR #68，main ba103b1 -> 80455c3，亲跑 check-line-set-model GREEN）
+#     dev-fg-b0ea914caf0e（agent-runtime，新增 102 行）→ 命中 2/8，补丁撞
+#       src/dispatch.ts:2943（main 自其 base 已前进 84 个提交），已退回该线以新 main
+#       为 base 重派，闸不重批。**这一笔落地并被收割前，本线保持 enabled。**
 # - wf-c22907：2026-09-08 定期复活，**名册当前没有「定期复活」这种终点语义**，
 #   按 CONVERGED 或 RETIRED 任一种退役都会把它错误固化。已立案补该语义。
 
