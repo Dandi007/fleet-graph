@@ -34,11 +34,13 @@ from fleet_graph.supervise.harvest import (
     HarvestRunConfig,
     _resolve_repo,
     authorize_harvest_write,
+    build_harvest,
     build_harvest_graph,
     run_harvest,
 )
 from fleet_graph.supervise.harvest_allowlist import HarvestAllowlist, parse_harvest_allowlist
 from fleet_graph.supervise.harvest_ops import EXIT_HEAD_MISMATCH, DefaultHarvestOps
+from fleet_graph.supervise.wiki_report import DefaultWikiClient, WikiReportError
 
 
 def fake_ops(
@@ -59,6 +61,7 @@ def fake_ops(
     harvest_tip: str = "b" * 40,
     inflight_binding: dict[str, Any] | None = None,
     resolve_verify_argv: tuple[list[str] | None, str] | None = None,
+    resolve_verify_argv_calls: list[tuple[list[str] | None, str]] | None = None,
     pr_merge_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A recording fake ops: every write/execute is recorded, results scripted.
@@ -71,6 +74,9 @@ def fake_ops(
     `resolve_verify_argv` 脚本化按目标仓解析结果（交付 A）：None 时默认返回
     `(["make","verify"], "")`（模拟 Makefile 含 verify 目标）；显式传
     `(None, "no resolvable verify command")` 等可脚本化解析失败路径。
+    `resolve_verify_argv_calls` 按调用序脚本化（run_verify 先、verify_real 后），
+    用于分别验证两个节点各自的解析/失败路径；非 None 时优先于
+    `resolve_verify_argv`。
     `pr_merge_result` 非 None 时 `pr_squash_merge` 返回该完整结果（脚本化，
     用于 M3 分支占用 refuse+escalate 编排短路口用例）；None 时返回默认
     `{"merged": ..., "pr_url": ...}`。
@@ -79,6 +85,7 @@ def fake_ops(
     deploy_repos: list[Path] = []
     verify_real_repos: list[Path] = []
     verify_real_heads: list[str | None] = []
+    verify_real_argvs: list[list[str]] = []
     binding_probes: list[dict[str, Any]] = []
     fetch_remote_urls: list[str | None] = []
     if divergence is None:
@@ -154,6 +161,11 @@ def fake_ops(
 
         def resolve_verify_argv(self, worktree: Path) -> tuple[list[str] | None, str]:
             # 机械读口：不入 calls（calls 只记录写/执行动作）。
+            # `resolve_verify_argv_calls` 按调用序脚本化（run_verify 先、
+            # verify_real 后），用于分别验证两个节点各自的解析/失败路径。
+            if resolve_verify_argv_calls is not None:
+                result = resolve_verify_argv_calls.pop(0)
+                return result[0], result[1]
             if resolve_verify_argv is not None:
                 return resolve_verify_argv[0], resolve_verify_argv[1]
             return ["make", "verify"], ""
@@ -196,6 +208,7 @@ def fake_ops(
             calls.append("verify_real")
             verify_real_repos.append(repo)
             verify_real_heads.append(expected_head)
+            verify_real_argvs.append(list(argv))
             if expected_head is None:
                 return EXIT_HEAD_MISMATCH
             return verify_real_exit
@@ -206,6 +219,7 @@ def fake_ops(
         "deploy_repos": deploy_repos,
         "verify_real_repos": verify_real_repos,
         "verify_real_heads": verify_real_heads,
+        "verify_real_argvs": verify_real_argvs,
         "pr_merge_args": pr_merge_args,
         "binding_probes": binding_probes,
         "fetch_remote_urls": fetch_remote_urls,
@@ -2072,12 +2086,13 @@ class TestHarvestTreeOccupancy:
         assert "pr_squash_merge" in fake["calls"], fake["calls"]
 
     def test_detect_inflight_binding_is_read_only(self, tmp_path: Path, monkeypatch: Any) -> None:
-        """只读判据（不另造账本）：occupancy 探测只 open/read + `git rev-parse`，
-        不写文件/不建目录/不登记。dd_root 目录树逐字节相同、`<target>` 一字未动。"""
+        """只读判据（不另造账本）：occupancy 探测只 open/read JSON（纯路径比较，
+        H8 case 2 收敛后连 `git rev-parse` 读口都不再需要），不写文件/不建目录/
+        不登记。dd_root 目录树逐字节相同、`<target>` 一字未动。"""
         from fleet_graph.supervise import harvest_ops
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
-        canonical, target, sentinel, dd_root = _h8_target_fixture(
+        _canonical, target, sentinel, dd_root = _h8_target_fixture(
             tmp_path, other_terminal="", subject_terminal="complete"
         )
         dd_snapshot_before = sorted(
@@ -2096,13 +2111,12 @@ class TestHarvestTreeOccupancy:
             return real_run_git(repo, *args, **kwargs)
 
         monkeypatch.setattr(harvest_ops, "run_git", recording_run_git)
-        binding = DefaultHarvestOps().detect_inflight_binding(canonical, dd_root)
+        binding = DefaultHarvestOps().detect_inflight_binding(target, dd_root)
         assert binding["in_flight"] is True
         assert binding["bound_development_id"] == "dev-fg-OTHER"
 
-        # 只发生 `git rev-parse`（纯读）；没有任何写类 git 命令。
-        assert git_calls, "detect_inflight_binding 未触发任何 git 读口"
-        assert all(args[0] == "rev-parse" for _repo, args in git_calls), git_calls
+        # 没有任何 git 调用，更没有任何写类 git 命令——纯 JSON 读 + 路径比较。
+        assert git_calls == [], f"detect_inflight_binding 不应触发任何 git 命令: {git_calls}"
         # dd_root 目录树逐字节相同（没有新建/改动任何账本文件）。
         dd_snapshot_after = sorted(
             (str(p.relative_to(dd_root)), p.read_bytes())
@@ -2132,16 +2146,16 @@ class TestHarvestTreeOccupancy:
     def test_self_sorts_first_does_not_mask_foreign_inflight(self, tmp_path: Path) -> None:
         """rc-3d12fbbe 阻塞项回归：本单 dev id 排序靠前时不得遮蔽更靠后的外来在飞单。
 
-        本单 dev-fg-SUBJECT 与外来 dev-fg-ZED-OTHER 同在飞且都绑定 `<target>`
-        （其 canonical 与本次收割目标 canonical 同一棵），而本单 id 在
-        `<dd_root>/` 枚举顺序（sorted）中先于外来单。旧实现 detect 返回第一条
+        本单 dev-fg-SUBJECT 与外来 dev-fg-ZED-OTHER 同在飞且都直接绑定 `<target>`
+        （`record.repo_path` 直接等于本次要消费的树路径，case 1 命中），而本单 id
+        在 `<dd_root>/` 枚举顺序（sorted）中先于外来单。旧实现 detect 返回第一条
         在飞绑定（=本单），`_detect_occupied_tree` 判定 bound==本单即丢弃、不继续
         扫 -> 外来在飞占用被静默漏检，树仍被 rmtree/pull/deploy。修复后 detect
         跳过本单自身绑定继续扫描，必须返回外来单并 escalate（bound=dev-fg-ZED-OTHER）。
         """
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
-        # 本单 SUBJECT 排序在 ZED-OTHER 之前（'S' < 'Z'），且两单都在飞绑定同一棵树。
+        # 本单 SUBJECT 排序在 ZED-OTHER 之前（'S' < 'Z'），且两单都在飞直接绑定同一棵树。
         canonical, target, sentinel, dd_root = _h8_target_fixture(
             tmp_path,
             other_dev="dev-fg-ZED-OTHER",
@@ -2151,7 +2165,7 @@ class TestHarvestTreeOccupancy:
         )
         # ops 层先验证：跳过本单、返回外来单（排序遮蔽被修复）。
         binding = DefaultHarvestOps().detect_inflight_binding(
-            canonical, dd_root, current_development_id="dev-fg-SUBJECT"
+            target, dd_root, current_development_id="dev-fg-SUBJECT"
         )
         assert binding["in_flight"] is True
         assert binding["bound_development_id"] == "dev-fg-ZED-OTHER", binding
@@ -2301,6 +2315,92 @@ class TestHarvestTreeOccupancy:
         assert (target / "sentinel.bin").read_bytes() == sentinel
         assert target.is_dir()
 
+    def test_other_linked_worktree_inflight_does_not_lock_canonical(self, tmp_path: Path) -> None:
+        """H8 case 2 收敛阴性（修复前必红）：同仓另一棵 linked worktree 在飞不再锁 canonical。
+
+        canonical + 两棵 linked worktree：dev-fg-OTHER 在飞绑定 `wt-other`
+        （record.repo_path = canonical 的**另一棵** linked worktree），本次收割单
+        dev-fg-SUBJECT 绑定 `wt-target`（终态）。修复前 case 2 把 `wt-other`
+        归属到 canonical -> `detect_inflight_binding(canonical)` 恒 in_flight=True
+        误锁整仓；修复后 canonical 与本次要消费的树都 in_flight=False，且
+        `run_harvest` 照常 harvested（不「等在飞单跑完再收」）。
+        """
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        wt_other = tmp_path / "wt-other"
+        git(canonical, "worktree", "add", "--detach", str(wt_other), "main")
+        wt_target = tmp_path / "wt-target"
+        git(canonical, "worktree", "add", "--detach", str(wt_target), "main")
+        (wt_target / "sentinel.bin").write_bytes(H8_SENTINEL_BYTES)
+
+        dd_root = tmp_path / "dd"
+        for dev, repo_path, terminal in (
+            ("dev-fg-OTHER", str(wt_other), ""),
+            ("dev-fg-SUBJECT", str(wt_target), "complete"),
+        ):
+            dev_dir = dd_root / dev
+            dev_dir.mkdir(parents=True)
+            (dev_dir / "record.json").write_text(
+                json.dumps(
+                    {
+                        "development_id": dev,
+                        "repo_path": repo_path,
+                        "remote_url": str(tmp_path / "local-remote.git"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (dev_dir / "status.json").write_text(
+                json.dumps(
+                    {"development_id": dev, "state": terminal or "running", "terminal": terminal}
+                ),
+                encoding="utf-8",
+            )
+
+        ops = DefaultHarvestOps()
+        # 阴性：canonical 与本次要消费的树都不再被同仓另一棵 linked worktree 锁住。
+        assert ops.detect_inflight_binding(canonical, dd_root)["in_flight"] is False
+        assert ops.detect_inflight_binding(wt_target, dd_root)["in_flight"] is False
+
+        # 编排层照常收割（harvested）：occupancy 用真实（修复后）判定，其余机械步
+        # 走 fake，全程不触真网/生产 checkout。
+        fake = fake_ops(resolve_canonical=canonical)
+
+        class _RealDetectFakeRest:
+            """detect_inflight_binding 走真实 DefaultHarvestOps，其余方法委托 fake。"""
+
+            def __getattr__(self, name):
+                return getattr(fake["ops"], name)
+
+            def detect_inflight_binding(
+                self, tree_path: Path, dd_root: Path, current_development_id: str | None = None
+            ) -> dict[str, Any]:
+                return ops.detect_inflight_binding(tree_path, dd_root, current_development_id)
+
+        config = HarvestRunConfig(
+            event=approved_unharvested_event(
+                development_id="dev-fg-SUBJECT", head_commit="a" * 40, stage="implement"
+            ).as_dict(),
+            state_root=tmp_path / "supervisor",
+            run_root=tmp_path / "runs",
+            dd_root=dd_root,
+            deploy_command=[],
+            allowlist=full_allowlist(str(canonical)),
+            ops=_RealDetectFakeRest(),
+            bus=FakeBus(),
+            publish_notes=True,
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED, result
+        intake_step = next(s for s in result["steps"] if s["step"] == "intake")
+        assert intake_step["ok"] is True
+        assert intake_step.get("escalate") != "HARVEST_TREE_OCCUPIED_BY_INFLIGHT"
+        # 本次要消费的树未被 in_flight 单动到（sentinel 仍在，目录仍在）。
+        assert (wt_target / "sentinel.bin").read_bytes() == H8_SENTINEL_BYTES
+        assert wt_target.is_dir()
+
 
 class TestResolveVerifyArgv:
     """交付 A/B：verify argv 按目标仓解析（机械口 + 编排层），不再全局硬编码 make verify。
@@ -2425,6 +2525,98 @@ class TestResolveVerifyArgv:
         receipt = json.loads(Path(result["receipt_path"]).read_text())
         rv = next(s for s in receipt["steps"] if s["step"] == "run_verify")
         assert rv["argv"] == ["custom", "verify-cmd"]
+
+
+class TestVerifyRealArgvResolution:
+    """H9 交付：verify_real 与 run_verify 共用 `resolve_verify_argv` 机械口。
+
+    真机触因：fleet-sentinel 是 uv 管仓（pyproject.toml + uv.lock、无 Makefile），
+    收割整链全绿但 verify_real 用 legacy `make verify` 退出 2 -> 真机 harnessed 后
+    判红 escalate。修复后 verify_real 按目标仓解析 argv，step argv 非 make verify；
+    解析失败 -> ok:false + detail + escalated，绝不硬跑 make verify 制造误导性
+    退出码。Makefile 仓与显式覆盖行为不变（零回归）。
+    """
+
+    def test_uv_repo_verify_real_uses_resolved_uv_pytest(self, tmp_path: Path) -> None:
+        """阴性（修复判据）：resolve_verify_argv 返回 uv pytest -> verify_real step
+        argv == ["uv","run","pytest","-q"]（非 make verify）、exit 0 -> harvested；
+        fake verify_real 收到的 argv 同样是非 make 指令。"""
+        fake = fake_ops(resolve_verify_argv=(["uv", "run", "pytest", "-q"], ""))
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), deploy_command=["make", "deploy"])
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert fake["calls"].count("verify_real") == 1
+        assert fake["verify_real_argvs"] == [["uv", "run", "pytest", "-q"]]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        vr = next(s for s in receipt["steps"] if s["step"] == "verify_real")
+        assert vr["argv"] == ["uv", "run", "pytest", "-q"]
+        assert vr["exit_code"] == 0
+        assert vr["ok"] is True
+        assert receipt["verify_real_exit_code"] == 0
+
+    def test_unresolvable_verify_real_escalates_no_run(self, tmp_path: Path) -> None:
+        """解析失败：resolve_verify_argv 返回 (None, no resolvable verify command)
+        -> verify_real step ok:false + detail + outcome=escalated，且 fake
+        verify_real 从未被调用（绝不产生误导性退出码）。run_verify 先消耗一次
+        解析（uv pytest 通过），verify_real 消耗第二次 -> 命中本节点的失败路径。"""
+        fake = fake_ops(
+            resolve_verify_argv_calls=[
+                (["uv", "run", "pytest", "-q"], ""),
+                (None, "no resolvable verify command"),
+            ]
+        )
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), deploy_command=["make", "deploy"])
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        vr = next(s for s in result["steps"] if s["step"] == "verify_real")
+        assert vr["ok"] is False
+        assert vr["detail"] == "no resolvable verify command"
+        assert "argv" not in vr or vr["argv"] != ["make", "verify"]
+        assert "verify_real" not in fake["calls"], fake["calls"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["verify_real_exit_code"] != 0
+
+    def test_makefile_repo_verify_real_still_make_verify(self, tmp_path: Path) -> None:
+        """反向不抖动：resolve_verify_argv 返回 make verify -> verify_real step
+        argv 仍 ["make","verify"]、exit 0 -> harvested（与现状一致，无回归）。"""
+        fake = fake_ops(resolve_verify_argv=(["make", "verify"], ""))
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), deploy_command=["make", "deploy"])
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert fake["verify_real_argvs"] == [["make", "verify"]]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        vr = next(s for s in receipt["steps"] if s["step"] == "verify_real")
+        assert vr["argv"] == ["make", "verify"]
+        assert vr["exit_code"] == 0
+        assert vr["ok"] is True
+
+    def test_explicit_verify_real_argv_override_still_wins(self, tmp_path: Path) -> None:
+        """显式覆盖不抖动：verify_real_argv 配置为非默认 -> 直接采用（覆盖优先，
+        同 verify 节点 deps.verify_argv 语义），resolve 被跳过。"""
+        fake = fake_ops(resolve_verify_argv=(["uv", "run", "pytest", "-q"], ""))
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), deploy_command=["make", "deploy"])
+        config.verify_real_argv = ["custom", "verify-cmd"]
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert fake["verify_real_argvs"] == [["custom", "verify-cmd"]]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        vr = next(s for s in receipt["steps"] if s["step"] == "verify_real")
+        assert vr["argv"] == ["custom", "verify-cmd"]
+        assert vr["exit_code"] == 0
+        assert vr["ok"] is True
+
+    def test_default_verify_real_argv_resolves_not_make_for_uv_repo(self, tmp_path: Path) -> None:
+        """默认 verify_real_argv 恒为 legacy make verify -> 仍走解析（uv 仓 -> uv
+        pytest），step argv 记录最终实际采用的指令。"""
+        fake = fake_ops(resolve_verify_argv=(["uv", "run", "pytest", "-q"], ""))
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), deploy_command=["make", "deploy"])
+        assert config.verify_real_argv == ["make", "verify"]
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert fake["verify_real_argvs"] == [["uv", "run", "pytest", "-q"]]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        vr = next(s for s in receipt["steps"] if s["step"] == "verify_real")
+        assert vr["argv"] == ["uv", "run", "pytest", "-q"]
 
 
 class TestHarvestWorktreeReclaimGuard:
@@ -2661,3 +2853,117 @@ class TestHarvestPrSquashMergeBranchOccupied:
         assert any(argv[:3] == ["gh", "pr", "merge"] for argv in gh_argv), gh_argv
         # push 已执行：origin 上存在 harvest/dev-x ref。
         assert git(repo, "ls-remote", "--heads", "origin", "harvest/dev-x") != ""
+
+
+class TestHarvestWikiReport:
+    """交付 D.1/D.2/D.3：harvest 生产晋级分节接线（fake wiki 注入，禁触真网）。
+
+    1. 【v2 新增·阴性守卫，必须能红】fake wiki 注入，harvest 终局 != HARVESTED
+       （escalated / no-op）→ `record_production_promotion` **0 次调用**。验收标准=
+       去掉 receipt 里 `and state.get("outcome") == OUTCOME_HARVESTED` 守卫后本用例
+       必须变红（当前缺失该守卫时全绿=阴性面没钉住）。
+    2. harvest 生产晋级触发：fake wiki + outcome==HARVESTED → 调用 1 次、入参带
+       non-empty 证据指针；未修复时 0 次（阴性能红）。
+    3. harvest wiki 失败不咬主链：fake wiki 抛 WikiReportError → outcome 仍
+       HARVESTED、`wiki_report` step ok=false、绝不 escalate。
+    """
+
+    def test_negative_guard_escalated_never_calls_production_promotion(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        calls: list[tuple[Any, ...]] = []
+
+        def recording(*_a: Any, **_kw: Any) -> dict[str, Any]:
+            calls.append((_a, _kw))
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            "fleet_graph.supervise.wiki_report.record_production_promotion", recording
+        )
+        fake = fake_ops(merged=False)  # -> escalated
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), wiki=object())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert calls == [], f"未收割成功却追加了生产晋级分节: {calls}"
+
+    def test_negative_guard_noop_terminal_never_calls_production_promotion(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        calls: list[tuple[Any, ...]] = []
+
+        def recording(*_a: Any, **_kw: Any) -> dict[str, Any]:
+            calls.append((_a, _kw))
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            "fleet_graph.supervise.wiki_report.record_production_promotion", recording
+        )
+        fake = fake_ops(cherry_equivalent=True)  # -> already_harvested no-op 终态
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), wiki=object())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ALREADY_HARVESTED
+        assert calls == [], f"no-op 终态却追加了生产晋级分节: {calls}"
+
+    def test_harvested_calls_production_promotion_once_with_evidence(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        seen: list[dict[str, Any]] = []
+
+        def recording(client: Any, **kwargs: Any) -> dict[str, Any]:
+            seen.append({"client": client, **kwargs})
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            "fleet_graph.supervise.wiki_report.record_production_promotion", recording
+        )
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), wiki=object())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert len(seen) == 1, seen
+        assert seen[0]["development_name"] == "dev-x"
+        assert seen[0]["evidence"], "证据指针不得为空"
+        # 证据指针 = PR 链接 / commit / event key 至少一项在场。
+        assert any("github.com" in str(p) for p in seen[0]["evidence"])
+
+    def test_wiki_failure_does_not_flip_outcome(self, tmp_path: Path, monkeypatch: Any) -> None:
+        def boom(*_a: Any, **_kw: Any) -> dict[str, Any]:
+            raise WikiReportError("mock wiki down")
+
+        monkeypatch.setattr("fleet_graph.supervise.wiki_report.record_production_promotion", boom)
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), wiki=object())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED, "wiki 失败绝不能翻转 outcome"
+        steps = result["steps"] or []
+        wiki_report = [s for s in steps if s.get("step") == "wiki_report"]
+        assert wiki_report, steps
+        assert wiki_report[0]["ok"] is False
+        assert "wiki" in wiki_report[0]["detail"]
+
+    def test_wiki_none_is_zero_regression(self, tmp_path: Path, monkeypatch: Any) -> None:
+        """wiki 缺省 None -> 无 wiki_report step、无任何追加（零回归）。"""
+        calls: list[tuple[Any, ...]] = []
+
+        def recording(*_a: Any, **_kw: Any) -> dict[str, Any]:
+            calls.append((_a, _kw))
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            "fleet_graph.supervise.wiki_report.record_production_promotion", recording
+        )
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert calls == []
+        assert not any(s.get("step") == "wiki_report" for s in (result["steps"] or []))
+
+    def test_default_wiki_client_is_injected_via_config(self, tmp_path: Path) -> None:
+        """HarvestRunConfig.wiki 注入 DefaultWikiClient（交付 A.2）。"""
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), wiki=DefaultWikiClient())
+        assert isinstance(config.wiki, DefaultWikiClient)
+        graph, deps, _event = build_harvest(config)
+        assert deps.wiki is config.wiki
+        assert graph is not None
