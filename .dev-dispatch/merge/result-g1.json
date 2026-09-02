@@ -1,0 +1,7 @@
+{
+ "development_id": "dev-fg-8fffd736ab08",
+ "result": "MERGED",
+ "subject_commit": "2f7bc478856c2a03f3445791f8a6917074a05faa",
+ "target_ref": "refs/heads/dd/dev-fg-8fffd736ab08",
+ "previous_target_head": "2f7bc478856c2a03f3445791f8a6917074a05faa"
+}
