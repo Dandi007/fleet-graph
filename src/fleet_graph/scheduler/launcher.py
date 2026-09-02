@@ -19,6 +19,7 @@ separate so the policy stays reviewable on its own.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
 from dataclasses import dataclass, field
@@ -26,6 +27,19 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_UNIT_PREFIX = "fleet-graph-line"
+
+#: Environment guard for test/acceptance isolation. When set to a truthy
+#: value, a `TransientLauncher` constructed *without* an explicit `dry_run`
+#: defaults to no-op (dry-run), so a test or acceptance run that builds a
+#: `LaunchSpec` and validates its argv never hands `systemd-run --user` to the
+#: real user manager. Production (guard unset) keeps the real launch semantics
+#: unchanged; an explicit `dry_run=` always wins over the guard.
+TRANSIENT_NOOP_ENV = "FLEET_GRAPH_TRANSIENT_NOOP"
+
+
+def _transient_noop_guard() -> bool:
+    value = os.environ.get(TRANSIENT_NOOP_ENV, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -149,8 +163,12 @@ class LaunchResult:
 
 
 class TransientLauncher:
-    def __init__(self, *, dry_run: bool = False) -> None:
-        self.dry_run = dry_run
+    def __init__(self, *, dry_run: bool | None = None) -> None:
+        #: An explicit `dry_run` always wins. `None` (the default) resolves
+        #: through the environment guard so a test/acceptance process defaults
+        #: to no-op and never hands `systemd-run --user` to the real user
+        #: manager; production (guard unset) keeps the real launch semantics.
+        self.dry_run = dry_run if dry_run is not None else _transient_noop_guard()
 
     def launch(self, spec: LaunchSpec) -> LaunchResult:
         argv = spec.argv()
@@ -175,4 +193,10 @@ class TransientLauncher:
         return LaunchResult(spec.unit_name, True, completed.stdout.strip()[:300])
 
 
-__all__ = ["DEFAULT_UNIT_PREFIX", "LaunchResult", "LaunchSpec", "TransientLauncher"]
+__all__ = [
+    "DEFAULT_UNIT_PREFIX",
+    "TRANSIENT_NOOP_ENV",
+    "LaunchResult",
+    "LaunchSpec",
+    "TransientLauncher",
+]
