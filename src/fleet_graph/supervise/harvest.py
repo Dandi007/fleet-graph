@@ -91,6 +91,13 @@ WRITE_STEPS = ("pr_squash_merge", "ff_only_pull", "deploy")
 #: 更早节点拦（intake 早退 -> receipt），拦不到时 H7 仍在位。
 ESCALATE_TREE_OCCUPIED = "HARVEST_TREE_OCCUPIED_BY_INFLIGHT"
 
+#: M3 分支占用 refuse+escalate 码（与 `harvest_ops.pr_squash_merge` 返回的
+#: `escalate` 值一致）：本地 `harvest/<development_id>` 分支被任一残留 worktree
+#: 检出 -> 占用前置判红 refuse+escalate。编排层据此立即 outcome=escalated +
+#: writes_skipped，绝不落「远端已合并却报未合并」的半态，也不触碰 pull/deploy/
+#: verify_real 任何写步（spec 交付 A.2：走既有 escalate 收尾）。
+ESCALATE_BRANCH_OCCUPIED = "HARVEST_BRANCH_OCCUPIED"
+
 #: SOP 步骤名的封闭枚举——测试据此断言「编排步骤齐全」。
 SOP_STEPS = (
     "fetch_dd_ref",
@@ -638,6 +645,17 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         merged = bool(result.get("merged"))
         pr_url = str(result.get("pr_url") or "")
         steps = _record_step(state, "pr_squash_merge", ok=merged, commit=harvest_tip, **result)
+        # M3 分支占用 refuse+escalate：pr_squash_merge 返回 refused+escalate ->
+        # 立即 outcome=escalated + writes_skipped，绝不落半态、绝不触碰任何写步
+        # （spec 交付 A.2：走既有 escalate 收尾，不执行 gh pr merge / 后续写步）。
+        if result.get("refused") and result.get("escalate") == ESCALATE_BRANCH_OCCUPIED:
+            return {
+                "steps": steps,
+                "pr_merged": merged,
+                "pr_url": pr_url,
+                "outcome": OUTCOME_ESCALATED,
+                "writes_skipped": list(WRITE_STEPS),
+            }
         return {"steps": steps, "pr_merged": merged, "pr_url": pr_url}
 
     def pull(state: HarvestState) -> HarvestState:
@@ -851,6 +869,17 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         # 不再跑 deploy/verify_real；未分叉 -> 既有链。
         return "deploy" if state.get("outcome") is None else "receipt"
 
+    def after_pr_merge(state: HarvestState) -> str:
+        # M3 分支占用 refuse+escalate：pr_squash_merge 返回 refused+escalate ->
+        # outcome 已设（escalated）-> 绝不进入 pull/deploy/verify_real 任何写步，
+        # 直接走既有 escalate 收尾（postconditions -> receipt）；outcome=refused
+        # （per-write 门拒绝）-> 直接 receipt。未判红 -> 既有链进 pull。
+        if state.get("outcome") is None:
+            return "pull"
+        if state.get("outcome") == OUTCOME_REFUSED:
+            return "receipt"
+        return "postconditions"
+
     def after_worktree(state: HarvestState) -> str:
         # H7 写前闸：worktree_cherry_pick 判红 -> outcome=escalated -> 直接 escalate
         # 收尾（postconditions 只读记缺失 -> receipt），绝不进入
@@ -915,7 +944,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
     graph.add_conditional_edges(
         "cleanup_worktree", after_cleanup, {"pr_merge", "postconditions", "receipt"}
     )
-    graph.add_edge("pr_merge", "pull")
+    graph.add_conditional_edges("pr_merge", after_pr_merge, {"pull", "postconditions", "receipt"})
     graph.add_conditional_edges("pull", after_pull, {"deploy", "receipt"})
     graph.add_edge("deploy", "verify_real")
     graph.add_edge("verify_real", "evidence")

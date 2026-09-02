@@ -23,6 +23,7 @@ from typing import Any
 from conftest import git, head
 from fleet_graph.supervise.events import approved_unharvested_event, validate_event
 from fleet_graph.supervise.harvest import (
+    ESCALATE_BRANCH_OCCUPIED,
     OUTCOME_ALREADY_HARVESTED,
     OUTCOME_ESCALATED,
     OUTCOME_HARVESTED,
@@ -58,6 +59,7 @@ def fake_ops(
     harvest_tip: str = "b" * 40,
     inflight_binding: dict[str, Any] | None = None,
     resolve_verify_argv: tuple[list[str] | None, str] | None = None,
+    pr_merge_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A recording fake ops: every write/execute is recorded, results scripted.
 
@@ -69,6 +71,9 @@ def fake_ops(
     `resolve_verify_argv` 脚本化按目标仓解析结果（交付 A）：None 时默认返回
     `(["make","verify"], "")`（模拟 Makefile 含 verify 目标）；显式传
     `(None, "no resolvable verify command")` 等可脚本化解析失败路径。
+    `pr_merge_result` 非 None 时 `pr_squash_merge` 返回该完整结果（脚本化，
+    用于 M3 分支占用 refuse+escalate 编排短路口用例）；None 时返回默认
+    `{"merged": ..., "pr_url": ...}`。
     """
     calls: list[str] = []
     deploy_repos: list[Path] = []
@@ -168,6 +173,8 @@ def fake_ops(
                     "default_branch": default_branch,
                 }
             )
+            if pr_merge_result is not None:
+                return dict(pr_merge_result)
             return {"merged": merged, "pr_url": pr_url, "method": "gh-pr-squash-merge"}
 
         def ff_only_pull(self, repo: Path, default_branch: str) -> dict[str, Any]:
@@ -1798,6 +1805,64 @@ class TestHarvestWriteGate:
         assert receipt["writes_skipped"] == []
 
 
+class TestHarvestBranchOccupiedEscalateShortCircuit:
+    """交付 A.2（rc-6c2e9473 复审修复）：pr_squash_merge 返回 refused+escalate
+    HARVEST_BRANCH_OCCUPIED -> 编排层立即 outcome=escalated + writes_skipped，
+    绝不进入 pull/deploy/verify_real 任何写步（不再在 postconditions 前对 canonical
+    checkout 跑 ff_only_pull / deploy / verify_real），也不落「远端已合并却报未合并」
+    的半态。
+    """
+
+    def test_occupied_refusal_escalates_without_running_pull_deploy_verify_real(
+        self, tmp_path: Path
+    ) -> None:
+        fake = fake_ops(
+            pr_merge_result={
+                "merged": False,
+                "refused": True,
+                "escalate": ESCALATE_BRANCH_OCCUPIED,
+                "worktree_paths": ["/data/worktrees/residual-wt"],
+                "detail": "harvest 分支 harvest/dev-x 被残留 worktree 检出占用",
+            }
+        )
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        # 占用判红后，后续写步零调用（ff_only_pull / deploy / verify_real 都不执行）。
+        assert "pr_squash_merge" in fake["calls"], fake["calls"]
+        assert "ff_only_pull" not in fake["calls"], fake["calls"]
+        assert "deploy" not in fake["calls"], fake["calls"]
+        assert "verify_real" not in fake["calls"], fake["calls"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["outcome"] == OUTCOME_ESCALATED
+        assert receipt["pr_merged"] is False
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+        # 机器可读占用诊断进步骤留痕。
+        merge_step = next(s for s in receipt["steps"] if s["step"] == "pr_squash_merge")
+        assert merge_step["refused"] is True
+        assert merge_step["escalate"] == ESCALATE_BRANCH_OCCUPIED
+
+    def test_occupied_refusal_does_not_produce_half_merged_state(self, tmp_path: Path) -> None:
+        """绝不落半态：merged=false 且无 pr_url（远端未合并、也无 forge 链接）。"""
+        fake = fake_ops(
+            pr_merge_result={
+                "merged": False,
+                "refused": True,
+                "escalate": ESCALATE_BRANCH_OCCUPIED,
+                "worktree_paths": ["/data/worktrees/residual-wt"],
+                "detail": "harvest 分支 harvest/dev-x 被残留 worktree 检出占用",
+            }
+        )
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["pr_merged"] is False
+        assert receipt["pr_url"] == ""
+        # 占用分支明确拒绝，绝不替人删残留 worktree（无 remove_worktree 之外的任何动作）。
+        assert "pr_squash_merge" in [s.get("step") for s in receipt["steps"]]
+
+
 def _real_repo_with_origin(tmp_path: Path) -> tuple[Path, str]:
     """真实可收割仓：main + feature 产品 commit + origin + dd ref（本地合成，禁真网）。"""
     repo = tmp_path / "canon"
@@ -2395,3 +2460,101 @@ class TestHarvestWorktreeReclaimGuard:
         ok, detail = _assert_repo_valid(repo)
         assert ok is False
         assert detail
+
+
+class TestHarvestPrSquashMergeBranchOccupied:
+    """M3 分支占用前置检测：pr_squash_merge 在 merge 前只读判占用，占用即
+    refuse+escalate，绝不执行 push / gh pr create / gh pr merge（合成本地仓，
+    禁触真网/生产 checkout）。
+
+    1. 阴性（本单判据，未修复必红）：残留 worktree 检出 `harvest/<id>` ->
+       `pr_squash_merge` 返回 refused=true / escalate=HARVEST_BRANCH_OCCUPIED /
+       merged=false，且 gh 零调用（fake 命令计数 0）、git push 不执行、占用者
+       worktree 原样保留（占用只 report 不替人删）。
+    2. 反向不抖动：无占用 -> 走原路径，merged=true、产出 pr_url（gh 走 fake，
+       不触真网）。
+    """
+
+    def _repo_with_origin(self, tmp_path: Path) -> Path:
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        origin = tmp_path / "origin.git"
+        git(repo, "clone", "--bare", "-q", ".", str(origin))
+        git(repo, "remote", "add", "origin", str(origin))
+        return repo
+
+    def test_occupied_branch_refuses_without_gh_or_push(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """阴性 fixture：残留 worktree 检出 harvest/dev-x -> refused+escalate。
+
+        未修复时必然走进 `gh pr merge --delete-branch` 报原始 `used by
+        worktree`、merged=false 且无 refused/escalate 码；修复后 refused=true +
+        escalate=HARVEST_BRANCH_OCCUPIED + gh 零调用（fake 命令计数 0）。
+        """
+        from fleet_graph.supervise import harvest_ops
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = self._repo_with_origin(tmp_path)
+        head_commit = head(repo)
+        # 残留 worktree 检出 harvest/dev-x（真实 git linked worktree）。
+        git(repo, "checkout", "-q", "-b", "harvest/dev-x")
+        git(repo, "checkout", "-q", "main")
+        worktree = tmp_path / "residual-wt"
+        git(repo, "worktree", "add", str(worktree), "harvest/dev-x")
+
+        gh_calls: list[list[str]] = []
+        real_run = harvest_ops._run
+
+        def recording_run(argv: list[str], cwd: Path | None = None) -> dict[str, Any]:
+            gh_calls.append(argv)
+            return real_run(argv, cwd=cwd)
+
+        monkeypatch.setattr(harvest_ops, "_run", recording_run)
+
+        result = DefaultHarvestOps().pr_squash_merge(repo, "dev-x", head_commit, "main")
+        assert result["merged"] is False, result
+        assert result["refused"] is True, result
+        assert result["escalate"] == "HARVEST_BRANCH_OCCUPIED", result
+        assert str(worktree) in result["detail"], result
+        # gh 零调用：merge/create 都不执行（fake 命令计数 0）。
+        assert gh_calls == [], f"gh 被调用: {gh_calls}"
+        # git push 不执行：origin 上不应出现 harvest/dev-x ref。
+        assert git(repo, "ls-remote", "--heads", "origin", "harvest/dev-x") == ""
+        # 占用者 worktree 与分支原样保留（占用只 report，绝不替人删）。
+        assert worktree.is_dir()
+        assert (worktree / "seed.txt").is_file()
+
+    def test_unoccupied_proceeds_to_gh_merge_and_produces_pr_url(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """反向不抖动：无占用 -> 走原路径，merged=true、产出 pr_url（gh 走 fake）。"""
+        from fleet_graph.supervise import harvest_ops
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo = self._repo_with_origin(tmp_path)
+        head_commit = head(repo)
+        pr_url = "https://github.com/Dandi007/fleet-harvest-sandbox/pull/7"
+        gh_calls: list[list[str]] = []
+
+        def fake_run(argv: list[str], cwd: Path | None = None) -> dict[str, Any]:
+            gh_calls.append(argv)
+            if argv[:3] == ["gh", "pr", "create"]:
+                return {
+                    "ok": True,
+                    "exit_code": 0,
+                    "stdout_tail": pr_url + "\n",
+                    "stderr_tail": "",
+                }
+            return {"ok": True, "exit_code": 0, "stdout_tail": "", "stderr_tail": ""}
+
+        monkeypatch.setattr(harvest_ops, "_run", fake_run)
+
+        result = DefaultHarvestOps().pr_squash_merge(repo, "dev-x", head_commit, "main")
+        assert result["merged"] is True, result
+        assert result["pr_url"] == pr_url, result
+        gh_argv = [argv for argv in gh_calls if argv and argv[0] == "gh"]
+        assert any(argv[:3] == ["gh", "pr", "create"] for argv in gh_argv), gh_argv
+        assert any(argv[:3] == ["gh", "pr", "merge"] for argv in gh_argv), gh_argv
+        # push 已执行：origin 上存在 harvest/dev-x ref。
+        assert git(repo, "ls-remote", "--heads", "origin", "harvest/dev-x") != ""
