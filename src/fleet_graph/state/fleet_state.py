@@ -19,6 +19,9 @@ dd status / decision-bridge 的 bridge.sqlite3，以及可选的 agent-bus
 - 机械事实只读：``heartbeat_age_s`` = 现在 - heartbeat.json 的 ``updated_at``；
   ``parked`` = ``waiting_on == "decision"``（见 ``normalize_waiting_on``）；
   ``wake_facts`` 至少含 ``waiting_on`` 等机械事实。
+- 驻停声明按 run 一致性门控：``terminal.json.run_id == heartbeat.json.run_id``
+  时该声明才属活 run；否则 ``wake_facts_stale=true`` 且顶层 ``run_id`` 暴露
+  **活 run** 的 run_id（方向 b：保留历史声明，让消费者机械可判）。
 - ``release_id`` 只消费 heartbeat.json 已持久化的值（line 进程启动时冻结），
   read 路径**绝不**重新 realpath 部署 ``current`` 符号链接——那是进程 exec 时
   解析一次的机械事实，不是链接当下指向。
@@ -385,6 +388,16 @@ class FleetStateView:
                     if terminal.get(key) is not None:
                         wake_facts[key] = terminal[key]
 
+            # run 一致性门控（SSoT：run_id 一致才属活 run）：
+            # - 顶层 run_id 永远暴露「活 run」的 heartbeat.run_id；
+            # - terminal 声明缺失/不可比对/与活 run 不一致 → wake_facts_stale=true，
+            #   保留历史声明但让消费者机械可判（方向 b，本卷选路）。
+            live_run_id = heartbeat.get("run_id") if heartbeat else None
+            declared_run_id = terminal.get("run_id") if terminal else None
+            wake_facts_stale = terminal is not None and (
+                live_run_id is None or declared_run_id is None or live_run_id != declared_run_id
+            )
+
             generation = self._generation_for(run_root, folder_id, roster_generation)
             line_objs.append(
                 {
@@ -396,6 +409,8 @@ class FleetStateView:
                     "terminal": terminal.get("terminal") if terminal else None,
                     "parked": waiting_on == "decision",
                     "wake_facts": wake_facts,
+                    "run_id": live_run_id,
+                    "wake_facts_stale": wake_facts_stale,
                     # The release this generation actually runs, frozen by the
                     # line process at startup. The read model only consumes the
                     # persisted heartbeat value -- it never re-resolves the

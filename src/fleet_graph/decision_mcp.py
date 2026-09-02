@@ -341,6 +341,19 @@ def deliver_decision(
     )
 
 
+class _NullLedger:
+    """A no-op ledger for servers built without an explicit ledger.
+
+    Deliberately the *default* for :func:`build_decision_mcp_server`: a test
+    that builds the surface without a ledger must never silently write to
+    ``DEFAULT_STATE_DIR`` (the production ledger/metrics files). Production
+    serving always passes a real :class:`DeliveryLedger` via ``serve()``.
+    """
+
+    def record(self, result: DeliveryResult) -> dict[str, Any]:
+        return {}
+
+
 @dataclass
 class DeliveryLedger:
     """Durable, queryable record of every delivery call (spec item 5).
@@ -485,11 +498,17 @@ def build_decision_mcp_server(
     scratch state dir and an injectable deliverer. The one tool,
     ``decision_deliver(line, decision, reason)``, is the synchronous delivery
     contract described in the module docstring.
+
+    Health-isolation rule (2026-09-02): the ledger is **never** silently
+    defaulted to ``DEFAULT_STATE_DIR``. A server built without an explicit
+    ledger uses a no-op ledger, so no test/acceptance run can append to the
+    production ledger; only ``serve()`` (which always passes a real
+    :class:`DeliveryLedger`) writes production files.
     """
     from fastmcp import FastMCP
     from fastmcp.exceptions import ToolError
 
-    ledger = ledger if ledger is not None else DeliveryLedger()
+    ledger = ledger if ledger is not None else _NullLedger()
     deliverer = deliver or (
         lambda line, decision, reason: deliver_decision(
             line=line,

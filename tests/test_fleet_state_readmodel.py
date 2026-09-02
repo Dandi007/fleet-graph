@@ -48,6 +48,8 @@ LINE_OBJ_FIELDS = {
     "terminal",
     "parked",
     "wake_facts",
+    "run_id",
+    "wake_facts_stale",
     "release_id",
 }
 
@@ -68,12 +70,13 @@ def write_heartbeat(
     phase: str,
     updated_at: str,
     release_id: str | None = None,
+    run_id: str | None = None,
 ) -> None:
     (run_root / folder_id).mkdir(parents=True, exist_ok=True)
     (run_root / folder_id / "heartbeat.json").write_text(
         json.dumps(
             {
-                "run_id": f"run-{folder_id}",
+                "run_id": run_id or f"run-{folder_id}",
                 "folder_id": folder_id,
                 "round": round_no,
                 "phase": phase,
@@ -96,10 +99,11 @@ def write_terminal(
     terminal: str,
     waiting_on: str | None = None,
     reason: str | None = None,
+    run_id: str | None = None,
 ) -> None:
     (run_root / folder_id).mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
-        "run_id": f"run-{folder_id}",
+        "run_id": run_id or f"run-{folder_id}",
         "folder_id": folder_id,
         "terminal": terminal,
         "pump_fault": False,
@@ -272,6 +276,71 @@ class TestLinesView:
         payload = FleetStateView(make_config(synthetic)).lines()
         for line in payload["lines"]:
             assert line["generation"] == 2  # roster generation
+
+    def test_matching_run_id_wake_facts_belong_to_the_live_run(
+        self, synthetic: dict[str, Any]
+    ) -> None:
+        """阳性判据（spec §4.2）：terminal.json.run_id == heartbeat.run_id 时，
+        该行照常 parked=true 且 wake_facts 属活 run，wake_facts_stale=false。"""
+        payload = FleetStateView(make_config(synthetic)).lines()
+        by_id = {line["folder_id"]: line for line in payload["lines"]}
+        line = by_id["wf-000001"]
+        assert line["run_id"] == "run-wf-000001"
+        assert line["wake_facts_stale"] is False
+        assert line["parked"] is True
+        assert line["wake_facts"]["run_id"] == "run-wf-000001"
+
+    def test_stale_run_declaration_is_flagged_not_presented_as_current(
+        self, synthetic: dict[str, Any]
+    ) -> None:
+        """阴性判据（spec §4.1）：线在 run A 声明驻停、run B（新 run_id）起来推进后，
+        /v1/lines 不得再把该行呈现为「当前驻停中且不可分辨」——wake_facts_stale=true，
+        顶层 run_id 暴露活 run B，声明 run（wake_facts.run_id）与活 run 机械可判。"""
+        run_root = synthetic["run_root"]
+        write_heartbeat(
+            run_root,
+            "wf-000001",
+            round_no=8,
+            phase="coordinator",
+            updated_at=iso(1_787_000_200.0),
+            run_id="run-B",
+        )
+        write_terminal(
+            run_root,
+            "wf-000001",
+            terminal="blocked",
+            waiting_on="decision",
+            reason="stale reason from run A",
+            run_id="run-A",
+        )
+        payload = FleetStateView(make_config(synthetic)).lines()
+        by_id = {line["folder_id"]: line for line in payload["lines"]}
+        line = by_id["wf-000001"]
+        assert line["wake_facts_stale"] is True
+        assert line["run_id"] == "run-B"
+        assert line["wake_facts"]["run_id"] == "run-A"
+
+    def test_stale_terminal_without_live_run_is_flagged(self, synthetic: dict[str, Any]) -> None:
+        """terminal 声明存在但活 heartbeat 缺失/不可比 → 声明 run 无法归于任何活 run，
+        同样按过期声明标记（方向 b：保留历史声明，wake_facts_stale=true）。"""
+        run_root = synthetic["run_root"]
+        (run_root / "wf-000001" / "heartbeat.json").unlink()
+        payload = FleetStateView(make_config(synthetic)).lines()
+        by_id = {line["folder_id"]: line for line in payload["lines"]}
+        line = by_id["wf-000001"]
+        assert line["wake_facts_stale"] is True
+        assert line["run_id"] is None
+
+    def test_no_terminal_has_no_stale_flag(self, synthetic: dict[str, Any]) -> None:
+        """没有 terminal 声明就没有「过期声明」可言：wf-000002 heartbeat 在但未声明
+        驻停，wake_facts_stale=false（parked=false 时消费者无歧义）。"""
+        run_root = synthetic["run_root"]
+        (run_root / "wf-000002" / "terminal.json").unlink()
+        payload = FleetStateView(make_config(synthetic)).lines()
+        by_id = {line["folder_id"]: line for line in payload["lines"]}
+        line = by_id["wf-000002"]
+        assert line["wake_facts_stale"] is False
+        assert line["run_id"] == "run-wf-000002"
 
     def test_release_id_is_read_from_the_persisted_heartbeat(
         self, synthetic: dict[str, Any]
