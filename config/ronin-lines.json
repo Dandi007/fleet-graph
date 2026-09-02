@@ -72,7 +72,8 @@
       "seat": "opencode-dsv4pro",
       "max_rounds": 9999,
       "alias": "ronin-dr-v4",
-      "enabled": true,
+      "enabled": false,
+      "_retirement": "2026-09-02 08:0x 闭卷审计判定不复活（监督面）：deep-research V4 线。三条独立证据——① R8 判据脚本 check_research_coldstart.py 原样重跑 pass=true（五件套全绿：exact/fresh、coverage 213 可重放、report 18613 字节、anchor 0.9383 ≥ 0.90、cold_read PASS 76 锚点）；② 产物真进 main（28 个 research 文件含该判据脚本本身，current 与 main HEAD 同为 14938bfd2305）；③ 其派出 7 张 complete 单产物均已在 main。审计陷阱记录在其 goal：goal 转写的题目引号与真实 argv 不同（『』vs「」）会致假红；该脚本 pass=false 时仍 exit 0。",
       "_provenance": "2026-08-30 23:4x 第七波入编（用户拍板 B：deep-research 重档放弃续修 loop-engine，在 fleet-graph research_pipeline 上彻底重构；用户硬约束：R1-R8 严格按依赖序全做，改序/跳项属 B 类升报 user-only）。诊断 wf-b9be03；判据 SSoT wf-3f87f3/constitution.md；方向权 vault-ee session，gate/收割 cc-supervisor。",
       "generation": 2,
       "_generation_note": "2026-08-31 00:0x 监督面抬代破崩溃循环：g1 崩于 started.v2 幂等 409（resume 复用 run_id），未写 terminal 致计数不推进、scheduler 永久 resume 废线程。roster 抬 generation=2 走 generation_of 的 max() 立即生效。根修（lifecycle 幂等容忍/attempt 维幂等键 + 无 terminal 崩溃的计数推进）已立案 wf-216dc3。"
@@ -189,7 +190,8 @@
       "seat": "opencode-dsv4pro",
       "max_rounds": 9999,
       "alias": "ronin-e6560a",
-      "enabled": true,
+      "enabled": false,
+      "_retirement": "2026-09-02 09:2x 闭卷审计判定不复活（监督面）：Claude Code 会话检索 MCP 线。实质面全部成立——① 监督面在生产 checkout 亲跑 bash scripts/acceptance.sh 回显「ACCEPTANCE: PASS（M1+M2+M3+载体验收）」exit 0；② main bc6dfff 上产物与放闸时 dd 工作树逐字节相同（sha256 比对 scripts/reconcile_counts.py 与 tests/test_reconcile_counts.py），无协议目录夹带；③ 退役按职责切分批准后，其 M3 DoD 第四条已按范围逐字重述（仅 claude-code 人类会话检索职责迁移，session-engine 整体不退役、三个 runtime 路由原样保留、不停服务）。已记过程瑕疵：收线未挂交付清单 evidence note（板上三条均为监督守护自动审计回执），实质面无缺故不复活，但不作为先例。遗留监督面动作：用户级 CLAUDE.md 路由文案改动。",
       "_provenance": "2026-09-01 第十一波入编（用户令『两条都入编，别 hold』）：agent-session-mcp —— Claude Code 会话检索 MCP。M1 由 dd 单 dev-fg-67bf15e27dd2 实现中，本线接手 M2/M3。入编时 scripts/acceptance.sh 存在且诚实报红（M2/M3 未实现，逐条打印 FAIL）——这是判据存在的正确形态。遗留待修：该脚本打印 ACCEPTANCE: FAIL 却 exit 0，验收必须用退出码说话，本线首轮修。goal SSoT：wf-e6560a。"
     },
     {
