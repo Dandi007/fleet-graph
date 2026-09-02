@@ -109,6 +109,11 @@ _EMPTY_PARK_FIELDS: dict[str, Any] = {
     "parked_at": None,
     "parked_goal_revision": None,
     "parked_inbox_available": None,
+    #: 4th wake fact: the instant the decision bridge consumed a decision for a
+    #: dd development this line dispatched (``dispatched_by == folder_id``).
+    #: The scheduler reads it as a wake fact and, when a line stays parked past
+    #: the stall threshold, as a red signal with the line id and wait duration.
+    "dispatched_decision_consumed_at": None,
 }
 
 

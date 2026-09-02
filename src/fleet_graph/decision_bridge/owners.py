@@ -58,6 +58,11 @@ class OwnerTarget:
     question_note_id: str
     card_entity_id: str
     state: str
+    #: The bounded principal (a line folder or a human subject) that dispatched
+    #: this owner. Carried on dd targets so a consumed dd decision can wake the
+    #: parked line that dispatched it (the 4th wake fact); empty means no
+    #: dispatch provenance was recorded.
+    dispatched_by: str = ""
 
 
 @dataclass(frozen=True)
@@ -130,9 +135,29 @@ class DdOwnerSource:
                     question_note_id=question_note_id,
                     card_entity_id=card_entity_id,
                     state=str(row.get("state") or ""),
+                    #: The bounded principal that dispatched this development
+                    #: (a line folder or a human subject), from the authoritative
+                    #: status row -- the same fact the gate holds. Carried so a
+                    #: consumed decision can wake the parked line that dispatched
+                    #: this dd single (the 4th wake fact).
+                    dispatched_by=str(row.get("dispatched_by") or ""),
                 )
             )
         return targets
+
+    def dispatched_by(self, development_id: str) -> str:
+        """The development's `dispatched_by` provenance, straight from the
+        admission record. Empty when absent. A cheap read (one file), so the
+        bridge can attribute a consumed decision to the line that dispatched it
+        even on the replay path, where the reconstructed target carries no
+        provenance.
+        """
+        record_path = self.dd_root / development_id / "record.json"
+        try:
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ""
+        return str(record.get("dispatched_by") or "")
 
     def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
         from fleet_graph.dd.control_plane import ControlPlaneError
