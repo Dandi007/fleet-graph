@@ -3,8 +3,9 @@
 # verify-mcp-only.sh — 全舰入口收敛到 MCP 的验收入口（wf-525fd4 首轮脚手架）。
 #
 # 本脚本逐条探测 M0/M1/M2(a)/M2(b)/M3/M4 的双向判据（阳性 + 阴性），判据文本
-# 与 goal.md 逐字对齐。当前 M0–M4 均未交付，因此每条判据都应给出未满足的
-# 具体证据并计红；退出码 = 红色判据的条数（全绿时才为 0）。
+# 与 goal.md 逐字对齐。M4 判定口已复用 fleet_graph.mcp_availability 落地（能绿、
+# 能红）；未交付的判据逐条给出未满足的具体证据并计红；退出码 = 红色判据的条数
+# （全绿时才为 0）。
 #
 # 探测纪律：真的去探（MCP tools/list / 端点 / 源码），不硬编码红绿；探不到
 # 时如实报「不可判定」并计红，同时给出为什么不可判定的证据。文件不存在只能
@@ -20,9 +21,12 @@ cd "$REPO_ROOT" || exit 2
 TMP_OUT="$(mktemp)"
 trap 'rm -f "$TMP_OUT"' EXIT
 
-# 所有探测由内嵌 python 完成（python3 是本机通用命令），结果以统一行格式
+# 所有探测由内嵌 python 完成，结果以统一行格式
 # 输出：id|side|status|desc|evidence；最后一行 exit_code=<红色判据条数>。
-python3 - "$REPO_ROOT" >"$TMP_OUT" <<'PY'
+# M4 段复用 fleet_graph.mcp_availability 判定口（FastMcpSurface 依赖 fastmcp，
+# 由项目 venv 经 `uv sync --frozen` 提供），故用 `uv run python` 承载内嵌探测；
+# 其余 M0-M3 段为纯标准库（json/os/urllib），解释器切换不影响其语义。
+uv run python - "$REPO_ROOT" >"$TMP_OUT" <<'PY'
 import json
 import os
 import sys
@@ -30,6 +34,15 @@ import urllib.error
 import urllib.request
 
 REPO_ROOT = sys.argv[1]
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+
+from fleet_graph.mcp_availability import (
+    PROBE_NOT_SUPPORTED,
+    STATUS_AVAILABLE,
+    STATUS_UNAVAILABLE,
+    FastMcpSurface,
+    judge_mcp_availability,
+)
 
 CRITERIA = []
 
@@ -385,60 +398,80 @@ else:
 
 # ---------------- M4 ----------------
 # M4 阳性：把某 MCP 面的上游指向不存在地址 → 必须告警。
-# 判定口归属可观测线 wf-6475fd，本线给出「MCP 面怎么算可用」的判定口。探测：
-# 仓库中是否存在把上游不可达映射为告警的判定机制。
-grep_paths = [os.path.join(REPO_ROOT, "src"), os.path.join(REPO_ROOT, "config")]
-availability_hits = []
-for root_dir in grep_paths:
-    if not os.path.isdir(root_dir):
-        continue
-    for dirpath, _dirnames, filenames in os.walk(root_dir):
-        for fname in filenames:
-            if not fname.endswith((".py", ".json", ".sh", ".yaml", ".yml")):
-                continue
-            path = os.path.join(dirpath, fname)
-            try:
-                with open(path, encoding="utf-8", errors="replace") as fh:
-                    content = fh.read()
-            except Exception:
-                continue
-            if ("tools/list" in content or "tools_list" in content) and any(
-                k in content for k in ("可用", "availability", "up == 0", "告警")
-            ):
-                availability_hits.append(os.path.relpath(path, REPO_ROOT))
-if availability_hits:
+# M4 阴性：面正常时不得开火；显式 NOT_SUPPORTED 的历史工具不得算失败。
+# 复用 fleet_graph.mcp_availability 判定口（归属可观测线 wf-6475fd；本线只交付
+# 「MCP 面怎么算可用」的判定口 + 结构化结论，不写告警规则、不自造第二份判定口）。
+# 探测：把判定口指向不可达地址 → 必须回 unavailable 且 list_error 非空；指向 live 的
+# dd :5610 → 必须回 available，且 NOT_SUPPORTED 历史工具（development_steer）加入探针时
+# 其拒绝必须被记为 not_supported 而非 error、不得把整体判失败。
+DD_MCP_URL = f"http://127.0.0.1:{DD}/mcp"
+UNREACHABLE_URL = "http://127.0.0.1:1/mcp"
+READ_ONLY_PROBES = ["development_list"]
+NOT_SUPPORTED_TOOL = "development_steer"
+NOT_SUPPORTED_ARGS = {
+    "development_id": "verify-mcp-only-probe",
+    "instruction": "verify-mcp-only-probe",
+    "idempotency_key": "verify-mcp-only-probe",
+    "expected_revision": 0,
+}
+
+
+class DdSteerArgsSurface:
+    """FastMcpSurface adapter that supplies development_steer's required args.
+
+    Without its args fastmcp rejects the call as a missing-argument validation
+    error before the function body runs, so the real NOT_SUPPORTED refusal would
+    never be observed. Supplying them makes the oracle see the actual refusal.
+    """
+
+    def __init__(self, url, timeout):
+        self._inner = FastMcpSurface(url, timeout=timeout)
+
+    def list_tools(self):
+        return self._inner.list_tools()
+
+    def call_tool(self, tool, arguments):
+        if tool == NOT_SUPPORTED_TOOL:
+            arguments = dict(NOT_SUPPORTED_ARGS)
+        return self._inner.call_tool(tool, arguments)
+
+
+# M4 阳性：把判定口指向不存在地址（connection refused），必须回 unavailable 且 list_error 非空。
+positive = judge_mcp_availability(FastMcpSurface(UNREACHABLE_URL, timeout=3), READ_ONLY_PROBES)
+if positive.status == STATUS_UNAVAILABLE and positive.list_error:
     emit("M4", "阳性", "绿",
          "把某 MCP 面的上游指向不存在地址 → 必须告警",
-         f"存在 MCP 面可用性判定机制：{', '.join(sorted(set(availability_hits)))}")
+         f"判定口实测：上游指向 {UNREACHABLE_URL} → status={positive.status}，"
+         f"list_error={positive.list_error!r}（判定口能把不可达上游判为 unavailable，可被告警）")
 else:
     emit("M4", "阳性", "红",
          "把某 MCP 面的上游指向不存在地址 → 必须告警",
-         "仓库中无 MCP 面可用性判定口（src/config 无 tools/list + 只读调用成功的健康判定规则）；把某 MCP 面的上游指向不存在地址不会产生告警——M3 那个 38/59 坏掉却全绿的门面就是证据")
+         f"判定口实测：上游指向 {UNREACHABLE_URL} → status={positive.status}，"
+         f"list_error={positive.list_error!r}（未把不可达上游判为 unavailable，判定口不能红）")
 
-# M4 阴性：面正常时不得开火；显式 NOT_SUPPORTED 的历史工具不得算失败。
-if availability_hits:
-    dd_tools = mcp_tools(DD)
-    not_supported = [
-        t["name"]
-        for t in (dd_tools or [])
-        if "NOT_SUPPORTED" in (t.get("description") or "")
-    ]
-    emit("M4", "阴性", "绿",
-         "面正常时不得开火；显式 NOT_SUPPORTED 的历史工具不得算失败",
-         f"判定口存在且可验证：dd 面 {len(not_supported)} 个显式 NOT_SUPPORTED 工具（{'、'.join(not_supported[:3])}…）被排除不算失败")
-else:
-    dd_tools = mcp_tools(DD)
-    not_supported = [
-        t["name"]
-        for t in (dd_tools or [])
-        if "NOT_SUPPORTED" in (t.get("description") or "")
-    ]
-    suffix = ""
-    if not_supported:
-        suffix = f"；dd 面实测 {len(not_supported)} 个显式 NOT_SUPPORTED 工具（{'、'.join(not_supported[:3])}…）应被排除，但无判定口可验证"
+# M4 阴性：面正常不得开火；显式 NOT_SUPPORTED 的历史工具不得算失败。
+negative = judge_mcp_availability(
+    DdSteerArgsSurface(DD_MCP_URL, 5), READ_ONLY_PROBES + [NOT_SUPPORTED_TOOL]
+)
+if negative.status == STATUS_UNAVAILABLE and negative.list_error and not negative.tools_listed:
     emit("M4", "阴性", "不可判定",
          "面正常时不得开火；显式 NOT_SUPPORTED 的历史工具不得算失败",
-         "无 MCP 面可用性判定口，正常面不误报与 NOT_SUPPORTED 不算失败均无从验证" + suffix)
+         f"dd 面 {DD_MCP_URL} 不可达：{negative.list_error}（判定口无法构造「面正常」前提），不可判定")
+else:
+    steer_probe = next((p for p in negative.probes if p.tool == NOT_SUPPORTED_TOOL), None)
+    steer_not_supported = steer_probe is not None and steer_probe.outcome == PROBE_NOT_SUPPORTED
+    if negative.status == STATUS_AVAILABLE and steer_not_supported:
+        emit("M4", "阴性", "绿",
+             "面正常时不得开火；显式 NOT_SUPPORTED 的历史工具不得算失败",
+             f"判定口实测 dd 面 :{DD}：status={negative.status}，development_list 探针成功；"
+             f"{NOT_SUPPORTED_TOOL} 探针 outcome={steer_probe.outcome}（NOT_SUPPORTED 拒绝计 "
+             f"not_supported，不把整体判失败）")
+    else:
+        detail = steer_probe.outcome if steer_probe else "无探针"
+        emit("M4", "阴性", "红",
+             "面正常时不得开火；显式 NOT_SUPPORTED 的历史工具不得算失败",
+             f"判定口实测 dd 面 :{DD}：status={negative.status}，{NOT_SUPPORTED_TOOL} 探针 "
+             f"outcome={detail}（正常面被误判或 NOT_SUPPORTED 被计失败）")
 
 # ---------------- 汇总 ----------------
 for cid, side, status, desc, evidence in CRITERIA:
