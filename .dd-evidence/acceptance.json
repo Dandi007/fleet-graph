@@ -1,0 +1,49 @@
+{
+ "development_id": "dev-fg-eab4ab9317ed",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "bash",
+    "-c",
+    "! grep -q -- \"--stage-model implement=deepseek-v4-flash\" deploy/systemd/fleet-graph-dd-mcp.service"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "bash",
+    "-c",
+    "grep -q -- \"continuous_review=deepseek-v4-pro\" deploy/systemd/fleet-graph-dd-mcp.service"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "bash",
+    "-c",
+    "grep -q -- \"final_review=deepseek-v4-pro\" deploy/systemd/fleet-graph-dd-mcp.service"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "pytest",
+    "-q",
+    "tests/test_deploy_unit.py"
+   ],
+   "exit_code": 0,
+   "stdout_tail": ".......................................................                  [100%]\n",
+   "stderr_tail": ""
+  }
+ ]
+}
