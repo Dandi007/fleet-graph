@@ -208,6 +208,35 @@ class TestLedgerObservability:
         assert entries[1]["status"] == OUTCOME_REFUSED
         assert entries[1]["code"] == CODE_NO_WAITING_PARTY
 
+    def test_a_delivered_call_persists_outcome_consumed_and_resume_status(
+        self, tmp_path: Path
+    ) -> None:
+        """Positive red/green criterion: a delivered delivery's ledger row
+        carries ``outcome: "consumed"`` plus the target's ``resume_status``."""
+        _stall(tmp_path, "wf-1")
+        ledger = DeliveryLedger(state_dir=tmp_path / "state")
+        result = _call(tmp_path)
+        assert result.status == OUTCOME_DELIVERED
+        ledger.record(result)
+        entry = ledger.entries()[0]
+        assert entry["status"] == OUTCOME_DELIVERED
+        assert entry["outcome"] == "consumed"
+        assert result.target is not None
+        assert entry["resume_status"] == result.target["resume_status"]
+
+    def test_a_refused_call_never_persists_outcome_consumed(self, tmp_path: Path) -> None:
+        """Negative red/green criterion: a refused delivery's ledger row must
+        not fabricate ``outcome: "consumed"``."""
+        ledger = DeliveryLedger(state_dir=tmp_path / "state")
+        refused = _call(tmp_path)
+        assert refused.status == OUTCOME_REFUSED
+        assert refused.code == CODE_LINE_NOT_PARKED
+        ledger.record(refused)
+        entry = ledger.entries()[0]
+        assert entry["status"] == OUTCOME_REFUSED
+        assert entry.get("outcome") != "consumed"
+        assert "outcome" not in entry
+
     def test_metrics_textfile_counts_delivered_and_refused(self, tmp_path: Path) -> None:
         from fleet_graph.cost_obs.exposition import parse
 

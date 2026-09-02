@@ -362,6 +362,12 @@ class DeliveryLedger:
     Prometheus textfile (``decision-delivery.prom``) whose counters make the
     delivered/refused split a scrapeable metric. Writing is atomic (temp +
     rename) so a concurrent scrape never reads a half-written file.
+
+    The persisted entry is field-aligned with
+    :meth:`DeliveryResult.as_dict`: a ``delivered`` call also records
+    ``outcome: "consumed"`` (and ``target.resume_status`` when the target is
+    present), so the delivery -> consumption conclusion is queryable from the
+    ledger; a ``refused`` call never gains an ``outcome: "consumed"`` field.
     """
 
     state_dir: Path = DEFAULT_STATE_DIR
@@ -381,7 +387,7 @@ class DeliveryLedger:
         return self.state_dir / self.metrics_name
 
     def record(self, result: DeliveryResult) -> dict[str, Any]:
-        entry = {
+        entry: dict[str, Any] = {
             "at": _iso(self.clock()),
             "line": result.line,
             "decision": result.decision,
@@ -393,6 +399,10 @@ class DeliveryLedger:
             "question_note_id": result.question_note_id,
             "card_entity_id": result.card_entity_id,
         }
+        if result.status == OUTCOME_DELIVERED:
+            entry["outcome"] = "consumed"
+            if result.target is not None:
+                entry["resume_status"] = result.target.get("resume_status")
         try:
             self.state_dir.mkdir(parents=True, exist_ok=True)
             with self.ledger_path.open("a", encoding="utf-8") as handle:
