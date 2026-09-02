@@ -1,0 +1,18 @@
+{
+ "development_id": "dev-fg-36c2d76baca7",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "bash",
+   "-lc",
+   "uv sync --frozen && uv run pytest -q tests/test_m2_dd_gate_delivery.py"
+  ],
+  [
+   "bash",
+   "-lc",
+   "make verify"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
