@@ -1,0 +1,20 @@
+{
+ "development_id": "dev-fg-3f179c021cc5",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_m2_decision_gaps.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
