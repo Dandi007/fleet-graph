@@ -57,6 +57,8 @@ def fake_ops(
     pull_ok: bool = True,
     pull_head: str = "f" * 40,
     resolve_canonical: Path | None = None,
+    resolve_canonical_unfiltered: Path | None = None,
+    resolve_canonical_unresolvable: bool = False,
     divergence: dict[str, Any] | None = None,
     harvest_tip: str = "b" * 40,
     inflight_binding: dict[str, Any] | None = None,
@@ -112,8 +114,20 @@ def fake_ops(
             allowlist_repo_paths: list[str],
         ) -> tuple[Path | None, str]:
             # 读口：不构成写原语，不入 calls（calls 只记录写/执行动作）。
+            if resolve_canonical_unresolvable:
+                return None, "record repo_path 无法解析到任何白名单 canonical 仓"
             if resolve_canonical is not None:
                 return resolve_canonical, ""
+            return Path(record_repo_path), ""
+
+        def resolve_canonical_repo_unfiltered(
+            self,
+            record_repo_path: str,
+            record_remote_url: str | None,
+        ) -> tuple[Path | None, str]:
+            # 读口：不构成写原语，不入 calls（calls 只记录写/执行动作）。
+            if resolve_canonical_unfiltered is not None:
+                return resolve_canonical_unfiltered, ""
             return Path(record_repo_path), ""
 
         def detect_inflight_binding(
@@ -2853,6 +2867,305 @@ class TestHarvestPrSquashMergeBranchOccupied:
         assert any(argv[:3] == ["gh", "pr", "merge"] for argv in gh_argv), gh_argv
         # push 已执行：origin 上存在 harvest/dev-x ref。
         assert git(repo, "ls-remote", "--heads", "origin", "harvest/dev-x") != ""
+
+
+class TestPerRepoEffectiveValuesInGraph:
+    """案 A 改写任务 1：逐仓生效值——default_branch / deploy_command 取自条目。
+
+    判据两方向可红：
+    ① main 仓条目 default_branch="main" -> 生效 branch 必须是 refs/heads/main
+      （gate 拿它比 allowed_branches 能过）；变异读全局 master -> refs/heads/master
+      不在 allowed_branches 内 -> 拒。
+    ② master 仓（如 fleet-sentinel）行为不得改变：条目未指定 default_branch 时
+      仍取全局；指定 master 时亦 master（既有 master 仓回归零红）。
+    """
+
+    def _allowlist(self, repo_path: str, **entry: Any) -> HarvestAllowlist:
+        base = {"repo_path": repo_path, "allowed_branches": ["refs/heads/main"]}
+        base.update(entry)
+        return parse_harvest_allowlist({"entries": [base]})
+
+    def test_entry_default_branch_main_wins_over_global_master(self, tmp_path: Path) -> None:
+        """判据①：条目 default_branch="main" -> 生效 main；全局 master 被条目覆盖。"""
+        repo = repo_path_for(tmp_path)
+        allowlist = self._allowlist(repo, default_branch="main")
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, allowlist=allowlist, ops=fake, bus=FakeBus())
+        config.default_branch = "master"
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["default_branch"] == "main"
+        # gate 用生效 branch refs/heads/main 比 allowed_branches -> 过；pr_merge
+        # 收到的 default_branch 也必须是条目生效值。
+        assert fake["pr_merge_args"][0]["default_branch"] == "main"
+
+    def test_entry_without_default_branch_uses_global_master(self, tmp_path: Path) -> None:
+        """判据②（master 仓回归零红）：条目未指定 default_branch -> 仍取全局 master。"""
+        repo = repo_path_for(tmp_path)
+        allowlist = self._allowlist(repo, allowed_branches=["refs/heads/master"])
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, allowlist=allowlist, ops=fake, bus=FakeBus())
+        config.default_branch = "master"
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["default_branch"] == "master"
+
+    def test_entry_default_branch_master_keeps_master(self, tmp_path: Path) -> None:
+        """判据②：条目 default_branch="master" + 全局 main -> 生效仍 master。"""
+        repo = repo_path_for(tmp_path)
+        allowlist = self._allowlist(
+            repo, allowed_branches=["refs/heads/master"], default_branch="master"
+        )
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, allowlist=allowlist, ops=fake, bus=FakeBus())
+        config.default_branch = "main"
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["default_branch"] == "master"
+
+    def test_entry_default_branch_outside_allowed_refuses(self, tmp_path: Path) -> None:
+        """阴性：条目 default_branch 不在 allowed_branches 内 -> gate 拒（refused）。"""
+        repo = repo_path_for(tmp_path)
+        allowlist = self._allowlist(repo, default_branch="master")
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, allowlist=allowlist, ops=fake)
+        config.default_branch = "main"
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_REFUSED
+        assert fake["calls"] == []
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["allowlist_auth"]["granted"] is False
+        assert any("分支/ref" in r for r in receipt["allowlist_auth"]["reasons"])
+
+
+class TestMergeOnlyEntry:
+    """案 A 改写任务 2：只授合并权入围形态（allowed_deploy=[]）。
+
+    判据（两方向可红）：
+    - 阳性：allowed_deploy: [] 的仓 -> 收割走到 harvested，deploy_exit_code==0，
+      deploy 是合法 no-op（不当作未执行写步骤误报，postconditions 不判红）。
+    - 反向：条目声明（生效）部署命令而该命令不在 allowed_deploy 白名单内
+      （声明与白名单不符）-> gate 拒（granted=false + 机器可读 reasons），
+      整单不得往前走。
+    """
+
+    def test_merge_only_entry_harvests_with_noop_deploy(self, tmp_path: Path) -> None:
+        repo = repo_path_for(tmp_path)
+        allowlist = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": repo,
+                        "allowed_branches": ["refs/heads/main"],
+                        "allowed_deploy": [],
+                    }
+                ]
+            }
+        )
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, allowlist=allowlist, ops=fake, bus=FakeBus())
+        config.deploy_command = ["make", "deploy"]
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        # deploy 是合法 no-op：ops.deploy 从未被调用。
+        assert "deploy" not in fake["calls"], fake["calls"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["deploy_exit_code"] == 0
+        deploy_step = next(s for s in receipt["steps"] if s["step"] == "deploy")
+        assert deploy_step["command"] == []
+        # postconditions 不判红：收割走到 harvested（deploy 不是未执行写步骤误报）。
+        post = next(s for s in receipt["steps"] if s["step"] == "postconditions")
+        assert post["ok"] is True
+
+    def test_merge_only_entry_ignores_global_deploy_command(self, tmp_path: Path) -> None:
+        """生效 deploy 命令取自条目而非全局：全局 deploy_command 非空也不生效。"""
+        repo = repo_path_for(tmp_path)
+        allowlist = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": repo,
+                        "allowed_branches": ["refs/heads/main"],
+                        "allowed_deploy": [],
+                    }
+                ]
+            }
+        )
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, allowlist=allowlist, ops=fake, bus=FakeBus())
+        config.deploy_command = ["bash", "scripts/deploy.sh"]
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert "deploy" not in fake["calls"], fake["calls"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["deploy_exit_code"] == 0
+
+    def test_declared_deploy_not_in_whitelist_refuses(self, tmp_path: Path) -> None:
+        """反向判据：条目声明 deploy_command 不在 allowed_deploy 白名单 -> gate 拒。"""
+        repo = repo_path_for(tmp_path)
+        allowlist = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": repo,
+                        "allowed_branches": ["refs/heads/main"],
+                        "allowed_deploy": [["make", "deploy"]],
+                        "deploy_command": ["bash", "scripts/deploy.sh"],
+                    }
+                ]
+            }
+        )
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, allowlist=allowlist, ops=fake)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_REFUSED
+        assert fake["calls"] == []
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["allowlist_auth"]["granted"] is False
+        assert any("部署命令" in r for r in receipt["allowlist_auth"]["reasons"])
+        # 整单不得往前走：写步骤零调用。
+        assert not any(
+            c in ("pr_squash_merge", "ff_only_pull", "deploy", "verify_real") for c in fake["calls"]
+        )
+
+    def test_declared_deploy_in_whitelist_harvests(self, tmp_path: Path) -> None:
+        """正向：条目声明 deploy_command 在 allowed_deploy 白名单内 -> 生效并收割。"""
+        repo = repo_path_for(tmp_path)
+        allowlist = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": repo,
+                        "allowed_branches": ["refs/heads/main"],
+                        "allowed_deploy": [["make", "deploy"]],
+                        "deploy_command": ["make", "deploy"],
+                    }
+                ]
+            }
+        )
+        fake = fake_ops(deploy_exit=0)
+        config, _ = config_for(tmp_path, allowlist=allowlist, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert "deploy" in fake["calls"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["deploy_exit_code"] == 0
+
+
+class TestDryRunResolveWithoutAuthorize:
+    """案 A 改写任务 3：dry-run——解析但不授权，先观测后授权。
+
+    判据（可红）：不在 allowlist 的仓 -> 报告如实记录「would-resolve canonical /
+    would-do write steps」且 writes_skipped 覆盖全部写步、真机零写；变异——
+    dry-run 路径真实执行任一写原语或漏记 writes_skipped -> 必须有用例变红。
+    """
+
+    def test_repo_not_in_allowlist_records_would_resolve_and_zero_writes(
+        self, tmp_path: Path
+    ) -> None:
+        repo = repo_path_for(tmp_path, "repos/other")
+        other = repo_path_for(tmp_path, "repos/fleet-graph")
+        fake = fake_ops()
+        allowlist = full_allowlist(other)
+        config, _ = config_for(tmp_path, allowlist=allowlist, repo_path=repo, ops=fake)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_REFUSED
+        # 真机零写：写原语零调用。
+        assert fake["calls"] == []
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["would_resolve_canonical"] == repo
+        assert receipt["would_do"] == list(WRITE_STEPS)
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+        # 写步骤本身不进回执（没执行）。
+        assert not any(
+            s.get("step") in ("worktree_cherry_pick", "pr_squash_merge", "ff_only_pull", "deploy")
+            for s in receipt["steps"]
+        )
+
+    def test_unresolvable_to_allowlist_records_would_resolve_via_unfiltered(
+        self, tmp_path: Path
+    ) -> None:
+        """解析不到 allowlist canonical 时，unfiltered 归属解析留痕 would-resolve。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        worktree = tmp_path / "linked-wt"
+        git(canonical, "worktree", "add", "--detach", str(worktree), "main")
+        allowlist = _canonical_allowlist(tmp_path / "other")
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, allowlist=allowlist, repo_path=str(worktree), ops=fake)
+        config.ops = DefaultHarvestOps()
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert fake["calls"] == []
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["would_resolve_canonical"] == str(canonical)
+        assert receipt["would_do"] == list(WRITE_STEPS)
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+
+    def test_fake_ops_would_resolve_from_configured_canonical(self, tmp_path: Path) -> None:
+        """fake ops 脚本化 unfiltered canonical -> 报告记录 would-resolve（可红变异）。"""
+        repo = repo_path_for(tmp_path, "repos/other")
+        other = repo_path_for(tmp_path, "repos/fleet-graph")
+        canonical = tmp_path / "canonical-repo"
+        fake = fake_ops(
+            resolve_canonical_unfiltered=canonical,
+        )
+        allowlist = full_allowlist(other)
+        config, _ = config_for(tmp_path, allowlist=allowlist, repo_path=repo, ops=fake)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_REFUSED
+        assert fake["calls"] == []
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["would_resolve_canonical"] == str(canonical)
+        assert receipt["would_do"] == list(WRITE_STEPS)
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+
+
+class TestVerifyPreWriteGateContract:
+    """案 A 改写任务 4：可解析 verify 是写前闸——解析失败必须 escalate 早退。
+
+    判据（可红）：变异——让 verify 解析失败时继续往下走（越过 escalate 放行
+    后续写节点）-> 必须有用例变红（断言 escalate 早退 + writes_skipped 全量 +
+    无写发生）。
+    """
+
+    def test_unresolvable_verify_escalates_before_any_write(self, tmp_path: Path) -> None:
+        fake = fake_ops(resolve_verify_argv=(None, "no resolvable verify command"))
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        # escalate 早退：verify 之后任何写节点（pr_merge/pull/deploy/verify_real）
+        # 一律零调用。
+        assert "pr_squash_merge" not in fake["calls"], fake["calls"]
+        assert "ff_only_pull" not in fake["calls"], fake["calls"]
+        assert "deploy" not in fake["calls"], fake["calls"]
+        assert "verify_real" not in fake["calls"], fake["calls"]
+        assert "run_verify" not in fake["calls"], fake["calls"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+        assert not any(
+            s.get("step") in ("pr_squash_merge", "ff_only_pull", "deploy") for s in receipt["steps"]
+        )
+        assert not any(s.get("step") == "pr_squash_merge" for s in receipt["steps"])
+
+    def test_unresolvable_verify_real_escalates_with_detail(self, tmp_path: Path) -> None:
+        fake = fake_ops(
+            resolve_verify_argv_calls=[
+                (["uv", "run", "pytest", "-q"], ""),
+                (None, "no resolvable verify command"),
+            ]
+        )
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), deploy_command=["make", "deploy"])
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        vr = next(s for s in result["steps"] if s["step"] == "verify_real")
+        assert vr["ok"] is False
+        assert vr["detail"] == "no resolvable verify command"
 
 
 class TestHarvestWikiReport:

@@ -364,6 +364,50 @@ def _resolve_canonical_repo(
     return None, f"record repo_path {record_repo_path!r} 无法解析到任何白名单 canonical 仓"
 
 
+def _resolve_canonical_repo_unfiltered(
+    record_repo_path: str,
+    record_remote_url: str | None,
+) -> tuple[Path | None, str]:
+    """dry-run 归属解析：与授权解耦，只解析「本会归属哪个 canonical 仓」。
+
+    任务 3：反应器要在**不授予写权限**的前提下解析出 record 本会归属的
+    canonical 仓并留痕（先观测后授权）。它与 `_resolve_canonical_repo`
+    共用同一套 git 事实链（direct hit / linked worktree common-dir / origin
+    本地路径），但**不做 allowlist 成员判定**——解析到的 canonical 不论是否
+    在白名单都如实返回，授权与否由 gate 另行判定。纯读口，零写原语。
+    """
+    record = Path(record_repo_path)
+    record_resolved = _resolved(record)
+
+    # 1. direct hit：record repo_path 本身是 canonical 主 checkout。
+    if record_resolved.is_dir() and (record_resolved / ".git").is_dir():
+        return record_resolved, ""
+
+    # 2. linked worktree 归属：common-dir 指向 <canonical>/.git。
+    if record_resolved.is_dir():
+        common = run_git(record, "rev-parse", "--git-common-dir")
+        if common.returncode == 0 and common.stdout.strip():
+            common_dir = Path(common.stdout.strip())
+            if not common_dir.is_absolute():
+                common_dir = record / common_dir
+            common_resolved = _resolved(common_dir)
+            if common_resolved.name == ".git" and common_resolved != (record / ".git").resolve():
+                canonical = common_resolved.parent
+                if canonical.is_dir():
+                    return canonical, ""
+
+    # 3. origin 本地路径。
+    origin = record_remote_url
+    if not origin:
+        origin_proc = run_git(record, "remote", "get-url", "origin")
+        if origin_proc.returncode == 0 and origin_proc.stdout.strip():
+            origin = origin_proc.stdout.strip()
+    if origin and Path(origin).is_absolute() and Path(origin).is_dir():
+        return _resolved(Path(origin)), ""
+
+    return None, f"record repo_path {record_repo_path!r} 无法解析到任何 canonical 仓"
+
+
 def _makefile_has_verify_target(worktree: Path) -> bool:
     """机械判定：目标仓根目录 `Makefile` 是否声明 `verify` 目标。
 
@@ -448,6 +492,19 @@ class DefaultHarvestOps:
         静默放行、绝不 fallback 到 record repo_path（worktree 路径）本身去授权。
         """
         return _resolve_canonical_repo(record_repo_path, record_remote_url, allowlist_repo_paths)
+
+    def resolve_canonical_repo_unfiltered(
+        self,
+        record_repo_path: str,
+        record_remote_url: str | None,
+    ) -> tuple[Path | None, str]:
+        """dry-run 归属解析（任务 3）：解析但不授权，只回答「本会归属哪个 canonical」。
+
+        与 `resolve_canonical_repo` 同一 git 事实链，但不做 allowlist 成员判定：
+        不在白名单的仓也能解析出本会归属的 canonical 供报告留痕。纯读口，
+        零写原语；授权与否由编排层 gate 另行判定（生成-验证分离）。
+        """
+        return _resolve_canonical_repo_unfiltered(record_repo_path, record_remote_url)
 
     def fetch_dd_ref(
         self,

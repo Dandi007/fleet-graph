@@ -39,18 +39,31 @@ class HarvestAllowlistError(ValueError):
 
 @dataclass(frozen=True)
 class HarvestAllowlistEntry:
-    """一条可写目标：哪个仓库、哪些分支/ref 前缀、哪些部署命令。"""
+    """一条可写目标：哪个仓库、哪些分支/ref 前缀、哪些部署命令。
+
+    逐仓生效值（案 A 改写任务 1）：可选 `default_branch` 与 `deploy_command`
+    （缺省 None）。命中条目后该单的生效 default_branch / deploy_command 取自
+    条目；条目未指定时退回全局缺省。向后兼容：现有 JSON 条目无这两个字段时
+    按旧全局行为解析（不新增配置面、不改签 allowlist）。
+    """
 
     repo_path: str
     allowed_branches: tuple[str, ...]
     allowed_deploy: tuple[tuple[str, ...], ...]
+    default_branch: str | None = None
+    deploy_command: tuple[str, ...] | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "repo_path": self.repo_path,
             "allowed_branches": list(self.allowed_branches),
             "allowed_deploy": [list(argv) for argv in self.allowed_deploy],
         }
+        if self.default_branch is not None:
+            out["default_branch"] = self.default_branch
+        if self.deploy_command is not None:
+            out["deploy_command"] = list(self.deploy_command)
+        return out
 
 
 @dataclass(frozen=True)
@@ -114,10 +127,33 @@ def _parse_entry(raw: Any) -> HarvestAllowlistEntry:
                 )
             deploy.append(tuple(argv))
 
+    default_branch = raw.get("default_branch")
+    if default_branch is not None and (
+        not isinstance(default_branch, str) or not default_branch.strip()
+    ):
+        raise HarvestAllowlistError(
+            f"{repo_path}: default_branch 必须是非空字符串（缺省 None 走全局）"
+        )
+
+    deploy_command_raw = raw.get("deploy_command")
+    deploy_command: tuple[str, ...] | None = None
+    if deploy_command_raw is not None:
+        if (
+            not isinstance(deploy_command_raw, list)
+            or not deploy_command_raw
+            or not all(isinstance(part, str) and part for part in deploy_command_raw)
+        ):
+            raise HarvestAllowlistError(
+                f"{repo_path}: deploy_command 必须是非空字符串 argv 列表（缺省 None 走全局）"
+            )
+        deploy_command = tuple(deploy_command_raw)
+
     return HarvestAllowlistEntry(
         repo_path=repo_path,
         allowed_branches=tuple(branches),
         allowed_deploy=tuple(deploy),
+        default_branch=default_branch,
+        deploy_command=deploy_command,
     )
 
 
@@ -137,6 +173,33 @@ class HarvestAllowlist:
             if entry.repo_path == repo_path:
                 return entry
         return None
+
+    def effective_default_branch(self, repo_path: str, global_default_branch: str) -> str:
+        """命中条目且条目指定 default_branch -> 取条目值；否则退回全局缺省。"""
+        entry = self.entry_for(repo_path)
+        if entry is not None and entry.default_branch is not None:
+            return entry.default_branch
+        return global_default_branch
+
+    def effective_deploy_command(
+        self, repo_path: str, global_deploy_command: list[str]
+    ) -> list[str]:
+        """命中条目后的生效 deploy 命令（任务 2：只授合并权入围形态）。
+
+        - 条目 `allowed_deploy` 为空（merge-only）-> 生效 deploy 命令恒为空，
+          走 `deploy` 节点既有 no-op 路径（deploy_exit_code == 0）；
+        - 条目声明 `deploy_command` -> 生效命令取条目声明（声明与白名单不符由
+          gate 拒：`authorize` 的 deploy 校验仍按 `allowed_deploy` 精确匹配）；
+        - 条目未声明 -> 退回全局缺省。
+        """
+        entry = self.entry_for(repo_path)
+        if entry is None:
+            return list(global_deploy_command)
+        if not entry.allowed_deploy:
+            return []
+        if entry.deploy_command is not None:
+            return list(entry.deploy_command)
+        return list(global_deploy_command)
 
     def authorize(
         self,

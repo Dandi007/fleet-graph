@@ -130,6 +130,11 @@ class HarvestOps(Protocol):
         record_remote_url: str | None,
         allowlist_repo_paths: list[str],
     ) -> tuple[Path | None, str]: ...
+    def resolve_canonical_repo_unfiltered(
+        self,
+        record_repo_path: str,
+        record_remote_url: str | None,
+    ) -> tuple[Path | None, str]: ...
     def cherry_equivalent(self, repo: Path, head_commit: str, default_branch: str) -> bool: ...
     def worktree_cherry_pick(
         self, repo: Path, head_commit: str, default_branch: str, worktree_root: Path
@@ -180,6 +185,8 @@ class HarvestState(TypedDict, total=False):
     outcome: str
     receipt_path: str
     writes_skipped: list[str]
+    would_resolve_canonical: str
+    would_do: list[str]
     _gaps: list[str]
     wiki: Any
 
@@ -400,14 +407,45 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 canonical=repo,
                 worktree_root=worktree_root,
             )
+        # 案 A 改写任务 1/2：命中条目后，该单生效 default_branch / deploy_command
+        # 取自条目（逐仓生效值）；条目未指定时退回全局缺省；条目 allowed_deploy
+        # 为空（merge-only）时生效 deploy 命令恒为空（走既有 no-op 路径）。
+        repo_path = str(repo) if repo is not None else ""
+        default_branch = deps.allowlist.effective_default_branch(repo_path, deps.default_branch)
+        deploy_command = deps.allowlist.effective_deploy_command(repo_path, deps.deploy_command)
+        # 案 A 改写任务 3（dry-run）：解析但不授权。归属解析与 allowlist 授权
+        # 判定解耦——不在 allowlist 的仓（解析不到 canonical，或解析出但无条目）
+        # 也如实留痕「本会归属哪个 canonical + 本会执行的写步骤」，writes_skipped
+        # 覆盖全部写步骤、真机零写。解析失败/占用继续走既有 escalated/refused。
+        would_resolve_canonical = ""
+        would_do: list[str] | None = None
+        dry_run = repo is None or deps.allowlist.entry_for(repo_path) is None
+        if dry_run:
+            would_do = list(WRITE_STEPS)
+            if repo is not None:
+                would_resolve_canonical = repo_path
+            if record_worktree:
+                try:
+                    dry_canonical, _dry_reason = deps.ops.resolve_canonical_repo_unfiltered(
+                        record_worktree, remote_url or None
+                    )
+                except Exception as exc:
+                    dry_canonical = None
+                    _dry_reason = f"dry-run canonical 解析异常: {repr(exc)[:200]}"
+                if dry_canonical is not None:
+                    would_resolve_canonical = str(dry_canonical)
         intake_facts: dict[str, Any] = {
             "ok": not gaps and occupied is None,
             "development_id": development_id,
             "head_commit": head_commit,
             "stage": stage,
-            "repo_path": str(repo) if repo is not None else "",
+            "repo_path": repo_path,
             "record_worktree": record_worktree,
             "remote_url": remote_url,
+            "default_branch": default_branch,
+            "deploy_command": deploy_command,
+            "would_resolve_canonical": would_resolve_canonical,
+            "would_do": would_do,
         }
         if occupied is not None:
             # H-C：_detect_occupied_tree 返回的 repo_path（本次判定的树的规范化路径）/
@@ -421,15 +459,17 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             "development_id": development_id,
             "head_commit": head_commit,
             "stage": stage,
-            "repo_path": str(repo) if repo is not None else "",
+            "repo_path": repo_path,
             "record_worktree": record_worktree,
             "remote_url": remote_url,
-            "default_branch": deps.default_branch,
-            "deploy_command": list(deps.deploy_command),
+            "default_branch": default_branch,
+            "deploy_command": deploy_command,
+            "would_resolve_canonical": would_resolve_canonical,
+            "would_do": would_do,
             "steps": steps,
             "_gaps": gaps,
             "outcome": outcome,
-            "writes_skipped": list(WRITE_STEPS) if occupied is not None else None,
+            "writes_skipped": list(WRITE_STEPS) if (occupied is not None or dry_run) else None,
         }
 
     def gate(state: HarvestState) -> HarvestState:
@@ -445,6 +485,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "allowlist_auth": auth.as_dict(),
                 "steps": steps,
                 "outcome": OUTCOME_REFUSED,
+                "writes_skipped": list(WRITE_STEPS),
             }
         return {"allowlist_auth": auth.as_dict(), "steps": steps}
 
@@ -946,9 +987,12 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "pr_url": state.get("pr_url"),
                 "verify_exit_code": state.get("verify_exit_code"),
                 "verify_real_exit_code": state.get("verify_real_exit_code"),
+                "deploy_exit_code": state.get("deploy_exit_code"),
                 "evidence_note_id": state.get("evidence_note_id"),
                 "outcome": state.get("outcome"),
                 "writes_skipped": state.get("writes_skipped") or [],
+                "would_resolve_canonical": state.get("would_resolve_canonical") or "",
+                "would_do": state.get("would_do") or [],
             },
         )
         return {"receipt_path": str(path), "steps": state.get("steps") or []}
