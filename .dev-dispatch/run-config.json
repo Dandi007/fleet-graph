@@ -1,0 +1,20 @@
+{
+ "development_id": "dev-fg-805954f50f41",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_m1_line_state_mcp.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
