@@ -872,6 +872,45 @@ class DefaultHarvestOps:
             }
         return {"bound_development_id": None, "in_flight": False, "detail": ""}
 
+    def _branch_occupied_by_worktree(self, repo: Path, branch: str) -> dict[str, Any]:
+        """只读占用检测：`git worktree list --porcelain` 找检出 `branch` 的 worktree。
+
+        返回 `{"occupied": bool, "worktree_paths": list[str], "detail": str}`。
+        命中任一棵 worktree 检出 `refs/heads/<branch>` -> occupied=True +
+        worktree 路径清单。检测失败（无法判定）-> 保守 occupied=True（fail-closed，
+        绝不留占用漏检后继续 `--delete-branch` 撞 `used by worktree` 的半态）。
+
+        **本方法只读**：零 `worktree remove` / `branch -D` / reset / checkout——
+        占用只 report，绝不替人删残留 worktree/分支（spec 铁律）。
+        """
+        proc = run_git(repo, "worktree", "list", "--porcelain")
+        if proc.returncode != 0:
+            return {
+                "occupied": True,
+                "worktree_paths": [],
+                "detail": "无法读取 worktree 列表（占用无法判定，fail-closed）: "
+                + (proc.stderr or proc.stdout).strip()[:400],
+            }
+        target_ref = f"refs/heads/{branch}"
+        occupied_paths: list[str] = []
+        current_path: str | None = None
+        for line in proc.stdout.splitlines():
+            if line.startswith("worktree "):
+                current_path = line[len("worktree ") :].strip()
+            elif line.startswith("branch ") and current_path is not None:
+                ref = line[len("branch ") :].strip()
+                if ref == target_ref:
+                    occupied_paths.append(current_path)
+            elif line == "":
+                current_path = None
+        if occupied_paths:
+            return {
+                "occupied": True,
+                "worktree_paths": occupied_paths,
+                "detail": f"harvest 分支 {branch} 被 worktree 占用: " + "; ".join(occupied_paths),
+            }
+        return {"occupied": False, "worktree_paths": [], "detail": ""}
+
     def pr_squash_merge(
         self,
         repo: Path,
@@ -900,6 +939,22 @@ class DefaultHarvestOps:
             return {"merged": False, "detail": "缺 origin remote——无法 forge PR"}
 
         branch = f"harvest/{development_id}"
+        # M3 分支占用前置检测（只读）：merge 之前先判本地分支是否被任一残留
+        # worktree 检出。命中 -> refuse+escalate，绝不执行 push / gh pr create /
+        # gh pr merge，绝不落「远端已合并却报未合并」的半态；绝不替人删残留。
+        occupancy = self._branch_occupied_by_worktree(repo, branch)
+        if occupancy["occupied"]:
+            occupiers = "; ".join(occupancy["worktree_paths"] or [])
+            return {
+                "merged": False,
+                "refused": True,
+                "escalate": "HARVEST_BRANCH_OCCUPIED",
+                "worktree_paths": occupancy["worktree_paths"],
+                "detail": f"harvest 分支 {branch} 被残留 worktree 检出占用"
+                + (f"（占用者 {occupiers}）" if occupiers else "")
+                + "；绝不执行 gh pr merge / gh pr create，占用只 report 不替人删",
+            }
+
         pushed = run_git(repo, "push", "origin", f"{head_commit}:refs/heads/{branch}")
         if pushed.returncode != 0:
             return {"merged": False, "detail": (pushed.stderr or pushed.stdout).strip()[:400]}
