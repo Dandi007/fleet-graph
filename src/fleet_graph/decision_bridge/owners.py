@@ -92,10 +92,16 @@ class DdOwnerSource:
     board itself and carries no verdict.
     """
 
-    def __init__(self, dd_root: str | Path = "/data/fleet-graph/dd") -> None:
+    def __init__(self, dd_root: str | Path = "/data/fleet-graph/dd", plane: Any = None) -> None:
+        #: An optional pre-built control plane (tests inject one pointed at a
+        #: scratch root with a recording launcher); the default builds a real
+        #: one against ``dd_root``.
         self.dd_root = Path(dd_root)
+        self._plane = plane
 
     def _control_plane(self) -> Any:
+        if self._plane is not None:
+            return self._plane
         from fleet_graph.dd.control_plane import DdControlPlane
 
         return DdControlPlane(root=self.dd_root)
@@ -362,6 +368,23 @@ class LineOwnerSource:
         path = self._stall_path(folder_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(cleared, sort_keys=True), encoding="utf-8")
+
+    def wake(self, folder_id: str) -> bool:
+        """Wake a parked line through its registered control entry.
+
+        Reuses the same stall-state snapshot clear ``_wake`` performs -- the
+        one control entry the scheduler recognises as "no longer parked" -- so
+        a decision delivery that must wake a *different* line (the one that
+        dispatched a dd gate, M2 gap b) does so without inventing a bypass.
+        Returns ``True`` when the line was parked and its parking is now
+        lifted; ``False`` when nothing was parked (a no-op, never a fabricated
+        wake or a second write).
+        """
+        state = self._read_state(folder_id)
+        if not state.get("parked_run_id"):
+            return False
+        self._wake(folder_id, state)
+        return True
 
 
 class CompositeOwnerSource:

@@ -781,6 +781,7 @@ def _decision_serve(args: argparse.Namespace) -> int:
             run_root=args.run_root,
             lines_config=args.lines_config,
             state_dir=args.state_dir,
+            dd_root=args.dd_root,
         )
     except RuntimeError as exc:
         # A startup refusal (port taken, state dir unusable) is a visible
@@ -1819,6 +1820,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="where the delivery ledger and metrics textfile live; defaults to "
         "/data/fleet-graph/decision-mcp (env FLEET_GRAPH_DECISION_MCP_STATE_DIR)",
+    )
+    decision_serve.add_argument(
+        "--dd-root",
+        default=None,
+        help="where the dd developments live (the awaiting_gate records the gate "
+        "delivery resolves server-side); defaults to /data/fleet-graph/dd",
     )
     decision_serve.set_defaults(func=_decision_serve)
 

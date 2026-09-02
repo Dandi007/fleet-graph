@@ -37,6 +37,7 @@ WorkingDirectory=/data/apps/fleet-graph/current
 ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph decision serve \
     --host 127.0.0.1 --port 5614 \
     --lines-config <lines-config> \
+    --dd-root /data/fleet-graph/dd \
     --state-dir /data/fleet-graph/decision-mcp
 Restart=always
 RestartSec=5
