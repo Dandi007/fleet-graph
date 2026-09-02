@@ -37,8 +37,13 @@ EXIT_HEAD_MISMATCH = 3
 #: dd 协议要求工单分支继续提交这些文件，排除只发生在收割侧、按顶层路径精确作用。
 DD_EXCLUDED_PATHS = (".dev-dispatch", ".dd-evidence")
 
-#: 洗树重提交的 commit message。
-DD_WASH_COMMIT_MESSAGE = "harvest: exclude dd protocol subtrees from product tree"
+#: 净产品 diff 的 pathspec。`git diff base..head -- . ':(exclude).dev-dispatch'
+#: ':(exclude).dd-evidence'`——协议子树**只在 diff 计算里排除**，绝不作为
+#: 「exclude 提交」落进产品树（产物本身不动）。
+NET_DIFF_PATHSPECS = (".", *(f":(exclude){p}" for p in DD_EXCLUDED_PATHS))
+
+#: 收割 merge 的 commit message（merge --no-ff 落地 merge commit 的标题）。
+DD_HARVEST_MERGE_MESSAGE = "harvest: merge approved head into product tree"
 
 #: 目标仓 verify 指令解析（交付 A.1）：根目录 Makefile 含 `verify` 目标 -> make verify。
 MAKE_VERIFY_ARGV = ["make", "verify"]
@@ -116,7 +121,12 @@ def _gh_pr_number(pr_url: str) -> str | None:
 
 
 def _commit_env() -> dict[str, str]:
-    """洗树重提交的隔离环境：dd/git.py 守卫环境 + 固定收割身份。"""
+    """收割 merge 的隔离环境：dd/git.py 守卫环境 + 固定收割身份。
+
+    `git merge --no-ff` 落地 merge commit 需要 committer identity；这里提供
+    固定的收割身份与守卫环境，绝不依赖 repo 本地 `user.name`/`user.email`
+    config 的巧合（生产仓可能无全局 identity）。
+    """
     env = git_ops.safe_git_environment()
     env.update(
         {
@@ -129,52 +139,54 @@ def _commit_env() -> dict[str, str]:
     return env
 
 
-def _strip_dd_subtrees(worktree: Path) -> dict[str, Any]:
-    """机械洗树：从 worktree HEAD 剔除 `.dev-dispatch/` 与 `.dd-evidence/` 两棵
-    顶层子树并重提交，返回 `{ok, harvest_tip, detail}`。
+def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> dict[str, Any]:
+    """exact-head 祖先判定（交付 1 机械口）：`git merge-base --is-ancestor
+    <ancestor> <descendant>` 的机械读判。
 
-    按顶层路径精确绑定并剔除（pathspec `:(exclude).dev-dispatch` /
-    `:(exclude).dd-evidence` 的等价机械原语：洗树后重提交），绝不靠全局
-    `.gitignore`。只剔这两棵顶层子树，不动任何产品文件、不动其它点前缀目录。
-    worktree 若无这两棵子树（普通工单 commit），则洗树是 no-op——harvest_tip
-    即 cherry-pick 后原 tip，不叠一层空提交。
+    纯读口，零写原语。返回 `{"ok": bool, "is_ancestor": bool, "detail": str}`：
+    - rc 0 -> is_ancestor True（放行 head 确在待收 head 的祖先链里）；
+    - rc 1 -> is_ancestor False（非祖先 -> 编排层 escalate，绝不收）；
+    - 其它 / 缺参 -> ok:False（无法判定，fail-closed）。
     """
-    removed = run_git(
-        worktree,
-        "rm",
-        "-r",
-        "--ignore-unmatch",
-        "--quiet",
+    if not ancestor or not descendant:
+        return {"ok": False, "is_ancestor": False, "detail": "缺 ancestor/descendant"}
+    proc = run_git(repo, "merge-base", "--is-ancestor", ancestor, descendant)
+    if proc.returncode == 0:
+        return {"ok": True, "is_ancestor": True, "detail": ""}
+    if proc.returncode == 1:
+        return {"ok": True, "is_ancestor": False, "detail": "approved_head 非待收 head 祖先"}
+    return {
+        "ok": False,
+        "is_ancestor": False,
+        "detail": (proc.stderr or proc.stdout).strip()[:400],
+    }
+
+
+def _net_product_files(repo: Path, base: str, head: str) -> dict[str, Any]:
+    """净产品 diff（交付 2/3 机械口）：`git diff --name-only base..head -- .
+    ':(exclude).dev-dispatch' ':(exclude).dd-evidence'` 的机械读算。
+
+    协议子树只在 diff 计算里排除（pathspec），产物本身不动。纯读口，零写原语。
+    返回 `{"ok": bool, "files": list[str], "detail": str}`；ok=False 时 files 恒 []。
+    """
+    if not base or not head:
+        return {"ok": False, "files": [], "detail": "缺 base/head"}
+    proc = run_git(
+        repo,
+        "diff",
+        "--name-only",
+        f"{base}..{head}",
         "--",
-        *DD_EXCLUDED_PATHS,
+        *NET_DIFF_PATHSPECS,
     )
-    if removed.returncode != 0:
+    if proc.returncode != 0:
         return {
             "ok": False,
-            "detail": (removed.stderr or removed.stdout).strip()[:400],
+            "files": [],
+            "detail": (proc.stderr or proc.stdout).strip()[:400],
         }
-    # 仅当确有剔除（index 有变更）才重提交；无变更时 tip 就是当前 HEAD。
-    staged = run_git(worktree, "diff", "--cached", "--quiet")
-    if staged.returncode == 0:
-        tip = run_git(worktree, "rev-parse", "HEAD")
-        if tip.returncode != 0 or not tip.stdout.strip():
-            return {"ok": False, "detail": "洗树后无法解析 tip commit"}
-        return {"ok": True, "harvest_tip": tip.stdout.strip(), "washed": False}
-    if staged.returncode != 1:
-        return {
-            "ok": False,
-            "detail": (staged.stderr or staged.stdout).strip()[:400],
-        }
-    committed = run_git(worktree, "commit", "-q", "-m", DD_WASH_COMMIT_MESSAGE, env=_commit_env())
-    if committed.returncode != 0:
-        return {
-            "ok": False,
-            "detail": (committed.stderr or committed.stdout).strip()[:400],
-        }
-    tip = run_git(worktree, "rev-parse", "HEAD")
-    if tip.returncode != 0 or not tip.stdout.strip():
-        return {"ok": False, "detail": "洗树后无法解析 tip commit"}
-    return {"ok": True, "harvest_tip": tip.stdout.strip(), "washed": True}
+    files = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    return {"ok": True, "files": files, "detail": ""}
 
 
 def _resolved(path: Path) -> Path:
@@ -599,36 +611,30 @@ class DefaultHarvestOps:
         default_branch: str,
         worktree_root: Path,
     ) -> dict[str, Any]:
-        """独立 worktree 上 cherry-pick 产品 commit，并洗掉 dd 协议子树。
+        """独立 worktree 上把放行的 exact head (`approved_head`) **merge** 进默认
+        分支，产出产品树 tip（`harvest_tip`）。
 
-        一次性 detached worktree，冲突即兴消解：先尝试直接 cherry-pick，若因
-        冲突失败则尝试 `-X theirs`（以默认分支为主）重跑；仍失败则如实报告
-        冲突，绝不强行覆盖。
+        采用 **merge 而非 cherry-pick**：`harvest_tip` 必须是 `approved_head`
+        的后代（回执三头对账判据③——「harvested_head 必须是 approved_head 的
+        后代」），cherry-pick 会打断祖先后代关系、还诱使「exclude 提交」重提
+        （本次事故的两次根因都起于洗树/cherry）。`git merge --no-ff -X theirs`
+        直接把 `approved_head` 合进默认分支 tip：fast-forward 可能时也强制生成
+        merge commit（父系含 approved_head），纯内容冲突时 `-X theirs` 以放行
+        head 为主自动收口。modify/delete 类冲突 `-X theirs` 收不了口 -> 如实
+        ok:false + conflicts:true，就地清理 worktree，绝不强行覆盖。
 
-        **H6 清场协议（冲突重试路径）**：首次 cherry-pick 因冲突返回非零时，
-        worktree 索引会残留 unmerged files（MERGING 态）；若不清场直接重试
-        `-X theirs`，git 恒报 `Cherry-picking is not possible because you
-        have unmerged files`——与「首败是否真冲突可解」无关。因此重试前必须先
-        `git cherry-pick --abort`；abort 非零则兜底 `git reset --merge` 把索引
-        从 MERGING 态恢复干净；清场仍失败则如实返回 ok:false + 机器可读 detail，
-        绝不带病继续（不 reset --hard、不动生产主 checkout）。
-
-        cherry-pick 成功后在**同一 worktree** 上做同样的剔除并提交（交付 A.4）：
-        按顶层路径剔除 `.dev-dispatch/` 与 `.dd-evidence/` 两棵子树，返回干净
-        产品树 tip（`harvest_tip`）——保证随后的 `run_verify` 也跑在干净产品树。
+        **不再落「exclude 提交」**：协议子树（`.dev-dispatch` / `.dd-evidence`）
+        只在净 diff 计算里排除（`_net_product_files` 的 `:(exclude)` pathspec），
+        产物本身不动、不另叠 exclude commit。
 
         **worktree 生命周期（rc-702098ab 回归）**：成功路径保留 worktree，供
-        下一步 `run_verify` 在真实目录上跑全量套件（若 here 提前删除目录，
-        subprocess 必然 FileNotFoundError -> 127，verify 永远不能 0 退出）；
-        移除由编排层在 verify 之后的 `cleanup_worktree` 步骤调用
-        `remove_worktree` 统一负责。失败/冲突路径无可验证内容，在此立即清理，
-        不留给编排层。
+        下一步 `run_verify` 在真实目录上跑全量套件；移除由编排层在 verify 之后
+        的 `cleanup_worktree` 步骤调用 `remove_worktree` 统一负责。失败/冲突路径
+        无可验证内容，在此立即清理，不留给编排层。
 
         **前置清树护栏（交付 A/B）**：清树走统一护栏 `_preclean_worktree`——
-        仅当目标确认为 linked worktree（`.git` 是 gitfile）才允许 rmtree；目标是
-        主 worktree（`.git` 是目录，即生产主 checkout）-> 拒绝并返回 `ok:false`
-        + 机器可读 detail，绝不 `rmtree` / 切分支。清树后跑后置校验
-        （`_assert_repo_valid`，交付 C）确认主仓仍有效 git。
+        仅当目标确认为 linked worktree 才允许 rmtree；目标是主 worktree -> 拒绝
+        + 机器可读 detail，绝不 `rmtree` / 切分支。
         """
         preclean = _preclean_worktree(repo, worktree_root)
         if not preclean.get("ok"):
@@ -644,66 +650,29 @@ class DefaultHarvestOps:
                 "ok": False,
                 "detail": (added.stderr or added.stdout).strip()[:400],
             }
-        picked = run_git(worktree_root, "cherry-pick", head_commit, env=_commit_env())
-        if picked.returncode == 0:
-            washed = _strip_dd_subtrees(worktree_root)
-            if not washed.get("ok"):
-                self.remove_worktree(repo, worktree_root)
-                return washed
-            return {
-                "ok": True,
-                "method": "cherry-pick",
-                "harvest_tip": washed["harvest_tip"],
-                "washed": washed["washed"],
-            }
-        if (
-            picked.returncode != 0
-            and b"conflict" not in (picked.stderr + picked.stdout).encode("utf-8").lower()
-        ):
+        merged = run_git(
+            worktree_root,
+            "merge",
+            "--no-ff",
+            "-X",
+            "theirs",
+            "-m",
+            DD_HARVEST_MERGE_MESSAGE,
+            head_commit,
+            env=_commit_env(),
+        )
+        if merged.returncode != 0:
             self.remove_worktree(repo, worktree_root)
             return {
                 "ok": False,
-                "detail": (picked.stderr or picked.stdout).strip()[:400],
+                "conflicts": True,
+                "detail": (merged.stderr or merged.stdout).strip()[:400],
             }
-        # H6：冲突重试路径必须先在原 worktree 上清场（abort / reset --merge），
-        # 否则首败残留的 unmerged files 会让 -X theirs 重试恒报
-        # "Cherry-picking is not possible because you have unmerged files"。
-        # 清场失败则如实 ok:false + 机器可读 detail，绝不带病继续。
-        aborted = run_git(worktree_root, "cherry-pick", "--abort")
-        if aborted.returncode != 0:
-            reset_merged = run_git(worktree_root, "reset", "--merge")
-            if reset_merged.returncode != 0:
-                self.remove_worktree(repo, worktree_root)
-                return {
-                    "ok": False,
-                    "conflicts": True,
-                    "detail": (
-                        "冲突清场失败（cherry-pick --abort 与 git reset --merge 均非零）: "
-                        + (aborted.stderr or aborted.stdout).strip()[:200]
-                        + " / "
-                        + (reset_merged.stderr or reset_merged.stdout).strip()[:200]
-                    ),
-                }
-        retried = run_git(
-            worktree_root, "cherry-pick", "-X", "theirs", head_commit, env=_commit_env()
-        )
-        if retried.returncode == 0:
-            washed = _strip_dd_subtrees(worktree_root)
-            if not washed.get("ok"):
-                self.remove_worktree(repo, worktree_root)
-                return washed
-            return {
-                "ok": True,
-                "method": "cherry-pick -X theirs",
-                "harvest_tip": washed["harvest_tip"],
-                "washed": washed["washed"],
-            }
-        self.remove_worktree(repo, worktree_root)
-        return {
-            "ok": False,
-            "conflicts": True,
-            "detail": (retried.stderr or retried.stdout).strip()[:400],
-        }
+        tip = run_git(worktree_root, "rev-parse", "HEAD")
+        if tip.returncode != 0 or not tip.stdout.strip():
+            self.remove_worktree(repo, worktree_root)
+            return {"ok": False, "detail": "merge 后无法解析 tip commit"}
+        return {"ok": True, "method": "merge", "harvest_tip": tip.stdout.strip()}
 
     def build_harvest_tip(
         self,
@@ -712,17 +681,16 @@ class DefaultHarvestOps:
         default_branch: str,
         worktree_root: Path,
     ) -> dict[str, Any]:
-        """机械写口：从产品 commit 派生一棵「去 dd 协议子树」的干净产品树。
+        """机械写口：从放行 head 派生产品树 tip（交付 A.3，不做 allowlist 判定——
+        判定在编排层 gate）。
 
-        只做机械事：读 `head_commit`、洗树、产出 tip（交付 A.3，不做 allowlist
-        判定——判定在编排层 gate）。在一次性 worktree 上 cherry-pick 后用
-        `_strip_dd_subtrees` 剔除 `.dev-dispatch/` / `.dd-evidence/` 两棵顶层
-        子树并重提交，返回 `{ok, harvest_tip, detail}`。worktree 用后即清，
-        不保留（此口不承担 verify 职责）。
+        与 `worktree_cherry_pick` 同用 merge 语义（`approved_head` 是 `harvest_tip`
+        后代，不再落 exclude 提交）。在一次性 worktree 上 merge 后即返回 tip，
+        worktree 用后即清，不保留（此口不承担 verify 职责）。
 
-        **前置清树护栏（交付 A/B）**：与 `worktree_cherry_pick` 同走
-        `_preclean_worktree`——仅 linked worktree 允许清树，主 worktree /
-        未知目标拒绝并返回 `ok:false` + 机器可读 detail，绝不 `rmtree`。
+        **前置清树护栏（交付 A/B）**：同走 `_preclean_worktree`——仅 linked
+        worktree 允许清树，主 worktree / 未知目标拒绝并返回 `ok:false` + 机器
+        可读 detail，绝不 `rmtree`。
         """
         preclean = _preclean_worktree(repo, worktree_root)
         if not preclean.get("ok"):
@@ -739,23 +707,28 @@ class DefaultHarvestOps:
                 "ok": False,
                 "detail": (added.stderr or added.stdout).strip()[:400],
             }
-        picked = run_git(worktree_root, "cherry-pick", head_commit, env=_commit_env())
-        if picked.returncode != 0:
+        merged = run_git(
+            worktree_root,
+            "merge",
+            "--no-ff",
+            "-X",
+            "theirs",
+            "-m",
+            DD_HARVEST_MERGE_MESSAGE,
+            head_commit,
+            env=_commit_env(),
+        )
+        if merged.returncode != 0:
             self.remove_worktree(repo, worktree_root)
             return {
                 "ok": False,
-                "detail": (picked.stderr or picked.stdout).strip()[:400],
+                "detail": (merged.stderr or merged.stdout).strip()[:400],
             }
-        washed = _strip_dd_subtrees(worktree_root)
+        tip = run_git(worktree_root, "rev-parse", "HEAD")
         self.remove_worktree(repo, worktree_root)
-        if not washed.get("ok"):
-            return washed
-        return {
-            "ok": True,
-            "harvest_tip": washed["harvest_tip"],
-            "washed": washed["washed"],
-            "detail": "washed",
-        }
+        if tip.returncode != 0 or not tip.stdout.strip():
+            return {"ok": False, "detail": "merge 后无法解析 tip commit"}
+        return {"ok": True, "method": "merge", "harvest_tip": tip.stdout.strip()}
 
     def remove_worktree(self, repo: Path, worktree_root: Path) -> dict[str, Any]:
         """移除 verify 之后的一次性 detached worktree（编排层 cleanup 步骤调用）。
@@ -801,6 +774,34 @@ class DefaultHarvestOps:
 
     def run_verify(self, worktree: Path, argv: list[str]) -> int:
         return int(_run(list(argv), cwd=worktree).get("exit_code") or 0)
+
+    def branch_head(self, repo: Path, branch: str) -> str | None:
+        """解析默认分支 tip（`git rev-parse --verify refs/heads/<branch>`，纯读口）。
+
+        用于净 diff 的 `base`（收割前默认分支 tip）。失败/缺 ref -> None。
+        """
+        if not branch:
+            return None
+        proc = run_git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        return proc.stdout.strip()
+
+    def is_ancestor(self, repo: Path, ancestor: str, descendant: str) -> dict[str, Any]:
+        """exact-head 祖先判定（交付 1 机械口，测试注入 fake）。
+
+        见模块级 `_is_ancestor`：`git merge-base --is-ancestor <ancestor>
+        <descendant>` 的机械读判。纯读口，零写原语。
+        """
+        return _is_ancestor(repo, ancestor, descendant)
+
+    def net_product_files(self, repo: Path, base: str, head: str) -> dict[str, Any]:
+        """净产品 diff（交付 2/3 机械口，测试注入 fake）。
+
+        见模块级 `_net_product_files`：`git diff --name-only base..head` 排除
+        `.dev-dispatch` / `.dd-evidence` 两棵协议子树的机械读算。纯读口。
+        """
+        return _net_product_files(repo, base, head)
 
     def resolve_verify_argv(self, worktree: Path) -> tuple[list[str] | None, str]:
         """目标仓 verify 指令解析（交付 A.1 机械口，测试注入 fake）。
@@ -1250,11 +1251,12 @@ class DefaultHarvestOps:
 __all__ = [
     "COMMAND_TIMEOUT_SECONDS",
     "DD_EXCLUDED_PATHS",
-    "DD_WASH_COMMIT_MESSAGE",
+    "DD_HARVEST_MERGE_MESSAGE",
     "EXIT_HEAD_MISMATCH",
     "EXIT_NOT_FOUND",
     "EXIT_TIMEOUT",
     "MAKE_VERIFY_ARGV",
+    "NET_DIFF_PATHSPECS",
     "NO_RESOLVABLE_VERIFY",
     "UV_PYTEST_ARGV",
     "DefaultHarvestOps",
