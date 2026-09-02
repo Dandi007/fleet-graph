@@ -33,6 +33,7 @@ from fleet_graph.decision_bridge.owners import OWNER_KIND_DD
 from fleet_graph.decision_mcp import (
     CODE_GATE_NOT_AWAITING,
     CODE_GATE_NOT_FOUND,
+    CODE_GATE_RESUME_REFUSED,
     CODE_LINE_NOT_PARKED,
     CODE_NO_WAITING_PARTY,
     CODE_QUESTION_CARD_UNRESOLVED,
@@ -294,6 +295,27 @@ def _parked_dispatch_line(run_root: Path, folder_id: str = "wf-1") -> Path:
     return _stall(run_root, folder_id, parked=True, question="q-1", card="card-1")
 
 
+class _RefusingResumePlane:
+    """A control plane that resolves an awaiting gate but whose registered
+    control entry refuses the valueless resume -- drives ``CODE_GATE_RESUME_REFUSED``
+    (the gate answered, but its resume was refused)."""
+
+    def get(self, development_id: str) -> dict[str, Any]:
+        return {
+            "state": "awaiting_gate",
+            "awaiting": {"question_note_id": "q-1", "card_entity_id": "card-1"},
+            "generation": 1,
+            "dispatched_by": "wf-1",
+        }
+
+    def gate(
+        self, development_id: str, resume: bool = False, action_key: str | None = None
+    ) -> dict[str, Any]:
+        from fleet_graph.dd.control_plane import ControlPlaneError
+
+        raise ControlPlaneError("CHECKPOINT_MISSING", f"{development_id} has no durable checkpoint")
+
+
 # --- gap (a) + (b): the line path -------------------------------------------
 
 
@@ -454,6 +476,20 @@ class TestGateNegativeRefusals:
                 run_root=tmp_path / "runs",
                 plane=plane,
             )
+
+    def test_a_gate_whose_resume_is_refused_is_an_explicit_refusal(self, tmp_path: Path) -> None:
+        result = deliver_decision_gate(
+            development_id="dev-abc",
+            decision=DECISION_APPROVE,
+            reason="x",
+            dd_root=tmp_path / "dd",
+            lines=ROSTER,
+            run_root=tmp_path / "runs",
+            plane=_RefusingResumePlane(),
+        )
+        assert result.status == OUTCOME_REFUSED
+        assert result.code == CODE_GATE_RESUME_REFUSED
+        assert "no durable checkpoint" in result.message
 
 
 class TestGateWakeTargetOnly:
