@@ -85,6 +85,7 @@ class FakeArtifacts:
         waiting_on: str = "none",
         waiting_on_declared: str | None = None,
         goal_revision: str | None = None,
+        dd_development_id: str | None = None,
     ) -> str:
         self.terminal = {
             "terminal": terminal,

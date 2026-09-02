@@ -70,6 +70,11 @@ TERMINAL_DONE = "done"
 TERMINAL_BLOCKED = "blocked"
 TERMINAL_BOUNDS = "bounds"
 TERMINAL_FAULT = "fault"
+#: M1: a line's own judgement that it cannot continue ("自判做不下去"). Distinct
+#: from ``TERMINAL_FAULT``, which is reserved for mechanical failure: a worked
+#: turn whose report says ``outcome: "failed"`` is a self-judged stop, not a
+#: fault. ``fault`` semantics are otherwise unchanged (never merged into failed).
+TERMINAL_FAILED = "failed"
 
 #: The one mechanical marker the resume verification's `overall` uses for a
 #: broken environment. Anything else ("MATCH", "OK", "") is simply non-BROKEN.
@@ -277,10 +282,14 @@ class Verdict(TypedDict, total=False):
     next_prompt: str
     reason: str
     no_progress: bool
-    #: Machine field for a blocked verdict: "decision" | "external" | "none".
-    #: Optional; absent means "none"; an unknown value is treated as "none"
-    #: and recorded verbatim -- never a fault. Parking is an optimisation.
+    #: Machine field for a blocked verdict: "decision" | "external" | "dd" |
+    #: "none". Optional; absent means "none"; an unknown value is treated as
+    #: "none" and recorded verbatim -- never a fault. Parking is an optimisation.
     waiting_on: str
+    #: M1: the development id the line dispatched and is now waiting on, when it
+    #: declared ``blocked`` + ``waiting_on: "dd"``. This is the scheduler's
+    #: anchor for the ``dd_awaiting_gate`` / ``dd_terminal`` wake facts.
+    dd_development_id: str
 
 
 class LineState(TypedDict, total=False):
@@ -303,6 +312,8 @@ class LineState(TypedDict, total=False):
     #: Set only on a blocked terminal from the coordinator's declared verdict.
     waiting_on: str
     waiting_on_declared: str
+    #: M1: the development id a ``waiting_on: "dd"`` terminal is parked on.
+    dd_development_id: str
     pump_fault: bool
     rounds_recorded: int
     #: Facts from the last acceptance step: status plus per-command exit codes
@@ -367,6 +378,7 @@ class ArtifactsPort(Protocol):
         waiting_on: str = ...,
         waiting_on_declared: str | None = ...,
         goal_revision: str | None = ...,
+        dd_development_id: str | None = ...,
     ) -> Any: ...
 
 
@@ -517,6 +529,9 @@ def _verdict_update(
         }
         if declared is not None:
             update["waiting_on_declared"] = declared
+        if str(result.get("dd_development_id") or "").strip():
+            # M1: the dispatch anchor the scheduler's dd wake facts key on.
+            update["dd_development_id"] = str(result["dd_development_id"])
         return update
 
     if verdict != "continue":
@@ -875,11 +890,15 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
                 "waiting_on_declared": None,
             }
         if outcome == OUTCOME_FAILED:
+            # M1: a worker self-reporting ``failed`` is the line judging it
+            # cannot continue -- the ``failed`` terminal, distinct from a
+            # mechanical ``fault``. `pump_fault` stays False: nothing broke,
+            # the work was judged impossible.
             return {
                 **progressed,
-                "terminal": TERMINAL_FAULT,
+                "terminal": TERMINAL_FAILED,
                 "terminal_reason": report["summary"],
-                "pump_fault": True,
+                "pump_fault": False,
             }
         # completed: proceed through the ordinary completed-turn path -- the
         # acceptance step runs, then the next coordinator turn weighs the
@@ -924,6 +943,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             waiting_on=state.get("waiting_on") or WAITING_ON_DEFAULT,
             waiting_on_declared=state.get("waiting_on_declared"),
             goal_revision=state.get("goal_revision"),
+            dd_development_id=state.get("dd_development_id"),
         )
         # E3: the terminal is authoritative through the checkpoint, so the run
         # id that terminal.json attributes is recorded into state too -- the
@@ -980,6 +1000,7 @@ __all__ = [
     "TERMINAL_BLOCKED",
     "TERMINAL_BOUNDS",
     "TERMINAL_DONE",
+    "TERMINAL_FAILED",
     "TERMINAL_FAULT",
     "WORKER_REPORT_PROTOCOL_FAILURE",
     "WORKER_REPORT_REQUEST",

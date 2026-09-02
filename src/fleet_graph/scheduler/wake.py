@@ -28,8 +28,10 @@ guess: the fail-open policy lives in one place, the scheduler.
 from __future__ import annotations
 
 import calendar
+import json
 import os
 import time
+from pathlib import Path
 from typing import Any, Protocol
 
 from fleet_graph.bus.tokens import (
@@ -37,6 +39,12 @@ from fleet_graph.bus.tokens import (
     LINE_TOKEN_PATH_TEMPLATE,
     resolve_line_token,
 )
+
+#: The dd status value that means a development has reached the human gate --
+#: the first of the two M1 dd wake facts, ``dd_awaiting_gate(dev_id)``. Kept
+#: local rather than importing the dd control plane's constant so the scheduler
+#: stays decoupled from the pipeline's internals.
+DD_AWAITING_GATE_STATE = "awaiting_gate"
 
 #: Wake probes ride the 60s tick loop; a hung endpoint must cost seconds.
 WAKE_TIMEOUT_SECONDS = 5.0
@@ -177,13 +185,75 @@ class LiveWakeSignals:
         return revision
 
 
+class DdWakeFacts(Protocol):
+    """The M1 dd wake source for a dispatched line's park.
+
+    The scheduler asks one question -- has the development the line dispatched
+    reached a wake point yet? -- and the probe answers with a fact or None.
+    A probe failure raises, exactly like ``WakeSignals``: the fail-open policy
+    lives in the caller, and a broken probe must never be able to lock a line
+    shut.
+    """
+
+    def dd_fact(self, development_id: str) -> str | None: ...
+
+
+def classify_dd_fact(status: dict[str, Any]) -> str | None:
+    """Map one dd status record to its wake fact, or None when not yet wakeable.
+
+    The two M1 facts are the whole vocabulary:
+
+    - ``"awaiting_gate"`` -- the development reached ``state: "awaiting_gate"``
+      (its acceptance is green and it is at the gate);
+    - ``"terminal"`` -- the development's ``terminal`` field is set (any
+      terminal: merged / rejected / failed / fault).
+
+    A record with neither signals a development still running -- no wake fact
+    yet. This is a *projection* of the dd status file, never new prose.
+    """
+    state = str(status.get("state") or "")
+    terminal = str(status.get("terminal") or "")
+    if state == DD_AWAITING_GATE_STATE:
+        return "awaiting_gate"
+    if terminal:
+        return "terminal"
+    return None
+
+
+class LiveDdWakeFacts:
+    """The production DdWakeFacts, reading ``<dd_root>/<dev_id>/status.json``.
+
+    A plain file read, no network -- kept as a class so the scheduler can hold
+    a concrete default and tests can inject a scripted fake. A missing or
+    unreadable status file raises -- the caller fails open rather than parking
+    on a guess.
+    """
+
+    def __init__(self, dd_root: str | Path) -> None:
+        self.dd_root = Path(dd_root)
+
+    def dd_fact(self, development_id: str) -> str | None:
+        path = self.dd_root / development_id / "status.json"
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"dd status for {development_id} unreadable: {path}") from exc
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"dd status for {development_id} is not an object: {path}")
+        return classify_dd_fact(raw)
+
+
 __all__ = [
+    "DD_AWAITING_GATE_STATE",
     "INBOX_TAIL_WINDOW",
     "LINE_TOKEN_PATH_ENV",
     "LINE_TOKEN_PATH_TEMPLATE",
     "WAKE_TIMEOUT_SECONDS",
+    "DdWakeFacts",
+    "LiveDdWakeFacts",
     "LiveWakeSignals",
     "WakeSignals",
+    "classify_dd_fact",
     "parse_bus_timestamp",
     "probe_error_tag",
 ]

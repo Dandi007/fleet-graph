@@ -32,7 +32,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import StateGraph
 
 from fleet_graph.graphs.goal_line import LineState
-from fleet_graph.state.run_artifacts import WAITING_ON_DEFAULT
+from fleet_graph.state.run_artifacts import WAITING_ON_DEFAULT, derive_line_state
 
 #: The checkpoint file a line writes, relative to its run root. Must stay the
 #: same path the launcher passes as ``--checkpoint`` (scheduler/launcher.py),
@@ -113,6 +113,10 @@ def to_record(values: dict[str, Any], *, created_at: Any) -> dict[str, Any] | No
         # other control field. The scheduler's parking reads it off this record;
         # absent on old generations -> fail open, never lock.
         "goal_revision": values.get("goal_revision"),
+        # M1: the development id a ``waiting_dd`` terminal is parked on.
+        "dd_development_id": values.get("dd_development_id"),
+        # The closed externally-facing line-state word (design.md §6.3).
+        "line_state": derive_line_state(str(terminal), waiting_on),
     }
 
 
