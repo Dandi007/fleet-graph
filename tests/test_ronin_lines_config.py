@@ -60,8 +60,17 @@ CONVERGED = {
     "wf-a08949",
     "wf-40fa8d",
     "wf-7bc4d1",
-    # 2026-09-02 监督面闭卷审计退役（#225）：三条 DoD 逐条真机核验后不复活，
-    # enabled=false 留在名册（名册是编成史实，退役靠开关不靠删行）。
+}
+
+# 2026-09-02 监督面闭卷审计退役（#225）：三条 DoD 逐条真机核验后不复活，
+# enabled=false 留在名册（名册是编成史实，退役靠开关不靠删行）。
+#
+# RETIRED 与 CONVERGED 是两种生命终点，严格互斥：CONVERGED 是「使命完成收敛」
+# （enabled=false 留名册），RETIRED 是「闭卷审计退役、判定不复活」。退役线仍属
+# ENROLLED（历史入编史实），故不进 loader 全集断言（语义同 CONVERGED/
+# CLOSED_BY_SUPERVISOR）。任一条被塞回 CONVERGED →
+# test_the_retired_lines_stay_in_the_roster_but_off 的互斥断言必红（语义污染守卫）。
+RETIRED = {
     "wf-7cd0a7",  # ronin-bus-redesign
     "wf-c106b9",  # ronin-entry-unify
     "wf-e7b0dd",  # ronin-e7b0dd
@@ -208,7 +217,7 @@ class TestTheShippedConfigLoads:
         enabled = {
             line.folder_id for line in SchedulerConfig.from_json(CONFIG).lines if line.enabled
         }
-        expected = (BATCH_TWO | OPENED | ENROLLED | REVIVED) - CONVERGED
+        expected = (BATCH_TWO | OPENED | ENROLLED | REVIVED) - CONVERGED - RETIRED
         assert enabled == expected - CLOSED_BY_SUPERVISOR
 
     def test_the_converged_lines_stay_in_the_roster_but_off(self) -> None:
@@ -217,6 +226,17 @@ class TestTheShippedConfigLoads:
         「金丝雀在后续批次保持在线」的断言随金丝雀本身收编而退役。"""
         lines = {line.folder_id: line for line in SchedulerConfig.from_json(CONFIG).lines}
         for folder_id in CONVERGED:
+            assert folder_id in lines, folder_id
+            assert not lines[folder_id].enabled, folder_id
+
+    def test_the_retired_lines_stay_in_the_roster_but_off(self) -> None:
+        """退役（2026-09-02 监督面闭卷审计 #225）不是删除：wf-7cd0a7 / wf-c106b9 /
+        wf-e7b0dd 三条 DoD 逐条真机核验后判定不复活，enabled=false 但留在名册里
+        ——名册同时是编成史实。RETIRED 与 CONVERGED 是两种生命终点，严格互斥：
+        任一条退役线被塞回 CONVERGED，本断言必红（语义污染守卫）。"""
+        assert RETIRED.isdisjoint(CONVERGED)
+        lines = {line.folder_id: line for line in SchedulerConfig.from_json(CONFIG).lines}
+        for folder_id in RETIRED:
             assert folder_id in lines, folder_id
             assert not lines[folder_id].enabled, folder_id
 

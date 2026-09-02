@@ -593,7 +593,7 @@ U3（wf-c106b9）统一的是**提交（submit）**，不是**点火（ignite）
 | goal 提交面 | `:5611` `goal_enroll` | 任何 agent | 统一 | 唯一对外提交入口：任何 agent 经 goal MCP 提交入册申请，申请对监督面结构性可见（read-model + E8 + 挂板），放行权仍留监督面 |
 | dd 派单面 | `:5610` `development_*` | roster 线 + 监督面 | 保留 | 内部执行入口且当前健康：dd 面回归纯 dev-dispatch，roster 线与监督面继续专用 |
 | 放行入口 | `roster PR` → `release` → `restart` | 监督面 | 保留 | 放行权不下放：roster `enabled` 永远留监督面；U2 后 queue entry 置 admitted 并留 decision 指针 |
-| 裁决入口 | `board question` → `work.decision.v1` | 有权作出人类裁决者/监督面 | 保留 | 治理裁决路径不变；如实注明 decision-bridge 缺陷已由 wf-216dc3 另案处理，桥修复后 E7 goal 直写退役 |
+| 裁决入口 | `board question` → `work.decision.v1`；`decision serve` `:5614` `decision_deliver` | 有权作出人类裁决者/监督面 | 保留 | 治理裁决路径不变；`decision_deliver`（MCP 同步定论）提供「已送达已消费 / 明确拒绝」单次返回，board 通道保留兼容并行对账，旧桥缺陷退役前由 wf-216dc3 另案处理 |
 | 收割入口 | `supervisor harvest` + `allowlist` | 监督面 | 保留 | allowlist 已激活且仍由监督面管控（fleet-sentinel 唯一仓，09-07 手工期限） |
 | 带外手工入口 | 手工 token 铸造、手工 roster 直编、spec 挂他卷、E7 goal 直写 | 监督面/历史带外操作者 | 统一 | U2 后提交一律收敛到 goal 提交面；token 铸造显式保留为放行 SOP 步骤并在提交期由闸 6 校验，不得把所有带外动作笼统保留 |
 
