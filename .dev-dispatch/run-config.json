@@ -1,0 +1,23 @@
+{
+ "development_id": "dev-fg-ad79746d57a7",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "bash",
+   "-lc",
+   "test -x scripts/verify-lim.sh"
+  ],
+  [
+   "bash",
+   "-lc",
+   "out=$(bash scripts/verify-lim.sh 2>/dev/null); rc=$?; n=$(printf \"%s\\n\" \"$out\" | grep -cE \"^[0-9]{2} [a-z0-9-]+ (PASS|FAIL)\"); f=$(printf \"%s\\n\" \"$out\" | grep -cE \"^[0-9]{2} [a-z0-9-]+ FAIL\"); test \"$n\" -eq 16 && test \"$rc\" -eq \"$f\""
+  ],
+  [
+   "bash",
+   "-lc",
+   "c=$(bash scripts/verify-lim.sh 2>/dev/null | grep -E \"^(03|07) \" | grep -c FAIL); test \"$c\" -eq 2"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
