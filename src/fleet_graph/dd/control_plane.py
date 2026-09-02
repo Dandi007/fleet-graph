@@ -40,10 +40,13 @@ terminal (or a reconfigure) launches generation n+1 with fresh derived
 identities, so a rerun never collides with its own past (R1-c; the tick-14
 IDEMPOTENCY_CONFLICT lesson).
 
-**Failure is classified into three exits** (R1-c; `classify_failure`):
-environment/contract -> `reconfigure` the acceptance context, then start a
-new generation; implementation -> the in-graph rework loop, untouched here;
-fabrication (the UNVERIFIED_TEST_CLAIM family) -> final, refused everywhere.
+**Failure is classified into four classes under three exits** (R1-c;
+`classify_failure`): environment/contract -> `reconfigure` the acceptance
+context, then start a new generation; implementation -> the in-graph rework
+loop, untouched here; fabrication (the UNVERIFIED_TEST_CLAIM family) ->
+final, refused everywhere; rejection (human_gate REJECT, `GATE_REJECTED`) ->
+a verdict, not a fault, classified independently so the supervision plane
+never reads it as one.
 
 **The gate carries no verdict.** `gate` reports the pending question note and
 offers `resume`, which re-enters the suspended thread with no input at all --
@@ -173,11 +176,13 @@ class ControlPlaneError(RuntimeError):
         return {"code": self.code, "message": self.detail, "retryable": self.retryable}
 
 
-# --- failure classification: the three exits (R1-c) ----------------------
+# --- failure classification: the three exits, four classes (R1-c) --------
 #
-# Every terminal that is not `complete` classifies into exactly one of three
-# exits, and the classification is derived at read time from the run record --
-# never stored as a second truth:
+# Every terminal that is not `complete` classifies into exactly one exit, and
+# the classification is derived at read time from the run record -- never
+# stored as a second truth. Rejection is a fourth *class* but not a fault:
+# it exists so a human_gate REJECT is never read downstream as a fault
+# (fault signal always 0) while keeping the same exit as implementation.
 #
 #   environment_contract -> the acceptance context was wrong (missing env
 #       piece, wrong acceptance argv, missing setup). Exit: `reconfigure` the
@@ -193,10 +198,17 @@ class ControlPlaneError(RuntimeError):
 #       (the UNVERIFIED_TEST_CLAIM family). Final. Not reconfigurable, not
 #       restartable: an actor that lied about its verification does not get
 #       the exam changed or retaken (m-6d5aa4, a 5+-times-recurring behavior).
+#   rejected -> human_gate REJECT (`GATE_REJECTED`): a verdict, not a fault.
+#       Independent of the three fault classes above, so a rejection is never
+#       read as `class="implementation"`/fault by downstream. It keeps the
+#       implementation exit (fresh generation rework), so it still exits
+#       deterministically on a new generation instead of lingering as a
+#       permanent alert.
 
 CLASS_ENVIRONMENT_CONTRACT = "environment_contract"
 CLASS_IMPLEMENTATION = "implementation"
 CLASS_FABRICATION = "fabrication"
+CLASS_REJECTED = "rejected"
 
 EXIT_RECONFIGURE = "reconfigure"
 EXIT_REWORK = "rework"
@@ -224,10 +236,23 @@ IMPLEMENTATION_CODES = frozenset(
         "REVIEWER_GIT_MUTATION",
         "UNDECLARED_ARTIFACT",
         "SECRET_SENTINEL_DETECTED",
-        "GATE_REJECTED",
         "REWORK_LIMIT_REACHED",
     }
 )
+
+#: Codes whose meaning is "a human (or the gate) REJECTed the work": a
+#: verdict, not a fault. These classify as `CLASS_REJECTED`, independent of
+#: environment_contract / implementation / fabrication, so a REJECT is never
+#: emitted as (or read downstream as) a fault signal.
+REJECTION_CODES = frozenset(
+    {
+        "GATE_REJECTED",
+    }
+)
+
+#: The classes a downstream supervision plane reads as a *fault*. `rejected`
+#: is deliberately absent: human_gate REJECT is a verdict, not a fault.
+FAULT_CLASSES = frozenset({CLASS_ENVIRONMENT_CONTRACT, CLASS_IMPLEMENTATION, CLASS_FABRICATION})
 
 #: Legacy results carry the code only inside the synthesized reason text
 #: ("implement failed (PROVIDER_UNAVAILABLE)"); results written before R1-c
@@ -261,6 +286,12 @@ def classify_failure(
         raw_error = f"{raw_error}; {terminal_detail}" if raw_error else terminal_detail
     if code in FABRICATION_CODES:
         cls, exit_, retryable = CLASS_FABRICATION, EXIT_NONE, False
+    elif code in REJECTION_CODES:
+        # human_gate REJECT: a verdict, not a fault. The class is
+        # independently "rejected" so downstream never reads it as a fault
+        # signal; the exit stays the fresh-generation rework, so a rejection
+        # still exits deterministically on a new generation.
+        cls, exit_, retryable = CLASS_REJECTED, EXIT_REWORK, True
     elif code in IMPLEMENTATION_CODES:
         cls, exit_, retryable = CLASS_IMPLEMENTATION, EXIT_REWORK, True
     else:
@@ -2270,6 +2301,7 @@ __all__ = [
     "CLASS_ENVIRONMENT_CONTRACT",
     "CLASS_FABRICATION",
     "CLASS_IMPLEMENTATION",
+    "CLASS_REJECTED",
     "DEFAULT_DD_ROOT",
     "DEFAULT_EXECUTABLE",
     "DEFAULT_PLUGIN_BINDING",
@@ -2280,10 +2312,12 @@ __all__ = [
     "EXIT_RECONFIGURE",
     "EXIT_REWORK",
     "FABRICATION_CODES",
+    "FAULT_CLASSES",
     "H0_FILE",
     "IMPLEMENTATION_CODES",
     "LAUNCHES_FILE",
     "RECORD_FILE",
+    "REJECTION_CODES",
     "RESULT_FILE",
     "STATUS_FILE",
     "UNIT_PREFIX",
