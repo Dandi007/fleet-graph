@@ -226,6 +226,14 @@
       "max_rounds": 9999,
       "alias": "ronin-model-avail",
       "enabled": true
+    },
+    {
+      "folder_id": "wf-8d9737",
+      "seat": "opencode-glm53",
+      "max_rounds": 9999,
+      "alias": "ronin-lim",
+      "enabled": true,
+      "_provenance": "2026-09-03 第十四波入编（用户令「给 goal agent 端到端完成整体重构的开发工作」）：舰队 less-is-more 重构线。经 goal MCP 走完 goal_enroll -> goal_admit，放行裁决 msg_01M1HFDDBJFPVY387TP1D9YF1D（board:work-notes seq 2325）。北极星是把 wf-8d9737/design.md 落成生产事实：6 个必要元素成为真机事实、§7.1 九项立即删除项消失、§7.2 十三项双轨按退役条件逐项退役、§8 十六条验收全绿。判据 SSoT 是 design.md §8（用户拍板 D1–D7 在 §1.2，原文在 golden-order.md），本线只实现不得改判据。入编时判据脚本 scripts/verify-lim.sh 尚不存在（liveness started=true exit=127）——判据全红是 goal 线的正常起点，首轮 M0 把它补成「存在且逐项诚实报红、退出码=失败项数」。座位 opencode-glm53：入编前 glm53 座全空，遵 2026-08-29 家族分流令；该座已在 src/fleet_graph/scheduler/probe.py:92 注册功能探针。"
     }
   ],
   "line_environment": {

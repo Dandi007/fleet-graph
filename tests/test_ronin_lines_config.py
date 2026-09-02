@@ -191,6 +191,14 @@ ENROLLED = {
     # ——「请求成功率 100% 的模型可以事实上不可用」。
     # 判据已先行冻结在 token-plan-report PR #1（合 main，当前诚实报红）。
     "wf-c8bce9",
+    # 2026-09-03 第十四波（用户令「给 goal agent 端到端完成整体重构的开发工作」）：
+    # 舰队 less-is-more 重构线 —— 把 wf-8d9737/design.md 落成生产事实。
+    # 判据 SSoT = design.md §8 十六条（用户拍板 D1-D7 在 §1.2，原文在 golden-order.md），
+    # 本线只实现、不得改判据。入编时 scripts/verify-lim.sh 尚不存在（liveness exit=127），
+    # 首轮 M0 把它补成「存在且逐项诚实报红、退出码=失败项数」——同 wf-a6cfea / wf-e6560a 先例。
+    # 放行裁决 msg_01M1HFDDBJFPVY387TP1D9YF1D（board:work-notes seq 2325）。
+    # 座位 opencode-glm53（入编前该座全空，遵家族分流令；probe.py:92 已注册功能探针）。
+    "wf-8d9737",
 }
 
 # 2026-08-29 复活：曾在 MIGRATED 里 enabled=false 停摆的线被用户令重新点亮。
