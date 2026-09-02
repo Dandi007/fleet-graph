@@ -24,12 +24,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/data/apps/fleet-graph/current
-# 2026-08-29 用户令全舰切 DS 家族（tokenplan 额度压测）：flash=写码、pro=智能。
-# implement 写码走 deepseek-v4-flash，两段 review 高智能走 deepseek-v4-pro；
-# 模型名经 agent-run chain（<model>@opencode）解析到网关腿。
+# 2026-09-02 监督面裁决：撤掉 implement 阶段的 flash 模型覆盖，回落 role registry
+# 出厂座位 deepseek-v4-pro（经 agent-run chain 解析到网关腿）；两段 review 高智能
+# 走 deepseek-v4-pro。
 ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph dd serve \
     --host 127.0.0.1 --port 5610 \
-    --stage-model implement=deepseek-v4-flash \
     --stage-model continuous_review=deepseek-v4-pro \
     --stage-model final_review=deepseek-v4-pro
 Restart=always
