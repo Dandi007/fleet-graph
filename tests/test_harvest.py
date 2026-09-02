@@ -23,6 +23,7 @@ from typing import Any
 from conftest import git, head
 from fleet_graph.supervise.events import approved_unharvested_event, validate_event
 from fleet_graph.supervise.harvest import (
+    ESCALATE_BRANCH_OCCUPIED,
     OUTCOME_ALREADY_HARVESTED,
     OUTCOME_ESCALATED,
     OUTCOME_HARVESTED,
@@ -58,6 +59,7 @@ def fake_ops(
     harvest_tip: str = "b" * 40,
     inflight_binding: dict[str, Any] | None = None,
     resolve_verify_argv: tuple[list[str] | None, str] | None = None,
+    pr_merge_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A recording fake ops: every write/execute is recorded, results scripted.
 
@@ -69,6 +71,9 @@ def fake_ops(
     `resolve_verify_argv` 脚本化按目标仓解析结果（交付 A）：None 时默认返回
     `(["make","verify"], "")`（模拟 Makefile 含 verify 目标）；显式传
     `(None, "no resolvable verify command")` 等可脚本化解析失败路径。
+    `pr_merge_result` 非 None 时 `pr_squash_merge` 返回该完整结果（脚本化，
+    用于 M3 分支占用 refuse+escalate 编排短路口用例）；None 时返回默认
+    `{"merged": ..., "pr_url": ...}`。
     """
     calls: list[str] = []
     deploy_repos: list[Path] = []
@@ -168,6 +173,8 @@ def fake_ops(
                     "default_branch": default_branch,
                 }
             )
+            if pr_merge_result is not None:
+                return dict(pr_merge_result)
             return {"merged": merged, "pr_url": pr_url, "method": "gh-pr-squash-merge"}
 
         def ff_only_pull(self, repo: Path, default_branch: str) -> dict[str, Any]:
@@ -1796,6 +1803,64 @@ class TestHarvestWriteGate:
         receipt = json.loads(Path(result["receipt_path"]).read_text())
         assert receipt["pr_merged"] is True
         assert receipt["writes_skipped"] == []
+
+
+class TestHarvestBranchOccupiedEscalateShortCircuit:
+    """交付 A.2（rc-6c2e9473 复审修复）：pr_squash_merge 返回 refused+escalate
+    HARVEST_BRANCH_OCCUPIED -> 编排层立即 outcome=escalated + writes_skipped，
+    绝不进入 pull/deploy/verify_real 任何写步（不再在 postconditions 前对 canonical
+    checkout 跑 ff_only_pull / deploy / verify_real），也不落「远端已合并却报未合并」
+    的半态。
+    """
+
+    def test_occupied_refusal_escalates_without_running_pull_deploy_verify_real(
+        self, tmp_path: Path
+    ) -> None:
+        fake = fake_ops(
+            pr_merge_result={
+                "merged": False,
+                "refused": True,
+                "escalate": ESCALATE_BRANCH_OCCUPIED,
+                "worktree_paths": ["/data/worktrees/residual-wt"],
+                "detail": "harvest 分支 harvest/dev-x 被残留 worktree 检出占用",
+            }
+        )
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        # 占用判红后，后续写步零调用（ff_only_pull / deploy / verify_real 都不执行）。
+        assert "pr_squash_merge" in fake["calls"], fake["calls"]
+        assert "ff_only_pull" not in fake["calls"], fake["calls"]
+        assert "deploy" not in fake["calls"], fake["calls"]
+        assert "verify_real" not in fake["calls"], fake["calls"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["outcome"] == OUTCOME_ESCALATED
+        assert receipt["pr_merged"] is False
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+        # 机器可读占用诊断进步骤留痕。
+        merge_step = next(s for s in receipt["steps"] if s["step"] == "pr_squash_merge")
+        assert merge_step["refused"] is True
+        assert merge_step["escalate"] == ESCALATE_BRANCH_OCCUPIED
+
+    def test_occupied_refusal_does_not_produce_half_merged_state(self, tmp_path: Path) -> None:
+        """绝不落半态：merged=false 且无 pr_url（远端未合并、也无 forge 链接）。"""
+        fake = fake_ops(
+            pr_merge_result={
+                "merged": False,
+                "refused": True,
+                "escalate": ESCALATE_BRANCH_OCCUPIED,
+                "worktree_paths": ["/data/worktrees/residual-wt"],
+                "detail": "harvest 分支 harvest/dev-x 被残留 worktree 检出占用",
+            }
+        )
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["pr_merged"] is False
+        assert receipt["pr_url"] == ""
+        # 占用分支明确拒绝，绝不替人删残留 worktree（无 remove_worktree 之外的任何动作）。
+        assert "pr_squash_merge" in [s.get("step") for s in receipt["steps"]]
 
 
 def _real_repo_with_origin(tmp_path: Path) -> tuple[Path, str]:
