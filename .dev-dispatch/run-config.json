@@ -1,0 +1,20 @@
+{
+ "development_id": "dev-fg-91564c3c5f3a",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_decisions_reconciliation.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
