@@ -1,0 +1,21 @@
+{
+ "development_id": "dev-fg-48e96f99db2d",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_decision_mcp.py",
+   "tests/test_decision_bridge.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
