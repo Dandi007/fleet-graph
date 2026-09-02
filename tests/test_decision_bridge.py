@@ -885,6 +885,249 @@ class TestCompositeOwner:
         result = composite.resume(targets[0], "e1:d-9:line:wf-1:1")
         assert result.status == RESUME_RESUMED
 
+    def test_record_decision_consumed_routes_to_the_line_owner(self, tmp_path: Path) -> None:
+        """Wake fact 4 recording goes through the composite's controlled entry
+        to the line owner's stall-state file, and never raises when the fact
+        cannot be written."""
+        run_root = tmp_path / "runs"
+        line = LineOwnerSource(run_root, ["wf-1"])
+
+        class NoopDd(OwnerSource):
+            def discover(self, question_note_id: str) -> list[OwnerTarget]:
+                return []
+
+            def discover_all(self) -> list[OwnerTarget]:
+                return []
+
+            def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
+                return OwnerResult(RESUME_RESUMED, "ok")
+
+        composite = CompositeOwnerSource([NoopDd(), line], kinds={"dd": NoopDd(), "line": line})
+        assert composite.record_decision_consumed("wf-1", 1_700_000_100.0) is True
+        stall = json.loads((run_root / ".scheduler" / "wf-1.json").read_text(encoding="utf-8"))
+        assert stall["dispatched_decision_consumed_at"] == 1_700_000_100.0
+
+    def test_record_decision_consumed_without_a_line_owner_is_a_noop(self, tmp_path: Path) -> None:
+        """A composite with no line owner records nothing (best-effort), never
+        raising -- the bridge must not fail a resume for a missing line side."""
+
+        class NoopDd(OwnerSource):
+            def discover(self, question_note_id: str) -> list[OwnerTarget]:
+                return []
+
+            def discover_all(self) -> list[OwnerTarget]:
+                return []
+
+            def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
+                return OwnerResult(RESUME_RESUMED, "ok")
+
+        composite = CompositeOwnerSource([NoopDd()], kinds={"dd": NoopDd()})
+        assert composite.record_decision_consumed("wf-1", 1_700_000_100.0) is False
+        assert not (tmp_path / "runs" / ".scheduler" / "wf-1.json").exists()
+
+
+class TestDispatchedLineWake:
+    """Wake fact 4 end to end on the bridge side: when a `work.decision.v1`
+    resumes a dd development that a parked line dispatched
+    (`dispatched_by == line folder`), the bridge records
+    `dispatched_decision_consumed_at` into that line's stall-state file so the
+    scheduler wakes it on its next tick (spec判据 §3.1)."""
+
+    def _wake_line(self, tmp_path: Path) -> Path:
+        """A parked line L (wf-1) awaiting its own question, plus the stall
+        file the bridge writes the wake fact into."""
+        run_root = tmp_path / "runs"
+        stall = run_root / ".scheduler" / "wf-1.json"
+        stall.parent.mkdir(parents=True, exist_ok=True)
+        stall.write_text(
+            json.dumps(
+                {
+                    "generation": 1,
+                    "board_card_entity_id": "card-line",
+                    "board_question_note_id": "q-line",
+                    "parked_run_id": "run-1",
+                    "parked_at": 1_700_000_000.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return stall
+
+    def test_a_resumed_dispatched_development_wakes_the_line(self, tmp_path: Path) -> None:
+        """Positive: the dd single the line dispatched is resumed by the
+        decision; the wake fact lands on the line's stall-state file."""
+        stall = self._wake_line(tmp_path)
+        run_root = tmp_path / "runs"
+        line = LineOwnerSource(run_root, ["wf-1"])
+
+        class RecordingDd(OwnerSource):
+            def discover(self, question_note_id: str) -> list[OwnerTarget]:
+                return []
+
+            def discover_all(self) -> list[OwnerTarget]:
+                return [
+                    OwnerTarget(
+                        kind="dd",
+                        id="dev-abc",
+                        generation=1,
+                        question_note_id="q-1",
+                        card_entity_id="card-1",
+                        state="awaiting_gate",
+                        dispatched_by="wf-1",
+                    )
+                ]
+
+            def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
+                return OwnerResult(RESUME_RESUMED, "ok")
+
+        dd = RecordingDd()
+        composite = CompositeOwnerSource([dd, line], kinds={"dd": dd, "line": line})
+        b = bridge(
+            tmp_path,
+            FakeBus([decision("d-1", 1, card="card-1")], refs={"q-1": ["d-1"]}),
+            composite,
+        )
+        record = b.run_once()
+        assert record["resumed"] == 1
+        after = json.loads(stall.read_text(encoding="utf-8"))
+        assert after["dispatched_decision_consumed_at"] is not None
+        assert after["parked_run_id"] == "run-1"  # the scheduler wakes, not the bridge
+
+    def test_a_resume_without_dispatch_provenance_leaves_no_wake_fact(self, tmp_path: Path) -> None:
+        """Negative: a dd development with no `dispatched_by` (a human subject,
+        or a pre-provenance admission) writes nothing -- no stall-state file is
+        created for a line nothing points at."""
+        stall = self._wake_line(tmp_path)
+        run_root = tmp_path / "runs"
+        line = LineOwnerSource(run_root, ["wf-1"])
+
+        class PlainDd(OwnerSource):
+            def discover(self, question_note_id: str) -> list[OwnerTarget]:
+                return []
+
+            def discover_all(self) -> list[OwnerTarget]:
+                return [
+                    OwnerTarget(
+                        kind="dd",
+                        id="dev-abc",
+                        generation=1,
+                        question_note_id="q-1",
+                        card_entity_id="card-1",
+                        state="awaiting_gate",
+                    )
+                ]
+
+            def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
+                return OwnerResult(RESUME_RESUMED, "ok")
+
+        dd = PlainDd()
+        composite = CompositeOwnerSource([dd, line], kinds={"dd": dd, "line": line})
+        b = bridge(
+            tmp_path,
+            FakeBus([decision("d-1", 1, card="card-1")], refs={"q-1": ["d-1"]}),
+            composite,
+        )
+        record = b.run_once()
+        assert record["resumed"] == 1
+        after = json.loads(stall.read_text(encoding="utf-8"))
+        assert after.get("dispatched_decision_consumed_at") is None
+
+    def test_a_refused_resume_writes_no_wake_fact(self, tmp_path: Path) -> None:
+        """A decision that could not be delivered to the dd single (refused)
+        has not consumed anything, so there is no wake fact for the line."""
+        stall = self._wake_line(tmp_path)
+        run_root = tmp_path / "runs"
+        line = LineOwnerSource(run_root, ["wf-1"])
+
+        class RefusingDd(OwnerSource):
+            def discover(self, question_note_id: str) -> list[OwnerTarget]:
+                return []
+
+            def discover_all(self) -> list[OwnerTarget]:
+                return [
+                    OwnerTarget(
+                        kind="dd",
+                        id="dev-abc",
+                        generation=1,
+                        question_note_id="q-1",
+                        card_entity_id="card-1",
+                        state="awaiting_gate",
+                        dispatched_by="wf-1",
+                    )
+                ]
+
+            def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
+                return OwnerResult(RESUME_REFUSED, "gate error")
+
+        dd = RefusingDd()
+        composite = CompositeOwnerSource([dd, line], kinds={"dd": dd, "line": line})
+        b = bridge(
+            tmp_path,
+            FakeBus([decision("d-1", 1, card="card-1")], refs={"q-1": ["d-1"]}),
+            composite,
+        )
+        record = b.run_once()
+        assert record["resumed"] == 0
+        after = json.loads(stall.read_text(encoding="utf-8"))
+        assert after.get("dispatched_decision_consumed_at") is None
+
+    def test_the_replay_path_rebuilds_provenance_from_the_admission_record(
+        self, tmp_path: Path
+    ) -> None:
+        """The crash-window replay reconstructs the target without provenance,
+        so the bridge re-reads `dispatched_by` from the admission record and
+        still records the wake fact exactly once."""
+        stall = self._wake_line(tmp_path)
+        run_root = tmp_path / "runs"
+        line = LineOwnerSource(run_root, ["wf-1"])
+        dd_root = tmp_path / "dd"
+        dev_root = dd_root / "dev-abc"
+        dev_root.mkdir(parents=True)
+        (dev_root / "record.json").write_text(
+            json.dumps({"development_id": "dev-abc", "dispatched_by": "wf-1"}),
+            encoding="utf-8",
+        )
+
+        class ReplayingDd(OwnerSource):
+            def discover(self, question_note_id: str) -> list[OwnerTarget]:
+                return []
+
+            def discover_all(self) -> list[OwnerTarget]:
+                return []
+
+            def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
+                return OwnerResult(RESUME_ALREADY_RESUMED, "dedup")
+
+        dd = ReplayingDd()
+        dd.dispatched_by = DdOwnerSource(dd_root).dispatched_by  # type: ignore[attr-defined]
+        composite = CompositeOwnerSource([dd, line], kinds={"dd": dd, "line": line})
+        store = BridgeStore(tmp_path / "bridge").open()
+        store.record_intent(
+            {
+                "source_message_id": "d-1",
+                "action_key": "e1:d-1:dd:dev-abc:1",
+                "target_kind": "dd",
+                "target_id": "dev-abc",
+                "generation": 1,
+                "question_note_id": "q-1",
+                "card_entity_id": "card-1",
+                "reason": "",
+                "source_event": decision("d-1", 1, card="card-1"),
+            }
+        )
+        store.close()
+
+        b = bridge(
+            tmp_path,
+            FakeBus([decision("d-1", 1, card="card-1")], refs={"q-1": ["d-1"]}),
+            composite,
+            store=BridgeStore(tmp_path / "bridge").open(),
+        )
+        record = b.run_once()
+        assert record["resumed"] == 0  # a replay, not a new logical resume
+        after = json.loads(stall.read_text(encoding="utf-8"))
+        assert after["dispatched_decision_consumed_at"] is not None
+
 
 # --- the old polling fallback survives --------------------------------------
 
