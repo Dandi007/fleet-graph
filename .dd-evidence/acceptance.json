@@ -1,0 +1,37 @@
+{
+ "development_id": "dev-fg-ad79746d57a7",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "bash",
+    "-lc",
+    "test -x scripts/verify-lim.sh"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "bash",
+    "-lc",
+    "out=$(bash scripts/verify-lim.sh 2>/dev/null); rc=$?; n=$(printf \"%s\\n\" \"$out\" | grep -cE \"^[0-9]{2} [a-z0-9-]+ (PASS|FAIL)\"); f=$(printf \"%s\\n\" \"$out\" | grep -cE \"^[0-9]{2} [a-z0-9-]+ FAIL\"); test \"$n\" -eq 16 && test \"$rc\" -eq \"$f\""
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "bash",
+    "-lc",
+    "c=$(bash scripts/verify-lim.sh 2>/dev/null | grep -E \"^(03|07) \" | grep -c FAIL); test \"$c\" -eq 2"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": ""
+  }
+ ]
+}
