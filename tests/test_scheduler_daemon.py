@@ -18,6 +18,7 @@ from fleet_graph.scheduler.daemon import (
 )
 from fleet_graph.scheduler.ignition import Refusal
 from fleet_graph.scheduler.launcher import LaunchResult
+from fleet_graph.state.completion import CompletionVerdict, product_on_default_branch
 
 _DEFAULT = object()
 
@@ -61,6 +62,7 @@ def make(
     units: FakeUnits | None = None,
     launcher: FakeLauncher | None = None,
     prober: Any = _DEFAULT,
+    completion: Any = None,
     now: float = 1000.0,
     slept: list[float] | None = None,
     **config: Any,
@@ -77,6 +79,7 @@ def make(
         units=units or FakeUnits(),
         clock=lambda: now,
         sleep=(slept.append if slept is not None else (lambda _s: None)),
+        completion=completion,
     )
 
 
@@ -1061,3 +1064,188 @@ class TestAcceptanceDeclaration:
         spec = make(tmp_path).spec_for(LineSpec(folder_id="wf-1", seat="s", enabled=True))
         assert "--noop-limit" not in spec.argv()
         assert "--timeout-limit" not in spec.argv()
+
+
+class FakeCompletionGate:
+    """The G2 gate the tests drive: it returns the verdict the test scripts."""
+
+    def __init__(
+        self,
+        verdicts: dict[str, CompletionVerdict] | None = None,
+        *,
+        raises: bool = False,
+    ) -> None:
+        self.verdicts = verdicts or {}
+        self.raises = raises
+        self.asked: list[tuple[str, dict[str, Any]]] = []
+
+    def verdict_for(self, folder_id: str, terminal: dict[str, Any]) -> CompletionVerdict:
+        self.asked.append((folder_id, terminal))
+        if self.raises:
+            raise RuntimeError("gate could not reach git")
+        return self.verdicts[folder_id]
+
+
+class TestTheCompletionGate:
+    """G2: a `done` line retires only when its product is on the default branch.
+
+    The gate is opt-in (like checkpoints, revives, parking): with no gate
+    injected, `done` stays final exactly as before. With a gate, a negative
+    verdict holds the line in pending acceptance -- refused, not re-ignited,
+    and the refusal names the development and the missing feature lines.
+
+    The last test is the mutation guard the spec demands: a dd record saying
+    ``terminal=complete`` (here, the line's ``done`` terminal) is *never* proof
+    the product reached the branch. Make the determination return "on branch"
+    whenever the record is complete, and
+    ``test_a_complete_record_is_not_proof_the_product_reached_the_branch`` goes
+    red.
+    """
+
+    def _gate(
+        self, development_id: str = "dev-fg-81dbb77434fa", **verdict_kwargs: Any
+    ) -> FakeCompletionGate:
+        verdict = CompletionVerdict(development_id=development_id, **verdict_kwargs)
+        return FakeCompletionGate({"wf-1": verdict})
+
+    def test_a_done_line_with_the_product_on_the_branch_retires(self, tmp_path: Path) -> None:
+        write_terminal(tmp_path, "wf-1", "done")
+        gate = self._gate(
+            development_id="dev-fg-81dbb77434fa", on_default_branch=True, found=8, total=8
+        )
+        result = make(tmp_path, completion=gate).tick()[0]
+
+        assert result.decision.refusal is Refusal.TERMINAL_DONE
+        assert result.completion is not None
+        assert result.completion.on_default_branch is True
+
+    def test_a_done_line_off_the_branch_does_not_retire(self, tmp_path: Path) -> None:
+        write_terminal(tmp_path, "wf-1", "done")
+        gate = self._gate(
+            development_id="dev-fg-81dbb77434fa",
+            on_default_branch=False,
+            found=0,
+            total=8,
+            missing=("feature-a", "feature-b"),
+        )
+        result = make(tmp_path, completion=gate).tick()[0]
+
+        assert result.decision.refusal is Refusal.PENDING_DEFAULT_BRANCH
+        assert "dev-fg-81dbb77434fa" in result.decision.detail
+        assert "missing" in result.decision.detail and "feature-a" in result.decision.detail
+        assert result.decision.ignite is False
+
+    def test_no_gate_keeps_the_legacy_done_reading(self, tmp_path: Path) -> None:
+        write_terminal(tmp_path, "wf-1", "done")
+        assert make(tmp_path).tick()[0].decision.refusal is Refusal.TERMINAL_DONE
+
+    def test_the_gate_is_consulted_only_for_done_lines(self, tmp_path: Path) -> None:
+        write_terminal(tmp_path, "wf-1", "blocked")
+        gate = self._gate(on_default_branch=False, found=0, total=8)
+        result = make(tmp_path, completion=gate).tick()[0]
+
+        assert result.decision.ignite
+        assert gate.asked == []
+
+    def test_a_gate_that_cannot_answer_fails_closed(self, tmp_path: Path) -> None:
+        """Unlike the parking probes' fail-open, a retirement gate must not
+        retire on an unverified `done` -- that is the exact silent defect G2
+        exists to stop."""
+        write_terminal(tmp_path, "wf-1", "done")
+        gate = FakeCompletionGate(
+            {
+                "wf-1": CompletionVerdict(
+                    development_id="dev-fg-81dbb77434fa", on_default_branch=True, found=8, total=8
+                )
+            },
+            raises=True,
+        )
+        result = make(tmp_path, completion=gate).tick()[0]
+
+        assert result.decision.refusal is Refusal.PENDING_DEFAULT_BRANCH
+        assert "could not verify" in result.decision.detail
+
+    def test_the_verdict_rides_the_observed_result(self, tmp_path: Path) -> None:
+        write_terminal(tmp_path, "wf-1", "done")
+        gate = self._gate(
+            development_id="dev-fg-b0ea914caf0e",
+            on_default_branch=False,
+            found=2,
+            total=8,
+            missing=("g3", "g4", "g5", "g6", "g7", "g8"),
+        )
+        record = make(tmp_path, completion=gate).tick()[0].as_dict()
+
+        assert record["refusal"] == "pending_default_branch"
+        assert record["completion_gate"]["development_id"] == "dev-fg-b0ea914caf0e"
+        assert record["completion_gate"]["found"] == 2
+        assert record["completion_gate"]["total"] == 8
+
+    def test_a_complete_record_is_not_proof_the_product_reached_the_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """The spec's mutation guard: ``terminal=done`` is the line's word that
+        the work is complete; it is not evidence the product is on the default
+        branch. A gate that reports a gap must hold the line even though the
+        record is, in dd terms, ``terminal=complete``."""
+        write_terminal(tmp_path, "wf-1", "done")
+        gate = self._gate(
+            development_id="dev-fg-b0ea914caf0e",
+            on_default_branch=False,
+            found=2,
+            total=8,
+            missing=("g3", "g4", "g5", "g6", "g7", "g8"),
+        )
+        result = make(tmp_path, completion=gate).tick()[0]
+
+        assert result.decision.refusal is not Refusal.TERMINAL_DONE
+        assert result.decision.refusal is Refusal.PENDING_DEFAULT_BRANCH
+
+
+class TestTheMechanicalJudgement:
+    """The two real regression samples, their conclusions hard-coded -- not
+    guessed. ``dev-fg-81dbb77434fa`` added 253 lines and canonical got none;
+    ``dev-fg-b0ea914caf0e``'s 102 lines hit only 2 of 8 feature lines."""
+
+    def test_reverse_apply_is_a_positive(self) -> None:
+        verdict = product_on_default_branch("d", ("a", "b"), reverse_applies_cleanly=True)
+        assert verdict.on_default_branch is True
+        assert verdict.method == "reverse-apply"
+
+    def test_all_feature_lines_found_is_a_positive(self) -> None:
+        verdict = product_on_default_branch("d", ("a", "b"), found_lines=("a", "b"))
+        assert verdict.on_default_branch is True
+        assert verdict.found == 2
+        assert verdict.total == 2
+        assert verdict.missing == ()
+
+    def test_a_gap_is_negative_and_names_what_is_missing(self) -> None:
+        verdict = product_on_default_branch("d", ("a", "b", "c"), found_lines=("a",))
+        assert verdict.on_default_branch is False
+        assert verdict.found == 1
+        assert verdict.total == 3
+        assert verdict.missing == ("b", "c")
+
+    def test_81dbb77434fa_is_not_on_the_default_branch(self) -> None:
+        feature_lines = tuple(f"line-{i}" for i in range(8))
+        verdict = product_on_default_branch("dev-fg-81dbb77434fa", feature_lines, found_lines=())
+        assert verdict.on_default_branch is False
+        assert verdict.found == 0
+        assert verdict.total == 8
+        assert len(verdict.missing) == 8
+
+    def test_b0ea914caf0e_hit_only_two_of_eight(self) -> None:
+        feature_lines = tuple(f"feature-{i}" for i in range(1, 9))
+        verdict = product_on_default_branch(
+            "dev-fg-b0ea914caf0e", feature_lines, found_lines=("feature-1", "feature-2")
+        )
+        assert verdict.on_default_branch is False
+        assert verdict.found == 2
+        assert verdict.total == 8
+        assert verdict.missing == tuple(f"feature-{i}" for i in range(3, 9))
+
+    def test_an_empty_product_without_a_clean_reverse_apply_is_negative(self) -> None:
+        """No feature lines and no reverse-apply is not evidence of anything:
+        it must not read as 'on the branch'."""
+        verdict = product_on_default_branch("d", ())
+        assert verdict.on_default_branch is False

@@ -45,6 +45,13 @@ class Refusal(StrEnum):
     TOTAL_CAP_REACHED = "total_cap_reached"
     GATEWAY_RED = "gateway_red"
     NO_PROBE = "no_probe"
+    #: G2 line-completion gate: the line declared `done` but its product has
+    #: not been confirmed on the default branch, so the line must not retire.
+    #: Unlike TERMINAL_DONE (final), this is a *pending-acceptance* hold: the
+    #: line is not re-ignited -- its work is done -- but it is refused with the
+    #: development and the missing feature lines named, until the supervision
+    #: surface confirms the product reached the default branch.
+    PENDING_DEFAULT_BRANCH = "pending_default_branch"
 
 
 def backoff_seconds(
