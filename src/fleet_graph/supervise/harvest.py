@@ -359,6 +359,30 @@ def _record_auth(
     )
 
 
+def _effective_deploy_command(
+    allowlist: HarvestAllowlist,
+    repo_path: str,
+    declared: list[str],
+) -> list[str]:
+    """解析本单的生效 deploy 命令（案A改写②：只授合并权）。
+
+    命中条目后，生效 deploy 命令取自条目 `allowed_deploy` 而非全局
+    `deps.deploy_command`：条目 `allowed_deploy` 为空（merge-only）时生效
+    deploy 命令恒为空 argv——只合并、不部署，走 deploy 节点既有 no-op 路径；
+    条目允许部署命令时沿用声明的命令，由 gate 的 authorize 校验其必须在
+    `allowed_deploy` 白名单内（声明与白名单不符 -> 拒）。未命中条目时保持
+    声明值（gate 会按 deny-all 拒绝 repo 本身）。
+    """
+    if not repo_path:
+        return list(declared)
+    entry = allowlist.entry_for(repo_path)
+    if entry is None:
+        return list(declared)
+    if not entry.allowed_deploy:
+        return []
+    return list(declared)
+
+
 # --- the graph --------------------------------------------------------------
 
 
@@ -425,7 +449,11 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             "record_worktree": record_worktree,
             "remote_url": remote_url,
             "default_branch": deps.default_branch,
-            "deploy_command": list(deps.deploy_command),
+            "deploy_command": _effective_deploy_command(
+                deps.allowlist,
+                str(repo) if repo is not None else "",
+                list(deps.deploy_command),
+            ),
             "steps": steps,
             "_gaps": gaps,
             "outcome": outcome,
@@ -731,9 +759,13 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "steps": _record_auth(state, auth, "deploy"),
                 "outcome": OUTCOME_REFUSED,
             }
-        steps = _record_step(state, "deploy", command=command)
         if not command:
+            # 案A改写②：生效 deploy 命令为空 argv（merge-only 条目）-> 合法
+            # no-op，deploy_exit_code==0，postconditions 不得据此判红、不当作
+            # 未执行写步误报。
+            steps = _record_step(state, "deploy", command=[], ok=True)
             return {"steps": steps, "deploy_exit_code": 0}
+        steps = _record_step(state, "deploy", command=command)
         repo = Path(state.get("repo_path") or "")
         try:
             exit_code = int(deps.ops.deploy(command, repo))
@@ -858,6 +890,12 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         假（机械事实，非自述）也计缺失 -> escalated——「收割链里非零退出必须
         停下来交人工」落进代码，任何中途 step 的 ok:false 都不再被静默吞掉
         （H2 终局语义缺口修复）。
+
+        **案A改写②（只授合并权）**：merge-only 条目（`allowed_deploy: []`）的
+        生效 deploy 命令恒为空 argv，deploy 节点走既有 no-op 路径并记录
+        `ok: True` + `deploy_exit_code: 0`——postconditions 承认这是合法 no-op
+        （只合并、不部署），绝不因此判红、绝不当作未执行写步误报；deploy 命令
+        非零退出码仍由 deploy step 的 ok:false 与这里显式校验兜底判红。
         """
         missing: list[str] = []
         if not state.get("pr_merged"):
@@ -866,6 +904,9 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             missing.append("PR merged 链接缺失（无真实 forge PR 链接）")
         if state.get("verify_exit_code") != 0:
             missing.append(f"verify 命令退出码 {state.get('verify_exit_code')!r} != 0")
+        deploy_exit = state.get("deploy_exit_code")
+        if deploy_exit not in (None, 0):
+            missing.append(f"deploy 命令退出码 {deploy_exit!r} != 0")
         if not state.get("evidence_note_id"):
             missing.append("evidence note 不存在（未挂卡）")
         for step in state.get("steps") or []:

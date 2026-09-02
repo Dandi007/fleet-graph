@@ -124,6 +124,57 @@ class TestDeployAllowlist:
         assert auth.granted is True
 
 
+class TestMergeOnlyEntry:
+    """案A改写②：allowed_deploy=[]（merge-only）条目只授合并权。
+
+    - merge-only 条目 + 空 deploy 请求 -> 不误拒（granted=True）；
+    - merge-only 条目 + 非空 deploy 请求（声明与白名单不符）-> 拒，reasons
+      指名 offending 命令与缺失授权。
+    """
+
+    def merge_only(self, **overrides: Any) -> HarvestAllowlist:
+        raw: dict[str, Any] = {
+            "entries": [
+                {
+                    "repo_path": "/data/code/self/fleet-graph",
+                    "allowed_branches": ["refs/heads/main"],
+                    "allowed_deploy": [],
+                }
+            ]
+        }
+        raw.update(overrides)
+        return parse_harvest_allowlist(raw)
+
+    def test_merge_only_empty_deploy_not_wrongly_refused(self) -> None:
+        auth = self.merge_only().authorize(
+            repo_path="/data/code/self/fleet-graph",
+            branch="refs/heads/main",
+            deploy=(),
+        )
+        assert auth.granted is True
+        assert auth.reasons == ()
+
+    def test_merge_only_nonempty_deploy_refused_naming_command(self) -> None:
+        auth = self.merge_only().authorize(
+            repo_path="/data/code/self/fleet-graph",
+            branch="refs/heads/main",
+            deploy=("make", "deploy"),
+        )
+        assert auth.granted is False
+        reasons = auth.reasons
+        assert any("make" in r and "deploy" in r for r in reasons), reasons
+        assert any("授权缺失" in r for r in reasons), reasons
+
+    def test_merge_only_branch_still_enforced(self) -> None:
+        auth = self.merge_only().authorize(
+            repo_path="/data/code/self/fleet-graph",
+            branch="refs/heads/other/x",
+            deploy=(),
+        )
+        assert auth.granted is False
+        assert any("不在白名单" in r for r in auth.reasons)
+
+
 class TestConfigParsing:
     def test_relative_repo_path_is_refused(self) -> None:
         with pytest.raises(HarvestAllowlistError, match="绝对路径"):

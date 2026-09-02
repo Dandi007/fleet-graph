@@ -395,6 +395,105 @@ class TestHarvestAllowlistRefusal:
         assert result["outcome"] == OUTCOME_REFUSED
         assert fake["calls"] == []
 
+    def test_merge_only_declared_command_not_in_whitelist_refuses(self, tmp_path: Path) -> None:
+        """案A改写②反向：条目（生效）声明部署命令而该命令确实不在
+        `allowed_deploy` 白名单内（声明与白名单不符）-> gate 必须拒
+        （granted=false + reasons 指名 offending 命令与缺失授权），整单不走。"""
+        fake = fake_ops()
+        allowlist = full_allowlist(
+            entries=[
+                {
+                    "repo_path": "/data/code/self/fleet-graph",
+                    "allowed_branches": ["refs/heads/main"],
+                    "allowed_deploy": [["make", "deploy"]],
+                }
+            ]
+        )
+        config, _ = config_for(
+            tmp_path,
+            allowlist=allowlist,
+            deploy_command=["make", "undeploy"],
+            ops=fake,
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_REFUSED
+        assert fake["calls"] == [], f"write primitives executed: {fake['calls']}"
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["allowlist_auth"]["granted"] is False
+        reasons = receipt["allowlist_auth"]["reasons"]
+        assert any("make" in r and "undeploy" in r for r in reasons), reasons
+        assert any("授权缺失" in r for r in reasons), reasons
+
+
+class TestMergeOnlyHarvest:
+    """案A改写②阳性：`allowed_deploy: []`（merge-only）只授合并权。
+
+    生效 deploy 命令取自条目 `allowed_deploy` 而非全局 `deps.deploy_command`：
+    条目 `allowed_deploy: []` 时生效命令恒为空 argv，deploy 走既有 no-op 路径，
+    `deploy_exit_code == 0`，postconditions 不判红、不当作未执行写步误报——收割
+    能走到 `harvested`（只合并、不部署）。
+    """
+
+    def merge_only_allowlist(self, repo_path: str) -> HarvestAllowlist:
+        return parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": repo_path,
+                        "allowed_branches": ["refs/heads/main"],
+                        "allowed_deploy": [],
+                    }
+                ]
+            }
+        )
+
+    def test_merge_only_harvests_with_noop_deploy(self, tmp_path: Path) -> None:
+        fake = fake_ops()
+        repo = repo_path_for(tmp_path)
+        config, _ = config_for(
+            tmp_path,
+            repo_path=repo,
+            allowlist=self.merge_only_allowlist(repo),
+            ops=fake,
+            bus=FakeBus(),
+            deploy_command=["make", "deploy"],
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["deploy_exit_code"] == 0
+        # deploy 是合法 no-op：ops 不执行任何部署命令。
+        assert "deploy" not in fake["calls"], fake["calls"]
+        deploy_steps = [s for s in receipt["steps"] if s["step"] == "deploy"]
+        assert deploy_steps and all(s.get("command") == [] for s in deploy_steps)
+        # postconditions 不判红、不当作未执行写步误报。
+        post = next(s for s in receipt["steps"] if s["step"] == "postconditions")
+        assert post["ok"] is True
+        assert (post.get("missing") or []) == []
+        assert "deploy" not in [str(m) for m in (post.get("missing") or [])]
+        # 生效 deploy 命令取自条目而非全局：全局 deploy_command 被忽略。
+        assert receipt["steps"]
+
+    def test_merge_only_effective_command_comes_from_entry_not_global(
+        self, tmp_path: Path
+    ) -> None:
+        """生效命令取自条目 allowed_deploy（空）而非全局 deps.deploy_command。"""
+        fake = fake_ops()
+        repo = repo_path_for(tmp_path)
+        config, _ = config_for(
+            tmp_path,
+            repo_path=repo,
+            allowlist=self.merge_only_allowlist(repo),
+            ops=fake,
+            bus=FakeBus(),
+            deploy_command=["/bin/rm", "-rf", "/"],
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert "deploy" not in fake["calls"], fake["calls"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["deploy_exit_code"] == 0
+
 
 class TestHarvestOrchestration:
     """交付 D.2：E5 事件 -> 编排步骤齐全。"""

@@ -155,9 +155,19 @@ class HarvestAllowlist:
         if not branch or not any(branch.startswith(prefix) for prefix in entry.allowed_branches):
             reasons.append(f"分支/ref {branch!r} 不在白名单 {list(entry.allowed_branches)} 内")
 
+        # 案A改写②（只授合并权）：allowed_deploy 为空 = merge-only 条目——生效
+        # deploy 命令恒为空 argv（由编排层解析），这里不误拒：空 deploy 请求直接
+        # 放行；请求了部署命令而该命令确实不在白名单内（声明与白名单不符）才拒，
+        # 并指名 offending 命令与缺失授权。
         if deploy and not any(argv == deploy for argv in entry.allowed_deploy):
+            detail = (
+                "（merge-only 条目不授任何部署命令——授权缺失）"
+                if not entry.allowed_deploy
+                else "（授权缺失）"
+            )
             reasons.append(
                 f"部署命令 {list(deploy)!r} 不在白名单 {[list(a) for a in entry.allowed_deploy]} 内"
+                f"{detail}"
             )
 
         return HarvestAuthorization(granted=not reasons, reasons=tuple(reasons))

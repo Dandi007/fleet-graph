@@ -1145,7 +1145,13 @@ class DefaultHarvestOps:
         return {"ok": True, "head": head_proc.stdout.strip()}
 
     def deploy(self, command: list[str], repo: Path) -> int:
-        """在 canonical 仓绝对路径 cwd 下执行部署命令（缺 cwd 是 127 假绿根因）。"""
+        """在 canonical 仓绝对路径 cwd 下执行部署命令（缺 cwd 是 127 假绿根因）。
+
+        **案A改写②（只授合并权）**：空 argv（merge-only 条目生效 deploy 命令
+        恒为空）是合法 no-op——直接返回 0，绝不执行 subprocess、绝不碰 repo。
+        """
+        if not command:
+            return 0
         return int(_run(list(command), cwd=repo).get("exit_code") or 0)
 
     def verify_real(self, argv: list[str], repo: Path, expected_head: str | None) -> int:
