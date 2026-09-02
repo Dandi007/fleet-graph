@@ -46,3 +46,38 @@ class TestMcpOnlyScaffold:
             "the scaffold must produce real per-criterion output, not substitute "
             "'No such file or directory' for a missing script"
         )
+
+    def test_m1_probe_covers_line_state_port_5615(self) -> None:
+        """Pin the M1 probe to the line-state MCP surface :5615.
+
+        Deliverable of wf-525fd4 M1 acceptance: the M1 probe must cover the
+        line-state face's port (:5615), register-check both read-only tools,
+        and field-compare generation/round/phase against the same-source
+        :7494 /v1/lines answer (never a second reader).
+        """
+        text = SCRIPT.read_text(encoding="utf-8")
+        assert "5615" in text, "M1 probe must cover the line-state MCP surface :5615"
+        assert "list_line_states" in text and "get_line_state" in text, (
+            "M1 probe must register-check both line-state tools"
+        )
+        for field in ("generation", "round", "phase"):
+            assert field in text, f"M1 probe must field-compare {field}"
+        assert "/v1/lines" in text, (
+            "M1 probe must compare against the same-source :7494 /v1/lines"
+        )
+
+    def test_m1_probe_reports_connection_refused_when_5615_unreachable(self) -> None:
+        """When :5615 is not live, the M1 阳性 criterion must honestly report
+        'connection refused' evidence and count red (不可判定), never a fake
+        green nor a fake 'no line-state tool'."""
+        proc = _run_script()
+        output = proc.stdout + proc.stderr
+        lines = output.splitlines()
+        for i, line in enumerate(lines):
+            if line.startswith("M1[阳性]"):
+                assert "不可判定" in line, line
+                evidence = lines[i + 1] if i + 1 < len(lines) else ""
+                assert evidence.startswith("    证据:"), evidence
+                assert "connection refused" in evidence, evidence
+                return
+        raise AssertionError(f"saw no M1 阳性 line:\n{output}")

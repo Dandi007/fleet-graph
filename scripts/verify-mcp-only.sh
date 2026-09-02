@@ -211,39 +211,131 @@ else:
 
 # ---------------- M1 ----------------
 # M1 阳性：正在跑的线，MCP 工具返回的 generation/round/phase 与同刻 :7494 逐字段相等。
-rm_code, _ = http_get(f"http://127.0.0.1:{READ_MODEL}/mcp")
-line_tool = None
-for port in (BUS, RONIN, DD, GOAL, RESEARCH, DECISION):
-    tools = mcp_tools(port)
-    if not tools:
-        continue
+# 线状态面在 :5615（fleet-graph-line-state），serve list_line_states / get_line_state 两个只读工具。
+LINE_STATE = 5615
+WRITE_TOKENS = ("set", "update", "clear", "patch", "deliver", "wake", "park")
+
+M1_POS_DESC = "正在跑的线，MCP 工具返回的 generation/round/phase 与同刻 :7494 逐字段相等"
+M1_NEG_DESC = "线状态面只读，不得暴露任何写能力（给一个写原语必须有用例变红）"
+
+
+def _line_state_write_offenders(tools):
+    offenders = []
     for t in tools:
-        name = t.get("name") or ""
-        if "line" in name and any(k in name for k in ("state", "status", "gen", "round")):
-            line_tool = f":{port} {name}"
-            break
-if rm_code is None and line_tool is None:
-    emit("M1", "阳性", "不可判定",
-         "正在跑的线，MCP 工具返回的 generation/round/phase 与同刻 :7494 逐字段相等",
-         f":{READ_MODEL} /mcp 与各 MCP 面均不可达：connection refused，无从比对")
-elif line_tool is not None:
-    emit("M1", "阳性", "绿",
-         "正在跑的线，MCP 工具返回的 generation/round/phase 与同刻 :7494 逐字段相等",
-         f"存在 line-state 工具 {line_tool}，可与 :{READ_MODEL} 逐字段比对")
+        name = str(t.get("name") or "").lower()
+        for token in WRITE_TOKENS:
+            if token in name:
+                offenders.append(f"工具名 {t.get('name')!r} 含写原语 {token!r}")
+        props = (t.get("inputSchema") or {}).get("properties") or {}
+        for prop in props:
+            pl = str(prop).lower()
+            for token in WRITE_TOKENS:
+                if token in pl:
+                    offenders.append(f"工具 {t.get('name')!r} inputSchema 参数 {prop!r} 含写原语 {token!r}")
+    return list(dict.fromkeys(offenders))
+
+
+ls_tools = mcp_tools(LINE_STATE)
+if ls_tools is None:
+    # :5615 不可达（尚未部署 / 未 live）：诚实报不可判定 + connection refused 证据，计红；
+    # 不伪造为绿，也不伪造为「不存在 line-state 工具」。
+    emit("M1", "阳性", "不可判定", M1_POS_DESC,
+         f"fleet-graph-line-state :{LINE_STATE} 不可达：connection refused（探 tools/list 失败）；"
+         "线状态面尚未部署/未 live，不可伪造绿亦不伪称「无 line-state 工具」，generation/round/phase 无从逐字段比对")
 else:
-    emit("M1", "阳性", "红",
-         "正在跑的线，MCP 工具返回的 generation/round/phase 与同刻 :7494 逐字段相等",
-         f":{READ_MODEL} /mcp 返回 {rm_code}（非 MCP，线状态只在裸 HTTP 读模型）；各 MCP 面 tools/list 无 line-state 工具，generation/round/phase 无从逐字段比对")
+    ls_names = {t.get("name") for t in ls_tools}
+    missing = {"list_line_states", "get_line_state"} - ls_names
+    if missing:
+        emit("M1", "阳性", "红", M1_POS_DESC,
+             f":{LINE_STATE} tools/list 缺线状态工具 {sorted(missing)}（实测注册 {sorted(ls_names)}），"
+             "list_line_states/get_line_state 未齐全，无从逐字段比对")
+    else:
+        lm_code, lm_body = http_get(f"http://127.0.0.1:{READ_MODEL}/v1/lines")
+        if lm_code is None:
+            emit("M1", "阳性", "不可判定", M1_POS_DESC,
+                 f":{READ_MODEL} /v1/lines 不可达：connection refused；虽有 :{LINE_STATE} 线状态工具但无同刻参照，"
+                 "generation/round/phase 无从逐字段比对")
+        else:
+            list_res = mcp_call(LINE_STATE, "list_line_states", {})
+            if list_res is None:
+                emit("M1", "阳性", "不可判定", M1_POS_DESC,
+                     f":{LINE_STATE} list_line_states tools/call 失败（tools/list 可达而调用失败），无从逐字段比对")
+            else:
+                list_err, list_text = list_res
+                if list_err:
+                    emit("M1", "阳性", "红", M1_POS_DESC,
+                         f":{LINE_STATE} list_line_states 调用返回错误：{list_text[:200] if list_text else 'empty'}")
+                else:
+                    try:
+                        ref_lines = json.loads(lm_body).get("lines", [])
+                    except Exception:
+                        ref_lines = []
+                    try:
+                        mcp_lines = json.loads(list_text).get("lines", [])
+                    except Exception:
+                        mcp_lines = []
+                    mcp_by_id = {l.get("folder_id"): l for l in mcp_lines if l.get("folder_id")}
+                    ref_by_id = {l.get("folder_id"): l for l in ref_lines if l.get("folder_id")}
+                    running_ids = [fid for fid, l in ref_by_id.items() if not l.get("terminal")]
+                    if not running_ids:
+                        emit("M1", "阳性", "不可判定", M1_POS_DESC,
+                             f":{READ_MODEL} /v1/lines 当前无 terminal 为空的「正在跑的线」，generation/round/phase 逐字段比对无从实测")
+                    else:
+                        folder = running_ids[0]
+                        ref_line = ref_by_id[folder]
+                        mcp_line = mcp_by_id.get(folder)
+                        if mcp_line is None:
+                            emit("M1", "阳性", "红", M1_POS_DESC,
+                                 f"list_line_states 未含正在跑的线 {folder}（:{READ_MODEL} /v1/lines 有而 MCP list 无），"
+                                 "generation/round/phase 无从比对")
+                        else:
+                            list_diffs = [
+                                f"{field}: list={mcp_line.get(field)!r} vs :7494={ref_line.get(field)!r}"
+                                for field in ("generation", "round", "phase")
+                                if mcp_line.get(field) != ref_line.get(field)
+                            ]
+                            get_res = mcp_call(LINE_STATE, "get_line_state", {"folder_id": folder})
+                            if get_res is None:
+                                emit("M1", "阳性", "红", M1_POS_DESC,
+                                     f"正在跑的线 {folder} list 逐字段{'不等：' + '；'.join(list_diffs) if list_diffs else '相等'}，"
+                                     f"但 get_line_state tools/call 失败，无法补齐同源佐证")
+                            else:
+                                get_err, get_text = get_res
+                                if get_err:
+                                    emit("M1", "阳性", "红", M1_POS_DESC,
+                                         f"正在跑的线 {folder} list 逐字段{'不等：' + '；'.join(list_diffs) if list_diffs else '相等'}，"
+                                         f"但 get_line_state 返回错误：{get_text[:200] if get_text else 'empty'}")
+                                else:
+                                    try:
+                                        get_line = json.loads(get_text)
+                                    except Exception:
+                                        get_line = {}
+                                    get_diffs = [
+                                        f"{field}: get={get_line.get(field)!r} vs :7494={ref_line.get(field)!r}"
+                                        for field in ("generation", "round", "phase")
+                                        if get_line.get(field) != ref_line.get(field)
+                                    ]
+                                    all_diffs = list(dict.fromkeys(list_diffs + get_diffs))
+                                    if all_diffs:
+                                        emit("M1", "阳性", "红", M1_POS_DESC,
+                                             f"正在跑的线 {folder} 逐字段不等（同源应相等）：{'；'.join(all_diffs)}")
+                                    else:
+                                        emit("M1", "阳性", "绿", M1_POS_DESC,
+                                             f"list_line_states 与 get_line_state 实测正在跑的线 {folder} 的 "
+                                             f"generation/round/phase 与同刻 :{READ_MODEL} /v1/lines 逐字段相等（同源）")
 
 # M1 阴性：线状态面只读，不得暴露任何写能力（给一个写原语必须有用例变红）。
-if line_tool is None:
-    emit("M1", "阴性", "不可判定",
-         "线状态面只读，不得暴露任何写能力（给一个写原语必须有用例变红）",
-         f"无 line-state MCP 工具（:{READ_MODEL} /mcp 返回 {rm_code}），只读/无写能力无从探测验证")
+if ls_tools is None:
+    emit("M1", "阴性", "不可判定", M1_NEG_DESC,
+         f"fleet-graph-line-state :{LINE_STATE} 不可达：connection refused，只读/无写能力无从探测验证")
 else:
-    emit("M1", "阴性", "绿",
-         "线状态面只读，不得暴露任何写能力（给一个写原语必须有用例变红）",
-         f"{line_tool} 为只读工具，写原语有用例会变红（需给写原语时验证）")
+    offenders = _line_state_write_offenders(ls_tools)
+    if offenders:
+        emit("M1", "阴性", "红", M1_NEG_DESC,
+             f":{LINE_STATE} 线状态面暴露写原语：{'；'.join(offenders)}——只读面被破坏（给写原语必须有用例变红）")
+    else:
+        emit("M1", "阴性", "绿", M1_NEG_DESC,
+             f":{LINE_STATE} tools/list 与每个工具 inputSchema 均无写原语（{', '.join(WRITE_TOKENS)}），线状态面只读")
 
 # ---------------- M2(a) ----------------
 dec_tools = mcp_tools(DECISION)
