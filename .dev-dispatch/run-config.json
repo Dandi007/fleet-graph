@@ -1,0 +1,20 @@
+{
+ "development_id": "dev-fg-70e8fdb846bc",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_scheduler_daemon.py",
+   "tests/test_parking.py"
+  ],
+  [
+   "make",
+   "verify"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
