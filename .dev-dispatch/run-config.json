@@ -1,0 +1,21 @@
+{
+ "development_id": "dev-fg-420815b40feb",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_parking.py",
+   "tests/test_scheduler_daemon.py",
+   "tests/test_decision_bridge.py"
+  ],
+  [
+   "make",
+   "verify"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
