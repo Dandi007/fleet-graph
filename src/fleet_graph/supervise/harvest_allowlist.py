@@ -39,18 +39,31 @@ class HarvestAllowlistError(ValueError):
 
 @dataclass(frozen=True)
 class HarvestAllowlistEntry:
-    """一条可写目标：哪个仓库、哪些分支/ref 前缀、哪些部署命令。"""
+    """一条可写目标：哪个仓库、哪些分支/ref 前缀、哪些部署命令。
+
+    可选逐仓生效值 `default_branch` / `deploy_command`（案A改写①）：命中本条
+    目时，该单的生效 `default_branch` / `deploy_command` 取自条目；缺省 `None`
+    时退回全局 `deps.default_branch` / `deps.deploy_command`（向后兼容：现有
+    JSON 条目无这两个字段按旧全局行为解析）。
+    """
 
     repo_path: str
     allowed_branches: tuple[str, ...]
     allowed_deploy: tuple[tuple[str, ...], ...]
+    default_branch: str | None = None
+    deploy_command: tuple[str, ...] | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "repo_path": self.repo_path,
             "allowed_branches": list(self.allowed_branches),
             "allowed_deploy": [list(argv) for argv in self.allowed_deploy],
         }
+        if self.default_branch is not None:
+            out["default_branch"] = self.default_branch
+        if self.deploy_command is not None:
+            out["deploy_command"] = list(self.deploy_command)
+        return out
 
 
 @dataclass(frozen=True)
@@ -72,6 +85,35 @@ def _refusal_for_prefix(prefix: str) -> str | None:
         return f"前缀 {prefix!r} 含空白字符"
     if any(ch not in _ALLOWED_PREFIX_CHARS for ch in prefix):
         return f"前缀 {prefix!r} 含非法字符——只认 ref 字符集，不接受通配或模式"
+    return None
+
+
+def _refusal_for_branch_name(name: str) -> str | None:
+    """一个逐仓 `default_branch` 分支名被拒绝的理由，合法则 None。
+
+    与 `_refusal_for_prefix` 同款字符纪律（只认 ref 字符集，不接受通配）——
+    但它是分支名不是前缀：仍按非空、无空白、字符集内校验。名称允许以任意
+    合法 ref 字符开头（与 `_branch_ref` 拼 `refs/heads/<name>` 的用法一致）。
+    """
+    if not isinstance(name, str) or not name.strip():
+        return "default_branch 必须是非空字符串"
+    if any(ch.isspace() for ch in name):
+        return f"default_branch {name!r} 含空白字符"
+    if any(ch not in _ALLOWED_PREFIX_CHARS for ch in name):
+        return f"default_branch {name!r} 含非法字符——只认 ref 字符集，不接受通配或模式"
+    return None
+
+
+def _refusal_for_deploy_command(argv: Any) -> str | None:
+    """一个逐仓 `deploy_command` argv 列表被拒绝的理由，合法则 None。
+
+    与 `allowed_deploy` 的条目同款校验：非空字符串 argv 列表（精确 argv 匹配，
+    不接受通配/变量）。`default_branch` 一样缺省 None 即未指定。
+    """
+    if not isinstance(argv, list) or not argv:
+        return "deploy_command 必须是非空 argv 列表"
+    if not all(isinstance(part, str) and part for part in argv):
+        return f"deploy_command 必须是非空字符串 argv 列表，got {argv!r}"
     return None
 
 
@@ -114,10 +156,30 @@ def _parse_entry(raw: Any) -> HarvestAllowlistEntry:
                 )
             deploy.append(tuple(argv))
 
+    # 案A改写①：可选逐仓生效值。缺省 None -> 未指定，intake/gate 命中条目后
+    # 若条目未指定才退回全局 deps.default_branch / deps.deploy_command。
+    default_branch_raw = raw.get("default_branch")
+    default_branch: str | None = None
+    if default_branch_raw is not None:
+        refusal = _refusal_for_branch_name(default_branch_raw)
+        if refusal is not None:
+            raise HarvestAllowlistError(f"{repo_path}: {refusal}")
+        default_branch = default_branch_raw
+
+    deploy_command_raw = raw.get("deploy_command")
+    deploy_command: tuple[str, ...] | None = None
+    if deploy_command_raw is not None:
+        refusal = _refusal_for_deploy_command(deploy_command_raw)
+        if refusal is not None:
+            raise HarvestAllowlistError(f"{repo_path}: {refusal}")
+        deploy_command = tuple(deploy_command_raw)
+
     return HarvestAllowlistEntry(
         repo_path=repo_path,
         allowed_branches=tuple(branches),
         allowed_deploy=tuple(deploy),
+        default_branch=default_branch,
+        deploy_command=deploy_command,
     )
 
 

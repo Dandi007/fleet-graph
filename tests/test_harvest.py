@@ -83,6 +83,7 @@ def fake_ops(
     """
     calls: list[str] = []
     deploy_repos: list[Path] = []
+    deploy_commands: list[list[str]] = []
     verify_real_repos: list[Path] = []
     verify_real_heads: list[str | None] = []
     verify_real_argvs: list[list[str]] = []
@@ -202,6 +203,7 @@ def fake_ops(
         def deploy(self, command: list[str], repo: Path) -> int:
             calls.append("deploy")
             deploy_repos.append(repo)
+            deploy_commands.append(list(command))
             return deploy_exit
 
         def verify_real(self, argv: list[str], repo: Path, expected_head: str | None) -> int:
@@ -217,6 +219,7 @@ def fake_ops(
         "ops": Ops(),
         "calls": calls,
         "deploy_repos": deploy_repos,
+        "deploy_commands": deploy_commands,
         "verify_real_repos": verify_real_repos,
         "verify_real_heads": verify_real_heads,
         "verify_real_argvs": verify_real_argvs,
@@ -330,6 +333,213 @@ class FakeBus:
             }
         )
         return _Result()
+
+
+class TestHarvestPerRepoEffectiveValues:
+    """案A改写①：逐仓生效值——命中 allowlist 条目即供 default_branch / deploy_command。
+
+    判据两方向可红：
+    - **① 正向**：`main` 仓单，条目 `default_branch="main"`（全局被配成 `master`，
+      若退回读全局必然拒）-> 生效 branch `refs/heads/main` 过 gate -> HARVESTED，
+      回执 default_branch == "main"。
+    - **变异（必须变红）**：把同一单改回读全局（全局 `master` 且 allowed_branches
+      只含 `refs/heads/main`）-> `refs/heads/master` 不在白名单 -> REFUSED。
+    - **② 回归**：`master` 仓（如 fleet-sentinel）：条目未指定 `default_branch`
+      仍取全局 `master`；条目指定 `master` 亦 `master`——既有 master 仓零红。
+    """
+
+    def test_entry_default_branch_overrides_global(self, tmp_path: Path) -> None:
+        """① 正向：条目 default_branch="main" 生效，即使全局被配成 master。"""
+        allowlist = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": repo_path_for(tmp_path),
+                        "allowed_branches": ["refs/heads/main"],
+                        "default_branch": "main",
+                    }
+                ]
+            }
+        )
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            allowlist=allowlist,
+            ops=fake,
+            bus=FakeBus(),
+            default_branch="master",
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["default_branch"] == "main"
+        assert receipt["allowlist_auth"]["granted"] is True
+
+    def test_entry_default_branch_supplies_branch_to_gate(self, tmp_path: Path) -> None:
+        """① gate 拿条目生效 branch 比 allowed_branches：refs/heads/main 能过。"""
+        allowlist = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": repo_path_for(tmp_path),
+                        "allowed_branches": ["refs/heads/main"],
+                        "default_branch": "main",
+                    }
+                ]
+            }
+        )
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            allowlist=allowlist,
+            ops=fake,
+            bus=FakeBus(),
+            default_branch="master",
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        gate = next(s for s in receipt["steps"] if s["step"] == "gate")
+        assert gate["ok"] is True
+        assert gate["evidence"]["granted"] is True
+
+    def test_mutation_reading_global_goes_red(self, tmp_path: Path) -> None:
+        """变异（必须变红）：同一单改回读全局（master）-> refs/heads/master 不在
+        allowed_branches -> REFUSED（证明生效值确实取自条目而非全局）。"""
+        allowlist = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": repo_path_for(tmp_path),
+                        "allowed_branches": ["refs/heads/main"],
+                    }
+                ]
+            }
+        )
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            allowlist=allowlist,
+            ops=fake,
+            bus=FakeBus(),
+            default_branch="master",
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_REFUSED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["default_branch"] == "master"
+        assert receipt["allowlist_auth"]["granted"] is False
+        assert any("分支/ref" in r for r in receipt["allowlist_auth"]["reasons"])
+
+    def test_entry_missing_default_branch_uses_global_master(self, tmp_path: Path) -> None:
+        """② 回归：条目未指定 default_branch -> 仍取全局 master（fleet-sentinel 零红）。"""
+        allowlist = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": repo_path_for(tmp_path),
+                        "allowed_branches": ["refs/heads/master"],
+                    }
+                ]
+            }
+        )
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            allowlist=allowlist,
+            ops=fake,
+            bus=FakeBus(),
+            default_branch="master",
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["default_branch"] == "master"
+
+    def test_entry_explicit_master_still_master(self, tmp_path: Path) -> None:
+        """② 回归：条目显式 default_branch="master" -> 亦 master（既有 master 仓零红）。"""
+        allowlist = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": repo_path_for(tmp_path),
+                        "allowed_branches": ["refs/heads/master"],
+                        "default_branch": "master",
+                    }
+                ]
+            }
+        )
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            allowlist=allowlist,
+            ops=fake,
+            bus=FakeBus(),
+            default_branch="master",
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["default_branch"] == "master"
+        assert receipt["allowlist_auth"]["granted"] is True
+
+    def test_entry_deploy_command_overrides_global(self, tmp_path: Path) -> None:
+        """逐仓 deploy_command：条目 deploy_command 生效，全局不同命令不再拒整单。"""
+        allowlist = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": repo_path_for(tmp_path),
+                        "allowed_branches": ["refs/heads/main"],
+                        "allowed_deploy": [["bash", "scripts/deploy.sh"]],
+                        "default_branch": "main",
+                        "deploy_command": ["bash", "scripts/deploy.sh"],
+                    }
+                ]
+            }
+        )
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            allowlist=allowlist,
+            ops=fake,
+            bus=FakeBus(),
+            default_branch="main",
+            deploy_command=["make", "deploy"],
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        gate = next(s for s in receipt["steps"] if s["step"] == "gate")
+        assert gate["ok"] is True
+        assert fake["deploy_commands"] == [["bash", "scripts/deploy.sh"]]
+
+    def test_entry_missing_deploy_command_uses_global(self, tmp_path: Path) -> None:
+        """回归：条目未指定 deploy_command -> 全局 deploy_command 仍生效（老行为不变）。"""
+        allowlist = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": repo_path_for(tmp_path),
+                        "allowed_branches": ["refs/heads/main"],
+                        "allowed_deploy": [["make", "deploy"]],
+                        "default_branch": "main",
+                    }
+                ]
+            }
+        )
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            allowlist=allowlist,
+            ops=fake,
+            bus=FakeBus(),
+            default_branch="main",
+            deploy_command=["make", "deploy"],
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert fake["deploy_commands"] == [["make", "deploy"]]
 
 
 class TestHarvestAllowlistRefusal:

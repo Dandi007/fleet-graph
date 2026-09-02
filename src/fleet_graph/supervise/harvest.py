@@ -386,6 +386,18 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             record_worktree = _record_repo_path(development_id, deps.dd_root)
         elif repo is not None:
             record_worktree = str(repo)
+        # 案A改写①：命中 allowlist 条目 -> 该单生效 default_branch / deploy_command
+        # 取自条目；条目未指定（缺省 None）才退回全局 deps 缺省值。repo 解析不到
+        # canonical（None）时无从命中条目 -> 保持全局缺省（gate 会拒绝并留痕）。
+        default_branch = deps.default_branch
+        deploy_command = list(deps.deploy_command)
+        if repo is not None:
+            entry = deps.allowlist.entry_for(str(repo))
+            if entry is not None:
+                if entry.default_branch is not None:
+                    default_branch = entry.default_branch
+                if entry.deploy_command is not None:
+                    deploy_command = list(entry.deploy_command)
         # H8 交付 B.2/B.3：_resolve_repo 成功之后、进入 gate 之前，对链上每棵
         # 将被消费的树（record_worktree / canonical / 本次 worktree_root）做
         # occupancy 探测。任一在飞且非本单 -> 立即拒绝+escalate，走既有
@@ -424,8 +436,8 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             "repo_path": str(repo) if repo is not None else "",
             "record_worktree": record_worktree,
             "remote_url": remote_url,
-            "default_branch": deps.default_branch,
-            "deploy_command": list(deps.deploy_command),
+            "default_branch": default_branch,
+            "deploy_command": deploy_command,
             "steps": steps,
             "_gaps": gaps,
             "outcome": outcome,

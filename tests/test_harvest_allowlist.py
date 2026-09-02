@@ -138,6 +138,138 @@ class TestConfigParsing:
                 }
             )
 
+    def test_optional_default_branch_parses(self) -> None:
+        loaded = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": "/data/code/self/fleet-graph",
+                        "allowed_branches": ["refs/heads/main"],
+                        "default_branch": "main",
+                    }
+                ]
+            }
+        )
+        (entry,) = loaded.entries
+        assert entry.default_branch == "main"
+        assert entry.deploy_command is None
+
+    def test_optional_deploy_command_parses(self) -> None:
+        loaded = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": "/data/code/self/fleet-graph",
+                        "allowed_branches": ["refs/heads/main"],
+                        "deploy_command": ["bash", "scripts/deploy.sh"],
+                    }
+                ]
+            }
+        )
+        (entry,) = loaded.entries
+        assert entry.deploy_command == ("bash", "scripts/deploy.sh")
+        assert entry.default_branch is None
+
+    def test_absent_optional_fields_default_to_none(self) -> None:
+        """向后兼容：现有 JSON 条目无 default_branch / deploy_command -> None（旧全局行为）。"""
+        loaded = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": "/data/code/self/fleet-graph",
+                        "allowed_branches": ["refs/heads/main"],
+                    }
+                ]
+            }
+        )
+        (entry,) = loaded.entries
+        assert entry.default_branch is None
+        assert entry.deploy_command is None
+
+    def test_empty_default_branch_is_refused(self) -> None:
+        with pytest.raises(HarvestAllowlistError, match="default_branch"):
+            parse_harvest_allowlist(
+                {
+                    "entries": [
+                        {
+                            "repo_path": "/data/x",
+                            "allowed_branches": ["refs/heads/main"],
+                            "default_branch": "",
+                        }
+                    ]
+                }
+            )
+
+    def test_whitespace_default_branch_is_refused(self) -> None:
+        with pytest.raises(HarvestAllowlistError, match="default_branch"):
+            parse_harvest_allowlist(
+                {
+                    "entries": [
+                        {
+                            "repo_path": "/data/x",
+                            "allowed_branches": ["refs/heads/main"],
+                            "default_branch": "ma in",
+                        }
+                    ]
+                }
+            )
+
+    def test_wildcard_in_default_branch_is_refused(self) -> None:
+        with pytest.raises(HarvestAllowlistError, match="default_branch"):
+            parse_harvest_allowlist(
+                {
+                    "entries": [
+                        {
+                            "repo_path": "/data/x",
+                            "allowed_branches": ["refs/heads/main"],
+                            "default_branch": "main/*",
+                        }
+                    ]
+                }
+            )
+
+    def test_non_list_deploy_command_is_refused(self) -> None:
+        with pytest.raises(HarvestAllowlistError, match="deploy_command"):
+            parse_harvest_allowlist(
+                {
+                    "entries": [
+                        {
+                            "repo_path": "/data/x",
+                            "allowed_branches": ["refs/heads/main"],
+                            "deploy_command": "bash scripts/deploy.sh",
+                        }
+                    ]
+                }
+            )
+
+    def test_empty_deploy_command_is_refused(self) -> None:
+        with pytest.raises(HarvestAllowlistError, match="deploy_command"):
+            parse_harvest_allowlist(
+                {
+                    "entries": [
+                        {
+                            "repo_path": "/data/x",
+                            "allowed_branches": ["refs/heads/main"],
+                            "deploy_command": [],
+                        }
+                    ]
+                }
+            )
+
+    def test_non_string_deploy_command_part_is_refused(self) -> None:
+        with pytest.raises(HarvestAllowlistError, match="deploy_command"):
+            parse_harvest_allowlist(
+                {
+                    "entries": [
+                        {
+                            "repo_path": "/data/x",
+                            "allowed_branches": ["refs/heads/main"],
+                            "deploy_command": ["bash", 3],
+                        }
+                    ]
+                }
+            )
+
     def test_empty_allowed_branches_is_refused(self) -> None:
         with pytest.raises(HarvestAllowlistError, match="allowed_branches"):
             parse_harvest_allowlist({"entries": [{"repo_path": "/data/x", "allowed_branches": []}]})
@@ -221,3 +353,26 @@ class TestEntryShape:
         assert out["repo_path"] == "/data/x"
         assert out["allowed_branches"] == ["refs/heads/main"]
         assert out["allowed_deploy"] == [["make", "deploy"]]
+
+    def test_entry_as_dict_omits_unset_optional_fields(self) -> None:
+        """向后兼容：未指定 default_branch / deploy_command 时 as_dict 不吐出 None 键。"""
+        entry = HarvestAllowlistEntry(
+            repo_path="/data/x",
+            allowed_branches=("refs/heads/main",),
+            allowed_deploy=(("make", "deploy"),),
+        )
+        out = entry.as_dict()
+        assert "default_branch" not in out
+        assert "deploy_command" not in out
+
+    def test_entry_as_dict_includes_set_optional_fields(self) -> None:
+        entry = HarvestAllowlistEntry(
+            repo_path="/data/x",
+            allowed_branches=("refs/heads/main",),
+            allowed_deploy=(("make", "deploy"),),
+            default_branch="main",
+            deploy_command=("make", "deploy"),
+        )
+        out = entry.as_dict()
+        assert out["default_branch"] == "main"
+        assert out["deploy_command"] == ["make", "deploy"]
