@@ -750,14 +750,52 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             }
         repo = Path(state.get("repo_path") or "")
         merged_head = state.get("merged_head")
+        # H9 交付：verify_real 与 run_verify 共用同一机械口
+        # `HarvestOps.resolve_verify_argv`（解析规则一字不改），不再全局硬编码
+        # make verify——uv 管仓（pyproject.toml/uv.lock、无 Makefile）真机 deploy
+        # 后用 legacy make verify 退出 2 制造误导性红。
+        # 显式配置且非历史硬编码默认 -> 直接覆盖（测试/运维注入，行为不变）；
+        # 否则（含 supervisor 默认透传的 legacy ["make","verify"]）按目标仓自身
+        # 声明解析（`repo` = canonical 目标仓，pull 后已位于 merged head；纯读）。
+        configured = deps.verify_real_argv
+        if configured is not None and list(configured) != list(DEFAULT_VERIFY_ARGV):
+            argv = list(configured)
+        else:
+            try:
+                argv, detail = deps.ops.resolve_verify_argv(repo)
+            except Exception as exc:
+                return {
+                    "steps": _record_step(state, "verify_real", ok=False, detail=repr(exc)[:300]),
+                    "verify_real_exit_code": EXIT_NOT_FOUND,
+                    "outcome": OUTCOME_ESCALATED,
+                }
+            if argv is None:
+                # 解析不到可执行 verify 指令 -> 如实 ok:false + 机器可读 detail
+                # （no resolvable verify command）-> escalated；绝不硬跑
+                # make verify 制造误导性退出码。
+                steps = _record_step(
+                    state,
+                    "verify_real",
+                    ok=False,
+                    detail=detail or "no resolvable verify command",
+                )
+                return {
+                    "steps": steps,
+                    "verify_real_exit_code": EXIT_NOT_FOUND,
+                    "outcome": OUTCOME_ESCALATED,
+                }
         try:
-            exit_code = int(deps.ops.verify_real(deps.verify_real_argv, repo, merged_head))
+            exit_code = int(deps.ops.verify_real(argv, repo, merged_head))
         except Exception as exc:
-            return {"steps": _record_step(state, "verify_real", ok=False, detail=repr(exc)[:300])}
+            return {
+                "steps": _record_step(state, "verify_real", ok=False, detail=repr(exc)[:300]),
+                "verify_real_exit_code": EXIT_NOT_FOUND,
+                "outcome": OUTCOME_ESCALATED,
+            }
         facts: dict[str, Any] = {
             "ok": exit_code == 0,
             "exit_code": exit_code,
-            "argv": deps.verify_real_argv,
+            "argv": argv,
         }
         if exit_code == EXIT_HEAD_MISMATCH:
             facts["detail"] = "HEAD 与已合并 commit 不一致——拒绝在陈旧树上报绿"
