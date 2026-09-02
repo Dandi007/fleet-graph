@@ -2420,7 +2420,9 @@ class TestResolveVerifyArgv:
         (worktree / "arbitrary.txt").write_text("x\n", encoding="utf-8")
         argv, detail = DefaultHarvestOps().resolve_verify_argv(worktree)
         assert argv is None
-        assert detail == "no resolvable verify command"
+        # 案A④：机器可读 detail 指名缺 verify 的目标仓（完整路径在 detail 里）。
+        assert detail.startswith("no resolvable verify command")
+        assert str(worktree.resolve()) in detail
 
     def test_makefile_with_verify_target_resolves_make(self, tmp_path: Path) -> None:
         worktree = tmp_path / "wt"
@@ -2464,7 +2466,12 @@ class TestResolveVerifyArgv:
         assert exit_code == 0
 
     def test_unresolvable_verify_escalates_with_detail_and_no_run(self, tmp_path: Path) -> None:
-        """阴性（编排层）：解析不到 -> run_verify step ok:false + detail，绝无 make 硬跑。"""
+        """案A④ 变异锚点（核心判据）：解析不到 -> escalate 早退 + writes_skipped
+        覆盖全部写步 + 无任何写发生。
+
+        若实现把 verify 解析失败继续往下走（越过 escalate 放行后续写节点），本用例
+        必红：outcome 不再是 escalated、pr_squash_merge / ff_only_pull / deploy /
+        verify_real 任一写原语被调用。"""
         fake = fake_ops(resolve_verify_argv=(None, "no resolvable verify command"))
         config, _ = config_for(tmp_path, ops=fake)
         result = run_harvest(config)
@@ -2475,8 +2482,18 @@ class TestResolveVerifyArgv:
         assert rv["argv"] is None
         # 绝不硬跑 make verify：run_verify 从未被调用。
         assert "run_verify" not in fake["calls"], fake["calls"]
+        # 无任何写发生：三个写步骤 + verify_real 零调用（变异判据）。
+        assert "pr_squash_merge" not in fake["calls"], fake["calls"]
+        assert "ff_only_pull" not in fake["calls"], fake["calls"]
+        assert "deploy" not in fake["calls"], fake["calls"]
+        assert "verify_real" not in fake["calls"], fake["calls"]
         receipt = json.loads(Path(result["receipt_path"]).read_text())
         assert receipt["writes_skipped"] == list(WRITE_STEPS)
+        # 写步骤本身不进回执（escalate 早退，从未走到写节点）。
+        write_steps_in_receipt = [s.get("step") for s in receipt["steps"]]
+        assert "pr_squash_merge" not in write_steps_in_receipt
+        assert "ff_only_pull" not in write_steps_in_receipt
+        assert "deploy" not in write_steps_in_receipt
 
     def test_makefile_repo_still_runs_make_verify_and_harvests(self, tmp_path: Path) -> None:
         """反向不抖动（编排层）：Makefile 仓 -> argv 仍 make verify 且 exit 0 -> harvested。"""
@@ -2509,7 +2526,9 @@ class TestResolveVerifyArgv:
         assert result["outcome"] == OUTCOME_ESCALATED
         rv = next(s for s in result["steps"] if s["step"] == "run_verify")
         assert rv["ok"] is False
-        assert rv["detail"] == "no resolvable verify command"
+        # 案A④：detail 指名缺 verify 的目标仓（完整 worktree 路径在 detail 里）。
+        assert rv["detail"].startswith("no resolvable verify command")
+        assert "worktree" in rv["detail"]
         assert rv["argv"] is None
         assert head(repo) == before, "escalated 后默认分支 HEAD 必须逐字节不变"
         receipt = json.loads(Path(result["receipt_path"]).read_text())
@@ -2555,9 +2574,9 @@ class TestVerifyRealArgvResolution:
         assert receipt["verify_real_exit_code"] == 0
 
     def test_unresolvable_verify_real_escalates_no_run(self, tmp_path: Path) -> None:
-        """解析失败：resolve_verify_argv 返回 (None, no resolvable verify command)
-        -> verify_real step ok:false + detail + outcome=escalated，且 fake
-        verify_real 从未被调用（绝不产生误导性退出码）。run_verify 先消耗一次
+        """案A④：verify_real 解析不到 -> verify_real step ok:false + 指名缺 verify
+        的目标仓的 detail + outcome=escalated + writes_skipped 覆盖全部写步骤，且
+        fake verify_real 从未被调用（绝不产生误导性退出码）。run_verify 先消耗一次
         解析（uv pytest 通过），verify_real 消耗第二次 -> 命中本节点的失败路径。"""
         fake = fake_ops(
             resolve_verify_argv_calls=[
@@ -2570,11 +2589,12 @@ class TestVerifyRealArgvResolution:
         assert result["outcome"] == OUTCOME_ESCALATED
         vr = next(s for s in result["steps"] if s["step"] == "verify_real")
         assert vr["ok"] is False
-        assert vr["detail"] == "no resolvable verify command"
+        assert vr["detail"].startswith("no resolvable verify command")
         assert "argv" not in vr or vr["argv"] != ["make", "verify"]
         assert "verify_real" not in fake["calls"], fake["calls"]
         receipt = json.loads(Path(result["receipt_path"]).read_text())
         assert receipt["verify_real_exit_code"] != 0
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
 
     def test_makefile_repo_verify_real_still_make_verify(self, tmp_path: Path) -> None:
         """反向不抖动：resolve_verify_argv 返回 make verify -> verify_real step

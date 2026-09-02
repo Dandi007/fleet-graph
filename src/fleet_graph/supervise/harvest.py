@@ -19,7 +19,10 @@ SOP（spec 交付 B）逐节点实现，全部是 script 节点（机械判定�
                    A.1：根目录 Makefile 含 verify 目标 -> make verify；无 Makefile
                    但 pyproject.toml / uv.lock -> repo-canonical 全量套件
                    uv run pytest -q），解析不到可执行指令 -> ok:false + 机器可读
-                   detail（no resolvable verify command）-> escalated（交付 A.2）。
+                   detail（指名缺 verify 的目标仓）-> escalated（案A④ escalate
+                   契约：在任何写步骤 pr_squash_merge / ff_only_pull / deploy
+                   **之前** escalate，writes_skipped 覆盖全部写步骤，绝不放行任何
+                   后续写节点产生写原语）。
 7. `cleanup_worktree` —— verify 之后移除一次性 worktree（harvest_ops 成功路径
    保留 worktree 供 verify 使用，见 rc-702098ab）。
 8. `pr_merge`     —— 用干净产品树 tip（harvest_tip，已剔除 .dev-dispatch/.dd-evidence）
@@ -63,7 +66,11 @@ from fleet_graph.supervise.harvest_allowlist import (
     HarvestAllowlist,
     HarvestAuthorization,
 )
-from fleet_graph.supervise.harvest_ops import EXIT_HEAD_MISMATCH, EXIT_NOT_FOUND
+from fleet_graph.supervise.harvest_ops import (
+    EXIT_HEAD_MISMATCH,
+    EXIT_NOT_FOUND,
+    NO_RESOLVABLE_VERIFY,
+)
 
 #: harvest 终态词汇（outcome）。REFUSED / ALREADY_HARVESTED 都是无写动作的合法
 #: 终止；HARVESTED 要求后置条件三要素齐全；ESCALATED = 失败/升报。
@@ -563,14 +570,16 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                     "writes_skipped": list(WRITE_STEPS),
                 }
             if argv is None:
-                # 交付 A.2：解析不到可执行 verify 指令 -> 如实 ok:false + 机器可读
-                # detail（no resolvable verify command）-> escalated；绝不硬跑
-                # make verify 制造误导性 127。
+                # 案A④ escalate 契约：解析不到可执行 verify 指令 -> 如实 ok:false +
+                # 机器可读 detail（指名缺 verify 的目标仓）-> outcome=escalated +
+                # writes_skipped 覆盖全部写步骤；绝不硬跑 make verify 制造误导性
+                # 127，也绝不放行任何后续写节点（pr_squash_merge / ff_only_pull /
+                # deploy）。
                 steps = _record_step(
                     state,
                     "run_verify",
                     ok=False,
-                    detail=detail or "no resolvable verify command",
+                    detail=detail or f"{NO_RESOLVABLE_VERIFY}: {worktree}",
                     argv=None,
                 )
                 return {
@@ -774,21 +783,24 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                     "steps": _record_step(state, "verify_real", ok=False, detail=repr(exc)[:300]),
                     "verify_real_exit_code": EXIT_NOT_FOUND,
                     "outcome": OUTCOME_ESCALATED,
+                    "writes_skipped": list(WRITE_STEPS),
                 }
             if argv is None:
-                # 解析不到可执行 verify 指令 -> 如实 ok:false + 机器可读 detail
-                # （no resolvable verify command）-> escalated；绝不硬跑
-                # make verify 制造误导性退出码。
+                # 案A④ escalate 契约：解析不到可执行 verify 指令 -> 如实 ok:false +
+                # 机器可读 detail（指名缺 verify 的目标仓）-> outcome=escalated +
+                # writes_skipped 覆盖全部写步骤；绝不硬跑 make verify 制造误导性
+                # 退出码，也绝不放行任何后续写节点。
                 steps = _record_step(
                     state,
                     "verify_real",
                     ok=False,
-                    detail=detail or "no resolvable verify command",
+                    detail=detail or f"{NO_RESOLVABLE_VERIFY}: {repo}",
                 )
                 return {
                     "steps": steps,
                     "verify_real_exit_code": EXIT_NOT_FOUND,
                     "outcome": OUTCOME_ESCALATED,
+                    "writes_skipped": list(WRITE_STEPS),
                 }
         try:
             exit_code = int(deps.ops.verify_real(argv, repo, merged_head))
