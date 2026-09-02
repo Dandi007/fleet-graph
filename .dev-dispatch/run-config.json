@@ -1,0 +1,30 @@
+{
+ "development_id": "dev-fg-eab4ab9317ed",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "bash",
+   "-c",
+   "! grep -q -- \"--stage-model implement=deepseek-v4-flash\" deploy/systemd/fleet-graph-dd-mcp.service"
+  ],
+  [
+   "bash",
+   "-c",
+   "grep -q -- \"continuous_review=deepseek-v4-pro\" deploy/systemd/fleet-graph-dd-mcp.service"
+  ],
+  [
+   "bash",
+   "-c",
+   "grep -q -- \"final_review=deepseek-v4-pro\" deploy/systemd/fleet-graph-dd-mcp.service"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "-q",
+   "tests/test_deploy_unit.py"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
