@@ -44,6 +44,7 @@ def _seal(
     target_kind: str = "dd",
     target_id: str = "",
     generation: int = 1,
+    card_entity_id: str = "card-1",
     seq: int,
 ) -> None:
     store = BridgeStore(bridge_dir).open()
@@ -56,7 +57,7 @@ def _seal(
                 "target_id": target_id,
                 "generation": generation,
                 "question_note_id": "q-1",
-                "card_entity_id": "card-1",
+                "card_entity_id": card_entity_id,
                 "status": status,
                 "reason": reason,
                 "source_event": {},
@@ -65,6 +66,18 @@ def _seal(
         )
     finally:
         store.close()
+
+
+def _write_record(dd_root: Path, development_id: str, *, card_entity_id: str) -> None:
+    dev = dd_root / development_id
+    dev.mkdir(parents=True, exist_ok=True)
+    (dev / "record.json").write_text(
+        json.dumps(
+            {"development_id": development_id, "card_entity_id": card_entity_id},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _write_status(dd_root: Path, development_id: str, *, state: str) -> None:
@@ -225,6 +238,88 @@ class TestNegativeReconciliation:
         assert decision["state"] == "swallowed"
         assert decision["basis"] == BASIS_DOCUMENT_AWAITING
         assert decision["reason"] == "owner refused delivery: stale"
+
+
+class TestOwnerIdEmptyReconciliation:
+    """M0 补口：receipt 的 target_id 为空（owner.id 空、reason 含 no waiting
+    owner），用 card_entity_id 反查所属 development 补 owner 并对账。
+
+    - 阳性：反查到 development 且单据侧证明消费 → 记 consumed、owner 补 dd/id。
+    - 阴性：反查不到（refs 空 / 卡片错配）或单据侧无消费证据 → 仍 swallowed。
+    """
+
+    def test_card_reverse_lookup_promotes_consumed_and_fills_owner(
+        self, tmp_path: Path
+    ) -> None:
+        dd_root = tmp_path / "dd"
+        bridge_dir = tmp_path / "bridge"
+        _seal(
+            bridge_dir,
+            source_message_id="d-owner",
+            status=STATUS_NOOP,
+            reason="no waiting owner references this question",
+            target_kind="",
+            target_id="",
+            card_entity_id="card-owned",
+            seq=1,
+        )
+        _write_record(dd_root, "dev-owned", card_entity_id="card-owned")
+        _write_gate_event(dd_root, "dev-owned", stage="human_gate", event="success")
+
+        decision = _by_id(_decisions(tmp_path, dd_root, bridge_dir))["d-owner"]
+
+        assert decision["state"] == "consumed"
+        assert decision["basis"] == BASIS_HUMAN_GATE_SUCCESS
+        assert decision["owner"]["kind"] == "dd"
+        assert decision["owner"]["id"] == "dev-owned"
+        assert decision.get("reason") is None
+
+    def test_card_mismatch_still_swallowed_without_owner(self, tmp_path: Path) -> None:
+        dd_root = tmp_path / "dd"
+        bridge_dir = tmp_path / "bridge"
+        _seal(
+            bridge_dir,
+            source_message_id="d-miss",
+            status=STATUS_NOOP,
+            reason="no waiting owner references this question",
+            target_kind="",
+            target_id="",
+            card_entity_id="card-unknown",
+            seq=1,
+        )
+        _write_record(dd_root, "dev-other", card_entity_id="card-owned")
+
+        decision = _by_id(_decisions(tmp_path, dd_root, bridge_dir))["d-miss"]
+
+        assert decision["state"] == "swallowed"
+        assert decision["basis"] == BASIS_RECEIPT
+        assert decision["owner"]["kind"] == ""
+        assert decision["owner"]["id"] == ""
+        assert decision["reason"] == "no waiting owner references this question"
+
+    def test_card_match_but_document_still_waiting_keeps_swallowed(self, tmp_path: Path) -> None:
+        dd_root = tmp_path / "dd"
+        bridge_dir = tmp_path / "bridge"
+        _seal(
+            bridge_dir,
+            source_message_id="d-owner-wait",
+            status=STATUS_NOOP,
+            reason="no waiting owner references this question",
+            target_kind="",
+            target_id="",
+            card_entity_id="card-owned",
+            seq=1,
+        )
+        _write_record(dd_root, "dev-owned", card_entity_id="card-owned")
+        _write_status(dd_root, "dev-owned", state="awaiting_gate")
+
+        decision = _by_id(_decisions(tmp_path, dd_root, bridge_dir))["d-owner-wait"]
+
+        assert decision["state"] == "swallowed"
+        assert decision["basis"] == BASIS_DOCUMENT_AWAITING
+        assert decision["owner"]["kind"] == "dd"
+        assert decision["owner"]["id"] == "dev-owned"
+        assert decision["reason"] == "no waiting owner references this question"
 
 
 class TestUnreconciledAnnotation:
