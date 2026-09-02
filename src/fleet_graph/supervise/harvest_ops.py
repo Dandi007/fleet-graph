@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -42,8 +43,9 @@ DD_EXCLUDED_PATHS = (".dev-dispatch", ".dd-evidence")
 #: 「exclude 提交」落进产品树（产物本身不动）。
 NET_DIFF_PATHSPECS = (".", *(f":(exclude){p}" for p in DD_EXCLUDED_PATHS))
 
-#: 收割 merge 的 commit message（merge --no-ff 落地 merge commit 的标题）。
-DD_HARVEST_MERGE_MESSAGE = "harvest: merge approved head into product tree"
+#: 收割产品补丁的 commit message（product patch 落地新提交的标题）。产品补丁父系
+#: = 默认分支 tip（base），不再是 approved_head 的 merge。
+DD_HARVEST_PATCH_MESSAGE = "harvest: product patch into product tree"
 
 #: 目标仓 verify 指令解析（交付 A.1）：根目录 Makefile 含 `verify` 目标 -> make verify。
 MAKE_VERIFY_ARGV = ["make", "verify"]
@@ -139,27 +141,64 @@ def _commit_env() -> dict[str, str]:
     return env
 
 
-def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> dict[str, Any]:
-    """exact-head 祖先判定（交付 1 机械口）：`git merge-base --is-ancestor
-    <ancestor> <descendant>` 的机械读判。
+def _product_patch_equivalent(
+    repo: Path, base: str, approved_head: str, harvested_head: str
+) -> dict[str, Any]:
+    """产品补丁等价读口（判据①/⑤机械口，纯读口，零写原语）。
 
-    纯读口，零写原语。返回 `{"ok": bool, "is_ancestor": bool, "detail": str}`：
-    - rc 0 -> is_ancestor True（放行 head 确在待收 head 的祖先链里）；
-    - rc 1 -> is_ancestor False（非祖先 -> 编排层 escalate，绝不收）；
-    - 其它 / 缺参 -> ok:False（无法判定，fail-closed）。
+    取代旧 merge 语义下的 `is_ancestor`：补丁形态里 `harvested_head` 的父系是
+    默认分支 tip（= base），`approved_head` 不再是它的后代。等价契约 = 两个机械事实：
+
+    1. `git diff --binary base..approved_head`（排除协议目录）与
+       `git diff --binary base..harvested_head`（同排除口径）逐字节一致——
+       产品内容等价；
+    2. 返回 `raw_files` = `git diff --name-only base..harvested_head -- .`（不带
+       排除口径），编排层据此对齐回执 `net_product_files`（多写一个文件即红）。
+
+    返回 `{"ok": bool, "equivalent": bool, "raw_files": list[str], "detail": str}`；
+    ok=False 时 equivalent False / raw_files 恒 []。带 `--binary` 保证二进制文件
+    也落在真正的逐字节内容比对里（否则 `Binary files differ` 会把不同二进制内容
+    误判为等价）。
     """
-    if not ancestor or not descendant:
-        return {"ok": False, "is_ancestor": False, "detail": "缺 ancestor/descendant"}
-    proc = run_git(repo, "merge-base", "--is-ancestor", ancestor, descendant)
-    if proc.returncode == 0:
-        return {"ok": True, "is_ancestor": True, "detail": ""}
-    if proc.returncode == 1:
-        return {"ok": True, "is_ancestor": False, "detail": "approved_head 非待收 head 祖先"}
-    return {
-        "ok": False,
-        "is_ancestor": False,
-        "detail": (proc.stderr or proc.stdout).strip()[:400],
-    }
+    if not base or not approved_head or not harvested_head:
+        return {
+            "ok": False,
+            "equivalent": False,
+            "raw_files": [],
+            "detail": "缺 base/approved_head/harvested_head",
+        }
+    approved_diff = run_git(
+        repo, "diff", "--binary", f"{base}..{approved_head}", "--", *NET_DIFF_PATHSPECS
+    )
+    if approved_diff.returncode != 0:
+        return {
+            "ok": False,
+            "equivalent": False,
+            "raw_files": [],
+            "detail": (approved_diff.stderr or approved_diff.stdout).strip()[:400],
+        }
+    harvested_diff = run_git(
+        repo, "diff", "--binary", f"{base}..{harvested_head}", "--", *NET_DIFF_PATHSPECS
+    )
+    if harvested_diff.returncode != 0:
+        return {
+            "ok": False,
+            "equivalent": False,
+            "raw_files": [],
+            "detail": (harvested_diff.stderr or harvested_diff.stdout).strip()[:400],
+        }
+    equivalent = approved_diff.stdout == harvested_diff.stdout
+    raw = run_git(repo, "diff", "--name-only", f"{base}..{harvested_head}", "--", ".")
+    if raw.returncode != 0:
+        return {
+            "ok": False,
+            "equivalent": False,
+            "raw_files": [],
+            "detail": (raw.stderr or raw.stdout).strip()[:400],
+        }
+    raw_files = [line.strip() for line in raw.stdout.splitlines() if line.strip()]
+    detail = "" if equivalent else "harvested_head 产品内容与 approved_head 不等价"
+    return {"ok": True, "equivalent": equivalent, "raw_files": raw_files, "detail": detail}
 
 
 def _net_product_files(repo: Path, base: str, head: str) -> dict[str, Any]:
@@ -604,37 +643,32 @@ class DefaultHarvestOps:
             return False
         return all(not line.startswith("+ ") for line in proc.stdout.splitlines())
 
-    def worktree_cherry_pick(
+    def _build_product_patch(
         self,
         repo: Path,
+        base: str,
         head_commit: str,
-        default_branch: str,
         worktree_root: Path,
+        *,
+        cleanup: bool,
     ) -> dict[str, Any]:
-        """独立 worktree 上把放行的 exact head (`approved_head`) **merge** 进默认
-        分支，产出产品树 tip（`harvest_tip`）。
+        """机械写口：把放行的 exact head (`approved_head`) 落成**产品补丁**新提交。
 
-        采用 **merge 而非 cherry-pick**：`harvest_tip` 必须是 `approved_head`
-        的后代（回执三头对账判据③——「harvested_head 必须是 approved_head 的
-        后代」），cherry-pick 会打断祖先后代关系、还诱使「exclude 提交」重提
-        （本次事故的两次根因都起于洗树/cherry）。`git merge --no-ff -X theirs`
-        直接把 `approved_head` 合进默认分支 tip：fast-forward 可能时也强制生成
-        merge commit（父系含 approved_head），纯内容冲突时 `-X theirs` 以放行
-        head 为主自动收口。modify/delete 类冲突 `-X theirs` 收不了口 -> 如实
-        ok:false + conflicts:true，就地清理 worktree，绝不强行覆盖。
+        不再 merge 整个分支（那会把 `.dev-dispatch/` / `.dd-evidence/` 协议子树
+        一起 squash 进默认分支）。这里：
 
-        **不再落「exclude 提交」**：协议子树（`.dev-dispatch` / `.dd-evidence`）
-        只在净 diff 计算里排除（`_net_product_files` 的 `:(exclude)` pathspec），
-        产物本身不动、不另叠 exclude commit。
+        1. 在 `base`（= 默认分支 tip，冻结自编排层 net_diff 的 base_commit）上
+           `git worktree add --detach`；
+        2. `git diff --binary base..head_commit -- . ':(exclude).dev-dispatch'
+           ':(exclude).dd-evidence'` 算出**净产品 diff**；
+        3. `git apply` 落地 + `git add -A` + `git commit` 一个新提交——其父系是
+           默认分支 tip（base），不是 approved_head 的 merge；
+        4. 返回 `harvest_tip`（产品补丁提交）。
 
-        **worktree 生命周期（rc-702098ab 回归）**：成功路径保留 worktree，供
-        下一步 `run_verify` 在真实目录上跑全量套件；移除由编排层在 verify 之后
-        的 `cleanup_worktree` 步骤调用 `remove_worktree` 统一负责。失败/冲突路径
-        无可验证内容，在此立即清理，不留给编排层。
-
-        **前置清树护栏（交付 A/B）**：清树走统一护栏 `_preclean_worktree`——
-        仅当目标确认为 linked worktree 才允许 rmtree；目标是主 worktree -> 拒绝
-        + 机器可读 detail，绝不 `rmtree` / 切分支。
+        `cleanup=True` 时成功路径用后即清（`build_harvest_tip`）；`cleanup=False`
+        成功路径保留 worktree 供 `run_verify`（`worktree_cherry_pick`，
+        rc-702098ab 语义）。失败路径一律就地清理 worktree。协议子树只在 diff 计算
+        里排除，绝不落「exclude 提交」。
         """
         preclean = _preclean_worktree(repo, worktree_root)
         if not preclean.get("ok"):
@@ -644,35 +678,98 @@ class DefaultHarvestOps:
             }
         worktree_root.mkdir(parents=True, exist_ok=True)
 
-        added = run_git(repo, "worktree", "add", "--detach", str(worktree_root), default_branch)
+        added = run_git(repo, "worktree", "add", "--detach", str(worktree_root), base)
         if added.returncode != 0:
             return {
                 "ok": False,
                 "detail": (added.stderr or added.stdout).strip()[:400],
             }
-        merged = run_git(
-            worktree_root,
-            "merge",
-            "--no-ff",
-            "-X",
-            "theirs",
-            "-m",
-            DD_HARVEST_MERGE_MESSAGE,
-            head_commit,
-            env=_commit_env(),
+        diff = run_git(
+            repo, "diff", "--binary", f"{base}..{head_commit}", "--", *NET_DIFF_PATHSPECS
         )
-        if merged.returncode != 0:
+        if diff.returncode != 0:
+            self.remove_worktree(repo, worktree_root)
+            return {
+                "ok": False,
+                "detail": (diff.stderr or diff.stdout).strip()[:400],
+            }
+        patch_bytes = diff.stdout
+        if not patch_bytes.strip():
+            # 净产品 diff 为空：本应由编排层 net_diff 节点先行 escalate，这里 fail-closed。
+            self.remove_worktree(repo, worktree_root)
+            return {"ok": False, "detail": "净产品 diff 为空——不得构建空补丁"}
+        patch_fd, patch_path = tempfile.mkstemp(prefix="harvest-patch-", suffix=".patch")
+        try:
+            with open(patch_fd, "w", encoding="utf-8") as patch_file:
+                patch_file.write(patch_bytes)
+            applied = run_git(worktree_root, "apply", "--whitespace=nowarn", "--", patch_path)
+        finally:
+            Path(patch_path).unlink(missing_ok=True)
+        if applied.returncode != 0:
             self.remove_worktree(repo, worktree_root)
             return {
                 "ok": False,
                 "conflicts": True,
-                "detail": (merged.stderr or merged.stdout).strip()[:400],
+                "detail": (applied.stderr or applied.stdout).strip()[:400],
+            }
+
+        staged = run_git(worktree_root, "add", "-A")
+        if staged.returncode != 0:
+            self.remove_worktree(repo, worktree_root)
+            return {
+                "ok": False,
+                "detail": (staged.stderr or staged.stdout).strip()[:400],
+            }
+        committed = run_git(
+            worktree_root,
+            "commit",
+            "-q",
+            "-m",
+            DD_HARVEST_PATCH_MESSAGE,
+            env=_commit_env(),
+        )
+        if committed.returncode != 0:
+            self.remove_worktree(repo, worktree_root)
+            return {
+                "ok": False,
+                "detail": (committed.stderr or committed.stdout).strip()[:400],
             }
         tip = run_git(worktree_root, "rev-parse", "HEAD")
         if tip.returncode != 0 or not tip.stdout.strip():
             self.remove_worktree(repo, worktree_root)
-            return {"ok": False, "detail": "merge 后无法解析 tip commit"}
-        return {"ok": True, "method": "merge", "harvest_tip": tip.stdout.strip()}
+            return {"ok": False, "detail": "产品补丁提交后无法解析 tip commit"}
+        if cleanup:
+            self.remove_worktree(repo, worktree_root)
+        return {"ok": True, "method": "patch", "harvest_tip": tip.stdout.strip()}
+
+    def worktree_cherry_pick(
+        self,
+        repo: Path,
+        head_commit: str,
+        default_branch: str,
+        worktree_root: Path,
+    ) -> dict[str, Any]:
+        """独立 worktree 上把放行的 exact head (`approved_head`) 落成**产品补丁**
+        提交（`harvest_tip`），只打产品补丁、不 merge 整个分支（整个分支 diff 会把
+        `.dev-dispatch/` / `.dd-evidence/` 协议子树一起写进默认分支）。
+
+        `base` = 默认分支 tip（`branch_head(repo, default_branch)`），与编排层
+        net_diff 节点冻结的 `base_commit` 同源（不在两节点之间写入默认分支，二者
+        一致）。产品补丁父系是 base，不再是 approved_head 的 merge。
+
+        **worktree 生命周期（rc-702098ab 回归）**：成功路径保留 worktree，供
+        下一步 `run_verify` 在真实目录上跑全量套件；移除由编排层在 verify 之后
+        的 `cleanup_worktree` 步骤调用 `remove_worktree` 统一负责。失败路径
+        无可验证内容，在此立即清理，不留给编排层。
+
+        **前置清树护栏（交付 A/B）**：清树走统一护栏 `_preclean_worktree`——
+        仅当目标确认为 linked worktree 才允许 rmtree；目标是主 worktree -> 拒绝
+        + 机器可读 detail，绝不 `rmtree` / 切分支。
+        """
+        base = self.branch_head(repo, default_branch)
+        if not base:
+            return {"ok": False, "detail": "无法解析默认分支 tip（缺 base）"}
+        return self._build_product_patch(repo, base, head_commit, worktree_root, cleanup=False)
 
     def build_harvest_tip(
         self,
@@ -681,54 +778,21 @@ class DefaultHarvestOps:
         default_branch: str,
         worktree_root: Path,
     ) -> dict[str, Any]:
-        """机械写口：从放行 head 派生产品树 tip（交付 A.3，不做 allowlist 判定——
-        判定在编排层 gate）。
+        """机械写口：从放行 head 派生**产品补丁** tip（交付 A.3，不做 allowlist
+        判定——判定在编排层 gate）。
 
-        与 `worktree_cherry_pick` 同用 merge 语义（`approved_head` 是 `harvest_tip`
-        后代，不再落 exclude 提交）。在一次性 worktree 上 merge 后即返回 tip，
+        与 `worktree_cherry_pick` 同用产品补丁语义（父系 = 默认分支 tip、只打净
+        产品 diff、不 merge 整个分支）。在一次性 worktree 上构建后即返回 tip，
         worktree 用后即清，不保留（此口不承担 verify 职责）。
 
         **前置清树护栏（交付 A/B）**：同走 `_preclean_worktree`——仅 linked
         worktree 允许清树，主 worktree / 未知目标拒绝并返回 `ok:false` + 机器
         可读 detail，绝不 `rmtree`。
         """
-        preclean = _preclean_worktree(repo, worktree_root)
-        if not preclean.get("ok"):
-            return {
-                "ok": False,
-                "detail": preclean.get("detail") or "前置清树护栏拒绝清理",
-            }
-        worktree_root.mkdir(parents=True, exist_ok=True)
-
-        added = run_git(repo, "worktree", "add", "--detach", str(worktree_root), default_branch)
-        if added.returncode != 0:
-            self.remove_worktree(repo, worktree_root)
-            return {
-                "ok": False,
-                "detail": (added.stderr or added.stdout).strip()[:400],
-            }
-        merged = run_git(
-            worktree_root,
-            "merge",
-            "--no-ff",
-            "-X",
-            "theirs",
-            "-m",
-            DD_HARVEST_MERGE_MESSAGE,
-            head_commit,
-            env=_commit_env(),
-        )
-        if merged.returncode != 0:
-            self.remove_worktree(repo, worktree_root)
-            return {
-                "ok": False,
-                "detail": (merged.stderr or merged.stdout).strip()[:400],
-            }
-        tip = run_git(worktree_root, "rev-parse", "HEAD")
-        self.remove_worktree(repo, worktree_root)
-        if tip.returncode != 0 or not tip.stdout.strip():
-            return {"ok": False, "detail": "merge 后无法解析 tip commit"}
-        return {"ok": True, "method": "merge", "harvest_tip": tip.stdout.strip()}
+        base = self.branch_head(repo, default_branch)
+        if not base:
+            return {"ok": False, "detail": "无法解析默认分支 tip（缺 base）"}
+        return self._build_product_patch(repo, base, head_commit, worktree_root, cleanup=True)
 
     def remove_worktree(self, repo: Path, worktree_root: Path) -> dict[str, Any]:
         """移除 verify 之后的一次性 detached worktree（编排层 cleanup 步骤调用）。
@@ -787,13 +851,17 @@ class DefaultHarvestOps:
             return None
         return proc.stdout.strip()
 
-    def is_ancestor(self, repo: Path, ancestor: str, descendant: str) -> dict[str, Any]:
-        """exact-head 祖先判定（交付 1 机械口，测试注入 fake）。
+    def product_patch_equivalent(
+        self, repo: Path, base: str, approved_head: str, harvested_head: str
+    ) -> dict[str, Any]:
+        """产品补丁等价读口（判据①/⑤ 机械口，测试注入 fake）。
 
-        见模块级 `_is_ancestor`：`git merge-base --is-ancestor <ancestor>
-        <descendant>` 的机械读判。纯读口，零写原语。
+        见模块级 `_product_patch_equivalent`：`git diff --binary base..approved_head`
+        与 `git diff --binary base..harvested_head`（同排除协议目录口径）逐字节一致
+        + 返回 `harvested_head` 相对 base 的不带排除口径文件清单 `raw_files`。纯读口，
+        零写原语。
         """
-        return _is_ancestor(repo, ancestor, descendant)
+        return _product_patch_equivalent(repo, base, approved_head, harvested_head)
 
     def net_product_files(self, repo: Path, base: str, head: str) -> dict[str, Any]:
         """净产品 diff（交付 2/3 机械口，测试注入 fake）。
@@ -1251,7 +1319,7 @@ class DefaultHarvestOps:
 __all__ = [
     "COMMAND_TIMEOUT_SECONDS",
     "DD_EXCLUDED_PATHS",
-    "DD_HARVEST_MERGE_MESSAGE",
+    "DD_HARVEST_PATCH_MESSAGE",
     "EXIT_HEAD_MISMATCH",
     "EXIT_NOT_FOUND",
     "EXIT_TIMEOUT",

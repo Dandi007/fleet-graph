@@ -12,9 +12,10 @@ SOP（spec 交付 B）逐节点实现，全部是 script 节点（机械判定�
 3. `fetch`        —— fetch dd ref（refs/heads/dd/<development_id>）。
 4. `cherry`       —— cherry 判重：产品 commit 是否已 cherry 等价进默认分支。
                    已等价 -> outcome=already_harvested，无写动作。
-5. `worktree`     —— 独立 worktree cherry-pick 产品 commit，冲突消解（即兴），
-                    并洗掉 `.dev-dispatch/` / `.dd-evidence/` 两棵 dd 协议子树
-                    得到干净产品树 tip（harvest_tip）。
+5. `worktree`     —— 独立 worktree 上把放行 head 落成**产品补丁**提交
+                    （`git diff base..approved_head` 排除 `.dev-dispatch/` /
+                    `.dd-evidence/` 两棵协议子树，落在默认分支 tip 上的新提交，
+                    不 merge 整个分支），得到产品补丁 tip（harvest_tip）。
 6. `verify`       —— 在 worktree 跑全量套件。verify argv 按目标仓解析（交付
                    A.1：根目录 Makefile 含 verify 目标 -> make verify；无 Makefile
                    但 pyproject.toml / uv.lock -> repo-canonical 全量套件
@@ -25,7 +26,7 @@ SOP（spec 交付 B）逐节点实现，全部是 script 节点（机械判定�
                    后续写节点产生写原语）。
 7. `cleanup_worktree` —— verify 之后移除一次性 worktree（harvest_ops 成功路径
    保留 worktree 供 verify 使用，见 rc-702098ab）。
-8. `pr_merge`     —— 用干净产品树 tip（harvest_tip，已剔除 .dev-dispatch/.dd-evidence）
+8. `pr_merge`     —— 用产品补丁 tip（harvest_tip，只打净产品 diff、不含协议子树）
                    建 harvest 分支 -> PR -> squash merge（H5）。
 9. `pull`         —— 先机器可读检测本地 HEAD 与 origin 是否分叉；分叉/无法判定 ->
                    立即 outcome=escalated 并直接走 receipt，绝不 ff_only_pull 带病
@@ -112,9 +113,11 @@ ESCALATE_BRANCH_OCCUPIED = "HARVEST_BRANCH_OCCUPIED"
 #: writes_skipped，**不得记 harvested、绝不串上自动部署**。
 ESCALATE_EMPTY_NET_DIFF = "HARVEST_EMPTY_NET_PRODUCT_DIFF"
 
-#: 非祖先 escalate 码（判据①）：`approved_head` 不是待收 head 的祖先 ->
-#: 立即 outcome=escalated + writes_skipped，绝不收（「分支 head 是什么就收什么」被拒）。
-ESCALATE_NON_ANCESTOR_HEAD = "HARVEST_APPROVED_HEAD_NOT_ANCESTOR"
+#: 产品补丁非等价 escalate 码（判据①/⑤）：`harvested_head` 相对 base 的产品内容
+#: 与 `approved_head` 相对 base 的产品内容不等价，或 `harvested_head` 相对 base 的
+#: 不带排除口径文件清单不等于回执 `net_product_files`（多写一个文件即越权写入）->
+#: 立即 outcome=escalated + writes_skipped，绝不收。
+ESCALATE_NON_EQUIVALENT_PATCH = "HARVEST_PRODUCT_PATCH_NOT_EQUIVALENT"
 
 #: SOP 步骤名的封闭枚举——测试据此断言「编排步骤齐全」。
 SOP_STEPS = (
@@ -170,8 +173,10 @@ class HarvestOps(Protocol):
     def resolve_verify_argv(self, worktree: Path) -> tuple[list[str] | None, str]: ...
     def board_card_entity_id(self, development_id: str, dd_root: Path) -> str | None: ...
     def branch_head(self, repo: Path, branch: str) -> str | None: ...
-    def is_ancestor(self, repo: Path, ancestor: str, descendant: str) -> dict[str, Any]: ...
     def net_product_files(self, repo: Path, base: str, head: str) -> dict[str, Any]: ...
+    def product_patch_equivalent(
+        self, repo: Path, base: str, approved_head: str, harvested_head: str
+    ) -> dict[str, Any]: ...
     def detect_inflight_binding(
         self, tree_path: Path, dd_root: Path, current_development_id: str | None = None
     ) -> dict[str, Any]: ...
@@ -393,35 +398,39 @@ def _record_auth(
 
 
 def _reconcile_harvest_heads(state: HarvestState, ops: HarvestOps, *, repo: Path) -> str | None:
-    """判据③：回执三头对账的机械复核（纯读口，零写原语）。
+    """判据③/⑤：回执三头对账的机械复核（纯读口，零写原语）。
 
-    `harvested_head` 必须是 `approved_head` 的后代、`net_product_files` 必须等于
-    `git diff base..harvested_head` 排除协议目录后的文件清单。三者对不上 -> 返回
-    机器可读缺失串（红）；无法判定（三头未齐）-> None（前序节点已各自 escalate）。
+    补丁形态下 `harvested_head` 的父系是默认分支 tip（base），`approved_head` 不再是
+    它的祖先；等价契约取代旧 `is_ancestor` 判定：
+
+    1. `harvested_head` 相对 base 的产品内容必须与 `approved_head` 相对 base 的
+       产品内容逐字节等价（`ops.product_patch_equivalent` 的同排除口径 diff 比对）；
+    2. `harvested_head` 相对 base 的**不带排除口径**文件清单必须恰好等于回执
+       `net_product_files`——多写一个文件即越权写入（判据⑤）。
+
+    对不上 -> 返回机器可读缺失串（红）；无法判定（三头未齐/缺 base）-> None
+    （前序节点已各自 escalate）。
     """
     approved_head = state.get("approved_head") or ""
     harvested_head = state.get("harvested_head") or ""
     base = state.get("base_commit") or ""
     stored_files = sorted(str(p) for p in (state.get("net_product_files") or []))
-    if not approved_head or not harvested_head:
+    if not approved_head or not harvested_head or not base:
         return None
     try:
-        anc = ops.is_ancestor(repo, approved_head, harvested_head)
+        eq = ops.product_patch_equivalent(repo, base, approved_head, harvested_head)
     except Exception as exc:
-        return f"回执三头对账：is_ancestor 异常 {repr(exc)[:200]}"
-    if not (anc.get("ok") and anc.get("is_ancestor")):
-        return "回执三头对账：harvested_head 非 approved_head 后代"
-    if not base:
-        return None
-    try:
-        net = ops.net_product_files(repo, base, harvested_head)
-    except Exception as exc:
-        return f"回执三头对账：net_product_files 异常 {repr(exc)[:200]}"
-    if not net.get("ok"):
-        return "回执三头对账：净 diff 重算失败"
-    recomputed = sorted(str(p) for p in (net.get("files") or []))
-    if recomputed != stored_files:
-        return f"回执三头对账：net_product_files 不一致（记 {stored_files!r}，重算 {recomputed!r}）"
+        return f"回执三头对账：product_patch_equivalent 异常 {repr(exc)[:200]}"
+    if not eq.get("ok"):
+        return "回执三头对账：产品补丁等价重算失败"
+    if not eq.get("equivalent"):
+        return "回执三头对账：harvested_head 产品内容与 approved_head 不等价"
+    raw_files = sorted(str(p) for p in (eq.get("raw_files") or []))
+    if raw_files != stored_files:
+        return (
+            "回执三头对账：实际写入集合与 net_product_files 不一致"
+            f"（记 {stored_files!r}，重算 {raw_files!r}）"
+        )
     return None
 
 
@@ -731,7 +740,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "writes_skipped": list(WRITE_STEPS),
             }
         if not result.get("ok"):
-            # H7 写前闸：merge 判红 -> 立即停止链（见 after_worktree），
+            # H7 写前闸：产品补丁构建判红 -> 立即停止链（见 after_worktree），
             # 不执行任何写步骤；escalate 收尾时回执显式记录 writes_skipped。
             steps = _record_step(state, "worktree_cherry_pick", **result)
             return {
@@ -740,42 +749,71 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "writes_skipped": list(WRITE_STEPS),
             }
         harvest_tip = str(result.get("harvest_tip") or "")
-        # 判据①：exact-head 祖先判定——approved_head 必须是 harvest_tip 的祖先。
-        # 非祖先（洗树/exclude 提交、或「分支 head 是什么就收什么」）-> escalate，
-        # 绝不收。is_ancestor 是纯读口；merge 已成功落地，这里先回收 worktree 再
-        # 判红，避免泄漏一次性 worktree。
+        # 判据①/⑤：产品补丁等价判定——补丁形态里 approved_head 不再是 harvest_tip
+        # 的祖先（harvest_tip 父系 = 默认分支 tip）。等价契约取代旧 is_ancestor：
+        # (a) harvest_tip 相对 base 的产品内容必须与 approved_head 相对 base 的产品
+        # 内容逐字节等价；(b) harvest_tip 相对 base 的不带排除口径文件清单必须恰好
+        # 等于 net_product_files（多写一个文件即越权写入）。任一不满足 -> escalate，
+        # 绝不收。等价判定是纯读口；产品补丁已落地，这里先回收 worktree 再判红，
+        # 避免泄漏一次性 worktree。
+        base = state.get("base_commit") or ""
+        stored_files = sorted(str(p) for p in (state.get("net_product_files") or []))
         try:
-            anc = deps.ops.is_ancestor(repo, approved_head, harvest_tip)
+            eq = deps.ops.product_patch_equivalent(repo, base, approved_head, harvest_tip)
         except Exception as exc:
-            anc = {
+            eq = {
                 "ok": False,
-                "is_ancestor": False,
-                "detail": f"is_ancestor 异常: {repr(exc)[:200]}",
+                "equivalent": False,
+                "raw_files": [],
+                "detail": f"product_patch_equivalent 异常: {repr(exc)[:200]}",
             }
-        if not (anc.get("ok") and anc.get("is_ancestor")):
+        if not (eq.get("ok") and eq.get("equivalent")):
             with contextlib.suppress(Exception):
                 deps.ops.remove_worktree(repo, worktree_root)
             steps = _record_step(
                 state,
                 "worktree_cherry_pick",
                 ok=False,
-                escalate=ESCALATE_NON_ANCESTOR_HEAD,
+                escalate=ESCALATE_NON_EQUIVALENT_PATCH,
                 harvest_tip=harvest_tip,
                 approved_head=approved_head,
-                detail=anc.get("detail") or "approved_head 非 harvest_tip 祖先——非祖先不收",
+                detail=eq.get("detail") or "产品补丁与放行 head 不等价——不收",
             )
             return {
                 "steps": steps,
                 "outcome": OUTCOME_ESCALATED,
                 "writes_skipped": list(WRITE_STEPS),
             }
-        # 非祖先被拦；自洽 -> 记录 product tree tip（merge commit，approved_head 后代）。
+        raw_files = sorted(str(p) for p in (eq.get("raw_files") or []))
+        if raw_files != stored_files:
+            with contextlib.suppress(Exception):
+                deps.ops.remove_worktree(repo, worktree_root)
+            steps = _record_step(
+                state,
+                "worktree_cherry_pick",
+                ok=False,
+                escalate=ESCALATE_NON_EQUIVALENT_PATCH,
+                harvest_tip=harvest_tip,
+                approved_head=approved_head,
+                detail=(
+                    f"实际写入集合与 net_product_files 不一致（记 {stored_files!r}，"
+                    f"写 {raw_files!r}）——多写文件即越权写入"
+                ),
+            )
+            return {
+                "steps": steps,
+                "outcome": OUTCOME_ESCALATED,
+                "writes_skipped": list(WRITE_STEPS),
+            }
+        # 等价通过 -> 记录产品补丁 tip（父系 = 默认分支 tip）。
         steps = _record_step(
             state,
             "worktree_cherry_pick",
             **result,
             approved_head=approved_head,
-            is_ancestor=anc.get("is_ancestor"),
+            base=base,
+            equivalent=True,
+            raw_files=raw_files,
         )
         return {"steps": steps, "harvest_tip": harvest_tip, "harvested_head": harvest_tip}
 
@@ -1131,10 +1169,11 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 if step.get("exit_code") is not None:
                     facts.append(f"exit_code={step['exit_code']!r}")
                 missing.append(f"step {name} ok:false（{' '.join(facts)}）")
-        # 判据③：回执三头对账——harvested_head 必须是 approved_head 的后代、
-        # net_product_files 必须等于 `git diff base..harvested_head` 排除协议目录
-        # 后的文件清单。三者对不上 -> 红（escalate）。这里是收尾前的机械复核，
-        # 与 worktree 节点的祖先判定互为双保险（净化写错/漏写 net_product_files）。
+        # 判据③/⑤：回执三头对账——harvested_head 相对 base 的产品内容必须与
+        # approved_head 相对 base 的产品内容逐字节等价；且 harvested_head 相对 base
+        # 的不带排除口径文件清单必须恰好等于 net_product_files（多写一个文件即红）。
+        # 对不上 -> 红（escalate）。这里是收尾前的机械复核，与 worktree 节点的产品
+        # 补丁等价判定互为双保险（净化写错/漏写 net_product_files）。
         _reconcile = _reconcile_harvest_heads(
             state, deps.ops, repo=Path(state.get("repo_path") or "")
         )
@@ -1421,7 +1460,7 @@ __all__ = [
     "DEFAULT_VERIFY_ARGV",
     "ESCALATE_BRANCH_OCCUPIED",
     "ESCALATE_EMPTY_NET_DIFF",
-    "ESCALATE_NON_ANCESTOR_HEAD",
+    "ESCALATE_NON_EQUIVALENT_PATCH",
     "ESCALATE_TREE_OCCUPIED",
     "EVENT_APPROVED_UNHARVESTED",
     "OUTCOME_ALREADY_HARVESTED",
