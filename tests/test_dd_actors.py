@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from conftest import git, head
-from fleet_graph.bus.board import Decision, GateTicket
+from fleet_graph.bus.board import DECISION_KIND, DECISION_KIND_V2, Decision, GateTicket
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.executors.agent_run import RunStatus, RunTicket, RunWaitTimeout
 from fleet_graph.graphs.dd_actors import (
@@ -589,7 +589,7 @@ class FakeBoard:
         return self.decision
 
 
-def a_decision(value: str, *, by: str = "青林") -> Decision:
+def a_decision(value: str, *, by: str = "青林", kind: str = DECISION_KIND) -> Decision:
     return Decision(
         message_id="msg-decision",
         decision=value,
@@ -598,14 +598,28 @@ def a_decision(value: str, *, by: str = "青林") -> Decision:
         rationale="",
         card_entity_id="card-1",
         raw={},
+        kind=kind,
     )
 
 
-def make_gate(board: FakeBoard) -> BoardGate:
+def make_gate(
+    board: FakeBoard,
+    *,
+    dispatched_by: str = "青林",
+    supervisor_identity_check: Any | None = None,
+) -> BoardGate:
+    """A gate whose default dispatch line is the operator `a_decision` names.
+
+    `supervisor_identity_check` defaults to a fail-closed stub so the gate's
+    identity rule never reaches a live supervision token root in tests; the
+    supervisor-override tests inject their own check.
+    """
     return BoardGate(
         board=board,  # type: ignore[arg-type]
         card_entity_id="card-1",
         development_id="dev-1",
+        dispatched_by=dispatched_by,
+        supervisor_identity_check=supervisor_identity_check or (lambda _identity: False),
     )
 
 
@@ -673,6 +687,8 @@ class TestTheHumanGateWaitsRatherThanDecides:
             card_entity_id="card-1",
             development_id="dev-1",
             repo=tmp_path,
+            dispatched_by="青林",
+            supervisor_identity_check=lambda _identity: False,
         )
         gate.act(GATE, dispatch_for(GATE, generation=2))
 
@@ -734,3 +750,93 @@ class TestGenerationDerivedIdentities:
         with pytest.raises(StageRefused) as refused:
             make_gate(board).act(GATE, dispatch_for(GATE))
         assert refused.value.code == "GATE_REJECTED"
+
+
+class TestTheGateValidatesWhoMayDecide:
+    """The gate's default authority is the dispatch line, not anyone at all.
+
+    A human-cast `work.decision.v1` only releases when its `decided_by` names
+    either the development's own dispatch line (`dispatched_by`) or a
+    supervisor-plane identity. Any third party -- including a verdict with no
+    principal at all -- is refused with a machine-readable code. The v2
+    preauth-released `gate_release` carries its own three-factor authorization
+    and is exempt.
+    """
+
+    def test_the_dispatch_line_may_approve(self) -> None:
+        gate = make_gate(
+            FakeBoard(a_decision(GATE_APPROVE, by="ronin-line")), dispatched_by="ronin-line"
+        )
+        outcome = gate.act(GATE, dispatch_for(GATE))
+
+        assert outcome.event == SPINE_EVENT
+
+    def test_a_supervisor_identity_may_approve(self) -> None:
+        gate = make_gate(
+            FakeBoard(a_decision(GATE_APPROVE, by="uther-tui")),
+            dispatched_by="ronin-line",
+            supervisor_identity_check=lambda identity: identity == "uther-tui",
+        )
+        outcome = gate.act(GATE, dispatch_for(GATE))
+
+        assert outcome.event == SPINE_EVENT
+
+    def test_a_supervisor_override_survives_a_different_dispatch_line(self) -> None:
+        # The supervisor plane is authorized wherever the development came from;
+        # the override is not accidentally rejected because it is not the line.
+        supervisor = {"uther-tui", "cc-supervisor"}
+        gate = make_gate(
+            FakeBoard(a_decision(GATE_APPROVE, by="cc-supervisor")),
+            dispatched_by="ronin-line",
+            supervisor_identity_check=lambda identity: identity in supervisor,
+        )
+        outcome = gate.act(GATE, dispatch_for(GATE))
+
+        assert outcome.event == SPINE_EVENT
+
+    def test_a_third_party_approve_is_refused(self) -> None:
+        """The negative case: a non-line, non-supervisor APPROVE must not pass,
+        and the refusal names the offending principal and the missing relation."""
+        gate = make_gate(
+            FakeBoard(a_decision(GATE_APPROVE, by="mallory")), dispatched_by="ronin-line"
+        )
+        with pytest.raises(StageRefused) as refused:
+            gate.act(GATE, dispatch_for(GATE))
+
+        assert refused.value.code == "GATE_DECISION_UNAUTHORIZED"
+        assert "mallory" in str(refused.value)
+        assert "ronin-line" in str(refused.value)
+
+    def test_an_unattributed_approve_is_refused(self) -> None:
+        """A non-empty decided_by is not the bar; a verdict with no principal
+        is still a third party and is refused."""
+        gate = make_gate(FakeBoard(a_decision(GATE_APPROVE, by="")), dispatched_by="ronin-line")
+        with pytest.raises(StageRefused) as refused:
+            gate.act(GATE, dispatch_for(GATE))
+
+        assert refused.value.code == "GATE_DECISION_UNAUTHORIZED"
+
+    def test_a_third_party_cannot_masquerade_as_any_non_empty_principal(self) -> None:
+        """The spec's mutation guard: flipping the rule to "any non-empty
+        decided_by is authorized" must turn this red. Only the exact dispatch
+        line (or a supervisor identity) releases."""
+        gate = make_gate(
+            FakeBoard(a_decision(GATE_APPROVE, by="someone-else")), dispatched_by="ronin-line"
+        )
+        with pytest.raises(StageRefused):
+            gate.act(GATE, dispatch_for(GATE))
+
+    def test_the_v2_gate_release_is_not_identity_checked(self) -> None:
+        """The preauth-released `work.decision.v2` gate_release carries its own
+        three-factor authorization; the identity rule governs v1 only."""
+        gate = make_gate(
+            FakeBoard(
+                a_decision(
+                    GATE_APPROVE, by="supervisor-graph (依预授权 msg-1 代行)", kind=DECISION_KIND_V2
+                )
+            ),
+            dispatched_by="ronin-line",
+        )
+        outcome = gate.act(GATE, dispatch_for(GATE))
+
+        assert outcome.event == SPINE_EVENT

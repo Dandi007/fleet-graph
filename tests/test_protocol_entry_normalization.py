@@ -258,6 +258,8 @@ def _gate(board: _FakeBoard) -> BoardGate:
         board=board,  # type: ignore[arg-type]
         card_entity_id="card-1",
         development_id="dev-1",
+        dispatched_by="青林",
+        supervisor_identity_check=lambda _identity: False,
     )
 
 

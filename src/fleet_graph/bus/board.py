@@ -55,6 +55,12 @@ class Decision:
     rationale: str
     card_entity_id: str
     raw: dict[str, Any]
+    #: The bus message kind this decision was read from (`work.decision.v1` or
+    #: `work.decision.v2`). Defaults to v1 -- the human-cast shape -- so a
+    #: Decision built directly in a test is governed by the human-gate identity
+    #: rule unless it says otherwise. v2 carries its own authorization (the
+    #: preauth-released `gate_release`), which the gate leaves untouched.
+    kind: str = DECISION_KIND
 
 
 @dataclass(frozen=True)
@@ -435,6 +441,7 @@ class Board:
             rationale=str(payload.get("rationale", "")),
             card_entity_id=str(payload.get("card_entity_id", ticket.card_entity_id)),
             raw=newest,
+            kind=str(newest.get("kind") or DECISION_KIND),
         )
 
     # --- observability ---------------------------------------------------

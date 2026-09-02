@@ -1396,6 +1396,9 @@ class TestFullChainFailedReconfigureRestart:
                 "setup_commands": [list(c) for c in record.get("setup_commands") or []],
                 "acceptance_env": dict(record.get("acceptance_env") or {}),
             },
+            # The gate decision this fixture casts is attributed to 青林; the
+            # dispatch line must agree for the human gate to accept it.
+            dispatched_by="青林",
         )
         return run_pipeline(
             config,

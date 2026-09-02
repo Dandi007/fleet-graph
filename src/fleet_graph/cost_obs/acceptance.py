@@ -175,6 +175,9 @@ def _run_development(
         card_entity_id="card-1",
         development_id=development_id,
         repo=repo,
+        # The synthetic board's verdict is cast as `fixture`; the dispatch
+        # line must agree for the human gate to accept it.
+        dispatched_by="fixture",
     )
     scripts: dict[str, Any] = {
         _producer(lifecycle, "run_config"): ConfigureStage(repo=repo, run_config={}),

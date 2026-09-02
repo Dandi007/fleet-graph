@@ -222,6 +222,7 @@ def run_settle(
             board=_ApprovingBoard(),  # type: ignore[arg-type]
             card_entity_id="card-1",
             development_id=development_id,
+            dispatched_by="fixture",
         ),
     }
     deps = PipelineDeps(
@@ -517,6 +518,7 @@ class TestAbsenceAccountingOnNonCompleteTerminals:
                 board=_ApprovingBoard(),  # type: ignore[arg-type]
                 card_entity_id="card-1",
                 development_id="dev-1",
+                dispatched_by="fixture",
             ),
         }
         deps = PipelineDeps(

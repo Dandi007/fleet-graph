@@ -85,6 +85,8 @@ def make_gate(board: FakeBoard) -> BoardGate:
         board=board,  # type: ignore[arg-type]
         card_entity_id="card-1",
         development_id="dev-1",
+        dispatched_by="青林",
+        supervisor_identity_check=lambda _identity: False,
     )
 
 
@@ -193,6 +195,8 @@ class TestBoardGateConsumesTheNormalizer:
             card_entity_id="card-1",
             development_id="dev-1",
             repo=tmp_path,
+            dispatched_by="青林",
+            supervisor_identity_check=lambda _identity: False,
         )
         gate.act(GATE, a_dispatch())
 

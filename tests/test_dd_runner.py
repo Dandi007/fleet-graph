@@ -387,6 +387,9 @@ class TestWaitingOnAHumanAndComingBack:
         # A resume has to find the thread, so the checkpoint outlives the process.
         config.checkpoint_path = str(tmp_path / "checkpoint.sqlite")
         config.run_config = {"acceptance_commands": [["true"]]}
+        # The gate decisions these tests cast are attributed to 青林; the
+        # dispatch line must agree for the human gate to accept them.
+        config.dispatched_by = "青林"
         return config
 
     def _run(self, config: DevelopmentConfig, board: FakeBoard, **kwargs: Any) -> dict[str, Any]:
@@ -623,6 +626,7 @@ class TestARestartedGenerationKeepsItsCostFacts:
             generation=generation,
             cost_obs_dir=str(tmp_path / "textfile"),
             run_config={"acceptance_commands": [["true"]]},
+            dispatched_by="青林",
         )
 
     def test_generation_two_rehydrates_the_previous_scrape_file(

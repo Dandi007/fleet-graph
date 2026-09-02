@@ -26,7 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from fleet_graph.bus.board import Board, GateTicket, normalize_decision
+from fleet_graph.bus.board import DECISION_KIND_V2, Board, GateTicket, normalize_decision
+from fleet_graph.bus.tokens import build_supervisor_identity_check
 from fleet_graph.cost_obs import CostDataPlane
 from fleet_graph.cost_obs.classify import LAUNCH, REVIEW
 from fleet_graph.dd.dispatch import derive_attempt_id
@@ -520,6 +521,17 @@ class BoardGate:
     question: str = ""
     approve: str = GATE_APPROVE
     allowed_decisions: tuple[str, ...] = (GATE_APPROVE, "REJECT")
+    #: The bounded principal that dispatched this development (the record.json
+    #: `dispatched_by`). A human-cast `work.decision.v1` whose `decided_by`
+    #: names this principal is accepted as the dispatch line deciding its own
+    #: development -- the default human-gate authority. Empty means no dispatch
+    #: line was recorded, so only a supervisor identity may release.
+    dispatched_by: str = ""
+    #: Supervisor-plane identity check ``(identity) -> bool`` (U4 admission).
+    #: None means the production default: `build_supervisor_identity_check`,
+    #: which requires the identity's credential to live under the supervision
+    #: token root. Injected in tests so the gate never touches a live root.
+    supervisor_identity_check: Any = None
 
     def _question(self, dispatch: Dispatch) -> str:
         if self.question:
@@ -535,6 +547,30 @@ class BoardGate:
             question=self._question(dispatch),
             idempotency_key=f"dd-gate:{self.development_id}:g{dispatch['generation']}",
         )
+
+    def _supervisor_check(self) -> Any:
+        if self.supervisor_identity_check is not None:
+            return self.supervisor_identity_check
+        return build_supervisor_identity_check()
+
+    def _authorized_principal(self, decided_by: str) -> tuple[bool, str]:
+        """Whether `decided_by` may release this development.
+
+        The gate accepts exactly two principals: the dispatch line (the
+        record.json `dispatched_by` this development was dispatched by) and a
+        supervisor-plane identity. Anything else -- including an empty
+        `decided_by` -- is a third party and is refused. Returns the dispatch
+        identity alongside the verdict so the refusal can name the missing
+        authorization relation.
+        """
+        dispatched = (self.dispatched_by or "").strip()
+        if not decided_by:
+            return False, dispatched
+        if dispatched and decided_by == dispatched:
+            return True, dispatched
+        if self._supervisor_check()(decided_by):
+            return True, dispatched
+        return False, dispatched
 
     def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
         ticket = self._ticket(dispatch)
@@ -566,6 +602,21 @@ class BoardGate:
         if verdict != self.approve:
             operator = decision.decided_by or "an operator"
             raise StageRefused(f"gate decision {verdict} by {operator}", code="GATE_REJECTED")
+
+        # The gate is not a self-serve release: a human-cast verdict only
+        # passes when its principal is the dispatch line or the supervisor
+        # plane. A v2 decision is the preauth-released `gate_release`, which
+        # carries its own three-factor authorization and is left untouched.
+        if getattr(decision, "kind", None) != DECISION_KIND_V2:
+            authorized, dispatched = self._authorized_principal(decision.decided_by)
+            if not authorized:
+                offending = decision.decided_by or "(no principal)"
+                raise StageRefused(
+                    f"gate decision {verdict} by {offending!r} is not authorized: "
+                    f"the principal is neither this development's dispatch line "
+                    f"({dispatched!r}) nor a supervisor identity",
+                    code="GATE_DECISION_UNAUTHORIZED",
+                )
 
         record = {
             "stage": stage.id,

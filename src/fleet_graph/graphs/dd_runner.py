@@ -249,6 +249,10 @@ def build_pipeline(
             card_entity_id=gate_card_entity_id,
             development_id=config.development_id,
             repo=config.workspace_path,
+            # The bounded dispatch principal threads to the gate's identity
+            # rule: a human-cast verdict only releases when decided_by names
+            # this principal (or a supervisor identity).
+            dispatched_by=config.dispatched_by,
         )
     registered.update(scripts or {})
 
