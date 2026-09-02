@@ -1,0 +1,29 @@
+{
+ "development_id": "dev-fg-2e9c3e6384a2",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "uv",
+    "sync",
+    "--frozen"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": "Checked 100 packages in 1ms\n"
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "pytest",
+    "-q",
+    "tests/test_m4_availability.py"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "..........                                                               [100%]\n",
+   "stderr_tail": ""
+  }
+ ]
+}
