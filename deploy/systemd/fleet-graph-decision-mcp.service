@@ -1,0 +1,50 @@
+# systemd *user* unit for the standalone decision MCP surface.
+#
+# The decision-delivery family (decision_deliver) lives on its own surface
+# (`fleet-graph decision serve`, :5614) -- the synchronous, conclusive verdict
+# delivery the 2026-09-02 用户拍板 moved the decision hand-off onto. It is a
+# standalone service, not a guest of the dev-dispatch / goal / research MCP.
+#
+# Template only: shipped in the repo, deliberately not enabled or installed by
+# any script here -- deployment is a supervision-plane decision (same
+# convention and comment discipline as fleet-graph-dd-mcp.service).
+#
+# `decision serve` is a real subcommand, checked by tests/test_deploy_unit.py
+# the same way the other MCP unit templates are: an invented subcommand plus
+# Restart=always is a silent crash loop, not a visible failure.
+#
+# ExecStart passes --lines-config (the roster that decides which lines are
+# registered waiting parties) and --state-dir (the delivery ledger + metrics
+# textfile). The site value for --lines-config is filled in by the deployer
+# (this repo never hardcodes a host path beyond the /data fleet roots).
+#
+# Port discipline (R1/R2, 2026-09-02): the decision MCP default moved from
+# 5613 to 5614 because the supervision scan found 5602-5613 continuously
+# occupied on the fleet host. The occupied/reserved loopback ports are the
+# committed single source `config/decision-mcp-reserved-ports.json`; 5614 is
+# outside that list (5614/5615/5616 scanned free), and the red-able port
+# assertion in tests/test_decision_mcp.py fails the suite if the default ever
+# drifts back into it. This is a CI/acceptance-time assertion, not a runtime
+# "probe the port at startup" behavior (spec item 0 R2).
+[Unit]
+Description=fleet-graph decision MCP surface (synchronous verdict delivery)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/apps/fleet-graph/current
+ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph decision serve \
+    --host 127.0.0.1 --port 5614 \
+    --lines-config <lines-config> \
+    --state-dir /data/fleet-graph/decision-mcp
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+# Credentials are env-only; never commit a token into this unit. The optional
+# marker (`-` after the `=`) matches fleet-graphd.service: a missing env file
+# must not be an unexplained start failure.
+EnvironmentFile=-%h/.config/fleet-graph/env
+Environment=PATH=%h/.bun/bin:%h/.local/bin:%h/.opencode/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+[Install]
+WantedBy=default.target

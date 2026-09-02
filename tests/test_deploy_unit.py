@@ -31,6 +31,12 @@ RESEARCH_MCP_UNIT = (
     / "systemd"
     / "fleet-graph-research-mcp.service"
 )
+DECISION_MCP_UNIT = (
+    Path(__file__).resolve().parent.parent
+    / "deploy"
+    / "systemd"
+    / "fleet-graph-decision-mcp.service"
+)
 ARBITER_UNIT = (
     Path(__file__).resolve().parent.parent / "deploy" / "systemd" / "fleet-graph-arbiter.service"
 )
@@ -339,6 +345,81 @@ class TestTheResearchMcpUnitRunsSomethingThatExists:
         with tempfile.TemporaryDirectory() as tmp:
             staged = Path(tmp) / RESEARCH_MCP_UNIT.name
             staged.write_text(RESEARCH_MCP_UNIT.read_text(encoding="utf-8"), encoding="utf-8")
+            done = subprocess.run(
+                [analyze, "--user", "verify", str(staged)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        noise = done.stderr + done.stdout
+        assert "Unknown key" not in noise, noise
+
+
+class TestTheDecisionMcpUnitRunsSomethingThatExists:
+    """Same discipline as the goal-mcp unit, applied to the standalone decision
+    MCP surface unit template (also shipped, deliberately not enabled)."""
+
+    def test_the_subcommand_is_one_the_cli_accepts(self) -> None:
+        argv = exec_start(DECISION_MCP_UNIT.read_text(encoding="utf-8"))
+        assert argv[0].endswith("fleet-graph"), argv[0]
+        parsed = build_parser().parse_args(argv[1:])
+        assert parsed.func is not None
+
+    def test_it_serves_the_agreed_loopback_port(self) -> None:
+        argv = exec_start(DECISION_MCP_UNIT.read_text(encoding="utf-8"))
+        assert argv[1:3] == ["decision", "serve"], argv
+        assert "--port" in argv and argv[argv.index("--port") + 1] == "5614", argv
+        assert "--host" in argv and argv[argv.index("--host") + 1] == "127.0.0.1", argv
+
+    def test_it_passes_lines_config_explicitly(self) -> None:
+        """Fail-fast binding: the unit passes --lines-config on ExecStart, so
+        the decision service never starts without a roster to resolve waiting
+        parties (a missing roster degrades to NO_WAITING_PARTY for every line)."""
+        argv = exec_start(DECISION_MCP_UNIT.read_text(encoding="utf-8"))
+        assert "--lines-config" in argv, argv
+
+    def test_it_restarts_and_runs_from_the_current_snapshot(self) -> None:
+        text = DECISION_MCP_UNIT.read_text(encoding="utf-8")
+        assert "Restart=always" in text
+        assert "WorkingDirectory=/data/apps/fleet-graph/current" in text
+        argv = exec_start(text)
+        assert argv[0].startswith("/data/apps/fleet-graph/current/"), argv[0]
+
+    def test_a_missing_env_file_is_tolerated(self) -> None:
+        text = DECISION_MCP_UNIT.read_text(encoding="utf-8")
+        assert re.search(r"^EnvironmentFile=-", text, re.MULTILINE)
+        assert not re.search(r"^-\w+=", text, re.MULTILINE)
+
+    def test_no_credential_is_baked_into_the_unit(self) -> None:
+        for line in DECISION_MCP_UNIT.read_text(encoding="utf-8").splitlines():
+            if line.startswith("Environment="):
+                assert "TOKEN" not in line.upper(), line
+                assert "KEY" not in line.upper(), line
+
+    def test_the_unit_port_is_not_reserved(self) -> None:
+        """R2: the unit serves the port the red-able assertion guarantees is
+        outside config/decision-mcp-reserved-ports.json."""
+        import json
+
+        from fleet_graph.decision_mcp import DEFAULT_PORT
+
+        assert DEFAULT_PORT == 5614
+        argv = exec_start(DECISION_MCP_UNIT.read_text(encoding="utf-8"))
+        unit_port = int(argv[argv.index("--port") + 1])
+        assert unit_port == DEFAULT_PORT
+        reserved_path = (
+            Path(__file__).resolve().parent.parent / "config" / "decision-mcp-reserved-ports.json"
+        )
+        reserved = json.loads(reserved_path.read_text(encoding="utf-8"))["reserved_ports"]
+        assert unit_port not in reserved
+
+    def test_systemd_itself_accepts_every_key(self) -> None:
+        analyze = shutil.which("systemd-analyze")
+        if analyze is None:
+            pytest.skip("systemd-analyze not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = Path(tmp) / DECISION_MCP_UNIT.name
+            staged.write_text(DECISION_MCP_UNIT.read_text(encoding="utf-8"), encoding="utf-8")
             done = subprocess.run(
                 [analyze, "--user", "verify", str(staged)],
                 capture_output=True,
