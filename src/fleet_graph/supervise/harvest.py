@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypedDict
@@ -63,7 +64,11 @@ from fleet_graph.supervise.harvest_allowlist import (
     HarvestAllowlist,
     HarvestAuthorization,
 )
-from fleet_graph.supervise.harvest_ops import EXIT_HEAD_MISMATCH, EXIT_NOT_FOUND
+from fleet_graph.supervise.harvest_ops import (
+    ESCALATE_SQUASH_TRAILER_MISSING,
+    EXIT_HEAD_MISMATCH,
+    EXIT_NOT_FOUND,
+)
 
 #: harvest 终态词汇（outcome）。REFUSED / ALREADY_HARVESTED 都是无写动作的合法
 #: 终止；HARVESTED 要求后置条件三要素齐全；ESCALATED = 失败/升报。
@@ -99,6 +104,12 @@ ESCALATE_TREE_OCCUPIED = "HARVEST_TREE_OCCUPIED_BY_INFLIGHT"
 #: verify_real 任何写步（spec 交付 A.2：走既有 escalate 收尾）。
 ESCALATE_BRANCH_OCCUPIED = "HARVEST_BRANCH_OCCUPIED"
 
+#: squash 溯源写前闸 refuse+escalate 码（`HARVEST_SQUASH_TRAILER_MISSING`，
+#: 定义见 `harvest_ops.ESCALATE_SQUASH_TRAILER_MISSING`，已在 import 段引入）：
+#: squash commit message 缺 `Development-Id` trailer（溯源不完整）-> merge 写前闸
+#: refuse，绝不执行 gh pr merge / 不落 squash commit / 不把无溯源 commit 写进
+#: 默认分支（spec 阴性②）。编排层据此走既有 escalate 收尾。
+
 #: SOP 步骤名的封闭枚举——测试据此断言「编排步骤齐全」。
 SOP_STEPS = (
     "fetch_dd_ref",
@@ -106,6 +117,7 @@ SOP_STEPS = (
     "worktree_cherry_pick",
     "run_verify",
     "cleanup_worktree",
+    "squash_commit_message",
     "pr_squash_merge",
     "ff_only_pull",
     "deploy",
@@ -148,8 +160,21 @@ class HarvestOps(Protocol):
     def detect_inflight_binding(
         self, tree_path: Path, dd_root: Path, current_development_id: str | None = None
     ) -> dict[str, Any]: ...
+    def build_squash_commit_message(
+        self,
+        repo: Path,
+        development_id: str,
+        dd_root: Path,
+        narrative: str | None = None,
+        decision_id: str | None = None,
+    ) -> dict[str, Any]: ...
     def pr_squash_merge(
-        self, repo: Path, development_id: str, head_commit: str, default_branch: str
+        self,
+        repo: Path,
+        development_id: str,
+        head_commit: str,
+        default_branch: str,
+        commit_message: str | None = None,
     ) -> dict[str, Any]: ...
     def detect_divergence(self, repo: Path, default_branch: str) -> dict[str, Any]: ...
     def ff_only_pull(self, repo: Path, default_branch: str) -> dict[str, Any]: ...
@@ -180,6 +205,7 @@ class HarvestState(TypedDict, total=False):
     outcome: str
     receipt_path: str
     writes_skipped: list[str]
+    squash_commit_message: str
     _gaps: list[str]
     wiki: Any
 
@@ -205,6 +231,10 @@ class HarvestDeps:
     #: None -> 不汇报（默认）。wiki 是 telemetry，追加失败绝不翻转 outcome /
     #: escalate / 重跑收割（best-effort，见 receipt 节点）。
     wiki: Any | None = None
+    #: squash commit message 的叙事半生成器（LLM，`(development_id, head_commit)
+    #: -> narrative`）。None/抛错/空 -> 降级为模板叙事（subject 仍非空，fail-open）。
+    #: trailer 半恒由 `ops.build_squash_commit_message` 机械生成，绝不取自 LLM 输出。
+    squash_narrative: Callable[[str, str], str] | None = None
 
     def thread_dir(self, key: str) -> Path:
         return self.state_root / "threads" / key
@@ -629,6 +659,51 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         steps = _record_step(state, "cleanup_worktree", **result)
         return {"steps": steps}
 
+    def squash_commit_message(state: HarvestState) -> HarvestState:
+        """机械组装 squash commit message（trailer 半恒机械，叙事半可 LLM 可模板）。
+
+        spec 节点位置：独立节点在 `pr_squash_merge` 之前产出溯源 trailer——
+        先机械取 trailer 值（record.json 的 development_id + durable ref HEAD，
+        见 `HarvestOps.build_squash_commit_message`）+ 让 LLM 写叙事（注入的
+        `deps.squash_narrative`，抛错/缺省 -> 模板兜底，subject 仍非空），再组装
+        commit message 存入 state，merge 写前闸据此校验。
+
+        **merge 写前闸（spec 阴性②）**：组装结果溯源不完整（缺 Development-Id /
+        Squashed-From）-> 立即 outcome=escalated + writes_skipped，绝不进入
+        pr_squash_merge（不执行 gh pr merge / 不落 squash commit / 不把无溯源
+        commit 写进默认分支）。LLM 不可用只降级叙事，绝不丢 trailer（阴性③）。
+        """
+        repo = Path(state.get("repo_path") or "")
+        development_id = state.get("development_id") or ""
+        head_commit = state.get("head_commit") or ""
+        narrative: str | None = None
+        if deps.squash_narrative is not None:
+            try:
+                narrative = deps.squash_narrative(development_id, head_commit)
+            except Exception:
+                narrative = None
+        try:
+            result = deps.ops.build_squash_commit_message(
+                repo, development_id, deps.dd_root, narrative=narrative
+            )
+        except Exception as exc:
+            return {
+                "steps": _record_step(
+                    state, "squash_commit_message", ok=False, detail=repr(exc)[:300]
+                ),
+                "outcome": OUTCOME_ESCALATED,
+                "writes_skipped": list(WRITE_STEPS),
+            }
+        step = {**result, "ok": bool(result.get("ok"))}
+        steps = _record_step(state, "squash_commit_message", **step)
+        if not result.get("ok"):
+            return {
+                "steps": steps,
+                "outcome": OUTCOME_ESCALATED,
+                "writes_skipped": list(WRITE_STEPS),
+            }
+        return {"steps": steps, "squash_commit_message": result.get("message") or ""}
+
     def pr_merge(state: HarvestState) -> HarvestState:
         auth = authorize_harvest_write(
             deps.allowlist,
@@ -649,6 +724,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 state.get("development_id") or "",
                 harvest_tip,
                 state.get("default_branch") or "",
+                commit_message=state.get("squash_commit_message") or None,
             )
         except Exception as exc:
             return {
@@ -660,7 +736,12 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         # M3 分支占用 refuse+escalate：pr_squash_merge 返回 refused+escalate ->
         # 立即 outcome=escalated + writes_skipped，绝不落半态、绝不触碰任何写步
         # （spec 交付 A.2：走既有 escalate 收尾，不执行 gh pr merge / 后续写步）。
-        if result.get("refused") and result.get("escalate") == ESCALATE_BRANCH_OCCUPIED:
+        # squash 溯源写前闸（spec 阴性②）：缺 Development-Id trailer 同样
+        # refused+escalate -> 同一 escalate 收尾，绝不把无溯源 commit 写进默认分支。
+        if result.get("refused") and result.get("escalate") in (
+            ESCALATE_BRANCH_OCCUPIED,
+            ESCALATE_SQUASH_TRAILER_MISSING,
+        ):
             return {
                 "steps": steps,
                 "pr_merged": merged,
@@ -1003,7 +1084,19 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
     def after_cleanup(state: HarvestState) -> str:
         # H7 写前闸（真正的闸口）：verify 判红后 cleanup 已完成 housekeeping，
         # 这里 outcome 已设（escalated）-> 绝不进入 pr_merge（写默认分支），
-        # 直接 postconditions escalate 收尾；未判红 -> 既有链进 pr_merge。
+        # 直接 postconditions escalate 收尾；未判红 -> 既有链进 squash_commit_message
+        # （spec：trailer 作为 pr_squash_merge 之前的独立节点产出）。
+        if state.get("outcome") is None:
+            return "squash_commit_message"
+        if state.get("outcome") == OUTCOME_REFUSED:
+            return "receipt"
+        return "postconditions"
+
+    def after_squash_commit_message(state: HarvestState) -> str:
+        # squash 溯源写前闸：trailer 组装判红（缺 Development-Id / Squashed-From）
+        # -> outcome 已设（escalated）-> 绝不进入 pr_squash_merge（不执行 gh pr
+        # merge、不落 squash commit、不把无溯源 commit 写进默认分支），直接
+        # postconditions escalate 收尾（spec 阴性②）。
         if state.get("outcome") is None:
             return "pr_merge"
         if state.get("outcome") == OUTCOME_REFUSED:
@@ -1021,6 +1114,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
     graph.add_node("worktree", worktree)
     graph.add_node("verify", verify)
     graph.add_node("cleanup_worktree", cleanup_worktree)
+    graph.add_node("squash_commit_message", squash_commit_message)
     graph.add_node("pr_merge", pr_merge)
     graph.add_node("pull", pull)
     graph.add_node("deploy", deploy)
@@ -1037,7 +1131,12 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
     graph.add_conditional_edges("worktree", after_worktree, {"verify", "postconditions", "receipt"})
     graph.add_conditional_edges("verify", after_verify, {"cleanup_worktree", "receipt"})
     graph.add_conditional_edges(
-        "cleanup_worktree", after_cleanup, {"pr_merge", "postconditions", "receipt"}
+        "cleanup_worktree", after_cleanup, {"squash_commit_message", "postconditions", "receipt"}
+    )
+    graph.add_conditional_edges(
+        "squash_commit_message",
+        after_squash_commit_message,
+        {"pr_merge", "postconditions", "receipt"},
     )
     graph.add_conditional_edges("pr_merge", after_pr_merge, {"pull", "postconditions", "receipt"})
     graph.add_conditional_edges("pull", after_pull, {"deploy", "receipt"})
@@ -1071,6 +1170,8 @@ class HarvestRunConfig:
     #: katana-wiki-mcp 客户端（可选）。终局 HARVESTED 时追加「生产晋级」分节；
     #: None -> 不汇报（默认）。wiki 是 telemetry，追加失败绝不翻转 outcome。
     wiki: Any | None = None
+    #: squash commit message 叙事半生成器（LLM）。None/抛错 -> 模板叙事兜底。
+    squash_narrative: Callable[[str, str], str] | None = None
 
     @property
     def resolved_checkpoint_path(self) -> str:
@@ -1096,6 +1197,7 @@ def build_harvest(config: HarvestRunConfig) -> tuple[Any, HarvestDeps, Superviso
         bus=config.bus,
         publish_notes=config.publish_notes,
         wiki=config.wiki,
+        squash_narrative=config.squash_narrative,
     )
     return build_harvest_graph(deps), deps, event
 
@@ -1143,6 +1245,8 @@ def run_harvest(config: HarvestRunConfig) -> dict[str, Any]:
 __all__ = [
     "DEFAULT_BRANCH",
     "DEFAULT_VERIFY_ARGV",
+    "ESCALATE_BRANCH_OCCUPIED",
+    "ESCALATE_SQUASH_TRAILER_MISSING",
     "ESCALATE_TREE_OCCUPIED",
     "EVENT_APPROVED_UNHARVESTED",
     "OUTCOME_ALREADY_HARVESTED",

@@ -63,6 +63,7 @@ def fake_ops(
     resolve_verify_argv: tuple[list[str] | None, str] | None = None,
     resolve_verify_argv_calls: list[tuple[list[str] | None, str]] | None = None,
     pr_merge_result: dict[str, Any] | None = None,
+    squash_message_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A recording fake ops: every write/execute is recorded, results scripted.
 
@@ -96,6 +97,7 @@ def fake_ops(
             "detail": "local 是 origin 祖先（未分叉）",
         }
     pr_merge_args: list[dict[str, Any]] = []
+    squash_message_args: list[dict[str, Any]] = []
 
     class Ops:
         def fetch_dd_ref(
@@ -104,6 +106,39 @@ def fake_ops(
             calls.append("fetch_dd_ref")
             fetch_remote_urls.append(remote_url)
             return {"ok": fetch_ok}
+
+        def build_squash_commit_message(
+            self,
+            repo: Path,
+            development_id: str,
+            dd_root: Path,
+            narrative: str | None = None,
+            decision_id: str | None = None,
+        ) -> dict[str, Any]:
+            # 机械读口：不入 calls（calls 只记录写/执行动作）；调用面单独记录。
+            squash_message_args.append(
+                {
+                    "development_id": development_id,
+                    "narrative": narrative,
+                    "decision_id": decision_id,
+                }
+            )
+            if squash_message_result is not None:
+                return dict(squash_message_result)
+            subject = narrative.splitlines()[0] if narrative else f"harvest: {development_id}"
+            message = f"{subject}\n\nDevelopment-Id: {development_id}\nSquashed-From: {'a' * 40}"
+            return {
+                "ok": True,
+                "subject": subject,
+                "body": "",
+                "message": message,
+                "trailers": {
+                    "Development-Id": development_id,
+                    "Squashed-From": "a" * 40,
+                    "Decision-Id": "",
+                },
+                "missing": [],
+            }
 
         def resolve_canonical_repo(
             self,
@@ -175,7 +210,12 @@ def fake_ops(
             return board_card_entity_id
 
         def pr_squash_merge(
-            self, repo: Path, development_id: str, head_commit: str, default_branch: str
+            self,
+            repo: Path,
+            development_id: str,
+            head_commit: str,
+            default_branch: str,
+            commit_message: str | None = None,
         ) -> dict[str, Any]:
             calls.append("pr_squash_merge")
             pr_merge_args.append(
@@ -183,6 +223,7 @@ def fake_ops(
                     "development_id": development_id,
                     "head_commit": head_commit,
                     "default_branch": default_branch,
+                    "commit_message": commit_message,
                 }
             )
             if pr_merge_result is not None:
@@ -221,6 +262,7 @@ def fake_ops(
         "verify_real_heads": verify_real_heads,
         "verify_real_argvs": verify_real_argvs,
         "pr_merge_args": pr_merge_args,
+        "squash_message_args": squash_message_args,
         "binding_probes": binding_probes,
         "fetch_remote_urls": fetch_remote_urls,
     }
@@ -2967,3 +3009,216 @@ class TestHarvestWikiReport:
         graph, deps, _event = build_harvest(config)
         assert deps.wiki is config.wiki
         assert graph is not None
+
+
+class TestHarvestSquashTrailer:
+    """spec：squash merge 提交溯源 trailer 机制（trailer 半恒机械）。
+
+    1. **阳性**：`build_squash_commit_message` 产出 message 带 `Development-Id`
+       == record.development_id 与 `Squashed-From` == durable ref HEAD 完整 40-hex；
+       `pr_squash_merge` 把组装好的 commit_message 作为 squash 提交的
+       subject/body 传进 `gh pr merge --squash`。
+    2. **阴性①（pin）**：trailer 取值源由机械事实换成「从 LLM 输出解析」必红——
+       叙事半里塞伪造 trailer 行，机械 trailer 值必须仍然正确且不被替换。
+    3. **阴性②（写前闸）**：缺 Development-Id trailer 的 commit/PR -> merge 写前闸
+       refuse，绝不执行 gh pr merge、不落 squash commit、不写默认分支。
+    4. **阴性③（LLM 不可用仍合）**：LLM/叙事抛错 -> 两条 trailer 仍完整且值正确、
+       subject 非空（模板兜底）、合并仍发生。
+    """
+
+    def _repo_with_dd_ref(self, tmp_path: Path, *, dev: str = "dev-x") -> tuple[Path, str]:
+        repo = tmp_path / "canon"
+        _init_git_repo(repo)
+        sha = head(repo)
+        git(repo, "update-ref", f"refs/heads/dd/{dev}", sha)
+        return repo, sha
+
+    def test_positive_message_has_mechanical_trailers(self, tmp_path: Path) -> None:
+        """阳性：Development-Id == record.development_id、Squashed-From == durable ref HEAD。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo, sha = self._repo_with_dd_ref(tmp_path)
+        dd_root = dd_record_root(tmp_path, str(repo))
+        result = DefaultHarvestOps().build_squash_commit_message(
+            repo, "dev-x", dd_root, narrative="LLM subject\n\nLLM body text"
+        )
+        assert result["ok"] is True, result
+        assert result["subject"] == "LLM subject"
+        assert result["message"].splitlines()[0] == "LLM subject"
+        assert "Development-Id: dev-x" in result["message"], result["message"]
+        assert f"Squashed-From: {sha}" in result["message"], result["message"]
+        # 判据锚点：trailer 值 == 机械事实（record + durable ref HEAD）。
+        assert result["trailers"]["Development-Id"] == "dev-x"
+        assert result["trailers"]["Squashed-From"] == sha
+        assert result["missing"] == []
+
+    def test_positive_trailers_survive_on_a_real_commit(self, tmp_path: Path) -> None:
+        """阳性（验收标准原文）：squash 提交 message 落成真实 commit 后可
+        `git show -s --format=%B` 查到两条机械 trailer（值正确、subject 非空）。"""
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo, sha = self._repo_with_dd_ref(tmp_path)
+        dd_root = dd_record_root(tmp_path, str(repo))
+        result = DefaultHarvestOps().build_squash_commit_message(
+            repo, "dev-x", dd_root, narrative="Narrative subject\n\nbody text"
+        )
+        assert result["ok"] is True, result
+
+        message_file = tmp_path / "squash-message.txt"
+        message_file.write_text(result["message"] + "\n", encoding="utf-8")
+        (repo / "probe.txt").write_text("probe\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-F", str(message_file))
+        body = git(repo, "show", "-s", "--format=%B", "HEAD")
+        assert "Development-Id: dev-x" in body, body
+        assert f"Squashed-From: {sha}" in body, body
+        assert body.splitlines()[0].strip() == "Narrative subject"
+
+    def test_negative_trailer_source_never_parsed_from_llm_output(self, tmp_path: Path) -> None:
+        """阴性①（pin）：LLM 输出里塞伪造 trailer 行，机械 trailer 值必须原样保留。
+
+        若实现把 trailer 取值源换成「从 LLM 输出解析」，这里的断言必红——
+        Development-Id 必须仍 == record 的 development_id，Squashed-From 必须仍
+        == durable ref HEAD，绝不采信 LLM 注入的值。
+        """
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo, sha = self._repo_with_dd_ref(tmp_path)
+        dd_root = dd_record_root(tmp_path, str(repo))
+        # LLM 叙事里塞伪造 trailer（这就是「从 LLM 输出解析」的实现会去读的值）。
+        forged = (
+            "Fake subject\n\n"
+            "this is llm narrative\n"
+            "Development-Id: llm-injected-dev\n"
+            "Squashed-From: " + ("0" * 40) + "\n"
+        )
+        result = DefaultHarvestOps().build_squash_commit_message(repo, "dev-x", dd_root, forged)
+        assert result["ok"] is True, result
+        # 机械 trailer 值不得被 LLM 输出替换/注入。
+        assert result["trailers"]["Development-Id"] == "dev-x"
+        assert result["trailers"]["Squashed-From"] == sha
+        assert "llm-injected-dev" not in result["trailers"]["Development-Id"]
+        assert ("0" * 40) not in result["trailers"]["Squashed-From"]
+        # 消息里最后的机械 trailer 行存在且值正确（git trailer 解析口径）。
+        assert "Development-Id: dev-x" in result["message"]
+        assert f"Squashed-From: {sha}" in result["message"]
+
+    def test_negative_missing_development_id_refuses_without_gh(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """阴性②（写前闸）：commit/PR 缺 Development-Id trailer -> merge 写前闸 refuse。
+
+        绝不执行 gh pr merge、不落 squash commit、不把无溯源 commit 写进默认分支
+        （fake 命令计数 0 + git push 不执行 + 远端无 harvest ref）。
+        """
+        from fleet_graph.supervise import harvest_ops
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        repo, sha = self._repo_with_dd_ref(tmp_path)
+        origin = tmp_path / "origin.git"
+        git(repo, "clone", "--bare", "-q", ".", str(origin))
+        git(repo, "remote", "add", "origin", str(origin))
+
+        gh_calls: list[list[str]] = []
+        real_run = harvest_ops._run
+
+        def recording_run(argv: list[str], cwd: Path | None = None) -> dict[str, Any]:
+            gh_calls.append(argv)
+            return real_run(argv, cwd=cwd)
+
+        monkeypatch.setattr(harvest_ops, "_run", recording_run)
+
+        # 缺 Development-Id trailer 的 commit_message（只有 Squashed-From）。
+        bad_message = f"harvest: no trailer\n\nSquashed-From: {sha}\n"
+        result = DefaultHarvestOps().pr_squash_merge(
+            repo, "dev-x", sha, "main", commit_message=bad_message
+        )
+        assert result["merged"] is False, result
+        assert result["refused"] is True, result
+        assert result["escalate"] == "HARVEST_SQUASH_TRAILER_MISSING", result
+        assert "Development-Id" in result["missing"], result
+        # 写前闸拦在 merge 前：gh pr merge 零调用、push 未执行、无 harvest ref。
+        assert gh_calls == [], f"gh 被调用: {gh_calls}"
+        assert git(repo, "ls-remote", "--heads", "origin", "harvest/dev-x") == ""
+
+    def test_negative_llm_down_still_merges_with_template_subject(self, tmp_path: Path) -> None:
+        """阴性③（LLM 不可用仍合）：叙事抛错/缺省 -> trailer 完整 + subject 模板兜底。
+
+        ops 层：narrative=None -> `FALLBACK_SQUASH_SUBJECT`（非空）、trailer 完整。
+        """
+        from fleet_graph.supervise.harvest_ops import (
+            FALLBACK_SQUASH_SUBJECT,
+            DefaultHarvestOps,
+        )
+
+        repo, sha = self._repo_with_dd_ref(tmp_path)
+        dd_root = dd_record_root(tmp_path, str(repo))
+        result = DefaultHarvestOps().build_squash_commit_message(repo, "dev-x", dd_root)
+        assert result["ok"] is True, result
+        assert result["subject"], "LLM 挂掉后 subject 必须仍非空（模板兜底）"
+        assert result["subject"] == FALLBACK_SQUASH_SUBJECT
+        assert result["trailers"]["Development-Id"] == "dev-x"
+        assert result["trailers"]["Squashed-From"] == sha
+        assert result["message"].splitlines()[0] == FALLBACK_SQUASH_SUBJECT
+
+    def test_orchestration_passes_assembled_message_to_pr_squash_merge(
+        self, tmp_path: Path
+    ) -> None:
+        """编排层：squash_commit_message 节点产出 message，pr_squash_merge 收到它。"""
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        ran_steps = [s["step"] for s in result["steps"]]
+        assert "squash_commit_message" in ran_steps
+        (merge_args,) = fake["pr_merge_args"]
+        assert merge_args["commit_message"], "pr_squash_merge 未收到组装好的 commit_message"
+        assert "Development-Id: dev-x" in merge_args["commit_message"]
+        assert "Squashed-From: " in merge_args["commit_message"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        sm = next(s for s in receipt["steps"] if s["step"] == "squash_commit_message")
+        assert sm["ok"] is True
+        assert sm["trailers"]["Development-Id"] == "dev-x"
+
+    def test_orchestration_narrative_failure_still_harvests(self, tmp_path: Path) -> None:
+        """阴性③（编排层）：叙事生成器抛错 -> 仍 assembled + merged（fail-open）。"""
+        fake = fake_ops()
+
+        def boom(development_id: str, head_commit: str) -> str:
+            raise RuntimeError("LLM down")
+
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), squash_narrative=boom)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED, result["steps"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        sm = next(s for s in receipt["steps"] if s["step"] == "squash_commit_message")
+        assert sm["ok"] is True, sm
+        assert sm["trailers"]["Development-Id"] == "dev-x"
+        assert sm["trailers"]["Squashed-From"] == "a" * 40
+        assert "pr_squash_merge" in [s["step"] for s in receipt["steps"]]
+
+    def test_orchestration_missing_trailer_escalates_before_merge(self, tmp_path: Path) -> None:
+        """阴性②（编排层）：组装出溯源不完整 message -> 写前闸 escalate，绝不进 pr_merge。"""
+        fake = fake_ops(
+            squash_message_result={
+                "ok": False,
+                "subject": "harvest: dev-x",
+                "body": "",
+                "message": "harvest: dev-x\n\nSquashed-From: " + "a" * 40,
+                "trailers": {
+                    "Development-Id": "",
+                    "Squashed-From": "a" * 40,
+                    "Decision-Id": "",
+                },
+                "missing": ["Development-Id"],
+            }
+        )
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert "pr_squash_merge" not in fake["calls"], fake["calls"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        sm = next(s for s in receipt["steps"] if s["step"] == "squash_commit_message")
+        assert sm["ok"] is False
+        assert "Development-Id" in sm["missing"]
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)

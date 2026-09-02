@@ -33,6 +33,18 @@ EXIT_NOT_FOUND = 127
 #: verify_real 的 HEAD 断言失败合成退出码：拒绝在陈旧树上报绿。
 EXIT_HEAD_MISMATCH = 3
 
+#: squash commit message 溯源 trailer 键名（trailer 半恒机械，绝不从 LLM 输出解析）。
+SQUASH_TRAILER_DEVELOPMENT_ID = "Development-Id"
+SQUASH_TRAILER_SQUASHED_FROM = "Squashed-From"
+SQUASH_TRAILER_DECISION_ID = "Decision-Id"
+
+#: LLM 叙事不可用/抛错时的模板 subject（subject 仍非空，fail-open）。
+FALLBACK_SQUASH_SUBJECT = "harvest: squash merge product commit"
+
+#: squash 溯源写前闸 refuse 的机器可读 escalate 码：commit message 缺
+#: Development-Id trailer（或 Squashed-From）——溯源不完整，绝不执行 gh pr merge。
+ESCALATE_SQUASH_TRAILER_MISSING = "HARVEST_SQUASH_TRAILER_MISSING"
+
 #: 收割时必须从产品树里剔除的两棵顶层 dd 协议子树。绝不全局 gitignore——
 #: dd 协议要求工单分支继续提交这些文件，排除只发生在收割侧、按顶层路径精确作用。
 DD_EXCLUDED_PATHS = (".dev-dispatch", ".dd-evidence")
@@ -389,6 +401,187 @@ def _makefile_has_verify_target(worktree: Path) -> bool:
             if "verify" in rest.split():
                 return True
     return False
+
+
+def _record_development_id(dd_root: Path, development_id: str) -> str:
+    """机械事实源：record.json 的 `development_id` 字段（Development-Id trailer 唯一来源）。
+
+    纯 JSON 读（Guard D 安全），不可读/坏档/缺字段 -> ""（溯源缺失，调用方必须
+    refuse，绝不从任何 LLM 输出解析替代）。与 `_resolve_repo` 读同一文件、同一模式。
+    """
+    record_path = Path(dd_root) / development_id / RECORD_FILE
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(record, dict):
+        return ""
+    value = record.get("development_id")
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _durable_ref_head(repo: Path, development_id: str) -> str:
+    """机械事实源：durable ref `refs/heads/dd/<development_id>` 的完整 40-hex HEAD。
+
+    即 spec 判据锚点钉死的 `git rev-parse --verify refs/heads/dd/<development_id>`
+    的值。解析失败/非零 -> ""（溯源缺失）。绝不从 LLM 输出解析替代。
+    """
+    ref = _dd_ref(development_id)
+    proc = run_git(repo, "rev-parse", "--verify", ref)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return ""
+    return proc.stdout.strip()
+
+
+def _split_narrative(narrative: str | None) -> tuple[str, str]:
+    """叙事半 -> (subject, body)。subject=首个非空标题行；无叙事/空 -> 模板兜底。
+
+    LLM 只写叙事半（subject/正文）；这里把 narrative 拆成 subject 与 body。
+    **trailer 行剥离**：凡形如 `<TrailerKey>: <value>`（Development-Id /
+    Squashed-From / Decision-Id）的行一律从叙事里剔除——trailer 半恒机械，绝不
+    允许 LLM 输出注入/替代 trailer 值（spec 阴性①，取值源被换成 LLM 输出必红）。
+    narrative 缺失/为空时 subject 降级为 `FALLBACK_SQUASH_SUBJECT`（仍非空，
+    fail-open），绝不因溯源或叙事失败而丢 subject。
+    """
+    if not narrative:
+        return FALLBACK_SQUASH_SUBJECT, ""
+    trailer_keys = {
+        SQUASH_TRAILER_DEVELOPMENT_ID.lower(),
+        SQUASH_TRAILER_SQUASHED_FROM.lower(),
+        SQUASH_TRAILER_DECISION_ID.lower(),
+    }
+    kept: list[str] = []
+    for line in narrative.splitlines():
+        if ":" in line:
+            candidate = line.split(":", 1)[0].strip().lower()
+            if candidate in trailer_keys:
+                continue
+        kept.append(line)
+    subject = ""
+    body_lines: list[str] = []
+    started = False
+    for line in kept:
+        if not started:
+            if line.strip():
+                subject = line.strip()
+                started = True
+        else:
+            body_lines.append(line)
+    if not subject:
+        subject = FALLBACK_SQUASH_SUBJECT
+    return subject, "\n".join(body_lines).strip()
+
+
+def _split_subject_body(message: str) -> tuple[str, str]:
+    """组装好的 commit message -> (subject, body)。subject=首个非空标题行。
+
+    供 `gh pr create --title/--body` 与 `gh pr merge --subject/--body` 用；
+    空 message -> ("", "")（调用方自行降级）。
+    """
+    if not message:
+        return "", ""
+    subject = ""
+    body_lines: list[str] = []
+    started = False
+    for line in message.splitlines():
+        if not started:
+            if line.strip():
+                subject = line.strip()
+                started = True
+        else:
+            body_lines.append(line)
+    return subject, "\n".join(body_lines).strip()
+
+
+def _trailer_value(message: str, key: str) -> str:
+    """机械读 commit message 里 `key: <value>` trailer 的值；缺/空 -> ""。
+
+    git trailer 惯例：`Key: value` 每行一条，取值只认非空行。
+    """
+    prefix = f"{key}:"
+    for line in (message or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            value = stripped[len(prefix) :].strip()
+            if value:
+                return value
+    return ""
+
+
+def _squash_traceability_gate(message: str) -> dict[str, Any]:
+    """merge 写前闸：commit message 的溯源 trailer 是否完整（Development-Id 恒必须）。
+
+    返回 `{"ok": bool, "missing": [...]}`：`Development-Id` / `Squashed-From`
+    任一缺失（值空）-> ok=False + 机器可读缺失清单。调用方（pr_squash_merge）
+    据此 refuse——绝不执行 gh pr merge、不落 squash commit、不把无溯源 commit
+    写进默认分支（spec 阴性②）。
+    """
+    missing: list[str] = []
+    if not _trailer_value(message, SQUASH_TRAILER_DEVELOPMENT_ID):
+        missing.append(SQUASH_TRAILER_DEVELOPMENT_ID)
+    if not _trailer_value(message, SQUASH_TRAILER_SQUASHED_FROM):
+        missing.append(SQUASH_TRAILER_SQUASHED_FROM)
+    return {"ok": not missing, "missing": missing}
+
+
+def _build_squash_commit_message(
+    repo: Path,
+    development_id: str,
+    dd_root: Path,
+    narrative: str | None = None,
+    decision_id: str | None = None,
+) -> dict[str, Any]:
+    """机械组装 squash commit message（trailer 半恒机械，叙事半可 LLM 可模板）。
+
+    取值源（spec「trailer 取值源」，严禁从 LLM 输出解析）：
+    - `Development-Id` 只来自 record.json 的 `development_id` 字段；
+    - `Squashed-From` 只来自 `git rev-parse --verify refs/heads/dd/<id>`；
+    - `Decision-Id`（若有）来自 board work.decision.v1 message_id 等结构化产物。
+
+    返回 `{"ok", "subject", "body", "message", "trailers", "missing"}`：
+    - `message` = subject + 空行 + body + 空行 + trailer 块；
+    - `ok=False` 且 `missing` 列出缺失的必选 trailer（Development-Id / Squashed-From）
+      ——调用方/写前闸据此 refuse，绝不把无溯源 commit 合入默认分支。
+    """
+    dev_id = _record_development_id(dd_root, development_id)
+    squashed_from = _durable_ref_head(repo, development_id)
+    subject, body = _split_narrative(narrative)
+
+    trailers: list[str] = []
+    if dev_id:
+        trailers.append(f"{SQUASH_TRAILER_DEVELOPMENT_ID}: {dev_id}")
+    if squashed_from:
+        trailers.append(f"{SQUASH_TRAILER_SQUASHED_FROM}: {squashed_from}")
+    if decision_id:
+        trailers.append(f"{SQUASH_TRAILER_DECISION_ID}: {decision_id}")
+
+    parts = [subject]
+    if body:
+        parts.append(body)
+    if trailers:
+        parts.append("\n".join(trailers))
+    message = "\n\n".join(parts)
+
+    missing: list[str] = []
+    if not dev_id:
+        missing.append(SQUASH_TRAILER_DEVELOPMENT_ID)
+    if not squashed_from:
+        missing.append(SQUASH_TRAILER_SQUASHED_FROM)
+
+    return {
+        "ok": not missing,
+        "subject": subject,
+        "body": body,
+        "message": message,
+        "trailers": {
+            SQUASH_TRAILER_DEVELOPMENT_ID: dev_id,
+            SQUASH_TRAILER_SQUASHED_FROM: squashed_from,
+            SQUASH_TRAILER_DECISION_ID: decision_id or "",
+        },
+        "missing": missing,
+    }
 
 
 def _resolve_verify_argv(worktree: Path) -> tuple[list[str] | None, str]:
@@ -948,12 +1141,30 @@ class DefaultHarvestOps:
             }
         return {"occupied": False, "worktree_paths": [], "detail": ""}
 
+    def build_squash_commit_message(
+        self,
+        repo: Path,
+        development_id: str,
+        dd_root: Path,
+        narrative: str | None = None,
+        decision_id: str | None = None,
+    ) -> dict[str, Any]:
+        """机械组装 squash commit message（trailer 半恒机械，叙事半可 LLM 可模板）。
+
+        见模块级 `_build_squash_commit_message`（判据锚点钉死取值源：record.json
+        的 development_id + durable ref HEAD；`Decision-Id` 若有才带）。编排层在
+        `pr_squash_merge` 之前独立产出 trailer（spec 节点位置），merge 写前闸
+        在此基础上校验。
+        """
+        return _build_squash_commit_message(repo, development_id, dd_root, narrative, decision_id)
+
     def pr_squash_merge(
         self,
         repo: Path,
         development_id: str,
         head_commit: str,
         default_branch: str,
+        commit_message: str | None = None,
     ) -> dict[str, Any]:
         """PR -> squash merge（真实远端 forge，绝不本地伪装合并）。
 
@@ -961,6 +1172,14 @@ class DefaultHarvestOps:
         merge --squash --delete-branch`，返回 merged PR 的 html url。git 子调用
         沿用 `dd/git.py` 守卫纪律（`run_git`）；`gh` 不经 git 守卫浸泡，独立
         argv 数组 subprocess（无 shell），cwd=repo。
+
+        **squash 溯源（写前闸）**：`commit_message` 非 None 时先跑 merge 写前闸
+        `_squash_traceability_gate`——缺 `Development-Id` trailer（溯源不完整）->
+        refuse+escalate（`ESCALATE_SQUASH_TRAILER_MISSING`），绝不执行 push /
+        gh pr create / gh pr merge，绝不把无溯源 commit 落进默认分支（spec 阴性②）。
+        commit_message 通过闸后才用其 subject/body 作为 squash 提交的 subject/body
+        （`gh pr merge --squash --subject <subject> --body <body>`），保证压出来的
+        commit message 带完整溯源 trailer。
 
         任一步非零退出 / 缺 gh / 缺 origin -> merged=False + detail（stderr/stdout
         tail[:400]），绝不降级回本地 `git merge --squash`、绝不直接 commit 目标
@@ -970,6 +1189,20 @@ class DefaultHarvestOps:
             return {"merged": False, "detail": "无 head_commit 可合"}
         if not development_id:
             return {"merged": False, "detail": "无 development_id——无法命名 harvest 分支"}
+
+        # merge 写前闸（spec 阴性②）：commit_message 溯源不完整 -> refuse。
+        if commit_message is not None:
+            gate = _squash_traceability_gate(commit_message)
+            if not gate["ok"]:
+                missing = ", ".join(gate["missing"])
+                return {
+                    "merged": False,
+                    "refused": True,
+                    "escalate": ESCALATE_SQUASH_TRAILER_MISSING,
+                    "missing": list(gate["missing"]),
+                    "detail": f"squash commit message 溯源不完整（缺 {missing}）——"
+                    "绝不执行 gh pr merge，不落无溯源 squash commit",
+                }
 
         origin = _origin_url(repo)
         if origin is None:
@@ -996,6 +1229,15 @@ class DefaultHarvestOps:
         if pushed.returncode != 0:
             return {"merged": False, "detail": (pushed.stderr or pushed.stdout).strip()[:400]}
 
+        # 组装好的 squash commit message（含溯源 trailer）拆成 subject/body：
+        # PR 的 title/body 与 `gh pr merge --squash --subject/--body` 都以此为准，
+        # 保证压出来的 squash commit message 完整携带机械溯源 trailer。
+        if commit_message:
+            subject, body = _split_subject_body(commit_message)
+        else:
+            subject = f"harvest: {development_id} {head_commit[:12]}"
+            body = f"harvest reactor merge of {head_commit} for {development_id}"
+
         created = _run(
             [
                 "gh",
@@ -1008,9 +1250,9 @@ class DefaultHarvestOps:
                 "--head",
                 branch,
                 "--title",
-                f"harvest: {development_id} {head_commit[:12]}",
+                subject,
                 "--body",
-                f"harvest reactor merge of {head_commit} for {development_id}",
+                body,
             ],
             cwd=repo,
         )
@@ -1030,10 +1272,12 @@ class DefaultHarvestOps:
         if not number:
             return {"merged": False, "detail": f"无法从 PR 链接解析编号: {pr_url}"}
 
-        merged = _run(
-            ["gh", "pr", "merge", number, "--squash", "--delete-branch"],
-            cwd=repo,
-        )
+        merge_argv = ["gh", "pr", "merge", number, "--squash", "--delete-branch"]
+        if commit_message:
+            merge_argv += ["--subject", subject]
+            if body:
+                merge_argv += ["--body", body]
+        merged = _run(merge_argv, cwd=repo)
         if not merged.get("ok"):
             return {
                 "merged": False,
@@ -1167,11 +1411,23 @@ __all__ = [
     "COMMAND_TIMEOUT_SECONDS",
     "DD_EXCLUDED_PATHS",
     "DD_WASH_COMMIT_MESSAGE",
+    "ESCALATE_SQUASH_TRAILER_MISSING",
     "EXIT_HEAD_MISMATCH",
     "EXIT_NOT_FOUND",
     "EXIT_TIMEOUT",
+    "FALLBACK_SQUASH_SUBJECT",
     "MAKE_VERIFY_ARGV",
     "NO_RESOLVABLE_VERIFY",
+    "SQUASH_TRAILER_DECISION_ID",
+    "SQUASH_TRAILER_DEVELOPMENT_ID",
+    "SQUASH_TRAILER_SQUASHED_FROM",
     "UV_PYTEST_ARGV",
     "DefaultHarvestOps",
+    "_build_squash_commit_message",
+    "_durable_ref_head",
+    "_record_development_id",
+    "_split_narrative",
+    "_split_subject_body",
+    "_squash_traceability_gate",
+    "_trailer_value",
 ]
