@@ -1408,3 +1408,76 @@ class TestHarvestWiring:
         assert config.harvest_default_branch is None
         assert config.harvest_deploy == []
         assert config.repo is None
+        assert config.e7_allowlist_path is None
+
+
+class TestE7AllowlistWiring:
+    """M4 E7 goal.md 直写 allowlist argv 透传：observer 侧把 --e7-allowlist 补传
+    进 `supervisor run` argv（spec 契约：带 e7_allowlist_path 的 ObserverConfig +
+    SupervisorObserver → spec.argv() 含 --e7-allowlist <path>；未配置时该旗标不
+    出现——E7 直写保持 deny-all 默认拒绝零放宽）。"""
+
+    def _observer(self, tmp_path: Path, **e7: Any) -> tuple[SupervisorObserver, RecordingLauncher]:
+        launcher = RecordingLauncher()
+        observer = SupervisorObserver(
+            ObserverConfig(
+                run_root=tmp_path / "runs",
+                supervisor_state_root=tmp_path / "supervisor",
+                **e7,
+            ),
+            launcher=launcher,  # type: ignore[arg-type]
+            read_model=read_model_for(EMPTY_READ_MODEL),
+        )
+        return observer, launcher
+
+    def test_argv_carries_e7_allowlist_flag_when_configured(self, tmp_path: Path) -> None:
+        observer, launcher = self._observer(
+            tmp_path,
+            e7_allowlist_path="/data/fleet-graph/supervisor/e7-write-allowlist.json",
+            harvest_allowlist_path="/data/fleet-graph/supervisor/harvest-allowlist.json",
+        )
+        tick(observer, {"wf-a": terminal("fault", "run-1")})
+        [spec] = launcher.specs
+        argv = spec.argv()
+        assert "--e7-allowlist" in argv
+        assert (
+            argv[argv.index("--e7-allowlist") + 1]
+            == "/data/fleet-graph/supervisor/e7-write-allowlist.json"
+        )
+        # --harvest-allowlist 同存量行为不变。
+        assert "--harvest-allowlist" in argv
+        assert (
+            argv[argv.index("--harvest-allowlist") + 1]
+            == "/data/fleet-graph/supervisor/harvest-allowlist.json"
+        )
+
+    def test_unconfigured_observer_emits_no_e7_allowlist_flag(self, tmp_path: Path) -> None:
+        observer, launcher = self._observer(tmp_path)
+        tick(observer, {"wf-a": terminal("fault", "run-1")})
+        [spec] = launcher.specs
+        argv = spec.argv()
+        assert "--e7-allowlist" not in argv
+
+    def test_launch_spec_without_e7_allowlist_field_emits_no_flag(self, tmp_path: Path) -> None:
+        # 阴性（默认拒绝零放宽）：SupervisorLaunchSpec 不带 e7_allowlist_path 时
+        # argv() 无 --e7-allowlist。
+        spec = SupervisorLaunchSpec(
+            event=line_fault_event("wf-a", "run-1"),
+            run_root=tmp_path / "runs",
+            state_root=tmp_path / "supervisor",
+        )
+        argv = spec.argv()
+        assert "--e7-allowlist" not in argv
+
+    def test_config_from_json_reads_e7_allowlist_field(self, tmp_path: Path) -> None:
+        path = tmp_path / "config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "lines": [],
+                    "e7_allowlist_path": "/data/fleet-graph/supervisor/e7-write-allowlist.json",
+                }
+            )
+        )
+        config = SchedulerConfig.from_json(path)
+        assert config.e7_allowlist_path == "/data/fleet-graph/supervisor/e7-write-allowlist.json"
