@@ -197,6 +197,31 @@ def _document_gate_consumed(dd_root: Path, development_id: str, generation: int)
     return BASIS_UNRECONCILED
 
 
+def _development_for_card(dd_root: Path, card_entity_id: str) -> str | None:
+    """反查 ``card_entity_id`` 所属的 development（M0 补 owner 分支）。
+
+    遍历 ``dd_root/*/record.json``（``card_entity_id`` 字段），命中则返回该单的
+    ``development_id``（缺省回退目录名）；命中不到返回 None（refs 空 / 卡片错配）。
+    只读、fail-soft：根缺失/记录不可读一律视为「查不到」，绝不抛异常、绝不一串
+    `400` 把整表挂掉。
+    """
+    if not card_entity_id:
+        return None
+    try:
+        entries = sorted(dd_root.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        record = _read_json(entry / "record.json")
+        if record is None:
+            continue
+        if str(record.get("card_entity_id") or "") == card_entity_id:
+            return str(record.get("development_id") or entry.name)
+    return None
+
+
 def _parse_iso(value: Any) -> float | None:
     """epoch seconds from ``%Y-%m-%dT%H:%M:%SZ``; None on anything else."""
     if not isinstance(value, str):
@@ -304,16 +329,34 @@ def _receipt_to_decision(receipt: dict[str, Any], *, dd_root: Path | None = None
     state, reason = _RECEIPT_STATE.get(status, (STATE_SWALLOWED, f"unknown_status:{status}"))
     basis = BASIS_RECEIPT
 
+    owner_kind = str(receipt.get("target_kind") or "")
+    owner_id = str(receipt.get("target_id") or "")
+
     # 终结对账：bridge receipt 定终结态不再单凭快照——有 dd 目标时拿单据侧
     # （events.jsonl human_gate success / status.json 离开 awaiting_gate）再对
     # 一声。单据侧证明被消费 → 提升为 consumed（修正「已送达且被消费却误记
     # swallowed」）；可读但仍 waiting → 维持 swallowed 并标注；对不上 → 显式
     # 标注 unreconciled，不静默归 consumed 或 swallowed。
+    #
+    # M0 补口：当 target_id 为空（bridge 在评估瞬间无法把裁决归到某个等待方），
+    # 用 card_entity_id 反查所属 development 把 owner.kind/id 补上（只补 owner
+    # 并据此提升，绝不把真丢误提为 consumed）。
     if dd_root is not None and state in (STATE_CONSUMED, STATE_SWALLOWED):
         target_kind = str(receipt.get("target_kind") or "")
         target_id = str(receipt.get("target_id") or "")
-        if target_kind == "dd" and target_id:
-            basis = _document_gate_consumed(dd_root, target_id, int(receipt.get("generation") or 1))
+        resolved_kind = target_kind if target_id else ""
+        resolved_id = target_id
+        if not (resolved_kind == "dd" and resolved_id) and not target_id:
+            development_id = _development_for_card(
+                dd_root, str(receipt.get("card_entity_id") or "")
+            )
+            if development_id is not None:
+                resolved_kind = "dd"
+                resolved_id = development_id
+                owner_kind = "dd"
+                owner_id = development_id
+        if resolved_kind == "dd" and resolved_id:
+            basis = _document_gate_consumed(dd_root, resolved_id, int(receipt.get("generation") or 1))
             if basis in (BASIS_HUMAN_GATE_SUCCESS, BASIS_LEFT_AWAITING_GATE):
                 state = STATE_CONSUMED
                 reason = None
@@ -323,8 +366,8 @@ def _receipt_to_decision(receipt: dict[str, Any], *, dd_root: Path | None = None
         "state": state,
         "basis": basis,
         "owner": {
-            "kind": str(receipt.get("target_kind") or ""),
-            "id": str(receipt.get("target_id") or ""),
+            "kind": owner_kind,
+            "id": owner_id,
             "generation": receipt.get("generation"),
         },
     }
