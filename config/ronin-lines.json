@@ -46,7 +46,7 @@
       "seat": "opencode-dsv4pro",
       "max_rounds": 9999,
       "alias": "ronin-platform-pump",
-      "enabled": true,
+      "enabled": false,
       "_provenance": "2026-08-29 复活（用户令「Deep research…重构开始」+ /loop 端到端授权）：接盘 goal.md C1–C6（部署契约/入口统一/失败语义基座/契约单源化/冷启动终验/宪法归档），DS 智能位。Phase 0 刷新见 folder golden-order 2026-08-29 节。"
     },
     {
@@ -121,7 +121,7 @@
     {
       "folder_id": "wf-a87b04",
       "seat": "opencode-dsv4pro",
-      "enabled": true,
+      "enabled": false,
       "alias": "ronin-wf-robust",
       "max_rounds": 9999
     },
@@ -130,7 +130,7 @@
       "seat": "opencode-dsv4pro",
       "alias": "ronin-eventify",
       "max_rounds": 9999,
-      "enabled": true,
+      "enabled": false,
       "_provenance": "2026-08-28 用户拍板开线：按 wiki w-577103（fleet-graph 控制面第一性再审）方向对引擎/goal-driven/dd 做事件化重构，自举开发（E1 决议事件桥→E2 等待收敛进图→E3 terminal 视图化 ∥ E4 协议收敛 ∥ E5 开线 MCP 面）。监督面=用户授权的人类监督者代行。alias token 已供给（agent:ronin-eventify）。"
     },
     {
