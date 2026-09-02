@@ -2072,12 +2072,13 @@ class TestHarvestTreeOccupancy:
         assert "pr_squash_merge" in fake["calls"], fake["calls"]
 
     def test_detect_inflight_binding_is_read_only(self, tmp_path: Path, monkeypatch: Any) -> None:
-        """只读判据（不另造账本）：occupancy 探测只 open/read + `git rev-parse`，
-        不写文件/不建目录/不登记。dd_root 目录树逐字节相同、`<target>` 一字未动。"""
+        """只读判据（不另造账本）：occupancy 探测只 open/read JSON（纯路径比较，
+        H8 case 2 收敛后连 `git rev-parse` 读口都不再需要），不写文件/不建目录/
+        不登记。dd_root 目录树逐字节相同、`<target>` 一字未动。"""
         from fleet_graph.supervise import harvest_ops
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
-        canonical, target, sentinel, dd_root = _h8_target_fixture(
+        _canonical, target, sentinel, dd_root = _h8_target_fixture(
             tmp_path, other_terminal="", subject_terminal="complete"
         )
         dd_snapshot_before = sorted(
@@ -2096,13 +2097,12 @@ class TestHarvestTreeOccupancy:
             return real_run_git(repo, *args, **kwargs)
 
         monkeypatch.setattr(harvest_ops, "run_git", recording_run_git)
-        binding = DefaultHarvestOps().detect_inflight_binding(canonical, dd_root)
+        binding = DefaultHarvestOps().detect_inflight_binding(target, dd_root)
         assert binding["in_flight"] is True
         assert binding["bound_development_id"] == "dev-fg-OTHER"
 
-        # 只发生 `git rev-parse`（纯读）；没有任何写类 git 命令。
-        assert git_calls, "detect_inflight_binding 未触发任何 git 读口"
-        assert all(args[0] == "rev-parse" for _repo, args in git_calls), git_calls
+        # 没有任何 git 调用，更没有任何写类 git 命令——纯 JSON 读 + 路径比较。
+        assert git_calls == [], f"detect_inflight_binding 不应触发任何 git 命令: {git_calls}"
         # dd_root 目录树逐字节相同（没有新建/改动任何账本文件）。
         dd_snapshot_after = sorted(
             (str(p.relative_to(dd_root)), p.read_bytes())
@@ -2132,16 +2132,16 @@ class TestHarvestTreeOccupancy:
     def test_self_sorts_first_does_not_mask_foreign_inflight(self, tmp_path: Path) -> None:
         """rc-3d12fbbe 阻塞项回归：本单 dev id 排序靠前时不得遮蔽更靠后的外来在飞单。
 
-        本单 dev-fg-SUBJECT 与外来 dev-fg-ZED-OTHER 同在飞且都绑定 `<target>`
-        （其 canonical 与本次收割目标 canonical 同一棵），而本单 id 在
-        `<dd_root>/` 枚举顺序（sorted）中先于外来单。旧实现 detect 返回第一条
+        本单 dev-fg-SUBJECT 与外来 dev-fg-ZED-OTHER 同在飞且都直接绑定 `<target>`
+        （`record.repo_path` 直接等于本次要消费的树路径，case 1 命中），而本单 id
+        在 `<dd_root>/` 枚举顺序（sorted）中先于外来单。旧实现 detect 返回第一条
         在飞绑定（=本单），`_detect_occupied_tree` 判定 bound==本单即丢弃、不继续
         扫 -> 外来在飞占用被静默漏检，树仍被 rmtree/pull/deploy。修复后 detect
         跳过本单自身绑定继续扫描，必须返回外来单并 escalate（bound=dev-fg-ZED-OTHER）。
         """
         from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
 
-        # 本单 SUBJECT 排序在 ZED-OTHER 之前（'S' < 'Z'），且两单都在飞绑定同一棵树。
+        # 本单 SUBJECT 排序在 ZED-OTHER 之前（'S' < 'Z'），且两单都在飞直接绑定同一棵树。
         canonical, target, sentinel, dd_root = _h8_target_fixture(
             tmp_path,
             other_dev="dev-fg-ZED-OTHER",
@@ -2151,7 +2151,7 @@ class TestHarvestTreeOccupancy:
         )
         # ops 层先验证：跳过本单、返回外来单（排序遮蔽被修复）。
         binding = DefaultHarvestOps().detect_inflight_binding(
-            canonical, dd_root, current_development_id="dev-fg-SUBJECT"
+            target, dd_root, current_development_id="dev-fg-SUBJECT"
         )
         assert binding["in_flight"] is True
         assert binding["bound_development_id"] == "dev-fg-ZED-OTHER", binding
@@ -2300,6 +2300,92 @@ class TestHarvestTreeOccupancy:
         )
         assert (target / "sentinel.bin").read_bytes() == sentinel
         assert target.is_dir()
+
+    def test_other_linked_worktree_inflight_does_not_lock_canonical(self, tmp_path: Path) -> None:
+        """H8 case 2 收敛阴性（修复前必红）：同仓另一棵 linked worktree 在飞不再锁 canonical。
+
+        canonical + 两棵 linked worktree：dev-fg-OTHER 在飞绑定 `wt-other`
+        （record.repo_path = canonical 的**另一棵** linked worktree），本次收割单
+        dev-fg-SUBJECT 绑定 `wt-target`（终态）。修复前 case 2 把 `wt-other`
+        归属到 canonical -> `detect_inflight_binding(canonical)` 恒 in_flight=True
+        误锁整仓；修复后 canonical 与本次要消费的树都 in_flight=False，且
+        `run_harvest` 照常 harvested（不「等在飞单跑完再收」）。
+        """
+        from fleet_graph.supervise.harvest_ops import DefaultHarvestOps
+
+        canonical = tmp_path / "canon"
+        _init_git_repo(canonical)
+        wt_other = tmp_path / "wt-other"
+        git(canonical, "worktree", "add", "--detach", str(wt_other), "main")
+        wt_target = tmp_path / "wt-target"
+        git(canonical, "worktree", "add", "--detach", str(wt_target), "main")
+        (wt_target / "sentinel.bin").write_bytes(H8_SENTINEL_BYTES)
+
+        dd_root = tmp_path / "dd"
+        for dev, repo_path, terminal in (
+            ("dev-fg-OTHER", str(wt_other), ""),
+            ("dev-fg-SUBJECT", str(wt_target), "complete"),
+        ):
+            dev_dir = dd_root / dev
+            dev_dir.mkdir(parents=True)
+            (dev_dir / "record.json").write_text(
+                json.dumps(
+                    {
+                        "development_id": dev,
+                        "repo_path": repo_path,
+                        "remote_url": str(tmp_path / "local-remote.git"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (dev_dir / "status.json").write_text(
+                json.dumps(
+                    {"development_id": dev, "state": terminal or "running", "terminal": terminal}
+                ),
+                encoding="utf-8",
+            )
+
+        ops = DefaultHarvestOps()
+        # 阴性：canonical 与本次要消费的树都不再被同仓另一棵 linked worktree 锁住。
+        assert ops.detect_inflight_binding(canonical, dd_root)["in_flight"] is False
+        assert ops.detect_inflight_binding(wt_target, dd_root)["in_flight"] is False
+
+        # 编排层照常收割（harvested）：occupancy 用真实（修复后）判定，其余机械步
+        # 走 fake，全程不触真网/生产 checkout。
+        fake = fake_ops(resolve_canonical=canonical)
+
+        class _RealDetectFakeRest:
+            """detect_inflight_binding 走真实 DefaultHarvestOps，其余方法委托 fake。"""
+
+            def __getattr__(self, name):
+                return getattr(fake["ops"], name)
+
+            def detect_inflight_binding(
+                self, tree_path: Path, dd_root: Path, current_development_id: str | None = None
+            ) -> dict[str, Any]:
+                return ops.detect_inflight_binding(tree_path, dd_root, current_development_id)
+
+        config = HarvestRunConfig(
+            event=approved_unharvested_event(
+                development_id="dev-fg-SUBJECT", head_commit="a" * 40, stage="implement"
+            ).as_dict(),
+            state_root=tmp_path / "supervisor",
+            run_root=tmp_path / "runs",
+            dd_root=dd_root,
+            deploy_command=[],
+            allowlist=full_allowlist(str(canonical)),
+            ops=_RealDetectFakeRest(),
+            bus=FakeBus(),
+            publish_notes=True,
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED, result
+        intake_step = next(s for s in result["steps"] if s["step"] == "intake")
+        assert intake_step["ok"] is True
+        assert intake_step.get("escalate") != "HARVEST_TREE_OCCUPIED_BY_INFLIGHT"
+        # 本次要消费的树未被 in_flight 单动到（sentinel 仍在，目录仍在）。
+        assert (wt_target / "sentinel.bin").read_bytes() == H8_SENTINEL_BYTES
+        assert wt_target.is_dir()
 
 
 class TestResolveVerifyArgv:
