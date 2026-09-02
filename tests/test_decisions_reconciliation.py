@@ -248,9 +248,7 @@ class TestOwnerIdEmptyReconciliation:
     - 阴性：反查不到（refs 空 / 卡片错配）或单据侧无消费证据 → 仍 swallowed。
     """
 
-    def test_card_reverse_lookup_promotes_consumed_and_fills_owner(
-        self, tmp_path: Path
-    ) -> None:
+    def test_card_reverse_lookup_promotes_consumed_and_fills_owner(self, tmp_path: Path) -> None:
         dd_root = tmp_path / "dd"
         bridge_dir = tmp_path / "bridge"
         _seal(

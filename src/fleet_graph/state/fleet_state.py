@@ -356,7 +356,9 @@ def _receipt_to_decision(receipt: dict[str, Any], *, dd_root: Path | None = None
                 owner_kind = "dd"
                 owner_id = development_id
         if resolved_kind == "dd" and resolved_id:
-            basis = _document_gate_consumed(dd_root, resolved_id, int(receipt.get("generation") or 1))
+            basis = _document_gate_consumed(
+                dd_root, resolved_id, int(receipt.get("generation") or 1)
+            )
             if basis in (BASIS_HUMAN_GATE_SUCCESS, BASIS_LEFT_AWAITING_GATE):
                 state = STATE_CONSUMED
                 reason = None
