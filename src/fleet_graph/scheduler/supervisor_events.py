@@ -154,6 +154,9 @@ class SupervisorLaunchSpec:
     harvest_default_branch: str | None = None
     harvest_deploy: tuple[str, ...] = ()
     repo: str | None = None
+    #: M4 wiki 人话账 (交付 B.2): 启用时 argv() 发 `--wiki` 旗标。缺省
+    #: False -> 不发（默认不启用、不改变既有 argv 词法；零回归）。
+    wiki: bool = False
 
     @property
     def unit_name(self) -> str:
@@ -202,6 +205,10 @@ class SupervisorLaunchSpec:
             argv += ["--harvest-deploy", word]
         if self.repo is not None:
             argv += ["--repo", self.repo]
+        # M4 wiki 人话账 (交付 B.2): 启用时在 --repo 之后按需追加 --wiki（词法
+        # 顺序稳定，测试按 `in argv` 断言）。
+        if self.wiki:
+            argv += ["--wiki"]
         return argv
 
 
@@ -235,6 +242,9 @@ class ObserverConfig:
     harvest_default_branch: str | None = None
     harvest_deploy: list[str] = field(default_factory=list)
     repo: str | None = None
+    #: M4 wiki 人话账 (交付 B.2): 透传给 SupervisorLaunchSpec（argv 的 --wiki
+    #: 旗标）。缺省 False -> 不发射 --wiki（默认不启用、零回归）。
+    wiki: bool = False
 
     @property
     def resolved_cursor_path(self) -> Path:
@@ -718,6 +728,7 @@ class SupervisorObserver:
             harvest_default_branch=self.config.harvest_default_branch,
             harvest_deploy=tuple(self.config.harvest_deploy),
             repo=self.config.repo,
+            wiki=self.config.wiki,
         )
 
     def _log_dedup(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:

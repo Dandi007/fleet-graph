@@ -863,6 +863,10 @@ def _scheduler_run(args: argparse.Namespace) -> int:
                 harvest_default_branch=config.harvest_default_branch,
                 harvest_deploy=config.harvest_deploy,
                 repo=config.repo,
+                # M4 wiki 人话账 (交付 B.2): 启用时 SupervisorLaunchSpec.argv()
+                # 发 --wiki 旗标（默认不启用、不改变既有 argv 词法）。getattr：
+                # SchedulerConfig 未声明 wiki 字段时缺省 False（零回归）。
+                wiki=getattr(config, "wiki", False),
             ),
             launcher=TransientLauncher(dry_run=args.dry_run),
             bus=board.client if board is not None else None,
@@ -1007,6 +1011,9 @@ def _supervisor_run(args: argparse.Namespace) -> int:
         harvest_verify_real_argv=args.harvest_verify_real,
         # M4 E7: goal.md 直写目标线白名单（deny-all 默认）。
         e7_allowlist_path=args.e7_allowlist,
+        # M4 wiki 人话账: --wiki 启用时 E5/E6/E7 注入 DefaultWikiClient（默认
+        # off -> deps.wiki=None 零回归）。
+        wiki_enabled=args.wiki,
     )
     result = run_supervisor(config)
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
@@ -2020,6 +2027,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="M4 E7 (decision_swallowed): E7 goal.md 直写目标线白名单 config file. "
         "Deny-all when unset -- E7 then refuses every goal.md direct write and "
         "records the refusal",
+    )
+    supervisor_run.add_argument(
+        "--wiki",
+        action="store_true",
+        help="M4 wiki 人话账: enable the katana-wiki-mcp client (DefaultWikiClient "
+        "at DEFAULT_WIKI_MCP_URL). Off by default -- E5/E6/E7 then keep "
+        "deps.wiki=None (zero regression); on injects the client into all three "
+        "dispatch paths so production promotion / defect-close sections append",
     )
     supervisor_run.set_defaults(func=_supervisor_run)
 

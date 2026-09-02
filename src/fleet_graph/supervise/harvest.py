@@ -43,6 +43,7 @@ SOP（spec 交付 B）逐节点实现，全部是 script 节点（机械判定�
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypedDict
@@ -52,7 +53,7 @@ from langgraph.graph import END, START, StateGraph
 from fleet_graph.bus.board import Board
 from fleet_graph.bus.client import BusClient
 from fleet_graph.dd.control_plane import DEFAULT_DD_ROOT, RECORD_FILE
-from fleet_graph.state.run_artifacts import write_json_durable
+from fleet_graph.state.run_artifacts import iso, write_json_durable
 from fleet_graph.supervise.events import (
     EVENT_APPROVED_UNHARVESTED,
     SupervisorEvent,
@@ -192,6 +193,10 @@ class HarvestDeps:
     ops: HarvestOps | None = None
     bus: BusClient | None = None
     publish_notes: bool = True
+    #: katana-wiki-mcp 客户端（可选，注入 fake 以便测试）。收割成功收口
+    #: （outcome==OUTCOME_HARVESTED）时向「舰队开发阶段性成果报告」页追加生产晋级
+    #: 分节；None -> 不汇报（默认）。wiki 是 telemetry，失败绝不翻转 harvest outcome。
+    wiki: Any | None = None
 
     def thread_dir(self, key: str) -> Path:
         return self.state_root / "threads" / key
@@ -815,6 +820,56 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
 
     def receipt(state: HarvestState) -> HarvestState:
         event = _event_of(state)
+        # M4 交付 A：生产晋级分节挂在 harvest 终局（outcome==OUTCOME_HARVESTED）。
+        # best-effort——wiki 是 telemetry：追加失败只记 wiki_report step ok:false +
+        # detail，绝不翻转 outcome、绝不 escalate、绝不重跑收割。
+        if deps.wiki is not None and state.get("outcome") == OUTCOME_HARVESTED:
+            try:
+                from fleet_graph.supervise.wiki_report import record_production_promotion
+
+                development_id = state.get("development_id") or ""
+                merged = (
+                    state.get("merged_head")
+                    or state.get("harvest_tip")
+                    or state.get("head_commit")
+                    or ""
+                )
+                # 证据指针 = PR 链接 / commit / 看板 seq，结构化字段不进 §6.5 洗白。
+                evidence = tuple(
+                    p
+                    for p in (
+                        state.get("pr_url") or "",
+                        f"commit {merged}" if merged else "",
+                        state.get("evidence_note_id") or "",
+                    )
+                    if p
+                ) or (f"event {event.key}",)
+                record_production_promotion(
+                    deps.wiki,
+                    development_name=development_id,
+                    background=(
+                        f"development {development_id} 过了 gate，产品 commit 尚未落默认分支，"
+                        "harvest 反应器将其收割进默认分支并部署。"
+                    ),
+                    delivery=(
+                        f"已 HARVESTED：产品 commit 已进默认分支 "
+                        f"{state.get('default_branch') or DEFAULT_BRANCH}，"
+                        f"postconditions 三要素（PR merged / verify 零退出 / evidence note）齐。"
+                    ),
+                    evidence=evidence,
+                    at=iso(time.time()),
+                    skeleton="# 舰队开发阶段性成果报告\n\n按「报告更新约定」追加分节。\n",
+                )
+            except Exception as exc:  # telemetry must not bite
+                steps = list(state.get("steps") or [])
+                steps.append(
+                    {
+                        "step": "wiki_report",
+                        "ok": False,
+                        "detail": f"wiki 追加失败: {repr(exc)[:200]}",
+                    }
+                )
+                state = {**state, "steps": steps}
         path = write_json_durable(
             deps.state_root / "reports" / f"{event.key}.json",
             {
@@ -944,6 +999,8 @@ class HarvestRunConfig:
     ops: HarvestOps | None = None
     bus: BusClient | None = None
     publish_notes: bool = True
+    #: katana-wiki-mcp 客户端（可选，注入 fake 以便测试）。同 HarvestDeps.wiki。
+    wiki: Any | None = None
 
     @property
     def resolved_checkpoint_path(self) -> str:
@@ -968,6 +1025,7 @@ def build_harvest(config: HarvestRunConfig) -> tuple[Any, HarvestDeps, Superviso
         ops=config.ops or DefaultHarvestOps(),
         bus=config.bus,
         publish_notes=config.publish_notes,
+        wiki=config.wiki,
     )
     return build_harvest_graph(deps), deps, event
 

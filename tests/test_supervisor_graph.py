@@ -993,3 +993,108 @@ class TestE6E7Dispatch:
         )
         assert result["outcome"] == OUTCOME_REFUSED
         assert result["receipt_path"]
+
+
+class TestWikiDispatch:
+    """M4 交付 B.1 + D.3：run_supervisor 的 --wiki 开关——off（默认）→ 三路
+    deps.wiki=None（E6/E7 不调 wiki）；on → 构造 DefaultWikiClient 注入 E5/E6/E7。
+    DefaultWikiClient 用 recording stub 替换，禁触真网/真 wiki。"""
+
+    def test_wiki_enabled_constructs_default_wiki_client(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        from fleet_graph.supervise.e6_stop import OUTCOME_STOPPED
+        from fleet_graph.supervise.events import heartbeat_stale_event
+        from fleet_graph.supervise.wiki_report import WikiReportError
+
+        constructed: list[Any] = []
+
+        class StubDefaultWikiClient:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                constructed.append(self)
+
+            def search(self, title: str) -> list[dict[str, Any]]:
+                raise WikiReportError("stub: no network")
+
+            def page_append(self, page_id: str, content: str) -> dict[str, Any]:
+                raise WikiReportError("stub: no network")
+
+            def read_page(self, page_id: str) -> str:
+                raise WikiReportError("stub: no network")
+
+            def page_create(self, title: str, content: str) -> dict[str, Any]:
+                raise WikiReportError("stub: no network")
+
+        monkeypatch.setattr(
+            "fleet_graph.supervise.wiki_report.DefaultWikiClient", StubDefaultWikiClient
+        )
+
+        event = heartbeat_stale_event(
+            folder_id="wf-a", heartbeat_age_s=600.0, round=3, phase="coordinator"
+        ).as_dict()
+        result = run_supervisor(
+            SupervisorRunConfig(
+                event=event,
+                state_root=tmp_path / "supervisor",
+                run_root=tmp_path / "runs",
+                publish_notes=False,
+                e6_ops=self._e6_ops(),
+                wiki_enabled=True,
+            )
+        )
+        # --wiki on -> DefaultWikiClient 被构造并注入 E6（deps.wiki 非 None ->
+        # record_defect_closed 被调用 -> stub 抛错被 best-effort 吞掉留痕）。
+        assert constructed, "wiki_enabled=True 未构造 DefaultWikiClient"
+        assert result["outcome"] == OUTCOME_STOPPED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert any(s["step"] == "wiki_report" and s.get("ok") is False for s in receipt["steps"])
+
+    def test_wiki_off_does_not_construct_or_call(self, tmp_path: Path, monkeypatch: Any) -> None:
+        from fleet_graph.supervise.e6_stop import OUTCOME_STOPPED
+        from fleet_graph.supervise.events import heartbeat_stale_event
+
+        constructed: list[Any] = []
+
+        class StubDefaultWikiClient:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                constructed.append(self)
+
+        monkeypatch.setattr(
+            "fleet_graph.supervise.wiki_report.DefaultWikiClient", StubDefaultWikiClient
+        )
+        event = heartbeat_stale_event(
+            folder_id="wf-a", heartbeat_age_s=600.0, round=3, phase="coordinator"
+        ).as_dict()
+        result = run_supervisor(
+            SupervisorRunConfig(
+                event=event,
+                state_root=tmp_path / "supervisor",
+                run_root=tmp_path / "runs",
+                publish_notes=False,
+                e6_ops=self._e6_ops(),
+            )
+        )
+        assert constructed == [], "wiki off 时不应构造 DefaultWikiClient"
+        assert result["outcome"] == OUTCOME_STOPPED
+        assert not any(s["step"] == "wiki_report" for s in result["steps"])
+
+    @staticmethod
+    def _e6_ops():
+        class Ops:
+            def resolve_line_unit(self, folder_id: str, run_root: Path) -> dict[str, Any]:
+                return {
+                    "ok": True,
+                    "unit": f"fleet-graph-line-{folder_id}-g1",
+                    "source": "list-units",
+                }
+
+            def is_active(self, unit_name: str) -> bool:
+                return False
+
+            def stop_unit(self, unit_name: str) -> int:
+                return 0
+
+            def line_heartbeat_age_s(self, folder_id: str) -> float | None:
+                return None
+
+        return Ops()

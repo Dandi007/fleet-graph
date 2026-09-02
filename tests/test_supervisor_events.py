@@ -1408,3 +1408,56 @@ class TestHarvestWiring:
         assert config.harvest_default_branch is None
         assert config.harvest_deploy == []
         assert config.repo is None
+
+
+class TestWikiWiring:
+    """M4 交付 B.2：wiki 旗标接线——ObserverConfig/SupervisorLaunchSpec 启用时
+    argv() 发 `--wiki`；缺省不发（零回归、不改变既有 argv 词法）。"""
+
+    def _observer(
+        self, tmp_path: Path, **wiki: Any
+    ) -> tuple[SupervisorObserver, RecordingLauncher]:
+        launcher = RecordingLauncher()
+        observer = SupervisorObserver(
+            ObserverConfig(
+                run_root=tmp_path / "runs",
+                supervisor_state_root=tmp_path / "supervisor",
+                **wiki,
+            ),
+            launcher=launcher,  # type: ignore[arg-type]
+            read_model=read_model_for(EMPTY_READ_MODEL),
+        )
+        return observer, launcher
+
+    def test_argv_carries_wiki_flag_when_enabled(self, tmp_path: Path) -> None:
+        observer, launcher = self._observer(tmp_path, wiki=True)
+        tick(observer, {"wf-a": terminal("fault", "run-1")})
+        [spec] = launcher.specs
+        argv = spec.argv()
+        assert "--wiki" in argv
+
+    def test_argv_omits_wiki_flag_by_default(self, tmp_path: Path) -> None:
+        observer, launcher = self._observer(tmp_path)
+        tick(observer, {"wf-a": terminal("fault", "run-1")})
+        [spec] = launcher.specs
+        argv = spec.argv()
+        assert "--wiki" not in argv
+        assert not any(arg.startswith("--wiki") for arg in argv)
+
+    def test_launch_spec_without_wiki_emits_no_wiki_flag(self, tmp_path: Path) -> None:
+        spec = SupervisorLaunchSpec(
+            event=line_fault_event("wf-a", "run-1"),
+            run_root=tmp_path / "runs",
+            state_root=tmp_path / "supervisor",
+        )
+        argv = spec.argv()
+        assert "--wiki" not in argv
+
+    def test_launch_spec_with_wiki_emits_wiki_flag(self, tmp_path: Path) -> None:
+        spec = SupervisorLaunchSpec(
+            event=line_fault_event("wf-a", "run-1"),
+            run_root=tmp_path / "runs",
+            state_root=tmp_path / "supervisor",
+            wiki=True,
+        )
+        assert "--wiki" in spec.argv()

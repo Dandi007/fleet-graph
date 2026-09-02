@@ -311,6 +311,51 @@ class FakeBus:
         return _Result()
 
 
+class FakeWiki:
+    """Recording fake wiki client (M4 交付 A/D): search/page_append/read_page/page_create."""
+
+    def __init__(self, *, fail: bool = False, readback_contains: bool = True) -> None:
+        self.calls: list[str] = []
+        self.pages: dict[str, str] = {}
+        self.fail = fail
+        self._readback_contains = readback_contains
+        self._page_id_counter = 0
+
+    def search(self, title: str) -> list[dict[str, Any]]:
+        self.calls.append("search")
+        if self.fail:
+            from fleet_graph.supervise.wiki_report import WikiReportError
+
+            raise WikiReportError("wiki down")
+        return [{"title": title, "page_id": "page-1"}]
+
+    def page_append(self, page_id: str, content: str) -> dict[str, Any]:
+        self.calls.append("page_append")
+        if self.fail:
+            from fleet_graph.supervise.wiki_report import WikiReportError
+
+            raise WikiReportError("wiki down")
+        self.pages[page_id] = self.pages.get(page_id, "") + content
+        return {"ok": True}
+
+    def read_page(self, page_id: str) -> str:
+        self.calls.append("read_page")
+        if self.fail:
+            from fleet_graph.supervise.wiki_report import WikiReportError
+
+            raise WikiReportError("wiki down")
+        if not self._readback_contains:
+            return ""
+        return self.pages.get(page_id, "")
+
+    def page_create(self, title: str, content: str) -> dict[str, Any]:
+        self.calls.append("page_create")
+        self._page_id_counter += 1
+        page_id = f"page-{self._page_id_counter}"
+        self.pages[page_id] = content
+        return {"ok": True, "page_id": page_id}
+
+
 class TestHarvestAllowlistRefusal:
     """交付 D.1 + 铁律：非白名单 -> 拒绝 + 留痕，不执行任何写。"""
 
@@ -2395,3 +2440,68 @@ class TestHarvestWorktreeReclaimGuard:
         ok, detail = _assert_repo_valid(repo)
         assert ok is False
         assert detail
+
+
+class TestHarvestWikiProductionPromotion:
+    """M4 交付 A：harvest 生产晋级分节接线——终局 HARVESTED 追加生产晋级分节。
+
+    1. 正向：fake wiki 注入，收割到大成功 -> record_production_promotion 被调用一次
+       （page_append 追加「生产晋级：」分节、证据指针 non-empty）；未修复时 0 次
+       （阴性能红）。
+    2. 失败不咬主链：fake wiki 抛 WikiReportError -> harvest outcome 仍 HARVESTED、
+       wiki_report step ok=false、绝不 escalate。
+    3. wiki 缺省（None）零回归：不追加分节、无 wiki_report step。
+    """
+
+    def _config(self, tmp_path: Path, wiki: Any, **overrides: Any):
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus(), wiki=wiki, **overrides)
+        return config, fake
+
+    def test_harvested_appends_production_promotion_section_once(self, tmp_path: Path) -> None:
+        wiki = FakeWiki()
+        config, fake = self._config(tmp_path, wiki)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        # 分节追加一次：search/page_append/read_page 各一次（无 page_create——
+        # 页已存在）。
+        assert wiki.calls.count("page_append") == 1, wiki.calls
+        body = "".join(wiki.pages.values())
+        assert "生产晋级：" in body
+        # 证据指针 non-empty（PR 链接 / commit / 看板 seq 至少一个在场）。
+        assert "https://github.com" in body
+        assert "f" * 40 in body  # pull_head 作为 commit 证据
+        # 收割链照常走完（wiki 是 telemetry，不咬主链）。
+        assert "pr_squash_merge" in fake["calls"]
+        # 成功路径不产 wiki_report ok:false step（与 e6/e7 同模式：仅失败留痕）。
+        assert not any(s["step"] == "wiki_report" for s in result["steps"])
+
+    def test_wiki_failure_does_not_bite_main_chain(self, tmp_path: Path) -> None:
+        wiki = FakeWiki(fail=True)
+        config, fake = self._config(tmp_path, wiki)
+        result = run_harvest(config)
+        # outcome 绝不翻转：仍 HARVESTED。
+        assert result["outcome"] == OUTCOME_HARVESTED
+        # 收割链照常走完：写步骤、verify_real、evidence 都在。
+        assert "pr_squash_merge" in fake["calls"]
+        assert "ff_only_pull" in fake["calls"]
+        assert "verify_real" in fake["calls"]
+        # wiki_report step ok=false + detail（回执里留痕——receipt 节点只回
+        # receipt_path，steps 落盘）。
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        wiki_step = next(s for s in receipt["steps"] if s["step"] == "wiki_report")
+        assert wiki_step["ok"] is False
+        assert "wiki 追加失败" in wiki_step["detail"]
+        # postconditions 未被 wiki 失败污染：仍是 ok:true、missing 空。
+        post = next(s for s in receipt["steps"] if s["step"] == "postconditions")
+        assert post["ok"] is True
+
+    def test_wiki_absent_zero_regression(self, tmp_path: Path) -> None:
+        """wiki 缺省（None）-> 不追加分节、无 wiki_report step（既有行为字节不变）。"""
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert not any(s["step"] == "wiki_report" for s in result["steps"])
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert not any(s["step"] == "wiki_report" for s in receipt["steps"])

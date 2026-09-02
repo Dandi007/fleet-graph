@@ -288,3 +288,78 @@ class TestVocabularyNegative:
         event = decision_swallowed_event("msg_sw", "noop")
         assert validate_event(event.as_dict()) == event
         assert event.key == "e7-msg_sw"
+
+
+class FakeWiki:
+    """Recording fake wiki client for M4 交付 C (record_defect_closed assertion)."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.calls: list[str] = []
+        self.pages: dict[str, str] = {}
+        self.fail = fail
+
+    def search(self, title: str) -> list[dict[str, Any]]:
+        self.calls.append("search")
+        if self.fail:
+            from fleet_graph.supervise.wiki_report import WikiReportError
+
+            raise WikiReportError("wiki down")
+        return [{"title": title, "page_id": "page-1"}]
+
+    def page_append(self, page_id: str, content: str) -> dict[str, Any]:
+        self.calls.append("page_append")
+        if self.fail:
+            from fleet_graph.supervise.wiki_report import WikiReportError
+
+            raise WikiReportError("wiki down")
+        self.pages[page_id] = self.pages.get(page_id, "") + content
+        return {"ok": True}
+
+    def read_page(self, page_id: str) -> str:
+        self.calls.append("read_page")
+        if self.fail:
+            from fleet_graph.supervise.wiki_report import WikiReportError
+
+            raise WikiReportError("wiki down")
+        return self.pages.get(page_id, "")
+
+    def page_create(self, title: str, content: str) -> dict[str, Any]:
+        self.calls.append("page_create")
+        page_id = "page-new"
+        self.pages[page_id] = content
+        return {"ok": True, "page_id": page_id}
+
+
+class TestWikiDefectClosed:
+    """M4 交付 C：E7 DELIVERED 时 wiki 客户端非 None -> record_defect_closed 被调用
+    （追加「缺陷闭环」分节）；失败 best-effort 不咬 goal.md 直写语义。"""
+
+    def _delivered_config(self, tmp_path: Path, wiki: Any):
+        bus = FakeBus()
+        bus.add_decision("msg_sw", "wf-a")
+        fake = fake_ops()
+        config, fake = config_for(tmp_path, ops=fake, bus=bus, wiki=wiki)
+        return config, fake
+
+    def test_delivered_appends_defect_closed_section(self, tmp_path: Path) -> None:
+        wiki = FakeWiki()
+        config, _ = self._delivered_config(tmp_path, wiki)
+        result = run_e7_write(config)
+        assert result["outcome"] == OUTCOME_DELIVERED
+        assert wiki.calls.count("page_append") == 1, wiki.calls
+        body = "".join(wiki.pages.values())
+        assert "缺陷闭环：" in body
+        assert "E7 送达失败" in body
+
+    def test_wiki_failure_does_not_bite_delivery_semantics(self, tmp_path: Path) -> None:
+        wiki = FakeWiki(fail=True)
+        config, fake = self._delivered_config(tmp_path, wiki)
+        result = run_e7_write(config)
+        # 直写语义不变：DELIVERED + wiki_report ok:false 留痕（receipt 节点只回
+        # receipt_path，steps 落盘）。
+        assert result["outcome"] == OUTCOME_DELIVERED
+        assert "append_delivery_fail_block" in fake["calls"]
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        wiki_step = next(s for s in receipt["steps"] if s["step"] == "wiki_report")
+        assert wiki_step["ok"] is False
+        assert "wiki 追加失败" in wiki_step["detail"]

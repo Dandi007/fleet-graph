@@ -875,6 +875,10 @@ class SupervisorRunConfig:
     #: katana-wiki-mcp 客户端。E6/E7 成功收口时向「舰队开发阶段性成果报告」页追加
     #: 缺陷闭环分节；None -> 不汇报（默认）。wiki 是 telemetry，失败不咬反应器。
     wiki: Any | None = None
+    #: M4 wiki 人话账（交付 B）：`--wiki` 可选 enable 开关。off（默认）→
+    #: `deps.wiki=None` 行为字节不变（零回归）；on 且未显式注入 `wiki` 客户端时
+    #: 构造 `DefaultWikiClient()` 注入 E5/E6/E7 三路 config.wiki。
+    wiki_enabled: bool = False
 
     @property
     def resolved_checkpoint_path(self) -> str:
@@ -923,6 +927,13 @@ def run_supervisor(config: SupervisorRunConfig) -> dict[str, Any]:
     from langgraph.checkpoint.sqlite import SqliteSaver
 
     event = validate_event(config.event)
+    # M4 交付 B：--wiki 启用时构造 DefaultWikiClient 注入 E5/E6/E7 三路 config.wiki；
+    # off（默认）时沿用 config.wiki（默认 None）——deps.wiki=None 行为字节不变。
+    wiki = config.wiki
+    if config.wiki_enabled and wiki is None:
+        from fleet_graph.supervise.wiki_report import DefaultWikiClient
+
+        wiki = DefaultWikiClient()
     if event.type == EVENT_APPROVED_UNHARVESTED:
         from fleet_graph.supervise.harvest import HarvestRunConfig, run_harvest
 
@@ -952,6 +963,7 @@ def run_supervisor(config: SupervisorRunConfig) -> dict[str, Any]:
             ops=config.harvest_ops,
             bus=config.bus,
             publish_notes=config.publish_notes,
+            wiki=wiki,
         )
         return run_harvest(harvest_config)
 
@@ -967,7 +979,7 @@ def run_supervisor(config: SupervisorRunConfig) -> dict[str, Any]:
                 ops=config.e6_ops,
                 bus=config.bus,
                 publish_notes=config.publish_notes,
-                wiki=config.wiki,
+                wiki=wiki,
             )
         )
 
@@ -991,7 +1003,7 @@ def run_supervisor(config: SupervisorRunConfig) -> dict[str, Any]:
                 ops=config.e7_ops,
                 bus=config.bus,
                 publish_notes=config.publish_notes,
-                wiki=config.wiki,
+                wiki=wiki,
             )
         )
 
