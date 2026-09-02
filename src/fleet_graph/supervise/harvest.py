@@ -130,6 +130,12 @@ class HarvestOps(Protocol):
         record_remote_url: str | None,
         allowlist_repo_paths: list[str],
     ) -> tuple[Path | None, str]: ...
+    def resolve_canonical_repo_unfiltered(
+        self,
+        record_repo_path: str,
+        record_remote_url: str | None,
+        candidate_repo_paths: list[str] | None = None,
+    ) -> tuple[Path | None, str]: ...
     def cherry_equivalent(self, repo: Path, head_commit: str, default_branch: str) -> bool: ...
     def worktree_cherry_pick(
         self, repo: Path, head_commit: str, default_branch: str, worktree_root: Path
@@ -166,6 +172,8 @@ class HarvestState(TypedDict, total=False):
     repo_path: str
     record_worktree: str
     remote_url: str
+    would_resolve_canonical: str
+    would_do: list[str]
     default_branch: str
     deploy_command: list[str]
     allowlist_auth: dict[str, Any]
@@ -386,6 +394,26 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             record_worktree = _record_repo_path(development_id, deps.dd_root)
         elif repo is not None:
             record_worktree = str(repo)
+        # 案A改写③：归属解析与 allowlist 授权判定解耦——record 归属的 canonical
+        # 不在 allowlist（`resolve_canonical_repo` 解析不到 -> None）时，用纯读
+        # unfiltered 口解析「本会归属的 canonical 仓」+「本会执行的写步骤」，把
+        # dry-run 留痕写进 e5 报告（would_resolve_canonical / would_do）——
+        # 不授予任何写权限，writes_skipped 覆盖全部写步、真机零写（不进入任何
+        # 写节点）。授权与否由 gate 另行判定，这里只做观测。
+        would_resolve_canonical = ""
+        would_do: list[str] = []
+        if repo is None and record_worktree:
+            try:
+                would_canonical, _reason = deps.ops.resolve_canonical_repo_unfiltered(
+                    record_worktree, remote_url or None
+                )
+            except Exception:
+                would_canonical = None
+            if would_canonical is not None:
+                would_resolve_canonical = str(would_canonical)
+            # 本会执行的写步骤 = 收割链的写步骤名单（与 writes_skipped 同源，
+            # 先观测后授权：只留痕，不执行）。
+            would_do = list(WRITE_STEPS)
         # H8 交付 B.2/B.3：_resolve_repo 成功之后、进入 gate 之前，对链上每棵
         # 将被消费的树（record_worktree / canonical / 本次 worktree_root）做
         # occupancy 探测。任一在飞且非本单 -> 立即拒绝+escalate，走既有
