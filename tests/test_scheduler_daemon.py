@@ -241,6 +241,9 @@ class TestItReadsOnlyWhatItNeeds:
             # coordinator round -- the parking baseline. Also finalise's own
             # mechanical hash, never prose.
             "goal_revision",
+            # M1: the development id a ``waiting_dd`` terminal is parked on --
+            # finalise's own mechanical anchor for the dd wake facts.
+            "dd_development_id",
         }
         assert reads - {"reason"} <= allowed, reads
 

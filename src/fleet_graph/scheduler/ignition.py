@@ -41,6 +41,9 @@ class Refusal(StrEnum):
     ALREADY_RUNNING = "already_running"
     TERMINAL_DONE = "terminal_done"
     PARKED_AWAITING_DECISION = "parked_awaiting_decision"
+    #: M1: a line parked on the development it dispatched (``waiting_dd``). The
+    #: wake is a dd fact (``dd_awaiting_gate`` / ``dd_terminal``), never a timer.
+    PARKED_AWAITING_DD = "parked_awaiting_dd"
     COOLING_DOWN = "cooling_down"
     TOTAL_CAP_REACHED = "total_cap_reached"
     GATEWAY_RED = "gateway_red"
@@ -97,6 +100,12 @@ def decide(
     unproductive_recent: int,
     zero_progress_streak: int,
     parked: bool = False,
+    #: M1: which parking reason holds the line, when ``parked`` is set. "dd" is
+    #: the dispatch park (``waiting_dd``); anything else reads as the legacy
+    #: human-decision park. The refusal text differs so an operator can tell the
+    #: two apart. Existing callers that pass only ``parked=True`` keep the
+    #: decision wording (their lines park on a human decision).
+    parked_kind: str = "decision",
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
     total_cap: int = DEFAULT_TOTAL_CAP,
     cap_window_seconds: float = DEFAULT_CAP_WINDOW_SECONDS,
@@ -159,6 +168,20 @@ def decide(
         # no wake fact -- see daemon.py), and any failure to probe those facts
         # comes in here as parked=False, falling through to plain backoff:
         # parking saves money, it must never be able to lock a line shut.
+        #
+        # M1: the dispatch park has the same shape and the same zero-LLM
+        # guarantee -- a ``waiting_dd`` line is only woken by a dd fact
+        # (``dd_awaiting_gate`` / ``dd_terminal``), never a relaunch on a
+        # timer. It is split onto its own refusal so the two waits stay
+        # distinguishable in the per-tick log.
+        if parked_kind == "dd":
+            return IgnitionDecision(
+                False,
+                Refusal.PARKED_AWAITING_DD,
+                f"{status.folder_id} is waiting on a dispatched development; "
+                "parked until the development reaches awaiting_gate or a terminal "
+                "(or the parked fields are cleared from its stall-state file)",
+            )
         return IgnitionDecision(
             False,
             Refusal.PARKED_AWAITING_DECISION,

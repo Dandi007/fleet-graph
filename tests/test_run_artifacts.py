@@ -288,6 +288,10 @@ class TestEquivalenceWithTheRealPump:
             "log_path",
             "goal_revision",
             "release_id",
+            # M1: the closed line-state word and the dispatch anchor are
+            # fleet-graph additions the retired pump will never grow.
+            "line_state",
+            "dd_development_id",
         }
     )
 
@@ -335,7 +339,7 @@ class TestNormalizeWaitingOn:
 
         assert normalize_waiting_on(None) == ("none", None)
 
-    @pytest.mark.parametrize("value", ["decision", "external", "none"])
+    @pytest.mark.parametrize("value", ["decision", "external", "dd", "none"])
     def test_known_values_pass_through(self, value: str) -> None:
         from fleet_graph.state.run_artifacts import normalize_waiting_on
 

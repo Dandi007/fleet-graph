@@ -93,10 +93,19 @@ from fleet_graph.scheduler.seat_override import (
     render_drift_line,
     roster_seat_from,
 )
-from fleet_graph.scheduler.wake import WakeSignals, parse_bus_timestamp, probe_error_tag
+from fleet_graph.scheduler.wake import (
+    DdWakeFacts,
+    WakeSignals,
+    parse_bus_timestamp,
+    probe_error_tag,
+)
+from fleet_graph.state.run_artifacts import derive_line_state
 
 DEFAULT_MAINTENANCE_STOP = Path("/data/fleet-graph/maintenance-stop")
 DEFAULT_INTERVAL_SECONDS = 60.0
+#: Where dd development run artifacts live. The M1 dd wake source reads a
+#: dispatched development's status.json from here.
+DEFAULT_DD_ROOT = Path("/data/fleet-graph/dd")
 
 #: Parking bookkeeping, kept in the stall-state file. `park_considered_run_id`
 #: marks a terminal the parking logic already looked at, so an operator who
@@ -109,6 +118,9 @@ _EMPTY_PARK_FIELDS: dict[str, Any] = {
     "parked_at": None,
     "parked_goal_revision": None,
     "parked_inbox_available": None,
+    # M1: the development a ``waiting_dd`` park is anchored on. Cleared with the
+    # rest of the snapshot so a wake also clears the dd anchor.
+    "parked_dd_development_id": None,
 }
 
 
@@ -215,6 +227,10 @@ class ParkOutcome:
     event: str | None = None
     blocker: str | None = None
     board_question: str | None = None
+    #: Which parking reason holds this line: "decision" (human ruling) or "dd"
+    #: (M1 dispatch park). None when not parked. Threaded into `decide` so the
+    #: refusal and its log line name the right wait.
+    kind: str | None = None
 
 
 class UnitProbe(Protocol):
@@ -238,6 +254,8 @@ class SystemdUnitProbe:
 class SchedulerConfig:
     lines: list[LineSpec] = field(default_factory=list)
     run_root: Path = Path("/data/fleet-graph/runs")
+    #: Where dd developments' run artifacts live -- the M1 dd wake source's root.
+    dd_root: Path = DEFAULT_DD_ROOT
     maintenance_stop_path: Path = DEFAULT_MAINTENANCE_STOP
     interval_seconds: float = DEFAULT_INTERVAL_SECONDS
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS
@@ -292,6 +310,7 @@ class SchedulerConfig:
                 for entry in raw.get("lines", [])
             ],
             run_root=Path(raw.get("run_root", "/data/fleet-graph/runs")),
+            dd_root=Path(raw.get("dd_root", str(DEFAULT_DD_ROOT))),
             maintenance_stop_path=Path(raw.get("maintenance_stop", str(DEFAULT_MAINTENANCE_STOP))),
             interval_seconds=float(raw.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)),
             cooldown_seconds=float(raw.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS)),
@@ -338,6 +357,7 @@ class Scheduler:
         checkpoints: Any = None,
         seat_overrides: SeatOverrideStore | None = None,
         revives: ReviveStore | None = None,
+        dd: DdWakeFacts | None = None,
     ) -> None:
         self.config = config
         self.prober = prober
@@ -364,6 +384,13 @@ class Scheduler:
         #: fail-open reading as a probe failure: no way to observe wake facts
         #: means no parking, and the line stays on plain backoff.
         self.wake = wake
+        #: The M1 dd wake source. None disables dd parking outright -- the same
+        #: fail-open reading as a missing wake source: no way to observe dd facts
+        #: means no dd parking, and a waiting_dd line falls back to plain backoff
+        #: rather than locking. Production wires ``LiveDdWakeFacts`` over
+        #: ``config.dd_root``; defaults are built on first tick so a scheduler
+        #: constructed without one still works when dd parking is not exercised.
+        self.dd = dd
         #: bus.board.Board for the best-effort question note on parking.
         #: None means parking is log-visible only.
         self.board = board
@@ -486,6 +513,13 @@ class Scheduler:
             # mechanical hash, never prose. Absent on old/anomalous terminals:
             # the scheduler then fails open rather than locking the line.
             "goal_revision": record.get("goal_revision"),
+            # M1: the development id a ``waiting_dd`` terminal is parked on. The
+            # dd wake facts key on it; absent for every other terminal.
+            "dd_development_id": record.get("dd_development_id"),
+            # The closed externally-facing line-state word (design.md §6.3),
+            # derived from terminal + waiting_on. Landed in this projection so
+            # the scheduler can mirror it into the stall-state file.
+            "line_state": derive_line_state(record.get("terminal"), record.get("waiting_on")),
         }
 
     def _line_for(self, folder_id: str) -> LineSpec | None:
@@ -659,6 +693,12 @@ class Scheduler:
             "parked_at": state.get("parked_at"),
             "parked_goal_revision": state.get("parked_goal_revision"),
             "parked_inbox_available": state.get("parked_inbox_available"),
+            # M1: the development a ``waiting_dd`` park is anchored on.
+            "parked_dd_development_id": state.get("parked_dd_development_id"),
+            # The closed externally-facing line-state word (design.md §6.3),
+            # mirrored here from the accounted terminal so the stall file is one
+            # of the two authoritative files that carry the vocabulary.
+            "line_state": state.get("line_state"),
             # The line's board card entity (`work.card.v1` on board:work-index),
             # materialised by the first escalation. Per line, not per parking:
             # it survives new terminals and re-parkings, so later question
@@ -788,6 +828,11 @@ class Scheduler:
                         # written explicitly None to keep the schema stable.
                         "board_card_entity_id": None,
                         "board_question_note_id": None,
+                        # M1: the closed line-state word derived from the
+                        # terminal the scheduler just adopted as baseline.
+                        "line_state": derive_line_state(
+                            record.get("terminal"), record.get("waiting_on")
+                        ),
                     },
                 )
             return 0
@@ -826,6 +871,9 @@ class Scheduler:
                 # its snapshot is cleared, and this run is not yet considered,
                 # so the parking logic gets to look at it exactly once.
                 **_EMPTY_PARK_FIELDS,
+                # M1: the closed line-state word derived from the newly
+                # accounted terminal.
+                "line_state": derive_line_state(record.get("terminal"), record.get("waiting_on")),
             },
         )
         return streak
@@ -887,14 +935,21 @@ class Scheduler:
     # be able to lock a line shut.
 
     def park_state(self, line: LineSpec, now: float) -> ParkOutcome:
-        """Is this line parked right now? Establishes, holds, or wakes."""
+        """Is this line parked right now? Establishes, holds, or wakes.
+
+        M1: a ``blocked`` terminal now carries two parking reasons. ``decision``
+        keeps the existing human-ruling park (inbox / goal.md wakes); ``dd``
+        routes the dispatch park whose only wake is a dd fact. Any other
+        ``waiting_on`` -- and every failure to see the mechanical fields -- stays
+        a non-park, so parking can never lock a line shut.
+        """
         record = self.terminal_record(line.folder_id)
-        if (
-            record is None
-            or record.get("terminal") != "blocked"
-            or record.get("waiting_on") != "decision"
-            or record.get("run_id") is None
-        ):
+        if record is None or record.get("terminal") != "blocked" or record.get("run_id") is None:
+            return ParkOutcome()
+        waiting_on = record.get("waiting_on")
+        if waiting_on == "dd":
+            return self._dd_park(line, record, now)
+        if waiting_on != "decision":
             return ParkOutcome()
         run_id = record["run_id"]
         state = self.stall_state(line.folder_id)
@@ -989,6 +1044,7 @@ class Scheduler:
             event="established" if inbox_note is None else f"established:{inbox_note}",
             blocker=blocker,
             board_question=board_question,
+            kind="decision",
         )
 
     def _check_wake(
@@ -1021,7 +1077,85 @@ class Scheduler:
                 return self._wake(line, state, "woken:goal_revision")
         except Exception as exc:  # fail open, by design
             return self._wake(line, state, f"woken:probe_failed:{probe_error_tag(exc)}")
-        return ParkOutcome(parked=True, blocker=self.blocker_summary(line.folder_id))
+        return ParkOutcome(
+            parked=True, blocker=self.blocker_summary(line.folder_id), kind="decision"
+        )
+
+    def _dd_fact(self, development_id: str) -> str | None:
+        """The dd wake fact for a development, or None when not yet wakeable.
+
+        Raises when the dd source is absent or the probe fails -- the caller
+        fails open (a ``waiting_dd`` line that cannot buy a wake fact must not
+        be parked, it falls back to plain backoff). This is the M1 production of
+        ``dd_awaiting_gate(dev_id)`` / ``dd_terminal(dev_id)``.
+        """
+        if self.dd is None:
+            raise RuntimeError("scheduler has no dd wake facts configured")
+        return self.dd.dd_fact(development_id)
+
+    # --- dd parking (M1: waiting_dd) --------------------------------------
+    #
+    # A line whose last terminal is `blocked` + `waiting_on: "dd"` dispatched a
+    # development and is waiting for it to reach the gate or a terminal. The
+    # wake is a dd *fact*, never a timer and never a poll: the scheduler refuses
+    # ignition until ``dd_awaiting_gate(dev_id)`` or ``dd_terminal(dev_id)``.
+    #
+    # Failure discipline is the fail-open reading shared with the decision park:
+    # no dd source, no dd anchor, or a broken probe means *no parking* -- the
+    # line falls back to plain backoff. A broken dd probe must never be able to
+    # lock a line shut.
+
+    def _dd_park(self, line: LineSpec, record: dict[str, Any], now: float) -> ParkOutcome:
+        run_id = record["run_id"]
+        state = self.stall_state(line.folder_id)
+        if state["parked_run_id"] == run_id and state["parked_at"] is not None:
+            return self._dd_check_wake(line, record, state)
+        if state["park_considered_run_id"] == run_id:
+            # Considered once and not parked (or the operator released it).
+            return ParkOutcome()
+        return self._dd_establish_park(line, record, state, now)
+
+    def _dd_establish_park(
+        self, line: LineSpec, record: dict[str, Any], state: dict[str, Any], now: float
+    ) -> ParkOutcome:
+        run_id = record["run_id"]
+        state["park_considered_run_id"] = run_id
+        dd_id = str(record.get("dd_development_id") or "")
+        if not dd_id:
+            # A waiting_dd terminal with no development anchor has no dd fact to
+            # wake on: fail open, never park.
+            self._write_stall_state(line.folder_id, state)
+            return ParkOutcome(event="not_parked:no_dd_development")
+        try:
+            fact = self._dd_fact(dd_id)
+        except Exception as exc:  # fail open, by design
+            self._write_stall_state(line.folder_id, state)
+            return ParkOutcome(event=f"not_parked:dd_probe_failed:{probe_error_tag(exc)}")
+        if fact in ("awaiting_gate", "terminal"):
+            # The wake fact already exists: nothing to wait for, never park.
+            self._write_stall_state(line.folder_id, state)
+            return ParkOutcome(event=f"not_parked:dd_{fact}")
+        state["parked_run_id"] = run_id
+        state["parked_at"] = now
+        state["parked_dd_development_id"] = dd_id
+        state["line_state"] = derive_line_state(record.get("terminal"), record.get("waiting_on"))
+        self._write_stall_state(line.folder_id, state)
+        return ParkOutcome(parked=True, event="established_dd", kind="dd")
+
+    def _dd_check_wake(
+        self, line: LineSpec, record: dict[str, Any], state: dict[str, Any]
+    ) -> ParkOutcome:
+        dd_id = str(state.get("parked_dd_development_id") or record.get("dd_development_id") or "")
+        if not dd_id:
+            # The anchor vanished: treat that as a wake (fail open), not a lock.
+            return self._wake(line, state, "woken:dd_anchor_lost")
+        try:
+            fact = self._dd_fact(dd_id)
+        except Exception as exc:  # fail open, by design
+            return self._wake(line, state, f"woken:dd_probe_failed:{probe_error_tag(exc)}")
+        if fact in ("awaiting_gate", "terminal"):
+            return self._wake(line, state, f"woken:dd_{fact}")
+        return ParkOutcome(parked=True, kind="dd")
 
     def _wake(self, line: LineSpec, state: dict[str, Any], event: str) -> ParkOutcome:
         """Clear the parking snapshot; the normal decide order takes over.
@@ -1036,6 +1170,7 @@ class Scheduler:
             "parked_at": None,
             "parked_goal_revision": None,
             "parked_inbox_available": None,
+            "parked_dd_development_id": None,
         }
         self._write_stall_state(line.folder_id, cleared)
         return ParkOutcome(parked=False, event=event)
@@ -1286,6 +1421,7 @@ class Scheduler:
                 maintenance_stop=stopped,
                 zero_progress_streak=streak,
                 parked=park.parked,
+                parked_kind=park.kind or "decision",
                 gateway_healthy=self.gateway_healthy(self.effective_seat_for(line)),
                 unproductive_recent=self.unproductive_recent(now),
                 cooldown_seconds=self.config.cooldown_seconds,

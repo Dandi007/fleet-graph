@@ -843,7 +843,7 @@ def _scheduler_run(args: argparse.Namespace) -> int:
     from fleet_graph.scheduler.daemon import Scheduler, SchedulerConfig
     from fleet_graph.scheduler.launcher import TransientLauncher
     from fleet_graph.scheduler.probe import CliGatewayProber, GatewayProber, HttpxProbeTransport
-    from fleet_graph.scheduler.wake import LiveWakeSignals
+    from fleet_graph.scheduler.wake import LiveDdWakeFacts, LiveWakeSignals
 
     config = SchedulerConfig.from_json(pathlib.Path(args.config))
 
@@ -874,6 +874,9 @@ def _scheduler_run(args: argparse.Namespace) -> int:
         launcher=TransientLauncher(dry_run=args.dry_run),
         observe=lambda result: print(json.dumps(result.as_dict(), ensure_ascii=False), flush=True),
         wake=LiveWakeSignals(),
+        # M1: the dd wake source over the dd run-artifact root, so a
+        # ``waiting_dd`` line is woken by dd facts (awaiting_gate / terminal).
+        dd=LiveDdWakeFacts(config.dd_root),
         board=board,
         # E3: normal terminal/account/parking decisions come from the line's
         # durable checkpoint (get_state); terminal.json is the derived view.
