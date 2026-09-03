@@ -34,6 +34,7 @@ from fleet_graph.dd.git import run_git
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.dd.mutation import (
     CHECKED_ITEMS_FIELD,
+    MUTATION_EXECUTION_FAILED,
     MUTATION_TARGET_NOT_RED,
     enumerate_mutation_targets,
     execute_final_review_mutations,
@@ -470,9 +471,18 @@ class AgentRunStageActor:
         REJECT. A valid all-red receipt travels on the stage receipt, so the
         gate downstream verifies it instead of re-running anything (S12.3's
         "gate 只核验回执"). Unwired or non-final stages pass through untouched.
+
+        A gate that cannot execute is never a pass: a diff that will not
+        resolve or a copy that will not open fails the stage with
+        ``MUTATION_EXECUTION_FAILED`` so the bounded retry machinery owns it,
+        instead of crashing the walk or quietly waving the review through.
         """
         provider = self.mutation_inputs
-        if provider is None or not is_final_review_stage(stage, self.lifecycle):
+        if (
+            provider is None
+            or provider is False
+            or not is_final_review_stage(stage, self.lifecycle)
+        ):
             return outcome
         inputs = provider(dispatch)
         if not isinstance(inputs, dict):
@@ -481,19 +491,26 @@ class AgentRunStageActor:
         base = str(inputs["base"])
         head = str(inputs["head"])
         commands = [list(argv) for argv in inputs["acceptance_commands"]]
-        receipt = final_review_mutation_receipt(
-            stage,
-            self.lifecycle,
-            repo=repo,
-            base=base,
-            head=head,
-            acceptance_commands=commands,
-            runner=inputs.get("runner"),
-            worktree_parent=inputs.get("worktree_parent"),
-        )
+        try:
+            receipt = final_review_mutation_receipt(
+                stage,
+                self.lifecycle,
+                repo=repo,
+                base=base,
+                head=head,
+                acceptance_commands=commands,
+                runner=inputs.get("runner"),
+                worktree_parent=inputs.get("worktree_parent"),
+            )
+            expected = enumerate_mutation_targets(repo, base, head)
+        except RuntimeError as exc:
+            return StageOutcome(
+                event=FAILURE_EVENT,
+                failure_code=MUTATION_EXECUTION_FAILED,
+                detail=f"final_review mutation gate could not execute: {exc}",
+            )
         if receipt is None:
             return outcome
-        expected = enumerate_mutation_targets(repo, base, head)
         verified, violations = verify_mutation_receipt(
             receipt, expected, acceptance_commands=commands
         )

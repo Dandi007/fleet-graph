@@ -589,8 +589,17 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     head_commit = sealed.commit
                     if sealed.receipt is not None:
                         # The sealer attested; its account supersedes the
-                        # actor's claim for every downstream binding.
-                        outcome = replace(outcome, receipt=sealed.receipt)
+                        # actor's claim for every downstream binding -- except
+                        # the actor's own final_review mutation receipt
+                        # (S12.3), which the sealer never sees and the gate
+                        # downstream must still be able to verify without
+                        # re-running. Re-attached here so the run state's
+                        # last_receipt carries it past the replacement.
+                        mutation_receipt = (outcome.receipt or {}).get("mutation_receipt")
+                        merged = dict(sealed.receipt)
+                        if isinstance(mutation_receipt, dict):
+                            merged["mutation_receipt"] = mutation_receipt
+                        outcome = replace(outcome, receipt=merged)
                     if sealed.produced is not None:
                         # A seal that names what it wrote is a better witness
                         # than an agent's self-report -- it is the thing that

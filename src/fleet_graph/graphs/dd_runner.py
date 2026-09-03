@@ -28,7 +28,7 @@ from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder
 from fleet_graph.dd.lifecycle import Lifecycle
 from fleet_graph.dd.prompt import PluginPromptSource
 from fleet_graph.executors.agent_run import AgentRunLauncher
-from fleet_graph.graphs.dd_actors import AgentRunStageActor, BoardGate
+from fleet_graph.graphs.dd_actors import PRODUCT_ARTIFACT, AgentRunStageActor, BoardGate
 from fleet_graph.graphs.dd_materializer import (
     MaterializationTarget,
     PluginMaterializer,
@@ -117,10 +117,47 @@ class DevelopmentConfig:
     #: `dispatched_by`. Empty lets the actor fall back to the dispatcher. Never
     #: a run_id/uuid: the label must name a bounded subject, not an identity.
     dispatched_by: str = ""
+    #: The final_review stage's mutation-gate input provider. ``None`` (the
+    #: default) means "derive the mechanical facts from this config" -- the
+    #: assembled pipeline owns S12.3's execution duty, so the gate is live
+    #: wherever the facts exist (frozen base, implement commit, acceptance
+    #: argv). A caller may supply their own ``(dispatch) -> dict | None``;
+    #: ``False`` is the one way to run unarmed, and exists for tests only.
+    mutation_inputs: Any = None
 
     @property
     def thread_id(self) -> str:
         return f"{self.development_id}:g{self.generation}"
+
+
+def configured_mutation_inputs(config: DevelopmentConfig) -> Any:
+    """The mutation-gate input provider the assembled pipeline runs with.
+
+    S12.3 is an engine duty, not a library export: the final_review stage the
+    walker actually dispatches must receive the mutation gun's mechanical
+    inputs, or the gate never fires and a green receipt can never exist. The
+    facts are mechanical -- the frozen base, the implement commit under review,
+    the frozen acceptance argv -- and this closure already holds every one of
+    them, so it hands them over and nothing else. Facts that are missing mean
+    "nothing to shoot at yet", which is ``None`` (the gate stays inert), not
+    an invented target. A config that supplies its own provider wins; only the
+    literal ``False`` disarms the gate, and tests are its customer.
+    """
+
+    def provider(dispatch: dict[str, Any]) -> dict[str, Any] | None:
+        head = str((dispatch.get("artifact_commits") or {}).get(PRODUCT_ARTIFACT) or "")
+        base = str(config.target_base_commit or "")
+        commands = [list(argv) for argv in (config.run_config.get("acceptance_commands") or [])]
+        if not head or not base or not commands:
+            return None
+        return {
+            "repo": config.workspace_path,
+            "base": base,
+            "head": head,
+            "acceptance_commands": commands,
+        }
+
+    return provider
 
 
 def build_pipeline(
@@ -199,6 +236,15 @@ def build_pipeline(
         # record the re-prepare into the run's event log. The re-adopt path
         # (a run still in flight) is excluded inside the actor.
         reprepare_worktree=config.reprepare_worktree,
+        # The final_review stage's mutation gate is wired here, in the one
+        # production assembly site: a gate that exists only as an actor
+        # capability no real dispatch can reach is the defect S12.3's
+        # tightening exists to stop.
+        mutation_inputs=(
+            configured_mutation_inputs(config)
+            if config.mutation_inputs is None
+            else config.mutation_inputs
+        ),
         observe=observe,
     )
     sealer = PluginMaterializer(
@@ -464,6 +510,7 @@ __all__ = [
     "DevelopmentConfig",
     "awaiting_decision",
     "build_pipeline",
+    "configured_mutation_inputs",
     "gate_refusal",
     "lifecycle_gate_stage",
     "run_pipeline",

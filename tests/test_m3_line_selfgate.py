@@ -27,9 +27,11 @@ from typing import Any
 
 import pytest
 
+from conftest import DEVELOPMENT_ID
 from fleet_graph.dd.control_plane import ControlPlaneError, DdControlPlane
 from fleet_graph.dd.mutation import (
     CHECKED_ITEMS_FIELD,
+    MUTATION_EXECUTION_FAILED,
     MUTATION_TARGET_NOT_RED,
     enumerate_mutation_targets,
     execute_final_review_mutations,
@@ -1016,14 +1018,116 @@ class TestS12CheckedItemsSchemaAndPrompt:
 
 
 class TestS12InstanceTargetAndReachability:
-    def test_final_review_entry_is_reachable_in_the_review_call_graph(self) -> None:
-        """D8: 静态可达性断言,不可达即红 —— 不是断言某进程在跑。"""
+    def test_the_assembled_pipeline_supplies_the_final_review_its_mutation_inputs(
+        self, dev_repo: DevRepo, tmp_path: Path
+    ) -> None:
+        """D8 的生产装配形态：断言对象是 build_pipeline 的产物，不是单模块调用图。
+
+        上一单的红因正是这里：执行入口在 dd_actors.py 模块内部静态可达，
+        装配出来的流水线却从不供给 mutation_inputs，闸在每次真跑中早退。
+        本用例把断言钉在生产装配点上——build_pipeline 组装的 dispatcher
+        必须带着 provider，且 provider 交出的就是机械事实（冻结 base、
+        implement 提交、冻结验收 argv）。静态调用图可达性退为辅助断言。
+        """
+        from fleet_graph.graphs.dd_actors import PRODUCT_ARTIFACT, AgentRunStageActor
+        from fleet_graph.graphs.dd_runner import DevelopmentConfig, build_pipeline
+
+        bare = tmp_path / "durable.git"
+        _git(tmp_path, "init", "-q", "--bare", "durable.git")
+        config = DevelopmentConfig(
+            development_id=DD_ID,
+            workspace_path=dev_repo.path,
+            state_root=tmp_path / "state",
+            run_root=tmp_path / "runs",
+            remote_url=str(bare),
+            remote_ref="refs/heads/dev-001",
+            target_base_commit=dev_repo.base,
+            root_handoff_digest="sha256:" + "c" * 64,
+            plugin_binding=object(),
+            head_commit=dev_repo.head,
+            run_config={"acceptance_commands": [list(argv) for argv in FROZEN_ACCEPTANCE]},
+        )
+        _graph, deps = build_pipeline(config)
+        dispatcher = deps.dispatcher
+        assert isinstance(dispatcher, AgentRunStageActor)
+        assert callable(dispatcher.mutation_inputs)
+        inputs = dispatcher.mutation_inputs({"artifact_commits": {PRODUCT_ARTIFACT: dev_repo.head}})
+        assert inputs == {
+            "repo": dev_repo.path,
+            "base": dev_repo.base,
+            "head": dev_repo.head,
+            "acceptance_commands": FROZEN_ACCEPTANCE,
+        }
+        # 静态层（辅助）：装配点引用的执行入口在源码调用图中同样可达。
         assert static_call_reachable(ACTORS_SOURCE_PATH, "act", "execute_final_review_mutations")
         assert static_call_reachable(ACTORS_SOURCE_PATH, "act", "verify_mutation_receipt")
-        # Negative control: an unrelated entry stays unreachable.
         assert not static_call_reachable(
             ACTORS_SOURCE_PATH, "stage_role", "execute_final_review_mutations"
         )
+
+    def test_the_provider_stays_inert_until_its_facts_exist(
+        self, dev_repo: DevRepo, tmp_path: Path
+    ) -> None:
+        """没有 implement 提交、没有冻结验收 argv，就没有可打的目标：None，
+        不是编造。事实齐备的生产单（CLI 派单两者必有）则必然上膛。"""
+        from fleet_graph.graphs.dd_actors import PRODUCT_ARTIFACT
+        from fleet_graph.graphs.dd_runner import (
+            DevelopmentConfig,
+            configured_mutation_inputs,
+        )
+
+        bare = tmp_path / "durable.git"
+        _git(tmp_path, "init", "-q", "--bare", "durable.git")
+
+        def make(*, commands: bool) -> Any:
+            return DevelopmentConfig(
+                development_id=DD_ID,
+                workspace_path=dev_repo.path,
+                state_root=tmp_path / "state",
+                run_root=tmp_path / "runs",
+                remote_url=str(bare),
+                remote_ref="refs/heads/dev-001",
+                target_base_commit=dev_repo.base,
+                root_handoff_digest="sha256:" + "c" * 64,
+                plugin_binding=object(),
+                head_commit=dev_repo.head,
+                run_config=(
+                    {"acceptance_commands": [list(argv) for argv in FROZEN_ACCEPTANCE]}
+                    if commands
+                    else {}
+                ),
+            )
+
+        provider = configured_mutation_inputs(make(commands=True))
+        assert provider({"artifact_commits": {}}) is None
+        unarmed = configured_mutation_inputs(make(commands=False))
+        assert unarmed({"artifact_commits": {PRODUCT_ARTIFACT: dev_repo.head}}) is None
+
+    def test_the_gate_fails_closed_when_it_cannot_execute(self, dev_repo: DevRepo) -> None:
+        """打不响的枪不是过了膛：diff 解析不了时 stage 失败（可观测、可重试），
+        绝不静默放行、也绝不炸掉整个 walk。"""
+        from fleet_graph.dd.lifecycle import Lifecycle
+        from fleet_graph.graphs.dd_actors import AgentRunStageActor
+        from fleet_graph.graphs.dd_pipeline import FAILURE_EVENT, StageOutcome
+
+        actor = AgentRunStageActor(
+            launcher=None,
+            development_id=DD_ID,
+            run_root=dev_repo.path.parent,
+            lifecycle=Lifecycle.load(),
+            mutation_inputs=lambda dispatch: {
+                "repo": dev_repo.path,
+                "base": "b" * 40,
+                "head": dev_repo.head,
+                "acceptance_commands": FROZEN_ACCEPTANCE,
+            },
+        )
+        stage = actor.lifecycle.stages["final_review"]
+        outcome = actor._with_final_review_mutations(
+            stage, {"input_commit": dev_repo.head}, StageOutcome(event="APPROVE")
+        )
+        assert outcome.event == FAILURE_EVENT
+        assert outcome.failure_code == MUTATION_EXECUTION_FAILED
 
     def test_the_gate_side_helper_exists_for_the_walker(self) -> None:
         from fleet_graph.graphs.dd_actors import final_review_mutation_receipt
@@ -1106,6 +1210,220 @@ class TestS12InstanceTargetAndReachability:
             stage, {"input_commit": dev_repo.head}, StageOutcome(event="APPROVE")
         )
         assert outcome.event == "APPROVE"
+
+
+# ---------------------------------------------------------------------------
+# S12 引擎侧收束（rf 三 blocker + D8 major 的修复面）：
+#   - 封 sidecar 工件：checklist + 变异回执落盘（plugin 的 pinned schema
+#     additionalProperties:false，checklist/回执物理上进不了 sealed review.json，
+#     spec 明言「落 review.json 或其旁挂工件」——旁挂工件即此）。
+#   - run state 保留 mutation_receipt：sealer 回执替换后不丢。
+# ---------------------------------------------------------------------------
+
+
+def _sealed_review_result() -> dict[str, Any]:
+    """Exactly what the plugin's Review sealer returns (its fixed field set)."""
+    return {
+        "attempt_id": "att-1",
+        "contract_version": "dev-dispatch.attempt-context/v1",
+        "development_id": DEVELOPMENT_ID,
+        "feedback_index": {
+            "blob_oid": "0" * 40,
+            "digest": "sha256:" + "0" * 64,
+            "entry_count": 1,
+            "path": ".dev-dispatch/feedback/index.json",
+        },
+        "implementation_handoff_receipt_digest": "sha256:" + "1" * 64,
+        "implementation_subject_commit": "2" * 40,
+        "input_commit": "3" * 40,
+        "materialization_intent_id": "intent-1",
+        "output_commit": "4" * 40,
+        "parent_handoff_receipt_digest": "sha256:" + "5" * 64,
+        "review_artifact": {
+            "blob_oid": "6" * 40,
+            "digest": "sha256:" + "7" * 64,
+            "path": ".dev-dispatch/reviews/rc-att-1/review.json",
+        },
+        "review_id": "rc-att-1",
+        "review_phase": "continuous",
+        "reviewer_job_id": "job-1",
+        "subject_commit": "3" * 40,
+        "verdict": "APPROVE",
+    }
+
+
+def _review_materializer(repo: Path) -> Any:
+    from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder
+    from fleet_graph.graphs.dd_materializer import MaterializationTarget, PluginMaterializer
+
+    builder = StageDispatchBuilder(
+        DevelopmentChain(
+            development_id=DEVELOPMENT_ID,
+            workspace_path=str(repo),
+            target_base_commit="b" * 40,
+            root_handoff_digest="sha256:" + "c" * 64,
+        )
+    )
+    return PluginMaterializer(
+        builder=builder,
+        binding=object(),
+        target=MaterializationTarget(
+            remote_url="https://example.invalid/repo.git",
+            remote_ref="refs/heads/dev-001",
+            worktree=str(repo),
+            state_root=str(repo / ".state"),
+        ),
+    )
+
+
+def _review_dispatch(repo: Path, stage_id: str) -> Any:
+    return {
+        "development_id": DEVELOPMENT_ID,
+        "stage": stage_id,
+        "mode": "initial",
+        "generation": 1,
+        "attempt": 1,
+        "attempt_started_at": "2026-09-03T08:00:00Z",
+        "input_commit": _git(repo, "rev-parse", "HEAD"),
+        "parent_receipt": {},
+        "receipt_digests": {},
+    }
+
+
+def _seal_receipt_bytes(repo: Path, attempt_id: str, name: str) -> None:
+    """What the plugin's sealer persists before a review stage may seal."""
+    path = repo / ".state" / "receipts" / attempt_id / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'{"ok":1}')
+
+
+class TestS12TheSealedSidecarCarriesWhatTheSealedReviewCannot:
+    def test_the_final_seal_persists_checklist_and_mutation_receipt(
+        self, repo: Path, monkeypatch: Any
+    ) -> None:
+        """checklist + 变异回执在封边落盘：缺这步，review.json 里永远没有
+        「已核验项」，gate 也永远拿不到真回执（rf blocker 1/2 的修复面）。"""
+        from conftest import DEVELOPMENT_ID
+        from fleet_graph.dd.dispatch import derive_attempt_id
+        from fleet_graph.dd.vendor import plugin_adapter
+        from fleet_graph.graphs.dd_materializer import (
+            load_mutation_receipt,
+            review_sidecar_path,
+        )
+        from fleet_graph.graphs.dd_pipeline import StageOutcome
+
+        monkeypatch.setattr(
+            plugin_adapter, "invoke_review_materializer", lambda *a, **k: _sealed_review_result()
+        )
+        materializer = _review_materializer(repo)
+        attempt_id = derive_attempt_id(DEVELOPMENT_ID, 1, 1)
+        for name in ("implement-receipt.json", "continuous-review-receipt.json"):
+            _seal_receipt_bytes(repo, attempt_id, name)
+        dispatch = _review_dispatch(repo, "final_review")
+        outcome = StageOutcome(
+            event="APPROVE",
+            receipt={
+                "review_result": {
+                    "verdict": "APPROVE",
+                    "checked_items": ["read the diff against the spec"],
+                },
+                "mutation_receipt": {"all_red": True, "targets": [{"path": "a.py"}]},
+            },
+        )
+        materializer.materialize(materializer.lifecycle.stages["final_review"], dispatch, outcome)
+
+        path = review_sidecar_path(materializer.target.state_root, attempt_id, "final")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["checked_items"] == ["read the diff against the spec"]
+        assert payload["verified_items"] == ["read the diff against the spec"]
+        assert payload["mutation_receipt"] == {"all_red": True, "targets": [{"path": "a.py"}]}
+        # 阴性侧（gate 只核验回执的取回通道）：load 拿到的就是封边那份。
+        assert load_mutation_receipt(materializer.target.state_root, attempt_id) == {
+            "all_red": True,
+            "targets": [{"path": "a.py"}],
+        }
+
+    def test_the_continuous_seal_persists_its_checklist(self, repo: Path, monkeypatch: Any) -> None:
+        from conftest import DEVELOPMENT_ID
+        from fleet_graph.dd.dispatch import derive_attempt_id
+        from fleet_graph.dd.vendor import plugin_adapter
+        from fleet_graph.graphs.dd_materializer import review_sidecar_path
+        from fleet_graph.graphs.dd_pipeline import StageOutcome
+
+        monkeypatch.setattr(
+            plugin_adapter, "invoke_review_materializer", lambda *a, **k: _sealed_review_result()
+        )
+        materializer = _review_materializer(repo)
+        attempt_id = derive_attempt_id(DEVELOPMENT_ID, 1, 1)
+        _seal_receipt_bytes(repo, attempt_id, "implement-receipt.json")
+        dispatch = _review_dispatch(repo, "continuous_review")
+        outcome = StageOutcome(
+            event="APPROVE",
+            receipt={"review_result": {"verdict": "APPROVE", "checked_items": ["walked the spec"]}},
+        )
+        materializer.materialize(
+            materializer.lifecycle.stages["continuous_review"], dispatch, outcome
+        )
+        path = review_sidecar_path(materializer.target.state_root, attempt_id, "continuous")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["checked_items"] == ["walked the spec"]
+        assert payload["mutation_receipt"] is None
+
+    def test_a_load_with_no_sidecar_is_none_not_a_guess(self, repo: Path) -> None:
+        from fleet_graph.graphs.dd_materializer import load_mutation_receipt
+
+        assert load_mutation_receipt(str(repo / ".state"), "att-none") is None
+
+
+class TestS12RunStateKeepsTheMutationReceipt:
+    def test_the_sealers_receipt_replacement_does_not_discard_it(self) -> None:
+        """rf blocker 1 后半：sealer 回执替换 outcome.receipt 时，
+        mutation_receipt 不能从 run state 里蒸发——final_review 的下一站
+        （acceptance）从 parent_receipt 里必须还能读到它。"""
+        from dataclasses import replace as dc_replace
+
+        from fleet_graph.graphs.dd_pipeline import Sealed
+        from test_dd_pipeline import ContractActor, Sealer, make_deps, run
+
+        class MutationCarrier(ContractActor):
+            def __init__(self, verdicts: dict[str, list[str]] | None = None) -> None:
+                super().__init__(verdicts)
+                self.dispatches: list[dict[str, Any]] = []
+
+            def act(self, stage: Any, dispatch: Any) -> Any:
+                self.dispatches.append(dict(dispatch))
+                outcome = super().act(stage, dispatch)
+                if stage.id != "final_review":
+                    return outcome
+                receipt = dict(outcome.receipt or {})
+                receipt["mutation_receipt"] = {
+                    "all_red": True,
+                    "executor": "final_review",
+                    "executed_in": "one_shot_copy",
+                    "targets": [],
+                }
+                return dc_replace(outcome, receipt=receipt)
+
+        class MutationStripper(Sealer):
+            """The real plugin never sees the sibling key: it seals without it."""
+
+            def materialize(self, stage: Any, dispatch: Any, outcome: Any) -> Any:
+                sealed = super().materialize(stage, dispatch, outcome)
+                stripped = {
+                    key: value
+                    for key, value in (sealed.receipt or {}).items()
+                    if key != "mutation_receipt"
+                }
+                return Sealed(commit=sealed.commit, receipt=stripped, produced=sealed.produced)
+
+        actor = MutationCarrier({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run(make_deps(actor=actor, materializer=MutationStripper()))
+        assert state["terminal"] == "complete"
+        acceptance_dispatch = next(
+            dispatch for dispatch in actor.dispatches if dispatch["stage"] == "acceptance"
+        )
+        carried = acceptance_dispatch["parent_receipt"]["mutation_receipt"]
+        assert carried["all_red"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -108,6 +108,12 @@ MUTATION_RECEIPT_INVALID = "MUTATION_RECEIPT_INVALID"
 #: Refusal code when a receipt target survived green: no test coverage.
 MUTATION_TARGET_NOT_RED = "MUTATION_TARGET_NOT_RED"
 
+#: Stage-failure code when the mutation gate itself cannot execute (a diff
+#: that will not resolve, a one-shot copy that will not open). The gate never
+#: answers "pass" on a broken experiment: the stage fails and the bounded
+#: retry machinery owns what happens next.
+MUTATION_EXECUTION_FAILED = "MUTATION_EXECUTION_FAILED"
+
 Runner = Callable[[Path, list[str]], int]
 
 
@@ -315,6 +321,15 @@ def execute_final_review_mutations(
         "subject workspace untouched (copy removed after the experiment)",
     ]
     verified = [target.location for target in targets]
+    if not targets:
+        # An empty enumeration is a checked fact, not a skipped check: the
+        # diff added no production-side call site, so there was nothing to
+        # shoot. The checklist still says so -- S12.5 refuses an empty
+        # checklist, and "nothing new to mutate" is exactly what was checked.
+        verified = [
+            "mechanical enumeration over base..head product diff found no new "
+            "production-side call sites: nothing to mutate"
+        ]
     return {
         "mutation_receipt_version": MUTATION_RECEIPT_VERSION,
         "executor": "final_review",
@@ -456,6 +471,7 @@ def static_call_reachable(path: Path, entry: str, target: str) -> bool:
 __all__ = [
     "CHECKED_ITEMS_FIELD",
     "EXCLUDED_DIFF_PREFIXES",
+    "MUTATION_EXECUTION_FAILED",
     "MUTATION_RECEIPT_INVALID",
     "MUTATION_RECEIPT_VERSION",
     "MUTATION_TARGET_NOT_RED",

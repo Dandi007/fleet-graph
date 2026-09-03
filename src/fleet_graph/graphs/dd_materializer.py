@@ -45,12 +45,17 @@ from fleet_graph.dd.dispatch import (
     read_committed_refs,
 )
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
+from fleet_graph.dd.mutation import (
+    CHECKED_ITEMS_FIELD,
+    VERIFIED_ITEMS_FIELD,
+)
 from fleet_graph.dd.vendor import plugin_adapter
 from fleet_graph.graphs.dd_actors import (
     implement_stage,
     review_stages,
 )
 from fleet_graph.graphs.dd_pipeline import Dispatch, Sealed, StageOutcome, StageRefused
+from fleet_graph.state.run_artifacts import write_json_durable
 
 # Upstream's identity for the commits the sealer writes. Deliberately not a
 # routable address, and deliberately not the operator's: these commits are
@@ -66,6 +71,19 @@ AUTHOR_EMAIL = "dev-dispatch@example.invalid"
 # Where the plugin's sealer writes the Implement receipt, relative to the
 # attempt's receipts directory under the state root.
 IMPLEMENT_RECEIPT_FILE = "implement-receipt.json"
+
+# The engine-owned sidecar the review materializer writes beside the sealed
+# receipt, same directory. The plugin's review-result schema is pinned
+# externally with ``additionalProperties: false``, so the reviewer's mandatory
+# checklist (S12.5) and the final_review mutation receipt (S12.3) physically
+# cannot travel inside the sealed review.json -- they travel here instead,
+# written by the engine the moment the stage seals, so the durable record of
+# what was checked (and what fell red) survives past the process. The spec's
+# own words: "落 review.json 或其旁挂工件" -- this is the sidecar artifact.
+REVIEW_SIDECAR_FILE = {
+    "continuous": "continuous-review-sidecar.json",
+    "final": "final-review-sidecar.json",
+}
 
 # Whose sealed receipt each stage's dispatch must name as its parent. The
 # digest is over the file's bytes, not over an equivalent object: the sealer
@@ -156,9 +174,87 @@ def receipt_digest(state_root: str, attempt_id: str, filename: str, *, label: st
 
 
 def review_actor_result(declared: dict[str, Any]) -> dict[str, Any]:
-    """The reviewer's declared result, narrowed to what the plugin admits."""
+    """The reviewer's declared result, narrowed to what the plugin admits.
+
+    The narrowing exists because the plugin enforces it (a result with an
+    unadmitted key is a ``SCHEMA_VIOLATION`` at the seal, not a repairable
+    nit) -- which is also why the checklist the narrowing drops is persisted
+    engine-side by :func:`write_review_sidecar` instead of forwarded.
+    """
     admitted = review_result_fields()
     return {key: value for key, value in declared.items() if key in admitted}
+
+
+def review_checklist(declared: dict[str, Any]) -> dict[str, list[str]]:
+    """The reviewer's mandatory checklist, normalized to two string lists.
+
+    ``checked_items`` is the schema-level name and ``verified_items`` its
+    alias; whichever the reviewer answered with lands under both keys of the
+    sidecar, so a reader never has to know which spelling a phase used.
+    """
+    items = declared.get(CHECKED_ITEMS_FIELD)
+    alias = declared.get(VERIFIED_ITEMS_FIELD)
+    effective = items if isinstance(items, list) and items else alias
+    if not isinstance(effective, list):
+        effective = []
+    strings = [str(item) for item in effective if isinstance(item, str) and item.strip()]
+    return {CHECKED_ITEMS_FIELD: list(strings), VERIFIED_ITEMS_FIELD: list(strings)}
+
+
+def review_sidecar_path(state_root: str | Path, attempt_id: str, review_phase: str) -> Path:
+    """Where a review stage's sidecar artifact lives for this attempt."""
+    name = REVIEW_SIDECAR_FILE.get(review_phase)
+    if name is None:
+        raise MaterializationFailed(
+            "INVALID_HANDOFF_SCHEMA", f"no review sidecar for phase {review_phase!r}"
+        )
+    return Path(state_root) / "receipts" / attempt_id / name
+
+
+def write_review_sidecar(
+    state_root: str | Path,
+    attempt_id: str,
+    review_phase: str,
+    checklist: dict[str, list[str]],
+    mutation_receipt: dict[str, Any] | None = None,
+) -> Path:
+    """Persist what the sealed review checked -- the engine's own record.
+
+    The plugin's sealed review.json cannot carry the checklist (pinned schema)
+    and never hears about the mutation receipt, so the materializer writes
+    both here, durably, the moment the stage seals. Fail-closed: a sidecar
+    that cannot be written fails the stage rather than leaving a review whose
+    checked-record survives only in process memory.
+    """
+    payload: dict[str, Any] = {
+        "attempt_id": attempt_id,
+        "review_phase": review_phase,
+        CHECKED_ITEMS_FIELD: list(checklist.get(CHECKED_ITEMS_FIELD) or []),
+        VERIFIED_ITEMS_FIELD: list(checklist.get(VERIFIED_ITEMS_FIELD) or []),
+        "mutation_receipt": mutation_receipt,
+    }
+    return write_json_durable(review_sidecar_path(state_root, attempt_id, review_phase), payload)
+
+
+def load_mutation_receipt(
+    state_root: str | Path, attempt_id: str, *, review_phase: str = "final"
+) -> dict[str, Any] | None:
+    """Read the final_review mutation receipt back from its sidecar artifact.
+
+    This is the production channel the verifying side reads: the gate loads
+    the receipt the engine's final_review stage produced and verifies it
+    against its own mechanical enumeration -- it never re-runs the gun.
+    ``None`` means no receipt was persisted, which duty 5 refuses.
+    """
+    path = review_sidecar_path(state_root, attempt_id, review_phase)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    receipt = payload.get("mutation_receipt")
+    return dict(receipt) if isinstance(receipt, dict) else None
 
 
 def implement_actor_result(receipt: dict[str, Any]) -> dict[str, Any]:
@@ -390,6 +486,28 @@ class PluginMaterializer:
         )
         result = invoke(self.binding, request, verify_worktree_head=self.verify_worktree_head)
         sealed = self._read(stage, result)
+        if stage.id in self.review_stages:
+            # The sealed review.json cannot carry the reviewer's checklist or
+            # the mutation receipt (the pinned plugin schema admits neither),
+            # so the engine persists them itself, beside the sealed receipt,
+            # before the stage is allowed to report success. This is the
+            # durable record S12.5 demands and the receipt S12.3's gate
+            # verifies -- not whatever stayed in process memory.
+            declared = dict(outcome.receipt or {}).get("review_result") or {}
+            checklist = review_checklist(declared if isinstance(declared, dict) else {})
+            mutation_receipt = dict(outcome.receipt or {}).get("mutation_receipt")
+            write_review_sidecar(
+                self.target.state_root,
+                str(dispatch.get("pinned_attempt_id") or "")
+                or derive_attempt_id(
+                    self.builder.chain.development_id,
+                    int(dispatch.get("generation", 1)),
+                    int(dispatch.get("attempt", 1)),
+                ),
+                "continuous" if stage.id == self.review_stages[0] else "final",
+                checklist,
+                mutation_receipt if isinstance(mutation_receipt, dict) else None,
+            )
         # The sealer wrote the stage's artifacts, so it -- not the agent --
         # is what output_verify should be believing.
         return Sealed(
@@ -464,13 +582,18 @@ class StageMaterializers:
 __all__ = [
     "AUTHOR_EMAIL",
     "AUTHOR_NAME",
+    "REVIEW_SIDECAR_FILE",
     "MaterializationFailed",
     "MaterializationTarget",
     "PluginMaterializer",
     "StageMaterializers",
     "UnservedStage",
     "implement_actor_result",
+    "load_mutation_receipt",
     "receipt_digest",
     "review_actor_result",
+    "review_checklist",
     "review_result_fields",
+    "review_sidecar_path",
+    "write_review_sidecar",
 ]

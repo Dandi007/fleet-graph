@@ -301,6 +301,9 @@ class TestTheDefaultsMakeItRunnable:
     ) -> None:
         config = make_config(repo, tmp_path)
         config.run_config = {"acceptance_commands": [["true"]]}
+        # This test's subject is script-stage defaults, not the mutation gate;
+        # its config names no real base commit the gate could enumerate.
+        config.mutation_inputs = False
         result = run_pipeline(
             config,
             scripts={"human_gate": ScriptStub()},
@@ -392,6 +395,9 @@ class TestWaitingOnAHumanAndComingBack:
         # A resume has to find the thread, so the checkpoint outlives the process.
         config.checkpoint_path = str(tmp_path / "checkpoint.sqlite")
         config.run_config = {"acceptance_commands": [["true"]]}
+        # This class's subject is the human gate, not the mutation gate; its
+        # config names no real base commit the gate could enumerate.
+        config.mutation_inputs = False
         return config
 
     def _run(self, config: DevelopmentConfig, board: FakeBoard, **kwargs: Any) -> dict[str, Any]:
@@ -628,6 +634,10 @@ class TestARestartedGenerationKeepsItsCostFacts:
             generation=generation,
             cost_obs_dir=str(tmp_path / "textfile"),
             run_config={"acceptance_commands": [["true"]]},
+            # This class's subject is cost-fact rehydration across a restarted
+            # generation, not the mutation gate; its config names no real base
+            # commit the gate could enumerate.
+            mutation_inputs=False,
         )
 
     def test_generation_two_rehydrates_the_previous_scrape_file(
