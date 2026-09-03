@@ -1,0 +1,18 @@
+{
+ "development_id": "dev-fg-7f62769d8997",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "bash",
+   "-lc",
+   "uv sync --frozen && uv run pytest -q tests/test_a2_escalation_targets.py"
+  ],
+  [
+   "bash",
+   "-lc",
+   "make verify"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
