@@ -36,6 +36,8 @@ from fleet_graph.dd.mutation import (
     MUTATION_TARGET_NOT_RED,
     enumerate_mutation_targets,
     execute_final_review_mutations,
+    is_product_path,
+    is_source_path,
     static_call_reachable,
     validate_review_receipt,
     verify_mutation_receipt,
@@ -901,6 +903,50 @@ class TestS12MechanicalEnumeration:
         targets = enumerate_mutation_targets(dev_repo.path, dev_repo.base, dev_repo.head)
         assert all(target.path == "app.py" for target in targets)
 
+    def test_non_source_product_lines_are_never_targets(self, tmp_path: Path) -> None:
+        """rf blocker 2（mutation.py:167）：枚举只认源码语言文件。
+
+        无语言过滤时，Markdown 散文、PromQL（``sum(rate(...))``）、shell 函数
+        定义里任何匹配 ``name(`` 的行都成了靶子——删了永远不会红，all_red 恒
+        False，碰了文档/配置的普通单据被闸自动拒。over-enumeration 本身是
+        spec §测试与验收 S12① 点名的拒绝条件。非源码产品文件仍是 duty-2
+        意义上的产品文件（diff 边界照管），只是永远不当靶子。
+        """
+        assert is_product_path("deploy/alerts.yml") is True
+        assert is_product_path("scripts/ops.sh") is True
+        assert is_source_path("app.py") is True
+        assert is_source_path("deploy/alerts.yml") is False
+        assert is_source_path("scripts/ops.sh") is False
+        assert is_source_path("README.md") is False
+
+        repo = tmp_path / "mixed"
+        repo.mkdir()
+        _git(repo, "init", "-q", "-b", "main")
+        (repo / "README.md").write_text("# docs\n", encoding="utf-8")
+        (repo / "app.py").write_text("def handler(value):\n    return value\n", encoding="utf-8")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", "base")
+        base = _git(repo, "rev-parse", "HEAD")
+        (repo / "README.md").write_text(
+            "# docs\n\nsee handler(value) wired below, go call it now\n", encoding="utf-8"
+        )
+        (repo / "deploy").mkdir()
+        (repo / "deploy" / "alerts.yml").write_text(
+            "- record: drop\n  expr: sum(rate(errors[5m]))\n", encoding="utf-8"
+        )
+        (repo / "scripts").mkdir()
+        (repo / "scripts" / "ops.sh").write_text("deploy() {\n  echo go\n}\n", encoding="utf-8")
+        (repo / "app.py").write_text(
+            "def handler(value):\n    return value\n\n\nresult = handler(value)\n",
+            encoding="utf-8",
+        )
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", "head: docs, promql, shell, and the wired call")
+        head = _git(repo, "rev-parse", "HEAD")
+
+        targets = enumerate_mutation_targets(repo, base, head)
+        assert [target.key for target in targets] == [("app.py", 5, "handler")]
+
 
 class TestS12OneShotCopyExecution:
     def test_each_target_is_deleted_and_must_turn_the_acceptance_red(
@@ -955,6 +1001,81 @@ class TestS12OneShotCopyExecution:
         )
         listed = _git(dev_repo.path, "worktree", "list", "--porcelain")
         assert listed.count("worktree") == 1
+
+    def test_every_frozen_command_observes_the_same_single_deletion(
+        self, dev_repo: DevRepo
+    ) -> None:
+        """rf blocker 1（mutation.py:328）：两条冻结验收命令各自必须看到
+        「恰好删了靶行」的同一份副本。
+
+        旧形态把命令叠加执行：第 2 条命令在已变异文件上再删一次
+        ``target.line``——删掉的是别的一行（或把行数删穿），靶子的红/绿
+        事实因此失真；本仓 dd-acceptance 恰好两条命令，张张中招，无覆盖的
+        调用点可能被记红过闸。修后每条命令前都从原始 head 内容重放同一
+        单行删除。
+        """
+        head_text = (dev_repo.path / "app.py").read_text(encoding="utf-8")
+        singly_mutated = head_text.replace("result = handler(value)\n", "", 1)
+
+        def observing_runner(cwd: Path, argv: list[str]) -> int:
+            """Green exactly when the copy shows the single deletion, no more."""
+            return 0 if (cwd / "app.py").read_text(encoding="utf-8") == singly_mutated else 1
+
+        receipt = execute_final_review_mutations(
+            dev_repo.path,
+            dev_repo.base,
+            dev_repo.head,
+            [["first", "frozen", "command"], ["second", "frozen", "command"]],
+            runner=observing_runner,
+            worktree_parent=dev_repo.path.parent,
+        )
+        assert receipt["targets"][0]["acceptance_exit_codes"] == [0, 0]
+        assert receipt["targets"][0]["acceptance_exit_code"] == 0
+        # The experiment ended with the subject byte-identical and copy-free.
+        assert (dev_repo.path / "app.py").read_text(encoding="utf-8") == head_text
+        listed = _git(dev_repo.path, "worktree", "list", "--porcelain")
+        assert listed.count("worktree") == 1
+
+    def test_a_failed_one_shot_cleanup_is_loud_not_silent(
+        self, dev_repo: DevRepo, monkeypatch: Any
+    ) -> None:
+        """rf minor（mutation.py:275）：清理失败必须响，绝不留哑巴账。
+
+        ``git worktree remove --force`` 的失败若被吞掉，一次性副本仍注册在
+        subject 仓的共享 git dir 里，而回执还写着 ``subject_workspace_writes:
+        0``。清理失败必须走失败闭环（fail-closed）。
+        """
+        import fleet_graph.dd.mutation as mutation_module
+
+        real_run_git = mutation_module.run_git
+
+        def refusing_remove(repo: Any, *args: str) -> Any:
+            if args[:2] == ("worktree", "remove"):
+                return subprocess.CompletedProcess(
+                    args=["git", *args], returncode=1, stdout="", stderr="remove refused"
+                )
+            return real_run_git(repo, *args)
+
+        monkeypatch.setattr(mutation_module, "run_git", refusing_remove)
+        with pytest.raises(RuntimeError, match="cleanup"):
+            _mutation_receipt(dev_repo)
+        # The failure was real: the copy is indeed still registered -- and it
+        # was the raise, not a suppression, that reported it.
+        listed = _git(dev_repo.path, "worktree", "list", "--porcelain")
+        assert listed.count("worktree") == 2
+
+    def test_a_stray_leftover_in_the_copy_parent_fails_the_cleanup_loudly(
+        self, dev_repo: DevRepo
+    ) -> None:
+        """rf minor 后半：rmdir 的 OSError 不再被吞——清理有任何残留即响。"""
+        import fleet_graph.dd.mutation as mutation_module
+
+        tmp, copy = mutation_module._one_shot_copy(
+            dev_repo.path, dev_repo.head, dev_repo.path.parent
+        )
+        (tmp / "stray.txt").write_text("x", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="cleanup"):
+            mutation_module._drop_worktree(dev_repo.path, tmp, copy)
 
 
 class TestS12GateVerifiesReceiptOnly:

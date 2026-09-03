@@ -7,13 +7,19 @@ final_review **stage** therefore executes the mutations itself, mechanically:
 
 1. **Mechanical enumeration** (:func:`enumerate_mutation_targets`): the targets
    are every *new production-side call site* in ``base..head``'s product diff --
-   not a hand-picked subset. Test files, ``.dev-dispatch/`` and ``.dd-evidence/``
-   are never targets; everything else that the diff adds a call on is.
+   not a hand-picked subset. Test files, ``.dev-dispatch/``, ``.dd-evidence/``
+   and non-source files (prose, config, shell) are never targets -- the
+   call-site extractor is Python-lexical, so a ``name(`` in Markdown prose or
+   PromQL is not a call, and over-enumerating it would auto-reject ordinary
+   tickets touching docs or config.
 2. **One-shot copy execution** (:func:`execute_final_review_mutations`): each
    target is deleted in turn inside a throwaway ``git worktree`` copy and the
-   frozen acceptance commands run there. The subject workspace is never written:
-   an experiment that writes the subject voids the verdict. The copy is removed
-   afterwards.
+   frozen acceptance commands run there -- every command observes the same
+   single-line deletion of the pristine head file; commands are never applied
+   cumulatively, which would delete a different line and unsound the 2nd+
+   command's red/green fact. The subject workspace is never written: an
+   experiment that writes the subject voids the verdict. The copy is always
+   removed afterwards, and a cleanup that fails is loud, never silent.
 3. **Receipt** (:func:`execute_final_review_mutations`): the artifact records
    every target's location (path/line/call) with its red/green result, plus the
    mandatory ``checked_items`` / ``verified_items`` checklists (S12.5 -- a
@@ -42,7 +48,6 @@ that tells the reviewer the contract before it answers.
 from __future__ import annotations
 
 import ast
-import contextlib
 import re
 import subprocess
 import tempfile
@@ -60,6 +65,16 @@ EXCLUDED_DIFF_PREFIXES = (".dev-dispatch/", ".dd-evidence/")
 #: A test path is never a production-side call site. Matched against the
 #: repo-relative posix path.
 TEST_PATH_PATTERN = re.compile(r"(^|/)(tests?/|conftest\.py)|(^|/)test_[^/]*\.py$|_test\.py$")
+
+#: Only source-language files can carry a call site the extractor sees. The
+#: extractor below is Python-lexical (``def``/``class``/``import``, ``#``
+#: comments), so a ``name(`` in Markdown prose, in PromQL
+#: (``sum(rate(...))``), or in a shell function definition is not a call --
+#: and deleting it can never turn the frozen acceptance red. Over-enumeration
+#: is itself a refusal condition (spec §测试与验收 S12 ①), so non-source
+#: files are filtered out before the regex ever runs; they remain product
+#: files for the diff-boundary duty, just never mutation targets.
+SOURCE_FILE_SUFFIXES = frozenset({".py"})
 
 #: A call site on an added line: ``name(`` with a Python identifier. Keywords
 #: and syntactic keywords that look like calls are excluded.
@@ -172,6 +187,16 @@ def is_product_path(path: str) -> bool:
     return not TEST_PATH_PATTERN.search(posix)
 
 
+def is_source_path(path: str) -> bool:
+    """Whether ``path`` is source-language the call-site extractor can read.
+
+    A ``name(`` match in prose or config is a category error, not a call
+    site: the extractor is Python-lexical, so only source files in
+    :data:`SOURCE_FILE_SUFFIXES` can carry a target it can extract soundly.
+    """
+    return Path(path.replace("\\", "/")).suffix in SOURCE_FILE_SUFFIXES
+
+
 def _strip_comment(line: str) -> str:
     """Drop a trailing ``#`` comment, ignoring ``#`` inside string literals."""
     quote = ""
@@ -223,7 +248,7 @@ def enumerate_mutation_targets(repo: Path, base: str, head: str) -> list[Mutatio
     """Every new production-side call site in ``base..head``'s product diff.
 
     Mechanical, and deliberately boring: walk the unified diff, keep added
-    lines of product files, extract their call sites with new-file line
+    lines of product source files, extract their call sites with new-file line
     numbers. No taste, no selection -- the spec's whole point is that nobody
     picks the targets. Deterministically ordered by (path, line, call).
     """
@@ -236,7 +261,9 @@ def enumerate_mutation_targets(repo: Path, base: str, head: str) -> list[Mutatio
     for raw in diff.stdout.splitlines():
         if raw.startswith("+++ b/"):
             candidate = raw[len("+++ b/") :]
-            current_path = candidate if is_product_path(candidate) else None
+            current_path = (
+                candidate if is_product_path(candidate) and is_source_path(candidate) else None
+            )
             continue
         if raw.startswith(("--- ", "diff ", "index ", "new file mode", "deleted file mode")):
             continue
@@ -273,20 +300,28 @@ def _one_shot_copy(repo: Path, head: str, parent: Path | None) -> tuple[Path, Pa
 
 
 def _drop_worktree(repo: Path, tmp: Path, copy: Path) -> None:
-    run_git(repo, "worktree", "remove", "--force", str(copy))
-    with contextlib.suppress(OSError):
+    """Remove the one-shot copy -- loudly, on any cleanup failure.
+
+    A silently failed cleanup would leave the copy registered in the subject
+    repo's shared git dir while the receipt still reports
+    ``subject_workspace_writes: 0`` -- a dumb ledger. Every cleanup failure
+    therefore raises, which fails the stage closed instead.
+    """
+    result = run_git(repo, "worktree", "remove", "--force", str(copy))
+    if result.returncode != 0:
+        raise RuntimeError(f"one-shot copy cleanup failed: {result.stderr.strip()}")
+    try:
         tmp.rmdir()
+    except OSError as error:
+        raise RuntimeError(f"one-shot copy cleanup failed: {error}") from error
 
 
-def _target_red(copy: Path, target: MutationTarget, argv: list[str], runner: Runner) -> int:
-    """Delete the target's line in the copy, run one acceptance command."""
-    source = copy / target.path
-    lines = source.read_text(encoding="utf-8").splitlines(keepends=True)
+def _mutated_text(original: str, target: MutationTarget) -> str:
+    """The pristine head file with exactly the target's line deleted."""
+    lines = original.splitlines(keepends=True)
     if not 1 <= target.line <= len(lines):
         raise RuntimeError(f"mutation target out of range: {target.location}")
-    mutated = lines[: target.line - 1] + lines[target.line :]
-    source.write_text("".join(mutated), encoding="utf-8")
-    return runner(copy, argv)
+    return "".join(lines[: target.line - 1] + lines[target.line :])
 
 
 def execute_final_review_mutations(
@@ -303,12 +338,15 @@ def execute_final_review_mutations(
 
     Runs in a one-shot worktree copy at ``head`` (the subject workspace is only
     read, never written): every mechanically enumerated target is deleted in
-    turn and the frozen acceptance commands run there. The receipt records each
-    target's location and red/green result, plus the mandatory checklists. The
-    copy is always removed, including on failure. Without a caller-supplied
-    runner the default is the bounded production runner -- an acceptance that
-    exceeds its bound raises, which is the same fail-closed path as any other
-    execution failure, never a wedged stage.
+    turn and the frozen acceptance commands run there -- each command against
+    the same single-line deletion of the pristine head file, never against a
+    re-mutated copy. The receipt records each target's location and red/green
+    result, plus the mandatory checklists. The copy is always removed,
+    including on failure, and a failed cleanup raises instead of leaving the
+    copy registered while the receipt claims a pristine subject. Without a
+    caller-supplied runner the default is the bounded production runner -- an
+    acceptance that exceeds its bound raises, which is the same fail-closed
+    path as any other execution failure, never a wedged stage.
     """
     if runner is None:
 
@@ -325,8 +363,17 @@ def execute_final_review_mutations(
             source = copy / target.path
             if target.path not in originals:
                 originals[target.path] = source.read_text(encoding="utf-8")
-            codes = [_target_red(copy, target, argv, run) for argv in acceptance_commands]
-            source.write_text(originals[target.path], encoding="utf-8")
+            original = originals[target.path]
+            mutated = _mutated_text(original, target)
+            codes: list[int] = []
+            for argv in acceptance_commands:
+                # Every command observes the same single deletion replayed
+                # onto the pristine head file. Never re-mutating the already
+                # mutated file: a cumulative 2nd command would delete a
+                # different line and unsound the target's red/green fact.
+                source.write_text(mutated, encoding="utf-8")
+                codes.append(run(copy, argv))
+            source.write_text(original, encoding="utf-8")
             red = any(code != 0 for code in codes)
             results.append(
                 {
@@ -345,6 +392,8 @@ def execute_final_review_mutations(
         "targets mechanically enumerated from base..head product diff",
         "each target deleted inside a one-shot worktree copy",
         "frozen acceptance commands run against every mutated copy",
+        "every acceptance command observed the same single-line deletion "
+        "of the pristine head file (never a cumulative re-mutation)",
         "subject workspace untouched (copy removed after the experiment)",
     ]
     verified = [target.location for target in targets]
@@ -503,12 +552,14 @@ __all__ = [
     "MUTATION_RECEIPT_INVALID",
     "MUTATION_RECEIPT_VERSION",
     "MUTATION_TARGET_NOT_RED",
+    "SOURCE_FILE_SUFFIXES",
     "TEST_PATH_PATTERN",
     "VERIFIED_ITEMS_FIELD",
     "MutationTarget",
     "enumerate_mutation_targets",
     "execute_final_review_mutations",
     "is_product_path",
+    "is_source_path",
     "static_call_reachable",
     "validate_review_receipt",
     "verify_mutation_receipt",
