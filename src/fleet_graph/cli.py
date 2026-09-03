@@ -176,6 +176,10 @@ def _line_run(args: argparse.Namespace) -> int:
         # valid revoke overturned. An unreadable envelope is an operator error
         # worth stopping on, not something to silently drop.
         revival=revival,
+        # M3: a dd_awaiting_gate wake names the development the line is now
+        # its own gate for; run_line mechanically produces the six evidence
+        # obligations and self-delivers the verdict before the run proceeds.
+        dd_awaiting_gate_development_id=args.dd_awaiting_gate,
     )
     result = run_line(config, run_id=args.run_id)
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
@@ -1445,6 +1449,15 @@ def build_parser() -> argparse.ArgumentParser:
         "threaded through from the scheduler's launcher for a line whose "
         "`done` terminal a valid revoke overturned. Absent means a normal "
         "launch with no revival fact",
+    )
+    run.add_argument(
+        "--dd-awaiting-gate",
+        default="",
+        help="M3: the development id a dd_awaiting_gate wake names (threaded "
+        "through from the scheduler's launcher). Non-empty makes the line "
+        "self-deliver that single's gate decision -- six mechanically "
+        "produced evidence obligations, then decision_deliver -- before the "
+        "run proceeds. Empty (default) is an ordinary run",
     )
     run.set_defaults(func=_line_run)
 

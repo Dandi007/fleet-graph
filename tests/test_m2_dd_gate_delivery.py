@@ -82,6 +82,11 @@ class FakeDdPlane:
     ) -> dict[str, Any]:
         assert resume is True
         self.resumed.append((development_id, action_key or ""))
+        # A resume that actually consumes the verdict moves the single off the
+        # gate: the read-back that M3's "consumed, not unit-started" check does
+        # must observe the single as no longer ``awaiting_gate``.
+        if self.state == "awaiting_gate":
+            self.state = "running"
         return {
             "state": self.state,
             "development_id": development_id,

@@ -352,19 +352,40 @@ fi
 
 # ---------------- 12 foreign-delivery-refused ----------------
 if needs_check 12; then
-    res="$(mcp_json "$DECISION_MCP" 'tools/call' "{\"name\":\"decision_deliver\",\"arguments\":{\"line\":\"$SELFTEST_LINE\",\"decision\":\"REJECT\",\"reason\":\"verify-lim check12 foreign-delivery-refused selftest probe\"}}")"
-    if [ -z "$res" ]; then
-        emit 12 foreign-delivery-refused FAIL "decision :$DECISION_MCP 不可达（空响应/连接失败），无法投递合成探针"
+    # S11 修对：改用一张真实存在、且 dispatched_by 非空（即非本探针方派单）的
+    # awaiting_gate 单，走形态 A（target_kind=dd + target_id）投 REJECT，断言
+    # NOT_DISPATCHING_LINE。旧探针用不存在的合成 id 走形态 B，先撞
+    # DEVELOPMENT_NOT_FOUND 就返回，永远到不了身份校验分支——既没证明校验在，
+    # 也没证明校验不在。
+    probe_id=""
+    for d in "$DD_ROOT"/*/; do
+        sf="$d/status.json"
+        [ -r "$sf" ] || continue
+        st="$(jq -r '.state // empty' "$sf" 2>/dev/null)"
+        db="$(jq -r '.dispatched_by // empty' "$sf" 2>/dev/null)"
+        did="$(jq -r '.development_id // empty' "$sf" 2>/dev/null)"
+        if [ "$st" = "awaiting_gate" ] && [ -n "$db" ] && [ -n "$did" ]; then
+            probe_id="$did"
+            break
+        fi
+    done
+    if [ -z "$probe_id" ]; then
+        emit 12 foreign-delivery-refused FAIL "无真实 awaiting_gate 且 dispatched_by 非空的 dd 单可作身份校验探针（DD_ROOT=$DD_ROOT），无法证明形态 A 的 NOT_DISPATCHING_LINE"
     else
-        text="$(printf '%s' "$res" | jq -r '.result.structuredContent // .result.content[0].text // empty' 2>/dev/null)"
-        code="$(printf '%s' "$text" | jq -r '.code // empty' 2>/dev/null)"
-        status="$(printf '%s' "$text" | jq -r '.status // empty' 2>/dev/null)"
-        if [ "$status" = "accepted" ] || printf '%s' "$text" | grep -qi 'accepted'; then
-            emit 12 foreign-delivery-refused FAIL "对外线合成 id ${SELFTEST_LINE} 投递 REJECT 被接受（ACCEPTED），严重红：${text}"
-        elif [ "$code" = "NOT_DISPATCHING_LINE" ]; then
-            emit 12 foreign-delivery-refused PASS "投递被拒且码含 NOT_DISPATCHING_LINE：${text}"
+        res="$(mcp_json "$DECISION_MCP" 'tools/call' "{\"name\":\"decision_deliver\",\"arguments\":{\"decision\":\"REJECT\",\"reason\":\"verify-lim check12 foreign-delivery-refused selftest probe\",\"target_kind\":\"dd\",\"target_id\":\"$probe_id\",\"principal\":\"\"}}")"
+        if [ -z "$res" ]; then
+            emit 12 foreign-delivery-refused FAIL "decision :$DECISION_MCP 不可达（空响应/连接失败），无法投递探针"
         else
-            emit 12 foreign-delivery-refused FAIL "返回非 NOT_DISPATCHING_LINE 的结构化拒绝码（code=${code:-无}, status=${status:-无}），原文: ${text}（M2 前必红）"
+            text="$(printf '%s' "$res" | jq -r '.result.structuredContent // .result.content[0].text // empty' 2>/dev/null)"
+            code="$(printf '%s' "$text" | jq -r '.code // empty' 2>/dev/null)"
+            status="$(printf '%s' "$text" | jq -r '.status // empty' 2>/dev/null)"
+            if [ "$status" = "accepted" ] || printf '%s' "$text" | grep -qi 'accepted'; then
+                emit 12 foreign-delivery-refused FAIL "以非派单方身份对真实单 ${probe_id} 形态 A 投递 REJECT 被接受（ACCEPTED），严重红：${text}"
+            elif [ "$code" = "NOT_DISPATCHING_LINE" ]; then
+                emit 12 foreign-delivery-refused PASS "以非派单方身份形态 A 投递被拒且码含 NOT_DISPATCHING_LINE：${text}"
+            else
+                emit 12 foreign-delivery-refused FAIL "返回非 NOT_DISPATCHING_LINE 的结构化拒绝码（code=${code:-无}, status=${status:-无}），原文: ${text}"
+            fi
         fi
     fi
 fi
