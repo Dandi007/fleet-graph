@@ -243,8 +243,91 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         # back to a best-effort default over the work-folder MCP when the config
         # does not inject one.
         goal_revision=config.goal_revision or _build_goal_revision_reader(config),
+        # M3: the line self-gate port, wired so a line re-ignited by
+        # ``dd_awaiting_gate`` discharges the six obligations and delivers its
+        # own APPROVE/REJECT (design §8「DD 闸不经人」). Constructed lazily so a
+        # line that never self-gates (no dd anchor) pays nothing and mounting a
+        # constraint-laden control plane never fails an unrelated line start.
+        selfgate=_build_selfgate(config),
     )
     return build_goal_line_graph(deps), deps
+
+
+class _ProductionSelfGate:
+    """The production ``SelfGatePort`` a line uses to self-gate a dispatched dd.
+
+    Bound lazily so ``build_line`` never pays the dd control-plane / decision
+    surface import for a line that has no ``dd_awaiting_gate`` to answer.
+    Once built it is the one seam the spec §5/S10 delivery path runs through:
+    gather the six facts (:class:`~fleet_graph.dd.selfgate_facts.EngineSelfGateFacts`),
+    run the gate (``run_line_selfgate``), and deliver the verdict through M2
+    (``deliver_line_selfgate``) with the templated §4 rationale riding the call.
+    """
+
+    def __init__(self, config: LineConfig) -> None:
+        self._config = config
+        self._impl: Any = None
+
+    def _build(self) -> Any:
+        if self._impl is not None:
+            return self._impl
+        from fleet_graph.dd.control_plane import DdControlPlane
+        from fleet_graph.dd.selfgate_facts import EngineSelfGateFacts
+        from fleet_graph.dd.selfgate_flow import run_line_selfgate
+        from fleet_graph.decision_mcp import deliver_line_selfgate
+
+        config = self._config
+        dd = DdControlPlane()
+        facts = EngineSelfGateFacts(dd)
+        principal = config.folder_id
+
+        def run(development_id: str) -> dict[str, Any]:
+            try:
+                dispatched_by = str((dd.get(development_id) or {}).get("dispatched_by") or "")
+            except Exception:
+                dispatched_by = ""
+            # Run the gate once for its verdict + templated rationale (the §4
+            # payload the graph records into progress), then deliver through M2.
+            judgement = run_line_selfgate(
+                development_id=development_id,
+                principal=principal,
+                dispatched_by=dispatched_by,
+                facts=facts,
+            )
+            delivery = deliver_line_selfgate(
+                development_id=development_id,
+                principal=principal,
+                dispatched_by=dispatched_by,
+                facts=facts,
+                run_root=config.run_root.parent,
+                lines=[],
+                dd=dd,
+            )
+            return {
+                "verdict": judgement.verdict,
+                "rationale": judgement.rationale,
+                "delivery_status": delivery.status,
+                "delivery_code": delivery.code or "",
+                "delivery_message": delivery.message,
+            }
+
+        self._impl = run
+        return self._impl
+
+    def run(self, development_id: str) -> dict[str, Any]:
+        return self._build()(development_id)
+
+
+def _build_selfgate(config: LineConfig) -> Any | None:
+    """The production self-gate port, or ``None`` when the line is not a
+    fleet-graph line that can meaningfully self-gate.
+
+    A line always gets the port in production (the engine default): whether it
+    ever fires is decided by the graph's ``dd_selfgate`` node, which only runs
+    when the line's prior terminal carries a ``dd_development_id``. Tests that
+    build a line without a dd context therefore never invoke the port.
+    """
+    return _ProductionSelfGate(config)
 
 
 def _build_goal_revision_reader(config: LineConfig) -> Any:

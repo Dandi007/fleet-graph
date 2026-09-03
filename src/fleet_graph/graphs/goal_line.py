@@ -325,6 +325,11 @@ class LineState(TypedDict, total=False):
     # consuming it; never persisted anywhere durable.
     pending_prompt: str
     pending_sha: str
+    #: M3: the line self-gate's structured result (verdict + templated evidence
+    #: rationale), injected into the round-1 coordinator input as a mechanical
+    #: fact -- analogous to ``last_acceptance`` -- after the line self-gated a
+    #: dd it dispatched. Absent on every round the self-gate did not run.
+    selfgate: dict[str, Any]
     #: The goal.md ``content_revision`` this line actually *consumed* at its
     #: last coordinator round (G1). A mechanical hash, never prose. Captured by
     #: the coordinator turn from the injected reader and carried through the
@@ -362,6 +367,21 @@ class AcceptancePort(Protocol):
     """Runs the roster-declared acceptance commands, returns the facts dict."""
 
     def run(self) -> dict[str, Any]: ...
+
+
+class SelfGatePort(Protocol):
+    """M3: the line self-gate -- discharge the six obligations for one dd and
+    deliver the verdict through M2's ``decision_deliver``.
+
+    Wired into the goal-line graph as the mechanical counterpart to the
+    coordinator's judgement: when a line is woken by ``dd_awaiting_gate`` (its
+    prior terminal is ``blocked`` + ``waiting_on: "dd"`` with a development
+    anchor), this port runs the six obligations and delivers APPROVE/REJECT. It
+    returns a structured result (``verdict`` + ``rationale``) that the graph
+    records into the line's progress, so the evidence is never a bare word of
+    mouth. ``None`` keeps the line on its pre-M3 path unchanged."""
+
+    def run(self, development_id: str) -> dict[str, Any]: ...
 
 
 class ArtifactsPort(Protocol):
@@ -437,9 +457,30 @@ class LineDeps:
     #: then absent, and the scheduler fails open (never locks) on the missing
     #: baseline.
     goal_revision: Any = None
+    #: M3: the line self-gate port. None keeps the line on its pre-M3 path; a
+    #: wired port discharges the six obligations the moment the line resumes
+    #: from a ``waiting_on: "dd"`` terminal (``dd_awaiting_gate``) and records
+    #: the templated evidence into the line's progress.
+    selfgate: SelfGatePort | None = None
 
     def now(self) -> float | None:
         return self.clock() if self.clock is not None else None
+
+
+def _dd_wait_development(deps: LineDeps) -> str:
+    """The development a line must self-gate, or "" when there is none.
+
+    M3: a line is self-gating exactly when its prior terminal is
+    ``blocked`` + ``waiting_on: "dd"`` with a ``dd_development_id`` anchor --
+    the shape the line's own ``finalise`` wrote before the scheduler parked it,
+    and the shape the scheduler's ``dd_awaiting_gate`` wake re-ignites it with.
+    Any other prior terminal (or none) yields "" and the self-gate node is a
+    no-op, so the pre-M3 line path is untouched.
+    """
+    prior = deps.prior_terminal or {}
+    if prior.get("waiting_on") != "dd":
+        return ""
+    return str(prior.get("dd_development_id") or "").strip()
 
 
 def _coordinator_input(
@@ -474,6 +515,11 @@ def _coordinator_input(
         coord_input["last_turn_report"] = state["last_turn_report"]
     if state.get("last_acceptance"):
         coord_input["last_acceptance"] = state["last_acceptance"]
+    if state.get("selfgate"):
+        # M3: the self-gate result is a mechanical fact the coordinator weighs,
+        # never prose -- the line delivered its own dd verdict and this is what
+        # it decided, so the round's judgement starts from that fact.
+        coord_input["selfgate"] = state["selfgate"]
     if deps.resume_verification is not None:
         coord_input["resume_verification"] = deps.resume_verification
     if round_no == 1 and deps.prior_terminal is not None:
@@ -577,6 +623,46 @@ def _verdict_update(
 
 
 def build_goal_line_graph(deps: LineDeps) -> StateGraph:
+    def dd_selfgate(state: LineState) -> LineState:
+        """M3: discharge the six obligations for the dd this line is woken on.
+
+        Runs exactly once per re-ignition, before ``check_bounds``. When the
+        line's prior terminal is ``blocked`` + ``waiting_on: "dd"`` (the
+        ``dd_awaiting_gate`` wake fact) and a self-gate port is wired, this node
+        runs the gate through the port, records the templated evidence into the
+        line's progress (spec §4 -- never a bare verdict), and clears the stale
+        dd/terminal facts so the round falls through to the coordinator with the
+        self-gate result as a mechanical fact. With no port or no dd anchor it
+        is a strict no-op, keeping the pre-M3 line path byte-identical.
+        """
+        dd_id = _dd_wait_development(deps)
+        if deps.selfgate is None or not dd_id:
+            return {}
+        result = deps.selfgate.run(dd_id)
+        if not isinstance(result, dict):
+            result = {"verdict": str(result), "rationale": ""}
+        # §4: the six-evidence rationale is templated into the progress record,
+        # not left as a transient check. ``rounds.jsonl`` is the line's durable
+        # progress: the self-gate round lands there with the verdict and the
+        # rationale payload so an audit can name every obligation weighed.
+        deps.artifacts.append_round(
+            {
+                "round": state.get("round_no", 1),
+                "verdict": "selfgate",
+                "reason": str(result.get("verdict") or ""),
+                "selfgate_rationale": result.get("rationale", ""),
+                "injected": True,
+            }
+        )
+        return {
+            "selfgate": result,
+            "terminal": None,
+            "terminal_reason": None,
+            "waiting_on": None,
+            "waiting_on_declared": None,
+            "dd_development_id": None,
+        }
+
     def check_bounds(state: LineState) -> LineState:
         """INV-8. Pure counting, no judgement."""
         round_no = state.get("round_no", 1)
@@ -972,6 +1058,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         return "check_bounds"
 
     graph: StateGraph = StateGraph(LineState)
+    graph.add_node("dd_selfgate", dd_selfgate)
     graph.add_node("check_bounds", check_bounds)
     graph.add_node("coordinator_turn", coordinator_turn)
     graph.add_node("worker_turn", worker_turn)
@@ -979,7 +1066,8 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     graph.add_node("finalise", finalise)
     graph.add_node("decision_interrupt", decision_interrupt)
 
-    graph.add_edge(START, "check_bounds")
+    graph.add_edge(START, "dd_selfgate")
+    graph.add_edge("dd_selfgate", "check_bounds")
     graph.add_conditional_edges("check_bounds", after_bounds)
     graph.add_conditional_edges("coordinator_turn", after_coordinator)
     # The interrupt node resumes into the same round's coordinator result, so it
@@ -1010,6 +1098,7 @@ __all__ = [
     "LineDeps",
     "LineMetricsPort",
     "LineState",
+    "SelfGatePort",
     "acknowledges_decision",
     "build_goal_line_graph",
     "claims_resume_verification_broken",

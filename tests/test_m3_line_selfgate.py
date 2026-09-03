@@ -19,6 +19,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from langgraph.checkpoint.memory import InMemorySaver
+
 from fleet_graph.dd.selfgate import (
     DECISION_APPROVE,
     DECISION_REJECT,
@@ -35,6 +37,7 @@ from fleet_graph.dd.selfgate import (
     regression_ok,
     zero_test_deletion,
 )
+from fleet_graph.dd.selfgate_facts import EngineSelfGateFacts
 from fleet_graph.dd.selfgate_flow import (
     RATIONALE_SCHEMA,
     harvest_eligibility,
@@ -56,6 +59,8 @@ from fleet_graph.decision_mcp import (
 from fleet_graph.decision_mcp import (
     DECISION_APPROVE as MCP_APPROVE,
 )
+from fleet_graph.graphs.goal_line import LineDeps, build_goal_line_graph
+from fleet_graph.graphs.guards import LineBounds, LineGuards
 from fleet_graph.supervise.harvest_allowlist import HarvestAllowlist, parse_harvest_allowlist
 
 DISPATCHER = "wf-1"
@@ -604,3 +609,186 @@ class TestS7HarvestWiring:
         )
         assert ok is False
         assert reasons
+
+
+class FakeControl:
+    """A duck-typed dd read surface carrying exactly the fields the gatherer reads."""
+
+    def __init__(self, **info: Any) -> None:
+        self.info = info
+
+    def get(self, development_id: str) -> dict[str, Any]:
+        self.info["development_id"] = development_id
+        return self.info
+
+
+class TestEngineSelfGateFacts:
+    """The production gatherer measures the six obligations from the read model."""
+
+    def test_full_positive_measurements_gather_six_ok(self) -> None:
+        control = FakeControl(
+            spec_acceptance_commands=ACCEPT,
+            acceptance_commands=ACCEPT,
+            verification_commands=ACCEPT,
+            changed_paths=["src/fleet_graph/x.py"],
+            scope_paths=["src/fleet_graph/x.py"],
+            deleted_paths=[],
+            acceptance_runs=[{"argv": ACCEPT, "exit_code": 0}],
+            mutations=[{"red": True, "restored": True}, {"red": True, "restored": True}],
+            target_base_commit="base",
+            compared_base_commit="base",
+            baseline_run={"passed": 100, "failed": 0, "failed_set": []},
+            head_run={"passed": 100, "failed": 0, "failed_set": []},
+        )
+        facts = EngineSelfGateFacts(control).gather("dev-fg-m3")
+        assert set(facts) == set(REQUIRED_EVIDENCE)
+        assert all(entry["ok"] for entry in facts.values())
+
+    def test_a_missing_acceptance_transcript_is_measured_negative(self) -> None:
+        control = FakeControl(
+            spec_acceptance_commands=ACCEPT,
+            acceptance_commands=ACCEPT,
+            verification_commands=[],  # receipt missing -> refuse, never a guess
+        )
+        facts = EngineSelfGateFacts(control).gather("dev-fg-m3")
+        assert facts["acceptance_verbatim"]["ok"] is False
+
+    def test_an_out_of_scope_product_change_is_measured_negative(self) -> None:
+        control = FakeControl(
+            changed_paths=["src/out-of-scope.py"],
+            scope_paths=["src/fleet_graph/x.py"],
+        )
+        facts = EngineSelfGateFacts(control).gather("dev-fg-m3")
+        assert facts["product_diff_in_scope"]["ok"] is False
+        assert "src/out-of-scope.py" in facts["product_diff_in_scope"]["reason"]
+
+    def test_a_green_to_red_regression_is_measured_negative(self) -> None:
+        control = FakeControl(
+            target_base_commit="base",
+            compared_base_commit="base",
+            baseline_run={"passed": 10, "failed": 0, "failed_set": []},
+            head_run={"passed": 9, "failed": 1, "failed_set": ["new:test"]},
+        )
+        facts = EngineSelfGateFacts(control).gather("dev-fg-m3")
+        assert facts["regression_baseline"]["ok"] is False
+        assert "new:test" in facts["regression_baseline"]["reason"]
+
+
+class _FakeSelfGatePort:
+    """A scripted ``SelfGatePort`` for the goal-line graph wiring test."""
+
+    def __init__(self, reply: dict[str, Any]) -> None:
+        self.reply = reply
+        self.called: list[str] = []
+
+    def run(self, development_id: str) -> dict[str, Any]:
+        self.called.append(development_id)
+        return self.reply
+
+
+class _FakeCoordinator:
+    def __init__(self) -> None:
+        self.inputs: list[dict[str, Any]] = []
+
+    def turn(
+        self, round_no: int, coord_input: dict[str, Any], resume: bool = False
+    ) -> dict[str, Any]:
+        self.inputs.append(coord_input)
+        return {"verdict": "done", "reason": "self-gated"}
+
+
+class _FakeReviewWorker:
+    def turn(self, prompt: str, round_no: int) -> Any:
+        raise AssertionError("the self-gate path must not reach the worker")
+
+
+class _FakeReviewInbox:
+    def drain_then_ack(self, persist: Any) -> tuple[list[Any], list[str]]:
+        persist([])
+        return [], []
+
+
+class _FakeReviewArtifacts:
+    def __init__(self) -> None:
+        self.rounds: list[dict[str, Any]] = []
+        self.terminal: dict[str, Any] | None = None
+
+    def heartbeat(self, round_no: int, phase: str, *, force: bool = False) -> bool:
+        return True
+
+    def append_round(self, line: dict[str, Any]) -> bool:
+        self.rounds.append(line)
+        return True
+
+    def write_worker_report(self, round_no: int, report: dict[str, Any]) -> str:
+        return "worker-report.json"
+
+    def write_terminal(self, **kwargs: Any) -> str:
+        self.terminal = kwargs
+        return "terminal.json"
+
+
+class TestGoalLineSelfGateWiring:
+    """The engine's own caller: a line woken by ``dd_awaiting_gate`` self-gates."""
+
+    def test_the_line_discharges_the_six_obligations_and_templates_the_evidence(
+        self,
+    ) -> None:
+        rationale = '{"schema": "fleet-graph.selfgate-rationale/v1", "verdict": "APPROVE"}'
+        port = _FakeSelfGatePort({"verdict": "APPROVE", "rationale": rationale})
+        artifacts = _FakeReviewArtifacts()
+        coordinator = _FakeCoordinator()
+        deps = LineDeps(
+            coordinator=coordinator,
+            worker=_FakeReviewWorker(),  # type: ignore[arg-type]
+            inbox=_FakeReviewInbox(),  # type: ignore[arg-type]
+            artifacts=artifacts,  # type: ignore[arg-type]
+            guards=LineGuards(bounds=LineBounds()),
+            folder_id=DISPATCHER,
+            selfgate=port,
+            prior_terminal={
+                "terminal": "blocked",
+                "waiting_on": "dd",
+                "dd_development_id": DD_ID,
+            },
+        )
+        compiled = build_goal_line_graph(deps).compile(
+            checkpointer=InMemorySaver()  # type: ignore[call-arg]
+        )
+        compiled.invoke(
+            {"round_no": 1},
+            config={"configurable": {"thread_id": "th-selfgate"}, "recursion_limit": 100},
+        )
+        # The mechanical gate ran against the dispatched development.
+        assert port.called == [DD_ID]
+        # §4: the evidence was templated into the line's progress, never a bare word.
+        assert any(round_["verdict"] == "selfgate" for round_ in artifacts.rounds)
+        progress = next(round_ for round_ in artifacts.rounds if round_["verdict"] == "selfgate")
+        assert progress["selfgate_rationale"] == rationale
+        # The self-gate result rode the coordinator input as a mechanical fact.
+        assert coordinator.inputs, "the coordinator was not (re-)consulted"
+        assert coordinator.inputs[0]["selfgate"]["verdict"] == "APPROVE"
+
+    def test_a_line_with_no_dd_anchor_keeps_the_pre_m3_path(self) -> None:
+        port = _FakeSelfGatePort({"verdict": "APPROVE", "rationale": "x"})
+        artifacts = _FakeReviewArtifacts()
+        coordinator = _FakeCoordinator()
+        deps = LineDeps(
+            coordinator=coordinator,
+            worker=_FakeReviewWorker(),  # type: ignore[arg-type]
+            inbox=_FakeReviewInbox(),  # type: ignore[arg-type]
+            artifacts=artifacts,  # type: ignore[arg-type]
+            guards=LineGuards(bounds=LineBounds()),
+            folder_id=DISPATCHER,
+            selfgate=port,
+            prior_terminal={"terminal": "blocked", "waiting_on": "decision"},
+        )
+        compiled = build_goal_line_graph(deps).compile(
+            checkpointer=InMemorySaver()  # type: ignore[call-arg]
+        )
+        compiled.invoke(
+            {"round_no": 1},
+            config={"configurable": {"thread_id": "th-nodd"}, "recursion_limit": 100},
+        )
+        # No dd anchor -> the self-gate never fired, the line ran its normal path.
+        assert port.called == []
