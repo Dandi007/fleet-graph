@@ -628,6 +628,20 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     )
 
         assert outcome is not None
+        # M3.1 defect 3: a failed outcome carries no receipt of its own, and
+        # clobbering the carried receipt here would make the *retry* fall back
+        # to the chain root for its parent digest -- anchoring the new receipt
+        # to a stale chain head (断链/回卷) instead of the latest sealed link
+        # (e.g. the rejecting review a rework implement must name). A failure
+        # keeps the previous stage's sealed receipt so the retry's dispatch
+        # stays anchored on the current chain head.
+        carried_receipt = (
+            outcome.receipt
+            if outcome.receipt is not None
+            else (state.get("last_receipt") or {})
+            if outcome.event == FAILURE_EVENT
+            else {}
+        )
         return {
             "steps": steps,
             "artifacts": artifacts,
@@ -641,7 +655,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                 stage.id: outcome.run_in_flight,
             },
             "last_event": outcome.event,
-            "last_receipt": outcome.receipt or {},
+            "last_receipt": carried_receipt,
             "last_failure_code": outcome.failure_code,
             # The raw error text as the failing collaborator reported it. The
             # advance() terminal keeps only the code in its reason; without

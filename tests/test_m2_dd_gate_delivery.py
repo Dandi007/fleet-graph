@@ -49,7 +49,13 @@ ROSTER: list[Any] = [{"folder_id": "wf-1", "seat": "s", "generation": 2}]
 
 
 class FakeDdPlane:
-    """A duck-typed dd control plane: ``get`` + ``gate`` only."""
+    """A duck-typed dd control plane: ``get`` + ``gate`` + publish.
+
+    The resume consumes the verdict per its semantics (M3.1 defect 1): an
+    APPROVE moves the single off the gate (``running``); a REJECT
+    terminalises it as ``refused`` -- which is what the delivery's read-back
+    must observe to report ``delivered/consumed``.
+    """
 
     def __init__(
         self,
@@ -67,6 +73,7 @@ class FakeDdPlane:
             "card_entity_id": "card-dd-1",
         }
         self.resumed: list[tuple[str, str]] = []
+        self.published: list[dict[str, Any]] = []
 
     def get(self, development_id: str) -> dict[str, Any]:
         return {
@@ -77,16 +84,35 @@ class FakeDdPlane:
             "awaiting": self.awaiting,
         }
 
+    def publish_gate_decision(
+        self,
+        development_id: str,
+        *,
+        decision: str,
+        decided_by: str,
+        reason: str = "",
+        action_key: str = "",
+    ) -> dict[str, Any]:
+        self.published.append(
+            {
+                "development_id": development_id,
+                "decision": decision,
+                "decided_by": decided_by,
+                "reason": reason,
+                "action_key": action_key,
+            }
+        )
+        return {"development_id": development_id, "decision": decision}
+
     def gate(
         self, development_id: str, resume: bool = False, action_key: str | None = None
     ) -> dict[str, Any]:
         assert resume is True
         self.resumed.append((development_id, action_key or ""))
-        # A resume that actually consumes the verdict moves the single off the
-        # gate: the read-back that M3's "consumed, not unit-started" check does
-        # must observe the single as no longer ``awaiting_gate``.
+        # The resumed graph re-reads the board and consumes the verdict per
+        # its semantics: APPROVE leaves the gate, REJECT ends refused.
         if self.state == "awaiting_gate":
-            self.state = "running"
+            self.state = "refused" if action_key and action_key.endswith(":REJECT") else "running"
         return {
             "state": self.state,
             "development_id": development_id,
@@ -160,6 +186,18 @@ class TestPositiveDdDelivery:
         # The single was resumed through its gate, once, with the durable key.
         assert plane.resumed == [(DD_ID, f"mcp:dd:{DD_ID}:g2:APPROVE")]
 
+        # M3.1: the verdict itself reached the single's decision read model,
+        # decided by the authorized principal, carrying the delivery reason.
+        assert plane.published == [
+            {
+                "development_id": DD_ID,
+                "decision": DECISION_APPROVE,
+                "decided_by": DISPATCHER,
+                "reason": "live drill",
+                "action_key": f"mcp:dd:{DD_ID}:g2:APPROVE",
+            }
+        ]
+
         # The dispatching line is woken: parked_* cleared, anti-swallow marker
         # preserved, and the wake fact written.
         after = _read_stall(tmp_path)
@@ -182,6 +220,10 @@ class TestPositiveDdDelivery:
         assert result.decision == DECISION_REJECT
         assert result.action_key == f"mcp:dd:{DD_ID}:g2:REJECT"
         assert plane.resumed == [(DD_ID, f"mcp:dd:{DD_ID}:g2:REJECT")]
+        # A consumed REJECT leaves the single terminal ``refused`` -- the
+        # semantic transfer the delivery's read-back must observe (M3.1).
+        assert plane.state == "refused"
+        assert plane.published[0]["decision"] == DECISION_REJECT
 
     def test_the_new_path_is_zero_swallowed(self, tmp_path: Path) -> None:
         """A dd delivery is never a third 'swallowed' state: it is delivered or

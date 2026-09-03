@@ -89,7 +89,11 @@ def _all_pass() -> list[EvidenceItem]:
 
 
 class FakeDd:
-    """A duck-typed dd control plane: ``get`` + ``gate`` + ``record_gate_refusal``."""
+    """A duck-typed dd control plane: ``get`` + ``gate`` + publish + refusals.
+
+    The resume consumes the verdict per its semantics (M3.1): a REJECT
+    terminalises the single as ``refused``; an APPROVE moves it off the gate.
+    """
 
     def __init__(
         self,
@@ -108,6 +112,7 @@ class FakeDd:
         self.consume_on_resume = consume_on_resume
         self.resume_exit_code = resume_exit_code
         self.resumed: list[tuple[str, str]] = []
+        self.published: list[dict[str, Any]] = []
         self.refusals: list[dict[str, Any]] = []
 
     def get(self, development_id: str) -> dict[str, Any]:
@@ -122,13 +127,33 @@ class FakeDd:
             payload["worktree_path"] = self.worktree_path
         return payload
 
+    def publish_gate_decision(
+        self,
+        development_id: str,
+        *,
+        decision: str,
+        decided_by: str,
+        reason: str = "",
+        action_key: str = "",
+    ) -> dict[str, Any]:
+        self.published.append(
+            {
+                "development_id": development_id,
+                "decision": decision,
+                "decided_by": decided_by,
+                "reason": reason,
+                "action_key": action_key,
+            }
+        )
+        return {"development_id": development_id, "decision": decision}
+
     def gate(
         self, development_id: str, resume: bool = False, action_key: str | None = None
     ) -> dict[str, Any]:
         assert resume is True
         self.resumed.append((development_id, action_key or ""))
         if self.consume_on_resume and self.state == "awaiting_gate":
-            self.state = "running"
+            self.state = "refused" if action_key and action_key.endswith(":REJECT") else "running"
         resume_payload: dict[str, Any] = {
             "development_id": development_id,
             "generation": self.generation,
@@ -355,6 +380,10 @@ class TestSelfGateDelivery:
         assert result.status == OUTCOME_DELIVERED
         assert result.decision == DECISION_APPROVE
         assert dd.resumed == [(DD_ID, f"mcp:dd:{DD_ID}:g2:APPROVE")]
+        # The verdict reached the single's decision read model, decided_by the
+        # dispatching line (M3.1 defect 1).
+        assert dd.published[0]["decided_by"] == PRINCIPAL
+        assert dd.published[0]["decision"] == DECISION_APPROVE
 
     def test_a_failed_obligation_delivers_reject_not_a_swallow(self, tmp_path: Path) -> None:
         evidence = _all_pass()

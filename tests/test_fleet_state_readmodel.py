@@ -481,6 +481,9 @@ def write_dd_development(
     missing_record: bool = False,
     card_entity_id: str = "",
 ) -> None:
+    """Fixture write. ``missing_status`` now means "no authority result.json"
+    (M3.1 defect 6: the harvestable view derives from the generation's
+    result.json, never the rebuildable status.json cache)."""
     dev_dir = dd_root / development_id
     dev_dir.mkdir(parents=True, exist_ok=True)
     if not missing_record:
@@ -489,11 +492,10 @@ def write_dd_development(
             record["card_entity_id"] = card_entity_id
         (dev_dir / "record.json").write_text(json.dumps(record), encoding="utf-8")
     if not missing_status:
-        (dev_dir / "status.json").write_text(
+        (dev_dir / "result.json").write_text(
             json.dumps(
                 {
                     "development_id": development_id,
-                    "state": "awaiting_gate",
                     "stage": stage,
                     "terminal": terminal,
                     "head_commit": head_commit,

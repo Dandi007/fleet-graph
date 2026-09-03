@@ -221,26 +221,61 @@ def classify_dd_fact(status: dict[str, Any]) -> str | None:
 
 
 class LiveDdWakeFacts:
-    """The production DdWakeFacts, reading ``<dd_root>/<dev_id>/status.json``.
+    """The production DdWakeFacts, derived from the single's authority artifacts.
 
-    A plain file read, no network -- kept as a class so the scheduler can hold
-    a concrete default and tests can inject a scripted fake. A missing or
-    unreadable status file raises -- the caller fails open rather than parking
-    on a guess.
+    M3.1 defect 6: this probe used to read the dd development's rebuildable
+    status cache -- a file with no invalidation logic, whose stale/lagging
+    values were then cited as machine facts. The fact is now derived from the
+    authority run artifacts the control plane itself rebuilds from: the
+    admission record's generation (``record.json``) picks the generation's
+    ``result.json``, whose ``awaiting``/``terminal`` fields are the mechanical
+    wake facts. A missing or unreadable authority raises -- the caller fails
+    open rather than parking on a guess.
     """
+
+    #: The control plane's run-artifact names (kept local so the scheduler
+    #: stays decoupled from the dd package).
+    RECORD_FILE = "record.json"
+    RESULT_FILE = "result.json"
 
     def __init__(self, dd_root: str | Path) -> None:
         self.dd_root = Path(dd_root)
 
-    def dd_fact(self, development_id: str) -> str | None:
-        path = self.dd_root / development_id / "status.json"
+    def _read_json(self, path: Path) -> dict[str, Any] | None:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"dd status for {development_id} unreadable: {path}") from exc
-        if not isinstance(raw, dict):
-            raise RuntimeError(f"dd status for {development_id} is not an object: {path}")
-        return classify_dd_fact(raw)
+        except (OSError, json.JSONDecodeError):
+            return None
+        return raw if isinstance(raw, dict) else None
+
+    def dd_fact(self, development_id: str) -> str | None:
+        dev_root = self.dd_root / development_id
+        record = self._read_json(dev_root / self.RECORD_FILE)
+        if record is None:
+            raise RuntimeError(
+                f"dd admission record for {development_id} unreadable: "
+                f"{dev_root / self.RECORD_FILE}"
+            )
+        try:
+            generation = max(1, int(record.get("generation") or 1))
+        except (TypeError, ValueError):
+            generation = 1
+        result_path = (
+            dev_root / self.RESULT_FILE
+            if generation <= 1
+            else dev_root / f"g{generation}" / self.RESULT_FILE
+        )
+        result = self._read_json(result_path)
+        if result is None:
+            raise RuntimeError(f"dd run result for {development_id} unreadable: {result_path}")
+        # The same precedence the control plane's rebuild enforces: a pending
+        # question means the single sits at the gate; otherwise any terminal
+        # terminalises the wake.
+        status = {
+            "state": "awaiting_gate" if result.get("awaiting") else "",
+            "terminal": str(result.get("terminal") or ""),
+        }
+        return classify_dd_fact(status)
 
 
 __all__ = [
