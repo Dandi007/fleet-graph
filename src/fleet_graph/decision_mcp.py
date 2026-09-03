@@ -55,6 +55,13 @@ from pathlib import Path
 from typing import Any
 
 from fleet_graph.cost_obs.exposition import Sample, render
+from fleet_graph.dd.selfgate import (
+    CODE_SELFGATE_BASELINE_UNANCHORED,
+    CODE_SELFGATE_INCOMPLETE,
+    CODE_SELFGATE_REGRESSION,
+    SelfGateEvidence,
+    decide,
+)
 from fleet_graph.decision_bridge.owners import (
     OWNER_KIND_DD,
     OWNER_KIND_LINE,
@@ -447,6 +454,61 @@ def _deliver_dd(
             "resume_status": "resumed",
         },
     )
+
+
+def deliver_self_gate_decision(
+    evidence: SelfGateEvidence,
+    *,
+    development_id: str,
+    run_root: Path,
+    dd: Any = None,
+    clock: Callable[[], float] = time.time,
+) -> DeliveryResult:
+    """M3: the dispatching line's self-judged dd delivery, gated by the six duties.
+
+    The engine-side mechanical gate runs first: ``decide(evidence)`` admits the
+    delivery only when all six evidence duties are present and in-bounds, the
+    regression vs. the frozen ``target_base_commit`` baseline did not grow the
+    red set, and ``principal == dispatched_by`` (design §8 "DD 闸不经人"). A
+    refused self-gate -- a missing/vacuous duty, an unanchored baseline, or a
+    regression -- is a refusal before the single is touched, never a swallowed
+    delivery.
+
+    An admitted verdict (``APPROVE``/``REJECT``) proceeds through the existing
+    M2 dd gate delivery (``_deliver_dd``), so the single is resumed through its
+    gate and the dispatching line is woken exactly as before. The six-duty
+    rationale rides the delivery message, so the evidence that admitted the
+    verdict is what a later audit sees.
+    """
+    result = decide(evidence)
+    if result.outcome == "refused":
+        return DeliveryResult(
+            status=OUTCOME_REFUSED,
+            code=result.code,
+            message=result.reason,
+            line=evidence.dispatched_by,
+            decision=evidence.decision,
+        )
+
+    if dd is None:
+        from fleet_graph.dd.control_plane import DdControlPlane
+
+        dd = DdControlPlane(root=DEFAULT_DD_ROOT)
+
+    delivery = _deliver_dd(
+        development_id=development_id,
+        decision=evidence.decision,
+        principal=evidence.principal,
+        run_root=run_root,
+        dd=dd,
+        clock=clock,
+    )
+    if delivery.status == OUTCOME_DELIVERED:
+        rationale = json.dumps(result.rationale, sort_keys=True, ensure_ascii=False)
+        delivery.message = f"{delivery.message}; self-gate rationale: {rationale}"
+        if delivery.target is not None:
+            delivery.target = {**delivery.target, "self_gate": result.rationale}
+    return delivery
 
 
 def deliver_decision(
@@ -998,6 +1060,9 @@ __all__ = [
     "CODE_NO_WAITING_PARTY",
     "CODE_OWNER_REFUSED",
     "CODE_QUESTION_CARD_UNRESOLVED",
+    "CODE_SELFGATE_BASELINE_UNANCHORED",
+    "CODE_SELFGATE_INCOMPLETE",
+    "CODE_SELFGATE_REGRESSION",
     "DD_DEV_PREFIX",
     "DECISION_APPROVE",
     "DECISION_REJECT",
@@ -1017,9 +1082,12 @@ __all__ = [
     "DecisionPayloadError",
     "DeliveryLedger",
     "DeliveryResult",
+    "SelfGateEvidence",
     "build_decision_mcp_server",
+    "decide",
     "deliver_decision",
     "deliver_decision_dd",
+    "deliver_self_gate_decision",
     "load_reserved_ports",
     "serve",
 ]

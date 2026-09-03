@@ -17,6 +17,8 @@ or a branch flipped turns a specific test red).
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 from fleet_graph.dd.selfgate import (
@@ -44,6 +46,11 @@ from fleet_graph.dd.selfgate import (
     decide,
     harvest_trigger,
     merge_then_harvest,
+)
+from fleet_graph.decision_mcp import (
+    OUTCOME_DELIVERED,
+    OUTCOME_REFUSED,
+    deliver_self_gate_decision,
 )
 
 LINE = "wf-1"
@@ -386,3 +393,156 @@ class TestClosedDutyVocabulary:
             DUTY_REGRESSION_BASELINE,
         )
         assert len(EVIDENCE_DUTIES) == 6
+
+
+# --- the engine default path: the self-gate is wired into the dd delivery -----
+#
+# The M3 blocker the reviewer named was that ``decide`` / ``SelfGateEvidence``
+# lived only in the judging library and were never consulted by the delivery
+# path. ``deliver_self_gate_decision`` is that wiring: the line's self-judged dd
+# delivery runs the six-duty gate first (``decide``), and only an admitted
+# verdict reaches the M2 dd gate delivery (``_deliver_dd``). A missing duty, a
+# non-dispatching principal, or a regression refusal stops before the single is
+# touched.
+
+
+DD_ID = "dev-fg-abc"
+
+
+class FakeDdPlane:
+    """A duck-typed dd control plane (``get`` + ``gate``), like M2's tests use."""
+
+    def __init__(self, *, state: str = "awaiting_gate", dispatched_by: str = LINE) -> None:
+        self.state = state
+        self.dispatched_by = dispatched_by
+        self.queried = False
+        self.resumed: list[tuple[str, str]] = []
+
+    def get(self, development_id: str) -> dict[str, Any]:
+        self.queried = True
+        return {
+            "development_id": development_id,
+            "state": self.state,
+            "dispatched_by": self.dispatched_by,
+            "generation": 2,
+            "awaiting": {"question_note_id": "q-dd-1", "card_entity_id": "card-dd-1"},
+        }
+
+    def gate(self, development_id: str, resume: bool = False, action_key: str | None = None) -> Any:
+        self.resumed.append((development_id, action_key or ""))
+        return {
+            "development_id": development_id,
+            "resume": {"development_id": development_id, "generation": 2},
+        }
+
+
+def _stall(run_root: Path) -> Path:
+    path = run_root / ".scheduler" / f"{LINE}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "generation": 2,
+                "park_considered_run_id": "run-1",
+                "parked_run_id": "run-1",
+                "parked_at": 1_700_000_000.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+class TestSelfGateDeliveryRefused:
+    def test_a_missing_duty_refuses_the_delivery_before_the_single_is_touched(
+        self, tmp_path: Path
+    ) -> None:
+        plane = FakeDdPlane()
+        result = deliver_self_gate_decision(
+            complete_evidence(self_run=None),
+            development_id=DD_ID,
+            run_root=tmp_path,
+            dd=plane,
+        )
+        assert result.status == OUTCOME_REFUSED
+        assert result.code == CODE_SELFGATE_INCOMPLETE
+        assert DUTY_SELF_RUN_ACCEPTANCE in result.message
+        # Refused at the gate: the dd control plane was never even queried.
+        assert plane.queried is False
+        assert plane.resumed == []
+
+    def test_a_regression_refusal_names_the_green_flip(self, tmp_path: Path) -> None:
+        plane = FakeDdPlane()
+        result = deliver_self_gate_decision(
+            complete_evidence(current_failed_tests=frozenset({"tests/test_x.py::test_flip"})),
+            development_id=DD_ID,
+            run_root=tmp_path,
+            dd=plane,
+        )
+        assert result.status == OUTCOME_REFUSED
+        assert result.code == CODE_SELFGATE_REGRESSION
+        assert plane.queried is False
+        assert plane.resumed == []
+
+    def test_a_non_dispatching_principal_is_refused_and_never_touches_the_single(
+        self, tmp_path: Path
+    ) -> None:
+        plane = FakeDdPlane()
+        result = deliver_self_gate_decision(
+            complete_evidence(principal="wf-other"),
+            development_id=DD_ID,
+            run_root=tmp_path,
+            dd=plane,
+        )
+        assert result.status == OUTCOME_REFUSED
+        assert result.code == CODE_SELFGATE_INCOMPLETE
+        assert plane.queried is False
+        assert plane.resumed == []
+
+
+class TestSelfGatePositiveDelivery:
+    def test_a_complete_evidence_approve_resumes_and_wakes_the_line(self, tmp_path: Path) -> None:
+        plane = FakeDdPlane()
+        _stall(tmp_path)
+        result = deliver_self_gate_decision(
+            complete_evidence(),
+            development_id=DD_ID,
+            run_root=tmp_path,
+            dd=plane,
+            clock=lambda: 1_700_000_123.0,
+        )
+        assert result.status == OUTCOME_DELIVERED
+        assert result.as_dict()["outcome"] == "consumed"
+        assert plane.resumed == [(DD_ID, f"mcp:dd:{DD_ID}:g2:APPROVE")]
+        # Item 4: the six-duty rationale is the delivery's evidence payload.
+        assert result.target is not None
+        assert result.target["self_gate"]["decided_by"] == LINE
+        assert result.target["self_gate"]["dispatched_by"] == LINE
+        assert DUTY_REGRESSION_BASELINE in result.target["self_gate"]
+        # The dispatching line is woken: the M2 wake fact landed.
+        after = json.loads((tmp_path / ".scheduler" / f"{LINE}.json").read_text(encoding="utf-8"))
+        assert after["dispatched_decision_consumed_at"] == 1_700_000_123.0
+
+    def test_a_complete_reject_verdict_is_also_a_delivered_decision(self, tmp_path: Path) -> None:
+        plane = FakeDdPlane()
+        result = deliver_self_gate_decision(
+            complete_evidence(decision=REJECT),
+            development_id=DD_ID,
+            run_root=tmp_path,
+            dd=plane,
+        )
+        assert result.status == OUTCOME_DELIVERED
+        assert result.decision == REJECT
+        assert plane.resumed == [(DD_ID, f"mcp:dd:{DD_ID}:g2:REJECT")]
+
+
+class TestSelfGateApprovedThenMergeHarvest:
+    def test_the_positive_path_harvests_only_after_merge(self) -> None:
+        """自判 APPROVE → merge 段完成 → 收割触发（S7 阳性链）。"""
+
+        result = decide(complete_evidence())
+        assert result.admitted
+        # At the gate (before merge) the harvest must not fire.
+        assert harvest_trigger(APPROVE, merged=False) is False
+        # After the merge segment the harvest fires.
+        assert harvest_trigger(APPROVE, merged=True) is True

@@ -455,6 +455,50 @@ class TestHarvestAllowlistRefusal:
         assert fake["calls"] == []
 
 
+class TestMergeThenHarvestTriggerGate:
+    """S7 收割触发点改接 merge 段之后：harvest_trigger 编入收割反应器 intake。
+
+    E5 事件携带 ``decision``/``merged`` 排序事实；收割反应器在 intake 就调用
+    ``selfgate.harvest_trigger(decision, merged)``，只有 APPROVE 且 merge 已完成
+    才收割。仍停在闸后（merged=False）-> escalated + 零写动作，绝不闸后抢收。
+    """
+
+    def test_an_approved_but_not_yet_merged_event_refuses_before_any_write(
+        self, tmp_path: Path
+    ) -> None:
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        event = e5_event()
+        event["payload"] = {**event["payload"], "decision": "APPROVE", "merged": False}
+        config.event = event
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert fake["calls"] == [], f"writes executed on an un-merged development: {fake['calls']}"
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        intake = next(s for s in receipt["steps"] if s["step"] == "intake")
+        assert intake["ok"] is False
+
+    def test_a_reject_decision_never_harvests_even_after_merge(self, tmp_path: Path) -> None:
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        event = e5_event()
+        event["payload"] = {**event["payload"], "decision": "REJECT", "merged": True}
+        config.event = event
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_ESCALATED
+        assert fake["calls"] == []
+
+    def test_an_approve_that_merged_harvests(self, tmp_path: Path) -> None:
+        """正向：APPROVE + merged=True -> 走既有收割链（零回归）。"""
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, ops=fake, bus=FakeBus())
+        event = e5_event()
+        event["payload"] = {**event["payload"], "decision": "APPROVE", "merged": True}
+        config.event = event
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+
+
 class TestHarvestOrchestration:
     """交付 D.2：E5 事件 -> 编排步骤齐全。"""
 

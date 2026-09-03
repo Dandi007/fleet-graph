@@ -58,6 +58,7 @@ from langgraph.graph import END, START, StateGraph
 from fleet_graph.bus.board import Board
 from fleet_graph.bus.client import BusClient
 from fleet_graph.dd.control_plane import DEFAULT_DD_ROOT, RECORD_FILE
+from fleet_graph.dd.selfgate import harvest_trigger
 from fleet_graph.state.run_artifacts import iso, write_json_durable
 from fleet_graph.supervise.events import (
     EVENT_APPROVED_UNHARVESTED,
@@ -447,6 +448,17 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         gaps: list[str] = []
         if not development_id or not head_commit:
             gaps.append("E5 payload 缺 development_id 或 head_commit——事件不完整")
+        # S7: 收割触发点已从「闸后」改到「merge 后」。收割反应器在 intake 就做
+        # 排序判定（selfgate.harvest_trigger）：只有 APPROVE 且 merge 段已完成才
+        # 收割；仍停在闸后（merged=False）或非 APPROVE -> 记 gap -> escalated，
+        # 绝不闸后抢收。
+        decision = str(payload.get("decision") or "APPROVE")
+        merged = bool(payload.get("merged", True))
+        if not harvest_trigger(decision, merged=merged):
+            gaps.append(
+                f"harvest 触发点尚未到达 merge 段之后（decision={decision!r}, "
+                f"merged={merged}）——拒绝收割，绝不闸后抢收"
+            )
         repo = deps.repo
         record_worktree = ""
         remote_url = ""

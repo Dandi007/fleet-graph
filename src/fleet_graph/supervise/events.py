@@ -172,12 +172,32 @@ def cap_breaker_event(bucket: int, detail: str, folder_ids: list[str]) -> Superv
 
 
 def approved_unharvested_event(
-    development_id: str, head_commit: str, stage: str
+    development_id: str,
+    head_commit: str,
+    stage: str,
+    *,
+    decision: str = "APPROVE",
+    merged: bool = True,
 ) -> SupervisorEvent:
+    """M3 S7: the harvest trigger moved from "闸后" to "merge 后".
+
+    The E5 event reaches the harvest reactor only for a development whose merge
+    segment has completed (``terminal == "complete"`` in the read model), so the
+    ordering facts ``decision`` (always ``APPROVE`` at this point) and ``merged``
+    (always ``True``) are carried in the payload for the reactor's ordering
+    predicate (``selfgate.harvest_trigger``): only an APPROVE whose merge is done
+    fires the harvest, never a gate pass that has not yet merged.
+    """
     return SupervisorEvent(
         type=EVENT_APPROVED_UNHARVESTED,
         key=sanitize_key(f"e5-{development_id}"),
-        payload={"development_id": development_id, "head_commit": head_commit, "stage": stage},
+        payload={
+            "development_id": development_id,
+            "head_commit": head_commit,
+            "stage": stage,
+            "decision": decision,
+            "merged": merged,
+        },
     )
 
 
