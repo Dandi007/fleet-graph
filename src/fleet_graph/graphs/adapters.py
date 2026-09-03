@@ -12,7 +12,9 @@ world-readable, and a coordinator input carries the whole inbox.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -223,14 +225,27 @@ class AgentSessionWorker:
     seat_key: str
     turn_timeout_seconds: int = 3000
     _handle: SeatHandle | None = None
+    #: The 1-based ordinal of the turn about to run, within this process's
+    #: ownership of the seat session. Counted per ``turn`` entry -- a turn
+    #: that times out still counts, which is exactly the point: the timeout
+    #: record's ``turn_ordinal`` names the turn that died.
+    _turn_ordinal: int = 0
+    #: This process's first-open wall clock. The session-age fallback when the
+    #: runtime never recorded a start timestamp: for an adopted seat that is
+    #: the start of the observed window, a lower bound -- never invented
+    #: further back. Resolved lazily (never inside ``open``) so a seat whose
+    #: handle cannot name its session keeps opening and turning untouched.
+    _opened_at: float | None = None
 
     def open(self) -> SeatHandle:
         if self._handle is None:
+            self._opened_at = time.time()
             self._handle = self.seat.open(self.seat_spec, self.seat_key)
         return self._handle
 
     def turn(self, prompt: str, round_no: int) -> dict[str, Any]:
         handle = self.open()
+        self._turn_ordinal += 1
         envelope = self.seat.send(handle, prompt, timeout_seconds=self.turn_timeout_seconds)
         return parse_worker_envelope(envelope, round_no=round_no)
 
@@ -244,11 +259,24 @@ class AgentSessionWorker:
         so a runtime that never names its model buckets as seat-only evidence
         instead of silently looking attributed. `turn_timeout_seconds` is the
         exact budget this adapter passes to `send`.
+
+        The d10-rework session identity triple is observed, never invented:
+        `seat_session_id` is the agent-session-owned session id this handle
+        names; `turn_ordinal` counts the turns this process has entered into
+        that session; `session_age` is seconds since the session's start (see
+        ``_session_started_at`` for the honest-start precedence). Alongside
+        them `session_last_activity_at` is the newest mtime under the
+        session's directory -- the 会话最后活动时刻 half of the two-track
+        真挂/撞顶 delta. Any half that cannot be observed is an honest None.
         """
         return {
             "seat": getattr(self.seat_spec, "agent", None),
             "model": self._session_model(),
             "turn_timeout_seconds": self.turn_timeout_seconds,
+            "seat_session_id": self._handle.session_id if self._handle is not None else None,
+            "turn_ordinal": self._turn_ordinal,
+            "session_age": self._session_age(),
+            "session_last_activity_at": self._session_last_activity_at(),
         }
 
     def _session_model(self) -> str | None:
@@ -259,6 +287,64 @@ class AgentSessionWorker:
             return None
         model = meta.get("model")
         return str(model) if model else None
+
+    #: session.json keys a runtime may use to name when the session started.
+    _SESSION_START_META_KEYS = ("started_at", "created_at", "start_time")
+
+    def _meta_started_at(self) -> float | None:
+        if self._handle is None:
+            return None
+        meta = read_session_meta(self._handle.session_root, self._handle.session_id)
+        if not meta:
+            return None
+        for key in self._SESSION_START_META_KEYS:
+            value = meta.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)) and value > 0:
+                return float(value)
+            if isinstance(value, str) and value.strip():
+                parsed = _parse_timestamp(value.strip())
+                if parsed is not None:
+                    return parsed
+        return None
+
+    def _session_age(self) -> float | None:
+        if self._handle is None:
+            return None
+        started = self._meta_started_at() or self._opened_at
+        if started is None:
+            return None
+        return max(0.0, time.time() - started)
+
+    def _session_last_activity_at(self) -> float | None:
+        if self._handle is None:
+            return None
+        session_dir = Path(self._handle.session_root) / "sessions" / self._handle.session_id
+        newest: float | None = None
+        try:
+            for path in session_dir.rglob("*"):
+                if path.is_file():
+                    mtime = path.stat().st_mtime
+                    newest = mtime if newest is None else max(newest, mtime)
+        except OSError:
+            return newest
+        return newest
+
+
+def _parse_timestamp(raw: str) -> float | None:
+    """Parse an epoch string or an ISO-8601 stamp into epoch seconds.
+
+    Mechanical and total: anything unparseable is None, never a guessed time.
+    """
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 __all__ = [

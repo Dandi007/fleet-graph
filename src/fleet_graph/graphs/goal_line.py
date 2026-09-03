@@ -27,6 +27,7 @@ design.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypedDict
 
@@ -106,18 +107,78 @@ WORKER_TURN_TIMEOUT_REASON = "worker_turn_timeout"
 
 #: The defect-⑩ variable matrix: the fields every ``worker_turn_timeout`` round
 #: record must carry so a 3000s zero-output hang is attributable to the
-#: seat/model/round configuration that produced it. ``scripts/
-#: turn-timeout-report.py`` buckets on exactly these names; a record missing
-#: any one of them lands in that report's 「变量缺失」 bucket instead of being
-#: silently dropped.
+#: seat/session configuration that produced it. The d10 rework (two-track
+#: 口径) added the session identity triple -- ``seat_session_id`` /
+#: ``turn_ordinal`` / ``session_age`` -- on top of the d10 delivered six:
+#: a timeout is attributed to the *seat session and where in its life it
+#: happened*, not to the round counter. ``scripts/turn-timeout-report.py``
+#: buckets on exactly these names; a record missing any one of them lands in
+#: that report's 「变量缺失」 bucket instead of being silently dropped.
 TIMEOUT_MATRIX_FIELDS = (
     "seat",
     "model",
     "round_index",
     "turn_timeout_seconds",
+    "seat_session_id",
+    "turn_ordinal",
+    "session_age",
     "input_bytes",
     "output_evidence",
 )
+
+#: The line-side (线侧) classification classes of the two-track 口径: a
+#: recorded timeout is either a true hang (真挂 -- the session produced
+#: nothing observable) or a long turn that ran into the budget ceiling
+#: (长 turn 撞顶 -- it was still producing when the budget ran out).
+#: Unresolvable inputs classify as ``None`` and are counted honestly, never
+#: forced into a class.
+TIMEOUT_CLASS_TRUE_HANG = "true_hang"
+TIMEOUT_CLASS_CEILING_HIT = "ceiling_hit"
+
+#: The ≈0 tolerance (seconds) for the 真挂 delta: ``receipt_at -
+#: session_last_activity_at`` within this bound means nothing observable
+#: happened in the session besides the timeout receipt itself.
+TRUE_HANG_DELTA_EPSILON_SECONDS = 5.0
+
+
+def classify_turn_timeout(
+    *,
+    zero_output: bool | None,
+    receipt_at: float | None,
+    session_last_activity_at: float | None,
+    turn_timeout_seconds: float | None,
+) -> str | None:
+    """The two-track line-side classification of one timed-out turn.
+
+    The 口径 is the delta ``TURN_TIMEOUT 回执时刻 - 会话最后活动时刻``:
+
+    - 真挂 (``true_hang``): the delta is ≈ 0 -- nothing observable happened in
+      the session besides the timeout receipt -- or the output evidence says
+      全程零产出 (``zero_output``), which is the same judgement made from the
+      envelope side when the timestamps are unusable.
+    - 长 turn 撞顶 (``ceiling_hit``): the session was still producing
+      (``zero_output`` False) and its last observable activity sits inside the
+      turn's budget window (delta < the budget) -- the turn was alive and ran
+      out of budget, not dead.
+
+    Anything that cannot be classified on these mechanical facts returns
+    ``None``: an honest 不可得, never a guessed class.
+    """
+    delta: float | None = None
+    if receipt_at is not None and session_last_activity_at is not None:
+        delta = float(receipt_at) - float(session_last_activity_at)
+    if delta is not None and abs(delta) <= TRUE_HANG_DELTA_EPSILON_SECONDS:
+        return TIMEOUT_CLASS_TRUE_HANG
+    if (
+        zero_output is False
+        and delta is not None
+        and turn_timeout_seconds is not None
+        and delta < float(turn_timeout_seconds)
+    ):
+        return TIMEOUT_CLASS_CEILING_HIT
+    if zero_output is True:
+        return TIMEOUT_CLASS_TRUE_HANG
+    return None
 
 
 def timeout_matrix_missing(record: dict[str, Any]) -> list[str]:
@@ -473,13 +534,15 @@ class LineDeps:
     #: baseline.
     goal_revision: Any = None
     #: The defect-⑩ variable matrix source: a callable returning the worker
-    #: seat's ``{seat, model, turn_timeout_seconds}`` (the wiring reads it off
-    #: ``AgentSessionWorker.turn_variables``), or None when the worker does not
-    #: expose one. The ``worker_turn`` timeout path calls it when recording a
-    #: ``worker_turn_timeout`` round so the record names the configuration that
-    #: timed out; a None source (or a failing call) records the matrix fields
-    #: with honest None values rather than dropping them -- the field set is
-    #: the contract, never the guess.
+    #: seat's ``{seat, model, turn_timeout_seconds, seat_session_id,
+    #: turn_ordinal, session_age, session_last_activity_at}`` (the wiring reads
+    #: it off ``AgentSessionWorker.turn_variables``), or None when the worker
+    #: does not expose one. The ``worker_turn`` timeout path calls it when
+    #: recording a ``worker_turn_timeout`` round so the record names the
+    #: configuration -- and the seat session, and where in that session's life
+    #: the turn sat -- that timed out; a None source (or a failing call)
+    #: records the matrix fields with honest None values rather than dropping
+    #: them -- the field set is the contract, never the guess.
     turn_variables: Any = None
 
     def now(self) -> float | None:
@@ -910,8 +973,9 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
                 deps.guards.record_timeout()
                 # Defect ⑩: the timeout round is recorded through the same
                 # append path as any other round, but it must carry the
-                # variable matrix -- seat/model/round/budget/input size and
-                # the output signal up to the deadline -- or the 3000s
+                # variable matrix -- seat/model/round/budget plus the session
+                # identity triple (seat_session_id/turn_ordinal/session_age)
+                # and the output signal up to the deadline -- or the 3000s
                 # zero-output hang is forever unattributable. Fields the
                 # worker wiring cannot resolve are recorded as None, never
                 # dropped: an absent field is how a legacy record says
@@ -927,14 +991,28 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
                         "zero_output": True,
                         "source": "no_output_received",
                     }
+                # The receipt moment: the wall clock at the instant the
+                # timeout came back. One half of the two-track 真挂/撞顶
+                # delta (the other half rides in as session_last_activity_at).
+                receipt_at = time.time()
                 turn_variables: dict[str, Any] = {
                     "seat": matrix.get("seat"),
                     "model": matrix.get("model"),
                     "round_index": round_no,
                     "turn_timeout_seconds": matrix.get("turn_timeout_seconds"),
+                    "seat_session_id": matrix.get("seat_session_id"),
+                    "turn_ordinal": matrix.get("turn_ordinal"),
+                    "session_age": matrix.get("session_age"),
                     "input_bytes": len(turn_prompt.encode("utf-8")),
                     "output_evidence": evidence,
                 }
+                zero_output = evidence.get("zero_output")
+                timeout_class = classify_turn_timeout(
+                    zero_output=zero_output if isinstance(zero_output, bool) else None,
+                    receipt_at=receipt_at,
+                    session_last_activity_at=matrix.get("session_last_activity_at"),
+                    turn_timeout_seconds=turn_variables["turn_timeout_seconds"],
+                )
                 deps.artifacts.append_round(
                     {
                         "round": round_no,
@@ -943,6 +1021,12 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
                         "reason": WORKER_TURN_TIMEOUT_REASON,
                         "prompt_sha256": state.get("pending_sha", ""),
                         "injected": True,
+                        # Two-track classification facts: the raw delta inputs
+                        # plus the mechanical class they resolve to (None when
+                        # 不可得 -- never a guessed class).
+                        "receipt_at": receipt_at,
+                        "session_last_activity_at": matrix.get("session_last_activity_at"),
+                        "timeout_class": timeout_class,
                         **turn_variables,
                     }
                 )
@@ -1170,7 +1254,10 @@ __all__ = [
     "TERMINAL_DONE",
     "TERMINAL_FAILED",
     "TERMINAL_FAULT",
+    "TIMEOUT_CLASS_CEILING_HIT",
+    "TIMEOUT_CLASS_TRUE_HANG",
     "TIMEOUT_MATRIX_FIELDS",
+    "TRUE_HANG_DELTA_EPSILON_SECONDS",
     "WORKER_REPORT_PROTOCOL_FAILURE",
     "WORKER_REPORT_REQUEST",
     "WORKER_REPORT_RETRY_LIMIT",
@@ -1183,6 +1270,7 @@ __all__ = [
     "acknowledges_decision",
     "build_goal_line_graph",
     "claims_resume_verification_broken",
+    "classify_turn_timeout",
     "n7_rejects_blocked",
     "n7_rejects_round_zero_repark",
     "timeout_matrix_missing",
