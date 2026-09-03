@@ -1,0 +1,20 @@
+{
+ "development_id": "dev-fg-d6ac36cb0849",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "bash",
+   "scripts/verify-lim.sh",
+   "--check",
+   "11"
+  ],
+  [
+   "bash",
+   "scripts/verify-lim.sh",
+   "--check",
+   "12"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
