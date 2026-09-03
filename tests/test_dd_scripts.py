@@ -242,7 +242,7 @@ class TestMerge:
         stage = MergeStage(
             repo=repo,
             remote_url=str(repo / "no-such-remote.git"),
-            target_ref="refs/heads/main",
+            target_ref="refs/heads/dd/dev-001",
             publish=True,
         )
         with pytest.raises(StageRefused, match="merge refused"):

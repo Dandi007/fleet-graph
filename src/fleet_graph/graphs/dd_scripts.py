@@ -24,6 +24,7 @@ from typing import Any
 from fleet_graph.cost_obs import CostDataPlane
 from fleet_graph.dd.feedback_scope import scope_index_for_generation
 from fleet_graph.dd.git import run_git
+from fleet_graph.dd.line_branch import RebaseConflictError, is_main_ref
 from fleet_graph.dd.vendor import git_ops
 from fleet_graph.graphs.dd_pipeline import (
     Dispatch,
@@ -120,21 +121,40 @@ class WorkspaceSealer:
 
 @dataclass
 class ConfigureStage:
-    """Writes the run config the later stages read."""
+    """Writes the run config the later stages read.
+
+    **The line rebase is this stage's fixed first step** (M5 D6): when a
+    ``line_rebase`` is wired, it runs before anything is written, and the
+    rebase record it emits is the only writer of the frozen post-rebase
+    ``target_base_commit`` on the admission record. Nothing recomputes the
+    base after the fact -- delete the step and the recorded base visibly
+    stops containing the target branch's advance, which is the property the
+    spec's negative criterion demands. A conflicted replay refuses the stage
+    with ``REBASE_CONFLICT`` after the record lands in the log.
+    """
 
     repo: Path
     run_config: dict[str, Any] = field(default_factory=dict)
+    # Configure's first step when the development carries a line branch
+    # (M5). None means "no line branch in play" -- step skipped entirely.
+    line_rebase: Any = None
+    # The admission record the post-rebase base is folded into. The fold is
+    # part of the same step that produced the record: one emission, one
+    # freeze, no compensating writer.
+    record_path: Path | None = None
 
     def act(self, stage: Any, dispatch: Dispatch) -> StageOutcome:
-        write_json(
-            self.repo,
-            RUN_CONFIG_PATH,
-            {
-                "development_id": dispatch.get("development_id", ""),
-                "generation": dispatch.get("generation", 1),
-                **self.run_config,
-            },
-        )
+        rebase_record: dict[str, Any] | None = None
+        if self.line_rebase is not None:
+            try:
+                rebase_record = self.line_rebase.run().as_dict()
+            except RebaseConflictError as conflict:
+                self._write_run_config(dispatch, conflict.record.as_dict())
+                raise StageRefused(
+                    f"line rebase conflicted: {conflict}", code="REBASE_CONFLICT"
+                ) from conflict
+            self._fold_rebase_into_record(rebase_record)
+        self._write_run_config(dispatch, rebase_record)
         # A fresh generation starts a new attempt chain. The committed feedback
         # index the carrier validates must therefore be scoped to that chain --
         # older-generation entries are archived (never erased), and the live
@@ -148,6 +168,42 @@ class ConfigureStage:
             development_id=str(dispatch.get("development_id", "")),
         )
         return StageOutcome(produced=tuple(stage.produced_artifacts))
+
+    def _write_run_config(self, dispatch: Dispatch, rebase_record: dict[str, Any] | None) -> None:
+        payload: dict[str, Any] = {
+            "development_id": dispatch.get("development_id", ""),
+            "generation": dispatch.get("generation", 1),
+            **self.run_config,
+        }
+        if rebase_record is not None:
+            # The configure log carries the rebase record (spec 阳性判据: the
+            # record is readable from the configure stage's own log).
+            payload["line_ref"] = rebase_record["line_ref"]
+            payload["rebase"] = rebase_record
+        write_json(self.repo, RUN_CONFIG_PATH, payload)
+
+    def _fold_rebase_into_record(self, rebase_record: dict[str, Any]) -> None:
+        """Fold the rebase's post-rebase base into the admission record.
+
+        Only this fold writes ``target_base_commit`` after admission, and it
+        writes what the rebase emitted -- never a fresh resolution of main.
+        """
+        if self.record_path is None:
+            return
+        try:
+            record = json.loads(self.record_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        after = str(rebase_record.get("after_line_head") or "")
+        if not after:
+            return
+        record["line_ref"] = str(rebase_record.get("line_ref") or "")
+        record["rebase"] = rebase_record
+        record["target_base_commit"] = after
+        try:
+            write_json(self.record_path.parent, self.record_path.name, record)
+        except OSError:
+            return
 
 
 @dataclass
@@ -295,6 +351,15 @@ class MergeStage:
     cost_plane: CostDataPlane | None = None
 
     def act(self, stage: Any, dispatch: Dispatch) -> StageOutcome:
+        # The dd path's hard branch boundary (M5): main is written only by
+        # the goal-level releaser, once per line. A merge stage asked to
+        # publish there is refused structurally, before any git runs.
+        if self.publish and is_main_ref(self.target_ref):
+            raise StageRefused(
+                f"merge refused: {self.target_ref!r} is the target branch; the dd path "
+                "publishes release/<line-id> only",
+                code="MAIN_PUSH_FORBIDDEN",
+            )
         result = MERGED if self.publish else PREPARED
         detail: dict[str, Any] = {}
         if self.publish:

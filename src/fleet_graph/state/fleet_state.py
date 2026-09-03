@@ -42,6 +42,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.dd.line_branch import (
+    DEFAULT_RELEASE_BEHIND_THRESHOLD,
+    release_behind_alarm,
+)
 from fleet_graph.state.run_artifacts import normalize_waiting_on
 
 log = logging.getLogger(__name__)
@@ -133,6 +137,13 @@ class FleetStateConfig:
     has_harvest_receipt: Callable[[str], bool] | None = None
     #: E5 首跑基线水位文件路径；None 用 ``<run_root>/.scheduler/e5-baseline.json``。
     harvest_baseline_path: Path | None = None
+    #: M5 ``release_behind`` 指标源：``(folder_id) -> 落后提交数 | None``，可注入
+    #: （生产用 ``line_branch.git_release_behind_reader``；任何读取失败降级为
+    #: None——「未知」绝不伪造成 0，也绝不 5xx）。None 表示未接线，字段恒为 None。
+    release_behind_reader: Callable[[str], int | None] | None = None
+    #: M5 超阈判定阈值（判定口在本仓；告警规则本体归 wf-6475fd）。默认取
+    #: design §6.4 的历史反例：落后 160 提交搁浅 54 个的死分支。
+    release_behind_threshold: int = DEFAULT_RELEASE_BEHIND_THRESHOLD
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -533,6 +544,14 @@ class FleetStateView:
             )
 
             generation = self._generation_for(run_root, folder_id, roster_generation)
+            # M5 release_behind：本线 release 分支落后目标分支的提交数。未知
+            # （未接线/读失败/分支缺失）是 None——机器可判的「未知」，不是 0。
+            release_behind: int | None = None
+            if self.config.release_behind_reader is not None:
+                try:
+                    release_behind = self.config.release_behind_reader(folder_id)
+                except Exception:
+                    release_behind = None
             line_objs.append(
                 {
                     "folder_id": folder_id,
@@ -551,6 +570,13 @@ class FleetStateView:
                     # deploy `current` symlink (that would report what the
                     # symlink points at *now*, not what the process exec'd).
                     "release_id": heartbeat.get("release_id") if heartbeat else None,
+                    # M5: the metric and its over-threshold verdict. The
+                    # determination port lives here; the alerting rule that
+                    # consumes it is wf-6475fd's and is deliberately absent.
+                    "release_behind": release_behind,
+                    "release_behind_over_threshold": release_behind_alarm(
+                        release_behind, threshold=self.config.release_behind_threshold
+                    ),
                 }
             )
         return {"schema_version": SCHEMA_VERSION, "lines": line_objs}

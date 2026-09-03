@@ -26,6 +26,7 @@ from fleet_graph.dd.capability import CapabilityLock
 from fleet_graph.dd.cost_obs import build_cost_plane
 from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder
 from fleet_graph.dd.lifecycle import Lifecycle
+from fleet_graph.dd.line_branch import LineRebase
 from fleet_graph.dd.prompt import PluginPromptSource
 from fleet_graph.executors.agent_run import AgentRunLauncher
 from fleet_graph.graphs.dd_actors import AgentRunStageActor, BoardGate
@@ -112,6 +113,13 @@ class DevelopmentConfig:
     management_cost: Any = None
     # Pushing to a durable ref is the one step here that cannot be undone.
     publish_merge: bool = False
+    #: M5: the line branch (``refs/heads/release/<line-id>``) the merge stage
+    #: publishes to and configure rebases first, when a line dispatched this
+    #: development. Empty keeps single-branch behavior byte-identical.
+    line_ref: str = ""
+    #: The admission record file configure folds its rebase record into (the
+    #: post-rebase ``target_base_commit`` freeze). None means no fold target.
+    record_path: Path | None = None
     #: The bounded principal that dispatched this development (a line folder or
     #: a human subject), threaded through to the stage run labels as
     #: `dispatched_by`. Empty lets the actor fall back to the dispatcher. Never
@@ -215,9 +223,24 @@ def build_pipeline(
 
     # Defaults that make an assembled pipeline runnable. A caller-supplied
     # entry always wins; nothing here is mandatory.
+    # M5: a line-dispatched development gets configure's fixed first step --
+    # the line branch rebased onto the target branch head -- and its merge
+    # stage publishes the line branch instead of the single's own ref.
+    line_rebase = (
+        LineRebase(
+            config.workspace_path,
+            remote_url=config.remote_url,
+            line_ref=config.line_ref,
+        )
+        if config.line_ref
+        else None
+    )
     registered: dict[str, Actor] = {
         stage_producing(lifecycle, RUN_CONFIG): ConfigureStage(
-            repo=config.workspace_path, run_config=config.run_config
+            repo=config.workspace_path,
+            run_config=config.run_config,
+            line_rebase=line_rebase,
+            record_path=config.record_path,
         ),
         stage_producing(lifecycle, ACCEPTANCE_RESULT): AcceptanceStage(
             repo=config.workspace_path,
@@ -234,7 +257,9 @@ def build_pipeline(
         stage_producing(lifecycle, MERGE_RESULT): MergeStage(
             repo=config.workspace_path,
             remote_url=config.remote_url,
-            target_ref=config.remote_ref,
+            # The merge stage's product goes into the line branch (M5); a
+            # development without a line branch keeps publishing its own ref.
+            target_ref=config.line_ref or config.remote_ref,
             publish=config.publish_merge,
             # The promotion (merge) lifecycle fact is emitted by this stage.
             cost_plane=cost_plane,

@@ -92,6 +92,7 @@ from fleet_graph.dd.evidence import (
     EvidenceLink,
 )
 from fleet_graph.dd.git import run_git
+from fleet_graph.dd.line_branch import is_valid_line_id, line_ref_for, resolve_remote_ref_head
 from fleet_graph.dd.recovery import (
     RECOVERY_MECHANISM,
     HumanRecoveryExit,
@@ -496,6 +497,15 @@ class DdLaunchSpec:
     #: no finer provenance was recorded and the runner falls back to the
     #: dispatcher. Never a run_id/uuid.
     dispatched_by: str = ""
+    #: M5: the line branch (``refs/heads/release/<line-id>``) this development
+    #: publishes to, when a line dispatched it. The runner wires configure's
+    #: first-step rebase and points the merge stage at it. Empty keeps the
+    #: single-branch-only behavior byte-identical.
+    line_ref: str = ""
+    #: The admission record file configure folds its rebase record into (the
+    #: post-rebase base freeze). Empty/None means no fold target -- test and
+    #: legacy runners keep working unchanged.
+    record_path: Path | None = None
     resume: bool = False
     launch_seq: int = 1
     #: Which generation this launch runs. The thread id, the derived run ids,
@@ -598,6 +608,10 @@ class DdLaunchSpec:
             argv += ["--board-card", self.board_card]
         if self.dispatched_by:
             argv += ["--dispatched-by", self.dispatched_by]
+        if self.line_ref:
+            argv += ["--line-ref", self.line_ref]
+        if self.record_path is not None:
+            argv += ["--record", str(self.record_path)]
         if self.resume:
             # Deliberately valueless: the gate re-reads the board on resume,
             # so whoever relaunches the unit cannot cast the verdict by it.
@@ -676,11 +690,18 @@ class DdControlPlane:
         # rather than whatever downstream failure happened to fire first. The
         # admitted verdict is persisted on the record as the B3 scope evidence.
         scope_verdict = self._require_scope(spec.decode("utf-8", errors="replace"))
-        base = self._default_target_base(repo, target_base)
+        dispatched_by = (dispatched_by or "").strip()
+        # M5: a dispatching line gets a line branch. The base freezes to that
+        # branch's head -- never to main's -- and the record carries the ref
+        # the merger will publish.
+        line_ref = line_ref_for(dispatched_by) if is_valid_line_id(dispatched_by) else ""
+        line_head = ""
+        if line_ref:
+            line_head = resolve_remote_ref_head(repo, self._origin_url(repo), line_ref) or ""
+        base = self._line_aware_base(repo, target_base, line_ref=line_ref, line_head=line_head)
         spec_digest = digest_of(spec)
         development_id = derive_development_id(repo, spec_digest, base)
         dev_root = self.root / development_id
-        dispatched_by = (dispatched_by or "").strip()
         validated_timeouts = validate_timeouts(timeouts)
 
         existing = self._read_record_if_any(development_id)
@@ -729,6 +750,10 @@ class DdControlPlane:
             "repo_path": str(repo),
             "remote_url": remote_url,
             "remote_ref": remote_ref,
+            # M5: the line branch this development publishes to when a line
+            # dispatched it (empty for a human-subject dispatch). The merger
+            # fast-forwards it; main is never on the dd path.
+            "line_ref": line_ref,
             "target_base_commit": base,
             "spec_digest": spec_digest,
             "spec_size_bytes": len(spec),
@@ -867,6 +892,45 @@ class DdControlPlane:
             raise ControlPlaneError("IDENTITY_EDITED", str(changed)) from changed
         return committed or self._resolve_target_base(repo, None)
 
+    def _line_aware_base(
+        self,
+        repo: Path,
+        target_base: str | None,
+        *,
+        line_ref: str,
+        line_head: str,
+    ) -> str:
+        """The admission base, under the release/<line-id> model (M5).
+
+        A line dispatch freezes its base to the line branch's head -- never
+        to main's. An explicit base that is not exactly the current line
+        head (in practice: a main-head base for a line whose branch exists)
+        is refused structurally and the single is not created; a line with
+        no branch yet takes the ordinary default, and the merger creates the
+        branch when it publishes the first gated single.
+        """
+        if not line_ref or not line_head:
+            return self._default_target_base(repo, target_base)
+        try:
+            committed = committed_target_base(repo)
+        except IdentityChanged as changed:
+            raise ControlPlaneError("IDENTITY_EDITED", str(changed)) from changed
+        if committed is not None:
+            # Re-admission: the committed, tamper-anchored identity wins,
+            # exactly as for a non-line dispatch.
+            return committed
+        if target_base:
+            resolved = self._resolve_target_base(repo, target_base)
+            if resolved != line_head:
+                raise ControlPlaneError(
+                    "CROSS_BRANCH_BASE",
+                    f"base {resolved[:12]} is not the head of {line_ref} ({line_head[:12]}); "
+                    "a line development freezes its base to release/<line-id>, not to "
+                    "the target branch -- main is written only by the goal-level releaser",
+                )
+            return resolved
+        return line_head
+
     def _resolve_target_base(self, repo: Path, target_base: str | None) -> str:
         ref = target_base or "HEAD"
         resolved = run_git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
@@ -925,6 +989,20 @@ class DdControlPlane:
             development_id=development_id, spec=spec, target_base_commit=base
         )
         context.write(repo)
+        # The bootstrap commit must sit on the frozen base, not on wherever
+        # HEAD happens to be: under the line model the base is the line
+        # branch's head, which a shared worktree is not checked out at. An
+        # exact-workspace run would refuse any other ancestry anyway.
+        head_now = run_git(repo, "rev-parse", "HEAD", check=True).stdout.strip()
+        if head_now != base:
+            detached = run_git(repo, "checkout", "--detach", "--force", base)
+            if detached.returncode != 0:
+                raise ControlPlaneError(
+                    "BOOTSTRAP_DETACH_FAILED",
+                    f"cannot put HEAD on the frozen base {base[:12]}: "
+                    f"{(detached.stderr or detached.stdout).strip()[:300]}",
+                    retryable=True,
+                )
         for args in (
             ("add", "--", ".dev-dispatch"),
             (
@@ -1268,6 +1346,8 @@ class DdControlPlane:
             acceptance_env=dict(record.get("acceptance_env") or {}),
             board_card=str(record.get("card_entity_id") or ""),
             dispatched_by=str(record.get("dispatched_by") or ""),
+            line_ref=str(record.get("line_ref") or ""),
+            record_path=dev_root / RECORD_FILE,
             resume=resume,
             launch_seq=seq,
             generation=generation,

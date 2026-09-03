@@ -656,6 +656,8 @@ def _dd_run(args: argparse.Namespace) -> int:
         # or a human subject), threaded to the stage run labels as
         # `dispatched_by`. Absent, the actor falls back to the dispatcher.
         dispatched_by=args.dispatched_by,
+        line_ref=args.line_ref,
+        record_path=pathlib.Path(args.record) if args.record else None,
     )
 
     board = None
@@ -1694,6 +1696,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="bounded principal that dispatched this development (a line folder "
         "or a human subject), recorded as the `dispatched_by` label on every "
         "dd-worker run; never a run_id/uuid. Empty falls back to the dispatcher",
+    )
+    dd_run.add_argument(
+        "--line-ref",
+        default="",
+        help="M5: the line branch (refs/heads/release/<line-id>) this development "
+        "publishes to when a line dispatched it. Wires configure's first-step "
+        "line rebase and points the merge stage at the line branch. Empty keeps "
+        "single-branch behavior",
+    )
+    dd_run.add_argument(
+        "--record",
+        default="",
+        help="M5: path of the admission record.json; configure folds its rebase "
+        "record (the post-rebase target_base_commit freeze) into it. Empty means "
+        "no fold target",
     )
     dd_run.add_argument(
         "--resume",

@@ -51,6 +51,11 @@ LINE_OBJ_FIELDS = {
     "run_id",
     "wake_facts_stale",
     "release_id",
+    # M5: the line branch's lag behind the target branch, and its
+    # over-threshold verdict (determination port; the alerting rule is
+    # wf-6475fd's).
+    "release_behind",
+    "release_behind_over_threshold",
 }
 
 
