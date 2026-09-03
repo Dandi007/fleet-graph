@@ -89,7 +89,12 @@ class AgentRunStub:
                 },
             }
         else:
-            declared = {"verdict": verdict, "findings": [], "review_phase": stage.id}
+            declared = {
+                "verdict": verdict,
+                "findings": [],
+                "review_phase": stage.id,
+                "checked_items": ["read the diff against the spec"],
+            }
         return RunStatus("succeeded", {"structured_result": declared})
 
 

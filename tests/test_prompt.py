@@ -330,10 +330,12 @@ class TestTheReviewPrompt:
         assert "blocker" in rendered
 
     def test_it_says_a_reviewer_must_not_write(self) -> None:
-        """A reviewer that writes to the subject workspace has its verdict
-        discarded -- REVIEWER_GIT_MUTATION in the contract's own taxonomy."""
+        """The subject workspace is read-only; experiments belong in a one-shot
+        copy, and writing the subject still voids the verdict (S12.1
+        rewording; REVIEWER_GIT_MUTATION in the contract's own taxonomy)."""
         assert "read-only" in self._rendered()
-        assert "discarded" in self._rendered()
+        assert "one-shot copy" in self._rendered()
+        assert "voids the verdict" in self._rendered()
 
     def test_it_forbids_both_directions_of_dishonesty(self) -> None:
         rendered = self._rendered()

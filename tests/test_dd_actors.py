@@ -86,7 +86,12 @@ class TestDispatchingAnLlmStage:
         its own schema and name the missing field, instead of a translation
         layer here getting between the agent and that answer.
         """
-        declared = {"verdict": "APPROVE", "findings": [], "review_phase": "continuous"}
+        declared = {
+            "verdict": "APPROVE",
+            "findings": [],
+            "review_phase": "continuous",
+            "checked_items": ["read the diff against the spec"],
+        }
         launcher = RecordingLauncher(RunStatus("succeeded", {"structured_result": declared}))
         outcome = make_actor(tmp_path, launcher).act(REVIEW, dispatch_for(REVIEW))
 

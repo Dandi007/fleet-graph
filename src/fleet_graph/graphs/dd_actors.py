@@ -22,7 +22,7 @@ board is not a decision, and the gate's answer to that is to wait.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,14 @@ from fleet_graph.cost_obs.classify import LAUNCH, REVIEW
 from fleet_graph.dd.dispatch import derive_attempt_id
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
+from fleet_graph.dd.mutation import (
+    CHECKED_ITEMS_FIELD,
+    MUTATION_TARGET_NOT_RED,
+    enumerate_mutation_targets,
+    execute_final_review_mutations,
+    validate_review_receipt,
+    verify_mutation_receipt,
+)
 from fleet_graph.executors.agent_run import (
     AgentRunLauncher,
     AgentRunSpec,
@@ -89,11 +97,57 @@ def review_stages(lifecycle: Lifecycle) -> tuple[str, ...]:
     return lifecycle.protocol_producers.get(REVIEW_ARTIFACT, ())
 
 
+def final_review_stage(lifecycle: Lifecycle) -> str | None:
+    """The contract's last review stage -- the one that owns the mutation gun."""
+    reviews = review_stages(lifecycle)
+    return reviews[-1] if reviews else None
+
+
+def is_final_review_stage(stage: Stage, lifecycle: Lifecycle) -> bool:
+    return final_review_stage(lifecycle) == stage.id
+
+
+def final_review_mutation_receipt(
+    stage: Stage,
+    lifecycle: Lifecycle,
+    *,
+    repo: Path,
+    base: str,
+    head: str,
+    acceptance_commands: list[list[str]],
+    runner: Any = None,
+    worktree_parent: Any = None,
+) -> dict[str, Any] | None:
+    """Execute the final_review stage's mutation gate, engine-side (S12.3).
+
+    The review agent does not carry the gun and neither does the dispatching
+    line: the final_review *stage* runs the mutations itself, inside a one-shot
+    worktree copy, over the targets a mechanical ``base..head`` enumeration
+    produces (:mod:`fleet_graph.dd.mutation`). A stage that is not the
+    contract's final review runs nothing. The receipt it returns is what the
+    gate later verifies -- the gate never re-runs a mutation itself.
+    """
+    if not is_final_review_stage(stage, lifecycle):
+        return None
+    return execute_final_review_mutations(
+        repo,
+        base,
+        head,
+        acceptance_commands,
+        runner=runner,
+        worktree_parent=worktree_parent,
+    )
+
+
 # The one word in the pipeline that means "go on". The contract declares which
 # values a gate_decision may carry; it does not, and cannot, say which of them
 # the pipeline should treat as consent. That is a policy, so it is written
 # down here rather than inferred from the order of a list in a JSON file.
 GATE_APPROVE = "APPROVE"
+
+#: The verdict the final_review stage reports when the engine-side mutation
+#: gate refuses: a target that survived green is the review's own REJECT.
+GATE_REJECT = "REJECT"
 
 # Failure codes from the contract's own taxonomy. Nothing here invents one:
 # an unknown code is not retryable, so guessing would turn a broken run into a
@@ -160,6 +214,12 @@ class AgentRunStageActor:
     #: Empty falls back to the dispatcher constant, the one bounded system
     #: subject always available when no finer provenance was recorded.
     dispatched_by: str = ""
+    #: When wired, a callable ``(dispatch) -> dict | None`` supplying the final
+    #: review stage's mutation-gate inputs (``repo`` / ``base`` / ``head`` /
+    #: ``acceptance_commands``, plus an optional test-only ``runner``). None
+    #: leaves the mutation gate inert -- the engine wiring decides where the
+    #: facts come from; the actor only owns the execution order.
+    mutation_inputs: Any = None
     # When wired, this actor is the responsible producer of the launch (the
     # implement stage it dispatches) and review (the continuous/final review
     # stages) lifecycle facts the cost-observability recording rules consume.
@@ -395,8 +455,81 @@ class AgentRunStageActor:
             )
 
         outcome = self._outcome_from(stage, declared)
+        outcome = self._with_final_review_mutations(stage, dispatch, outcome)
         self._record_cost_obs(stage, dispatch, outcome, envelope=status.result, run_id=run_id)
         return outcome
+
+    def _with_final_review_mutations(
+        self, stage: Stage, dispatch: Dispatch, outcome: StageOutcome
+    ) -> StageOutcome:
+        """Run the engine-side mutation gate behind the final review's verdict.
+
+        S12.3: the final_review stage executes the mutations itself, in a
+        one-shot copy, over mechanically enumerated targets -- and any target
+        that survives green means no test coverage, which *is* the review's
+        REJECT. A valid all-red receipt travels on the stage receipt, so the
+        gate downstream verifies it instead of re-running anything (S12.3's
+        "gate 只核验回执"). Unwired or non-final stages pass through untouched.
+        """
+        provider = self.mutation_inputs
+        if provider is None or not is_final_review_stage(stage, self.lifecycle):
+            return outcome
+        inputs = provider(dispatch)
+        if not isinstance(inputs, dict):
+            return outcome
+        repo = Path(inputs["repo"])
+        base = str(inputs["base"])
+        head = str(inputs["head"])
+        commands = [list(argv) for argv in inputs["acceptance_commands"]]
+        receipt = final_review_mutation_receipt(
+            stage,
+            self.lifecycle,
+            repo=repo,
+            base=base,
+            head=head,
+            acceptance_commands=commands,
+            runner=inputs.get("runner"),
+            worktree_parent=inputs.get("worktree_parent"),
+        )
+        if receipt is None:
+            return outcome
+        expected = enumerate_mutation_targets(repo, base, head)
+        verified, violations = verify_mutation_receipt(
+            receipt, expected, acceptance_commands=commands
+        )
+        receipt = {**receipt, "gate_verification": {"verified": verified, "violations": violations}}
+        if verified and receipt.get("all_red") is True:
+            prior = dict(outcome.receipt or {})
+            prior["mutation_receipt"] = receipt
+            return replace(outcome, receipt=prior)
+        summary = "; ".join(violations) or "a mutation target survived green"
+        declared = dict(outcome.receipt or {}).get("review_result") or {}
+        finding = {
+            "severity": "blocker",
+            "summary": f"final_review mutation gate refused: {summary}",
+            "location": "; ".join(
+                entry.get("location", f"{entry.get('path')}:{entry.get('line')}")
+                for entry in receipt.get("targets", [])
+                if entry.get("red") is not True
+            ),
+        }
+        return StageOutcome(
+            event=GATE_REJECT,
+            receipt={
+                "review_result": {
+                    **declared,
+                    "verdict": GATE_REJECT,
+                    "findings": [*(declared.get("findings") or []), finding],
+                    "checked_items": [
+                        *(declared.get("checked_items") or []),
+                        *receipt.get(CHECKED_ITEMS_FIELD, []),
+                    ],
+                },
+                "mutation_receipt": receipt,
+            },
+            failure_code=MUTATION_TARGET_NOT_RED,
+            detail=summary,
+        )
 
     def _record_cost_obs(
         self,
@@ -471,13 +604,22 @@ class AgentRunStageActor:
             )
 
     def _outcome_from(self, stage: Stage, declared: dict[str, Any]) -> StageOutcome:
-        """The declared result, passed on as it stands.
+        """The declared result, passed on as it stands -- after one engine check.
 
         The role's result *is* the actor result the sealer consumes -- an
         `implement.result.v1` or a `review.result.v2`. It is forwarded whole
         rather than filtered, because the plugin validates it against its own
         schema and says exactly which field is missing. A translation layer
         here would only get between the agent and that answer.
+
+        One check belongs to the engine alone (S12.5): a review receipt that
+        does not say what it checked -- the mandatory ``checked`` /
+        ``verified_items`` checklist -- is invalid even at ``findings == 0``,
+        and an invalid receipt is not a verdict the engine will carry
+        downstream. That failure is the contract's own shape failure, not a
+        new verdict: the stage fails with ``INVALID_HANDOFF_SCHEMA`` and the
+        bounded retry machinery owns what happens next. A result with no
+        verdict at all is not a receipt, and keeps its own semantics below.
 
         A result with no verdict reports the spine event. For a stage the
         contract steers a verdict out of, that is not a quiet approval: the
@@ -488,6 +630,14 @@ class AgentRunStageActor:
         event = (
             str(verdict).strip() if isinstance(verdict, str) and verdict.strip() else SPINE_EVENT
         )
+        if stage.id in review_stages(self.lifecycle) and event != SPINE_EVENT:
+            violations = validate_review_receipt(declared)
+            if violations:
+                return StageOutcome(
+                    event=FAILURE_EVENT,
+                    failure_code=INVALID_HANDOFF_SCHEMA,
+                    detail="review receipt invalid: " + "; ".join(violations),
+                )
         if stage.id in review_stages(self.lifecycle):
             receipt: dict[str, Any] | None = {"review_result": declared}
         else:
@@ -600,11 +750,15 @@ class BoardGate:
 __all__ = [
     "DEFAULT_ROLES",
     "GATE_APPROVE",
+    "GATE_REJECT",
     "PRODUCT_ARTIFACT",
     "ROLE_STAGE",
     "AgentRunStageActor",
     "BoardGate",
+    "final_review_mutation_receipt",
+    "final_review_stage",
     "implement_stage",
+    "is_final_review_stage",
     "review_stages",
     "stage_role",
 ]

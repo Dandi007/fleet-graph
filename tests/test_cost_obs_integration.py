@@ -82,7 +82,11 @@ class Launcher:
     def wait(self, ticket: RunTicket, **kwargs: Any) -> RunStatus:
         stage = self._stage_by_run[ticket.run_id]
         if stage in review_stages(LIFECYCLE):
-            declared: dict[str, Any] = {"verdict": "APPROVE", "findings": []}
+            declared: dict[str, Any] = {
+                "verdict": "APPROVE",
+                "findings": [],
+                "checked_items": ["read the diff against the spec"],
+            }
         else:
             declared = {
                 "actor_job_id": "job-1",

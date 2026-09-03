@@ -1476,6 +1476,50 @@ class DdControlPlane:
         gate_report["resume"] = self._launch(record, resume=True, generation=generation)
         return gate_report
 
+    def record_gate_refusal(
+        self,
+        development_id: str,
+        *,
+        reason: str,
+        unit_exit_code: int | None = None,
+        source: str = "decision_mcp",
+    ) -> dict[str, Any]:
+        """S10: leave a refused gate delivery on the single, durably.
+
+        "The process died and the record never changed a word" is what made
+        gate refusals recoverable only by reading the systemd journal
+        afterwards. A refusal -- a workspace that does not exist, a resume that
+        launched a unit which died with the single still at ``awaiting_gate`` --
+        is written into the generation's result (the same ``gate_refused`` fact
+        the status rebuild already surfaces) and appended to the generation's
+        ``events.jsonl``, so the refusal is queryable through the read model
+        the operator already reads. Last refusal wins on the status fact; the
+        event log keeps the full history.
+        """
+        record = self._record(development_id)
+        generation = self._generation(record)
+        gen_root = self._gen_root(development_id, generation)
+        refusal: dict[str, Any] = {
+            "reason": str(reason),
+            "unit_exit_code": unit_exit_code,
+            "source": str(source),
+            "at": iso(self.clock()),
+        }
+        result = self._read_result(development_id, generation) or {}
+        result["gate_refused"] = refusal
+        write_json_durable(gen_root / RESULT_FILE, result)
+        with (gen_root / EVENTS_FILE).open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {"event": "gate_refused", "generation": generation, **refusal},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+        self.rebuild_status(development_id)
+        return refusal
+
     def _resume_claim_path(self, development_id: str, generation: int, action_key: str) -> Path:
         digest = hashlib.sha256(action_key.encode("utf-8")).hexdigest()
         return (

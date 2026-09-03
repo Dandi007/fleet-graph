@@ -144,6 +144,37 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return raw if isinstance(raw, dict) else None
 
 
+def _merge_result_path(generation: int) -> str:
+    """The merger stage's committed artifact path, matching the engine's own."""
+    from fleet_graph.dd.control_plane import merge_result_path
+
+    return merge_result_path(generation)
+
+
+def merge_result_committed(record: dict[str, Any]) -> bool:
+    """S7: has this development's merge segment actually landed?
+
+    The merger stage commits its result artifact
+    (``.dev-dispatch/merge/result-g<generation>.json``) into the development's
+    repo; its presence at ``HEAD`` is the mechanical "merge 完成" fact. The
+    development's generation comes from the admission record; an unreadable
+    repo or a failing git reads as "not merged" (fail-closed), never an
+    exception -- this check sits inside a table scan that must degrade per
+    entry.
+    """
+    repo = str(record.get("repo_path") or "")
+    if not repo:
+        return False
+    try:
+        generation = max(1, int(record.get("generation") or 1))
+    except (TypeError, ValueError):
+        generation = 1
+    from fleet_graph.dd.git import run_git
+
+    result = run_git(Path(repo), "cat-file", "-e", f"HEAD:{_merge_result_path(generation)}", "--")
+    return result.returncode == 0
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     """One JSONL artifact, fail-soft: bad lines degrade away, never a crash."""
     try:
@@ -589,12 +620,21 @@ class FleetStateView:
         return {"schema_version": SCHEMA_VERSION, "enrollments": _read_enroll_queue(self.config)}
 
     def harvestable(self) -> dict[str, Any]:
-        """The M2 E5 data plane: complete developments with no harvest receipt.
+        """The M2 E5 data plane: complete developments whose merge has landed.
 
         E5 ``approved_unharvested`` ⇔ ``terminal == "complete"`` **and** the
         card carries no harvest receipt (an ``evidence`` note whose idempotency
         key starts with ``evidence-``). ``refused`` / ``fault`` / any non-complete
         terminal / in-flight developments are **never** listed.
+
+        S7 (2026-09-03): the trigger point is *after the merge segment*, not
+        after the gate. A complete terminal already implies the pipeline's own
+        merger stage sealed; this view additionally requires the committed
+        merge-result artifact in the development's repo, so a development whose
+        gate said APPROVE but whose merge never landed is never harvestable.
+        The check is mechanical (``git cat-file -e HEAD:<merge-result-path>``)
+        and degrades per entry: an unreadable repo drops the entry, never the
+        table.
 
         First-run baseline exemption (direction B, per the E7 ``e7_baseline``
         precedent): the first observation adopts the current complete set as
@@ -630,6 +670,11 @@ class FleetStateView:
             # refused / fault / any non-complete terminal / in-flight never
             # listed (目标语义): only `complete` can be approved_unharvested.
             if terminal != "complete":
+                continue
+            if not merge_result_committed(record):
+                # S7: the harvest reactor fires after the merge segment. A
+                # gate-approver whose merge result artifact is absent from the
+                # repo's HEAD is not harvestable, whatever its terminal says.
                 continue
             if first_run:
                 # 首跑基线豁免：存量 complete 一次性出清，不入列。

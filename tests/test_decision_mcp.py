@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -32,9 +33,6 @@ import pytest
 from fleet_graph.decision_bridge.owners import (
     OWNER_KIND_DD,
     OWNER_KIND_LINE,
-    RESUME_REFUSED,
-    RESUME_RESUMED,
-    OwnerResult,
     OwnerTarget,
 )
 from fleet_graph.decision_mcp import (
@@ -43,7 +41,6 @@ from fleet_graph.decision_mcp import (
     CODE_DD_NOT_FOUND,
     CODE_LINE_NOT_PARKED,
     CODE_NO_WAITING_PARTY,
-    CODE_OWNER_REFUSED,
     CODE_QUESTION_CARD_UNRESOLVED,
     DECISION_APPROVE,
     DECISION_REJECT,
@@ -107,7 +104,13 @@ ROSTER = [{"folder_id": "wf-1", "seat": "s", "generation": 2}]
 
 
 class FakePlane:
-    """A dd control-plane stub: ``get`` answers known/awaiting vs unknown."""
+    """A dd control-plane stub: ``get`` answers known/awaiting vs unknown.
+
+    M3/S10+S11 fidelity: the single's read model carries its dispatching
+    principal and an existing ``worktree_path``, and ``gate`` actually moves
+    the single out of ``awaiting_gate`` (a started unit owns the state) while
+    recording the resume -- the unified delivery path drives exactly this.
+    """
 
     def __init__(self, source: FakeDdSource) -> None:
         self._source = source
@@ -116,12 +119,40 @@ class FakePlane:
         from fleet_graph.dd.control_plane import ControlPlaneError
 
         if development_id in self._source._awaiting:
-            return {"development_id": development_id, "state": "awaiting_gate"}
+            target = self._source._awaiting[development_id]
+            return {
+                "development_id": development_id,
+                "state": target.state,
+                "dispatched_by": target.dispatched_by,
+                "generation": target.generation,
+                "awaiting": {
+                    "question_note_id": target.question_note_id,
+                    "card_entity_id": target.card_entity_id,
+                },
+                "worktree_path": str(self._source.worktree or ""),
+                "unit_exit_code": None,
+            }
         if development_id in self._source._known:
-            return {"development_id": development_id, "state": "running"}
+            return {
+                "development_id": development_id,
+                "state": "running",
+                "dispatched_by": self._source.dispatched_by,
+                "generation": 1,
+                "worktree_path": str(self._source.worktree or ""),
+            }
         raise ControlPlaneError(
             "DEVELOPMENT_NOT_FOUND", f"no admission record for {development_id}"
         )
+
+    def gate(
+        self, development_id: str, resume: bool = False, action_key: str | None = None
+    ) -> dict[str, Any]:
+        assert resume is True
+        self._source.resumes.append((development_id, action_key or ""))
+        target = self._source._awaiting.get(development_id)
+        if target is not None:
+            self._source._awaiting[development_id] = replace(target, state="running")
+        return {"resume": {"development_id": development_id}}
 
 
 class FakeDdSource:
@@ -129,28 +160,27 @@ class FakeDdSource:
 
     ``awaiting`` maps development id -> OwnerTarget (a waiting dd gate);
     ``known`` names developments the control plane has on record but whose
-    state is *not* awaiting_gate; anything else is unknown. ``resume`` records
-    its calls and answers ``resumed``.
+    state is *not* awaiting_gate; anything else is unknown. Since M3 unified
+    the dd delivery forms, the control plane stub carries the resume: the
+    identity check happens before it, on the ``principal``.
     """
 
     def __init__(
         self,
         awaiting: dict[str, OwnerTarget] | None = None,
         known: set[str] | None = None,
+        *,
+        worktree: Path | None = None,
+        dispatched_by: str = "wf-1",
     ) -> None:
         self._awaiting = dict(awaiting or {})
         self._known = set(known or {})
-        self.resumes: list[tuple[OwnerTarget, str]] = []
+        self.worktree = worktree
+        self.dispatched_by = dispatched_by
+        self.resumes: list[tuple[str, str]] = []
 
     def _control_plane(self) -> FakePlane:
         return FakePlane(self)
-
-    def discover_all(self) -> list[OwnerTarget]:
-        return list(self._awaiting.values())
-
-    def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
-        self.resumes.append((target, action_key))
-        return OwnerResult(RESUME_RESUMED, "resumed")
 
 
 def _dd_target(dev: str = "dev-abc", *, generation: int = 1) -> OwnerTarget:
@@ -161,6 +191,7 @@ def _dd_target(dev: str = "dev-abc", *, generation: int = 1) -> OwnerTarget:
         question_note_id="q-1",
         card_entity_id="card-1",
         state="awaiting_gate",
+        dispatched_by="wf-1",
     )
 
 
@@ -173,6 +204,8 @@ def _call(
     target_kind: str = TARGET_KIND_LINE,
     target_id: str = "",
     dd_source: FakeDdSource | None = None,
+    principal: str = "wf-1",
+    dd: Any = None,
 ) -> DeliveryResult:
     return deliver_decision(
         line=line,
@@ -183,6 +216,8 @@ def _call(
         target_kind=target_kind,
         target_id=target_id,
         dd_source=dd_source,
+        principal=principal,
+        dd=dd,
     )
 
 
@@ -523,7 +558,10 @@ class TestDdGateDelivery:
     """
 
     def test_awaiting_dd_gate_is_delivered_and_consumed(self, tmp_path: Path) -> None:
-        dd_source = FakeDdSource(awaiting={"dev-abc": _dd_target()})
+        dd_source = FakeDdSource(
+            awaiting={"dev-abc": _dd_target()},
+            worktree=tmp_path,
+        )
         result = _call(
             tmp_path,
             target_kind=TARGET_KIND_DD,
@@ -537,11 +575,11 @@ class TestDdGateDelivery:
         assert result.target["id"] == "dev-abc"
         assert result.target["question_note_id"] == "q-1"
         assert result.target["card_entity_id"] == "card-1"
-        assert result.target["resume_status"] == RESUME_RESUMED
-        assert dd_source.resumes == [(_dd_target(), "mcp:dd:dev-abc:g1:APPROVE")]
+        assert result.target["resume_status"] == "resumed"
+        assert dd_source.resumes == [("dev-abc", "mcp:dd:dev-abc:g1:APPROVE")]
 
     def test_reject_is_also_a_valid_dd_verdict(self, tmp_path: Path) -> None:
-        dd_source = FakeDdSource(awaiting={"dev-abc": _dd_target()})
+        dd_source = FakeDdSource(awaiting={"dev-abc": _dd_target()}, worktree=tmp_path)
         result = _call(
             tmp_path,
             decision=DECISION_REJECT,
@@ -598,27 +636,37 @@ class TestDdGateDelivery:
         with pytest.raises(DecisionPayloadError, match="target_kind must be"):
             _call(tmp_path, target_kind="folder", target_id="dev-abc")
 
-    def test_owner_side_refusal_surfaces_as_owner_refused(self, tmp_path: Path) -> None:
-        class RefusingDdSource(FakeDdSource):
-            def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
-                return OwnerResult(RESUME_REFUSED, "gate refused")
+    def test_a_gate_that_refuses_the_resume_surfaces_the_refusal(self, tmp_path: Path) -> None:
+        """A gate error comes back as an explicit refusal naming its cause --
+        never a swallow and never a guessed verdict."""
+        from fleet_graph.dd.control_plane import ControlPlaneError
 
+        class RefusingPlane(FakePlane):
+            def gate(
+                self, development_id: str, resume: bool = False, action_key: str | None = None
+            ) -> dict[str, Any]:
+                raise ControlPlaneError("CHECKPOINT_MISSING", "no durable checkpoint to resume")
+
+        dd_source = FakeDdSource(awaiting={"dev-abc": _dd_target()}, worktree=tmp_path)
+        dd_source._control_plane = lambda: RefusingPlane(dd_source)  # type: ignore[method-assign]
         result = _call(
             tmp_path,
             target_kind=TARGET_KIND_DD,
             target_id="dev-abc",
-            dd_source=RefusingDdSource(awaiting={"dev-abc": _dd_target()}),
+            dd_source=dd_source,
         )
         assert result.status == OUTCOME_REFUSED
-        assert result.code == CODE_OWNER_REFUSED
+        assert result.code == "CHECKPOINT_MISSING"
+        assert "CHECKPOINT_MISSING" in result.message
 
     def test_dd_delivery_reaches_the_client(self, tmp_path: Path) -> None:
-        """The tool wiring carries target_kind/target_id to the dd path."""
+        """The tool wiring carries target_kind/target_id (and principal) to the
+        unified dd path."""
         from fastmcp import Client
 
         from test_dd_service import running_server
 
-        dd_source = FakeDdSource(awaiting={"dev-abc": _dd_target()})
+        dd_source = FakeDdSource(awaiting={"dev-abc": _dd_target()}, worktree=tmp_path)
         server = build_decision_mcp_server(tmp_path, ROSTER, dd_source=dd_source)
 
         async def call(url: str) -> dict[str, Any]:
@@ -630,6 +678,7 @@ class TestDdGateDelivery:
                         "reason": "live",
                         "target_kind": "dd",
                         "target_id": "dev-abc",
+                        "principal": "wf-1",
                     },
                 )
                 return json.loads(result.content[0].text)

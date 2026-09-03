@@ -17,6 +17,7 @@ bridge.sqlite3 fixture) drive the load-bearing cases:
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -470,6 +471,28 @@ class TestDecisionsView:
 # --- /v1/harvestable --------------------------------------------------------
 
 
+def _merged_repo(path: Path) -> Path:
+    """A repo whose HEAD carries the merger stage's committed result artifact.
+
+    S7: a development is harvestable only after its merge segment landed, and
+    the mechanical fact is the committed ``.dev-dispatch/merge/result-g1.json``.
+    """
+    if (path / ".git").exists():
+        return path
+    path.mkdir(parents=True, exist_ok=True)
+    merge_dir = path / ".dev-dispatch" / "merge"
+    merge_dir.mkdir(parents=True)
+    (merge_dir / "result-g1.json").write_text(json.dumps({"merged": True}), encoding="utf-8")
+    for argv in (
+        ["init", "-q", "-b", "main"],
+        ["add", "-A"],
+        ["-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "-m", "merge"],
+    ):
+        proc = subprocess.run(["git", "-C", str(path), *argv], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+    return path
+
+
 def write_dd_development(
     dd_root: Path,
     development_id: str,
@@ -480,11 +503,17 @@ def write_dd_development(
     missing_status: bool = False,
     missing_record: bool = False,
     card_entity_id: str = "",
+    repo: Path | None = None,
+    merge_landed: bool = True,
 ) -> None:
     dev_dir = dd_root / development_id
     dev_dir.mkdir(parents=True, exist_ok=True)
+    if repo is None:
+        repo = dev_dir / "repo"
+    if merge_landed and not missing_record:
+        _merged_repo(repo)
     if not missing_record:
-        record: dict[str, Any] = {"development_id": development_id, "repo_path": "/tmp/x"}
+        record: dict[str, Any] = {"development_id": development_id, "repo_path": str(repo)}
         if card_entity_id:
             record["card_entity_id"] = card_entity_id
         (dev_dir / "record.json").write_text(json.dumps(record), encoding="utf-8")
@@ -585,15 +614,29 @@ class TestHarvestableView:
         """交付 D.5 首跑基线豁免：147 条历史 complete（无回执）首跑全部出清不在
         列；此后新增一条 complete 无回执 → 该条入列。"""
         dd_root = tmp_path / "dd"
+        shared_repo = tmp_path / "shared-repo"
         for i in range(147):
             dev_id = f"dev-hist-{i:03d}"
-            write_dd_development(dd_root, dev_id, head_commit=f"h{i}", terminal="complete")
+            write_dd_development(
+                dd_root, dev_id, head_commit=f"h{i}", terminal="complete", repo=shared_repo
+            )
         view = FleetStateView(self._config(tmp_path))
         payload = view.harvestable()
         assert payload["developments"] == []
         write_dd_development(dd_root, "dev-new", head_commit="n1", terminal="complete")
         payload = view.harvestable()
         assert [d["development_id"] for d in payload["developments"]] == ["dev-new"]
+
+    def test_complete_whose_merge_never_landed_is_never_listed(self, tmp_path: Path) -> None:
+        """S7：收割触发点在 merge 段之后 —— 闸后未 merge 的 complete 不入列。"""
+        dd_root = tmp_path / "dd"
+        view = self._baselined(self._config(tmp_path), dd_root)
+        write_dd_development(
+            dd_root, "dev-unmerged", head_commit="u1", terminal="complete", merge_landed=False
+        )
+        write_dd_development(dd_root, "dev-merged", head_commit="m1", terminal="complete")
+        payload = view.harvestable()
+        assert [d["development_id"] for d in payload["developments"]] == ["dev-merged"]
 
     def test_missing_status_or_record_degrades_the_entry(self, tmp_path: Path) -> None:
         dd_root = tmp_path / "dd"

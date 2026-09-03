@@ -98,7 +98,11 @@ class _RecordingLauncher:
     def wait(self, ticket: RunTicket, **kwargs: Any) -> RunStatus:
         stage = self._stage_by_run[ticket.run_id]
         if stage in self._review_ids:
-            declared: dict[str, Any] = {"verdict": "APPROVE", "findings": []}
+            declared: dict[str, Any] = {
+                "verdict": "APPROVE",
+                "findings": [],
+                "checked_items": ["read the diff against the spec"],
+            }
             tokens: float = REVIEW_TOKENS
         else:
             declared = {

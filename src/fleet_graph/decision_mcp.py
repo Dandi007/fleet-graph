@@ -137,6 +137,15 @@ CODE_DD_NOT_AWAITING_GATE = "DD_NOT_AWAITING_GATE"
 CODE_NOT_DISPATCHING_LINE = "NOT_DISPATCHING_LINE"
 CODE_DD_UNKNOWN = "DD_UNKNOWN"
 
+#: S10 refusals. ``DD_WORKSPACE_MISSING`` fires *before* any unit is started --
+#: a single whose workspace path does not exist would only launch a unit
+#: destined to die within a second, so the refusal happens first. A resume that
+#: reports success while the single is still sitting at ``awaiting_gate`` is
+#: ``DD_GATE_NOT_CONSUMED``: "I started a unit" is not "the verdict was
+#: consumed", and only the single's own state decides which one happened.
+CODE_DD_WORKSPACE_MISSING = "DD_WORKSPACE_MISSING"
+CODE_DD_GATE_NOT_CONSUMED = "DD_GATE_NOT_CONSUMED"
+
 #: Prometheus metric names emitted by the ledger's textfile.
 METRIC_DELIVERED = "fleet_graph_decision_delivered_total"
 METRIC_REFUSED = "fleet_graph_decision_refused_total"
@@ -152,6 +161,11 @@ DEFAULT_STATE_DIR = Path("/data/fleet-graph/decision-mcp")
 #: The dd control plane's root; where ``target_kind=dd`` deliveries resolve the
 #: waiting development (the same default ``DdOwnerSource`` reads).
 DEFAULT_DD_ROOT = Path("/data/fleet-graph/dd")
+
+#: The scheduler run root; where the dispatching line's wake facts are written
+#: after a consumed dd delivery. Used as the fail-safe default when a direct
+#: :func:`deliver_decision_dd` call supplies no run root.
+DEFAULT_RUN_ROOT = Path("/data/fleet-graph/runs")
 
 #: M2 dd-gate delivery vocabulary. A ``decision_deliver`` target in the
 #: ``dev-fg-<id>`` form (the deterministic development id the dd control plane
@@ -332,6 +346,41 @@ def _wake_dispatching_line(run_root: Path, folder_id: str, at: float) -> None:
         pass
 
 
+def _trace_gate_refusal(
+    dd: Any,
+    development_id: str,
+    *,
+    reason: str,
+    unit_exit_code: int | None = None,
+) -> None:
+    """S10: leave a refused resume on the single (`gate_refused` + events).
+
+    Every refusal past identity resolution -- a missing workspace, a gate
+    resume that raised, a resume that launched a unit which died with the
+    single still at ``awaiting_gate`` -- is recorded on the development via the
+    control plane's ``record_gate_refusal`` (the ``gate_refused`` status fact
+    plus an ``events.jsonl`` append). Best-effort: the trace must never mask
+    the refusal it is recording, and a plane without the recorder (an older
+    fake) still gets its refusal answered.
+    """
+    recorder = getattr(dd, "record_gate_refusal", None)
+    if not callable(recorder):
+        return
+    with contextlib.suppress(Exception):
+        recorder(development_id, reason=reason, unit_exit_code=unit_exit_code)
+
+
+def _unit_exit_code(status: dict[str, Any]) -> int | None:
+    """The dead unit's exit code from the read model, when it carries one.
+
+    Production read models are growing this fact; its absence reads as
+    ``None`` and the refusal says so explicitly rather than inventing a code
+    nobody measured.
+    """
+    code = status.get("unit_exit_code")
+    return code if isinstance(code, int) else None
+
+
 def _deliver_dd(
     *,
     development_id: str,
@@ -341,19 +390,23 @@ def _deliver_dd(
     dd: Any,
     clock: Callable[[], float],
 ) -> DeliveryResult:
-    """The synchronous dd-gate delivery (M2).
+    """The synchronous dd-gate delivery (M2), and the *only* dd path (S11).
 
-    A dd single is delivered through its existing gate-release path: the
+    A dd single is delivered through its existing gate-release path. The
     caller's ``principal`` must equal the single's ``record.json.dispatched_by``
-    (else ``NOT_DISPATCHING_LINE`` and the development is untouched), the single
-    must be ``awaiting_gate``, and the gate resume then wakes the dispatching
-    line. Every refusal is a structured :class:`DeliveryResult`, never a
-    swallowed HTTP-200.
+    (else ``NOT_DISPATCHING_LINE`` and the development is untouched). S10 then
+    makes the resume honest: the workspace must exist *before* a unit is
+    started, and the verdict only counts as delivered once the single's own
+    state has left ``awaiting_gate`` -- "a unit was started" never substitutes
+    for "the decision was consumed". Every refusal past identity resolution is
+    traced onto the single (``gate_refused`` + ``events.jsonl``). Every refusal
+    is a structured :class:`DeliveryResult`, never a swallowed HTTP-200.
     """
     try:
         status = dd.get(development_id)
     except Exception as exc:  # a read failure is an explicit refusal, not a swallow
-        code = str(getattr(exc, "code", "") or CODE_DD_UNKNOWN)
+        raw = str(getattr(exc, "code", "") or "")
+        code = CODE_DD_NOT_FOUND if raw == "DEVELOPMENT_NOT_FOUND" else (raw or CODE_DD_UNKNOWN)
         return DeliveryResult(
             status=OUTCOME_REFUSED,
             code=code,
@@ -390,6 +443,34 @@ def _deliver_dd(
             decision=decision,
         )
 
+    # S10, third duty: check the workspace *before* starting anything. A
+    # single whose workspace path does not exist can only launch a unit that
+    # dies within a second -- refuse before that, with the reason on record.
+    workspace_raw = status.get("worktree_path")
+    workspace = (
+        Path(str(workspace_raw).strip())
+        if isinstance(workspace_raw, str) and workspace_raw.strip()
+        else None
+    )
+    if workspace is None or not workspace.is_dir():
+        reason_missing = (
+            f"workspace {workspace_raw!r} does not exist"
+            if workspace is not None
+            else f"dd single {development_id!r} carries no resolvable workspace path"
+        )
+        _trace_gate_refusal(dd, development_id, reason=reason_missing)
+        return DeliveryResult(
+            status=OUTCOME_REFUSED,
+            code=CODE_DD_WORKSPACE_MISSING,
+            message=(
+                f"refused before launching any unit: {reason_missing}; the resume "
+                "would only start a unit destined to die (S10: validate the "
+                "workspace before the unit)"
+            ),
+            line=development_id,
+            decision=decision,
+        )
+
     generation = int(status.get("generation") or 1)
     awaiting = status.get("awaiting") or {}
     question_note_id = str(awaiting.get("question_note_id") or "")
@@ -400,10 +481,12 @@ def _deliver_dd(
         result = dd.gate(development_id, resume=True, action_key=action_key)
     except Exception as exc:  # the gate refused: report it, never a swallow
         code = str(getattr(exc, "code", "") or CODE_DD_NOT_AWAITING_GATE)
+        reason_refused = f"gate resume refused for {development_id!r}: {type(exc).__name__}: {exc}"
+        _trace_gate_refusal(dd, development_id, reason=reason_refused)
         return DeliveryResult(
             status=OUTCOME_REFUSED,
             code=code,
-            message=f"gate resume refused for {development_id!r}: {type(exc).__name__}: {exc}",
+            message=reason_refused,
             line=development_id,
             decision=decision,
             generation=generation,
@@ -412,10 +495,39 @@ def _deliver_dd(
         )
 
     if not (isinstance(result, dict) and result.get("resume")):
+        reason_no_resume = f"gate did not resume {development_id!r}"
+        _trace_gate_refusal(dd, development_id, reason=reason_no_resume)
         return DeliveryResult(
             status=OUTCOME_REFUSED,
             code=CODE_DD_NOT_AWAITING_GATE,
-            message=f"gate did not resume {development_id!r}",
+            message=reason_no_resume,
+            line=development_id,
+            decision=decision,
+            generation=generation,
+            question_note_id=question_note_id,
+            card_entity_id=card_entity_id,
+        )
+
+    # S10, first duty: the success criterion is *consumption*, not "a unit was
+    # started". Re-read the single's own state: until it has left
+    # ``awaiting_gate``, the verdict was not consumed, no matter what the
+    # resume call returned -- report REFUSED with the unit exit code when the
+    # read model carries one, and never a delivered/consumed.
+    after = dd.get(development_id)
+    if isinstance(after, dict) and str(after.get("state") or "") == STATE_AWAITING_GATE:
+        exit_code = _unit_exit_code(after)
+        reason_not_consumed = (
+            f"resume started a unit but {development_id!r} is still "
+            f"{STATE_AWAITING_GATE!r}: the verdict was not consumed"
+            + (f" (unit exit code {exit_code})" if exit_code is not None else "")
+        )
+        _trace_gate_refusal(
+            dd, development_id, reason=reason_not_consumed, unit_exit_code=exit_code
+        )
+        return DeliveryResult(
+            status=OUTCOME_REFUSED,
+            code=CODE_DD_GATE_NOT_CONSUMED,
+            message=reason_not_consumed,
             line=development_id,
             decision=decision,
             generation=generation,
@@ -435,8 +547,8 @@ def _deliver_dd(
         card_entity_id=card_entity_id,
         action_key=action_key,
         message=(
-            "delivered and consumed: dd single resumed through its gate and the "
-            f"dispatching line {dispatched_by!r} was woken"
+            "delivered and consumed: dd single left awaiting_gate through its gate "
+            f"resume and the dispatching line {dispatched_by!r} was woken"
         ),
         target={
             "kind": OWNER_KIND_DD,
@@ -475,14 +587,24 @@ def deliver_decision(
 
     M2: a ``dev-fg-<id>`` ``line`` routes to the dd gate path, validated against
     the caller's ``principal`` (which must equal the single's ``dispatched_by``).
+
+    S11: the two dd delivery forms are one path. ``target_kind="dd"`` +
+    ``target_id`` (form A) and ``line="dev-fg-<id>"`` (form B) both resolve to
+    :func:`_deliver_dd`, which enforces the ``principal`` == ``dispatched_by``
+    check -- there is no dd delivery shape left that skips the authorization
+    check.
     """
     kind = _normalize_target_kind(target_kind)
     if kind == TARGET_KIND_DD:
-        return deliver_decision_dd(
-            target_id=target_id,
+        if not isinstance(target_id, str) or not target_id.strip():
+            raise DecisionPayloadError("target_id is required for a dd target")
+        return _deliver_dd(
+            development_id=target_id.strip(),
             decision=decision,
-            reason=reason,
-            dd_source=dd_source if dd_source is not None else DdOwnerSource(DEFAULT_DD_ROOT),
+            principal=principal,
+            run_root=run_root,
+            dd=_resolve_dd_plane(target_id, decision, dd_source=dd_source, dd=dd),
+            clock=clock,
         )
 
     line, decision, reason = _validate(line, decision, reason)
@@ -588,114 +710,62 @@ def deliver_decision(
     )
 
 
+def _resolve_dd_plane(
+    target_id: str,
+    decision: str,
+    *,
+    dd_source: DdOwnerSource | None,
+    dd: Any,
+) -> Any:
+    """The single dd control plane both delivery forms drive (S11 unification).
+
+    An explicitly bound plane wins; otherwise the plane is derived from the
+    bound ``dd_source``'s own control-plane factory -- so a server built with a
+    ``dd_source`` keeps resolving against that source's root, never against a
+    second root that could disagree with it.
+    """
+    if dd is not None:
+        return dd
+    factory = getattr(dd_source, "_control_plane", None)
+    if callable(factory):
+        return factory()
+    from fleet_graph.dd.control_plane import DdControlPlane
+
+    return DdControlPlane(root=DEFAULT_DD_ROOT)
+
+
 def deliver_decision_dd(
     *,
     target_id: str,
     decision: str,
     reason: str,
-    dd_source: DdOwnerSource,
+    dd_source: DdOwnerSource | None = None,
+    principal: str = "",
+    run_root: Path | None = None,
+    dd: Any = None,
+    clock: Callable[[], float] = time.time,
 ) -> DeliveryResult:
     """Deliver one decision to a dd development gate, synchronously.
 
-    The caller names the dd development by id; the server resolves the pending
-    question/card from the dd control plane's ``awaiting_gate`` record and
-    delivers the verdict through ``DdControlPlane.gate(development_id,
-    resume=True)``. An unknown dd, a dd that is not awaiting the gate, or an
-    owner-side refusal each map to a distinct, explicit refusal -- never a
-    silent HTTP-200 swallow.
+    S11: this is no longer a second dd path. It validates its payload and then
+    delegates to the same principal-checked :func:`_deliver_dd` core form B
+    uses -- ``principal`` must equal the single's ``dispatched_by`` or the
+    delivery is refused ``NOT_DISPATCHING_LINE``. An unknown dd, a dd that is
+    not awaiting the gate, a missing workspace, or a resume that never consumed
+    each map to a distinct, explicit refusal -- never a silent HTTP-200 swallow.
     """
     if not isinstance(target_id, str) or not target_id.strip():
         raise DecisionPayloadError("target_id is required for a dd target")
     target_id = target_id.strip()
     decision, reason = _validate_verdict(decision, reason)
 
-    try:
-        target, refusal = _resolve_dd_target(dd_source, target_id)
-    except Exception as exc:
-        return DeliveryResult(
-            status=OUTCOME_REFUSED,
-            code=CODE_OWNER_REFUSED,
-            message=f"dd control plane unavailable: {type(exc).__name__}: {exc}",
-            line=target_id,
-            decision=decision,
-        )
-    if refusal is not None:
-        return DeliveryResult(
-            status=OUTCOME_REFUSED,
-            code=refusal,
-            message=_dd_refusal_message(refusal, target_id),
-            line=target_id,
-            decision=decision,
-        )
-
-    action_key = f"mcp:dd:{target.id}:g{target.generation}:{decision}"
-    owner_result = dd_source.resume(target, action_key)
-    if owner_result.status == RESUME_REFUSED:
-        return DeliveryResult(
-            status=OUTCOME_REFUSED,
-            code=CODE_OWNER_REFUSED,
-            message=f"owner refused delivery: {owner_result.detail}",
-            line=target_id,
-            decision=decision,
-            generation=target.generation,
-            question_note_id=target.question_note_id,
-            card_entity_id=target.card_entity_id,
-        )
-
-    return DeliveryResult(
-        status=OUTCOME_DELIVERED,
-        line=target_id,
+    return _deliver_dd(
+        development_id=target_id,
         decision=decision,
-        generation=target.generation,
-        question_note_id=target.question_note_id,
-        card_entity_id=target.card_entity_id,
-        action_key=action_key,
-        message=(
-            f"delivered and consumed: dd gate {target.id} resumed through the "
-            f"control plane ({owner_result.status})"
-        ),
-        target={
-            "kind": target.kind,
-            "id": target.id,
-            "generation": target.generation,
-            "question_note_id": target.question_note_id,
-            "card_entity_id": target.card_entity_id,
-            "resume_status": owner_result.status,
-        },
-    )
-
-
-def _resolve_dd_target(
-    dd_source: DdOwnerSource, target_id: str
-) -> tuple[OwnerTarget | None, str | None]:
-    """(awaiting dd target, None) or (None, closed refusal code).
-
-    The awaiting owner is found by development id among the control plane's
-    ``awaiting_gate`` rows; when the id is absent from those rows, the control
-    plane is asked whether the development exists at all, so an unknown dd
-    (``DD_NOT_FOUND``) is distinguished from a dd that is admitted but not
-    awaiting the gate (``DD_NOT_AWAITING_GATE``).
-    """
-    from fleet_graph.dd.control_plane import ControlPlaneError
-
-    for target in dd_source.discover_all():
-        if target.id == target_id:
-            return target, None
-    try:
-        dd_source._control_plane().get(target_id)
-    except ControlPlaneError as exc:
-        if exc.code == "DEVELOPMENT_NOT_FOUND":
-            return None, CODE_DD_NOT_FOUND
-        raise
-    return None, CODE_DD_NOT_AWAITING_GATE
-
-
-def _dd_refusal_message(code: str, target_id: str) -> str:
-    if code == CODE_DD_NOT_FOUND:
-        return f"no such dd development: {target_id!r} is not admitted"
-    return (
-        f"dd development {target_id!r} is not awaiting the gate; "
-        "deliver only to a development in awaiting_gate state"
+        principal=principal,
+        run_root=run_root if run_root is not None else DEFAULT_RUN_ROOT,
+        dd=_resolve_dd_plane(target_id, decision, dd_source=dd_source, dd=dd),
+        clock=clock,
     )
 
 
@@ -990,9 +1060,11 @@ def serve(
 __all__ = [
     "ALLOWED_DECISIONS",
     "ALLOWED_TARGET_KINDS",
+    "CODE_DD_GATE_NOT_CONSUMED",
     "CODE_DD_NOT_AWAITING_GATE",
     "CODE_DD_NOT_FOUND",
     "CODE_DD_UNKNOWN",
+    "CODE_DD_WORKSPACE_MISSING",
     "CODE_LINE_NOT_PARKED",
     "CODE_NOT_DISPATCHING_LINE",
     "CODE_NO_WAITING_PARTY",
@@ -1004,6 +1076,7 @@ __all__ = [
     "DEFAULT_DD_ROOT",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
+    "DEFAULT_RUN_ROOT",
     "DEFAULT_STATE_DIR",
     "MCP_SERVER_NAME",
     "METRIC_DELIVERED",

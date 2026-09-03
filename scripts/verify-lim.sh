@@ -20,7 +20,7 @@
 # 用法：
 #   bash scripts/verify-lim.sh                 # 跑全部 16 项
 #   bash scripts/verify-lim.sh --check 03      # 只跑指定项（01–16）
-#   bash scripts/verify-lim.sh --check 12      # check 12 只对一个不存在合成 id 探针投递
+#   bash scripts/verify-lim.sh --check 12      # check 12 对一张真实非本方派单的 awaiting 单投递，断言 NOT_DISPATCHING_LINE（S11 修订）
 #   bash scripts/verify-lim.sh --window-seconds 3600   # 覆盖 check 11/13/14 的时间窗
 #
 # 退出码：等于 FAIL 项数（0–16，全绿为 0）。
@@ -351,20 +351,27 @@ if needs_check 11; then
 fi
 
 # ---------------- 12 foreign-delivery-refused ----------------
+# S11 修订（2026-09-03）：探针原用不存在的合成 id 走默认线路径，先撞
+# NO_WAITING_PARTY / DEVELOPMENT_NOT_FOUND 就返回，永远到不了身份校验分支——
+# 既没证明校验在、也没证明校验不在。改用真实存在、且非本方派单的
+# awaiting_gate 单（dev-fg-36c2d76baca7，wf-8d9737 M2 r1 真机单），以空
+# principal（形态等价：line 填 dev-fg- 号即走 dd 闸路径）投递，断言必须拿到
+# NOT_DISPATCHING_LINE——这条判据证明的是「身份校验在且生效」。
 if needs_check 12; then
-    res="$(mcp_json "$DECISION_MCP" 'tools/call' "{\"name\":\"decision_deliver\",\"arguments\":{\"line\":\"$SELFTEST_LINE\",\"decision\":\"REJECT\",\"reason\":\"verify-lim check12 foreign-delivery-refused selftest probe\"}}")"
+    foreign_dd="dev-fg-36c2d76baca7"
+    res="$(mcp_json "$DECISION_MCP" 'tools/call' "{\"name\":\"decision_deliver\",\"arguments\":{\"line\":\"$foreign_dd\",\"decision\":\"REJECT\",\"reason\":\"verify-lim check12 foreign-delivery-refused probe (S11): non-dispatching principal on a real awaiting single\",\"principal\":\"\"}}")"
     if [ -z "$res" ]; then
-        emit 12 foreign-delivery-refused FAIL "decision :$DECISION_MCP 不可达（空响应/连接失败），无法投递合成探针"
+        emit 12 foreign-delivery-refused FAIL "decision :$DECISION_MCP 不可达（空响应/连接失败），无法投递身份探针"
     else
         text="$(printf '%s' "$res" | jq -r '.result.structuredContent // .result.content[0].text // empty' 2>/dev/null)"
         code="$(printf '%s' "$text" | jq -r '.code // empty' 2>/dev/null)"
         status="$(printf '%s' "$text" | jq -r '.status // empty' 2>/dev/null)"
-        if [ "$status" = "accepted" ] || printf '%s' "$text" | grep -qi 'accepted'; then
-            emit 12 foreign-delivery-refused FAIL "对外线合成 id ${SELFTEST_LINE} 投递 REJECT 被接受（ACCEPTED），严重红：${text}"
-        elif [ "$code" = "NOT_DISPATCHING_LINE" ]; then
-            emit 12 foreign-delivery-refused PASS "投递被拒且码含 NOT_DISPATCHING_LINE：${text}"
+        if [ "$code" = "NOT_DISPATCHING_LINE" ] && [ "$status" = "refused" ]; then
+            emit 12 foreign-delivery-refused PASS "非派单方对真实 awaiting 单 ${foreign_dd} 投递被拒，code=NOT_DISPATCHING_LINE：${text}"
+        elif [ "$status" = "delivered" ]; then
+            emit 12 foreign-delivery-refused FAIL "非派单方对 ${foreign_dd} 的投递被接受（delivered/consumed）——身份校验不生效，严重红：${text}"
         else
-            emit 12 foreign-delivery-refused FAIL "返回非 NOT_DISPATCHING_LINE 的结构化拒绝码（code=${code:-无}, status=${status:-无}），原文: ${text}（M2 前必红）"
+            emit 12 foreign-delivery-refused FAIL "返回非 NOT_DISPATCHING_LINE 的结构化拒绝码（code=${code:-无}, status=${status:-无}），原文: ${text}（S11 修订后必绿；若该单不在 awaiting_gate 则另择真实在闸单号更新探针）"
         fi
     fi
 fi

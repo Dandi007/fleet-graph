@@ -49,7 +49,13 @@ ROSTER: list[Any] = [{"folder_id": "wf-1", "seat": "s", "generation": 2}]
 
 
 class FakeDdPlane:
-    """A duck-typed dd control plane: ``get`` + ``gate`` only."""
+    """A duck-typed dd control plane: ``get`` + ``gate`` only.
+
+    Fidelity notes (M3/S10): the resume actually moves the single out of
+    ``awaiting_gate`` (a started unit owns the state), and the read model
+    carries the single's ``worktree_path`` -- the fact the delivery core now
+    verifies *before* starting any unit.
+    """
 
     def __init__(
         self,
@@ -58,6 +64,7 @@ class FakeDdPlane:
         dispatched_by: str = DISPATCHER,
         generation: int = 2,
         awaiting: dict[str, str] | None = None,
+        worktree: Path | None = None,
     ) -> None:
         self.state = state
         self.dispatched_by = dispatched_by
@@ -66,6 +73,7 @@ class FakeDdPlane:
             "question_note_id": "q-dd-1",
             "card_entity_id": "card-dd-1",
         }
+        self.worktree = worktree
         self.resumed: list[tuple[str, str]] = []
 
     def get(self, development_id: str) -> dict[str, Any]:
@@ -75,6 +83,7 @@ class FakeDdPlane:
             "dispatched_by": self.dispatched_by,
             "generation": self.generation,
             "awaiting": self.awaiting,
+            "worktree_path": str(self.worktree) if self.worktree is not None else "",
         }
 
     def gate(
@@ -82,6 +91,8 @@ class FakeDdPlane:
     ) -> dict[str, Any]:
         assert resume is True
         self.resumed.append((development_id, action_key or ""))
+        # The resume starts the unit; the single leaves awaiting_gate.
+        self.state = "running"
         return {
             "state": self.state,
             "development_id": development_id,
@@ -121,6 +132,11 @@ def _call(
     decision: str = DECISION_APPROVE,
     principal: str = DISPATCHER,
 ) -> DeliveryResult:
+    # The single's workspace exists in these drills (the run root doubles as
+    # it); the S10 pre-launch workspace refusals are covered in depth by
+    # tests/test_m3_line_selfgate.py.
+    if plane.worktree is None:
+        plane.worktree = run_root
     return deliver_decision(
         line=line,
         decision=decision,
@@ -131,6 +147,14 @@ def _call(
         dd=plane,
         clock=lambda: 1_700_000_123.0,
     )
+
+
+@pytest.fixture
+def plane_worktree(tmp_path: Path) -> Path:
+    """The single's workspace, which must exist before any unit is started."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    return workspace
 
 
 class TestPositiveDdDelivery:

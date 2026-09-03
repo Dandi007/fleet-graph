@@ -228,8 +228,11 @@ every review artifact it references; together with the immutable cross-generatio
 feedback archive at `{history_path}` (older generations' entries, never erased)
 they are the complete feedback history. The live index is scoped to the current
 generation's attempt chain, so earlier-generation records appear in the archive,
-not in the index. Do not modify anything: this is a read-only review, and a
-reviewer that writes to the subject workspace has its verdict discarded.
+not in the index. The subject workspace is read-only for you: it must survive
+your review byte-identical. Any verification experiment you need to run --
+mutation testing included -- belongs in a one-shot copy (a throwaway worktree
+or a temporary directory) that you discard afterwards. Writing to the subject
+workspace still voids the verdict.
 
 ## Your verdict
 
@@ -255,15 +258,19 @@ key, no outer `effects` key. Echo these back verbatim:
 }}
 ```
 
-and add these three, which are yours to determine:
+and add these four, which are yours to determine:
 
 - `verdict`: `APPROVE` or `REJECT`
 - `findings`: an array, possibly empty, of
   `{{"severity": "blocker"|"major"|"minor"|"note", "summary": "...", "location": "..."}}`
   -- `location` is optional; `severity` and `summary` are not
+- `checked_items`: a non-empty array of what you actually checked, one entry
+  per check. Mandatory even when `findings` is empty -- a review that records
+  no verified items is an invalid receipt, because a green nobody can audit
+  later is only recoverable by re-reading the journal
 - `reviewer_model`: the model you are running as
 
-All eleven keys must be present, and nothing else.\
+All twelve keys must be present, and nothing else.\
 """
 
 
