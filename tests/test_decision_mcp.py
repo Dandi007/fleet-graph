@@ -29,11 +29,21 @@ from typing import Any
 
 import pytest
 
-from fleet_graph.decision_bridge.owners import OWNER_KIND_LINE
+from fleet_graph.decision_bridge.owners import (
+    OWNER_KIND_DD,
+    OWNER_KIND_LINE,
+    RESUME_REFUSED,
+    RESUME_RESUMED,
+    OwnerResult,
+    OwnerTarget,
+)
 from fleet_graph.decision_mcp import (
     ALLOWED_DECISIONS,
+    CODE_DD_NOT_AWAITING_GATE,
+    CODE_DD_NOT_FOUND,
     CODE_LINE_NOT_PARKED,
     CODE_NO_WAITING_PARTY,
+    CODE_OWNER_REFUSED,
     CODE_QUESTION_CARD_UNRESOLVED,
     DECISION_APPROVE,
     DECISION_REJECT,
@@ -42,11 +52,14 @@ from fleet_graph.decision_mcp import (
     MCP_SERVER_NAME,
     OUTCOME_DELIVERED,
     OUTCOME_REFUSED,
+    TARGET_KIND_DD,
+    TARGET_KIND_LINE,
     DecisionPayloadError,
     DeliveryLedger,
     DeliveryResult,
     build_decision_mcp_server,
     deliver_decision,
+    deliver_decision_dd,
     load_reserved_ports,
 )
 
@@ -93,12 +106,73 @@ def _parked_but_unresolved(run_root: Path, folder_id: str) -> Path:
 ROSTER = [{"folder_id": "wf-1", "seat": "s", "generation": 2}]
 
 
+class FakePlane:
+    """A dd control-plane stub: ``get`` answers known/awaiting vs unknown."""
+
+    def __init__(self, source: FakeDdSource) -> None:
+        self._source = source
+
+    def get(self, development_id: str) -> dict[str, Any]:
+        from fleet_graph.dd.control_plane import ControlPlaneError
+
+        if development_id in self._source._awaiting:
+            return {"development_id": development_id, "state": "awaiting_gate"}
+        if development_id in self._source._known:
+            return {"development_id": development_id, "state": "running"}
+        raise ControlPlaneError(
+            "DEVELOPMENT_NOT_FOUND", f"no admission record for {development_id}"
+        )
+
+
+class FakeDdSource:
+    """An in-memory ``DdOwnerSource`` stand-in for the decision MCP dd path.
+
+    ``awaiting`` maps development id -> OwnerTarget (a waiting dd gate);
+    ``known`` names developments the control plane has on record but whose
+    state is *not* awaiting_gate; anything else is unknown. ``resume`` records
+    its calls and answers ``resumed``.
+    """
+
+    def __init__(
+        self,
+        awaiting: dict[str, OwnerTarget] | None = None,
+        known: set[str] | None = None,
+    ) -> None:
+        self._awaiting = dict(awaiting or {})
+        self._known = set(known or {})
+        self.resumes: list[tuple[OwnerTarget, str]] = []
+
+    def _control_plane(self) -> FakePlane:
+        return FakePlane(self)
+
+    def discover_all(self) -> list[OwnerTarget]:
+        return list(self._awaiting.values())
+
+    def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
+        self.resumes.append((target, action_key))
+        return OwnerResult(RESUME_RESUMED, "resumed")
+
+
+def _dd_target(dev: str = "dev-abc", *, generation: int = 1) -> OwnerTarget:
+    return OwnerTarget(
+        kind=OWNER_KIND_DD,
+        id=dev,
+        generation=generation,
+        question_note_id="q-1",
+        card_entity_id="card-1",
+        state="awaiting_gate",
+    )
+
+
 def _call(
     run_root: Path,
     line: str = "wf-1",
     decision: str = DECISION_APPROVE,
     reason: str = "live drill",
     roster: list[Any] | None = None,
+    target_kind: str = TARGET_KIND_LINE,
+    target_id: str = "",
+    dd_source: FakeDdSource | None = None,
 ) -> DeliveryResult:
     return deliver_decision(
         line=line,
@@ -106,6 +180,9 @@ def _call(
         reason=reason,
         run_root=run_root,
         lines=roster if roster is not None else ROSTER,
+        target_kind=target_kind,
+        target_id=target_id,
+        dd_source=dd_source,
     )
 
 
@@ -249,10 +326,19 @@ class TestMcpSurface:
     def test_the_tool_lists_its_required_arguments(self) -> None:
         server = build_decision_mcp_server(Path("/tmp"), ROSTER)
         tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
-        params = set(tools["decision_deliver"].parameters["properties"])
-        assert {"line", "decision", "reason"} <= params
-        required = set(tools["decision_deliver"].parameters.get("required") or params)
-        assert {"line", "decision", "reason"} <= required
+        schema = tools["decision_deliver"].parameters
+        params = set(schema["properties"])
+        # The target is explicit in the schema: a distinct target_kind plus a
+        # distinct target_id, so a line never shares one string with a dd id.
+        assert {"line", "decision", "reason", "target_kind", "target_id"} <= params
+        required = set(schema.get("required") or params)
+        assert {"decision", "reason"} <= required
+        # The three-arg line path stays backward-compatible: line/target_kind/
+        # target_id are optional, and target_kind defaults to the line path.
+        assert "line" not in required
+        assert "target_kind" not in required
+        assert "target_id" not in required
+        assert schema["properties"]["target_kind"]["default"] == TARGET_KIND_LINE
 
     def test_invalid_payload_reaches_the_client_machine_readably(self, tmp_path: Path) -> None:
         from fastmcp import Client
@@ -423,3 +509,134 @@ class TestCli:
         from fleet_graph.cli import _decision_serve
 
         assert "from fleet_graph.decision_mcp import serve" in inspect.getsource(_decision_serve)
+
+
+class TestDdGateDelivery:
+    """M2(a): the decision surface delivers to a dd gate, not just a line.
+
+    A dd target is resolved server-side from the dd control plane's
+    ``awaiting_gate`` record and resumed through ``DdControlPlane.gate(resume=True)``,
+    exercised here over an isolated dd owner. An unknown dd, a non-awaiting dd,
+    and a dd id mis-delivered down the line path are each an explicit refusal --
+    never a silent swallow and never the "read the line stall state" bypass that
+    would surface a dd id as ``LINE_NOT_PARKED``.
+    """
+
+    def test_awaiting_dd_gate_is_delivered_and_consumed(self, tmp_path: Path) -> None:
+        dd_source = FakeDdSource(awaiting={"dev-abc": _dd_target()})
+        result = _call(
+            tmp_path,
+            target_kind=TARGET_KIND_DD,
+            target_id="dev-abc",
+            dd_source=dd_source,
+        )
+        assert result.status == OUTCOME_DELIVERED
+        assert result.as_dict()["outcome"] == "consumed"
+        assert result.target is not None
+        assert result.target["kind"] == OWNER_KIND_DD
+        assert result.target["id"] == "dev-abc"
+        assert result.target["question_note_id"] == "q-1"
+        assert result.target["card_entity_id"] == "card-1"
+        assert result.target["resume_status"] == RESUME_RESUMED
+        assert dd_source.resumes == [(_dd_target(), "mcp:dd:dev-abc:g1:APPROVE")]
+
+    def test_reject_is_also_a_valid_dd_verdict(self, tmp_path: Path) -> None:
+        dd_source = FakeDdSource(awaiting={"dev-abc": _dd_target()})
+        result = _call(
+            tmp_path,
+            decision=DECISION_REJECT,
+            reason="do not merge",
+            target_kind=TARGET_KIND_DD,
+            target_id="dev-abc",
+            dd_source=dd_source,
+        )
+        assert result.status == OUTCOME_DELIVERED
+        assert result.decision == DECISION_REJECT
+        assert result.action_key == "mcp:dd:dev-abc:g1:REJECT"
+
+    def test_unknown_dd_is_an_explicit_refusal(self, tmp_path: Path) -> None:
+        result = _call(
+            tmp_path,
+            target_kind=TARGET_KIND_DD,
+            target_id="dev-nope",
+            dd_source=FakeDdSource(),
+        )
+        assert result.status == OUTCOME_REFUSED
+        assert result.code == CODE_DD_NOT_FOUND
+
+    def test_a_dd_not_awaiting_the_gate_is_an_explicit_refusal(self, tmp_path: Path) -> None:
+        result = _call(
+            tmp_path,
+            target_kind=TARGET_KIND_DD,
+            target_id="dev-busy",
+            dd_source=FakeDdSource(known={"dev-busy"}),
+        )
+        assert result.status == OUTCOME_REFUSED
+        assert result.code == CODE_DD_NOT_AWAITING_GATE
+
+    def test_a_dd_id_delivered_down_the_line_path_is_refused_not_treated_as_line(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression guard for the swallow: a dd development id routed down the
+        *line* path is an explicit refusal (the line roster does not know it),
+        never a read of the line stall-state that would answer LINE_NOT_PARKED."""
+        result = _call(tmp_path, line="dev-abc")
+        assert result.status == OUTCOME_REFUSED
+        assert result.code == CODE_NO_WAITING_PARTY
+        assert result.code != CODE_LINE_NOT_PARKED
+
+    def test_missing_target_id_for_a_dd_target_is_a_call_point_error(self) -> None:
+        with pytest.raises(DecisionPayloadError, match="target_id is required"):
+            deliver_decision_dd(
+                target_id="  ",
+                decision=DECISION_APPROVE,
+                reason="x",
+                dd_source=FakeDdSource(),
+            )
+
+    def test_an_unknown_target_kind_is_a_call_point_error(self, tmp_path: Path) -> None:
+        with pytest.raises(DecisionPayloadError, match="target_kind must be"):
+            _call(tmp_path, target_kind="folder", target_id="dev-abc")
+
+    def test_owner_side_refusal_surfaces_as_owner_refused(self, tmp_path: Path) -> None:
+        class RefusingDdSource(FakeDdSource):
+            def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
+                return OwnerResult(RESUME_REFUSED, "gate refused")
+
+        result = _call(
+            tmp_path,
+            target_kind=TARGET_KIND_DD,
+            target_id="dev-abc",
+            dd_source=RefusingDdSource(awaiting={"dev-abc": _dd_target()}),
+        )
+        assert result.status == OUTCOME_REFUSED
+        assert result.code == CODE_OWNER_REFUSED
+
+    def test_dd_delivery_reaches_the_client(self, tmp_path: Path) -> None:
+        """The tool wiring carries target_kind/target_id to the dd path."""
+        from fastmcp import Client
+
+        from test_dd_service import running_server
+
+        dd_source = FakeDdSource(awaiting={"dev-abc": _dd_target()})
+        server = build_decision_mcp_server(tmp_path, ROSTER, dd_source=dd_source)
+
+        async def call(url: str) -> dict[str, Any]:
+            async with Client(url) as client:
+                result = await client.call_tool(
+                    "decision_deliver",
+                    {
+                        "decision": "APPROVE",
+                        "reason": "live",
+                        "target_kind": "dd",
+                        "target_id": "dev-abc",
+                    },
+                )
+                return json.loads(result.content[0].text)
+
+        with running_server(server) as url:
+            payload = asyncio.run(call(url))
+        assert payload["status"] == OUTCOME_DELIVERED
+        assert payload["outcome"] == "consumed"
+        assert payload["target"]["kind"] == OWNER_KIND_DD
+        assert payload["target"]["id"] == "dev-abc"
