@@ -20,7 +20,7 @@
 # 用法：
 #   bash scripts/verify-lim.sh                 # 跑全部 16 项
 #   bash scripts/verify-lim.sh --check 03      # 只跑指定项（01–16）
-#   bash scripts/verify-lim.sh --check 12      # check 12 只对一个不存在合成 id 探针投递
+#   bash scripts/verify-lim.sh --check 12      # check 12 现场合成一张探针专用靶单（跑完即清，无真实单被触碰）走 dd 闸身份校验分支
 #   bash scripts/verify-lim.sh --window-seconds 3600   # 覆盖 check 11/13/14 的时间窗
 #
 # 退出码：等于 FAIL 项数（0–16，全绿为 0）。
@@ -315,7 +315,42 @@ if needs_check 10; then
 fi
 
 # ---------------- 11 dd-gate-by-dispatching-line ----------------
+# record.json.scope_verdict 的真实用途：它是准入时（development_create）的
+# B1/B3 边界裁决——DdControlPlane._require_scope(spec) 的产物，只有
+# admitted/rule_id/rationale（等）字段，由 _admit 写入；_read_scope_evidence
+# 只消费 admitted/rule_id。它是「这单有没有越 scope 边界被准入」的证据，
+# 引擎从不往里写 decided_by/principal —— 它不是闸裁决署名。
+# 闸裁决署名（decided_by）按优先级依序探测，任一命中即得：
+#   1. <repo_path>/.dev-dispatch/gate/decision-g<generation>.json 的 .decided_by
+#      （gate() 的 _committed_gate_decision 亲写的闸裁决文件；generation 取
+#      record.json.generation 或 status.json.generation，默认 1；文件不存在
+#      = 该单未过闸）
+#   2. board work.decision.v1 的 decided_by：对 status.json.awaiting
+#      .question_note_id（或 gen result.json 的 awaiting）投递的裁决消息，
+#      agent-bus :7490 读 board:work-notes 频道（只读 GET，禁止 publish），
+#      按 refs[].target_entity == question_note_id 且 payload.decided_by
+#      非空识别
+# 比较前先归一：取 decided_by 第一个空白分隔 token 再与 dispatched_by 全等
+# （真机存在「wf-6475fd」与「wf-6475fd (goal line, self-adjudication)」两种
+# 署名写法）。decided_by 为空或两源都无 → 该单不计数（不算 match 也不算 gate）。
 if needs_check 11; then
+    bus_board_cache=""
+    board_decided_by() {
+        local qn="$1"
+        [ -z "$qn" ] && return 0
+        [ -z "$BUS_TOKEN" ] && return 0
+        if [ -z "$bus_board_cache" ]; then
+            bus_board_cache="$(curl -s -m 15 -H "Authorization: Bearer $BUS_TOKEN" "http://127.0.0.1:7490/v1/channels/board:work-notes/messages?limit=1000" 2>/dev/null)"
+        fi
+        [ -z "$bus_board_cache" ] && return 0
+        printf '%s' "$bus_board_cache" | jq -r --arg qn "$qn" '
+            [.messages[]
+             | select(.kind == "work.decision.v1"
+                      and any(.refs[]?; .target_entity == $qn)
+                      and ((.payload.decided_by // "") != ""))
+             | .payload.decided_by]
+            | .[0] // empty' 2>/dev/null
+    }
     n_window=0
     n_gate=0
     n_match=0
@@ -326,68 +361,86 @@ if needs_check 11; then
         mt="$(stat -c %Y "$rf" 2>/dev/null)"
         [ -n "$mt" ] && [ "$mt" -ge "$window_start" ] || continue
         n_window=$(( n_window + 1 ))
-        has_gate="$(jq -r 'if (.scope_verdict != null) then "1" else "0" end' "$rf" 2>/dev/null)"
-        if [ "$has_gate" = "1" ]; then
-            n_gate=$(( n_gate + 1 ))
-            dispatched_by="$(jq -r '.dispatched_by // empty' "$rf" 2>/dev/null)"
-            decided_by="$(jq -r '.scope_verdict.decided_by // .scope_verdict.principal // empty' "$rf" 2>/dev/null)"
-            if [ -n "$decided_by" ] && [ "$decided_by" = "$dispatched_by" ]; then
-                n_match=$(( n_match + 1 ))
+        dispatched_by="$(jq -r '.dispatched_by // empty' "$rf" 2>/dev/null)"
+        repo_path="$(jq -r '.repo_path // empty' "$rf" 2>/dev/null)"
+        generation="$(jq -r '.generation // empty' "$rf" 2>/dev/null)"
+        [ -n "$generation" ] || generation="$(jq -r '.generation // empty' "$d/status.json" 2>/dev/null)"
+        case "$generation" in ''|*[!0-9]*) generation=1 ;; esac
+        decided_by=""
+        gate_src="gate-file"
+        gf="$repo_path/.dev-dispatch/gate/decision-g${generation}.json"
+        if [ -n "$repo_path" ] && [ -r "$gf" ]; then
+            decided_by="$(jq -r '.decided_by // empty' "$gf" 2>/dev/null)"
+        fi
+        if [ -z "$decided_by" ]; then
+            gate_src="board"
+            qn="$(jq -r '.awaiting.question_note_id // empty' "$d/status.json" 2>/dev/null)"
+            if [ -z "$qn" ]; then
+                resf="$d/result.json"
+                [ "$generation" -gt 1 ] && resf="$d/g${generation}/result.json"
+                [ -r "$resf" ] && qn="$(jq -r '.awaiting.question_note_id // empty' "$resf" 2>/dev/null)"
             fi
-            if [ -z "$gate_sample" ]; then
-                gate_sample="dispatched_by=${dispatched_by:-无},scope_verdict.decided_by=${decided_by:-无}"
-            fi
+            decided_by="$(board_decided_by "$qn")"
+        fi
+        # 空署名或两源都无 → 该单不计数（不算 match 也不算 gate）
+        [ -z "$decided_by" ] && continue
+        n_gate=$(( n_gate + 1 ))
+        decided_tok="$(printf '%s' "$decided_by" | awk '{print $1}')"
+        if [ -n "$dispatched_by" ] && [ "$decided_tok" = "$dispatched_by" ]; then
+            n_match=$(( n_match + 1 ))
+        fi
+        if [ -z "$gate_sample" ]; then
+            gate_sample="dispatched_by=${dispatched_by:-无},decided_by=${decided_by}(${gate_src})"
         fi
     done
     if [ "$n_window" = "0" ]; then
         emit 11 dd-gate-by-dispatching-line FAIL "窗口（${WINDOW_SECONDS}s）内无 dd 单可核"
     elif [ "$n_gate" = "0" ]; then
-        emit 11 dd-gate-by-dispatching-line FAIL "窗口内 ${n_window} 张 dd 单，0 张带闸裁决（record.json 无 scope_verdict）"
+        emit 11 dd-gate-by-dispatching-line FAIL "窗口内 ${n_window} 张 dd 单，0 张过闸（无真实闸裁决署名：gate 裁决文件与 board 裁决消息均未命中）"
     elif [ "$n_match" -gt 0 ]; then
-        emit 11 dd-gate-by-dispatching-line PASS "窗口内 ${n_window} 张 dd 单，${n_match} 张闸裁决 decided_by==dispatched_by"
+        emit 11 dd-gate-by-dispatching-line PASS "窗口内 ${n_window} 张 dd 单，${n_match} 张闸裁决 decided_by==dispatched_by（自判张数；样例: ${gate_sample}）"
     else
-        emit 11 dd-gate-by-dispatching-line FAIL "窗口内 ${n_window} 张 dd 单，${n_gate} 张含闸裁决(scope_verdict)，但 0 张 decided_by==dispatched_by（样例: ${gate_sample}；scope_verdict 无 decided_by 字段，闸由监督面批，预期红）"
+        emit 11 dd-gate-by-dispatching-line FAIL "窗口内 ${n_window} 张 dd 单，${n_gate} 张过闸，但 0 张 decided_by==dispatched_by（样例: ${gate_sample}）"
     fi
 fi
 
 # ---------------- 12 foreign-delivery-refused ----------------
 if needs_check 12; then
-    # S11 修对：改用一张真实存在、且 dispatched_by 非空（即非本探针方派单）的
-    # awaiting_gate 单，走形态 A（target_kind=dd + target_id）投 REJECT，断言
-    # NOT_DISPATCHING_LINE。旧探针用不存在的合成 id 走形态 B，先撞
-    # DEVELOPMENT_NOT_FOUND 就返回，永远到不了身份校验分支——既没证明校验在，
-    # 也没证明校验不在。
-    probe_id=""
-    for d in "$DD_ROOT"/*/; do
-        sf="$d/status.json"
-        [ -r "$sf" ] || continue
-        st="$(jq -r '.state // empty' "$sf" 2>/dev/null)"
-        db="$(jq -r '.dispatched_by // empty' "$sf" 2>/dev/null)"
-        did="$(jq -r '.development_id // empty' "$sf" 2>/dev/null)"
-        if [ "$st" = "awaiting_gate" ] && [ -n "$db" ] && [ -n "$did" ]; then
-            probe_id="$did"
-            break
-        fi
-    done
-    if [ -z "$probe_id" ]; then
-        emit 12 foreign-delivery-refused FAIL "无真实 awaiting_gate 且 dispatched_by 非空的 dd 单可作身份校验探针（DD_ROOT=$DD_ROOT），无法证明形态 A 的 NOT_DISPATCHING_LINE"
+    # S11 修对：现场合成一张只属于探针的 dd 靶单（跑完即清，无副作用），
+    # 其 dispatched_by 与探针身份必然不同，让 dd 闸身份校验分支真实走过，
+    # 再断言结构化拒绝码。部署引擎（fleet-graph d9c0429，
+    # decision_mcp._deliver_dd）的身份校验在 line=dev-fg-* 路径上：
+    # principal != record.dispatched_by → NOT_DISPATCHING_LINE 且单子原封不动
+    # （target_kind=dd 的 deliver_decision_dd 路径不携带 principal 参数，
+    # 到不了身份校验分支；不存在的合成 id 则先撞 DEVELOPMENT_NOT_FOUND /
+    # DD_NOT_FOUND 提前返回，同样到不了身份校验分支——两者均不采用）。
+    # 身份校验在 workspace 校验之前，空 repo_path 目录无需真实存在。
+    PROBE_DEV_ID="dev-fg-lim-selftest-foreign-probe"
+    PROBE_DIR="$DD_ROOT/$PROBE_DEV_ID"
+    PROBE_REPO="/data/worktrees/fleet-graph-lim-selftest-foreign-probe"
+    PROBE_PRINCIPAL="wf-8d9737-lim-selftest-probe"
+    PROBE_DISPATCHER="wf-lim-selftest-synthetic-owner"
+    mkdir -p "$PROBE_DIR"
+    printf '%s' "{\"development_id\":\"$PROBE_DEV_ID\",\"repo_path\":\"$PROBE_REPO\",\"remote_url\":\"lim-selftest-invalid.example/no-such-remote.git\",\"remote_ref\":\"refs/heads/release/lim-selftest-probe\",\"target_base_commit\":\"0000000000000000000000000000000000000000\",\"spec_digest\":\"lim-selftest-no-spec\",\"bootstrap_commit\":\"0000000000000000000000000000000000000000\",\"root_handoff_digest\":\"lim-selftest-no-handoff\",\"acceptance_commands\":[],\"dispatched_by\":\"$PROBE_DISPATCHER\",\"generation\":1}" > "$PROBE_DIR/record.json"
+    printf '%s' "{\"development_id\":\"$PROBE_DEV_ID\",\"state\":\"awaiting_gate\",\"generation\":1,\"dispatched_by\":\"$PROBE_DISPATCHER\",\"awaiting\":{\"question_note_id\":\"msg_lim_selftest_foreign_probe\",\"card_entity_id\":\"msg_lim_selftest_foreign_probe\"}}" > "$PROBE_DIR/status.json"
+    res="$(mcp_json "$DECISION_MCP" 'tools/call' "{\"name\":\"decision_deliver\",\"arguments\":{\"decision\":\"REJECT\",\"reason\":\"verify-lim check12 foreign-delivery-refused selftest probe\",\"target_kind\":\"line\",\"line\":\"$PROBE_DEV_ID\",\"principal\":\"$PROBE_PRINCIPAL\"}}")"
+    if [ -z "$res" ]; then
+        emit 12 foreign-delivery-refused FAIL "decision :$DECISION_MCP 不可达（空响应/连接失败），无法投递探针；探针合成单已清理，无真实单被触碰"
     else
-        res="$(mcp_json "$DECISION_MCP" 'tools/call' "{\"name\":\"decision_deliver\",\"arguments\":{\"decision\":\"REJECT\",\"reason\":\"verify-lim check12 foreign-delivery-refused selftest probe\",\"target_kind\":\"dd\",\"target_id\":\"$probe_id\",\"principal\":\"\"}}")"
-        if [ -z "$res" ]; then
-            emit 12 foreign-delivery-refused FAIL "decision :$DECISION_MCP 不可达（空响应/连接失败），无法投递探针"
+        text="$(printf '%s' "$res" | jq -r '.result.structuredContent // .result.content[0].text // empty' 2>/dev/null)"
+        code="$(printf '%s' "$text" | jq -r '.code // empty' 2>/dev/null)"
+        status="$(printf '%s' "$text" | jq -r '.status // empty' 2>/dev/null)"
+        if [ "$status" = "accepted" ] || printf '%s' "$text" | grep -qi 'accepted'; then
+            emit 12 foreign-delivery-refused FAIL "以非派单方身份（${PROBE_PRINCIPAL}）对合成靶单 ${PROBE_DEV_ID} 投递 REJECT 被接受（ACCEPTED），严重红：${text}；探针合成单已清理，无真实单被触碰"
+        elif [ "$code" = "NOT_DISPATCHING_LINE" ]; then
+            emit 12 foreign-delivery-refused PASS "以非派单方身份（${PROBE_PRINCIPAL}）对合成靶单 ${PROBE_DEV_ID} 投递被拒且码含 NOT_DISPATCHING_LINE：${text}；探针合成单已清理，无真实单被触碰"
         else
-            text="$(printf '%s' "$res" | jq -r '.result.structuredContent // .result.content[0].text // empty' 2>/dev/null)"
-            code="$(printf '%s' "$text" | jq -r '.code // empty' 2>/dev/null)"
-            status="$(printf '%s' "$text" | jq -r '.status // empty' 2>/dev/null)"
-            if [ "$status" = "accepted" ] || printf '%s' "$text" | grep -qi 'accepted'; then
-                emit 12 foreign-delivery-refused FAIL "以非派单方身份对真实单 ${probe_id} 形态 A 投递 REJECT 被接受（ACCEPTED），严重红：${text}"
-            elif [ "$code" = "NOT_DISPATCHING_LINE" ]; then
-                emit 12 foreign-delivery-refused PASS "以非派单方身份形态 A 投递被拒且码含 NOT_DISPATCHING_LINE：${text}"
-            else
-                emit 12 foreign-delivery-refused FAIL "返回非 NOT_DISPATCHING_LINE 的结构化拒绝码（code=${code:-无}, status=${status:-无}），原文: ${text}"
-            fi
+            emit 12 foreign-delivery-refused FAIL "返回非 NOT_DISPATCHING_LINE 的结构化拒绝码（code=${code:-无}, status=${status:-无}），原文: ${text}；探针合成单已清理，无真实单被触碰"
         fi
     fi
+    # 跑完即清（清理放 emit 之后，保证回显先落）：删除合成靶单目录，真实
+    # dev-fg-* 单零触碰。
+    rm -rf "$PROBE_DIR"
 fi
 
 # ---------------- 13 dd-touches-line-branch-only ----------------
