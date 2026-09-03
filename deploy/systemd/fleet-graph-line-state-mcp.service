@@ -26,6 +26,15 @@
 # red-able port assertion in tests/test_m1_line_state_mcp.py fails the suite if
 # the default ever drifts into it. This is a CI/acceptance-time assertion, not
 # a runtime "probe the port at startup" behavior (spec item 0 R2).
+#
+# M5 (wf-8d9737, 2026-09-03): --release-behind-repo/--release-behind-remote
+# wire the `release_behind` metric here too. This surface serves the same
+# FleetStateView -- and therefore the same field surface -- as the :7494 read
+# model (never a second reader), so it carries the same wiring: without it the
+# deployed :5615 face answers release_behind=null forever while :7494 answers
+# with the live count for the same line. Same repo/remote convention as
+# fleet-graph-state.service; the threshold keeps the module default (design
+# §6.4's 160-commit dead branch).
 [Unit]
 Description=fleet-graph line-state MCP surface (read-only M1 line runtime state)
 After=network-online.target
@@ -36,7 +45,9 @@ Type=simple
 WorkingDirectory=/data/apps/fleet-graph/current
 ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph line-state serve \
     --host 127.0.0.1 --port 5615 \
-    --lines-config <lines-config>
+    --lines-config <lines-config> \
+    --release-behind-repo /data/apps/fleet-graph/current \
+    --release-behind-remote origin
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

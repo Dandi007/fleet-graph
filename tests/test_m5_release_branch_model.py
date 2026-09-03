@@ -848,6 +848,19 @@ class TestReleaseBehindProductionWiring:
         assert "--release-behind-repo /data/apps/fleet-graph/current" in exec_start
         assert "--release-behind-remote origin" in exec_start
 
+    def test_the_deployed_5615_unit_carries_the_same_wiring(self) -> None:
+        """:5615 line-state MCP 与 :7494 供的是同一个 FleetStateView（同字段
+        面，红线 1「never a second reader」），部署单元必须带同一套
+        --release-behind-* 接线；缺席时该面 release_behind 恒 null 而 :7494
+        回真值——同一个读模型的两个面答案分叉（rf-2ef6320c 记录项）。"""
+        unit = (
+            Path(__file__).resolve().parent.parent
+            / "deploy/systemd/fleet-graph-line-state-mcp.service"
+        )
+        exec_start = unit.read_text(encoding="utf-8").replace("\\\n", " ")
+        assert "--release-behind-repo /data/apps/fleet-graph/current" in exec_start
+        assert "--release-behind-remote origin" in exec_start
+
 
 # --- harvest allowlist 新语义：圈 release/<line-id> 可写仓 ---------------------
 
