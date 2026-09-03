@@ -251,9 +251,10 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         # does not inject one.
         goal_revision=config.goal_revision or _build_goal_revision_reader(config),
         # Defect ⑩: the timeout matrix source. The worker adapter is the one
-        # place that knows the seat name, the session's model and the exact
-        # turn budget; the graph reads them off it when a worker turn times
-        # out, so the round record attributes the hang.
+        # place that knows the seat name, the session's model, the exact turn
+        # budget and the seat session's identity (id / turn ordinal / age /
+        # last activity); the graph reads them off it when a worker turn
+        # times out, so the round record attributes the hang.
         turn_variables=worker.turn_variables,
     )
     return build_goal_line_graph(deps), deps

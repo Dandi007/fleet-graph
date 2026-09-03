@@ -1,8 +1,9 @@
-"""缺陷⑩（wf-8d9737）：worker_turn_timeout 变量矩阵落 record + 归因报表。
+"""缺陷⑩（wf-8d9737 d10b 两轨口径）：worker_turn_timeout 变量矩阵落 record + 归因报表。
 
-阳性：fixture 注入 AgentSessionTimeout → rounds 记录含全部矩阵字段；
-report 命令分桶正确。阴性：抹掉任一矩阵字段 → 报表「变量缺失」桶接住，
-绝不静默丢弃；report 对空数据如实报空（弄虚作假即红）。
+阳性：fixture 注入 AgentSessionTimeout → rounds 记录含全部矩阵字段
+（d10b 起含 seat_session_id/turn_ordinal/session_age 会话身份三元组）；
+report 命令按会话三元组分桶。阴性：抹掉任一矩阵字段 → 报表「变量缺失」
+桶接住，绝不静默丢弃；report 对空数据如实报空（弄虚作假即红）。
 """
 
 from __future__ import annotations
@@ -36,8 +37,18 @@ from fleet_graph.state.run_artifacts import RunArtifacts
 REPO_ROOT = Path(__file__).parent.parent
 REPORT_SCRIPT = REPO_ROOT / "scripts" / "turn-timeout-report.py"
 
-#: 一个有名字的配置：glm-5.3 座位、3000s 预算——缺陷⑩的疑变量组合。
-MATRIX = {"seat": "opencode-glm53", "model": "glm-5.3", "turn_timeout_seconds": 3000}
+#: 一个有名字的配置：glm-5.3 座位、3000s 预算、具名座位会话——缺陷⑩的疑
+#: 变量组合（d10b 起矩阵带会话身份三元组；session_last_activity_at 是分类
+#: 输入而非矩阵字段，None 时分类走零产出证据，保持确定性）。
+MATRIX = {
+    "seat": "opencode-glm53",
+    "model": "glm-5.3",
+    "turn_timeout_seconds": 3000,
+    "seat_session_id": "sess-glm53-1",
+    "turn_ordinal": 1,
+    "session_age": 600.0,
+    "session_last_activity_at": None,
+}
 
 _UNSET = object()
 
@@ -69,6 +80,9 @@ def full_matrix_record(round_no: int, **overrides: Any) -> dict[str, Any]:
         "seat": "opencode-glm53",
         "model": "glm-5.3",
         "turn_timeout_seconds": 3000,
+        "seat_session_id": "sess-glm53-1",
+        "turn_ordinal": round_no,
+        "session_age": 600.0 * round_no,
         "input_bytes": 2048,
         "output_evidence": {
             "stdout_lines": 0,
@@ -184,6 +198,9 @@ class TestTimeoutRecordMatrix:
             assert record["model"] == "glm-5.3"
             assert record["round_index"] == record["round"]
             assert record["turn_timeout_seconds"] == 3000
+            assert record["seat_session_id"] == "sess-glm53-1"
+            assert record["turn_ordinal"] == 1
+            assert record["session_age"] == 600.0
             assert isinstance(record["input_bytes"], int) and record["input_bytes"] > 0
             evidence = record["output_evidence"]
             assert evidence["zero_output"] is True
@@ -201,6 +218,9 @@ class TestTimeoutRecordMatrix:
             "model",
             "round_index",
             "turn_timeout_seconds",
+            "seat_session_id",
+            "turn_ordinal",
+            "session_age",
             "input_bytes",
             "output_evidence",
         )
@@ -276,6 +296,10 @@ class TestWorkerAdapterVariables:
             "seat": "opencode-gpt-terra",
             "model": None,
             "turn_timeout_seconds": 1234,
+            "seat_session_id": None,
+            "turn_ordinal": 0,
+            "session_age": None,
+            "session_last_activity_at": None,
         }
 
     def test_model_is_read_from_session_meta_when_the_runtime_records_it(
@@ -341,8 +365,12 @@ class TestExecutorEvidence:
 
 
 class TestReportBuckets:
-    def test_buckets_by_seat_model_round_index(self, tmp_path: Path) -> None:
-        """阳性：report 按 seat x model x round_index 分桶，总数/超时/零产出齐全。"""
+    def test_buckets_by_session_turn_ordinal_and_age(self, tmp_path: Path) -> None:
+        """阳性：report 按 seat_session_id x turn_ordinal x session_age 分桶。
+
+        seat/model 降为显示列；round_index 不再参与分桶——同会话同序号同
+        年龄的两个不同 round_index 落进同一个桶，而不是被旧三键劈开。
+        """
         root = tmp_path / "runs"
         line_a = root / "wf-aaa"
         line_a.mkdir(parents=True)
@@ -352,16 +380,9 @@ class TestReportBuckets:
                     json.dumps({"round": 1, "verdict": "continue", "reason": ""}),
                     json.dumps(full_matrix_record(1)),
                     json.dumps({"round": 2, "verdict": "continue", "reason": ""}),
-                    json.dumps(
-                        full_matrix_record(
-                            2,
-                            output_evidence={
-                                "stdout_lines": 4,
-                                "last_output_at": None,
-                                "zero_output": False,
-                            },
-                        )
-                    ),
+                    # 与 round 1 同会话/同序号/同年龄，仅 round_index 不同：
+                    # 旧键会把它劈成第二桶，新键必须并作一桶。
+                    json.dumps(full_matrix_record(2, turn_ordinal=1, session_age=600.0)),
                 ]
             )
             + "\n"
@@ -369,25 +390,41 @@ class TestReportBuckets:
         line_b = root / "wf-bbb"
         line_b.mkdir(parents=True)
         (line_b / "rounds.jsonl").write_text(
-            json.dumps(full_matrix_record(1, seat="opencode-dsv4pro", model="dsv4pro")) + "\n"
+            json.dumps(
+                full_matrix_record(
+                    1,
+                    seat="opencode-dsv4pro",
+                    model="dsv4pro",
+                    seat_session_id="sess-dsv4pro-9",
+                    turn_ordinal=4,
+                    session_age=90.5,
+                )
+            )
+            + "\n"
         )
 
         report = report_json(str(root))
         buckets = report["buckets"]
-        assert [(b["seat"], b["model"], b["round_index"]) for b in buckets] == [
-            ("opencode-glm53", "glm-5.3", 1),
-            ("opencode-glm53", "glm-5.3", 2),
-            ("opencode-dsv4pro", "dsv4pro", 1),
+        assert [(b["seat_session_id"], b["turn_ordinal"], b["session_age"]) for b in buckets] == [
+            ("sess-glm53-1", 1, 600.0),
+            ("sess-dsv4pro-9", 4, 90.5),
         ]
-        by_key = {(b["seat"], b["round_index"]): b for b in buckets}
-        a1 = by_key[("opencode-glm53", 1)]
-        assert (a1["total_rounds"], a1["timeout_rounds"], a1["zero_output_timeouts"]) == (2, 1, 1)
-        assert a1["timeout_rate"] == 0.5
-        a2 = by_key[("opencode-glm53", 2)]
-        assert (a2["total_rounds"], a2["timeout_rounds"], a2["zero_output_timeouts"]) == (2, 1, 0)
-        b1 = by_key[("opencode-dsv4pro", 1)]
-        assert (b1["total_rounds"], b1["timeout_rounds"], b1["zero_output_timeouts"]) == (1, 1, 1)
-        assert report["totals"] == {"records": 5, "timeout_rounds": 3, "zero_output_timeouts": 2}
+        assert buckets[0]["seat"] == "opencode-glm53"
+        assert buckets[0]["model"] == "glm-5.3"
+        assert buckets[1]["seat"] == "opencode-dsv4pro"
+        assert buckets[1]["model"] == "dsv4pro"
+        a1 = buckets[0]
+        assert (a1["timeout_rounds"], a1["zero_output_timeouts"]) == (2, 2)
+        b1 = buckets[1]
+        assert (b1["timeout_rounds"], b1["zero_output_timeouts"]) == (1, 1)
+        assert report["totals"] == {
+            "records": 5,
+            "timeout_rounds": 3,
+            "zero_output_timeouts": 3,
+            "true_hangs": 0,
+            "ceiling_hits": 0,
+            "unclassified": 3,
+        }
         assert report["missing_variables"]["count"] == 0
 
     def test_legacy_records_missing_fields_land_in_the_missing_bucket(self, tmp_path: Path) -> None:
@@ -439,6 +476,15 @@ class TestReportBuckets:
             "records": 0,
             "timeout_rounds": 0,
             "zero_output_timeouts": 0,
+            "true_hangs": 0,
+            "ceiling_hits": 0,
+            "unclassified": 0,
+        }
+        assert report["dd_provider_unavailable"]["totals"] == {
+            "provider_unavailable": 0,
+            "in_fence": 0,
+            "out_of_fence": 0,
+            "buckets": 0,
         }
         proc = run_report(str(empty))
         assert proc.returncode == 0
@@ -464,10 +510,11 @@ class TestEndToEndThroughRealArtifacts:
         report = report_json(str(tmp_path))
         assert len(report["buckets"]) == 1
         bucket = report["buckets"][0]
-        assert (bucket["seat"], bucket["model"], bucket["round_index"]) == (
-            "opencode-glm53",
-            "glm-5.3",
+        assert (bucket["seat_session_id"], bucket["turn_ordinal"], bucket["session_age"]) == (
+            "sess-glm53-1",
             1,
+            600.0,
         )
         assert bucket["zero_output_timeouts"] == 1
+        assert bucket["true_hangs"] == 1
         assert timeout_matrix_missing(artifacts.rounds[0]) == []
