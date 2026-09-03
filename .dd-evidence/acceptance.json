@@ -10,7 +10,7 @@
     "uv sync --frozen && uv run pytest -q tests/test_m3_line_selfgate.py"
    ],
    "exit_code": 0,
-   "stdout_tail": "...............................................................          [100%]\n",
+   "stdout_tail": ".......................................................................  [100%]\n",
    "stderr_tail": "Checked 100 packages in 1ms\n"
   },
   {
