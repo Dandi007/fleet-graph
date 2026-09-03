@@ -44,6 +44,7 @@ from typing import Any
 
 from fleet_graph.dd.line_branch import (
     DEFAULT_RELEASE_BEHIND_THRESHOLD,
+    git_release_behind_reader,
     release_behind_alarm,
 )
 from fleet_graph.state.run_artifacts import normalize_waiting_on
@@ -139,8 +140,18 @@ class FleetStateConfig:
     harvest_baseline_path: Path | None = None
     #: M5 ``release_behind`` 指标源：``(folder_id) -> 落后提交数 | None``，可注入
     #: （生产用 ``line_branch.git_release_behind_reader``；任何读取失败降级为
-    #: None——「未知」绝不伪造成 0，也绝不 5xx）。None 表示未接线，字段恒为 None。
+    #: None——「未知」绝不伪造成 0，也绝不 5xx）。None 表示不注入、改由下面的
+    #: ``release_behind_repo`` 拼默认 reader。
     release_behind_reader: Callable[[str], int | None] | None = None
+    #: M5 默认 reader 读的仓库：``release/<folder_id>`` 线分支的所在仓
+    #: （folder_id 即线 id）。生产由 serve 入口注入（``state serve`` /
+    #: ``line-state serve`` 的 ``--release-behind-repo``，systemd 单元指向部署
+    #: checkout 本身）。**None = 未接线**：默认 reader 就地退化为恒 None——
+    #: 「未知」绝不伪造成 0（也是测试环境无关性的保证：不配就不碰 git）。
+    release_behind_repo: Path | None = None
+    #: 默认 reader 解析本地缺失 ref 时用的 remote（名字或 URL，如 ``origin``）；
+    #: 空 = 只读本地 ref，绝不 fetch。
+    release_behind_remote: str = ""
     #: M5 超阈判定阈值（判定口在本仓；告警规则本体归 wf-6475fd）。默认取
     #: design §6.4 的历史反例：落后 160 提交搁浅 54 个的死分支。
     release_behind_threshold: int = DEFAULT_RELEASE_BEHIND_THRESHOLD
@@ -462,6 +473,29 @@ def _default_has_harvest_receipt(config: FleetStateConfig) -> Callable[[str], bo
     return has_receipt
 
 
+def _default_release_behind_reader(config: FleetStateConfig) -> Callable[[str], int | None]:
+    """The default M5 reader, built from the config's repo/remote knobs.
+
+    Same shape as ``_default_has_harvest_receipt``: ``FleetStateView.__init__``
+    always installs it, and it self-wires from a config field instead of every
+    serve path hand-constructing a reader. An unconfigured repo
+    (``release_behind_repo=None``, the default) keeps the metric honestly
+    unknown -- None, never a fake zero -- and never touches git, so the
+    unwired view stays deterministic and environment-independent. Wiring
+    happens where production names the repo: the ``state serve`` /
+    ``line-state serve`` flags (the :7494 unit points at the deployed
+    checkout).
+    """
+    repo = config.release_behind_repo
+    if repo is None:
+
+        def unwired(folder_id: str) -> int | None:
+            return None
+
+        return unwired
+    return git_release_behind_reader(repo, remote_url=config.release_behind_remote)
+
+
 class FleetStateView:
     """Builds the two read-only payloads from the configured data sources."""
 
@@ -470,6 +504,12 @@ class FleetStateView:
         #: E5 receipt predicate, injectable. Defaults to the read-only bus
         #: reader; any read failure degrades to unharvested, never a 5xx.
         self.has_harvest_receipt = config.has_harvest_receipt or _default_has_harvest_receipt(
+            config
+        )
+        #: M5 ``release_behind`` source, injectable. Defaults to the git reader
+        #: over ``config.release_behind_repo``; an unconfigured repo keeps the
+        #: metric honestly unknown (None), never a fake zero.
+        self.release_behind_reader = config.release_behind_reader or _default_release_behind_reader(
             config
         )
 
@@ -547,9 +587,9 @@ class FleetStateView:
             # M5 release_behind：本线 release 分支落后目标分支的提交数。未知
             # （未接线/读失败/分支缺失）是 None——机器可判的「未知」，不是 0。
             release_behind: int | None = None
-            if self.config.release_behind_reader is not None:
+            if self.release_behind_reader is not None:
                 try:
-                    release_behind = self.config.release_behind_reader(folder_id)
+                    release_behind = self.release_behind_reader(folder_id)
                 except Exception:
                     release_behind = None
             line_objs.append(

@@ -680,6 +680,175 @@ class TestReleaseBehindMetric:
         assert reader(LINE) == 0
 
 
+# --- release_behind 的生产接线（终审 rf-ffc78633 blocker 的收口） ---------------
+#
+# 终审 blocker：release_behind_reader 在任何 serve 路径都不被构造（:7494 生产
+# 入口、:5615 MCP serve 均不传），既无 CLI 旗标，视图也不自带默认——已部署的
+# /v1/lines 恒返回 null，阴性判据「落后超阈可查」在生产读模型上不成立。这里把
+# 三处注入点逐个钉死：视图默认构造、CLI 旗标 → config、部署单元 ExecStart。
+# 任一被拆掉，下面的用例必须红。
+
+
+class TestReleaseBehindProductionWiring:
+    @staticmethod
+    def _roster(tmp_path: Path) -> Path:
+        lines_config = tmp_path / "lines.json"
+        lines_config.write_text(
+            json.dumps({"lines": [{"folder_id": LINE, "generation": 1}]}),
+            encoding="utf-8",
+        )
+        return lines_config
+
+    @staticmethod
+    def _wired_config(line_repo: _LineRepo, tmp_path: Path, **overrides: Any) -> Any:
+        kwargs: dict[str, Any] = {
+            "host": "127.0.0.1",
+            "port": 0,
+            "run_root": tmp_path / "runs",
+            "lines_config": TestReleaseBehindProductionWiring._roster(tmp_path),
+            "release_behind_repo": line_repo.work,
+            "release_behind_remote": remote_url(line_repo.work),
+        }
+        kwargs.update(overrides)
+        return FleetStateConfig(**kwargs)
+
+    def test_the_view_self_carries_a_default_reader_from_the_configured_repo(
+        self, line_repo: _LineRepo, tmp_path: Path
+    ) -> None:
+        """has_harvest_receipt 同款：config 只点名仓库，视图 __init__ 自造
+        reader——serve 路径无需各自手工构造，指标即活。"""
+        base = line_repo.advance_main()
+        line_repo.publish_line_branch(base)
+        line_repo.advance_main("second.txt")  # 线分支落后 1 个提交。
+
+        view = FleetStateView(self._wired_config(line_repo, tmp_path))
+        assert view.release_behind_reader is not None
+        row = view.lines()["lines"][0]
+        assert row["release_behind"] == 1
+        assert row["release_behind_over_threshold"] is False
+
+        over = FleetStateView(
+            self._wired_config(line_repo, tmp_path, release_behind_threshold=0)
+        ).lines()["lines"][0]
+        assert over["release_behind"] == 1
+        assert over["release_behind_over_threshold"] is True
+
+    def test_an_unconfigured_repo_keeps_the_default_reader_inert(self, tmp_path: Path) -> None:
+        """默认 reader 必须环境无关：仓库未点名时恒 None（诚实的「未知」），
+        绝不碰 git、绝不看测试机恰好有什么分支。"""
+        bare = FleetStateView(
+            FleetStateConfig(
+                host="127.0.0.1",
+                port=0,
+                run_root=tmp_path / "runs",
+                lines_config=self._roster(tmp_path),
+            )
+        )
+        assert bare.release_behind_reader is not None  # default installed...
+        assert bare.release_behind_reader(LINE) is None  # ...but honestly inert
+        row = bare.lines()["lines"][0]
+        assert row["release_behind"] is None
+        assert row["release_behind_over_threshold"] is None
+
+    def test_the_7494_cli_entry_constructs_and_passes_the_wiring(
+        self, line_repo: _LineRepo, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """:7494 生产入口（state serve）把旗标接进 config；serve 只被喂 config，
+        reader 由视图默认路径构造。"""
+        import fleet_graph.state.fleet_state as fleet_state_module
+        from fleet_graph.cli import _state_serve, build_parser
+
+        base = line_repo.advance_main()
+        line_repo.publish_line_branch(base)
+        line_repo.advance_main("second.txt")
+
+        captured: dict[str, Any] = {}
+
+        def record(config: Any) -> None:
+            captured["config"] = config
+
+        monkeypatch.setattr(fleet_state_module, "serve", record)
+
+        args = build_parser().parse_args(
+            [
+                "state",
+                "serve",
+                "--run-root",
+                str(tmp_path / "runs"),
+                "--lines-config",
+                str(self._roster(tmp_path)),
+                "--release-behind-repo",
+                str(line_repo.work),
+                "--release-behind-remote",
+                remote_url(line_repo.work),
+                "--release-behind-threshold",
+                "0",
+            ]
+        )
+        assert _state_serve(args) == 0
+
+        config = captured["config"]
+        assert config.release_behind_repo == line_repo.work
+        assert config.release_behind_remote == remote_url(line_repo.work)
+        assert config.release_behind_threshold == 0
+        # 接好的 config 走默认路径即出真指标：落后 1 且超阈（阈值 0）。
+        row = FleetStateView(config).lines()["lines"][0]
+        assert row["release_behind"] == 1
+        assert row["release_behind_over_threshold"] is True
+
+    def test_the_5615_mcp_serve_wires_the_reader_the_same_way(
+        self, line_repo: _LineRepo, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        import fleet_graph.line_state_mcp as line_state_mcp_module
+
+        base = line_repo.advance_main()
+        line_repo.publish_line_branch(base)
+        line_repo.advance_main("second.txt")
+
+        captured: dict[str, Any] = {}
+
+        class _FakeServer:
+            def run(self, **_kwargs: Any) -> None:
+                return None
+
+        def fake_build(config: Any, *, view: Any = None) -> _FakeServer:
+            captured["config"] = config
+            return _FakeServer()
+
+        monkeypatch.setattr(line_state_mcp_module, "build_line_state_mcp_server", fake_build)
+        line_state_mcp_module.serve(
+            run_root=str(tmp_path / "runs"),
+            lines_config=str(self._roster(tmp_path)),
+            release_behind_repo=str(line_repo.work),
+            release_behind_remote=remote_url(line_repo.work),
+        )
+
+        config = captured["config"]
+        assert config.release_behind_repo == line_repo.work
+        assert config.release_behind_threshold == DEFAULT_RELEASE_BEHIND_THRESHOLD
+        row = FleetStateView(config).lines()["lines"][0]
+        assert row["release_behind"] == 1
+        assert row["release_behind_over_threshold"] is False
+
+    def test_the_serve_flags_default_to_the_unwired_honest_state(self) -> None:
+        """不点仓库就是未接线：旗标缺席时 repo=None、阈值取 design §6.4 反例。"""
+        from fleet_graph.cli import build_parser
+
+        for argv in (("state", "serve"), ("line-state", "serve")):
+            args = build_parser().parse_args([*argv])
+            assert args.release_behind_repo is None, argv
+            assert args.release_behind_remote == "", argv
+            assert args.release_behind_threshold == DEFAULT_RELEASE_BEHIND_THRESHOLD, argv
+
+    def test_the_deployed_7494_unit_carries_the_release_behind_wiring(self) -> None:
+        """已部署的 :7494 读模型（systemd 单元）必须在 ExecStart 里点名仓库与
+        remote——这正是终审 blocker 的「生产注入」缺口。"""
+        unit = Path(__file__).resolve().parent.parent / "deploy/systemd/fleet-graph-state.service"
+        exec_start = unit.read_text(encoding="utf-8").replace("\\\n", " ")
+        assert "--release-behind-repo /data/apps/fleet-graph/current" in exec_start
+        assert "--release-behind-remote origin" in exec_start
+
+
 # --- harvest allowlist 新语义：圈 release/<line-id> 可写仓 ---------------------
 
 

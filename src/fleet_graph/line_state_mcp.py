@@ -43,6 +43,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.dd.line_branch import DEFAULT_RELEASE_BEHIND_THRESHOLD
 from fleet_graph.state.fleet_state import (
     DEFAULT_LINES_CONFIG,
     DEFAULT_RUN_ROOT,
@@ -245,22 +246,32 @@ def serve(
     *,
     run_root: str | None = None,
     lines_config: str | None = None,
+    release_behind_repo: str | None = None,
+    release_behind_remote: str = "",
+    release_behind_threshold: int = DEFAULT_RELEASE_BEHIND_THRESHOLD,
 ) -> None:
     """Run the read-only line-state MCP surface on loopback.
 
     ``run_root`` / ``lines_config`` default to the same roots the :7494 read
     model serves (``/data/fleet-graph/runs`` + ``config/ronin-lines.json``), so
-    production reads the identical data source. The R2 port discipline is a
-    CI/acceptance-time assertion (the red-able ``tests/test_m1_line_state_mcp.py``
-    check that :5615 never sits in ``config/line-state-mcp-reserved-ports.json``),
-    deliberately not a runtime "probe the port at startup" behavior (spec item
-    0 R2).
+    production reads the identical data source. ``release_behind_repo`` /
+    ``release_behind_remote`` / ``release_behind_threshold`` wire the M5
+    ``release_behind`` metric through the same ``FleetStateConfig`` the :7494
+    read model uses -- the view's default builds the git reader when a repo is
+    named, and an unnamed repo keeps the metric honestly unknown (None). The
+    R2 port discipline is a CI/acceptance-time assertion (the red-able
+    ``tests/test_m1_line_state_mcp.py`` check that :5615 never sits in
+    ``config/line-state-mcp-reserved-ports.json``), deliberately not a runtime
+    "probe the port at startup" behavior (spec item 0 R2).
     """
     config = FleetStateConfig(
         host=host,
         port=port,
         run_root=Path(run_root) if run_root else DEFAULT_RUN_ROOT,
         lines_config=Path(lines_config) if lines_config else DEFAULT_LINES_CONFIG,
+        release_behind_repo=Path(release_behind_repo) if release_behind_repo else None,
+        release_behind_remote=release_behind_remote,
+        release_behind_threshold=release_behind_threshold,
     )
     build_line_state_mcp_server(config).run(
         transport="streamable-http", host=host, port=port, path="/mcp"

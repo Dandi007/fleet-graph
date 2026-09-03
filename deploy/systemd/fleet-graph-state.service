@@ -27,6 +27,14 @@
 # B.1) so it observes the actual enrollment queue rather than going blind.
 # Explicit --enroll-queue remains the override when a different queue home is
 # deployed.
+#
+# M5 (wf-8d9737, 2026-09-03): --release-behind-repo/--release-behind-remote
+# wire the `release_behind` metric into production. The repo is the deployed
+# checkout itself (WorkingDirectory above); `origin` resolves the
+# release/<line-id> refs the checkout has not fetched locally, so the metric
+# is a live fact for every roster line rather than a perpetual null. The
+# threshold keeps the module default (design §6.4's 160-commit dead branch);
+# pass --release-behind-threshold to override at the site.
 [Unit]
 Description=fleet-graph state read-model (M1 sensing layer)
 After=network-online.target
@@ -38,7 +46,9 @@ WorkingDirectory=/data/apps/fleet-graph/current
 ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph state serve \
     --host 127.0.0.1 --port 7494 \
     --lines-config /data/apps/fleet-graph/current/config/ronin-lines.json \
-    --enroll-queue /data/fleet-graph/goal/enroll-queue.jsonl
+    --enroll-queue /data/fleet-graph/goal/enroll-queue.jsonl \
+    --release-behind-repo /data/apps/fleet-graph/current \
+    --release-behind-remote origin
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

@@ -811,6 +811,9 @@ def _line_state_serve(args: argparse.Namespace) -> int:
             port=args.port,
             run_root=args.run_root,
             lines_config=args.lines_config,
+            release_behind_repo=args.release_behind_repo,
+            release_behind_remote=args.release_behind_remote,
+            release_behind_threshold=args.release_behind_threshold,
         )
     except RuntimeError as exc:
         # A startup refusal (port taken) is a visible failure, not a crash
@@ -836,6 +839,11 @@ def _state_serve(args: argparse.Namespace) -> int:
             enroll_queue_path=(
                 pathlib.Path(args.enroll_queue) if args.enroll_queue else DEFAULT_ENROLL_QUEUE
             ),
+            release_behind_repo=(
+                pathlib.Path(args.release_behind_repo) if args.release_behind_repo else None
+            ),
+            release_behind_remote=args.release_behind_remote,
+            release_behind_threshold=args.release_behind_threshold,
         )
     )
     return 0
@@ -1384,6 +1392,8 @@ def _arbiter_run(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from fleet_graph.dd.line_branch import DEFAULT_RELEASE_BEHIND_THRESHOLD
+
     parser = argparse.ArgumentParser(prog="fleet-graph")
     parser.add_argument("--version", action="version", version=__version__)
     parser.set_defaults(func=lambda _: 0)
@@ -1902,6 +1912,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="the roster SSoT that decides which lines /v1/lines (and the "
         "line-state MCP) covers; defaults to config/ronin-lines.json",
     )
+    line_state_serve.add_argument(
+        "--release-behind-repo",
+        default=None,
+        help="repo whose release/<line-id> branches the M5 release_behind "
+        "metric reads (folder_id is the line id); unset keeps the metric "
+        "honestly unknown (null), never a fake zero",
+    )
+    line_state_serve.add_argument(
+        "--release-behind-remote",
+        default="",
+        help="optional remote name/URL the release_behind reader uses to "
+        "resolve release/target refs missing locally (e.g. origin); empty "
+        "reads local refs only",
+    )
+    line_state_serve.add_argument(
+        "--release-behind-threshold",
+        type=int,
+        default=DEFAULT_RELEASE_BEHIND_THRESHOLD,
+        help="release_behind_over_threshold threshold (default: design §6.4's "
+        "historical dead branch, 160 commits behind)",
+    )
     line_state_serve.set_defaults(func=_line_state_serve)
 
     state = subparsers.add_parser(
@@ -1947,6 +1978,27 @@ def build_parser() -> argparse.ArgumentParser:
         "/v1/enrollments view re-reads per request; defaults to the goal "
         "service's own queue home /data/fleet-graph/goal/enroll-queue.jsonl "
         "(the same home goal serve writes by default)",
+    )
+    state_serve.add_argument(
+        "--release-behind-repo",
+        default=None,
+        help="repo whose release/<line-id> branches the M5 release_behind "
+        "metric reads (folder_id is the line id); unset keeps the metric "
+        "honestly unknown (null), never a fake zero",
+    )
+    state_serve.add_argument(
+        "--release-behind-remote",
+        default="",
+        help="optional remote name/URL the release_behind reader uses to "
+        "resolve release/target refs missing locally (e.g. origin); empty "
+        "reads local refs only",
+    )
+    state_serve.add_argument(
+        "--release-behind-threshold",
+        type=int,
+        default=DEFAULT_RELEASE_BEHIND_THRESHOLD,
+        help="release_behind_over_threshold threshold (default: design §6.4's "
+        "historical dead branch, 160 commits behind)",
     )
     state_serve.set_defaults(func=_state_serve)
 
