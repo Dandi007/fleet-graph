@@ -518,6 +518,16 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         outcome = None
         if gaps or occupied is not None:
             outcome = OUTCOME_ESCALATED
+        # 案A改写①：命中 allowlist 条目后，该单的生效 default_branch / deploy_command
+        # 取自条目（逐仓生效值）；条目未指定时才退回全局 deps.* 缺省。授权判定仍在
+        # gate 独立进行，这里只决定「生效值取哪份」，不放宽也不收紧写权。
+        resolved_repo_path = str(repo) if repo is not None else ""
+        effective_default_branch = deps.allowlist.effective_default_branch(
+            resolved_repo_path, deps.default_branch
+        )
+        effective_deploy_command = deps.allowlist.effective_deploy_command(
+            resolved_repo_path, deps.deploy_command
+        )
         return {
             "development_id": development_id,
             "head_commit": head_commit,
@@ -528,8 +538,8 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             "remote_url": remote_url,
             "would_resolve_canonical": would_resolve_canonical,
             "would_do": list(would_do),
-            "default_branch": deps.default_branch,
-            "deploy_command": list(deps.deploy_command),
+            "default_branch": effective_default_branch,
+            "deploy_command": effective_deploy_command,
             "steps": steps,
             "_gaps": gaps,
             "outcome": outcome,

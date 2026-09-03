@@ -221,3 +221,123 @@ class TestEntryShape:
         assert out["repo_path"] == "/data/x"
         assert out["allowed_branches"] == ["refs/heads/main"]
         assert out["allowed_deploy"] == [["make", "deploy"]]
+
+    def test_entry_as_dict_carry_optional_effective_values(self) -> None:
+        entry = HarvestAllowlistEntry(
+            repo_path="/data/x",
+            allowed_branches=("refs/heads/main",),
+            allowed_deploy=(("make", "deploy"),),
+            default_branch="main",
+            deploy_command=("bash", "scripts/deploy.sh"),
+        )
+        out = entry.as_dict()
+        assert out["default_branch"] == "main"
+        assert out["deploy_command"] == ["bash", "scripts/deploy.sh"]
+
+    def test_entry_as_dict_defaults_optional_effective_values_to_none(self) -> None:
+        entry = HarvestAllowlistEntry(
+            repo_path="/data/x",
+            allowed_branches=("refs/heads/main",),
+            allowed_deploy=(),
+        )
+        out = entry.as_dict()
+        assert out["default_branch"] is None
+        assert out["deploy_command"] is None
+
+
+class TestEntryEffectiveValues:
+    """案A改写①：逐仓生效值解析与缺省回退（向后兼容）。"""
+
+    def test_parses_optional_default_branch_and_deploy_command(self) -> None:
+        allowlist = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": "/data/code/self/fleet-graph",
+                        "allowed_branches": ["refs/heads/main"],
+                        "allowed_deploy": [["make", "deploy"]],
+                        "default_branch": "main",
+                        "deploy_command": ["bash", "scripts/deploy.sh"],
+                    }
+                ]
+            }
+        )
+        entry = allowlist.entry_for("/data/code/self/fleet-graph")
+        assert entry is not None
+        assert entry.default_branch == "main"
+        assert entry.deploy_command == ("bash", "scripts/deploy.sh")
+
+    def test_missing_optional_fields_default_to_none(self) -> None:
+        entry = allowlist().entry_for("/data/code/self/fleet-graph")
+        assert entry is not None
+        assert entry.default_branch is None
+        assert entry.deploy_command is None
+
+    def test_effective_values_fall_back_to_global_when_unspecified(self) -> None:
+        allow = allowlist()
+        assert allow.effective_default_branch("/data/code/self/fleet-graph", "master") == "master"
+        assert allow.effective_deploy_command(
+            "/data/code/self/fleet-graph", ["make", "deploy"]
+        ) == ["make", "deploy"]
+
+    def test_effective_values_prefer_entry_over_global(self) -> None:
+        allow = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": "/data/code/self/fleet-graph",
+                        "allowed_branches": ["refs/heads/main"],
+                        "default_branch": "main",
+                        "deploy_command": ["bash", "scripts/deploy.sh"],
+                    }
+                ]
+            }
+        )
+        assert allow.effective_default_branch("/data/code/self/fleet-graph", "master") == "main"
+        assert allow.effective_deploy_command(
+            "/data/code/self/fleet-graph", ["make", "deploy"]
+        ) == ["bash", "scripts/deploy.sh"]
+
+    def test_unmatched_repo_effective_values_fall_back_to_global(self) -> None:
+        allow = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": "/data/code/self/fleet-graph",
+                        "allowed_branches": ["refs/heads/main"],
+                        "default_branch": "main",
+                        "deploy_command": ["bash", "scripts/deploy.sh"],
+                    }
+                ]
+            }
+        )
+        assert allow.effective_default_branch("/data/code/self/other", "master") == "master"
+        assert allow.effective_deploy_command("/data/code/self/other", ["x"]) == ["x"]
+
+    def test_invalid_default_branch_is_refused(self) -> None:
+        with pytest.raises(HarvestAllowlistError, match="default_branch"):
+            parse_harvest_allowlist(
+                {
+                    "entries": [
+                        {
+                            "repo_path": "/data/x",
+                            "allowed_branches": ["refs/heads/main"],
+                            "default_branch": "bad branch",
+                        }
+                    ]
+                }
+            )
+
+    def test_invalid_deploy_command_is_refused(self) -> None:
+        with pytest.raises(HarvestAllowlistError, match="deploy_command"):
+            parse_harvest_allowlist(
+                {
+                    "entries": [
+                        {
+                            "repo_path": "/data/x",
+                            "allowed_branches": ["refs/heads/main"],
+                            "deploy_command": ["bash", 3],
+                        }
+                    ]
+                }
+            )

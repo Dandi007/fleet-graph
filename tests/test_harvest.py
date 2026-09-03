@@ -100,6 +100,7 @@ def fake_ops(
     """
     calls: list[str] = []
     deploy_repos: list[Path] = []
+    deploy_argvs: list[list[str]] = []
     verify_real_repos: list[Path] = []
     verify_real_heads: list[str | None] = []
     verify_real_argvs: list[list[str]] = []
@@ -259,6 +260,7 @@ def fake_ops(
         def deploy(self, command: list[str], repo: Path) -> int:
             calls.append("deploy")
             deploy_repos.append(repo)
+            deploy_argvs.append(list(command))
             return deploy_exit
 
         def verify_real(self, argv: list[str], repo: Path, expected_head: str | None) -> int:
@@ -274,6 +276,7 @@ def fake_ops(
         "ops": Ops(),
         "calls": calls,
         "deploy_repos": deploy_repos,
+        "deploy_argvs": deploy_argvs,
         "verify_real_repos": verify_real_repos,
         "verify_real_heads": verify_real_heads,
         "verify_real_argvs": verify_real_argvs,
@@ -487,6 +490,159 @@ class TestHarvestOrchestration:
         assert result["outcome"] == OUTCOME_HARVESTED
         receipt = json.loads(Path(result["receipt_path"]).read_text())
         assert receipt["repo_path"] == str(config.dd_root.parent / "repos" / "fleet-graph")
+
+
+class TestPerRepoEffectiveValues:
+    """案A改写①：命中条目后逐仓 default_branch / deploy_command 生效，未指定退回全局。
+
+    判据（两方向可红）：
+    - 正向：main 仓单条目 default_branch="main" -> gate 拿 refs/heads/main 比
+      allowed_branches 能过（即使全局 default_branch=master）。
+    - 负向（变异变红）：条目未指定 default_branch 时读回全局（master）->
+      refs/heads/master 不在 allowed_branches -> 拒。
+    - 回归：master 仓（如 fleet-sentinel）零红——条目未指定仍取全局 master，
+      指定 master 亦 master。
+    """
+
+    def _repo_path(self, tmp_path: Path, name: str = "repos/fleet-graph") -> str:
+        return repo_path_for(tmp_path, name)
+
+    def test_main_repo_entry_default_branch_overrides_global(self, tmp_path: Path) -> None:
+        repo_path = self._repo_path(tmp_path)
+        allowlist = full_allowlist(
+            repo_path=repo_path,
+            entries=[
+                {
+                    "repo_path": repo_path,
+                    "allowed_branches": ["refs/heads/main"],
+                    "allowed_deploy": [["make", "deploy"]],
+                    "default_branch": "main",
+                }
+            ],
+        )
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            repo_path=repo_path,
+            allowlist=allowlist,
+            ops=fake,
+            bus=FakeBus(),
+            default_branch="master",
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["default_branch"] == "main"
+
+    def test_entry_without_default_branch_falls_back_to_global_and_refuses(
+        self, tmp_path: Path
+    ) -> None:
+        """变异变红：条目未指定 default_branch -> 读回全局 master ->
+        refs/heads/master 不在 allowed_branches -> 拒，零写。"""
+        repo_path = self._repo_path(tmp_path)
+        allowlist = full_allowlist(
+            repo_path=repo_path,
+            entries=[
+                {
+                    "repo_path": repo_path,
+                    "allowed_branches": ["refs/heads/main"],
+                    "allowed_deploy": [["make", "deploy"]],
+                }
+            ],
+        )
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            repo_path=repo_path,
+            allowlist=allowlist,
+            ops=fake,
+            default_branch="master",
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_REFUSED
+        assert fake["calls"] == []
+
+    def test_master_repo_without_entry_default_branch_keeps_global(self, tmp_path: Path) -> None:
+        """回归：master 仓条目未指定 default_branch -> 仍取全局 master -> 零红。"""
+        repo_path = self._repo_path(tmp_path, "repos/fleet-sentinel")
+        allowlist = full_allowlist(
+            repo_path=repo_path,
+            entries=[
+                {
+                    "repo_path": repo_path,
+                    "allowed_branches": ["refs/heads/master"],
+                    "allowed_deploy": [["make", "deploy"]],
+                }
+            ],
+        )
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            repo_path=repo_path,
+            allowlist=allowlist,
+            ops=fake,
+            bus=FakeBus(),
+            default_branch="master",
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["default_branch"] == "master"
+
+    def test_master_repo_entry_default_branch_explicit_master(self, tmp_path: Path) -> None:
+        """回归：master 仓条目显式 default_branch=master -> 亦 master -> 零红。"""
+        repo_path = self._repo_path(tmp_path, "repos/fleet-sentinel")
+        allowlist = full_allowlist(
+            repo_path=repo_path,
+            entries=[
+                {
+                    "repo_path": repo_path,
+                    "allowed_branches": ["refs/heads/master"],
+                    "allowed_deploy": [["make", "deploy"]],
+                    "default_branch": "master",
+                }
+            ],
+        )
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            repo_path=repo_path,
+            allowlist=allowlist,
+            ops=fake,
+            bus=FakeBus(),
+            default_branch="master",
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["default_branch"] == "master"
+
+    def test_entry_deploy_command_overrides_global(self, tmp_path: Path) -> None:
+        """逐仓 deploy_command：条目指定 deploy 命令生效，即使全局 deploy 是错的。"""
+        repo_path = self._repo_path(tmp_path)
+        allowlist = full_allowlist(
+            repo_path=repo_path,
+            entries=[
+                {
+                    "repo_path": repo_path,
+                    "allowed_branches": ["refs/heads/main"],
+                    "allowed_deploy": [["bash", "scripts/deploy.sh"]],
+                    "deploy_command": ["bash", "scripts/deploy.sh"],
+                }
+            ],
+        )
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            repo_path=repo_path,
+            allowlist=allowlist,
+            ops=fake,
+            bus=FakeBus(),
+            deploy_command=["bash", "scripts/wrong-deploy.sh"],
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert fake["deploy_argvs"] == [["bash", "scripts/deploy.sh"]]
 
 
 class TestHarvestCanonicalCwdAndHead:
