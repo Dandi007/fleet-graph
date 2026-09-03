@@ -58,6 +58,7 @@ from langgraph.graph import END, START, StateGraph
 from fleet_graph.bus.board import Board
 from fleet_graph.bus.client import BusClient
 from fleet_graph.dd.control_plane import DEFAULT_DD_ROOT, RECORD_FILE
+from fleet_graph.dd.selfgate_flow import harvest_eligibility
 from fleet_graph.state.run_artifacts import iso, write_json_durable
 from fleet_graph.supervise.events import (
     EVENT_APPROVED_UNHARVESTED,
@@ -107,6 +108,12 @@ ESCALATE_TREE_OCCUPIED = "HARVEST_TREE_OCCUPIED_BY_INFLIGHT"
 #: writes_skipped，绝不落「远端已合并却报未合并」的半态，也不触碰 pull/deploy/
 #: verify_real 任何写步（spec 交付 A.2：走既有 escalate 收尾）。
 ESCALATE_BRANCH_OCCUPIED = "HARVEST_BRANCH_OCCUPIED"
+
+#: S7 merge-eligibility refuse code: an E5 event whose payload does not attest the
+#: merge segment completed is refused *before* any write step -- the harvest
+#: trigger moved from "after the gate" to "after the merge" (spec §5), machine-
+#: checked by `harvest_eligibility`.
+REFUSE_MERGE_NOT_COMPLETE = "HARVEST_MERGE_NOT_COMPLETE"
 
 #: 空收割 escalate 码（判据②/④）：净产品 diff（`git diff base..head` 排除
 #: `.dev-dispatch` / `.dd-evidence` 后）为空 -> 立即 outcome=escalated +
@@ -447,6 +454,14 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         gaps: list[str] = []
         if not development_id or not head_commit:
             gaps.append("E5 payload 缺 development_id 或 head_commit——事件不完整")
+        # S7 收割触发点：从「闸后」改到「merge 后」。E5 payload 显式携带 merge_complete
+        # （`approved_unharvested_event` 默认 True），这里 fail-closed 派生——缺字段视为
+        # 未完成合并，绝不把「闸刚 APPROVE」误当「已可收割」。不合资格 -> refused +
+        # writes_skipped（零写、显式收尾），绝不进任何写节点。
+        merge_complete = bool(payload.get("merge_complete", False))
+        eligible, eligibility_reason = harvest_eligibility(
+            gate_approved=True, merge_complete=merge_complete
+        )
         repo = deps.repo
         record_worktree = ""
         remote_url = ""
@@ -498,7 +513,7 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 worktree_root=worktree_root,
             )
         intake_facts: dict[str, Any] = {
-            "ok": not gaps and occupied is None,
+            "ok": not gaps and occupied is None and eligible,
             "development_id": development_id,
             "head_commit": head_commit,
             # 判据①：收割绑定放行的 exact head（线被 gate 放行的 commit），不采信
@@ -509,7 +524,11 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             "repo_path": str(repo) if repo is not None else "",
             "record_worktree": record_worktree,
             "remote_url": remote_url,
+            "merge_complete": merge_complete,
         }
+        if not eligible:
+            intake_facts["refused"] = REFUSE_MERGE_NOT_COMPLETE
+            intake_facts["refusal_detail"] = eligibility_reason
         if occupied is not None:
             # H-C：_detect_occupied_tree 返回的 repo_path（本次判定的树的规范化路径）/
             # detail / bound_development_id 原样落进 intake step，不被上面基础字段吞掉。
@@ -517,7 +536,12 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         steps = _record_step(state, "intake", **intake_facts)
         outcome = None
         if gaps or occupied is not None:
+            # 事件不完整（缺 development_id/head_commit）或动树被占用 -> 失败/升报。
             outcome = OUTCOME_ESCALATED
+        elif not eligible:
+            # S7：未过 merge 段 -> refused（零写、显式收尾，writes_skipped 覆盖全部写步），
+            # 不是 escalated（这不是失败，是「还没到收割时点」）。
+            outcome = OUTCOME_REFUSED
         return {
             "development_id": development_id,
             "head_commit": head_commit,
@@ -535,7 +559,10 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
             "outcome": outcome,
             # 案A改写③：不在 allowlist（解析不出授权 canonical）或动树被占用时，
             # writes_skipped 覆盖全部写步骤（先观测后授权，真机零写）。
-            "writes_skipped": list(WRITE_STEPS) if (occupied is not None or would_do) else None,
+            # S7：merge 未完成（ineligible）同样覆盖全部写步。
+            "writes_skipped": list(WRITE_STEPS)
+            if (occupied is not None or would_do or not eligible)
+            else None,
         }
 
     def gate(state: HarvestState) -> HarvestState:
@@ -1467,6 +1494,7 @@ __all__ = [
     "OUTCOME_ESCALATED",
     "OUTCOME_HARVESTED",
     "OUTCOME_REFUSED",
+    "REFUSE_MERGE_NOT_COMPLETE",
     "SOP_STEPS",
     "WRITE_STEPS",
     "HarvestDeps",

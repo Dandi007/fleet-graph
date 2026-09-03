@@ -408,6 +408,7 @@ def _deliver_dd(
     run_root: Path,
     dd: Any,
     clock: Callable[[], float],
+    reason: str = "",
 ) -> DeliveryResult:
     """The synchronous dd-gate delivery (M2).
 
@@ -559,6 +560,14 @@ def _deliver_dd(
     if dispatched_by:
         _wake_dispatching_line(run_root, dispatched_by, clock())
 
+    message = (
+        "delivered and consumed: dd single resumed through its gate and the "
+        f"dispatching line {dispatched_by!r} was woken"
+    )
+    if reason:
+        # §4: the decision's rationale (the line self-gate's templated six-evidence
+        # payload) rides the delivery so the verdict is never a bare APPROVE/REJECT.
+        message += f"; rationale: {reason}"
     return DeliveryResult(
         status=OUTCOME_DELIVERED,
         line=development_id,
@@ -567,10 +576,7 @@ def _deliver_dd(
         question_note_id=question_note_id,
         card_entity_id=card_entity_id,
         action_key=action_key,
-        message=(
-            "delivered and consumed: dd single resumed through its gate and the "
-            f"dispatching line {dispatched_by!r} was woken"
-        ),
+        message=message,
         target={
             "kind": OWNER_KIND_DD,
             "id": development_id,
@@ -578,6 +584,7 @@ def _deliver_dd(
             "question_note_id": question_note_id,
             "card_entity_id": card_entity_id,
             "resume_status": "resumed",
+            **({"reason": reason} if reason else {}),
         },
     )
 
@@ -632,6 +639,7 @@ def deliver_decision(
             run_root=run_root,
             dd=dd,
             clock=clock,
+            reason=reason,
         )
 
     if line not in _roster_ids(lines):
@@ -718,6 +726,54 @@ def deliver_decision(
             "card_entity_id": target.card_entity_id,
             "resume_status": owner_result.status,
         },
+    )
+
+
+def deliver_line_selfgate(
+    *,
+    development_id: str,
+    principal: str,
+    facts: Any,
+    run_root: Path,
+    lines: list[Any],
+    dispatched_by: str = "",
+    dd: Any = None,
+    clock: Callable[[], float] = time.time,
+) -> DeliveryResult:
+    """M3 line self-gate: run the six-obligation gate, then deliver via M2.
+
+    Production caller of ``dd.selfgate_flow.run_line_selfgate`` -- the engine
+    path that makes the line self-gate the fleet default (spec §1). The line's
+    engine-side gatherer supplies ``facts`` (the six measured obligations); the
+    gate decides APPROVE/REJECT (a wrong principal or a violated obligation is
+    REJECT), the §4 rationale is templated from the six results, and the verdict
+    is delivered through the existing synchronous dd-gate path
+    (``_deliver_dd``) with ``reason`` = that rationale. Delivery honours the S10
+    contract unchanged: consumed-not-started, refusal trace, workspace validated
+    before any unit is launched.
+    """
+    from fleet_graph.dd.selfgate_flow import run_line_selfgate
+
+    if not dispatched_by and dd is not None:
+        try:
+            dispatched_by = str(dd.get(development_id).get("dispatched_by") or "")
+        except Exception:
+            dispatched_by = ""
+    result = run_line_selfgate(
+        development_id=development_id,
+        principal=principal,
+        dispatched_by=dispatched_by,
+        facts=facts,
+    )
+    return deliver_decision(
+        line=development_id,
+        decision=result.verdict,
+        reason=result.rationale,
+        principal=principal,
+        run_root=run_root,
+        lines=lines,
+        dd=dd,
+        clock=clock,
     )
 
 
@@ -1155,6 +1211,7 @@ __all__ = [
     "build_decision_mcp_server",
     "deliver_decision",
     "deliver_decision_dd",
+    "deliver_line_selfgate",
     "load_reserved_ports",
     "serve",
 ]

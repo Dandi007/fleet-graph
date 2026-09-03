@@ -26,10 +26,15 @@ Two contracts the tools themselves enforce:
   path, a target base, and the spec. There is no handoff parameter, no digest
   parameter, no receipt parameter -- the whole vocabulary a client used to
   have to guess is derived by the server and returned, not requested.
-- **The gate carries no verdict.** ``development_gate`` reports the pending
-  question note and offers a valueless ``resume``; on resume the graph
-  re-reads the board itself. Decisions travel only as ``work.decision.v1`` on
-  the bus, published by a human.
+- **The gate's verdict is the line's own.** ``development_gate`` reports the
+  pending question note and offers a valueless ``resume``; on resume the graph
+  re-reads the board itself. A line woken by ``dd_awaiting_gate`` no longer
+  hands the single back for a human: the line self-gate (M3,
+  ``dd/selfgate_flow.run_line_selfgate``) discharges the six evidence
+  obligations and delivers APPROVE/REJECT through the M2 ``decision_deliver``
+  surface with ``decided_by`` = the dispatching line. The valueless ``resume``
+  for a *human-admitted* single stays as-is; only the line-dispatched singles
+  self-gate by default (design §8「DD 闸不经人」).
 """
 
 from __future__ import annotations

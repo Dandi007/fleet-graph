@@ -430,6 +430,25 @@ class TestHarvestAllowlistRefusal:
         assert result["outcome"] == OUTCOME_REFUSED
         assert fake["calls"] == []
 
+    def test_merge_not_complete_refuses_before_any_write(self, tmp_path: Path) -> None:
+        """S7：收割触发点在「merge 后」。E5 携带 merge_complete=False（闸刚
+        APPROVE、merge 段尚未完成）-> 立即 refused + writes_skipped，零写动作。"""
+        from fleet_graph.supervise.harvest import REFUSE_MERGE_NOT_COMPLETE
+
+        fake = fake_ops()
+        event = approved_unharvested_event(
+            development_id="dev-x", head_commit="a" * 40, stage="implement", merge_complete=False
+        ).as_dict()
+        config, _ = config_for(tmp_path, ops=fake, event=event)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_REFUSED
+        assert fake["calls"] == [], f"write primitives executed: {fake['calls']}"
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        intake = next(s for s in receipt["steps"] if s["step"] == "intake")
+        assert intake["merge_complete"] is False
+        assert intake["refused"] == REFUSE_MERGE_NOT_COMPLETE
+        assert receipt["writes_skipped"] == list(WRITE_STEPS)
+
     def test_per_write_gate_still_holds_after_the_main_gate(self, tmp_path: Path) -> None:
         """belt-and-braces：主 gate 通过后，每个写步骤仍各自校验 allowlist。"""
         # main branch allowed, but the deploy command is not: the main gate sees

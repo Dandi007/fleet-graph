@@ -172,12 +172,30 @@ def cap_breaker_event(bucket: int, detail: str, folder_ids: list[str]) -> Superv
 
 
 def approved_unharvested_event(
-    development_id: str, head_commit: str, stage: str
+    development_id: str,
+    head_commit: str,
+    stage: str,
+    *,
+    merge_complete: bool = True,
 ) -> SupervisorEvent:
+    """The E5 harvest-trigger fact (S7: harvest fires after the merge segment).
+
+    ``merge_complete`` is the S7 signal that the merge segment (the dd lifecycle's
+    ``merger`` stage) completed -- the harvest reactor refuses when it is False,
+    so a bare "gate approved" can never reach the write steps. Defaults True
+    because the read-model already only lists ``terminal == "complete"``
+    developments (which have passed the merger); callers observing an earlier
+    state must pass ``False`` explicitly.
+    """
     return SupervisorEvent(
         type=EVENT_APPROVED_UNHARVESTED,
         key=sanitize_key(f"e5-{development_id}"),
-        payload={"development_id": development_id, "head_commit": head_commit, "stage": stage},
+        payload={
+            "development_id": development_id,
+            "head_commit": head_commit,
+            "stage": stage,
+            "merge_complete": bool(merge_complete),
+        },
     )
 
 

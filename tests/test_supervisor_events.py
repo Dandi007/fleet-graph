@@ -268,6 +268,7 @@ class TestReadModelEvents:
             "development_id": "dev-x",
             "head_commit": "abc123",
             "stage": "implement",
+            "merge_complete": True,
         }
 
     def test_e6_stale_heartbeat_line_fires(self, tmp_path: Path) -> None:

@@ -22,6 +22,7 @@ from typing import Any
 from fleet_graph.dd.selfgate import (
     DECISION_APPROVE,
     DECISION_REJECT,
+    REQUIRED_EVIDENCE,
     FlakeAttribution,
     RegressionRun,
     acceptance_argv_verbatim,
@@ -34,6 +35,14 @@ from fleet_graph.dd.selfgate import (
     regression_ok,
     zero_test_deletion,
 )
+from fleet_graph.dd.selfgate_flow import (
+    RATIONALE_SCHEMA,
+    harvest_eligibility,
+    is_release_writable_repo,
+    release_branch_ref,
+    run_line_selfgate,
+    template_evidence_rationale,
+)
 from fleet_graph.decision_mcp import (
     CODE_DD_GATE_NOT_CONSUMED,
     CODE_DD_WORKSPACE_MISSING,
@@ -42,10 +51,12 @@ from fleet_graph.decision_mcp import (
     OUTCOME_REFUSED,
     DeliveryResult,
     deliver_decision,
+    deliver_line_selfgate,
 )
 from fleet_graph.decision_mcp import (
     DECISION_APPROVE as MCP_APPROVE,
 )
+from fleet_graph.supervise.harvest_allowlist import HarvestAllowlist, parse_harvest_allowlist
 
 DISPATCHER = "wf-1"
 DD_ID = "dev-fg-m3"
@@ -378,3 +389,218 @@ def test_selfgate_assessment_round_trips_to_json() -> None:
     assessment = assess_evidence(_evidence())
     payload = assessment.as_dict()
     assert json.loads(json.dumps(payload)) == payload
+
+
+class FakeFacts:
+    """A scripted six-obligation gatherer: the engine-side ``SelfGateFacts`` port."""
+
+    def __init__(self, evidence: dict[str, Any]) -> None:
+        self.evidence = evidence
+        self.seen: list[str] = []
+
+    def gather(self, development_id: str) -> dict[str, Any]:
+        self.seen.append(development_id)
+        return self.evidence
+
+
+class TestSelfGateOrchestration:
+    """The production caller: gather six facts -> decide -> template rationale."""
+
+    def test_clean_gate_and_matching_principal_calls_the_gatherer_and_approves(self) -> None:
+        facts = FakeFacts(_evidence())
+        result = run_line_selfgate(
+            development_id=DD_ID,
+            principal=DISPATCHER,
+            dispatched_by=DISPATCHER,
+            facts=facts,
+        )
+        assert facts.seen == [DD_ID]
+        assert result.verdict == DECISION_APPROVE
+        assert result.assessment.ok is True
+        assert result.dispatched_by == DISPATCHER
+
+    def test_wrong_principal_is_rejected_by_the_orchestrator(self) -> None:
+        result = run_line_selfgate(
+            development_id=DD_ID,
+            principal="wf-other",
+            dispatched_by=DISPATCHER,
+            facts=FakeFacts(_evidence()),
+        )
+        assert result.verdict == DECISION_REJECT
+        assert result.assessment.ok is False
+
+    def test_broken_obligation_is_rejected_even_with_matching_principal(self) -> None:
+        result = run_line_selfgate(
+            development_id=DD_ID,
+            principal=DISPATCHER,
+            dispatched_by=DISPATCHER,
+            facts=FakeFacts(_evidence(regression_baseline=None)),
+        )
+        assert result.verdict == DECISION_REJECT
+        assert "regression_baseline" in result.assessment.violations[0]
+
+
+class TestRationaleTemplating:
+    """§4: the six results + verdict template into the decision_deliver rationale."""
+
+    def test_rationale_is_a_machine_readable_payload_with_all_six_obligations(self) -> None:
+        evidence = _evidence()
+        assessment = assess_evidence(evidence)
+        payload = json.loads(
+            template_evidence_rationale(
+                evidence=evidence,
+                assessment=assessment,
+                verdict=DECISION_APPROVE,
+                development_id=DD_ID,
+            )
+        )
+        assert payload["schema"] == RATIONALE_SCHEMA
+        assert payload["verdict"] == DECISION_APPROVE
+        assert payload["development_id"] == DD_ID
+        assert payload["violations"] == []
+        assert set(payload["evidence"]) == set(REQUIRED_EVIDENCE)
+        assert all(entry["ok"] for entry in payload["evidence"].values())
+
+    def test_rationale_names_each_failed_obligation(self) -> None:
+        evidence = _evidence(zero_test_deletion={"ok": False, "reason": "tests/t_removed.py"})
+        assessment = assess_evidence(evidence)
+        payload = json.loads(
+            template_evidence_rationale(
+                evidence=evidence,
+                assessment=assessment,
+                verdict=DECISION_REJECT,
+                development_id=DD_ID,
+            )
+        )
+        assert payload["verdict"] == DECISION_REJECT
+        assert any("zero_test_deletion" in v for v in payload["violations"])
+
+    def test_rationale_normalises_a_plain_boolean_obligation(self) -> None:
+        evidence = _evidence(product_diff_in_scope=False)
+        assessment = assess_evidence(evidence)
+        payload = json.loads(
+            template_evidence_rationale(
+                evidence=evidence,
+                assessment=assessment,
+                verdict=DECISION_REJECT,
+                development_id=DD_ID,
+            )
+        )
+        assert payload["evidence"]["product_diff_in_scope"]["ok"] is False
+
+
+class TestSelfGateDelivery:
+    """The integrated self-APPROVE flow, through M2 decision_deliver (spec §1/S10)."""
+
+    def test_deliver_line_selfgate_approves_and_consumes_with_rationale(
+        self, tmp_path: Path
+    ) -> None:
+        plane = FakeGatePlane(workspace=str(tmp_path))
+        result = deliver_line_selfgate(
+            development_id=DD_ID,
+            principal=DISPATCHER,
+            dispatched_by=DISPATCHER,
+            facts=FakeFacts(_evidence()),
+            run_root=tmp_path,
+            lines=ROSTER,
+            dd=plane,
+            clock=lambda: 1_700_000_123.0,
+        )
+        assert result.status == OUTCOME_DELIVERED
+        assert result.decision == MCP_APPROVE
+        # The six-evidence rationale rides the delivery (§4), never a bare verdict.
+        assert RATIONALE_SCHEMA in result.message
+        assert RATIONALE_SCHEMA in result.target["reason"]
+        assert plane.resumed == [(DD_ID, f"mcp:dd:{DD_ID}:g2:APPROVE")]
+
+    def test_deliver_line_selfgate_rejects_broken_evidence(self, tmp_path: Path) -> None:
+        plane = FakeGatePlane(workspace=str(tmp_path))
+        result = deliver_line_selfgate(
+            development_id=DD_ID,
+            principal=DISPATCHER,
+            dispatched_by=DISPATCHER,
+            facts=FakeFacts(_evidence(regression_baseline=None)),
+            run_root=tmp_path,
+            lines=ROSTER,
+            dd=plane,
+            clock=lambda: 0.0,
+        )
+        assert result.decision == DECISION_REJECT
+
+    def test_deliver_line_selfgate_derives_dispatched_by_from_the_plane(
+        self, tmp_path: Path
+    ) -> None:
+        plane = FakeGatePlane(workspace=str(tmp_path))
+        result = deliver_line_selfgate(
+            development_id=DD_ID,
+            principal=DISPATCHER,
+            facts=FakeFacts(_evidence()),
+            run_root=tmp_path,
+            lines=ROSTER,
+            dd=plane,
+            clock=lambda: 1_700_000_123.0,
+        )
+        # dispatched_by defaults from dd.get(...).dispatched_by == DISPATCHER.
+        assert result.status == OUTCOME_DELIVERED
+        assert result.decision == MCP_APPROVE
+
+
+class TestS7HarvestWiring:
+    """§5/S7: harvest waits for merge, and the release/<line-id> allowlist semantics."""
+
+    def test_harvest_eligibility_requires_the_merge_segment(self) -> None:
+        assert harvest_eligibility(gate_approved=True, merge_complete=False) == (
+            False,
+            "merge not complete; harvest waits for the merge segment",
+        )
+        assert harvest_eligibility(gate_approved=True, merge_complete=True)[0] is True
+        assert harvest_eligibility(gate_approved=False, merge_complete=True)[0] is False
+
+    def test_release_branch_ref_is_the_s7_writable_release_target(self) -> None:
+        assert release_branch_ref("wf-1") == "refs/heads/release/wf-1"
+
+    def test_release_writable_repo_hits_the_allowlist_prefix(self) -> None:
+        allowlist = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": "/data/code/self/fleet-graph",
+                        "allowed_branches": ["refs/heads/release/wf-1"],
+                        "allowed_deploy": [],
+                    }
+                ]
+            }
+        )
+        ok, reasons = is_release_writable_repo(
+            allowlist, repo_path="/data/code/self/fleet-graph", line_id="wf-1"
+        )
+        assert ok is True
+        assert reasons == ()
+
+    def test_release_writable_repo_refuses_another_line_and_unknown_repo(self) -> None:
+        allowlist = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": "/data/code/self/fleet-graph",
+                        "allowed_branches": ["refs/heads/release/wf-1"],
+                        "allowed_deploy": [],
+                    }
+                ]
+            }
+        )
+        ok, reasons = is_release_writable_repo(
+            allowlist, repo_path="/data/code/self/fleet-graph", line_id="wf-2"
+        )
+        assert ok is False
+        assert reasons
+        ok2, reasons2 = is_release_writable_repo(allowlist, repo_path="/unknown", line_id="wf-1")
+        assert ok2 is False
+        assert reasons2
+
+    def test_release_writable_repo_deny_all_by_default(self) -> None:
+        ok, reasons = is_release_writable_repo(
+            HarvestAllowlist.default(), repo_path="/x", line_id="wf-1"
+        )
+        assert ok is False
+        assert reasons
