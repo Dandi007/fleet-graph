@@ -147,7 +147,7 @@ class FakeReasoner:
                 "recommendation": "default suggestion",
                 "evidence_refs": [],
                 "consequence": "reversible",
-                "needs_human": True,
+                "escalation_target": "needs_evidence",
             }
         return self.responses.pop(0)
 
@@ -189,12 +189,12 @@ def decision(message_id: str, seq: int, card_id: str) -> dict[str, Any]:
     }
 
 
-def valid_response(needs_human: bool = True, **overrides: Any) -> dict[str, Any]:
+def valid_response(escalation_target: str = "needs_evidence", **overrides: Any) -> dict[str, Any]:
     response: dict[str, Any] = {
         "recommendation": "looks safe to proceed",
         "evidence_refs": [],
         "consequence": "reversible",
-        "needs_human": needs_human,
+        "escalation_target": escalation_target,
     }
     response.update(overrides)
     return response
@@ -238,7 +238,7 @@ def test_blocked_diagnosis_emits_recommendation_but_no_control_action() -> None:
 
     assert len(run.emitted) == 1
     assert run.emitted[0].kind == "work.note.v1"
-    assert run.emitted[0].note_type == "finding"  # needs_human -> finding
+    assert run.emitted[0].note_type == "finding"  # escalation_target set -> finding
 
     # No control action: the only write is a suggestion note. No card revision,
     # no decision, nothing else.
@@ -576,20 +576,31 @@ def test_recommendation_contract_uses_no_decision_field_names() -> None:
         recommendation="suggest",
         evidence_refs=("e1",),
         consequence="reversible",
-        needs_human=True,
+        escalation_target="needs_evidence",
     )
     fields = set(recommendation.as_dict())
     assert not fields & {"decision", "verdict", "approve", "reject", "gate_release"}
-    assert fields == {"subject_id", "recommendation", "evidence_refs", "consequence", "needs_human"}
+    assert fields == {
+        "subject_id",
+        "recommendation",
+        "evidence_refs",
+        "consequence",
+        "escalation_target",
+    }
 
 
 def test_coerce_recommendation_accepts_the_allowed_shape() -> None:
     coerced = coerce_recommendation(
-        {"recommendation": "go", "evidence_refs": ["e1"], "consequence": "c", "needs_human": True},
+        {
+            "recommendation": "go",
+            "evidence_refs": ["e1"],
+            "consequence": "c",
+            "escalation_target": "needs_evidence",
+        },
         subject_id="q1",
     )
     assert coerced.subject_id == "q1"
-    assert coerced.needs_human is True
+    assert coerced.escalation_target == "needs_evidence"
     assert coerced.evidence_refs == ("e1",)
 
 
