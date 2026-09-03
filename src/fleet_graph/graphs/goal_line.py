@@ -99,6 +99,36 @@ N7_INVALID_ROUND_CODE = "resume_verification_mismatch"
 #: carries both error causes.
 WORKER_REPORT_PROTOCOL_FAILURE = "worker_report_protocol_failure"
 
+#: The reason code a timed-out worker turn is recorded under (the streak
+#: breaker's input). Named so the attribution surface and the rounds records
+#: agree on one literal (defect ⑩).
+WORKER_TURN_TIMEOUT_REASON = "worker_turn_timeout"
+
+#: The defect-⑩ variable matrix: the fields every ``worker_turn_timeout`` round
+#: record must carry so a 3000s zero-output hang is attributable to the
+#: seat/model/round configuration that produced it. ``scripts/
+#: turn-timeout-report.py`` buckets on exactly these names; a record missing
+#: any one of them lands in that report's 「变量缺失」 bucket instead of being
+#: silently dropped.
+TIMEOUT_MATRIX_FIELDS = (
+    "seat",
+    "model",
+    "round_index",
+    "turn_timeout_seconds",
+    "input_bytes",
+    "output_evidence",
+)
+
+
+def timeout_matrix_missing(record: dict[str, Any]) -> list[str]:
+    """The matrix fields a timeout round record is missing (defect ⑩'s negative face).
+
+    The report script keeps a stdlib-only twin of this check so it stays
+    runnable without the package installed; this is the in-graph authority.
+    """
+    return [name for name in TIMEOUT_MATRIX_FIELDS if name not in record]
+
+
 #: The bounded re-ask upper bound for a worker turn report that fails the v1
 #: protocol (D1). Configurable: ``LineDeps.worker_report_retry_limit`` defaults
 #: to this constant, so an operator can tune the cost/benefit of a re-ask
@@ -442,6 +472,15 @@ class LineDeps:
     #: then absent, and the scheduler fails open (never locks) on the missing
     #: baseline.
     goal_revision: Any = None
+    #: The defect-⑩ variable matrix source: a callable returning the worker
+    #: seat's ``{seat, model, turn_timeout_seconds}`` (the wiring reads it off
+    #: ``AgentSessionWorker.turn_variables``), or None when the worker does not
+    #: expose one. The ``worker_turn`` timeout path calls it when recording a
+    #: ``worker_turn_timeout`` round so the record names the configuration that
+    #: timed out; a None source (or a failing call) records the matrix fields
+    #: with honest None values rather than dropping them -- the field set is
+    #: the contract, never the guess.
+    turn_variables: Any = None
 
     def now(self) -> float | None:
         return self.clock() if self.clock is not None else None
@@ -579,6 +618,23 @@ def _verdict_update(
 
     deps.guards.accept_prompt(check, prompt, round_no)
     return {"pending_prompt": prompt, "pending_sha": check.sha256}
+
+
+def _timeout_matrix(deps: LineDeps) -> dict[str, Any]:
+    """The seat-side variables for the timeout matrix, or {} when unwired.
+
+    A failing or malformed source degrades to {} -- the matrix fields are then
+    recorded as None values, never omitted, so the record's field set stays the
+    contract (defect ⑩) even when the seat cannot name itself.
+    """
+    getter = deps.turn_variables
+    if getter is None:
+        return {}
+    try:
+        value = getter()
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def _drained_line_messages(drain: Any) -> list[tuple[str, dict[str, Any]]]:
@@ -852,19 +908,57 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
                 break
             except TimeoutError as exc:
                 deps.guards.record_timeout()
+                # Defect ⑩: the timeout round is recorded through the same
+                # append path as any other round, but it must carry the
+                # variable matrix -- seat/model/round/budget/input size and
+                # the output signal up to the deadline -- or the 3000s
+                # zero-output hang is forever unattributable. Fields the
+                # worker wiring cannot resolve are recorded as None, never
+                # dropped: an absent field is how a legacy record says
+                # 「变量缺失」to the report.
+                matrix = _timeout_matrix(deps)
+                evidence = getattr(exc, "output_evidence", None)
+                if not isinstance(evidence, dict):
+                    # Boundary default, honest at this layer: nothing was
+                    # received from the worker call before it raised.
+                    evidence = {
+                        "stdout_lines": 0,
+                        "last_output_at": None,
+                        "zero_output": True,
+                        "source": "no_output_received",
+                    }
+                turn_variables: dict[str, Any] = {
+                    "seat": matrix.get("seat"),
+                    "model": matrix.get("model"),
+                    "round_index": round_no,
+                    "turn_timeout_seconds": matrix.get("turn_timeout_seconds"),
+                    "input_bytes": len(turn_prompt.encode("utf-8")),
+                    "output_evidence": evidence,
+                }
                 deps.artifacts.append_round(
                     {
                         "round": round_no,
+                        "round_index": round_no,
                         "verdict": "continue",
-                        "reason": "worker_turn_timeout",
+                        "reason": WORKER_TURN_TIMEOUT_REASON,
                         "prompt_sha256": state.get("pending_sha", ""),
                         "injected": True,
+                        **turn_variables,
                     }
                 )
                 return {
                     "round_no": round_no + 1,
                     "rounds_recorded": state.get("rounds_recorded", 0) + 1,
-                    "last_turn_status": {"kind": "turn_timeout", "detail": str(exc)},
+                    "last_turn_status": {
+                        "kind": "turn_timeout",
+                        "detail": str(exc),
+                        # Spec item 4's mechanical passthrough: the next
+                        # coordinator input embeds last_turn_status verbatim,
+                        # so whichever seat/model picks the round up sees the
+                        # dead round's death cause. Budgets and seat strategy
+                        # stay untouched -- this is a fact channel, not a knob.
+                        "turn_variables": turn_variables,
+                    },
                     "last_turn_output": "",
                     "last_turn_report": None,
                 }
@@ -1076,9 +1170,11 @@ __all__ = [
     "TERMINAL_DONE",
     "TERMINAL_FAILED",
     "TERMINAL_FAULT",
+    "TIMEOUT_MATRIX_FIELDS",
     "WORKER_REPORT_PROTOCOL_FAILURE",
     "WORKER_REPORT_REQUEST",
     "WORKER_REPORT_RETRY_LIMIT",
+    "WORKER_TURN_TIMEOUT_REASON",
     "AcceptancePort",
     "DecisionInterruptPort",
     "LineDeps",
@@ -1089,4 +1185,5 @@ __all__ = [
     "claims_resume_verification_broken",
     "n7_rejects_blocked",
     "n7_rejects_round_zero_repark",
+    "timeout_matrix_missing",
 ]
