@@ -1570,6 +1570,36 @@ class DdControlPlane:
             return None
         return dict(raw) if isinstance(raw, dict) else None
 
+    def publish_selfgate_evidence(
+        self, development_id: str, *, verdict: str, rationale: str
+    ) -> bool:
+        """Spec §4: write the six-evidence rationale to the single's board card.
+
+        The self-gate's templated rationale (the six obligations + verdict) must
+        land as a board evidence note on the single's card -- the "板卡 evidence
+        note" half of §4, alongside the line's local ``rounds.jsonl`` and the
+        ``decision_deliver`` rationale payload. Best-effort: the gate must never
+        fail because a board cannot take the note (the rationale already rode the
+        delivery), and a single published without a card has no card to note.
+        """
+        record = self._record(development_id)
+        card = str(record.get("card_entity_id") or "")
+        if not card:
+            return False
+        board = self._board_factory()
+        if board is None:
+            return False
+        generation = self._generation(record)
+        try:
+            board.evidence(
+                card_entity_id=card,
+                text=rationale,
+                idempotency_key=f"dd-selfgate:{development_id}:g{generation}:{verdict}",
+            )
+            return True
+        except Exception:
+            return False
+
     def _committed_gate_decision(
         self, record: dict[str, Any], generation: int = 1
     ) -> dict[str, Any] | None:

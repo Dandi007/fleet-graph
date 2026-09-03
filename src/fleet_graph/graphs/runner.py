@@ -260,8 +260,9 @@ class _ProductionSelfGate:
     surface import for a line that has no ``dd_awaiting_gate`` to answer.
     Once built it is the one seam the spec §5/S10 delivery path runs through:
     gather the six facts (:class:`~fleet_graph.dd.selfgate_facts.EngineSelfGateFacts`),
-    run the gate (``run_line_selfgate``), and deliver the verdict through M2
-    (``deliver_line_selfgate``) with the templated §4 rationale riding the call.
+    run the gate (``run_line_selfgate``), deliver the verdict through M2's
+    ``decision_deliver`` (``deliver_decision``) with the templated §4 rationale
+    riding the call, and land the rationale as a board evidence note.
     """
 
     def __init__(self, config: LineConfig) -> None:
@@ -274,7 +275,7 @@ class _ProductionSelfGate:
         from fleet_graph.dd.control_plane import DdControlPlane
         from fleet_graph.dd.selfgate_facts import EngineSelfGateFacts
         from fleet_graph.dd.selfgate_flow import run_line_selfgate
-        from fleet_graph.decision_mcp import deliver_line_selfgate
+        from fleet_graph.decision_mcp import deliver_decision
 
         config = self._config
         dd = DdControlPlane()
@@ -288,21 +289,35 @@ class _ProductionSelfGate:
                 dispatched_by = ""
             # Run the gate once for its verdict + templated rationale (the §4
             # payload the graph records into progress), then deliver through M2.
+            # Gathering is performed exactly once -- the six facts are measured
+            # live here, so a second gather would re-run the acceptance, re-fire
+            # the mutation gun and re-run the regression, never a cheap read.
             judgement = run_line_selfgate(
                 development_id=development_id,
                 principal=principal,
                 dispatched_by=dispatched_by,
                 facts=facts,
             )
-            delivery = deliver_line_selfgate(
-                development_id=development_id,
+            delivery = deliver_decision(
+                line=development_id,
+                decision=judgement.verdict,
+                reason=judgement.rationale,
                 principal=principal,
-                dispatched_by=dispatched_by,
-                facts=facts,
                 run_root=config.run_root.parent,
                 lines=[],
                 dd=dd,
             )
+            # §4 "板卡 evidence note": the six-evidence rationale also lands as a
+            # board evidence note on the single's card (best-effort -- the
+            # rationale already rode the delivery, so a down board must not fail
+            # the gate). Judgment remains out of the write path; this is a
+            # reporting note, never a verdict.
+            with suppress(Exception):
+                dd.publish_selfgate_evidence(
+                    development_id,
+                    verdict=judgement.verdict,
+                    rationale=judgement.rationale,
+                )
             return {
                 "verdict": judgement.verdict,
                 "rationale": judgement.rationale,

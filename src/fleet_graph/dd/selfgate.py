@@ -135,6 +135,14 @@ def acceptance_argv_verbatim(
     return _ok()
 
 
+def _in_scope(path: str, scope: set[str]) -> bool:
+    """A path maps onto the surface when it equals an entry or sits under a
+    directory-prefix entry (one ending in ``/``)."""
+    if path in scope:
+        return True
+    return any(path.startswith(prefix) for prefix in scope if prefix.endswith("/"))
+
+
 def product_diff_in_scope(
     *,
     changed_paths: Any,
@@ -144,7 +152,8 @@ def product_diff_in_scope(
     """Obligation 2: every product change maps onto the declared delivery surface.
 
     ``changed_paths`` is the product file list from ``base..head``; ``scope_paths``
-    is the spec's declared delivery surface. Protocol subtrees are exempt. A path
+    is the spec's declared delivery surface (an exact path, or a directory
+    prefix marked by a trailing ``/``). Protocol subtrees are exempt. A path
     that is neither protocol machinery nor in scope is a boundary crossing and
     names itself.
     """
@@ -156,7 +165,7 @@ def product_diff_in_scope(
             continue
         if _is_protocol_path(path, protocol_roots):
             continue
-        if path not in scope:
+        if not _in_scope(path, scope):
             violators.append(path)
     if violators:
         return _bad("product changes outside the declared surface: " + ", ".join(sorted(violators)))

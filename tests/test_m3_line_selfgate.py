@@ -21,6 +21,7 @@ from typing import Any
 
 from langgraph.checkpoint.memory import InMemorySaver
 
+from fleet_graph.dd.control_plane import DdControlPlane
 from fleet_graph.dd.selfgate import (
     DECISION_APPROVE,
     DECISION_REJECT,
@@ -46,6 +47,7 @@ from fleet_graph.dd.selfgate_flow import (
     run_line_selfgate,
     template_evidence_rationale,
 )
+from fleet_graph.dd.selfgate_run import SelfGateExecutor, parse_pytest_summary
 from fleet_graph.decision_mcp import (
     CODE_DD_GATE_NOT_CONSUMED,
     CODE_DD_WORKSPACE_MISSING,
@@ -792,3 +794,145 @@ class TestGoalLineSelfGateWiring:
         )
         # No dd anchor -> the self-gate never fired, the line ran its normal path.
         assert port.called == []
+
+
+class _FakeProc:
+    def __init__(self, returncode: int = 0) -> None:
+        self.returncode = returncode
+        self.stdout = ""
+        self.stderr = ""
+
+
+def _fake_run(returncode: int):
+    def run(argv: list[str], **kwargs: Any) -> _FakeProc:
+        return _FakeProc(returncode)
+
+    return run
+
+
+class _FakeExecutor:
+    """A scripted ``SelfGateExecutor`` recording the calls the gatherer makes."""
+
+    def __init__(self) -> None:
+        self.rerun: list[str] = []
+        self.mutations: list[str] = []
+        self.regression: list[str] = []
+
+    def rerun_acceptance(self, argvs: list[list[str]], *, cwd: str) -> list[dict[str, Any]]:
+        self.rerun.append(cwd)
+        return [{"argv": list(argv), "exit_code": 0} for argv in argvs]
+
+    def fire_mutation_gun(
+        self, argvs: list[list[str]], *, cwd: str, product_paths: list[str], shots: int = 2
+    ) -> list[dict[str, Any]]:
+        self.mutations.append(cwd)
+        return [{"path": p, "red": True, "restored": True} for p in product_paths[:shots]]
+
+    def full_regression(
+        self, *, repo: str, base_commit: str, head_commit: str, test_argv: tuple[str, ...] = ()
+    ) -> dict[str, Any]:
+        self.regression.append(repo)
+        ok = {"passed": 10, "failed": 0, "skipped": 0, "failed_set": []}
+        return {"baseline_run": ok, "head_run": ok}
+
+
+class TestParsePytestSummary:
+    def test_parses_pass_fail_skip_counts_and_the_failed_set(self) -> None:
+        summary = parse_pytest_summary(
+            "FAILED tests/test_x.py::TestY::test_z - assert False\n"
+            "1 failed, 2 passed, 1 skipped in 1.02s\n"
+        )
+        assert summary == {
+            "passed": 2,
+            "failed": 1,
+            "skipped": 1,
+            "failed_set": ["tests/test_x.py::TestY::test_z"],
+        }
+
+    def test_a_clean_run_has_no_failed_set(self) -> None:
+        assert parse_pytest_summary("50 passed in 3.20s\n")["failed"] == 0
+        assert parse_pytest_summary("50 passed in 3.20s\n")["failed_set"] == []
+
+
+class TestGathererPerformsTheObligations:
+    """The engine performs §2.4/§2.5/§2.6 rather than reading absent facts."""
+
+    def test_when_transcripts_are_absent_the_gatherer_runs_the_executor(
+        self, tmp_path: Path
+    ) -> None:
+        control = FakeControl(
+            spec_acceptance_commands=ACCEPT,
+            acceptance_commands=ACCEPT,
+            verification_commands=ACCEPT,
+            worktree_path=str(tmp_path),
+            target_base_commit="base",
+            head_commit="head",
+            compared_base_commit="base",
+            changed_paths=["src/a.py", "src/b.py"],
+        )
+        executor = _FakeExecutor()
+        facts = EngineSelfGateFacts(control, executor=executor).gather("dev-fg-m3")
+        assert executor.rerun == [str(tmp_path)]
+        assert executor.mutations == [str(tmp_path)]
+        assert executor.regression == [str(tmp_path)]
+        assert all(entry["ok"] for entry in facts.values())
+
+
+class TestMutationGunExecution:
+    def test_a_shot_turns_acceptance_red_and_restores_the_bytes(self, tmp_path: Path) -> None:
+        (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("y = 2\n", encoding="utf-8")
+        executor = SelfGateExecutor(run=_fake_run(1), git=lambda *a, **k: _FakeProc(0))
+        shots = executor.fire_mutation_gun(
+            [ACCEPT], cwd=str(tmp_path), product_paths=["a.py", "b.py"]
+        )
+        assert len(shots) == 2
+        assert all(shot["red"] is True and shot["restored"] is True for shot in shots)
+        assert (tmp_path / "a.py").read_text(encoding="utf-8") == "x = 1\n"
+        assert (tmp_path / "b.py").read_text(encoding="utf-8") == "y = 2\n"
+
+    def test_out_of_scope_mutation_still_runs_the_frozen_acceptance(self, tmp_path: Path) -> None:
+        executor = SelfGateExecutor(run=_fake_run(0), git=lambda *a, **k: _FakeProc(0))
+        runs = executor.rerun_acceptance([ACCEPT], cwd=str(tmp_path))
+        assert runs == [{"argv": ACCEPT, "exit_code": 0}]
+
+
+class _FakeBoard:
+    def __init__(self) -> None:
+        self.evidence_calls: list[dict[str, str]] = []
+
+    def evidence(self, *, card_entity_id: str, text: str, idempotency_key: str) -> None:
+        self.evidence_calls.append({"card": card_entity_id, "text": text, "key": idempotency_key})
+
+
+class TestSelfGateEvidenceNote:
+    def test_the_rationale_lands_as_a_board_evidence_note(self, tmp_path: Path) -> None:
+        (tmp_path / DD_ID).mkdir()
+        (tmp_path / DD_ID / "record.json").write_text(
+            json.dumps({"card_entity_id": "card-1", "generation": 2}), encoding="utf-8"
+        )
+        board = _FakeBoard()
+        control = DdControlPlane(root=tmp_path, board_factory=lambda: board)
+        assert (
+            control.publish_selfgate_evidence(
+                DD_ID, verdict="APPROVE", rationale='{"schema": "x", "verdict": "APPROVE"}'
+            )
+            is True
+        )
+        assert board.evidence_calls == [
+            {
+                "card": "card-1",
+                "text": '{"schema": "x", "verdict": "APPROVE"}',
+                "key": f"dd-selfgate:{DD_ID}:g2:APPROVE",
+            }
+        ]
+
+    def test_a_single_without_a_card_writes_no_note(self, tmp_path: Path) -> None:
+        (tmp_path / DD_ID).mkdir()
+        (tmp_path / DD_ID / "record.json").write_text(
+            json.dumps({"card_entity_id": "", "generation": 1}), encoding="utf-8"
+        )
+        board = _FakeBoard()
+        control = DdControlPlane(root=tmp_path, board_factory=lambda: board)
+        assert control.publish_selfgate_evidence(DD_ID, verdict="REJECT", rationale="x") is False
+        assert board.evidence_calls == []
