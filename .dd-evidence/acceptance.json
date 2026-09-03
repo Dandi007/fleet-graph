@@ -1,6 +1,6 @@
 {
  "development_id": "dev-fg-eee4da1e3649",
- "attempt": 2,
+ "attempt": 1,
  "passed": true,
  "results": [
   {
@@ -10,8 +10,8 @@
     "uv sync --frozen && uv run pytest -q tests/test_m5_release_branch_model.py"
    ],
    "exit_code": 0,
-   "stdout_tail": ".....................................                                    [100%]\n",
-   "stderr_tail": "Checked 100 packages in 0.86ms\n"
+   "stdout_tail": "......................................                                   [100%]\n",
+   "stderr_tail": "Checked 100 packages in 1ms\n"
   },
   {
    "command": [
