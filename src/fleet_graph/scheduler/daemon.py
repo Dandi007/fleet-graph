@@ -162,6 +162,12 @@ class LineSpec:
     #: was never reviewed is never passed down.
     noop_limit: int | None = None
     timeout_limit: int | None = None
+    #: M4 acceptance-command freeze: the goal carrier's ```dd-acceptance block
+    #: digest pinned at enlistment (a roster-PR field). None means the line
+    #: predates the pin -- the freeze fails open for it, never locking a
+    #: pre-M4 line shut. When set and the carrier's current digest differs,
+    #: ignition refuses with ACCEPTANCE_DIGEST_MISMATCH.
+    acceptance_digest: str | None = None
 
 
 @dataclass
@@ -342,6 +348,12 @@ class SchedulerConfig:
     #: M4 E7: 纯配置透传（无业务逻辑）。缺省 None → 不发射 --e7-allowlist，
     #: E7 goal.md 直写保持 deny-all 默认拒绝语义零放宽。
     e7_allowlist_path: str | None = None
+    #: M4 acceptance-command freeze: the goal-folder root the scheduler reads
+    #: each line's goal.md from (the same root the goal MCP face serves).
+    #: None disables the freeze check entirely -- a scheduler that cannot read
+    #: carriers simply never computes a current digest, and `decide` fails
+    #: open on the missing side.
+    goal_folder_root: Path | None = None
 
     @classmethod
     def from_json(cls, path: Path) -> SchedulerConfig:
@@ -383,6 +395,9 @@ class SchedulerConfig:
             harvest_deploy=list(raw.get("harvest_deploy") or []),
             repo=raw.get("repo"),
             e7_allowlist_path=raw.get("e7_allowlist_path"),
+            goal_folder_root=(
+                Path(raw["goal_folder_root"]) if raw.get("goal_folder_root") else None
+            ),
         )
 
 
@@ -1557,6 +1572,30 @@ class Scheduler:
             timeout_seconds=line.acceptance_timeout_seconds,
         ).to_cli_json()
 
+    def _carrier_acceptance_digest(self, line: LineSpec) -> str | None:
+        """The goal carrier's current dd-acceptance block digest, or None.
+
+        M4 acceptance-command freeze. Reads goal.md straight from the
+        configured goal-folder root (the same folders the goal MCP face
+        serves) and hashes its ```dd-acceptance block. Every failure mode --
+        no root configured, unreadable file, no block -- returns None, and
+        `decide` fails open on a missing side: a probe that cannot read must
+        never be able to lock a line shut. The executed commands stay the
+        roster's declared argv regardless; the digest only arms the drift
+        tripwire.
+        """
+        if self.config.goal_folder_root is None:
+            return None
+        from fleet_graph.goal_enroll.freeze import acceptance_block_digest
+
+        try:
+            goal_md = (Path(self.config.goal_folder_root) / line.folder_id / "goal.md").read_text(
+                encoding="utf-8"
+            )
+        except (OSError, ValueError):
+            return None
+        return acceptance_block_digest(goal_md)
+
     def line_environment(self) -> dict[str, str]:
         """A line must be able to run the executables the scheduler can.
 
@@ -1627,6 +1666,8 @@ class Scheduler:
                 cap_window_seconds=self.config.cap_window_seconds,
                 backoff_cap_seconds=self.config.backoff_cap_seconds,
                 revived=revived,
+                acceptance_digest_pinned=line.acceptance_digest,
+                acceptance_digest_current=self._carrier_acceptance_digest(line),
             )
             seat_roster, seat_override, seat_effective = self.seat_triple(line)
             # G2 line-completion gate: a `done` line whose product is not

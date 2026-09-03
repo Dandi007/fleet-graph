@@ -31,6 +31,9 @@ WorkingDirectory=/data/apps/fleet-graph/current
 # fr 的出厂座位写着 claude-opus-5 却整整五天跑 deepseek-v4-pro，就是被这两行盖的。
 # 判据 scripts/verify-lim.sh 07 seat-single-source 直接读本进程 cmdline，出现
 # --stage-model 即判 FAIL。要换档位改 role registry，不要在这里加回来。
+# M4（wf-8d9737）收尾：座位是每单的，不归服务。development_create 的 stage_models
+# 形参把座位冻进 record.json（seats/seats_source），launch 只读 record——服务级
+# --stage-model 已退役：传了即拒（STAGE_MODEL_OVERRIDE_RETIRED），serve 拒绝启动。
 ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph dd serve \
     --host 127.0.0.1 --port 5610
 Restart=always

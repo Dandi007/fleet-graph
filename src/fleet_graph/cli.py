@@ -734,6 +734,22 @@ def _dd_serve(args: argparse.Namespace) -> int:
     """Serve the dev-dispatch MCP surface on loopback. It is the control plane."""
     from fleet_graph.dd.service import serve
 
+    if args.stage_model:
+        # M4 (S2.3/S3 收尾): the server-wide stage-model override is retired.
+        # It was the second seat source that silently shadowed the role
+        # registry; seats are now frozen per development in record.json at
+        # admission (`development_create` stage_models). Keep the flag
+        # parseable so a stale unit template fails visibly here instead of
+        # crashing in argparse -- but never start with a seat policy attached.
+        print(
+            "fleet-graph dd serve: --stage-model is retired "
+            "(STAGE_MODEL_OVERRIDE_RETIRED). Seats are per-development, frozen "
+            "in record.json at admission via development_create stage_models; "
+            "there is no server-wide override. Remove the flag from the unit "
+            "template (see deploy/systemd/fleet-graph-dd-mcp.service).",
+            file=sys.stderr,
+        )
+        return 2
     serve(
         host=args.host,
         port=args.port,
@@ -741,7 +757,6 @@ def _dd_serve(args: argparse.Namespace) -> int:
         plugin_binding=args.plugin_binding,
         working_directory=args.working_directory,
         executable=args.executable,
-        stage_models=dict(pair.split("=", 1) for pair in args.stage_model),
         auto_resume=args.auto_resume,
         auto_resume_interval=args.auto_resume_interval,
         work_folder_root=args.work_folder_root,
@@ -1706,8 +1721,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="STAGE=MODEL",
-        help="override one stage's model, e.g. continuous_review=deepseek-v4-pro. "
-        "The role's own selector is the default and stays the policy",
+        help="the stage seat this development runs under, e.g. "
+        "continuous_review=glm-5.3. Forwarded from the admission record's "
+        "`seats` -- the single source (M4); not an operator override",
     )
     dd_run.add_argument(
         "--stage-timeout",
@@ -1777,9 +1793,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="STAGE=MODEL",
-        help="server-side policy: override one stage's model for every launched "
-        "run (e.g. continuous_review=deepseek-v4-pro); the roles' own "
-        "selectors stay the default",
+        help="RETIRED (STAGE_MODEL_OVERRIDE_RETIRED): parsing is kept so a "
+        "stale unit template fails visibly, but the server refuses to start "
+        "with any value. Seats are per-development, frozen in record.json at "
+        "admission (development_create stage_models)",
     )
     dd_serve.add_argument(
         "--auto-resume",

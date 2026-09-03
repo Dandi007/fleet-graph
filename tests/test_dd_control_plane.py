@@ -15,6 +15,7 @@ walked back:
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 from typing import Any
@@ -855,27 +856,110 @@ class TestCredentialDiscipline:
 
 
 class TestStageModelPolicy:
-    def test_server_side_stage_models_reach_the_launched_run(
-        self, scratch: Path, tmp_path: Path
-    ) -> None:
-        """Model overrides are deploy-level policy on the control plane, not
-        client vocabulary -- create's schema has no model parameter."""
-        launcher = RecordingLauncher()
+    """M4 seat single source: seats are a `create` parameter, frozen into
+    record.json, and read back at launch from the record -- never a
+    server-side global injected into every unit."""
+
+    def _plane(self, tmp_path: Path, launcher: RecordingLauncher) -> DdControlPlane:
         binding = tmp_path / "plugin-binding.json"
         binding.write_text('{"plugin_producer": {}}', encoding="utf-8")
-        plane = DdControlPlane(
+        return DdControlPlane(
             root=tmp_path / "dd",
             plugin_binding=binding,
             worktree_roots=(str(tmp_path),),
             launcher=launcher,
             unit_probe=lambda unit: False,
             board_factory=lambda: None,
-            stage_models={"continuous_review": "deepseek-v4-pro"},
         )
+
+    @staticmethod
+    def _argv_seat_pairs(argv: list[str]) -> dict[str, str]:
+        pairs: dict[str, str] = {}
+        for index, part in enumerate(argv):
+            if part == "--stage-model":
+                stage, seat = argv[index + 1].split("=", 1)
+                pairs[stage] = seat
+        return pairs
+
+    def test_stage_models_are_a_create_parameter_frozen_into_the_record(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        launcher = RecordingLauncher()
+        plane = self._plane(tmp_path, launcher)
+        dev = plane.create(
+            str(scratch),
+            spec_text=SPEC,
+            stage_models={"implement": "glm-5.3-flash"},
+        )["development_id"]
+
+        record = json.loads((plane.root / dev / RECORD_FILE).read_text(encoding="utf-8"))
+        assert record["seats"]["implement"] == "glm-5.3-flash"
+        assert record["seats_source"]["implement"] == "line-explicit"
+        # The unnamed stages carry the registry's factory seats
+        # (2026-09-03 拍板: cr=glm-5.3 / fr=claude-opus-5).
+        assert record["seats"]["continuous_review"] == "glm-5.3"
+        assert record["seats"]["final_review"] == "claude-opus-5"
+
+    def test_the_launched_argv_is_exactly_the_record_seats(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        launcher = RecordingLauncher()
+        plane = self._plane(tmp_path, launcher)
+        dev = plane.create(
+            str(scratch),
+            spec_text=SPEC,
+            stage_models={"implement": "glm-5.3-flash"},
+        )["development_id"]
+        plane.start(dev)
+
+        record = json.loads((plane.root / dev / RECORD_FILE).read_text(encoding="utf-8"))
+        argv = launcher.specs[0].argv()
+        assert self._argv_seat_pairs(argv) == record["seats"], (
+            "the measured launch argv and record.seats must agree pair for pair"
+        )
+
+    def test_seats_default_to_the_registry_factory_values(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        launcher = RecordingLauncher()
+        plane = self._plane(tmp_path, launcher)
         dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
         plane.start(dev)
-        argv = launcher.specs[0].argv()
-        assert argv[argv.index("--stage-model") + 1] == "continuous_review=deepseek-v4-pro"
+
+        record = json.loads((plane.root / dev / RECORD_FILE).read_text(encoding="utf-8"))
+        assert set(record["seats"]) == {"implement", "continuous_review", "final_review"}
+        assert set(record["seats_source"].values()) == {"registry-default"}
+        assert self._argv_seat_pairs(launcher.specs[0].argv()) == record["seats"]
+
+    def test_a_server_wide_stage_model_override_no_longer_exists(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        """The second seat source is gone, not shadowed: the control plane has
+        no seat policy of its own, and a launch reads the record only."""
+        assert "stage_models" not in inspect.signature(DdControlPlane.__init__).parameters
+        launcher = RecordingLauncher()
+        plane = self._plane(tmp_path, launcher)
+        dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
+        plane.start(dev)
+        record = json.loads((plane.root / dev / RECORD_FILE).read_text(encoding="utf-8"))
+        assert self._argv_seat_pairs(launcher.specs[0].argv()) == record["seats"]
+
+    def test_a_seat_outside_the_registry_refuses_and_creates_nothing(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        plane = self._plane(tmp_path, RecordingLauncher())
+        with pytest.raises(ControlPlaneError) as excinfo:
+            plane.create(str(scratch), spec_text=SPEC, stage_models={"implement": "gpt-9"})
+        assert excinfo.value.code == "STAGE_SEAT_NOT_ALLOWED"
+        assert not (tmp_path / "dd").exists() or not any(
+            path.is_dir() for path in (tmp_path / "dd").iterdir()
+        ), "the unit is not established"
+
+    def test_a_seat_for_a_non_llm_stage_refuses(self, scratch: Path, tmp_path: Path) -> None:
+        plane = self._plane(tmp_path, RecordingLauncher())
+        with pytest.raises(ControlPlaneError) as excinfo:
+            plane.create(str(scratch), spec_text=SPEC, stage_models={"configure": "glm-5.3"})
+        assert excinfo.value.code == "STAGE_SEAT_STAGE_UNKNOWN"
 
 
 class TestPerStageTimeouts:

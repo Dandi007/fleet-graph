@@ -396,6 +396,144 @@ def validate_timeouts(timeouts: dict[str, Any] | None) -> dict[str, int]:
     return validated
 
 
+# --- M4 stage seats: the record is the single source -----------------------
+#
+# S2.3/S3 收尾. A stage's model used to be server-side policy: `dd serve
+# --stage-model` injected a fleet-wide override into every launched run, and
+# that second source silently shadowed the role registry (fr ran five days on
+# deepseek-v4-pro while its registry seat said claude-opus-5). The override is
+# retired; seats now come from exactly one place -- the admission record. The
+# committed ``config/stage-seats.json`` is the local projection of the role
+# registry (the registry itself is agent-runtime's, closed out by wf-9b5931):
+# its factory defaults fill every seat a dispatch did not name explicitly,
+# and its allowed set is what ``development_create`` validates against.
+
+STAGE_SEATS_FILE = (
+    Path(__file__).resolve().parent.parent.parent.parent / "config" / "stage-seats.json"
+)
+
+#: Where a seat value came from, recorded per stage in the admission record.
+SEAT_SOURCE_REGISTRY_DEFAULT = "registry-default"
+SEAT_SOURCE_LINE_EXPLICIT = "line-explicit"
+
+#: Structured seat refusals. Both mean "the unit was not created".
+CODE_STAGE_SEAT_STAGE_UNKNOWN = "STAGE_SEAT_STAGE_UNKNOWN"
+CODE_STAGE_SEAT_NOT_ALLOWED = "STAGE_SEAT_NOT_ALLOWED"
+CODE_STAGE_SEAT_REGISTRY_UNREADABLE = "STAGE_SEAT_REGISTRY_UNREADABLE"
+
+
+def load_stage_seat_registry(path: str | Path | None = None) -> dict[str, Any]:
+    """The committed registry projection: ``{"default_seats", "allowed_seats"}``.
+
+    Fail-closed on purpose: a missing or malformed projection means the
+    factory values are unknowable, and freezing guessed seats into a record
+    is exactly the drift this module exists to kill. The refusal names the
+    file so the operator's next step is obvious.
+    """
+    seat_path = Path(path) if path is not None else STAGE_SEATS_FILE
+    try:
+        raw = json.loads(seat_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlPlaneError(
+            CODE_STAGE_SEAT_REGISTRY_UNREADABLE,
+            f"the stage-seat registry projection {seat_path} is missing or "
+            f"malformed ({exc}); seats cannot be resolved fail-closed",
+        ) from exc
+    defaults = raw.get("default_seats")
+    allowed = raw.get("allowed_seats")
+    if (
+        not isinstance(defaults, dict)
+        or not isinstance(allowed, list)
+        or not all(isinstance(seat, str) and seat for seat in allowed)
+    ):
+        raise ControlPlaneError(
+            CODE_STAGE_SEAT_REGISTRY_UNREADABLE,
+            f"the stage-seat registry projection {seat_path} must carry "
+            '{"default_seats": {...}, "allowed_seats": [str, ...]}',
+        )
+    return {
+        "default_seats": {str(stage): str(seat) for stage, seat in defaults.items() if str(seat)},
+        "allowed_seats": frozenset(allowed),
+    }
+
+
+def _seat_eligible_stages() -> set[str]:
+    """The lifecycle's llm stages -- the only stages a seat can apply to.
+
+    ``configure`` / ``acceptance`` / ``human_gate`` / ``merger`` run
+    in-process; a "seat" for them is a typo that would read as policy.
+    """
+    from fleet_graph.dd.lifecycle import Lifecycle
+
+    return {stage for stage, spec in Lifecycle.load().stages.items() if spec.is_llm}
+
+
+def validate_stage_seats(
+    stage_models: dict[str, Any] | None, registry: dict[str, Any]
+) -> dict[str, str]:
+    """The explicitly dispatched seats, validated against the projection.
+
+    A stage the lifecycle does not dispatch to an agent, or a seat value the
+    registry does not allow, refuses by name -- the unit is not created
+    (单不建立). Values must be non-empty strings.
+    """
+    if not stage_models:
+        return {}
+    if not isinstance(stage_models, dict):
+        raise ControlPlaneError(
+            CODE_STAGE_SEAT_STAGE_UNKNOWN,
+            f"stage_models must be a dict of stage -> seat, got {stage_models!r}",
+        )
+    eligible = _seat_eligible_stages()
+    allowed = registry["allowed_seats"]
+    validated: dict[str, str] = {}
+    for stage, seat in stage_models.items():
+        if not isinstance(stage, str) or stage not in eligible:
+            raise ControlPlaneError(
+                CODE_STAGE_SEAT_STAGE_UNKNOWN,
+                f"{stage!r} is not a stage an agent seat applies to; stage_models "
+                f"may name only {sorted(eligible)}",
+            )
+        if not isinstance(seat, str) or not seat.strip():
+            raise ControlPlaneError(
+                CODE_STAGE_SEAT_NOT_ALLOWED,
+                f"seat for {stage!r} must be a non-empty string, got {seat!r}",
+            )
+        seat = seat.strip()
+        if seat not in allowed:
+            raise ControlPlaneError(
+                CODE_STAGE_SEAT_NOT_ALLOWED,
+                f"seat {seat!r} for stage {stage!r} is not in the registry's "
+                f"allowed set {sorted(allowed)}; fix the seat or extend the "
+                "registry projection (config/stage-seats.json)",
+            )
+        validated[stage] = seat
+    return validated
+
+
+def resolve_stage_seats(
+    stage_models: dict[str, Any] | None, registry: dict[str, Any]
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Every seat the development will run under, plus where each came from.
+
+    Registry factory defaults fill the llm stages a dispatch did not name;
+    an explicit ``stage_models`` entry wins and is recorded as
+    ``line-explicit``. Both mappings are frozen into record.json at
+    admission -- the record is the single source the launch reads.
+    """
+    explicit = validate_stage_seats(stage_models, registry)
+    seats: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    for stage in sorted(_seat_eligible_stages()):
+        if stage in explicit:
+            seats[stage] = explicit[stage]
+            sources[stage] = SEAT_SOURCE_LINE_EXPLICIT
+        elif stage in registry["default_seats"]:
+            seats[stage] = registry["default_seats"][stage]
+            sources[stage] = SEAT_SOURCE_REGISTRY_DEFAULT
+    return seats, sources
+
+
 def build_h0_handoff(
     *, development_id: str, spec_digest: str, target_base_commit: str, remote_url: str
 ) -> dict[str, Any]:
@@ -506,9 +644,10 @@ class DdLaunchSpec:
     #: development root itself (existing on-disk layout); later generations
     #: get their own subdirectory so a rerun never overwrites history.
     run_root: Path | None = None
-    #: Server-side policy, not client vocabulary: per-stage model overrides
-    #: (the roles' own selectors stay the default). The §24 precedent runs
-    #: review stages on deepseek-v4-pro.
+    #: The development's frozen seats (stage -> seat), read from the admission
+    #: record at launch time -- the single source (M4). There is no second
+    #: stage-model source to shadow the role registry any more: the control
+    #: plane holds no seat policy of its own.
     stage_models: dict[str, str] = field(default_factory=dict)
     #: Per-stage run-fence overrides (stage_id -> seconds), forwarded from the
     #: admission record so the launched `dd run` fences each stage with its own
@@ -620,7 +759,6 @@ class DdControlPlane:
         unit_probe: Callable[[str], bool] = _systemd_unit_is_active,
         board_factory: Callable[[], Any] | None = None,
         environment: dict[str, str] | None = None,
-        stage_models: dict[str, str] | None = None,
         scope_boundary: ScopeBoundary | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -637,7 +775,6 @@ class DdControlPlane:
         self.environment = (
             dict(environment) if environment is not None else _inherited_environment()
         )
-        self.stage_models = dict(stage_models or {})
         #: The scope boundary admission refuses against (B1). Data, not a literal
         #: scattered across call sites -- a rescope edits this, not the checks.
         self.scope_boundary = scope_boundary if scope_boundary is not None else default_boundary()
@@ -653,6 +790,7 @@ class DdControlPlane:
         spec_path: str | None = None,
         dispatched_by: str = "",
         timeouts: dict[str, int] | None = None,
+        stage_models: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Admit one development: derive everything, bootstrap, record.
 
@@ -668,9 +806,24 @@ class DdControlPlane:
         positive seconds); it is validated against the contract's stage ids and
         recorded for audit. Not passed (or empty) keeps the 3600s default for
         every stage -- existing behavior unchanged.
+
+        `stage_models` (M4) is the seat parameter channel: `{llm_stage ->
+        seat}`, validated against the registry projection before anything is
+        created -- an unknown stage or a disallowed seat refuses with a
+        structured code and the unit is not established. Every llm stage is
+        frozen into record.json as `seats` (explicit entries recorded as
+        `line-explicit`, the rest as the registry's factory defaults), and
+        that record -- not any server-side global -- is what every launch of
+        this development runs under. Seats freeze at first admission: a
+        re-admission of the same (repo, spec, base) returns the existing
+        record unchanged.
         """
         repo = self._admit_repo(repo_path)
         spec = self._read_spec(spec_text, spec_path)
+        # M4: seats are validated before a single byte is written -- a bad
+        # seat must refuse the admission, not poison a bootstrapped worktree.
+        registry = load_stage_seat_registry()
+        seats, seat_sources = resolve_stage_seats(stage_models, registry)
         # B1: admit nothing that actively crosses the declared scope boundary.
         # The refusal names the scope rule, so a crossing is a scope decision
         # rather than whatever downstream failure happened to fire first. The
@@ -744,6 +897,15 @@ class DdControlPlane:
             #: byte-identical. Persisted so the audit trail says what fence the
             #: order actually ran under.
             "timeouts": validated_timeouts,
+            #: M4 seat single source: every llm stage's seat, frozen at
+            #: admission. `seats_source` records where each seat came from
+            #: (`line-explicit` / `registry-default`). Every launch reads its
+            #: seats from THIS mapping -- there is no server-side stage-model
+            #: override any more -- and the launched argv is the record's
+            #: `--stage-model stage=seat` pairs, so launches.jsonl and the
+            #: record can never disagree.
+            "seats": seats,
+            "seats_source": seat_sources,
             "plugin_binding_path": str(self.plugin_binding),
             "created_at": iso(self.clock()),
         }
@@ -763,6 +925,8 @@ class DdControlPlane:
             },
             "remote": {"url": record["remote_url"], "ref": record["remote_ref"]},
             "acceptance_commands": record["acceptance_commands"],
+            "seats": dict(record.get("seats") or {}),
+            "seats_source": dict(record.get("seats_source") or {}),
             "card_entity_id": record["card_entity_id"],
             "gate_enabled": bool(record["card_entity_id"]),
         }
@@ -1272,7 +1436,11 @@ class DdControlPlane:
             launch_seq=seq,
             generation=generation,
             run_root=run_root,
-            stage_models=dict(self.stage_models),
+            # M4 seat single source: the seats the record froze at admission,
+            # never a server-side global. The launched `dd run` argv carries
+            # exactly these pairs, so launches.jsonl's measured argv and
+            # record.seats agree by construction.
+            stage_models=dict(record.get("seats") or {}),
             timeouts=dict(record.get("timeouts") or {}),
             working_directory=self.working_directory,
             executable=self.executable,

@@ -49,6 +49,11 @@ import os
 import socket
 from typing import Any
 
+from fleet_graph.goal.line_message import (
+    CODE_SINK_UNBOUND,
+    BusLineMessageSink,
+    LineMessageError,
+)
 from fleet_graph.goal_enroll.briefing import BRIEFING_TEXT, goal_open_prompt_text
 from fleet_graph.goal_enroll.contract import (
     BRIEFING_RESOURCE_URI,
@@ -126,6 +131,10 @@ def build_goal_mcp_server(
     submitted_by: str | None = None,
     alias_token_check: Any | None = None,
     supervisor_identity_check: Any | None = None,
+    line_message_sink: Any | None = None,
+    line_alias_resolver: Any | None = None,
+    goal_carrier_digest: Any | None = None,
+    clock: Any | None = None,
 ) -> Any:
     """Build the standalone goal-driven MCP surface.
 
@@ -150,18 +159,46 @@ def build_goal_mcp_server(
     ``/data/agent-bus/tokens``), keeping admission authority exclusively with
     the supervisor plane. Drills inject a temp-dir check built over a scratch
     secrets root and supervision root.
+
+    ``line_message_sink`` (M4) is the line-message delivery seam
+    ``(alias, payload) -> message_id``; production binds
+    :class:`BusLineMessageSink` (publish into ``agent:{alias}`` with the
+    line's own token). When None the tool exists but refuses with
+    ``LINE_MESSAGE_SINK_UNBOUND`` -- and ``goal serve`` binds the real sink,
+    so production never reaches the unbound route. ``line_alias_resolver`` is
+    ``(line) -> alias | None`` over the read-only roster;
+    ``goal_carrier_digest`` is ``(folder_id) -> digest | None`` for the M4
+    acceptance-freeze report on ``goal_status``.
     """
     from fastmcp import FastMCP
     from fastmcp.exceptions import ToolError
 
+    real_roster = real_roster if real_roster is not None else RealRosterReader()
     enroll = GoalEnrollService(
         GoalEnrollValidator(goal_folders, alias_token_check=alias_token_check),
         queue=goal_queue if goal_queue is not None else EnrollQueue(),
-        roster=real_roster if real_roster is not None else RealRosterReader(),
+        roster=real_roster,
         board=board,
         submitted_by=submitted_by or os.environ.get("FLEET_GRAPH_SUBMITTED_BY", "goal-mcp"),
         supervisor_identity_check=supervisor_identity_check,
+        goal_carrier_digest=goal_carrier_digest,
     )
+    if line_alias_resolver is None:
+
+        def _resolve_line_alias(line: str) -> str | None:
+            entry = real_roster.get(line) or {}
+            alias = str(entry.get("alias") or "")
+            return alias or None
+
+    else:
+        _resolve_line_alias = line_alias_resolver
+
+    if clock is not None:
+        _clock = clock
+    else:
+        import time as _time
+
+        _clock = _time.time
     mcp = FastMCP(MCP_SERVER_NAME)
 
     def refuse_enroll(tool: str, exc: GoalEnrollError) -> dict[str, Any]:
@@ -174,6 +211,15 @@ def build_goal_mcp_server(
                     "tool": tool,
                     "briefing_version": BRIEFING_VERSION,
                 },
+                sort_keys=True,
+            )
+        )
+
+    def refuse_line_message(exc: LineMessageError) -> dict[str, Any]:
+        """Raise the machine-readable line_message refusal structure."""
+        raise ToolError(
+            json.dumps(
+                {"code": exc.code, "message": exc.detail, "tool": "line_message"},
                 sort_keys=True,
             )
         )
@@ -310,6 +356,52 @@ def build_goal_mcp_server(
         except GoalEnrollError as exc:
             return refuse_enroll("goal_reject", exc)
 
+    @mcp.tool()
+    def line_message(
+        line: str,
+        text: str,
+        kind: str,
+        sent_by: str,
+    ) -> dict[str, Any]:
+        """Send one supervisor message to a goal line's inbox (M4).
+
+        Supervisor-only, fail-closed: ``sent_by`` must be a supervisor-plane
+        principal (the exact guard ``goal_admit`` / ``goal_reject`` use); any
+        other identity refuses with ``LINE_MESSAGE_NOT_SUPERVISOR`` and
+        nothing is delivered -- not even a roster lookup. ``kind`` is
+        ``instruction`` or ``info``; ``instruction`` obliges the line's next
+        round to ack ``(message_id, executed | rejected + reason)``.
+
+        The message lands in the line's own inbox (``agent:<alias>``), which
+        makes it the M1 ``inbox_message`` wake fact: a parked line wakes and
+        carries the text verbatim in its next round's ``inbox_messages``.
+        A message is *never* a decision: the payload has no decision field,
+        and only ``decision_deliver`` (the M2 surface) lifts a
+        ``waiting_decision`` park. Delivery failures are explicit
+        machine-readable refusals, never silent swallows.
+        """
+        if line_message_sink is None:
+            return refuse_line_message(
+                LineMessageError(
+                    CODE_SINK_UNBOUND, "no line-message inbox sink is bound to this server"
+                )
+            )
+        try:
+            from fleet_graph.goal.line_message import deliver_line_message
+
+            return deliver_line_message(
+                line=line,
+                text=text,
+                kind=kind,
+                sent_by=sent_by,
+                resolve_alias=_resolve_line_alias,
+                sink=line_message_sink,
+                identity_check=enroll.is_supervisor,
+                clock=_clock,
+            )
+        except LineMessageError as exc:
+            return refuse_line_message(exc)
+
     return mcp
 
 
@@ -356,11 +448,22 @@ def serve(
     migrate_queue_home(legacy_root=root, queue_home=queue_home)
     goal_folders = governed_goal_folder_store(root)
     goal_queue = EnrollQueue(queue_home)
+
+    def carrier_digest(folder_id: str) -> str | None:
+        from fleet_graph.goal_enroll.freeze import acceptance_block_digest
+
+        goal_md = goal_folders.read(folder_id, "goal.md")
+        if goal_md is None:
+            return None
+        return acceptance_block_digest(goal_md)
+
     build_goal_mcp_server(
         goal_folders=goal_folders,
         goal_queue=goal_queue,
         real_roster=RealRosterReader(),
         board=_bind_board(),
+        line_message_sink=BusLineMessageSink(),
+        goal_carrier_digest=carrier_digest,
     ).run(transport="streamable-http", host=host, port=port, path="/mcp")
 
 

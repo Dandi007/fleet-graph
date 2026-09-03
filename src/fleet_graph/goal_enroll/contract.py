@@ -143,6 +143,12 @@ class GoalRosterEntry:
     mechanism: str
     admitted_at: str
     engine: str = "fleet-graph"
+    #: M4 acceptance-command freeze: the sha256 digest of the goal carrier's
+    #: ```dd-acceptance block at enlistment. A carrier whose block no longer
+    #: hashes to this has changed its acceptance commands -- which means
+    #: re-enlisting, not quietly running. None on entries admitted before the
+    #: pin existed (the freeze fails open for them).
+    acceptance_digest: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -154,6 +160,7 @@ class GoalRosterEntry:
             "mechanism": self.mechanism,
             "admitted_at": self.admitted_at,
             "engine": self.engine,
+            "acceptance_digest": self.acceptance_digest,
         }
 
 

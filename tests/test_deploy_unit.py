@@ -212,6 +212,14 @@ class TestTheDdMcpUnitRunsSomethingThatExists:
         argv = exec_start(text)
         assert argv[0].startswith("/data/apps/fleet-graph/current/"), argv[0]
 
+    def test_the_unit_carries_no_stage_model_override(self) -> None:
+        """M4 seat single source (S3 收尾): the unit's ExecStart argv carries no
+        --stage-model key. The two keys it once carried silently shadowed the
+        role registry for five days; the same check scripts/verify-lim.sh 07
+        runs against the live /proc cmdline runs here against the template."""
+        argv = exec_start(DD_MCP_UNIT.read_text(encoding="utf-8"))
+        assert "--stage-model" not in argv, argv
+
     def test_a_missing_env_file_is_tolerated(self) -> None:
         text = DD_MCP_UNIT.read_text(encoding="utf-8")
         assert re.search(r"^EnvironmentFile=-", text, re.MULTILINE)
