@@ -56,6 +56,7 @@ on the bus, published by a human; this module has no way to publish one.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -1657,6 +1658,58 @@ class DdControlPlane:
             "events": selected[: max(1, limit)],
             "head_event_id": entries[-1]["event_id"] if entries else None,
         }
+
+    def record_gate_refusal(
+        self,
+        development_id: str,
+        *,
+        code: str,
+        reason: str,
+        exit_code: str = "",
+    ) -> dict[str, Any]:
+        """Durably trace a gate refusal cast on the *delivery* path (M3 S10).
+
+        The decision MCP's dd delivery calls this when a resume's success cannot
+        be read back as consumption (or the frozen workspace vanished before any
+        unit started). It has two observable effects, both read back by the
+        existing read side:
+
+        - an ``events.jsonl`` line carrying ``event: gate_refused`` (so the
+          defiance is visible in the append-only trail, not only in systemd
+          journal);
+        - a ``gate_refused`` fact folded into ``result.json``, which
+          ``rebuild_status`` already surfaces -- so ``get()``/``status.json``
+          report the refusal instead of the previous "unit died, single never
+          changed" hole.
+
+        Best-effort writes: a trace that cannot land never changes the refusal
+        itself.
+        """
+        record = self._record(development_id)
+        generation = self._generation(record)
+        run_root = self._gen_root(development_id, generation)
+        at = iso(self.clock())
+        payload = {"code": code, "reason": reason, "exit_code": exit_code, "at": at}
+
+        event_path = run_root / EVENTS_FILE
+        with contextlib.suppress(OSError):
+            event_path.parent.mkdir(parents=True, exist_ok=True)
+            with event_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {"at": at, "event": "gate_refused", **payload},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+
+        result = self._read_result(development_id, generation) or {}
+        result.setdefault("development_id", development_id)
+        result["gate_refused"] = payload
+        with contextlib.suppress(OSError):
+            write_json_durable(run_root / RESULT_FILE, result)
+        return payload
 
     # --- evidence --------------------------------------------------------
 
