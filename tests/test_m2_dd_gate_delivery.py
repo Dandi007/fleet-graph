@@ -41,6 +41,9 @@ from fleet_graph.decision_mcp import (
     DeliveryResult,
     deliver_decision,
 )
+from fleet_graph.selfgate import GATE_EVIDENCE_FIELDS
+
+COMPLETE_EVIDENCE: dict[str, Any] = {field: {"ok": True} for field in GATE_EVIDENCE_FIELDS}
 
 DD_ID = "dev-fg-abc"
 DISPATCHER = "wf-1"
@@ -134,6 +137,7 @@ def _call(
         lines=ROSTER,
         dd=plane,
         clock=lambda: 1_700_000_123.0,
+        evidence=COMPLETE_EVIDENCE,
     )
 
 

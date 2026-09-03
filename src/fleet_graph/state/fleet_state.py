@@ -97,6 +97,12 @@ _RECEIPT_STATE: dict[str, tuple[str, str | None]] = {
 GATE_STAGE = "human_gate"
 GATE_SUCCESS_EVENT = "success"
 DD_AWAITING_GATE = "awaiting_gate"
+#: The dd pipeline's merge stage id (lifecycle: ... -> human_gate -> merger).
+#: The harvest reactor (E5 ``approved_unharvested``) must fire only *after* the
+#: merge stage completes -- not after the gate approves (spec item 5 / S7: 收割
+#: 触发点从「闸后」改到「merge 后」). A `complete` terminal that is not at this
+#: stage is a gate-only (or corrupt) state and is not harvestable.
+DD_MERGE_STAGE = "merger"
 
 #: 对账 basis 词汇（closed）。前两者 = 单据侧证明被消费；``document_awaiting``
 #: = 单据侧可读但仍停留在 waiting（真没消费）；``unreconciled`` = 有 dd 目标
@@ -630,6 +636,14 @@ class FleetStateView:
             # refused / fault / any non-complete terminal / in-flight never
             # listed (目标语义): only `complete` can be approved_unharvested.
             if terminal != "complete":
+                continue
+            # Harvest fires after the merge stage (spec item 5 / S7), not after
+            # the gate: `complete` alone is the pipeline terminal, and in that
+            # pipeline it is reached at the merger stage. A `complete` record
+            # whose stage is not the merge stage (a gate-only or mis-derived
+            # cache) is *not* harvestable -- the trigger point is post-merge,
+            # fail-closed toward delaying a harvest rather than reaping early.
+            if str(status.get("stage") or "") != DD_MERGE_STAGE:
                 continue
             if first_run:
                 # 首跑基线豁免：存量 complete 一次性出清，不入列。

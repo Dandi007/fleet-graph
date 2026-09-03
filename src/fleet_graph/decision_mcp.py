@@ -63,6 +63,10 @@ from fleet_graph.decision_bridge.owners import (
     LineOwnerSource,
     OwnerTarget,
 )
+from fleet_graph.selfgate import (
+    GateEvidenceMissing,
+    gate_evidence_payload,
+)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5614
@@ -144,6 +148,12 @@ CODE_DD_UNKNOWN = "DD_UNKNOWN"
 CODE_DD_WORKSPACE_MISSING = "DD_WORKSPACE_MISSING"
 CODE_DD_NOT_CONSUMED = "DD_NOT_CONSUMED"
 
+#: M3 self-gate refusal: a dd delivery that did not carry the six mandatory
+#: evidence answer fields (the gate's 必答字段). The self-gate path is the
+#: engine default, so a delivery whose evidence is absent or incomplete is
+#: refused here -- never silently resumed (spec item 2's "缺任一项 → 投递被拒").
+CODE_GATE_EVIDENCE_MISSING = "GATE_EVIDENCE_MISSING"
+
 #: Prometheus metric names emitted by the ledger's textfile.
 METRIC_DELIVERED = "fleet_graph_decision_delivered_total"
 METRIC_REFUSED = "fleet_graph_decision_refused_total"
@@ -187,6 +197,11 @@ class DeliveryResult:
     card_entity_id: str = ""
     action_key: str = ""
     target: dict[str, Any] | None = None
+    #: M3: the six-evidence rationale the self-gate delivery is bound to. Only a
+    #: delivered dd delivery carries it (built by ``gate_evidence_payload``), so
+    #: its presence is the machine check that the gate's 必答字段 actually rode
+    #: the verdict (spec item 4: 取证与结论落档).
+    evidence: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -203,6 +218,8 @@ class DeliveryResult:
             payload["action_key"] = self.action_key
             if self.target is not None:
                 payload["target"] = self.target
+            if self.evidence is not None:
+                payload["evidence"] = self.evidence
         else:
             payload["code"] = self.code
             payload["message"] = self.message
@@ -377,6 +394,7 @@ def _deliver_dd(
     run_root: Path,
     dd: Any,
     clock: Callable[[], float],
+    evidence: dict[str, Any] | None = None,
 ) -> DeliveryResult:
     """The synchronous dd-gate delivery (M2, hardened by M3 S10/S11).
 
@@ -438,6 +456,24 @@ def _deliver_dd(
                 f"{STATE_AWAITING_GATE!r}; a decision can only be delivered at the gate"
             ),
             retryable=True,
+            line=development_id,
+            decision=decision,
+        )
+
+    # M3: the six evidence obligations are the gate's mandatory answer fields.
+    # The self-gate path is the engine default, so a dd delivery that did not
+    # carry every one of them is refused here -- before any resume -- rather
+    # than a delivery leaking through on "a unit was started" (spec item 2).
+    # Authorization (principal == dispatched_by) is still the outermost gate:
+    # it fires before this, so a non-dispatching caller is never asked for its
+    # evidence and a missing-evidence delivery of its own line is legible.
+    try:
+        rationale = gate_evidence_payload(evidence or {})
+    except GateEvidenceMissing as exc:
+        return DeliveryResult(
+            status=OUTCOME_REFUSED,
+            code=CODE_GATE_EVIDENCE_MISSING,
+            message="gate evidence missing mandatory field(s): " + ", ".join(sorted(exc.missing)),
             line=development_id,
             decision=decision,
         )
@@ -557,6 +593,7 @@ def _deliver_dd(
             "card_entity_id": card_entity_id,
             "resume_status": "resumed",
         },
+        evidence=rationale,
     )
 
 
@@ -573,6 +610,7 @@ def deliver_decision(
     dd_source: DdOwnerSource | None = None,
     principal: str = "",
     dd: Any = None,
+    evidence: dict[str, Any] | None = None,
 ) -> DeliveryResult:
     """The synchronous delivery core, testable without the MCP transport.
 
@@ -614,6 +652,7 @@ def deliver_decision(
             run_root=run_root,
             dd=dd,
             clock=clock,
+            evidence=evidence,
         )
 
     line, decision, reason = _validate(line, decision, reason)
@@ -631,6 +670,7 @@ def deliver_decision(
             run_root=run_root,
             dd=dd,
             clock=clock,
+            evidence=evidence,
         )
 
     if line not in _roster_ids(lines):
@@ -738,6 +778,7 @@ def deliver_decision_dd(
     principal: str = "",
     run_root: Path | None = None,
     clock: Callable[[], float] = time.time,
+    evidence: dict[str, Any] | None = None,
 ) -> DeliveryResult:
     """Deliver one decision to a dd development gate, synchronously.
 
@@ -762,6 +803,7 @@ def deliver_decision_dd(
         run_root=Path(run_root) if run_root is not None else Path("/data/fleet-graph/runs"),
         dd=_dd_control_plane_from(dd_source),
         clock=clock,
+        evidence=evidence,
     )
 
 
@@ -817,6 +859,11 @@ class DeliveryLedger:
             "question_note_id": result.question_note_id,
             "card_entity_id": result.card_entity_id,
         }
+        # M3 spec item 4: the delivered rationale (evidence digest + field
+        # attestation) rides the durable ledger entry, not just the in-memory
+        # result -- so the gate's 必答字段 are auditable after the fact.
+        if result.evidence is not None:
+            entry["evidence"] = result.evidence
         try:
             self.state_dir.mkdir(parents=True, exist_ok=True)
             with self.ledger_path.open("a", encoding="utf-8") as handle:
@@ -951,6 +998,7 @@ def build_decision_mcp_server(
         target_kind: str = TARGET_KIND_LINE,
         target_id: str = "",
         principal: str = "",
+        evidence: dict[str, Any] | None = None,
     ) -> DeliveryResult:
         return deliver_decision(
             line=line,
@@ -963,6 +1011,7 @@ def build_decision_mcp_server(
             dd_source=dd_source,
             principal=principal,
             dd=dd,
+            evidence=evidence,
         )
 
     deliverer = deliver or _deliver
@@ -985,6 +1034,7 @@ def build_decision_mcp_server(
         target_kind: str = TARGET_KIND_LINE,
         target_id: str = "",
         principal: str = "",
+        evidence: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Deliver one decision to a parked goal line or a dd gate, synchronously.
 
@@ -1008,6 +1058,7 @@ def build_decision_mcp_server(
                 target_kind=target_kind,
                 target_id=target_id,
                 principal=principal,
+                evidence=evidence,
             )
         except DecisionPayloadError as exc:
             refuse(f"invalid payload: {exc}")
@@ -1061,6 +1112,7 @@ __all__ = [
     "CODE_DD_NOT_FOUND",
     "CODE_DD_UNKNOWN",
     "CODE_DD_WORKSPACE_MISSING",
+    "CODE_GATE_EVIDENCE_MISSING",
     "CODE_LINE_NOT_PARKED",
     "CODE_NOT_DISPATCHING_LINE",
     "CODE_NO_WAITING_PARTY",

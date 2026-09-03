@@ -28,12 +28,14 @@ from fleet_graph.decision_mcp import (
     CODE_DD_NOT_CONSUMED,
     CODE_DD_NOT_FOUND,
     CODE_DD_WORKSPACE_MISSING,
+    CODE_GATE_EVIDENCE_MISSING,
     CODE_NOT_DISPATCHING_LINE,
     DECISION_APPROVE,
     DECISION_REJECT,
     OUTCOME_DELIVERED,
     OUTCOME_REFUSED,
     TARGET_KIND_DD,
+    DeliveryLedger,
     deliver_decision,
     deliver_decision_dd,
 )
@@ -43,6 +45,7 @@ from fleet_graph.selfgate import (
     SuiteSnapshot,
     acceptance_equality,
     diff_in_scope,
+    gate_evidence_payload,
     missing_gate_evidence,
     regression_verdict,
     require_gate_evidence,
@@ -53,6 +56,11 @@ from fleet_graph.selfgate import (
 DD_ID = "dev-fg-36c2d76baca7"
 DISPATCHER = "wf-8d9737"
 ROSTER: list[Any] = [{"folder_id": "wf-8d9737", "seat": "s", "generation": 1}]
+
+#: A complete six-field evidence payload the self-gate delivery is bound to.
+#: The six obligations are the gate's mandatory answer fields; the mechanism
+#: tests pass this so the delivery reaches the S10/S11 mechanics being drilled.
+COMPLETE_EVIDENCE: dict[str, Any] = {field: {"ok": True} for field in GATE_EVIDENCE_FIELDS}
 
 
 class FakeDdPlane:
@@ -130,6 +138,7 @@ def _deliver(
     target_id: str = DD_ID,
     decision: str = DECISION_APPROVE,
     principal: str = DISPATCHER,
+    evidence: dict[str, Any] | None = None,
 ) -> Any:
     return deliver_decision(
         line="",
@@ -141,6 +150,7 @@ def _deliver(
         target_kind=TARGET_KIND_DD,
         target_id=target_id,
         dd=plane,
+        evidence=evidence if evidence is not None else COMPLETE_EVIDENCE,
     )
 
 
@@ -264,6 +274,56 @@ class TestS10ConsumptionIsNotUnitStart:
         result = _deliver(plane, tmp_path, decision=DECISION_REJECT)
         assert result.status == OUTCOME_DELIVERED
         assert result.decision == DECISION_REJECT
+
+
+# ---------------------------------------------------------------------------
+# the six obligations are wired into the delivery path (not an orphaned module)
+# ---------------------------------------------------------------------------
+
+
+class TestEvidenceEnforcedByTheDeliveryPath:
+    def test_missing_evidence_is_refused_before_any_resume(self, tmp_path: Path) -> None:
+        """The negative criterion has a real engine path: a self-gate delivery
+        with no evidence is refused, not delivered (spec item 2's 缺任一项)."""
+        plane = FakeDdPlane()
+        result = _deliver(plane, tmp_path, evidence={})
+        assert result.status == OUTCOME_REFUSED
+        assert result.code == CODE_GATE_EVIDENCE_MISSING
+        for field in GATE_EVIDENCE_FIELDS:
+            assert field in result.message
+        assert plane.resumed == []
+
+    def test_an_incomplete_payload_names_every_missing_field(self, tmp_path: Path) -> None:
+        plane = FakeDdPlane()
+        result = _deliver(plane, tmp_path, evidence={"acceptance_equality": {"ok": True}})
+        assert result.status == OUTCOME_REFUSED
+        assert result.code == CODE_GATE_EVIDENCE_MISSING
+        for field in set(GATE_EVIDENCE_FIELDS) - {"acceptance_equality"}:
+            assert field in result.message
+        assert plane.resumed == []
+
+    def test_complete_evidence_is_delivered_with_a_digest_rationale(self, tmp_path: Path) -> None:
+        plane = FakeDdPlane()
+        result = _deliver(plane, tmp_path, evidence=COMPLETE_EVIDENCE)
+        assert result.status == OUTCOME_DELIVERED
+        # The rationale (digest + field attestation) rides the result, keyed to
+        # exactly the six fields -- the machine check that the gate's 必答字段
+        # travelled with the verdict (spec item 4).
+        assert result.evidence == gate_evidence_payload(COMPLETE_EVIDENCE)
+        assert result.evidence["fields"] == {field: True for field in GATE_EVIDENCE_FIELDS}
+        assert result.evidence["digest"].startswith("sha256:")
+        assert result.as_dict()["evidence"] == result.evidence
+
+    def test_the_ledger_entry_embeds_the_evidence_digest(self, tmp_path: Path) -> None:
+        plane = FakeDdPlane()
+        result = _deliver(plane, tmp_path, evidence=COMPLETE_EVIDENCE)
+        assert result.status == OUTCOME_DELIVERED
+        ledger = DeliveryLedger(state_dir=tmp_path / "ledger")
+        ledger.record(result)
+        entry = ledger.entries()[0]
+        assert entry["status"] == OUTCOME_DELIVERED
+        assert entry["evidence"] == result.evidence
+        assert entry["evidence"]["digest"] == gate_evidence_payload(COMPLETE_EVIDENCE)["digest"]
 
 
 # ---------------------------------------------------------------------------

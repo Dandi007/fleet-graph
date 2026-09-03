@@ -60,6 +60,12 @@ from fleet_graph.decision_mcp import (
     deliver_decision_dd,
     load_reserved_ports,
 )
+from fleet_graph.selfgate import GATE_EVIDENCE_FIELDS
+
+#: A complete six-field evidence payload for a self-gate dd delivery. The six
+#: obligations are now the gate's mandatory answer fields, so the delivery
+#: exercise passes this instead of the pre-M3 no-evidence drill.
+COMPLETE_EVIDENCE: dict[str, Any] = {field: {"ok": True} for field in GATE_EVIDENCE_FIELDS}
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RESERVED_PORTS_FILE = REPO_ROOT / "config" / "decision-mcp-reserved-ports.json"
@@ -227,6 +233,7 @@ def _call(
     target_kind: str = TARGET_KIND_LINE,
     target_id: str = "",
     dd_source: FakeDdSource | None = None,
+    evidence: dict[str, Any] | None = None,
 ) -> DeliveryResult:
     return deliver_decision(
         line=line,
@@ -237,6 +244,7 @@ def _call(
         target_kind=target_kind,
         target_id=target_id,
         dd_source=dd_source,
+        evidence=evidence if evidence is not None else COMPLETE_EVIDENCE,
     )
 
 
@@ -698,6 +706,7 @@ class TestDdGateDelivery:
                         "reason": "live",
                         "target_kind": "dd",
                         "target_id": "dev-abc",
+                        "evidence": COMPLETE_EVIDENCE,
                     },
                 )
                 return json.loads(result.content[0].text)

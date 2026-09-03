@@ -476,7 +476,7 @@ def write_dd_development(
     *,
     head_commit: str,
     terminal: str,
-    stage: str = "implement",
+    stage: str = "merger",
     missing_status: bool = False,
     missing_record: bool = False,
     card_entity_id: str = "",
@@ -580,6 +580,18 @@ class TestHarvestableView:
         write_dd_development(dd_root, "dev-new", head_commit="n1", terminal="complete")
         payload = view.harvestable()
         assert [d["development_id"] for d in payload["developments"]] == ["dev-new"]
+
+    def test_complete_at_the_gate_stage_is_not_harvestable(self, tmp_path: Path) -> None:
+        """Harvest fires after the merge stage, not after the gate (S7): a
+        `complete` record that is still at the gate stage is not harvestable."""
+        dd_root = tmp_path / "dd"
+        view = self._baselined(self._config(tmp_path), dd_root)
+        write_dd_development(
+            dd_root, "dev-gate-only", head_commit="g1", terminal="complete", stage="human_gate"
+        )
+        write_dd_development(dd_root, "dev-merger", head_commit="m1", terminal="complete")
+        payload = view.harvestable()
+        assert [d["development_id"] for d in payload["developments"]] == ["dev-merger"]
 
     def test_first_run_baseline_clears_historical_complete(self, tmp_path: Path) -> None:
         """交付 D.5 首跑基线豁免：147 条历史 complete（无回执）首跑全部出清不在

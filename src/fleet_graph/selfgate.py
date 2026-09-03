@@ -30,6 +30,7 @@ evidence payload that delivery embeds as its ``rationale``.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,6 +75,38 @@ def require_gate_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
     if missing:
         raise GateEvidenceMissing(missing)
     return evidence
+
+
+def gate_evidence_digest(evidence: dict[str, Any]) -> str:
+    """A stable digest over the six mandatory answer fields only.
+
+    The six fields are the *whole* answer a self-gate delivery is bound to; the
+    digest is computed over exactly those names (in spec order-independent
+    canonical form) so a delivery can embed a rationale a later auditor can
+    recompute, without the receiver having to re-parse the payload.
+    """
+    canonical = json.dumps(
+        {name: evidence.get(name) for name in GATE_EVIDENCE_FIELDS},
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def gate_evidence_payload(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Validate the six fields and build the rationale a delivery embeds.
+
+    This is the mechanical join the delivery path calls: it refuses an
+    incomplete payload (naming every missing field) and, on success, returns a
+    compact rationale carrying the digest plus the field attestation. It is
+    deliberately side-effect-free -- the delivery decides how to refuse.
+    """
+    require_gate_evidence(evidence)
+    return {
+        "digest": gate_evidence_digest(evidence),
+        "fields": {name: True for name in GATE_EVIDENCE_FIELDS},
+    }
 
 
 class GateEvidenceError(RuntimeError):
@@ -367,6 +400,8 @@ __all__ = [
     "SuiteSnapshot",
     "acceptance_equality",
     "diff_in_scope",
+    "gate_evidence_digest",
+    "gate_evidence_payload",
     "missing_gate_evidence",
     "mutation_gun",
     "regression_verdict",
