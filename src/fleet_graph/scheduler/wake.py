@@ -1,7 +1,7 @@
 """Mechanical wake facts for parked lines.
 
 A line parked as "blocked waiting on a human decision" is woken by facts, not
-by prose. Two live sources, each a single cheap read:
+by prose. Three live sources, each a single cheap read:
 
 - **inbox**: a message arrived in the line's `agent:{alias}` channel *after*
   the blocked terminal was written. Anything earlier was already drained by the
@@ -14,9 +14,19 @@ by prose. Two live sources, each a single cheap read:
 - **goal.md revision**: the work folder's `fs_stat` content_revision differs
   from the one snapshotted at parking time. The revision is a hash the MCP
   computes; nothing here reads the goal text.
+- **board decision** (D5): a `work.decision.v1` landed on `board:work-notes`
+  referencing the parked line's own question note, created after the parking
+  instant, and signed (`payload.decided_by` non-empty). The read is two plain
+  GETs -- the refs endpoint (how an answer finds its question; the real bus
+  does not inline refs on served messages) plus the channel tail -- with the
+  service credential, the same family every other board reader uses. No
+  publish, no consume, no lease: the wake observes the ruling, it never takes
+  it.
 
-The third wake source needs no code: an operator clears the `parked_*` fields
-from the line's stall-state file (see daemon.py).
+The other wake sources need no code here: an operator clears the `parked_*`
+fields from the line's stall-state file, and the decision bridge's consumed
+fact (`dispatched_decision_consumed_at`) is read straight off that same file
+by the scheduler (see daemon.py).
 
 Failure discipline: every probe here is best-effort with a short timeout, and
 every failure is the *caller's* signal to fail open -- treat the line as not
@@ -34,6 +44,7 @@ import time
 from pathlib import Path
 from typing import Any, Protocol
 
+from fleet_graph.bus.board import DECISION_KIND, WORK_NOTES
 from fleet_graph.bus.tokens import (
     LINE_TOKEN_PATH_ENV,
     LINE_TOKEN_PATH_TEMPLATE,
@@ -54,6 +65,12 @@ WAKE_TIMEOUT_SECONDS = 5.0
 #: messages slowly, so a short tail window is enough.
 INBOX_TAIL_WINDOW = 50
 
+#: How far below head_seq the board-decision probe re-reads `board:work-notes`.
+#: The channel carries every board's notes and rulings, so it moves faster than
+#: a line inbox; the window still only has to cover the tail a fresh ruling
+#: sits in (the refs endpoint already narrowed the candidates by message id).
+DECISION_TAIL_WINDOW = 200
+
 
 class WakeSignals(Protocol):
     """What the scheduler may ask about a parked line. Probes raise on failure."""
@@ -61,6 +78,8 @@ class WakeSignals(Protocol):
     def inbox_message_after(self, alias: str, after_epoch: float) -> bool: ...
 
     def goal_revision(self, folder_id: str) -> str: ...
+
+    def decision_landed(self, question_note_id: str, after_epoch: float) -> bool: ...
 
 
 def probe_error_tag(exc: BaseException) -> str:
@@ -184,6 +203,69 @@ class LiveWakeSignals:
             raise RuntimeError(f"fs_stat goal.md for {folder_id} returned no content_revision")
         return revision
 
+    @staticmethod
+    def _message_targets_question(message: dict[str, Any], question_note_id: str) -> bool:
+        """Whether one served message's inline refs point at the question note.
+
+        The authoritative source is the refs endpoint (`refs_to`), but a served
+        message that *does* carry inline refs must be honoured too, so a bus
+        shape that inlines them can never make the probe miss a real ruling.
+        """
+        refs = message.get("refs")
+        if not isinstance(refs, list):
+            return False
+        return any(
+            isinstance(ref, dict) and str(ref.get("target_entity") or "") == question_note_id
+            for ref in refs
+        )
+
+    def decision_landed(self, question_note_id: str, after_epoch: float) -> bool:
+        """Has a `work.decision.v1` answering this question landed after `after_epoch`?
+
+        The D5 gate ruling is a fact on `board:work-notes`; the probe is two
+        plain GETs with the service credential -- the refs endpoint names the
+        messages that reference the question (the real bus does not inline
+        refs on served messages), then the channel tail is read for one that
+        is the decision kind, was created after `after_epoch` (the parking
+        instant), and carries a non-empty `payload.decided_by`. A ruling that
+        answers a *different* question, or that nobody signed, is not this
+        park's fact. Read-only by discipline: no publish, no consume, no
+        lease -- a probe that touched a write surface would be the bug.
+        """
+        client = self._bus_client()
+        candidates = {
+            str(ref.get("message_id") or "")
+            for ref in client.refs_to(question_note_id)
+            if isinstance(ref, dict) and str(ref.get("target_entity") or "") == question_note_id
+        }
+        candidates.discard("")
+        # The bus pages ascending: learn the head first, then read the tail
+        # window a fresh ruling can actually sit in -- the same recipe the
+        # board's own decision reader follows.
+        _, head_seq = client.messages(WORK_NOTES, limit=1)
+        tail, _ = client.messages(
+            WORK_NOTES,
+            limit=DECISION_TAIL_WINDOW,
+            after_seq=max(0, head_seq - DECISION_TAIL_WINDOW),
+        )
+        for message in tail:
+            referenced = str(
+                message.get("message_id") or ""
+            ) in candidates or self._message_targets_question(message, question_note_id)
+            if not referenced:
+                continue
+            if message.get("kind") != DECISION_KIND:
+                continue
+            if parse_bus_timestamp(message.get("created_at")) <= after_epoch:
+                continue
+            payload = message.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if not str(payload.get("decided_by") or "").strip():
+                continue
+            return True
+        return False
+
 
 class DdWakeFacts(Protocol):
     """The M1 dd wake source for a dispatched line's park.
@@ -280,6 +362,7 @@ class LiveDdWakeFacts:
 
 __all__ = [
     "DD_AWAITING_GATE_STATE",
+    "DECISION_TAIL_WINDOW",
     "INBOX_TAIL_WINDOW",
     "LINE_TOKEN_PATH_ENV",
     "LINE_TOKEN_PATH_TEMPLATE",

@@ -79,14 +79,19 @@ class FakeWake:
         error: Exception | None = None,
         inbox_error: Exception | None = None,
         revision_error: Exception | None = None,
+        decision: bool = False,
+        decision_error: Exception | None = None,
     ) -> None:
         self.revision = revision
         self.inbox = inbox
         self.error = error
         self.inbox_error = inbox_error
         self.revision_error = revision_error
+        self.decision = decision
+        self.decision_error = decision_error
         self.inbox_calls: list[tuple[str, float]] = []
         self.revision_calls: list[str] = []
+        self.decision_calls: list[tuple[str, float]] = []
 
     def inbox_message_after(self, alias: str, after_epoch: float) -> bool:
         self.inbox_calls.append((alias, after_epoch))
@@ -101,6 +106,13 @@ class FakeWake:
         if failure is not None:
             raise failure
         return self.revision
+
+    def decision_landed(self, question_note_id: str, after_epoch: float) -> bool:
+        self.decision_calls.append((question_note_id, after_epoch))
+        failure = self.error or self.decision_error
+        if failure is not None:
+            raise failure
+        return self.decision
 
 
 class FakeTicket:
