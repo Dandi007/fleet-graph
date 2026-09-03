@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import traceback
 from collections.abc import Callable
@@ -42,7 +43,8 @@ Phase = Literal["coordinator", "worker"]
 VALID_PHASES: frozenset[str] = frozenset({"coordinator", "worker", "acceptance"})
 
 # The pump refreshes at least this often; fleet-sentinel's staleness check is
-# calibrated against it, so slowing it down would create false alarms.
+# calibrated against it, so slowing it down would create false alarms. The
+# phase-internal ticker (H0) beats at the same cadence.
 HEARTBEAT_INTERVAL_SECONDS = 5.0
 
 HEARTBEAT_FIELDS = frozenset(
@@ -55,6 +57,10 @@ HEARTBEAT_FIELDS = frozenset(
         "started_at",
         "phase_started_at",
         "updated_at",
+        # H0: when the phase-internal ticker last refreshed the heartbeat.
+        # Kept separate from `updated_at` (the last write of any kind) so a
+        # dead ticker is observable even while phase boundaries still write.
+        "last_tick_at",
         "log_path",
         "release_id",
     }
@@ -210,6 +216,7 @@ class RunArtifacts:
         pid: int | None = None,
         log_path: str | Path | None = None,
         release_id: str | None = None,
+        tick_interval: float = HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self.run_root = Path(run_root)
         self.run_id = run_id
@@ -234,6 +241,22 @@ class RunArtifacts:
         self._hb_phase_started_at = self.started_at
         self._hb_last_write = 0.0
         self._hb_warned = False
+        #: H0: when the phase-internal ticker last refreshed the heartbeat,
+        #: or None before its first successful beat. Guarded by ``_hb_lock``.
+        self._hb_last_tick: float | None = None
+        #: The write-guard lock shared by the main graph thread and the ticker
+        #: thread (H0): two threads must never interleave heartbeat writes or
+        #: race the round/phase bookkeeping.
+        self._hb_lock = threading.Lock()
+
+        #: H0: the phase-internal ticker. Daemon thread plus a stop event: a
+        #: dead process takes its ticker with it (so a true stop still goes
+        #: stale), while a live process stuck in a long worker turn keeps
+        #: refreshing the heartbeat mtime.
+        self._tick_interval = tick_interval
+        self._tick_state_lock = threading.Lock()
+        self._tick_thread: threading.Thread | None = None
+        self._tick_stop: threading.Event | None = None
 
         self.run_root.mkdir(parents=True, exist_ok=True)
 
@@ -245,7 +268,33 @@ class RunArtifacts:
         Returns whether a write happened. `updated_at` must advance on every
         write: it is the only thing standing between a SIGKILLed pump and
         looking alive forever.
+
+        Thread-safe: the whole read-decide-write path runs under the write
+        guard shared with the phase-internal ticker (H0), so a tick racing a
+        phase boundary can neither interleave two writes nor regress the
+        phase or `phase_started_at`.
         """
+        with self._hb_lock:
+            return self._write_heartbeat(round_no, phase, force=force, from_tick=False)
+
+    def tick_once(self) -> bool:
+        """One phase-internal refresh: re-write the established phase, forced.
+
+        The ticker's beat (H0). The established round/phase is captured and
+        re-written under the same lock `heartbeat` uses, so a tick can never
+        change the phase or reset `phase_started_at` -- only `updated_at`, the
+        file mtime and `last_tick_at` advance. A no-op returning False before
+        the first `heartbeat` call established a phase.
+        """
+        with self._hb_lock:
+            if self._hb_round is None or self._hb_phase is None:
+                return False
+            return self._write_heartbeat(self._hb_round, self._hb_phase, force=True, from_tick=True)
+
+    def _write_heartbeat(
+        self, round_no: int, phase: Phase, *, force: bool, from_tick: bool
+    ) -> bool:
+        """The heartbeat write path. ``_hb_lock`` must be held."""
         if phase not in VALID_PHASES:
             raise ValueError(f"phase must be one of {sorted(VALID_PHASES)}, got {phase!r}")
 
@@ -255,6 +304,8 @@ class RunArtifacts:
             self._hb_phase_started_at = now
         elif not force and now - self._hb_last_write < HEARTBEAT_INTERVAL_SECONDS:
             return False
+        if from_tick:
+            self._hb_last_tick = now
 
         self._hb_round = round_no
         self._hb_phase = phase
@@ -267,6 +318,7 @@ class RunArtifacts:
             "started_at": iso(self.started_at),
             "phase_started_at": iso(self._hb_phase_started_at),
             "updated_at": iso(now),
+            "last_tick_at": iso(self._hb_last_tick) if self._hb_last_tick is not None else None,
             "log_path": self.log_path,
             "release_id": self.release_id,
         }
@@ -283,6 +335,59 @@ class RunArtifacts:
                 log.warning("heartbeat write failed (not blocking the loop): %s", exc)
                 self._hb_warned = True
             return False
+
+    # --- phase-internal ticker (H0) ----------------------------------------
+
+    def start_tick(self) -> bool:
+        """Start the phase-internal heartbeat ticker (H0).
+
+        A daemon thread beats `tick_once` every ``tick_interval`` seconds, so
+        a long worker turn no longer freezes the heartbeat mtime -- the
+        `PumpHeartbeatStale` false alarm this exists to end. Idempotent: a
+        start while already ticking is a no-op returning False. The thread is
+        a daemon on purpose: a dead process kills its ticker with it, which is
+        exactly why a true stop still goes stale.
+        """
+        with self._tick_state_lock:
+            if self._tick_thread is not None and self._tick_thread.is_alive():
+                return False
+            self._tick_stop = threading.Event()
+            self._tick_thread = threading.Thread(
+                target=self._tick_loop,
+                name=f"heartbeat-tick:{self.folder_id}",
+                daemon=True,
+            )
+            self._tick_thread.start()
+            return True
+
+    def stop_tick(self, *, timeout: float = 5.0) -> None:
+        """Stop the ticker. Idempotent, and safe before any start.
+
+        ``Event.wait`` wakes the moment the stop event is set, so the thread
+        exits promptly even mid-interval; the join timeout only bounds a
+        pathological hang on the way out. Never joins from the ticker thread
+        itself (that would deadlock on its own exit).
+        """
+        with self._tick_state_lock:
+            stop = self._tick_stop
+            thread = self._tick_thread
+        if stop is not None:
+            stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+
+    def _tick_loop(self) -> None:
+        stop = self._tick_stop
+        assert stop is not None
+        while not stop.wait(self._tick_interval):
+            try:
+                self.tick_once()
+            except Exception as exc:
+                # The write path already fails soft on OSError; this boundary
+                # keeps any other surprise from silently killing the ticker --
+                # a quietly dead ticker is exactly the frozen mtime this
+                # feature exists to prevent.
+                log.warning("heartbeat tick failed (not blocking the loop): %s", exc)
 
     # --- rounds ----------------------------------------------------------
 

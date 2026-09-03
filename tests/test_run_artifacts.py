@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import json
 import re
+import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -292,6 +295,9 @@ class TestEquivalenceWithTheRealPump:
             # fleet-graph additions the retired pump will never grow.
             "line_state",
             "dd_development_id",
+            # H0: the phase-internal ticker's last beat, additive on top of
+            # the transcribed shape -- the retired pump never grows it.
+            "last_tick_at",
         }
     )
 
@@ -465,3 +471,227 @@ class TestAcceptancePhaseHeartbeat:
     def test_acceptance_is_a_valid_heartbeat_phase(self, tmp_path):
         artifacts = RunArtifacts(tmp_path, run_id="r", folder_id="wf-x")
         assert artifacts.heartbeat(1, "acceptance", force=True)
+
+
+class TestHeartbeatTick:
+    """H0: the phase-internal tick.
+
+    heartbeat.json used to be written only at phase boundaries, so a long
+    worker turn froze the mtime (`mtime == phase_started_at == updated_at`)
+    and `PumpHeartbeatStale` fired on healthy lines. The tick re-writes the
+    established phase with force: `updated_at` and the mtime advance while
+    `phase_started_at` holds.
+    """
+
+    def test_last_tick_at_belongs_to_the_field_set(self) -> None:
+        assert "last_tick_at" in HEARTBEAT_FIELDS
+
+    def test_field_set_stays_exact_after_a_tick(self, artifacts: RunArtifacts) -> None:
+        artifacts.heartbeat(1, "worker")
+        artifacts.tick_once()
+        assert set(read_json(artifacts.heartbeat_path)) == HEARTBEAT_FIELDS
+
+    def test_tick_before_any_phase_is_a_no_op(self, artifacts: RunArtifacts) -> None:
+        assert artifacts.tick_once() is False
+        assert not artifacts.heartbeat_path.exists()
+
+    def test_tick_refreshes_updated_at_without_moving_phase_started_at(
+        self, artifacts: RunArtifacts, clock: FakeClock
+    ) -> None:
+        artifacts.heartbeat(1, "worker")
+        before = read_json(artifacts.heartbeat_path)
+        clock.advance(2.0)
+        assert artifacts.tick_once() is True
+        after = read_json(artifacts.heartbeat_path)
+        assert after["round"] == 1
+        assert after["phase"] == "worker"
+        assert after["phase_started_at"] == before["phase_started_at"]
+        assert after["updated_at"] != before["updated_at"]
+
+    def test_tick_records_last_tick_at(self, artifacts: RunArtifacts, clock: FakeClock) -> None:
+        artifacts.heartbeat(1, "worker")
+        assert read_json(artifacts.heartbeat_path)["last_tick_at"] is None
+        clock.advance(2.0)
+        artifacts.tick_once()
+        assert read_json(artifacts.heartbeat_path)["last_tick_at"] == iso(clock.now)
+
+    def test_a_phase_boundary_write_leaves_last_tick_at_alone(
+        self, artifacts: RunArtifacts, clock: FakeClock
+    ) -> None:
+        """`last_tick_at` records ticker activity, not write activity: a
+        boundary write must not rewrite it, so a dead ticker stays observable
+        even while the pump itself still writes at phase changes."""
+        artifacts.heartbeat(1, "worker")
+        clock.advance(2.0)
+        artifacts.tick_once()
+        ticked_at = read_json(artifacts.heartbeat_path)["last_tick_at"]
+        clock.advance(3.0)
+        artifacts.heartbeat(2, "coordinator")
+        after = read_json(artifacts.heartbeat_path)
+        assert after["last_tick_at"] == ticked_at
+        assert after["phase_started_at"] != ticked_at
+
+    def test_tick_write_failure_is_fail_soft(
+        self, artifacts: RunArtifacts, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        artifacts.heartbeat(1, "worker")
+
+        def boom(*_args, **_kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(Path, "open", boom)
+        assert artifacts.tick_once() is False
+
+    def test_racing_beats_never_tear_the_heartbeat(self, artifacts: RunArtifacts) -> None:
+        """The main graph thread and the ticker share one write guard (H0):
+        concurrent beats must serialize into well-formed writes that never
+        regress the phase bookkeeping."""
+        artifacts.heartbeat(1, "worker")
+        errors: list[Exception] = []
+
+        def main_beats() -> None:
+            for i in range(200):
+                try:
+                    artifacts.heartbeat(1 + i % 2, "coordinator" if i % 2 else "worker")
+                except Exception as exc:
+                    errors.append(exc)
+
+        def ticker_beats() -> None:
+            for _ in range(200):
+                try:
+                    artifacts.tick_once()
+                except Exception as exc:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=main_beats) for _ in range(3)] + [
+            threading.Thread(target=ticker_beats) for _ in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert errors == []
+        payload = read_json(artifacts.heartbeat_path)
+        assert set(payload) == HEARTBEAT_FIELDS
+        assert payload["phase"] in {"coordinator", "worker"}
+        assert payload["phase_started_at"] >= payload["started_at"]
+
+
+class TestHeartbeatTickerThread:
+    """The real thread (spec items 2 and 4): it beats in-phase on its
+    interval, never before a phase is established, stops cleanly, and fails
+    soft. Daemon by construction: a dead process kills its ticker, which is
+    why a true stop still goes stale.
+
+    The only wall-clock tests in this file; everything else stays on the
+    FakeClock. A fast tick interval keeps each well under a second.
+    """
+
+    TICK_INTERVAL = 0.02
+
+    def _artifacts(self, tmp_path: Path) -> RunArtifacts:
+        return RunArtifacts(
+            tmp_path / "run",
+            run_id="run-1",
+            folder_id="wf-tick",
+            tick_interval=self.TICK_INTERVAL,
+        )
+
+    def test_a_running_ticker_refreshes_the_heartbeat_in_phase(self, tmp_path: Path) -> None:
+        artifacts = self._artifacts(tmp_path)
+        artifacts.heartbeat(1, "worker")
+        first_mtime = artifacts.heartbeat_path.stat().st_mtime
+        assert artifacts.start_tick() is True
+        try:
+            refreshed = False
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                time.sleep(self.TICK_INTERVAL)
+                if artifacts.heartbeat_path.stat().st_mtime > first_mtime:
+                    refreshed = True
+                    break
+            assert refreshed, "the ticker must refresh the heartbeat while the phase holds"
+            assert read_json(artifacts.heartbeat_path)["last_tick_at"] is not None
+        finally:
+            artifacts.stop_tick()
+
+    def test_stop_tick_ends_the_refreshes(self, tmp_path: Path) -> None:
+        artifacts = self._artifacts(tmp_path)
+        artifacts.heartbeat(1, "worker")
+        artifacts.start_tick()
+        time.sleep(self.TICK_INTERVAL * 3)
+        artifacts.stop_tick()
+        frozen = artifacts.heartbeat_path.stat().st_mtime
+        time.sleep(self.TICK_INTERVAL * 10)
+        assert artifacts.heartbeat_path.stat().st_mtime == frozen
+
+    def test_stop_tick_is_safe_before_start_and_idempotent(self, tmp_path: Path) -> None:
+        artifacts = self._artifacts(tmp_path)
+        artifacts.stop_tick()
+        artifacts.start_tick()
+        artifacts.stop_tick()
+        artifacts.stop_tick()
+
+    def test_a_second_start_while_ticking_is_refused(self, tmp_path: Path) -> None:
+        artifacts = self._artifacts(tmp_path)
+        assert artifacts.start_tick() is True
+        try:
+            assert artifacts.start_tick() is False
+        finally:
+            artifacts.stop_tick()
+
+    def test_the_ticker_never_writes_before_a_phase_is_established(self, tmp_path: Path) -> None:
+        artifacts = self._artifacts(tmp_path)
+        artifacts.start_tick()
+        try:
+            time.sleep(self.TICK_INTERVAL * 5)
+            assert not artifacts.heartbeat_path.exists()
+        finally:
+            artifacts.stop_tick()
+
+    def test_the_ticker_survives_a_failing_disk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        artifacts = self._artifacts(tmp_path)
+        artifacts.heartbeat(1, "worker")
+
+        def boom(*_args, **_kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(Path, "open", boom)
+        assert artifacts.start_tick() is True
+        time.sleep(self.TICK_INTERVAL * 5)
+        artifacts.stop_tick()
+
+
+class TestRunLineTickerLifecycle:
+    """Spec item 4: the line starts the ticker at launch and stops it at the
+    terminal -- the fault path included, since that is finally's whole job."""
+
+    FAKE_RUN = Path(__file__).parent / "fakes" / "fake_agent_run.py"
+
+    def test_run_line_starts_and_stops_the_ticker_on_the_fault_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fleet_graph.graphs.adapters import CoordinatorFault
+        from fleet_graph.graphs.runner import LineConfig, run_line
+
+        events: list[str] = []
+        monkeypatch.setattr(RunArtifacts, "start_tick", lambda self: events.append("start"))
+        monkeypatch.setattr(
+            RunArtifacts, "stop_tick", lambda self, **_kwargs: events.append("stop")
+        )
+
+        bin_path = tmp_path / "agent-run"
+        bin_path.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{self.FAKE_RUN}" "$@"\n')
+        bin_path.chmod(0o755)
+        config = LineConfig(
+            folder_id="wf-tick-lc",
+            seat="s",
+            run_root=tmp_path / "run",
+            checkpoint_path=":memory:",
+            agent_run_bin=str(bin_path),
+        )
+        with pytest.raises(CoordinatorFault):
+            run_line(config)
+        assert events == ["start", "stop"]

@@ -312,6 +312,29 @@ def _flush_line_metrics(deps: LineDeps) -> None:
         metrics.write_exposition()
 
 
+def _start_heartbeat_tick(deps: LineDeps) -> None:
+    """Start the phase-internal heartbeat ticker (H0) at line start.
+
+    Only the real ``RunArtifacts`` carries the ticker; a test fake implementing
+    just ``ArtifactsPort`` is left untouched. The line's pump thread keeps
+    blocking inside a long worker turn while the ticker thread refreshes the
+    heartbeat, so ``heartbeat_age_s`` no longer climbs through a healthy turn.
+    """
+    if isinstance(deps.artifacts, RunArtifacts):
+        deps.artifacts.start_tick()
+
+
+def _stop_heartbeat_tick(deps: LineDeps) -> None:
+    """Stop the phase-internal heartbeat ticker (H0) at terminal/shutdown.
+
+    Runs on every exit path, fault included. A SIGKILL needs no stop: the
+    ticker is a daemon thread and dies with the process, which is exactly why
+    a true stop still goes stale and the sentinel still fires.
+    """
+    if isinstance(deps.artifacts, RunArtifacts):
+        deps.artifacts.stop_tick()
+
+
 def _build_interrupt(config: LineConfig, *, run_id: str = "") -> LineInterruptPort | None:
     """The production E2 interrupt port for one line.
 
@@ -459,6 +482,10 @@ def run_line(config: LineConfig, *, run_id: str | None = None) -> dict[str, Any]
         "recursion_limit": config.max_rounds * 8 + 20,
     }
 
+    # H0: the phase-internal ticker starts with the line, before the first
+    # round, so even a first-round worker turn that blocks for its whole
+    # timeout keeps a fresh heartbeat.
+    _start_heartbeat_tick(deps)
     try:
         with SqliteSaver.from_conn_string(config.resolved_checkpoint_path) as saver:
             compiled = graph.compile(checkpointer=saver)
@@ -472,6 +499,10 @@ def run_line(config: LineConfig, *, run_id: str | None = None) -> dict[str, Any]
         deps.artifacts.write_fault_terminal(exception=exc)
         raise
     finally:
+        # H0: the ticker stops when the line does -- terminal or fault. Started
+        # just before the run below; a SIGKILL skips both and takes the daemon
+        # thread with the process, which is why a true stop still goes stale.
+        _stop_heartbeat_tick(deps)
         # D3 effect side: render the protocol counters recorded during the run
         # (including those recorded before a fault) to the line's textfile, so
         # they reach the node_exporter scrape path instead of dying with the
@@ -501,6 +532,7 @@ def resume_goal_line(config: LineConfig, decision: DecisionInput) -> tuple[dict[
     deps: LineDeps | None = None
     try:
         graph, deps = build_line(config)
+        _start_heartbeat_tick(deps)
         invoke_config: dict[str, Any] = {
             "configurable": {"thread_id": config.thread_id},
             "recursion_limit": config.max_rounds * 8 + 20,
@@ -509,6 +541,10 @@ def resume_goal_line(config: LineConfig, decision: DecisionInput) -> tuple[dict[
             compiled = graph.compile(checkpointer=saver)
             return resume_line(compiled, config=invoke_config, decision=decision, store=store)
     finally:
+        # H0: the resumed line stops its ticker on the way out, exactly as a
+        # fresh run_line does in its own finally.
+        if deps is not None:
+            _stop_heartbeat_tick(deps)
         # D3 effect side: render the protocol counters recorded during the
         # resumed rounds to the line's textfile, exactly as run_line does for
         # a fresh launch. Only when the line was actually built.
