@@ -1,0 +1,27 @@
+{
+ "development_id": "dev-fg-61cf0c469a06",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "bash",
+    "-lc",
+    "uv sync --frozen && uv run pytest -q tests/test_turn_timeout_two_tracks.py"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "..........................                                               [100%]\n",
+   "stderr_tail": "Checked 100 packages in 0.82ms\n"
+  },
+  {
+   "command": [
+    "bash",
+    "-lc",
+    "make verify"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-debater-opponent\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-debater-judge\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-arbiter\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/arbiter-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-code-local\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-code-remote\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-content\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-feishu\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-web\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-wiki\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}], \"roles_root\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles\", \"run_ok\": true}\nresearch-role-contracts self_check: pass\n",
+   "stderr_tail": ""
+  }
+ ]
+}
