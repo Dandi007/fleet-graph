@@ -106,6 +106,16 @@ class LineConfig:
     #: scheduler parks on the line-consumed revision. None falls back to a
     #: default best-effort reader over the work-folder MCP.
     goal_revision: Any = None
+    #: M3: the dd single this line dispatched and whose gate it judges (the
+    #: self-gate anchor). None falls back to the prior terminal's
+    #: ``dd_development_id`` -- the anchor M1's waiting_dd park recorded -- and
+    #: no anchor anywhere wires no self-gate (the loop stays byte-identical).
+    self_gate_development_id: str | None = None
+    #: M3: the spec-declared deliverable surfaces the self-gate's product-diff
+    #: obligation checks the single's changed files against. Empty fails
+    #: closed: an un-declared product change is out of scope and the gate
+    #: answers REJECT with the legible out-of-scope list, never a silent pass.
+    self_gate_declared_paths: tuple[str, ...] = ()
 
     @property
     def inbox_alias(self) -> str | None:
@@ -243,8 +253,56 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         # back to a best-effort default over the work-folder MCP when the config
         # does not inject one.
         goal_revision=config.goal_revision or _build_goal_revision_reader(config),
+        # M3: the production self-gate port. A line with a dd anchor wakes on
+        # dd_awaiting_gate and mechanically performs the six evidence
+        # obligations before its ordinary loop; a line without one gets None
+        # and the pre-M3 loop byte-identical.
+        self_gate=_build_self_gate(config),
     )
     return build_goal_line_graph(deps), deps
+
+
+def _self_gate_anchor(config: LineConfig) -> str:
+    """The dd single this line's self-gate judges, or "" when there is none.
+
+    An explicit ``self_gate_development_id`` wins; otherwise the anchor is the
+    prior terminal's ``dd_development_id`` -- the fact M1's waiting_dd park
+    recorded and the dd wake ignited on.
+    """
+    if config.self_gate_development_id:
+        return config.self_gate_development_id
+    prior = (
+        config.prior_terminal
+        if config.prior_terminal is not None
+        else _read_prior_terminal(config.run_root)
+    )
+    return str((prior or {}).get("dd_development_id") or "")
+
+
+def _build_self_gate(config: LineConfig) -> Any:
+    """The production self-gate port for one line, or None when not wired.
+
+    No dd anchor means no self-gate: the line keeps the pre-M3 loop exactly.
+    The wake fact must land in the *runs root's* stall-state file (the same
+    file the scheduler parks and the decision bridge reads), which is the line
+    run root's parent -- the same discipline ``_build_interrupt`` uses. A
+    control plane that cannot be built degrades to None rather than bricking
+    the line: parking/backoff remains the fallback path.
+    """
+    from fleet_graph.graphs.self_gate_port import build_line_self_gate
+
+    anchor = _self_gate_anchor(config)
+    if not anchor:
+        return None
+    try:
+        return build_line_self_gate(
+            line_id=config.folder_id,
+            development_id=anchor,
+            run_root=config.run_root.parent,
+            declared_paths=config.self_gate_declared_paths,
+        )
+    except Exception:
+        return None
 
 
 def _build_goal_revision_reader(config: LineConfig) -> Any:

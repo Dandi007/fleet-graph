@@ -65,6 +65,7 @@ from fleet_graph.decision_bridge.owners import (
 )
 from fleet_graph.selfgate import (
     GateEvidenceMissing,
+    gate_decision,
     gate_evidence_payload,
 )
 
@@ -153,6 +154,13 @@ CODE_DD_NOT_CONSUMED = "DD_NOT_CONSUMED"
 #: engine default, so a delivery whose evidence is absent or incomplete is
 #: refused here -- never silently resumed (spec item 2's "缺任一项 → 投递被拒").
 CODE_GATE_EVIDENCE_MISSING = "GATE_EVIDENCE_MISSING"
+
+#: M3 self-gate refusal (rc-b79ebd77 blocker 2): a delivery whose evidence is
+#: present but whose *recorded answers* do not support the verdict it casts.
+#: The delivery path invokes the six obligations' own verdict join
+#: (``gate_decision``), so a caller-forged dict -- even one whose recorded
+#: answers are failures -- can no longer carry an APPROVE through the gate.
+CODE_GATE_EVIDENCE_DECISION_MISMATCH = "GATE_EVIDENCE_DECISION_MISMATCH"
 
 #: Prometheus metric names emitted by the ledger's textfile.
 METRIC_DELIVERED = "fleet_graph_decision_delivered_total"
@@ -474,6 +482,28 @@ def _deliver_dd(
             status=OUTCOME_REFUSED,
             code=CODE_GATE_EVIDENCE_MISSING,
             message="gate evidence missing mandatory field(s): " + ", ".join(sorted(exc.missing)),
+            line=development_id,
+            decision=decision,
+        )
+
+    # M3 (rc-b79ebd77 blocker 2): presence is not enough -- the recorded
+    # answers must actually support the verdict being cast. ``gate_decision``
+    # is the six obligations' verdict join; running it here means the delivery
+    # path mechanically enforces the obligations instead of only checking that
+    # six keys are truthy. A forged dict whose recorded answers are failures
+    # (e.g. {"acceptance_equality": {"equal": False}}) can no longer carry an
+    # APPROVE: the evidence refuses the verdict it does not support. A self-gate
+    # REJECT rides on failing evidence and stays consistent by construction.
+    verdict = gate_decision(evidence or {})
+    if verdict != decision:
+        return DeliveryResult(
+            status=OUTCOME_REFUSED,
+            code=CODE_GATE_EVIDENCE_DECISION_MISMATCH,
+            message=(
+                f"gate evidence decides {verdict!r} but the delivery casts "
+                f"{decision!r}; the six obligations' own answers refuse a "
+                "verdict they do not support"
+            ),
             line=development_id,
             decision=decision,
         )
@@ -1112,6 +1142,7 @@ __all__ = [
     "CODE_DD_NOT_FOUND",
     "CODE_DD_UNKNOWN",
     "CODE_DD_WORKSPACE_MISSING",
+    "CODE_GATE_EVIDENCE_DECISION_MISMATCH",
     "CODE_GATE_EVIDENCE_MISSING",
     "CODE_LINE_NOT_PARKED",
     "CODE_NOT_DISPATCHING_LINE",

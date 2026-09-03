@@ -67,6 +67,28 @@ from fleet_graph.selfgate import GATE_EVIDENCE_FIELDS
 #: exercise passes this instead of the pre-M3 no-evidence drill.
 COMPLETE_EVIDENCE: dict[str, Any] = {field: {"ok": True} for field in GATE_EVIDENCE_FIELDS}
 
+#: Evidence whose six recorded answers genuinely pass (the payload
+#: ``gather_gate_evidence`` produces on a green single). An APPROVE delivery
+#: must ride answers that support it: the delivery path runs ``gate_decision``
+#: and refuses a verdict its own evidence does not support.
+ACCEPTANCE_ARGV = [["uv", "run", "pytest", "-q", "tests/test_decision_mcp.py"]]
+PASSING_EVIDENCE: dict[str, Any] = {
+    "acceptance_equality": {
+        "equal": True,
+        "spec_argv": ACCEPTANCE_ARGV,
+        "record_argv": ACCEPTANCE_ARGV,
+        "receipt_argv": ACCEPTANCE_ARGV,
+    },
+    "diff_in_scope": {"in_scope": True, "changed": [], "declared": [], "out_of_scope": []},
+    "zero_test_deletion": {"zero": True, "deleted_tests": [], "all_deleted": []},
+    "rerun_acceptance": {
+        "rerun": True,
+        "commands": [{"argv": ACCEPTANCE_ARGV, "exit_code": 0, "output": "ok"}],
+    },
+    "mutation": {"two_shots": True, "red": True, "restored": True, "shots": []},
+    "regression": {"pass": True, "red_set_grew": False, "green_to_red_flip": False},
+}
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RESERVED_PORTS_FILE = REPO_ROOT / "config" / "decision-mcp-reserved-ports.json"
 DECISION_MCP_UNIT = REPO_ROOT / "deploy" / "systemd" / "fleet-graph-decision-mcp.service"
@@ -235,6 +257,11 @@ def _call(
     dd_source: FakeDdSource | None = None,
     evidence: dict[str, Any] | None = None,
 ) -> DeliveryResult:
+    if evidence is None:
+        # The delivery path enforces the evidence *verdict* (M3): the six
+        # answers must support the verdict cast -- passing evidence for an
+        # APPROVE, key-present-but-failing answers decide REJECT.
+        evidence = PASSING_EVIDENCE if decision == DECISION_APPROVE else COMPLETE_EVIDENCE
     return deliver_decision(
         line=line,
         decision=decision,
@@ -244,7 +271,7 @@ def _call(
         target_kind=target_kind,
         target_id=target_id,
         dd_source=dd_source,
-        evidence=evidence if evidence is not None else COMPLETE_EVIDENCE,
+        evidence=evidence,
     )
 
 
@@ -706,10 +733,10 @@ class TestDdGateDelivery:
                         "reason": "live",
                         "target_kind": "dd",
                         "target_id": "dev-abc",
-                        "evidence": COMPLETE_EVIDENCE,
+                        "evidence": PASSING_EVIDENCE,
                     },
                 )
-                return json.loads(result.content[0].text)
+            return json.loads(result.content[0].text)
 
         with running_server(server) as url:
             payload = asyncio.run(call(url))

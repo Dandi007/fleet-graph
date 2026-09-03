@@ -45,6 +45,28 @@ from fleet_graph.selfgate import GATE_EVIDENCE_FIELDS
 
 COMPLETE_EVIDENCE: dict[str, Any] = {field: {"ok": True} for field in GATE_EVIDENCE_FIELDS}
 
+#: Evidence whose six recorded answers genuinely pass (the payload
+#: ``gather_gate_evidence`` produces on a green single). The delivery path
+#: runs ``gate_decision`` over the six answers, so an APPROVE delivery must
+#: ride answers that support it.
+M2_ACCEPTANCE_ARGV = [["uv", "run", "pytest", "-q", "tests/test_m2_dd_gate_delivery.py"]]
+PASSING_EVIDENCE: dict[str, Any] = {
+    "acceptance_equality": {
+        "equal": True,
+        "spec_argv": M2_ACCEPTANCE_ARGV,
+        "record_argv": M2_ACCEPTANCE_ARGV,
+        "receipt_argv": M2_ACCEPTANCE_ARGV,
+    },
+    "diff_in_scope": {"in_scope": True, "changed": [], "declared": [], "out_of_scope": []},
+    "zero_test_deletion": {"zero": True, "deleted_tests": [], "all_deleted": []},
+    "rerun_acceptance": {
+        "rerun": True,
+        "commands": [{"argv": M2_ACCEPTANCE_ARGV, "exit_code": 0, "output": "ok"}],
+    },
+    "mutation": {"two_shots": True, "red": True, "restored": True, "shots": []},
+    "regression": {"pass": True, "red_set_grew": False, "green_to_red_flip": False},
+}
+
 DD_ID = "dev-fg-abc"
 DISPATCHER = "wf-1"
 
@@ -128,6 +150,9 @@ def _call(
     decision: str = DECISION_APPROVE,
     principal: str = DISPATCHER,
 ) -> DeliveryResult:
+    # The delivery path enforces the evidence verdict (M3): passing answers
+    # for an APPROVE; key-present answers that decide REJECT for a REJECT.
+    evidence = PASSING_EVIDENCE if decision == DECISION_APPROVE else COMPLETE_EVIDENCE
     return deliver_decision(
         line=line,
         decision=decision,
@@ -137,7 +162,7 @@ def _call(
         lines=ROSTER,
         dd=plane,
         clock=lambda: 1_700_000_123.0,
-        evidence=COMPLETE_EVIDENCE,
+        evidence=evidence,
     )
 
 
