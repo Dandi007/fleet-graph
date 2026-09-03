@@ -24,13 +24,15 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/data/apps/fleet-graph/current
-# 2026-09-02 监督面裁决：撤掉 implement 阶段的 flash 模型覆盖，回落 role registry
-# 出厂座位 deepseek-v4-pro（经 agent-run chain 解析到网关腿）；两段 review 高智能
-# 走 deepseek-v4-pro。
+# 2026-09-03 用户拍板 impl=glm-5.3-flash / cr=glm-5.3 / fr=claude-opus-5，并要求
+# 「用想用的模型跑起来」。三档一律落在 agent-runtime 的 role registry
+# (profiles/roles/{implementer,continuous_reviewer,final_reviewer}.yaml)，本 unit
+# 不再带 --stage-model —— 那是第二个模型来源，会静默盖掉 role registry：8/29 起
+# fr 的出厂座位写着 claude-opus-5 却整整五天跑 deepseek-v4-pro，就是被这两行盖的。
+# 判据 scripts/verify-lim.sh 07 seat-single-source 直接读本进程 cmdline，出现
+# --stage-model 即判 FAIL。要换档位改 role registry，不要在这里加回来。
 ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph dd serve \
-    --host 127.0.0.1 --port 5610 \
-    --stage-model continuous_review=deepseek-v4-pro \
-    --stage-model final_review=deepseek-v4-pro
+    --host 127.0.0.1 --port 5610
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
