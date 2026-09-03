@@ -596,7 +596,7 @@ def _dd_run(args: argparse.Namespace) -> int:
     from fleet_graph.dd.bootstrap import IdentityChanged, committed_target_base
     from fleet_graph.dd.git import run_git
     from fleet_graph.dd.vendor.plugin_adapter import load_plugin_binding
-    from fleet_graph.graphs.dd_runner import DevelopmentConfig, run_pipeline
+    from fleet_graph.graphs.dd_runner import DevelopmentConfig, ReworkReplayRefused, run_pipeline
 
     if args.resume and not args.checkpoint:
         # An in-memory checkpointer has no thread to resume. Silently starting
@@ -621,6 +621,17 @@ def _dd_run(args: argparse.Namespace) -> int:
 
     run_root = pathlib.Path(args.run_root or f"/data/fleet-graph/dd/{args.development}")
     management_cost = _management_cost(args)
+    gate_reject: dict[str, Any] = {}
+    if args.gate_reject_file:
+        # Rework contract A (wf-8d9737): the rejecting verdict travels in a
+        # file, never in argv. Unreadable is a refusal, not an empty mandate.
+        try:
+            loaded = json.loads(pathlib.Path(args.gate_reject_file).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"--gate-reject-file is unreadable: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise SystemExit("--gate-reject-file must carry a JSON object")
+        gate_reject = loaded
     config = DevelopmentConfig(
         development_id=args.development,
         workspace_path=workspace,
@@ -656,6 +667,7 @@ def _dd_run(args: argparse.Namespace) -> int:
         # or a human subject), threaded to the stage run labels as
         # `dispatched_by`. Absent, the actor falls back to the dispatcher.
         dispatched_by=args.dispatched_by,
+        gate_reject=gate_reject,
     )
 
     board = None
@@ -665,12 +677,33 @@ def _dd_run(args: argparse.Namespace) -> int:
 
         board = Board(BusClient())
 
-    result = run_pipeline(
-        config,
-        board=board,
-        gate_card_entity_id=args.board_card or "",
-        resume=args.resume,
-    )
+    try:
+        result = run_pipeline(
+            config,
+            board=board,
+            gate_card_entity_id=args.board_card or "",
+            resume=args.resume,
+        )
+    except ReworkReplayRefused as refused:
+        # Rework contract B (wf-8d9737): a structured refusal with the code
+        # and the missing pieces, not a traceback. Nothing ran: no stage, no
+        # receipt, no result.
+        json.dump(
+            {
+                "development_id": args.development,
+                "generation": args.generation,
+                "refused": {
+                    "code": refused.code,
+                    "detail": refused.detail,
+                    "missing": refused.missing,
+                },
+            },
+            sys.stdout,
+            ensure_ascii=False,
+            indent=1,
+        )
+        sys.stdout.write("\n")
+        raise SystemExit(2) from refused
     json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
     sys.stdout.write("\n")
     # `complete` is the only ending that means the pipeline did what it was
@@ -1732,6 +1765,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="STAGE=SECONDS",
         help="override one stage's run fence in whole seconds, e.g. "
         "implement=7200. Stages without an override keep the 3600s default",
+    )
+    dd_run.add_argument(
+        "--gate-reject-file",
+        default="",
+        help="JSON file carrying the gate REJECT verdict this generation "
+        "reworks from (wf-8d9737 rework contract A), frozen by the control "
+        "plane at generation start. The implement prompt is assembled with "
+        "it; the receipt replay path is refused for such a generation",
     )
     dd_run.add_argument(
         "--publish-merge",

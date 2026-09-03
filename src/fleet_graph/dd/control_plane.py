@@ -134,6 +134,18 @@ UNIT_PREFIX = "fleet-graph-dd"
 
 ACCEPTANCE_RECORD_PATH = ".dd-evidence/acceptance.json"
 
+#: Where one generation's sealed gate-reject verdict is frozen for the launch
+#: that carries it into the rework (wf-8d9737 rework contract A). Written by
+#: `start` under the generation's run root, read by `dd run` through
+#: `--gate-reject-file`.
+GATE_REJECT_FILE = "gate-reject.json"
+
+#: Rework contract B (wf-8d9737): a generation the engine cannot assemble a
+#: new implement dispatch for -- a sealed-receipt replay that would open a
+#: "new generation" with no new prompt and no new agent run -- is refused at
+#: start instead of being launched as a fake generation.
+CODE_REWORK_REPLAY_REFUSED = "REWORK_REPLAY_REFUSED"
+
 
 def gate_decision_path(generation: int) -> str:
     """Where the gate seals its verdict for one generation (dd_scripts.GATE_PATH)."""
@@ -654,6 +666,11 @@ class DdLaunchSpec:
     #: timeout instead of the 3600s default. Empty means the runner's default
     #: applies to every stage -- existing behavior unchanged.
     timeouts: dict[str, int] = field(default_factory=dict)
+    #: The gate REJECT verdict a rework generation starts from (wf-8d9737
+    #: rework contract A), frozen by `start` at `GATE_REJECT_FILE` under the
+    #: generation's run root. Empty means the launch is not a gate rework and
+    #: carries no `--gate-reject-file` -- byte-identical to before.
+    gate_reject_file: str = ""
     working_directory: str = DEFAULT_WORKING_DIRECTORY
     executable: str = DEFAULT_EXECUTABLE
     environment: dict[str, str] = field(default_factory=dict)
@@ -733,6 +750,8 @@ class DdLaunchSpec:
             argv += ["--stage-model", f"{stage}={model}"]
         for stage, seconds in sorted(self.timeouts.items()):
             argv += ["--stage-timeout", f"{stage}={seconds}"]
+        if self.gate_reject_file:
+            argv += ["--gate-reject-file", self.gate_reject_file]
         if self.board_card:
             argv += ["--board-card", self.board_card]
         if self.dispatched_by:
@@ -1416,6 +1435,38 @@ class DdControlPlane:
                 f"no plugin binding at {self.plugin_binding}; the capability "
                 "check is fail-closed and will not be skipped",
             )
+        # Rework contract A/B (wf-8d9737): a generation whose predecessor was
+        # gate-REJECTed is a rework generation, and its launch must carry the
+        # rejecting verdict so the implement prompt can be assembled with it.
+        # A launch that cannot carry it (record unreadable or contradicting
+        # the terminal) is refused here rather than opened as a fake new
+        # generation.
+        gate_reject_file = ""
+        if generation > 1:
+            gate_reject = self._seal_gate_rework(record, generation)
+            if gate_reject is not None:
+                path = run_root / GATE_REJECT_FILE
+                write_json_durable(path, gate_reject)
+                gate_reject_file = str(path)
+                with contextlib.suppress(OSError):
+                    event_path = run_root / EVENTS_FILE
+                    event_path.parent.mkdir(parents=True, exist_ok=True)
+                    with event_path.open("a", encoding="utf-8") as handle:
+                        handle.write(
+                            json.dumps(
+                                {
+                                    "at": iso(self.clock()),
+                                    "event": "gate_rework_dispatch",
+                                    "development_id": development_id,
+                                    "generation": generation,
+                                    "rejected_generation": gate_reject.get("rejected_generation"),
+                                    "decision_message_id": gate_reject.get("decision_message_id"),
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                            + "\n"
+                        )
         run_root.mkdir(parents=True, exist_ok=True)
         seq = len(self._launches(development_id)) + 1
         spec = DdLaunchSpec(
@@ -1442,6 +1493,7 @@ class DdControlPlane:
             # record.seats agree by construction.
             stage_models=dict(record.get("seats") or {}),
             timeouts=dict(record.get("timeouts") or {}),
+            gate_reject_file=gate_reject_file,
             working_directory=self.working_directory,
             executable=self.executable,
             environment=dict(self.environment),
@@ -1476,6 +1528,118 @@ class DdControlPlane:
             "thread_id": f"{development_id}:g{generation}",
             "checkpoint": str(dev_root / CHECKPOINT_FILE),
         }
+
+    def _seal_gate_rework(self, record: dict[str, Any], generation: int) -> dict[str, Any] | None:
+        """The gate REJECT verdict generation `generation` must rework from.
+
+        Rework contract A (wf-8d9737): when a development is started into
+        generation N+1 after its generation N ended ``GATE_REJECTED``, the
+        launch carries that rejecting verdict -- decision message id,
+        decided_by, rationale -- so the implement prompt can be assembled with
+        it. The verdict is read from the gate decision record at
+        `gate_decision_path(N)`: committed first, then the worktree copy the
+        gate's own refusal left behind (which is committed here, so the
+        verdict becomes a durable part of the chain).
+
+        Returns None when generation N was not a gate rejection at all (no
+        record anywhere, no GATE_REJECTED terminal) -- the ordinary reconfigure
+        or retry path, untouched. A record that exists but cannot serve -- not
+        readable, or not a REJECT while the terminal says otherwise -- raises
+        ``REWORK_REPLAY_REFUSED``: starting the generation without its
+        mandated rationale input is exactly the fake-rework defect this
+        contract exists to kill, so the launch is refused instead.
+        """
+        development_id = str(record["development_id"])
+        rejected = generation - 1
+        repo = Path(str(record["repo_path"]))
+        prior_result = self._read_result(development_id, rejected)
+        prior_failure = self._failure_of(prior_result)
+        was_rejected = prior_failure is not None and prior_failure["code"] in REJECTION_CODES
+
+        decision = self._committed_gate_decision(record, rejected)
+        source = "committed"
+        if decision is None:
+            path = repo / gate_decision_path(rejected)
+            if path.is_file():
+                source = "worktree"
+                try:
+                    decision = dict(json.loads(path.read_text(encoding="utf-8")))
+                except (OSError, ValueError):
+                    decision = {}
+                if str(decision.get("decision") or "").strip().upper() == "REJECT":
+                    # The gate sealed its refusal into the worktree but the
+                    # pipeline refused before any materialize step could
+                    # commit it. Commit the reserved-path record now so the
+                    # verdict is durable and the next read takes the standard
+                    # committed path.
+                    committed = self._commit_gate_record(
+                        repo, gate_decision_path(rejected), rejected
+                    )
+                    if not committed:
+                        raise ControlPlaneError(
+                            CODE_REWORK_REPLAY_REFUSED,
+                            f"{development_id} g{generation} cannot start as a gate rework: "
+                            f"the rejecting verdict at {gate_decision_path(rejected)} could "
+                            "not be committed; no new implement dispatch will be assembled "
+                            "without it (missing: gate-reject-rationale)",
+                            retryable=True,
+                        )
+        if decision is None:
+            if not was_rejected:
+                return None
+            # A GATE_REJECTED terminal with no sealed verdict record anywhere
+            # (a legacy result predating the seal). The terminal's own reason
+            # is the minimal rework face; the anchor still travels so the
+            # prompt always marks a gate rework as a gate rework.
+            return {
+                "development_id": development_id,
+                "rejected_generation": rejected,
+                "decision": "REJECT",
+                "decision_message_id": "",
+                "decided_by": "",
+                "rationale": str((prior_result or {}).get("terminal_reason") or ""),
+                "source": "terminal-facts",
+            }
+        if str(decision.get("decision") or "").strip().upper() != "REJECT":
+            if not was_rejected:
+                return None
+            raise ControlPlaneError(
+                CODE_REWORK_REPLAY_REFUSED,
+                f"{development_id} g{generation} cannot start as a gate rework: the gate "
+                f"record for g{rejected} says "
+                f"{str(decision.get('decision') or '')!r} while its terminal was "
+                "GATE_REJECTED; no new implement dispatch will be assembled against "
+                "contradicting verdicts (missing: gate-reject-rationale)",
+            )
+        return {
+            "development_id": development_id,
+            "rejected_generation": rejected,
+            "decision": "REJECT",
+            "decision_message_id": str(decision.get("decision_message_id") or ""),
+            "decided_by": str(decision.get("decided_by") or ""),
+            "rationale": str(decision.get("rationale") or ""),
+            "question_note_id": str(decision.get("question_note_id") or ""),
+            "source": source,
+        }
+
+    def _commit_gate_record(self, repo: Path, relative: str, rejected: int) -> bool:
+        for args in (
+            ("add", "--", relative),
+            (
+                "-c",
+                "user.name=Dev Dispatch",
+                "-c",
+                "user.email=dev-dispatch@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                f"dev-dispatch: seal gate reject g{rejected}",
+            ),
+        ):
+            proc = run_git(repo, *args)
+            if proc.returncode != 0:
+                return False
+        return True
 
     # --- reconfigure: the environment/contract exit -----------------------
 
