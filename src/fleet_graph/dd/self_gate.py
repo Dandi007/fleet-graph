@@ -1,16 +1,20 @@
 """The line self-gate decision (M3): six evidence obligations -> one verdict.
 
 After M1 (``dd_awaiting_gate`` wake) and M2 (``decision_deliver`` for a dd
-single with a principal check), the dispatching line is its own gate: on a
-``dd_awaiting_gate`` wake the line mechanically discharges **six evidence
-obligations** and then delivers ``APPROVE``/``REJECT`` through the exact dd
-delivery path the decision surface already checks. ``decided_by`` *is* the
-line's principal, and the delivery path refuses any principal that is not the
-single's ``dispatched_by`` -- so a self-gate verdict can never be cast by
-anyone but the dispatching line.
+single with a principal check), the gate authority is the dispatching line's
+own judgment (golden-order D5): on a ``dd_awaiting_gate`` wake the line
+mechanically discharges **six evidence obligations** and then delivers
+``APPROVE``/``REJECT`` through the exact dd delivery path the decision surface
+already checks. ``decided_by`` *must equal* that single's
+``record.json.dispatched_by`` -- the delivery path refuses any principal that
+is not the single's ``dispatched_by`` -- so a self-gate verdict can never be
+cast by anyone but the dispatching line. Under D5 the human/supervision
+surface appears at exactly three points -- enrollment release, goal-level
+acceptance, and the answer escalation report -- and never inside this gate.
 
-The six obligations are the gate's non-negotiable required fields (design.md
-§6.2/§6.3; goal.md §二 M3 + S8/S9/S10/S11/S12). Missing any one of them leaves
+The six obligations are the gate's non-negotiable required fields (golden-order
+D5; design.md §6.2/§6.3; goal.md §二 M3 + S9/S10/S11/S12). Missing any one of
+them leaves
 the delivery **refused** -- the negative criterion a test must be able to turn
 red:
 
