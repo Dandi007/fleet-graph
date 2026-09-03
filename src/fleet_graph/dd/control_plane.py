@@ -1476,6 +1476,70 @@ class DdControlPlane:
         gate_report["resume"] = self._launch(record, resume=True, generation=generation)
         return gate_report
 
+    def record_gate_refusal(
+        self,
+        development_id: str,
+        *,
+        decision: str = "",
+        reason: str = "",
+        unit_exit_code: str = "",
+    ) -> None:
+        """S10 第 2 条: leave a resume-refusal trace on the single.
+
+        A resume that was refused -- a missing workspace, a unit that died
+        without the single ever leaving ``awaiting_gate``, or a gate that
+        declined to resume -- writes the refusal reason + unit exit code into
+        the generation's ``result.json`` (``gate_refused``, plus an append-only
+        ``gate_refused_history``) and appends a ``gate_refused`` event to
+        ``events.jsonl``. Without this, a "unit started then died" resume reads
+        as ``delivered/consumed`` and the single shows nothing: the exact void
+        the supervision plane found while tracing dev-fg-36c2d76baca7.
+
+        Every write here is best-effort and never raises: observability must
+        never fail the delivery it records.
+        """
+        try:
+            generation = self._generation(self._record(development_id))
+        except ControlPlaneError:
+            generation = 1
+        gen_root = self._gen_root(development_id, generation)
+
+        entry: dict[str, Any] = {
+            "at": iso(self.clock()),
+            "stage": "gate",
+            "event": "gate_refused",
+            "decision": decision,
+            "reason": reason,
+            "unit_exit_code": unit_exit_code,
+        }
+        events_path = gen_root / EVENTS_FILE
+        try:
+            events_path.parent.mkdir(parents=True, exist_ok=True)
+            with events_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+                handle.flush()
+        except OSError:
+            pass
+
+        result_path = gen_root / RESULT_FILE
+        result: dict[str, Any] = {}
+        if result_path.is_file():
+            try:
+                loaded = json.loads(result_path.read_text(encoding="utf-8"))
+            except ValueError:
+                loaded = {}
+            if isinstance(loaded, dict):
+                result = loaded
+        history = list(result.get("gate_refused_history") or [])
+        history.append(entry)
+        result["gate_refused"] = {
+            "reason": reason,
+            "unit_exit_code": unit_exit_code,
+            "decision": decision,
+        }
+        result["gate_refused_history"] = history
+        write_json_durable(result_path, result)
+
     def _resume_claim_path(self, development_id: str, generation: int, action_key: str) -> Path:
         digest = hashlib.sha256(action_key.encode("utf-8")).hexdigest()
         return (

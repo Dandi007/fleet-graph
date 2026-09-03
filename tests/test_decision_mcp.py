@@ -32,7 +32,6 @@ import pytest
 from fleet_graph.decision_bridge.owners import (
     OWNER_KIND_DD,
     OWNER_KIND_LINE,
-    RESUME_REFUSED,
     RESUME_RESUMED,
     OwnerResult,
     OwnerTarget,
@@ -43,7 +42,6 @@ from fleet_graph.decision_mcp import (
     CODE_DD_NOT_FOUND,
     CODE_LINE_NOT_PARKED,
     CODE_NO_WAITING_PARTY,
-    CODE_OWNER_REFUSED,
     CODE_QUESTION_CARD_UNRESOLVED,
     DECISION_APPROVE,
     DECISION_REJECT,
@@ -107,20 +105,74 @@ ROSTER = [{"folder_id": "wf-1", "seat": "s", "generation": 2}]
 
 
 class FakePlane:
-    """A dd control-plane stub: ``get`` answers known/awaiting vs unknown."""
+    """A dd control-plane stub for the unified dd delivery path.
+
+    ``get`` answers awaiting/known vs unknown; ``gate`` consumes the single
+    (moves it out of ``awaiting_gate``) so the M3 S10 consumption re-read sees
+    it leave the gate. ``record_gate_refusal`` captures the refusal trace.
+    """
 
     def __init__(self, source: FakeDdSource) -> None:
         self._source = source
+        self.resumed: list[tuple[str, str]] = []
+        self.refusals: list[dict[str, Any]] = []
 
     def get(self, development_id: str) -> dict[str, Any]:
         from fleet_graph.dd.control_plane import ControlPlaneError
 
         if development_id in self._source._awaiting:
-            return {"development_id": development_id, "state": "awaiting_gate"}
+            target = self._source._awaiting[development_id]
+            return {
+                "development_id": development_id,
+                "state": "awaiting_gate",
+                "dispatched_by": getattr(target, "dispatched_by", ""),
+                "generation": getattr(target, "generation", 1),
+                "awaiting": {
+                    "question_note_id": getattr(target, "question_note_id", ""),
+                    "card_entity_id": getattr(target, "card_entity_id", ""),
+                },
+            }
         if development_id in self._source._known:
-            return {"development_id": development_id, "state": "running"}
+            return {
+                "development_id": development_id,
+                "state": "running",
+                "dispatched_by": "",
+                "generation": 1,
+                "awaiting": {},
+            }
         raise ControlPlaneError(
             "DEVELOPMENT_NOT_FOUND", f"no admission record for {development_id}"
+        )
+
+    def gate(
+        self, development_id: str, resume: bool = False, action_key: str | None = None
+    ) -> dict[str, Any]:
+        assert resume is True
+        target = self._source._awaiting.pop(development_id, None)
+        self._source._known.add(development_id)
+        self.resumed.append((development_id, action_key or ""))
+        return {
+            "resume": {
+                "development_id": development_id,
+                "generation": getattr(target, "generation", 1),
+            }
+        }
+
+    def record_gate_refusal(
+        self,
+        development_id: str,
+        *,
+        decision: str = "",
+        reason: str = "",
+        unit_exit_code: str = "",
+    ) -> None:
+        self.refusals.append(
+            {
+                "development_id": development_id,
+                "decision": decision,
+                "reason": reason,
+                "unit_exit_code": unit_exit_code,
+            }
         )
 
 
@@ -129,8 +181,9 @@ class FakeDdSource:
 
     ``awaiting`` maps development id -> OwnerTarget (a waiting dd gate);
     ``known`` names developments the control plane has on record but whose
-    state is *not* awaiting_gate; anything else is unknown. ``resume`` records
-    its calls and answers ``resumed``.
+    state is *not* awaiting_gate; anything else is unknown. The single
+    ``FakePlane`` it fronts is stable, so a caller can inspect ``resumed``/
+    ``refusals`` after a unified delivery.
     """
 
     def __init__(
@@ -140,10 +193,11 @@ class FakeDdSource:
     ) -> None:
         self._awaiting = dict(awaiting or {})
         self._known = set(known or {})
+        self.plane = FakePlane(self)
         self.resumes: list[tuple[OwnerTarget, str]] = []
 
     def _control_plane(self) -> FakePlane:
-        return FakePlane(self)
+        return self.plane
 
     def discover_all(self) -> list[OwnerTarget]:
         return list(self._awaiting.values())
@@ -538,7 +592,7 @@ class TestDdGateDelivery:
         assert result.target["question_note_id"] == "q-1"
         assert result.target["card_entity_id"] == "card-1"
         assert result.target["resume_status"] == RESUME_RESUMED
-        assert dd_source.resumes == [(_dd_target(), "mcp:dd:dev-abc:g1:APPROVE")]
+        assert dd_source.plane.resumed == [("dev-abc", "mcp:dd:dev-abc:g1:APPROVE")]
 
     def test_reject_is_also_a_valid_dd_verdict(self, tmp_path: Path) -> None:
         dd_source = FakeDdSource(awaiting={"dev-abc": _dd_target()})
@@ -599,18 +653,32 @@ class TestDdGateDelivery:
             _call(tmp_path, target_kind="folder", target_id="dev-abc")
 
     def test_owner_side_refusal_surfaces_as_owner_refused(self, tmp_path: Path) -> None:
-        class RefusingDdSource(FakeDdSource):
-            def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
-                return OwnerResult(RESUME_REFUSED, "gate refused")
+        """A gate-side resume refusal surfaces as an explicit refusal (with the
+        gate's own code) and leaves a ``gate_refused`` trace on the single."""
 
+        class RefusingPlane(FakePlane):
+            def gate(
+                self, development_id: str, resume: bool = False, action_key: str | None = None
+            ) -> dict[str, Any]:
+                from fleet_graph.dd.control_plane import ControlPlaneError
+
+                raise ControlPlaneError("GATE_UNAVAILABLE", "gate refused")
+
+        class RefusingSource(FakeDdSource):
+            def __init__(self) -> None:
+                super().__init__(awaiting={"dev-abc": _dd_target()})
+                self.plane = RefusingPlane(self)
+
+        source = RefusingSource()
         result = _call(
             tmp_path,
             target_kind=TARGET_KIND_DD,
             target_id="dev-abc",
-            dd_source=RefusingDdSource(awaiting={"dev-abc": _dd_target()}),
+            dd_source=source,
         )
         assert result.status == OUTCOME_REFUSED
-        assert result.code == CODE_OWNER_REFUSED
+        assert result.code == "GATE_UNAVAILABLE"
+        assert any(r["development_id"] == "dev-abc" for r in source.plane.refusals)
 
     def test_dd_delivery_reaches_the_client(self, tmp_path: Path) -> None:
         """The tool wiring carries target_kind/target_id to the dd path."""

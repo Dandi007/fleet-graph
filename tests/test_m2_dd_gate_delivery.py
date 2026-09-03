@@ -82,6 +82,10 @@ class FakeDdPlane:
     ) -> dict[str, Any]:
         assert resume is True
         self.resumed.append((development_id, action_key or ""))
+        # M3 S10: a resume means "the unit started and the single left the
+        # gate" -- reflect consumption in the re-read a delivery performs.
+        if self.state == "awaiting_gate":
+            self.state = "running"
         return {
             "state": self.state,
             "development_id": development_id,
