@@ -25,6 +25,7 @@ from typing import Any
 
 from fleet_graph.dd import selfgate
 from fleet_graph.dd.git import run_git
+from fleet_graph.dd.selfgate import as_argv_commands
 from fleet_graph.dd.selfgate_run import SelfGateExecutor
 
 #: The spec's declared delivery surface, as a directory-prefix scope, when the
@@ -75,18 +76,8 @@ class EngineSelfGateFacts:
         return ""
 
     def _acceptance_argvs(self, info: dict[str, Any]) -> list[list[str]]:
-        """The frozen acceptance commands as argv lists.
-
-        The control plane's ``acceptance_commands`` is ``[argv, ...]`` (a list of
-        lists). A duck-typed read model may carry a single flat argv instead; that
-        is normalised to one command so the executor still re-runs exactly it.
-        """
-        commands = _list(info.get("acceptance_commands"))
-        if not commands:
-            return []
-        if all(isinstance(command, (list, tuple)) for command in commands):
-            return [[str(part) for part in command] for command in commands]
-        return [[str(part) for part in commands]]
+        """The frozen acceptance commands as canonical argv lists."""
+        return as_argv_commands(info.get("acceptance_commands"))
 
     def _scope_paths(self, info: dict[str, Any]) -> list[str]:
         declared = info.get("scope_paths")
@@ -94,11 +85,23 @@ class EngineSelfGateFacts:
             return [str(path) for path in _list(declared)]
         return list(PRODUCT_SCOPE_ROOTS)
 
-    def _receipt_commands(self, info: dict[str, Any]) -> list[str]:
-        """The committed acceptance stage's recorded commands (spec §2.1 receipt)."""
+    def _receipt_commands(self, info: dict[str, Any]) -> list[list[str]]:
+        """The committed acceptance stage's recorded commands (spec §2.1 receipt).
+
+        The compare is over argv lists, never over a ``str()`` repr of them:
+        the control plane's ``acceptance_commands`` and every committed
+        receipt entry (fleet-graph's ``results[].command``, the old engine's
+        ``command_results[].argv`` -- the two shapes
+        ``supervise/audit.py::_frozen_argvs`` names) carry one argv list per
+        command, and rc-18d66081's repr-string projection made the three-way
+        verbatim compare unsatisfiable for every real single. Both shapes
+        reduce through :func:`as_argv_commands`, so a genuine receipt
+        compares equal and a drifted or repr-projected one still fails
+        closed.
+        """
         provided = info.get("verification_commands")
         if provided is not None:
-            return [str(command) for command in _list(provided)]
+            return as_argv_commands(provided)
         repo, _, head = self._git_anchors(info)
         if not repo or not head:
             return []
@@ -114,20 +117,24 @@ class EngineSelfGateFacts:
             return []
         if not isinstance(payload, dict):
             return []
-        return [
-            str(entry["command"])
-            for entry in payload.get("results") or []
-            if isinstance(entry, dict) and entry.get("command")
-        ]
+        entries = payload.get("results")
+        key = "command"
+        if entries is None:
+            entries = payload.get("command_results")
+            key = "argv"
+        commands: list[list[str]] = []
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            commands.extend(as_argv_commands(entry.get(key)))
+        return commands
 
     # --- measured members (one per obligation) ---------------------------
 
     def _acceptance_verbatim(self, info: dict[str, Any]) -> dict[str, Any]:
-        spec_argv = _list(info.get("spec_acceptance_commands") or info.get("acceptance_commands"))
-        record = _list(info.get("acceptance_commands"))
         return selfgate.acceptance_argv_verbatim(
-            spec=spec_argv,
-            record=record,
+            spec=info.get("spec_acceptance_commands") or info.get("acceptance_commands"),
+            record=info.get("acceptance_commands"),
             receipt=self._receipt_commands(info),
         )
 

@@ -16,6 +16,7 @@ the module consumes measured facts and returns a judgement.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +102,25 @@ class TestSixObligations:
         result = acceptance_argv_verbatim(spec=ACCEPT, record=ACCEPT, receipt=drifted)
         assert result["ok"] is False
         assert "differ" in result["reason"]
+
+    def test_acceptance_verbatim_compares_canonical_argv_not_reprs(self) -> None:
+        """rc-18d66081: the real record/receipt shapes are lists of argv lists.
+
+        record.json's ``acceptance_commands`` and the stage receipt's
+        ``results[].command`` both store one argv list per command; the
+        three-way compare must pass on those real shapes and must never pass
+        on the ``str(argv)`` repr of them (fail closed, never repr-equal).
+        """
+        result = acceptance_argv_verbatim(spec=[ACCEPT], record=[ACCEPT], receipt=[ACCEPT])
+        assert result["ok"] is True
+        repr_receipt = [str([ACCEPT])]
+        refused = acceptance_argv_verbatim(spec=[ACCEPT], record=[ACCEPT], receipt=repr_receipt)
+        assert refused["ok"] is False
+        drifted = acceptance_argv_verbatim(
+            spec=[ACCEPT], record=[ACCEPT], receipt=[["bash", "-lc", "pytest tests/other.py"]]
+        )
+        assert drifted["ok"] is False
+        assert "differ" in drifted["reason"]
 
     def test_product_diff_outside_scope_is_negative(self) -> None:
         result = product_diff_in_scope(
@@ -674,6 +694,97 @@ class TestEngineSelfGateFacts:
         facts = EngineSelfGateFacts(control).gather("dev-fg-m3")
         assert facts["regression_baseline"]["ok"] is False
         assert "new:test" in facts["regression_baseline"]["reason"]
+
+
+def _git(*args: str, cwd: Path) -> str:
+    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
+    return proc.stdout.strip()
+
+
+def _receipt_repo(tmp_path: Path, payload: dict[str, Any]) -> tuple[str, str]:
+    """A git worktree whose head commits one acceptance receipt (real layout)."""
+    evidence = tmp_path / ".dd-evidence"
+    evidence.mkdir()
+    (evidence / "acceptance.json").write_text(json.dumps(payload), encoding="utf-8")
+    _git("init", "-q", cwd=tmp_path)
+    _git("config", "user.name", "receipt", cwd=tmp_path)
+    _git("config", "user.email", "receipt@example.invalid", cwd=tmp_path)
+    _git("add", ".", cwd=tmp_path)
+    _git("commit", "-q", "-m", "acceptance receipt", cwd=tmp_path)
+    return str(tmp_path), _git("rev-parse", "HEAD", cwd=tmp_path)
+
+
+class TestReceiptVerbatimAgainstTheRealShapes:
+    """rc-18d66081: the receipt path reads argv lists, never repr strings.
+
+    ``DdControlPlane.get()`` carries ``acceptance_commands`` as a list of argv
+    lists, and the committed stage receipt (``.dd-evidence/acceptance.json``)
+    stores one argv list per result -- both confirmed by
+    ``supervise/audit.py::_frozen_argvs``. No test may bypass the git-show
+    receipt path when pinning the §2.1 three-way compare.
+    """
+
+    def test_the_committed_fleet_graph_receipt_satisfies_the_real_record_shape(
+        self, tmp_path: Path
+    ) -> None:
+        repo, head = _receipt_repo(
+            tmp_path, {"results": [{"command": list(ACCEPT), "exit_code": 0}]}
+        )
+        control = FakeControl(
+            acceptance_commands=[list(ACCEPT)],  # DdControlPlane.get() shape
+            worktree_path=repo,
+            target_base_commit="base",
+            head_commit=head,
+        )
+        facts = EngineSelfGateFacts(control).gather("dev-fg-m3")
+        assert facts["acceptance_verbatim"]["ok"] is True
+
+    def test_the_old_engine_receipt_shape_is_read_the_same_way(self, tmp_path: Path) -> None:
+        repo, head = _receipt_repo(
+            tmp_path, {"command_results": [{"argv": list(ACCEPT), "exit_code": 0}]}
+        )
+        control = FakeControl(
+            acceptance_commands=[list(ACCEPT)],
+            worktree_path=repo,
+            target_base_commit="base",
+            head_commit=head,
+        )
+        facts = EngineSelfGateFacts(control).gather("dev-fg-m3")
+        assert facts["acceptance_verbatim"]["ok"] is True
+
+    def test_a_drifted_committed_receipt_is_measured_negative(self, tmp_path: Path) -> None:
+        repo, head = _receipt_repo(
+            tmp_path, {"results": [{"command": ["bash", "-lc", "pytest tests/other.py"]}]}
+        )
+        control = FakeControl(
+            acceptance_commands=[list(ACCEPT)],
+            worktree_path=repo,
+            target_base_commit="base",
+            head_commit=head,
+        )
+        facts = EngineSelfGateFacts(control).gather("dev-fg-m3")
+        assert facts["acceptance_verbatim"]["ok"] is False
+        assert "differ" in facts["acceptance_verbatim"]["reason"]
+
+    def test_a_receipt_of_repr_strings_is_refused_not_matched(self, tmp_path: Path) -> None:
+        repo, head = _receipt_repo(tmp_path, {"results": [{"command": str([ACCEPT])}]})
+        control = FakeControl(
+            acceptance_commands=[list(ACCEPT)],
+            worktree_path=repo,
+            target_base_commit="base",
+            head_commit=head,
+        )
+        facts = EngineSelfGateFacts(control).gather("dev-fg-m3")
+        assert facts["acceptance_verbatim"]["ok"] is False
+
+    def test_injected_verification_commands_in_the_real_shape_compare_ok(self) -> None:
+        control = FakeControl(
+            spec_acceptance_commands=[ACCEPT],
+            acceptance_commands=[ACCEPT],
+            verification_commands=[ACCEPT],
+        )
+        facts = EngineSelfGateFacts(control).gather("dev-fg-m3")
+        assert facts["acceptance_verbatim"]["ok"] is True
 
 
 class _FakeSelfGatePort:

@@ -40,6 +40,7 @@ testable in isolation and keeps judgement out of the write path (INV-3).
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 from typing import Any
 
@@ -110,18 +111,51 @@ def _is_protocol_path(path: str, protocol_roots: tuple[str, ...]) -> bool:
     return any(stripped == root or stripped.startswith(f"{root}/") for root in protocol_roots)
 
 
+def as_argv_commands(value: Any) -> list[list[str]]:
+    """Canonical command shape: a list of argv lists of plain strings.
+
+    The acceptance-argv sources speak two shapes -- a single flat argv
+    (``["bash", "-lc", ...]``) or a list of argv lists (record.json's
+    ``acceptance_commands``, the stage receipt's ``results[].command`` /
+    ``command_results[].argv``). Both reduce to the same canonical form so
+    the verbatim compare is over the commands themselves, never over a
+    ``str()`` repr of them (the rc-18d66081 defect: a repr string and an
+    argv list are unequal shapes, so every real single compared negative).
+    A bare string is one command line and is shlex-split; anything the
+    normalizer cannot reduce is kept verbatim inside its one command, which
+    fails the compare closed rather than guessing a match.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            argv = shlex.split(value)
+        except ValueError:
+            argv = [value]
+        return [argv] if argv else []
+    items = list(value) if isinstance(value, (list, tuple)) else [value]
+    if not items:
+        return []
+    if all(isinstance(item, (list, tuple)) for item in items):
+        return [[str(part) for part in item] for item in items if list(item)]
+    return [[str(part) for part in items]]
+
+
 def acceptance_argv_verbatim(
     *, spec: list[str] | tuple[str, ...], record: Any, receipt: Any
 ) -> dict[str, Any]:
     """Obligation 1: the three acceptance argv are byte-for-byte equal.
 
-    Any of the three missing (empty) is itself a violation: the frozen spec
-    argv, the record's ``acceptance_commands`` and the stage receipt command
-    must all be present and identical -- a machine comparison, never prose.
+    Each side is first reduced to the canonical argv-list shape
+    (:func:`as_argv_commands`) -- the compare is mechanical over the
+    commands themselves, never over a Python repr. Any of the three
+    missing (empty) is itself a violation: the frozen spec argv, the
+    record's ``acceptance_commands`` and the stage receipt command must all
+    be present and identical.
     """
-    spec_argv = list(spec)
-    record_argv = list(record) if isinstance(record, (list, tuple)) else []
-    receipt_argv = list(receipt) if isinstance(receipt, (list, tuple)) else []
+    spec_argv = as_argv_commands(spec)
+    record_argv = as_argv_commands(record)
+    receipt_argv = as_argv_commands(receipt)
     if not spec_argv or not record_argv or not receipt_argv:
         return _bad(
             "acceptance argv missing: spec/record/receipt must all be non-empty "
@@ -343,6 +377,7 @@ __all__ = [
     "GateAssessment",
     "RegressionRun",
     "acceptance_argv_verbatim",
+    "as_argv_commands",
     "assess_evidence",
     "decide",
     "harvest_eligible",
