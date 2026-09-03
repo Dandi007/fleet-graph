@@ -21,6 +21,7 @@ from fleet_graph.acceptance import AcceptanceRunner, AcceptanceSpec
 from fleet_graph.bus.client import BusClient
 from fleet_graph.bus.inbox import Inbox
 from fleet_graph.bus.tokens import resolve_line_token
+from fleet_graph.dd.self_gate import deliver_self_gate_decision
 from fleet_graph.executors.agent_run import AgentRunLauncher
 from fleet_graph.executors.agent_session import (
     AgentSessionSeat,
@@ -106,6 +107,11 @@ class LineConfig:
     #: scheduler parks on the line-consumed revision. None falls back to a
     #: default best-effort reader over the work-folder MCP.
     goal_revision: Any = None
+    #: M3: when a run is an ``dd_awaiting_gate`` wake, this names the
+    #: development the line is now its own gate for. Non-empty makes
+    #: :func:`run_self_gate` self-deliver the gate decision (D5: "DD gate needs
+    #: no human"); empty means an ordinary run and the hook is a no-op.
+    dd_awaiting_gate_development_id: str = ""
 
     @property
     def inbox_alias(self) -> str | None:
@@ -450,7 +456,41 @@ def resume_start(compiled: Any, invoke_config: dict[str, Any]) -> dict[str, Any]
     return {"round_no": 1}
 
 
+def run_self_gate(
+    config: LineConfig,
+    *,
+    dd: Any = None,
+    evidence: list[Any] | None = None,
+) -> Any:
+    """M3: a line woken by ``dd_awaiting_gate`` self-delivers its gate decision.
+
+    The line is its own gate now (design §8 "DD gate needs no human"): with a
+    development id in the wake, it derives ``APPROVE``/``REJECT`` from the six
+    evidence obligations and delivers it through the dd path, which validates
+    ``principal == dispatched_by`` -- so ``decided_by`` is the line and only the
+    line. ``None`` when this run is not a dd wake (an ordinary run).
+
+    ``evidence`` carries the six grounded obligations; ``None``/empty leaves the
+    gate decision *incomplete* and the delivery refused rather than guessed --
+    the same fail-closed shape as every other gate obligation.
+    """
+    if not config.dd_awaiting_gate_development_id:
+        return None
+    result = deliver_self_gate_decision(
+        development_id=config.dd_awaiting_gate_development_id,
+        principal=config.folder_id,
+        evidence=evidence or [],
+        run_root=config.run_root,
+        dd=dd,
+    )
+    return result
+
+
 def run_line(config: LineConfig, *, run_id: str | None = None) -> dict[str, Any]:
+    # M3: on a dd_awaiting_gate wake the line is its own gate and seals its
+    # verdict before the run proceeds (D5: "DD gate needs no human"). An
+    # ordinary run (no wake id) is a no-op here.
+    run_self_gate(config)
     graph, deps = build_line(config, run_id=run_id)
     invoke_config: dict[str, Any] = {
         "configurable": {"thread_id": config.thread_id},
@@ -523,4 +563,5 @@ __all__ = [
     "resume_goal_line",
     "resume_start",
     "run_line",
+    "run_self_gate",
 ]

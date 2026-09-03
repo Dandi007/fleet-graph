@@ -137,6 +137,13 @@ CODE_DD_NOT_AWAITING_GATE = "DD_NOT_AWAITING_GATE"
 CODE_NOT_DISPATCHING_LINE = "NOT_DISPATCHING_LINE"
 CODE_DD_UNKNOWN = "DD_UNKNOWN"
 
+#: M3 self-gate delivery refusals (S10: ``delivered`` must mean *consumed*, not
+#: "a unit was started"). A resume whose success cannot be read back as the
+#: single having left ``awaiting_gate`` is refused; a single whose frozen
+#: workspace path no longer exists is refused *before* any unit is started.
+CODE_WORKSPACE_MISSING = "WORKSPACE_MISSING"
+CODE_GATE_NOT_CONSUMED = "GATE_NOT_CONSUMED"
+
 #: Prometheus metric names emitted by the ledger's textfile.
 METRIC_DELIVERED = "fleet_graph_decision_delivered_total"
 METRIC_REFUSED = "fleet_graph_decision_refused_total"
@@ -332,6 +339,66 @@ def _wake_dispatching_line(run_root: Path, folder_id: str, at: float) -> None:
         pass
 
 
+def _dispatch_authorization_refusal(
+    *, principal: str, dispatched_by: str, development_id: str, decision: str
+) -> DeliveryResult | None:
+    """The one authority check both dd delivery forms share (S11).
+
+    ``dispatched_by`` on the single's admission record is the authority: any
+    principal that is not exactly that line is refused before the single is
+    touched. Returning ``None`` means "authorized"; a :class:`DeliveryResult`
+    means "refused, stop here". Both the ``target_kind="dd"`` form and the
+    ``dev-fg-<id>`` ``line`` form call this, so there is no dd delivery path
+    that skips the check (the M3 unification -- the ``dd`` form previously
+    resolved existence only, so any caller could cast any line's gate).
+    """
+    if principal == dispatched_by:
+        return None
+    return DeliveryResult(
+        status=OUTCOME_REFUSED,
+        code=CODE_NOT_DISPATCHING_LINE,
+        message=(
+            f"principal {principal!r} is not the dispatching line "
+            f"{dispatched_by!r} for {development_id!r}"
+        ),
+        line=development_id,
+        decision=decision,
+    )
+
+
+def _unit_exit_code(gate_result: dict[str, Any]) -> str:
+    """The launched unit's exit code, extracted from a ``gate(resume=True)``
+    report. The resume payload is the launch dict; a unit that already died
+    carries its code (e.g. ``75/TEMPFAIL``) so the refusal names it rather than
+    leaving the single with no trace (S10 clause 2)."""
+    payload = gate_result.get("resume")
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("exit_code", "unit_exit_code", "exit"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _record_gate_refusal(
+    dd: Any, development_id: str, *, code: str, reason: str, exit_code: str = ""
+) -> None:
+    """Best-effort durable trace of a gate refusal on the delivery path (S10).
+
+    The control plane owns the durable write (``record_gate_refusal`` appends
+    an ``events.jsonl`` line and surfaces a ``gate_refused`` fact), but a
+    duck-typed fake without the method must still let refusal answer truthfully
+    -- the trace is observability, never a swallow guard. A write that cannot
+    land never changes the refusal code.
+    """
+    write = getattr(dd, "record_gate_refusal", None)
+    if write is None:
+        return
+    with contextlib.suppress(Exception):
+        write(development_id, code=code, reason=reason, exit_code=exit_code)
+
+
 def _deliver_dd(
     *,
     development_id: str,
@@ -365,17 +432,14 @@ def _deliver_dd(
         )
 
     dispatched_by = str(status.get("dispatched_by") or "")
-    if principal != dispatched_by:
-        return DeliveryResult(
-            status=OUTCOME_REFUSED,
-            code=CODE_NOT_DISPATCHING_LINE,
-            message=(
-                f"principal {principal!r} is not the dispatching line "
-                f"{dispatched_by!r} for {development_id!r}"
-            ),
-            line=development_id,
-            decision=decision,
-        )
+    refused = _dispatch_authorization_refusal(
+        principal=principal,
+        dispatched_by=dispatched_by,
+        development_id=development_id,
+        decision=decision,
+    )
+    if refused is not None:
+        return refused
 
     if status.get("state") != STATE_AWAITING_GATE:
         return DeliveryResult(
@@ -386,6 +450,27 @@ def _deliver_dd(
                 f"{STATE_AWAITING_GATE!r}; a decision can only be delivered at the gate"
             ),
             retryable=True,
+            line=development_id,
+            decision=decision,
+        )
+
+    # S10 clause 3: validate the frozen workspace *before* starting any unit. A
+    # missing workspace means the resume would launch a unit that dies in
+    # milliseconds (the measured 889ms ``75/TEMPFAIL``); refusing up front is a
+    # traceable refusal, never a "delivered/consumed" for a process nobody saw.
+    workspace = str(
+        status.get("worktree_path") or status.get("workspace") or status.get("repo_path") or ""
+    )
+    if workspace and not Path(workspace).is_dir():
+        reason = (
+            f"workspace {workspace!r} for {development_id!r} does not exist; "
+            "the resume would start a unit on a missing path"
+        )
+        _record_gate_refusal(dd, development_id, code=CODE_WORKSPACE_MISSING, reason=reason)
+        return DeliveryResult(
+            status=OUTCOME_REFUSED,
+            code=CODE_WORKSPACE_MISSING,
+            message=reason,
             line=development_id,
             decision=decision,
         )
@@ -416,6 +501,37 @@ def _deliver_dd(
             status=OUTCOME_REFUSED,
             code=CODE_DD_NOT_AWAITING_GATE,
             message=f"gate did not resume {development_id!r}",
+            line=development_id,
+            decision=decision,
+            generation=generation,
+            question_note_id=question_note_id,
+            card_entity_id=card_entity_id,
+        )
+
+    # S10 clause 1: ``resume`` means "a unit was started", not "the verdict was
+    # consumed". Re-read the single and confirm it actually left
+    # ``awaiting_gate``; a resume that started but did not consume (the unit
+    # died, the single is still parked) is a refusal with the unit's exit code,
+    # never a ``delivered/consumed`` receipt.
+    try:
+        after = dd.get(development_id)
+    except Exception:
+        after = {}
+    if after.get("state") == STATE_AWAITING_GATE:
+        exit_code = _unit_exit_code(result)
+        reason = (
+            f"resume started for {development_id!r} but the single stayed at "
+            f"{STATE_AWAITING_GATE!r} after the unit exited"
+            + (f" (unit exit {exit_code})" if exit_code else "")
+            + "; the verdict was not consumed"
+        )
+        _record_gate_refusal(
+            dd, development_id, code=CODE_GATE_NOT_CONSUMED, reason=reason, exit_code=exit_code
+        )
+        return DeliveryResult(
+            status=OUTCOME_REFUSED,
+            code=CODE_GATE_NOT_CONSUMED,
+            message=reason,
             line=development_id,
             decision=decision,
             generation=generation,
@@ -482,6 +598,7 @@ def deliver_decision(
             target_id=target_id,
             decision=decision,
             reason=reason,
+            principal=principal,
             dd_source=dd_source if dd_source is not None else DdOwnerSource(DEFAULT_DD_ROOT),
         )
 
@@ -594,15 +711,20 @@ def deliver_decision_dd(
     decision: str,
     reason: str,
     dd_source: DdOwnerSource,
+    principal: str = "",
 ) -> DeliveryResult:
     """Deliver one decision to a dd development gate, synchronously.
 
     The caller names the dd development by id; the server resolves the pending
     question/card from the dd control plane's ``awaiting_gate`` record and
     delivers the verdict through ``DdControlPlane.gate(development_id,
-    resume=True)``. An unknown dd, a dd that is not awaiting the gate, or an
-    owner-side refusal each map to a distinct, explicit refusal -- never a
-    silent HTTP-200 swallow.
+    resume=True)``. An unknown dd, a dd that is not awaiting the gate, an
+    unauthorized principal, or an owner-side refusal each map to a distinct,
+    explicit refusal -- never a silent HTTP-200 swallow.
+
+    M3 (S11): the ``principal`` is checked against the single's
+    ``dispatched_by`` exactly as the ``dev-fg-<id>`` form does -- the two dd
+    delivery forms share one authority check, so no path bypasses it.
     """
     if not isinstance(target_id, str) or not target_id.strip():
         raise DecisionPayloadError("target_id is required for a dd target")
@@ -627,6 +749,15 @@ def deliver_decision_dd(
             line=target_id,
             decision=decision,
         )
+
+    authorized = _dispatch_authorization_refusal(
+        principal=principal,
+        dispatched_by=target.dispatched_by,
+        development_id=target_id,
+        decision=decision,
+    )
+    if authorized is not None:
+        return authorized
 
     action_key = f"mcp:dd:{target.id}:g{target.generation}:{decision}"
     owner_result = dd_source.resume(target, action_key)
@@ -993,11 +1124,13 @@ __all__ = [
     "CODE_DD_NOT_AWAITING_GATE",
     "CODE_DD_NOT_FOUND",
     "CODE_DD_UNKNOWN",
+    "CODE_GATE_NOT_CONSUMED",
     "CODE_LINE_NOT_PARKED",
     "CODE_NOT_DISPATCHING_LINE",
     "CODE_NO_WAITING_PARTY",
     "CODE_OWNER_REFUSED",
     "CODE_QUESTION_CARD_UNRESOLVED",
+    "CODE_WORKSPACE_MISSING",
     "DD_DEV_PREFIX",
     "DECISION_APPROVE",
     "DECISION_REJECT",
