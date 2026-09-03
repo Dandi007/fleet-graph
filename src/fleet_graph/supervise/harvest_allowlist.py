@@ -9,7 +9,8 @@ commit 落进默认分支、跑部署脚本，这些写动作在 M3 里**唯一*
 
 - **独立配置**：字段含 `repo_path`（可写仓库绝对路径）+ `allowed_branches`
   （允许写入的分支/ref 前缀列表，前缀语义，不用正则）+ `allowed_deploy`
-  （允许执行的部署脚本/命令 argv 列表，精确 argv 匹配）。
+  （允许执行的部署脚本/命令 argv 列表，精确 argv 匹配；空列表 = merge-only，
+  即只授合并权、不授任何部署命令——见 `effective_deploy_command`）。
 - **越界写拒绝并留痕**：写目标不在白名单 -> `granted=False` + 机器可读 reasons，
   调用方（harvest 子图的写步骤）据此拒绝执行并把 reasons 记进 receipt/evidence，
   绝不静默放行。
@@ -45,6 +46,12 @@ class HarvestAllowlistEntry:
     （缺省 `None`）。命中条目时该单的生效默认分支 / 部署命令取自条目；缺省
     `None` 时退回全局 `deps.default_branch` / `deps.deploy_command`（向后兼容：
     现有 JSON 条目无这两字段时按旧全局行为解析，不新增配置面）。
+
+    案A改写②（merge-only）：`allowed_deploy: []` 表示该条目**只授合并权、
+    不授任何部署命令**。命中此类条目时生效 deploy 命令恒为空 argv，走 `deploy`
+    节点合法 no-op（`deploy_exit_code == 0`，postconditions 不判红）；但条目
+    若**声明**了 `deploy_command` 而它不在 `allowed_deploy` 白名单内（声明与
+    白名单不符），authorize 必须拒——声明不会被静默吞掉。
     """
 
     repo_path: str
@@ -182,10 +189,23 @@ class HarvestAllowlist:
         return fallback
 
     def effective_deploy_command(self, repo_path: str, fallback: list[str]) -> list[str]:
-        """案A改写①：命中条目时取条目 `deploy_command`，缺省退回全局 fallback。"""
+        """案A改写①/②：命中条目时该单的生效 deploy 命令按条目解析，不再盲用全局。
+
+        - 条目**声明** `deploy_command` -> 生效值取声明值；它是否落在
+          `allowed_deploy` 白名单内由 `authorize` 判定（声明与白名单不符 -> 拒，
+          声明绝不被静默吞掉）；
+        - 条目未声明且 `allowed_deploy` 为空（merge-only）-> 生效值**恒为空
+          argv**，绝不退回全局 `fallback`——退回全局会让 merge-only 条目拿全局
+          命令去对空白名单校验、被误伤成 deny（本改写要修的根因）；
+        - 其余（未命中条目 / 条目未声明且白名单非空）-> 全局 `fallback`
+          （改写①向后兼容语义不变）。
+        """
         entry = self.entry_for(repo_path)
-        if entry is not None and entry.deploy_command is not None:
-            return list(entry.deploy_command)
+        if entry is not None:
+            if entry.deploy_command is not None:
+                return list(entry.deploy_command)
+            if not entry.allowed_deploy:
+                return []
         return list(fallback)
 
     def authorize(

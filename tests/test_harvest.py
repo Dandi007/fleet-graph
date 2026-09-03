@@ -645,6 +645,149 @@ class TestPerRepoEffectiveValues:
         assert fake["deploy_argvs"] == [["bash", "scripts/deploy.sh"]]
 
 
+class TestMergeOnlyDeploy:
+    """案A改写②：`allowed_deploy: []`（merge-only）——只授合并权、不部署。
+
+    判据（两方向可红 + 变异钉）：
+
+    - 阳性：merge-only 仓（全局 deploy 命令在旁虎视眈眈也不许用）-> 收割
+      `outcome == harvested` 且 `deploy_exit_code == 0`；deploy 是合法 no-op
+      （不执行任何部署原语），postconditions 不判红、不当作未执行写步。
+    - 反向：条目声明（生效）部署命令而该命令不在 `allowed_deploy` 白名单内
+      -> `granted=false` + reasons 指名 offending 命令，整单不走（零写）。
+    - 变异钉：把「空命令走 no-op 且 exit 0」改成「空命令判红 / 当作未执行
+      写步 / 判部署失败」-> 本类用例转红。
+    """
+
+    def test_merge_only_entry_harvests_with_noop_deploy(self, tmp_path: Path) -> None:
+        repo_path = repo_path_for(tmp_path)
+        allowlist = full_allowlist(
+            repo_path,
+            entries=[
+                {
+                    "repo_path": repo_path,
+                    "allowed_branches": ["refs/heads/main"],
+                    "allowed_deploy": [],
+                }
+            ],
+        )
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            repo_path=repo_path,
+            allowlist=allowlist,
+            ops=fake,
+            bus=FakeBus(),
+            deploy_command=["bash", "scripts/deploy.sh"],
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        # 合法 no-op：ops.deploy 从未被调用（零部署原语），但 deploy 步骤在链上
+        # （不是被跳过的未执行写步），且记 ok=True / exit_code=0（deploy_exit_code 恒 0）。
+        assert "deploy" not in fake["calls"], f"deploy executed: {fake['calls']}"
+        ran_steps = [s["step"] for s in result["steps"]]
+        assert "deploy" in ran_steps
+        deploy_step = next(s for s in result["steps"] if s["step"] == "deploy")
+        assert deploy_step["ok"] is True
+        assert deploy_step["exit_code"] == 0
+        assert deploy_step.get("noop") is True
+        assert deploy_step["command"] == []
+        # postconditions 不判红：missing 空且 ok=True（outcome harvested 已证）。
+        post = next(s for s in result["steps"] if s["step"] == "postconditions")
+        assert post["ok"] is True
+        assert post["missing"] == []
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        assert receipt["outcome"] == OUTCOME_HARVESTED
+        # gate 放行（merge-only 不误拒），全程零写步跳过。
+        assert receipt["allowlist_auth"]["granted"] is True
+        assert receipt["writes_skipped"] == []
+
+    def test_declared_deploy_command_outside_whitelist_refuses_the_order(
+        self, tmp_path: Path
+    ) -> None:
+        """反向：声明与白名单不符 -> gate 拒 + reasons 指名命令，零写、整单不走。"""
+        repo_path = repo_path_for(tmp_path)
+        allowlist = full_allowlist(
+            repo_path,
+            entries=[
+                {
+                    "repo_path": repo_path,
+                    "allowed_branches": ["refs/heads/main"],
+                    "allowed_deploy": [["bash", "scripts/deploy.sh"]],
+                    "deploy_command": ["make", "deploy"],
+                }
+            ],
+        )
+        fake = fake_ops()
+        config, _ = config_for(tmp_path, repo_path=repo_path, allowlist=allowlist, ops=fake)
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_REFUSED
+        assert fake["calls"] == [], f"write primitives executed: {fake['calls']}"
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        auth = receipt["allowlist_auth"]
+        assert auth["granted"] is False
+        assert any("['make', 'deploy']" in r and "不在白名单" in r for r in auth["reasons"])
+
+    def test_non_merge_only_entry_still_deploys_whitelisted_global_command(
+        self, tmp_path: Path
+    ) -> None:
+        """回归：白名单非空且全局命令恰在其中 -> 照常部署（修复不收窄既有授权）。"""
+        repo_path = repo_path_for(tmp_path)
+        allowlist = full_allowlist(
+            repo_path,
+            entries=[
+                {
+                    "repo_path": repo_path,
+                    "allowed_branches": ["refs/heads/main"],
+                    "allowed_deploy": [["bash", "scripts/deploy.sh"]],
+                }
+            ],
+        )
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            repo_path=repo_path,
+            allowlist=allowlist,
+            ops=fake,
+            bus=FakeBus(),
+            deploy_command=["bash", "scripts/deploy.sh"],
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_HARVESTED
+        assert fake["deploy_argvs"] == [["bash", "scripts/deploy.sh"]]
+
+    def test_non_merge_only_entry_global_command_outside_whitelist_still_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """回归：白名单非空而全局命令不在其中 -> 仍拒（merge-only 修复不开洪闸）。"""
+        repo_path = repo_path_for(tmp_path)
+        allowlist = full_allowlist(
+            repo_path,
+            entries=[
+                {
+                    "repo_path": repo_path,
+                    "allowed_branches": ["refs/heads/main"],
+                    "allowed_deploy": [["bash", "scripts/deploy.sh"]],
+                }
+            ],
+        )
+        fake = fake_ops()
+        config, _ = config_for(
+            tmp_path,
+            repo_path=repo_path,
+            allowlist=allowlist,
+            ops=fake,
+            deploy_command=["make", "deploy"],
+        )
+        result = run_harvest(config)
+        assert result["outcome"] == OUTCOME_REFUSED
+        assert fake["calls"] == []
+
+    def test_default_ops_deploy_empty_command_is_a_noop(self, tmp_path: Path) -> None:
+        """变异钉（ops 层）：空命令恒 0，绝不执行原语/报 command not found。"""
+        assert DefaultHarvestOps().deploy([], tmp_path) == 0
+
+
 class TestHarvestCanonicalCwdAndHead:
     """交付 C：deploy/verify_real 以 canonical 仓为 cwd + verify_real 先断言 HEAD。
 
