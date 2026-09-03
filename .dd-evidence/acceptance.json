@@ -1,0 +1,29 @@
+{
+ "development_id": "dev-fg-d6ac36cb0849",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "bash",
+    "scripts/verify-lim.sh",
+    "--check",
+    "11"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "11 dd-gate-by-dispatching-line PASS — 窗口内 61 张 dd 单，37 张闸裁决 decided_by==dispatched_by（自判张数；样例: dispatched_by=wf-216dc3,decided_by=wf-216dc3(gate-file)）\nTOTAL pass=1 fail=0\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "bash",
+    "scripts/verify-lim.sh",
+    "--check",
+    "12"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "12 foreign-delivery-refused PASS — 以非派单方身份（wf-8d9737-lim-selftest-probe）对合成靶单 dev-fg-lim-selftest-foreign-probe 投递被拒且码含 NOT_DISPATCHING_LINE：{ \"status\": \"refused\", \"line\": \"dev-fg-lim-selftest-foreign-probe\", \"decision\": \"REJECT\", \"code\": \"NOT_DISPATCHING_LINE\", \"message\": \"principal 'wf-8d9737-lim-selftest-probe' is not the dispatching line 'wf-lim-selftest-synthetic-owner' for 'dev-fg-lim-selftest-foreign-probe'\" }；探针合成单已清理，无真实单被触碰\nTOTAL pass=1 fail=0\n",
+   "stderr_tail": ""
+  }
+ ]
+}
