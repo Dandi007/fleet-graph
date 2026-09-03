@@ -392,18 +392,179 @@ def regression_verdict(
     return verdict
 
 
+def regression_obligation(
+    *,
+    target_base_commit: str | None,
+    baseline: SuiteSnapshot | None,
+    head: SuiteSnapshot | None,
+    flake_attribution: dict[str, Any] | None = None,
+    main_head_commit: str | None = None,
+) -> dict[str, Any]:
+    """Obligation 6 (S9) as one machine answer: the four negative sub-cases.
+
+    The judgement is anchored at the *frozen* ``target_base_commit`` -- never
+    the drifting main head (spec item 2.6, the "用漂移后的 main 当基线" refusal).
+    The four negative sub-cases:
+
+    - **缺基线字段** -- a missing ``target_base_commit`` / ``baseline`` snapshot /
+      ``head`` snapshot is itself a refusal (the "缺基线/增量字段" negative);
+    - **红项集合扩大** -- the red set grew vs the frozen baseline (including a
+      red added to a baseline that was already red);
+    - **绿→红翻转** -- a test observed green on the baseline is now red;
+    - **漂移 main 当基线** -- a drifted ``main_head_commit`` is *never*
+      consulted; the anchor is ``target_base_commit`` alone, and a non-matching
+      main head is recorded (``ignored_main_head_commit``) rather than folded
+      into the comparison.
+
+    A red->green flip is an improvement, never refused (S9 更正 2026-09-03).
+    """
+    missing: list[str] = []
+    if not target_base_commit:
+        missing.append("target_base_commit")
+    if baseline is None:
+        missing.append("baseline")
+    if head is None:
+        missing.append("head")
+    if missing:
+        return {
+            "pass": False,
+            "refusal": "missing_baseline",
+            "missing": missing,
+            "target_base_commit": target_base_commit or "",
+        }
+
+    verdict = regression_verdict(baseline, head, flake_attribution=flake_attribution)
+    verdict["target_base_commit"] = target_base_commit
+    # The drift guard is machine-visible: a main head that differs from the
+    # frozen target_base is recorded as ignored, and never used. The comparison
+    # above was already made purely from the injected (frozen-base-anchored)
+    # snapshots, so this field is proof the drifted main was not consulted.
+    if main_head_commit is not None and main_head_commit != target_base_commit:
+        verdict["ignored_main_head_commit"] = main_head_commit
+    verdict["anchored"] = True
+    return verdict
+
+
+#: The self-gate verdict vocabulary (the dd single's ``decision``). Kept as
+#: plain strings so selfgate does not import decision_mcp (which imports it).
+SELF_GATE_APPROVE = "APPROVE"
+SELF_GATE_REJECT = "REJECT"
+
+
+def gate_decision(evidence: dict[str, Any]) -> str:
+    """The self-gate verdict for a mechanically-gathered evidence payload.
+
+    APPROVE only when all six obligations pass; any failure -- a missing field,
+    an out-of-scope diff, a deleted test, a rerun that did not return 0, a
+    mutation that did not red, or a regression refusal -- yields REJECT. This is
+    the join that turns the six mandatory answer fields into the single
+    ``decision_deliver`` (APPROVE|REJECT) the line casts.
+    """
+    require_gate_evidence(evidence)
+    all_pass = bool(
+        evidence["acceptance_equality"].get("equal") is True
+        and evidence["diff_in_scope"].get("in_scope") is True
+        and evidence["zero_test_deletion"].get("zero") is True
+        and evidence["rerun_acceptance"].get("rerun") is True
+        and evidence["mutation"].get("red") is True
+        and evidence["regression"].get("pass") is True
+    )
+    return SELF_GATE_APPROVE if all_pass else SELF_GATE_REJECT
+
+
+@dataclass
+class GateEvidenceInputs:
+    """The raw, mechanical inputs one self-gate needs to run all six obligations.
+
+    Every field maps directly to one of the six obligations, so the goal line
+    can gather the raw facts (spec argv / record argv / receipt argv, the
+    product diff, the deleted paths, the acceptance commands to rerun, the
+    mutation target, and the regression snapshots) and hand them to
+    ``gather_gate_evidence`` -- which *runs* the six obligations rather than
+    trusting a caller-assembled six-key dict.
+    """
+
+    spec_argv: list[list[str]] = field(default_factory=list)
+    record_argv: list[list[str]] = field(default_factory=list)
+    receipt_argv: list[list[str]] = field(default_factory=list)
+    changed_paths: list[str] = field(default_factory=list)
+    declared_paths: list[str] = field(default_factory=list)
+    deleted_paths: list[str] = field(default_factory=list)
+    acceptance_commands: list[list[str]] = field(default_factory=list)
+    acceptance_runner: Callable[[list[str]], tuple[int, str]] | None = None
+    mutation_target: Path | None = None
+    mutations: list[Callable[[bytes], bytes]] = field(default_factory=list)
+    mutation_accept: Callable[[], int] | None = None
+    target_base_commit: str | None = None
+    baseline: SuiteSnapshot | None = None
+    head: SuiteSnapshot | None = None
+    flake_attribution: dict[str, Any] | None = None
+    main_head_commit: str | None = None
+
+
+def gather_gate_evidence(inputs: GateEvidenceInputs) -> dict[str, Any]:
+    """Mechanically perform the six evidence obligations and return the payload.
+
+    This is the engine-side join the goal-line self-gate calls on a
+    ``dd_awaiting_gate`` wake (spec items 1/2: "自动履行六项取证义务", "引擎侧
+    机械履行"). It *runs* the six obligations -- ``acceptance_equality`` /
+    ``diff_in_scope`` / ``zero_test_deletion`` / ``rerun_acceptance`` /
+    ``two_shot_mutation_gun`` / ``regression_verdict`` -- rather than trusting a
+    caller-supplied six-key dict. The result is the gate's six mandatory answer
+    fields, ready for ``decision_deliver``; a delivery that lacks any one of
+    them is refused by ``require_gate_evidence``.
+    """
+    runner: Callable[[list[str]], tuple[int, str]] = inputs.acceptance_runner or (
+        lambda argv: (0, "")
+    )
+    evidence: dict[str, Any] = {
+        "acceptance_equality": acceptance_equality(
+            inputs.spec_argv, inputs.record_argv, inputs.receipt_argv
+        ),
+        "diff_in_scope": diff_in_scope(inputs.changed_paths, inputs.declared_paths),
+        "zero_test_deletion": zero_test_deletion(inputs.deleted_paths),
+        "rerun_acceptance": rerun_acceptance(inputs.acceptance_commands, runner),
+    }
+    if inputs.mutation_target is None:
+        evidence["mutation"] = {"red": False, "detail": "no mutation target"}
+    else:
+        try:
+            evidence["mutation"] = two_shot_mutation_gun(
+                inputs.mutation_target,
+                mutations=inputs.mutations,
+                accept=inputs.mutation_accept or (lambda: 0),
+            )
+        except GateEvidenceError as exc:
+            # A mutation gun that cannot fire is a failure to red, never a crash.
+            evidence["mutation"] = {"red": False, "detail": str(exc)}
+    evidence["regression"] = regression_obligation(
+        target_base_commit=inputs.target_base_commit,
+        baseline=inputs.baseline,
+        head=inputs.head,
+        flake_attribution=inputs.flake_attribution,
+        main_head_commit=inputs.main_head_commit,
+    )
+    return evidence
+
+
 __all__ = [
     "GATE_EVIDENCE_FIELDS",
     "MACHINE_PREFIXES",
+    "SELF_GATE_APPROVE",
+    "SELF_GATE_REJECT",
     "GateEvidenceError",
+    "GateEvidenceInputs",
     "GateEvidenceMissing",
     "SuiteSnapshot",
     "acceptance_equality",
     "diff_in_scope",
+    "gate_decision",
     "gate_evidence_digest",
     "gate_evidence_payload",
+    "gather_gate_evidence",
     "missing_gate_evidence",
     "mutation_gun",
+    "regression_obligation",
     "regression_verdict",
     "require_gate_evidence",
     "rerun_acceptance",

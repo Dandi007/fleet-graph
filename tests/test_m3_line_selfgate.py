@@ -19,6 +19,7 @@ through ``fleet_graph.selfgate``: missing any one refuses a delivery.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -39,14 +40,21 @@ from fleet_graph.decision_mcp import (
     deliver_decision,
     deliver_decision_dd,
 )
+from fleet_graph.graphs.self_gate import SelfGateResult, perform_line_self_gate
 from fleet_graph.selfgate import (
     GATE_EVIDENCE_FIELDS,
+    SELF_GATE_APPROVE,
+    SELF_GATE_REJECT,
+    GateEvidenceInputs,
     GateEvidenceMissing,
     SuiteSnapshot,
     acceptance_equality,
     diff_in_scope,
+    gate_decision,
     gate_evidence_payload,
+    gather_gate_evidence,
     missing_gate_evidence,
+    regression_obligation,
     regression_verdict,
     require_gate_evidence,
     two_shot_mutation_gun,
@@ -408,3 +416,400 @@ class TestRegressionVerdict:
         verdict = regression_verdict(baseline, head, flake_attribution={"cleared": ["flakey"]})
         assert verdict["pass"] is True
         assert verdict["flake_attribution"] == {"cleared": ["flakey"]}
+
+
+# ---------------------------------------------------------------------------
+# S9 four款 through regression_obligation (missing baseline / frozen anchor)
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionObligation:
+    def test_missing_baseline_fields_refuse(self) -> None:
+        """缺基线字段拒 (判据第 6 条第一款): a missing frozen target_base_commit,
+        baseline snapshot, or head snapshot is itself a refusal -- never a
+        silent pass, never a comparison against a guessed baseline."""
+        verdict = regression_obligation(
+            target_base_commit=None,
+            baseline=SuiteSnapshot(passed=106, failed=0, total=106),
+            head=SuiteSnapshot(passed=106, failed=0, total=106),
+        )
+        assert verdict["pass"] is False
+        assert verdict["refusal"] == "missing_baseline"
+        assert "target_base_commit" in verdict["missing"]
+
+        verdict = regression_obligation(
+            target_base_commit="base",
+            baseline=None,
+            head=SuiteSnapshot(passed=106, failed=0, total=106),
+        )
+        assert verdict["pass"] is False
+        assert "baseline" in verdict["missing"]
+
+        verdict = regression_obligation(
+            target_base_commit="base",
+            baseline=SuiteSnapshot(passed=106, failed=0, total=106),
+            head=None,
+        )
+        assert verdict["pass"] is False
+        assert "head" in verdict["missing"]
+
+    def test_green_to_red_flip_refuses(self) -> None:
+        baseline = SuiteSnapshot(passed=106, failed=0, total=106, green_tests={"a", "b"})
+        head = SuiteSnapshot(passed=105, failed=1, total=106, failed_tests={"a"})
+        verdict = regression_obligation(target_base_commit="base", baseline=baseline, head=head)
+        assert verdict["pass"] is False
+        assert verdict["green_to_red_flip"] is True
+        assert "a" in verdict["green_to_red"]
+
+    def test_red_set_growth_refuses_even_when_baseline_is_red(self) -> None:
+        """红项集合扩大(含基线本身红时再添新红) → refuse (判据第 6 条第三款)."""
+        baseline = SuiteSnapshot(passed=105, failed=1, total=106, failed_tests={"a"})
+        head = SuiteSnapshot(passed=104, failed=2, total=106, failed_tests={"a", "b"})
+        verdict = regression_obligation(target_base_commit="base", baseline=baseline, head=head)
+        assert verdict["pass"] is False
+        assert verdict["red_set_grew"] is True
+        assert verdict["red_growth"] == ["b"]
+
+    def test_a_red_baseline_with_no_growth_passes(self) -> None:
+        """基线红但红集未扩 → pass (基线本身红不是本单的错)."""
+        baseline = SuiteSnapshot(passed=105, failed=1, total=106, failed_tests={"a"})
+        head = SuiteSnapshot(passed=105, failed=1, total=106, failed_tests={"a"})
+        verdict = regression_obligation(target_base_commit="base", baseline=baseline, head=head)
+        assert verdict["pass"] is True
+
+    def test_drifted_main_is_ignored_and_frozen_target_base_is_the_anchor(self) -> None:
+        """gate 时 main 已漂移仍按冻结 target_base 比对 (判据第 6 条第四款):
+        a drifted main head is recorded as ignored and never consulted -- the
+        verdict is computed purely from the frozen target_base- anchored
+        snapshots."""
+        baseline = SuiteSnapshot(passed=106, failed=0, total=106, green_tests={"a"})
+        head = SuiteSnapshot(passed=106, failed=0, total=106)
+        verdict = regression_obligation(
+            target_base_commit="frozen-target-base",
+            baseline=baseline,
+            head=head,
+            main_head_commit="drifted-main-head",
+        )
+        assert verdict["pass"] is True
+        assert verdict["target_base_commit"] == "frozen-target-base"
+        # The drifted main was seen and explicitly ignored, never folded in.
+        assert verdict["ignored_main_head_commit"] == "drifted-main-head"
+
+
+# ---------------------------------------------------------------------------
+# the six obligations are mechanically performed (not a forged six-key dict)
+# ---------------------------------------------------------------------------
+
+
+def _mutation_gadget(tmp_path: Path) -> tuple[Any, list[Any], Any]:
+    """A real mutation target + two mutations that must red the frozen accept."""
+    target = tmp_path / "prod.py"
+    original = b"def stable():\n    return 42\n"
+    target.write_bytes(original)
+
+    def shot_one(data: bytes) -> bytes:
+        return data.replace(b"return 42", b"return 43")
+
+    def shot_two(data: bytes) -> bytes:
+        return data + b"\n# injected\n"
+
+    def accept() -> int:
+        return 0 if target.read_bytes() == original else 1
+
+    return target, [shot_one, shot_two], accept
+
+
+def _all_pass_inputs(tmp_path: Path) -> GateEvidenceInputs:
+    target, shots, accept = _mutation_gadget(tmp_path)
+    argv = [["uv", "run", "pytest", "-q", "tests/test_m3_line_selfgate.py"]]
+    return GateEvidenceInputs(
+        spec_argv=argv,
+        record_argv=argv,
+        receipt_argv=argv,
+        changed_paths=["src/fleet_graph/selfgate.py"],
+        declared_paths=["src/fleet_graph/selfgate.py"],
+        deleted_paths=[],
+        acceptance_commands=argv,
+        acceptance_runner=lambda a: (0, "ok"),
+        mutation_target=target,
+        mutations=shots,
+        mutation_accept=accept,
+        target_base_commit="frozen-base",
+        baseline=SuiteSnapshot(passed=106, failed=0, total=106, green_tests={"a"}),
+        head=SuiteSnapshot(passed=106, failed=0, total=106),
+    )
+
+
+class TestGatherGateEvidence:
+    def test_all_six_obligations_are_mechanically_run(self, tmp_path: Path) -> None:
+        """gather_gate_evidence invokes the six obligations: the evidence payload
+        has all six mandatory fields, each a *real* obligation answer -- the
+        acceptance rerun echo in particular (obligation 4) is produced here, not
+        trusted from a caller."""
+        evidence = gather_gate_evidence(_all_pass_inputs(tmp_path))
+        assert set(evidence.keys()) == set(GATE_EVIDENCE_FIELDS)
+
+        assert evidence["acceptance_equality"]["equal"] is True
+        assert evidence["diff_in_scope"]["in_scope"] is True
+        assert evidence["zero_test_deletion"]["zero"] is True
+        # Obligation 4: rerun ran the frozen argv and kept the echo.
+        assert evidence["rerun_acceptance"]["rerun"] is True
+        assert evidence["rerun_acceptance"]["commands"][0]["exit_code"] == 0
+        assert evidence["mutation"]["red"] is True
+        assert evidence["mutation"]["restored"] is True
+        assert evidence["regression"]["pass"] is True
+        assert evidence["regression"]["target_base_commit"] == "frozen-base"
+
+    def test_an_out_of_scope_diff_flips_the_verdict_to_reject(self, tmp_path: Path) -> None:
+        inputs = _all_pass_inputs(tmp_path)
+        inputs.changed_paths = ["src/fleet_graph/selfgate.py"]
+        inputs.declared_paths = ["src/fleet_graph/decision_mcp.py"]
+        evidence = gather_gate_evidence(inputs)
+        assert evidence["diff_in_scope"]["in_scope"] is False
+        assert gate_decision(evidence) == SELF_GATE_REJECT
+
+
+class TestGateDecision:
+    def test_all_pass_yields_approve(self, tmp_path: Path) -> None:
+        evidence = gather_gate_evidence(_all_pass_inputs(tmp_path))
+        assert gate_decision(evidence) == SELF_GATE_APPROVE
+
+    def test_any_obligation_failure_yields_reject(self, tmp_path: Path) -> None:
+        inputs = _all_pass_inputs(tmp_path)
+        inputs.deleted_paths = ["tests/test_removed.py"]
+        evidence = gather_gate_evidence(inputs)
+        assert evidence["zero_test_deletion"]["zero"] is False
+        assert gate_decision(evidence) == SELF_GATE_REJECT
+
+    def test_a_missing_field_raises(self) -> None:
+        import pytest as _pytest
+
+        with _pytest.raises(GateEvidenceMissing):
+            gate_decision({"acceptance_equality": {"equal": True}})
+
+
+# ---------------------------------------------------------------------------
+# the self-gate orchestration: gather -> decide -> deliver (spec item 1)
+# ---------------------------------------------------------------------------
+
+
+class TestPerformLineSelfGate:
+    def test_gathers_decides_and_delivers(self, tmp_path: Path) -> None:
+        casts: list[tuple[str, dict[str, Any]]] = []
+
+        def deliver(decision: str, evidence: dict[str, Any]) -> dict[str, Any]:
+            casts.append((decision, evidence))
+            return {"status": "delivered", "decision": decision}
+
+        result = perform_line_self_gate(
+            development_id=DD_ID,
+            principal=DISPATCHER,
+            inputs=_all_pass_inputs(tmp_path),
+            deliver=deliver,
+        )
+        assert isinstance(result, SelfGateResult)
+        assert result.decision == SELF_GATE_APPROVE
+        assert result.principal == DISPATCHER
+        assert result.as_dict()["decided_by"] == DISPATCHER
+        # The delivery received the mechanically-gathered evidence, all six fields.
+        assert len(casts) == 1
+        assert casts[0][0] == SELF_GATE_APPROVE
+        assert set(casts[0][1].keys()) == set(GATE_EVIDENCE_FIELDS)
+        assert result.delivery == {"status": "delivered", "decision": SELF_GATE_APPROVE}
+
+    def test_a_failed_obligation_is_delivered_as_reject_not_crashed(self, tmp_path: Path) -> None:
+        inputs = _all_pass_inputs(tmp_path)
+        inputs.deleted_paths = ["tests/test_gone.py"]
+        casts: list[tuple[str, dict[str, Any]]] = []
+
+        result = perform_line_self_gate(
+            development_id=DD_ID,
+            principal=DISPATCHER,
+            inputs=inputs,
+            deliver=lambda decision, evidence: (
+                casts.append((decision, evidence)) or {"status": "delivered", "decision": decision}
+            ),
+        )
+        assert result.decision == SELF_GATE_REJECT
+        assert casts[0][0] == SELF_GATE_REJECT
+
+
+# ---------------------------------------------------------------------------
+# the goal-line self-gate node is wired into the graph (no orphaned module)
+# ---------------------------------------------------------------------------
+
+
+class _MinimalArtifacts:
+    def __init__(self) -> None:
+        self.beats: list[tuple[int, str]] = []
+        self.terminal: dict[str, Any] | None = None
+
+    def heartbeat(self, round_no: int, phase: str, *, force: bool = False) -> bool:
+        self.beats.append((round_no, phase))
+        return True
+
+    def append_round(self, line: dict[str, Any]) -> bool:
+        return True
+
+    def write_worker_report(self, round_no: int, report: dict[str, Any]) -> str:
+        return ""
+
+    def write_terminal(self, **kwargs: Any) -> str:
+        self.terminal = kwargs
+        return ""
+
+
+class _MinimalInbox:
+    def drain_then_ack(self, persist: Any) -> tuple[list[Any], list[str]]:
+        persist([])
+        return [], []
+
+
+class _MinimalCoordinator:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def turn(self, round_no: int, coord_input: dict[str, Any], *, resume: bool = False) -> dict:
+        self.calls.append(coord_input)
+        return {"verdict": "done", "reason": "ok"}
+
+
+class _MinimalWorker:
+    def turn(self, prompt: str, round_no: int) -> dict:
+        return {
+            "schema_version": "fleet-graph.worker-turn-report/v1",
+            "turn_id": "t",
+            "outcome": "completed",
+            "summary": "",
+            "did": [],
+            "files": [],
+            "self_tests": [],
+            "blocker": None,
+        }
+
+
+class _FakeSelfGatePort:
+    def __init__(self, *, pending: bool, facts: dict[str, Any] | None = None) -> None:
+        self.pending = pending
+        self.facts = facts or {
+            "development_id": DD_ID,
+            "decision": SELF_GATE_APPROVE,
+            "evidence": {field: {"ok": True} for field in GATE_EVIDENCE_FIELDS},
+        }
+        self.performed = 0
+
+    def is_pending(self) -> bool:
+        return self.pending
+
+    def perform(self) -> dict[str, Any]:
+        self.performed += 1
+        return self.facts
+
+
+def _build_graph_with_self_gate(port: Any) -> Any:
+    from fleet_graph.graphs.goal_line import LineDeps, build_goal_line_graph
+    from fleet_graph.graphs.guards import LineBounds, LineGuards
+
+    deps = LineDeps(
+        coordinator=_MinimalCoordinator(),  # type: ignore[arg-type]
+        worker=_MinimalWorker(),  # type: ignore[arg-type]
+        inbox=_MinimalInbox(),  # type: ignore[arg-type]
+        artifacts=_MinimalArtifacts(),  # type: ignore[arg-type]
+        guards=LineGuards(bounds=LineBounds()),
+        folder_id=DISPATCHER,
+        self_gate=port,
+    )
+    return build_goal_line_graph(deps), deps
+
+
+class TestSelfGateNode:
+    def test_a_pending_wake_runs_the_self_gate_turn(self) -> None:
+        port = _FakeSelfGatePort(pending=True)
+        graph, deps = _build_graph_with_self_gate(port)
+        from langgraph.checkpoint.memory import InMemorySaver
+
+        state = graph.compile(checkpointer=InMemorySaver()).invoke(
+            {"round_no": 1},
+            config={"configurable": {"thread_id": "t1"}, "recursion_limit": 100},
+        )
+        assert port.performed == 1
+        assert state.get("last_self_gate", {}).get("performed") is True
+        assert state["last_self_gate"]["decision"] == SELF_GATE_APPROVE
+        # The facts reached the coordinator input too (engine facts, not prose).
+        assert deps.coordinator.calls[0]["last_self_gate"]["decision"] == SELF_GATE_APPROVE  # type: ignore[attr-defined]
+
+    def test_no_port_keeps_the_loop_byte_identical(self) -> None:
+        graph, _deps = _build_graph_with_self_gate(None)
+        from langgraph.checkpoint.memory import InMemorySaver
+
+        state = graph.compile(checkpointer=InMemorySaver()).invoke(
+            {"round_no": 1},
+            config={"configurable": {"thread_id": "t2"}, "recursion_limit": 100},
+        )
+        assert "last_self_gate" not in state
+        assert state.get("terminal") == "done"
+
+
+# ---------------------------------------------------------------------------
+# positive path: self-gate APPROVE -> merge 后收割触发 (spec item 5 / 判据)
+# ---------------------------------------------------------------------------
+
+
+class TestSelfGateApproveToHarvest:
+    def test_self_gate_approve_is_not_harvestable_until_merge(self, tmp_path: Path) -> None:
+        """自判 APPROVE → merge 后收割触发: a self-gate APPROVE (the positive
+        verdict) must only become harvestable after the dd single reaches the
+        merge stage -- a `complete` record still at the gate stage is never
+        listed, while the same record at `merger` is (the read-model gating)."""
+        from fleet_graph.state.fleet_state import FleetStateConfig, FleetStateView
+
+        casts: list[str] = []
+        result = perform_line_self_gate(
+            development_id=DD_ID,
+            principal=DISPATCHER,
+            inputs=_all_pass_inputs(tmp_path),
+            deliver=lambda decision, evidence: (
+                casts.append(decision) or {"status": "delivered", "decision": decision}
+            ),
+        )
+        assert result.decision == SELF_GATE_APPROVE
+
+        dd_root = tmp_path / "dd"
+        dev_dir = dd_root / DD_ID
+        dev_dir.mkdir(parents=True, exist_ok=True)
+        (dev_dir / "record.json").write_text(
+            json.dumps({"development_id": DD_ID, "repo_path": str(tmp_path)}), encoding="utf-8"
+        )
+
+        def write_status(*, terminal: str, stage: str) -> None:
+            (dev_dir / "status.json").write_text(
+                json.dumps(
+                    {
+                        "development_id": DD_ID,
+                        "state": "complete",
+                        "stage": stage,
+                        "terminal": terminal,
+                        "head_commit": "h1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        config = FleetStateConfig(
+            host="127.0.0.1",
+            port=0,
+            run_root=tmp_path / "runs",
+            dd_root=dd_root,
+            lines_config=tmp_path / "missing.json",
+            bridge_state_dir=tmp_path / "bridge",
+        )
+
+        # A gate-stage complete (the self-gate just approved) is NOT harvestable.
+        view = FleetStateView(config)
+        assert view.harvestable()["developments"] == []
+
+        write_status(terminal="complete", stage="human_gate")
+        assert view.harvestable()["developments"] == []
+
+        write_status(terminal="complete", stage="merger")
+        assert [d["development_id"] for d in view.harvestable()["developments"]] == [DD_ID]

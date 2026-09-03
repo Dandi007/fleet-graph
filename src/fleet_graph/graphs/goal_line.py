@@ -277,6 +277,23 @@ class LineMetricsPort(Protocol):
     def write_exposition(self) -> Any: ...
 
 
+class SelfGatePort(Protocol):
+    """The M3 line self-gate orchestration port (spec item 1).
+
+    On a ``dd_awaiting_gate`` wake the line mechanically performs the six
+    evidence obligations and delivers the decision. ``is_pending`` tells the
+    graph whether this launch is a self-gate wake at all (``False`` keeps the
+    normal bounds -> coordinator loop exactly as before); ``perform`` runs the
+    gather + decide + deliver turn and returns the mechanical facts the graph
+    records into ``last_self_gate``. ``None`` (the default) means no self-gate
+    is wired -- the node is a pass-through and the line is unchanged.
+    """
+
+    def is_pending(self) -> bool: ...
+
+    def perform(self) -> dict[str, Any]: ...
+
+
 class Verdict(TypedDict, total=False):
     verdict: str
     next_prompt: str
@@ -321,6 +338,11 @@ class LineState(TypedDict, total=False):
     #: by an agent -- which is exactly why the coordinator may weigh it above
     #: any self-report.
     last_acceptance: dict[str, Any]
+    #: M3: the mechanical facts of the last self-gate turn (gathered evidence +
+    #: the verdict delivered), recorded by the ``self_gate`` node on a
+    #: ``dd_awaiting_gate`` wake. Like ``last_acceptance`` it is engine-produced,
+    #: never agent prose, and reaches the coordinator as a fact to weigh.
+    last_self_gate: dict[str, Any]
     # Set only between the coordinator accepting a prompt and the worker
     # consuming it; never persisted anywhere durable.
     pending_prompt: str
@@ -437,6 +459,10 @@ class LineDeps:
     #: then absent, and the scheduler fails open (never locks) on the missing
     #: baseline.
     goal_revision: Any = None
+    #: The M3 self-gate port. None keeps the line on the pre-M3 loop unchanged;
+    #: non-None runs the six-evidence self-gate turn on a ``dd_awaiting_gate``
+    #: wake before the ordinary bounds -> coordinator loop (spec item 1).
+    self_gate: SelfGatePort | None = None
 
     def now(self) -> float | None:
         return self.clock() if self.clock is not None else None
@@ -474,6 +500,8 @@ def _coordinator_input(
         coord_input["last_turn_report"] = state["last_turn_report"]
     if state.get("last_acceptance"):
         coord_input["last_acceptance"] = state["last_acceptance"]
+    if state.get("last_self_gate"):
+        coord_input["last_self_gate"] = state["last_self_gate"]
     if deps.resume_verification is not None:
         coord_input["resume_verification"] = deps.resume_verification
     if round_no == 1 and deps.prior_terminal is not None:
@@ -577,6 +605,39 @@ def _verdict_update(
 
 
 def build_goal_line_graph(deps: LineDeps) -> StateGraph:
+    def self_gate(state: LineState) -> LineState:
+        """M3: run the six-obligation self-gate turn on a ``dd_awaiting_gate`` wake.
+
+        A pass-through unless a self-gate port is wired *and* it reports a
+        pending wake. On a pending wake it calls ``perform()`` (gather the six
+        obligations -> decide -> deliver) and records the mechanical facts into
+        ``last_self_gate``, exactly the way the acceptance step records
+        ``last_acceptance`` -- the coordinator weighs them as facts, never as a
+        verdict the line itself already cast. Default (no port / not pending)
+        returns ``{}`` so every pre-M3 line keeps its loop byte-identical.
+        """
+        if deps.self_gate is None:
+            return {}
+        try:
+            if not deps.self_gate.is_pending():
+                return {}
+            facts = deps.self_gate.perform()
+        except Exception as exc:  # the self-gate must not fault the line
+            return {
+                "last_self_gate": {
+                    "performed": False,
+                    "detail": f"{type(exc).__name__}: {exc}"[:400],
+                }
+            }
+        if not isinstance(facts, dict):
+            return {
+                "last_self_gate": {
+                    "performed": False,
+                    "detail": "self-gate port returned a non-dict",
+                }
+            }
+        return {"last_self_gate": {**facts, "performed": True}}
+
     def check_bounds(state: LineState) -> LineState:
         """INV-8. Pure counting, no judgement."""
         round_no = state.get("round_no", 1)
@@ -972,6 +1033,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         return "check_bounds"
 
     graph: StateGraph = StateGraph(LineState)
+    graph.add_node("self_gate", self_gate)
     graph.add_node("check_bounds", check_bounds)
     graph.add_node("coordinator_turn", coordinator_turn)
     graph.add_node("worker_turn", worker_turn)
@@ -979,7 +1041,10 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     graph.add_node("finalise", finalise)
     graph.add_node("decision_interrupt", decision_interrupt)
 
-    graph.add_edge(START, "check_bounds")
+    graph.add_edge(START, "self_gate")
+    # The self-gate node is a pass-through unless a wake is pending, so routing
+    # always falls into the ordinary bounds -> coordinator loop.
+    graph.add_edge("self_gate", "check_bounds")
     graph.add_conditional_edges("check_bounds", after_bounds)
     graph.add_conditional_edges("coordinator_turn", after_coordinator)
     # The interrupt node resumes into the same round's coordinator result, so it
@@ -1010,6 +1075,7 @@ __all__ = [
     "LineDeps",
     "LineMetricsPort",
     "LineState",
+    "SelfGatePort",
     "acknowledges_decision",
     "build_goal_line_graph",
     "claims_resume_verification_broken",
