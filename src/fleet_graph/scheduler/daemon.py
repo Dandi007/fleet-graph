@@ -427,6 +427,13 @@ class Scheduler:
         #: the next launch's round-1 coordinator input. Reset at the top of
         #: every tick so a stale revoke can never leak into a later launch.
         self._pending_revival: dict[str, dict[str, Any]] = {}
+        #: M3: the development each line's ``dd_awaiting_gate`` wake names,
+        #: keyed by folder, consumed by `spec_for` on the launch this wake
+        #: produces. The wake used to only clear the park, so the line booted
+        #: as an ordinary run and ``decided_by`` = line principal never
+        #: happened (rework rc-aa907dfb finding 1). Reset at the top of every
+        #: tick so a stale wake can never leak into a later launch.
+        self._pending_dd_gate: dict[str, str] = {}
         #: Wake facts for parking. None disables parking outright -- the same
         #: fail-open reading as a probe failure: no way to observe wake facts
         #: means no parking, and the line stays on plain backoff.
@@ -1262,6 +1269,11 @@ class Scheduler:
             return ParkOutcome(event=f"not_parked:dd_probe_failed:{probe_error_tag(exc)}")
         if fact in ("awaiting_gate", "terminal"):
             # The wake fact already exists: nothing to wait for, never park.
+            # M3: an already-awaiting_gate fact is a self-gate wake all the
+            # same -- the line must ignite *as the gate*, not as an ordinary
+            # run, so the development id is threaded into the next launch.
+            if fact == "awaiting_gate":
+                self._pending_dd_gate[line.folder_id] = dd_id
             self._write_stall_state(line.folder_id, state)
             return ParkOutcome(event=f"not_parked:dd_{fact}")
         state["parked_run_id"] = run_id
@@ -1283,6 +1295,14 @@ class Scheduler:
         except Exception as exc:  # fail open, by design
             return self._wake(line, state, f"woken:dd_probe_failed:{probe_error_tag(exc)}")
         if fact in ("awaiting_gate", "terminal"):
+            # M3: an ``awaiting_gate`` wake makes the next launch a self-gate
+            # run (the line delivers its own verdict), so the anchored
+            # development id is captured for `spec_for` before the snapshot is
+            # cleared -- `_wake` deliberately drops the parked anchor, and the
+            # launch must not lose the wake identity with it. A ``terminal``
+            # wake stays an ordinary run: there is no gate left to judge.
+            if fact == "awaiting_gate":
+                self._pending_dd_gate[line.folder_id] = dd_id
             return self._wake(line, state, f"woken:dd_{fact}")
         return ParkOutcome(parked=True, kind="dd")
 
@@ -1513,6 +1533,11 @@ class Scheduler:
             # so a revived line can read who overturned it, on what basis, and
             # which generation was overturned. Absent for a normal launch.
             revival=self._pending_revival.get(line.folder_id),
+            # M3: the development a ``dd_awaiting_gate`` wake this tick named.
+            # This is what makes the self-gate the *default path*: the woken
+            # line process receives ``--dd-awaiting-gate`` and self-delivers
+            # the verdict instead of booting as an ordinary run.
+            dd_awaiting_gate_development_id=self._pending_dd_gate.get(line.folder_id, ""),
         )
 
     def acceptance_json_for(self, line: LineSpec) -> str | None:
@@ -1565,6 +1590,10 @@ class Scheduler:
         self.reconcile_overrides()
         # M5: no revoke applied earlier can leak into this tick's launches.
         self._pending_revival = {}
+        # M3: no dd_awaiting_gate wake observed earlier can leak into this
+        # tick's launches either -- only a wake this tick itself observed
+        # names the next launch a self-gate run.
+        self._pending_dd_gate = {}
 
         for line in self.config.lines:
             # Accounting runs first: a terminal observed this tick must bump

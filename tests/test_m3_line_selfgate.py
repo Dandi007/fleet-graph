@@ -17,8 +17,11 @@ dd root, no live git repo, no live pytest run is required.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from fleet_graph.dd.self_gate import (
     CODE_SELF_GATE_EVIDENCE_INCOMPLETE,
@@ -590,3 +593,640 @@ def test_an_ordinary_run_is_not_a_self_gate_wake(tmp_path: Path) -> None:
 
     config = runner.LineConfig(folder_id=PRINCIPAL, seat="s", run_root=tmp_path)
     assert runner.run_self_gate(config) is None
+
+
+# --- production wiring (rework rc-aa907dfb): the wake reaches the line and ---
+# --- the six obligations are mechanically produced, never passed empty    ---
+
+
+def _fake_agent_run(tmp_path: Path) -> str:
+    """A fake agent-run binary whose envelope faults the coordinator adapter,
+    so run_line can be driven past the self-gate seal without a gateway."""
+    import sys
+
+    fake_run = Path(__file__).parent / "fakes" / "fake_agent_run.py"
+    bin_path = tmp_path / "agent-run"
+    bin_path.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{fake_run}" "$@"\n')
+    bin_path.chmod(0o755)
+    return str(bin_path)
+
+
+class TestWakeReachesTheLineProcess:
+    """Finding 1 (blocker), fixed: a dd_awaiting_gate wake names the next
+    launch a self-gate run all the way down -- daemon capture, LaunchSpec
+    argv, CLI flag, LineConfig. An ordinary run carries none of it."""
+
+    def test_launchspec_argv_forwards_the_dd_wake(self) -> None:
+        from fleet_graph.scheduler.launcher import LaunchSpec
+
+        spec = LaunchSpec(folder_id="wf-1", seat="s", dd_awaiting_gate_development_id=DD_ID)
+        argv = spec.argv()
+        assert argv[argv.index("--dd-awaiting-gate") + 1] == DD_ID
+
+    def test_an_ordinary_launch_carries_no_dd_wake(self) -> None:
+        from fleet_graph.scheduler.launcher import LaunchSpec
+
+        assert "--dd-awaiting-gate" not in LaunchSpec(folder_id="wf-1", seat="s").argv()
+
+    def test_the_cli_parses_the_dd_wake_flag(self) -> None:
+        from fleet_graph.cli import build_parser
+
+        args = build_parser().parse_args(
+            ["line", "run", "--folder", "wf-1", "--seat", "s", "--dd-awaiting-gate", DD_ID]
+        )
+        assert args.dd_awaiting_gate == DD_ID
+        ordinary = build_parser().parse_args(["line", "run", "--folder", "wf-1", "--seat", "s"])
+        assert ordinary.dd_awaiting_gate == ""
+
+
+class _GateClock:
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _GateUnits:
+    def is_active(self, unit_name: str) -> bool:
+        return False
+
+
+class _GateProber:
+    def check(self, seat: str) -> bool:
+        return True
+
+
+class _GateLauncher:
+    def __init__(self) -> None:
+        self.launched: list[Any] = []
+
+    def launch(self, spec: Any) -> Any:
+        from fleet_graph.scheduler.launcher import LaunchResult
+
+        self.launched.append(spec)
+        return LaunchResult(spec.unit_name, True, "")
+
+
+class _ScriptedDdFacts:
+    def __init__(self, fact: str | None) -> None:
+        self.fact = fact
+
+    def dd_fact(self, development_id: str) -> str | None:
+        return self.fact
+
+
+def _parked_dispatch_line(
+    tmp_path: Path, fact: str | None
+) -> tuple[Any, _GateClock, _GateLauncher]:
+    """A line the scheduler launched once, now parked ``waiting_dd``."""
+    from fleet_graph.scheduler.daemon import LineSpec, Scheduler, SchedulerConfig
+
+    clock = _GateClock(1_787_000_000.0)
+    launcher = _GateLauncher()
+    scheduler = Scheduler(
+        SchedulerConfig(
+            lines=[LineSpec(folder_id="wf-1", seat="s", enabled=True)],
+            run_root=tmp_path / "runs",
+            dd_root=tmp_path / "dd",
+            maintenance_stop_path=tmp_path / "maintenance-stop",
+        ),
+        prober=_GateProber(),
+        launcher=launcher,
+        units=_GateUnits(),
+        clock=clock,
+        sleep=lambda _s: None,
+        dd=_ScriptedDdFacts(None),
+    )
+    assert scheduler.tick()[0].decision.ignite  # the priming launch
+    launcher.launched.clear()
+    terminal = {
+        "terminal": "blocked",
+        "rounds": 0,
+        "run_id": "run-d1",
+        "at": "2026-08-27T10:00:00Z",
+        "reason": "dispatched, waiting for the development",
+        "waiting_on": "dd",
+        "dd_development_id": DD_ID,
+    }
+    path = tmp_path / "runs" / "wf-1" / "terminal.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(terminal), encoding="utf-8")
+    clock.now += 3600.0
+    scheduler.dd = _ScriptedDdFacts(fact)
+    return scheduler, clock, launcher
+
+
+def test_an_awaiting_gate_wake_launches_the_line_as_the_gate(tmp_path: Any) -> None:
+    scheduler, clock, launcher = _parked_dispatch_line(tmp_path, fact=None)
+    scheduler.tick()  # the park establishes; nothing launches
+    assert launcher.launched == []
+
+    scheduler.dd = _ScriptedDdFacts("awaiting_gate")
+    clock.now += 600.0  # past cooldown
+    results = scheduler.tick()
+
+    assert results[0].decision.ignite
+    spec = launcher.launched[0]
+    assert spec.dd_awaiting_gate_development_id == DD_ID
+    argv = spec.argv()
+    assert argv[argv.index("--dd-awaiting-gate") + 1] == DD_ID
+
+
+def test_the_wake_identity_is_consumed_by_exactly_one_launch(tmp_path: Any) -> None:
+    scheduler, clock, launcher = _parked_dispatch_line(tmp_path, fact=None)
+    scheduler.tick()
+    scheduler.dd = _ScriptedDdFacts("awaiting_gate")
+    clock.now += 600.0
+    scheduler.tick()
+    assert launcher.launched[0].dd_awaiting_gate_development_id == DD_ID
+
+    clock.now += 600.0
+    scheduler.tick()
+    assert launcher.launched[1].dd_awaiting_gate_development_id == ""
+
+
+def test_an_already_awaiting_gate_fact_at_establish_is_still_a_gate_wake(
+    tmp_path: Any,
+) -> None:
+    """The establish path parks nothing when the fact already exists -- the
+    line would then have re-ignited as an ordinary run. It must not."""
+    scheduler, _clock, launcher = _parked_dispatch_line(tmp_path, fact="awaiting_gate")
+    results = scheduler.tick()
+
+    assert results[0].decision.ignite
+    assert results[0].park_event == "not_parked:dd_awaiting_gate"
+    assert launcher.launched[0].dd_awaiting_gate_development_id == DD_ID
+
+
+def test_a_terminal_wake_is_an_ordinary_run_not_a_gate_run(tmp_path: Any) -> None:
+    scheduler, clock, launcher = _parked_dispatch_line(tmp_path, fact=None)
+    scheduler.tick()
+    scheduler.dd = _ScriptedDdFacts("terminal")
+    clock.now += 600.0
+    results = scheduler.tick()
+
+    assert results[0].decision.ignite
+    assert launcher.launched[0].dd_awaiting_gate_development_id == ""
+
+
+class TestRunLineProducesTheObligationsMechanically:
+    """Finding 2 (major), fixed: ``run_line`` itself mechanically collects
+    the six obligations for a dd wake; an ordinary run collects nothing."""
+
+    def test_a_dd_wake_run_line_delivers_mechanically_collected_evidence(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        import fleet_graph.graphs.runner as runner
+        from fleet_graph.graphs.adapters import CoordinatorFault
+
+        sentinel = ["the", "six", "obligations"]
+        deliver_calls: dict[str, Any] = {}
+        collect_calls: list[dict[str, Any]] = []
+
+        monkeypatch.setattr(
+            runner,
+            "collect_gate_evidence",
+            lambda **kwargs: collect_calls.append(kwargs) or sentinel,
+        )
+        monkeypatch.setattr(
+            runner, "deliver_self_gate_decision", lambda **kwargs: deliver_calls.update(kwargs)
+        )
+        config = runner.LineConfig(
+            folder_id="wf-1",
+            seat="s",
+            run_root=tmp_path / "run",
+            checkpoint_path=":memory:",
+            agent_run_bin=_fake_agent_run(tmp_path),
+            dd_awaiting_gate_development_id=DD_ID,
+        )
+        with pytest.raises(CoordinatorFault):
+            runner.run_line(config)
+
+        assert collect_calls == [{"development_id": DD_ID}]
+        assert deliver_calls["evidence"] is sentinel
+        assert deliver_calls["development_id"] == DD_ID
+        record = json.loads((tmp_path / "run" / "self-gate.json").read_text(encoding="utf-8"))
+        assert record["development_id"] == DD_ID
+
+    def test_an_ordinary_run_line_collects_no_gate_evidence(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        import fleet_graph.graphs.runner as runner
+        from fleet_graph.graphs.adapters import CoordinatorFault
+
+        def no_collection(**kwargs: Any) -> Any:
+            raise AssertionError("an ordinary run must not collect gate evidence")
+
+        monkeypatch.setattr(runner, "collect_gate_evidence", no_collection)
+        config = runner.LineConfig(
+            folder_id="wf-1",
+            seat="s",
+            run_root=tmp_path / "run",
+            checkpoint_path=":memory:",
+            agent_run_bin=_fake_agent_run(tmp_path),
+        )
+        with pytest.raises(CoordinatorFault):
+            runner.run_line(config)
+
+
+# --- the mechanical collector (dd/self_gate_evidence.py) --------------------
+
+
+def _git(workspace: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(["git", *args], cwd=workspace, check=True, capture_output=True, text=True)
+
+
+def _git_head(workspace: Path) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+BASE_SPEC = "```dd-acceptance\nbash -lc 'echo gate-ok'\n```\n"
+FROZEN_ARGV = ["bash", "-lc", "echo gate-ok"]
+
+
+def _make_workspace(tmp_path: Path) -> tuple[Path, str, str]:
+    """A real two-commit repo: base, then a head that adds one production
+    call site (the S12 shape) plus a test file. The base also carries an
+    older test file so a deletion inside ``base..head`` is expressible."""
+    workspace = tmp_path / "ws"
+    (workspace / "src" / "pkg").mkdir(parents=True)
+    (workspace / "tests").mkdir()
+    (workspace / ".dev-dispatch" / "spec").mkdir(parents=True)
+    (workspace / "src" / "pkg" / "api.py").write_text("def serve():\n    return 1\n")
+    (workspace / "tests" / "test_legacy.py").write_text("def test_legacy():\n    assert True\n")
+    (workspace / ".dev-dispatch" / "spec" / "approved.md").write_text(BASE_SPEC)
+    _git(workspace, "init", "-q")
+    _git(workspace, "config", "user.email", "gate@example.invalid")
+    _git(workspace, "config", "user.name", "gate")
+    _git(workspace, "add", "-A")
+    _git(workspace, "commit", "-q", "-m", "base")
+    base = _git_head(workspace)
+
+    (workspace / "src" / "pkg" / "api.py").write_text("def serve():\n    return gate()\n")
+    (workspace / "tests" / "test_api.py").write_text("def test_serve():\n    assert True\n")
+    _git(workspace, "add", "-A")
+    _git(workspace, "commit", "-q", "-m", "head")
+    return workspace, base, _git_head(workspace)
+
+
+def _seal_receipt(dd_root: Path, attempt: str, name: str, payload: dict[str, Any]) -> Path:
+    path = dd_root / DD_ID / "state" / "receipts" / attempt / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _record_dd(workspace: Path, base: str) -> Any:
+    class RecordDd:
+        def __init__(self) -> None:
+            self.record = {
+                "development_id": DD_ID,
+                "state": "awaiting_gate",
+                "dispatched_by": PRINCIPAL,
+                "generation": 1,
+                "target_base_commit": base,
+                "worktree_path": str(workspace),
+                "acceptance_commands": [FROZEN_ARGV],
+            }
+
+        def get(self, development_id: str) -> dict[str, Any]:
+            assert development_id == DD_ID
+            return dict(self.record)
+
+    return RecordDd()
+
+
+class TestMechanicalCollector:
+    """The production collector: real git facts, sealed receipts, seams."""
+
+    def test_diff_facts_are_read_from_the_real_repo(self, tmp_path: Path) -> None:
+        from fleet_graph.dd.self_gate import enumerate_mutation_targets
+        from fleet_graph.dd.self_gate_evidence import (
+            diff_added_lines,
+            diff_changed_paths,
+            diff_deleted_paths,
+        )
+
+        workspace, base, head = _make_workspace(tmp_path)
+
+        changed = diff_changed_paths(workspace, base, head)
+        assert "src/pkg/api.py" in changed
+        assert "tests/test_api.py" in changed
+        assert diff_deleted_paths(workspace, base, head) == []
+
+        targets = enumerate_mutation_targets(diff_added_lines(workspace, base, head))
+        assert [(t.file, t.call) for t in targets] == [("src/pkg/api.py", "gate")]
+
+    def test_an_updated_test_is_changed_but_not_deleted(self, tmp_path: Path) -> None:
+        from fleet_graph.dd.self_gate_evidence import (
+            diff_changed_paths,
+            diff_deleted_paths,
+        )
+
+        workspace, base, _head = _make_workspace(tmp_path)
+        (workspace / "tests" / "test_api.py").write_text(
+            "def test_serve():\n    assert gate() == 1\n"
+        )
+        _git(workspace, "add", "-A")
+        _git(workspace, "commit", "-q", "-m", "edit test")
+
+        new_head = _git_head(workspace)
+        assert "tests/test_api.py" in diff_changed_paths(workspace, base, new_head)
+        assert diff_deleted_paths(workspace, base, new_head) == []
+
+    def test_a_deleted_test_file_is_seen(self, tmp_path: Path) -> None:
+        from fleet_graph.dd.self_gate_evidence import diff_deleted_paths
+
+        workspace, base, _head = _make_workspace(tmp_path)
+        (workspace / "tests" / "test_legacy.py").unlink()
+        _git(workspace, "add", "-A")
+        _git(workspace, "commit", "-q", "-m", "drop tests")
+
+        assert "tests/test_legacy.py" in diff_deleted_paths(workspace, base, _git_head(workspace))
+
+    def test_all_six_obligations_pass_when_the_sources_align(self, tmp_path: Path) -> None:
+        from fleet_graph.dd.self_gate import (
+            EVIDENCE_ACCEPTANCE_FROZEN,
+            EVIDENCE_DIFF_WITHIN_SCOPE,
+            EVIDENCE_MUTATION_RECEIPT,
+            EVIDENCE_PERSONALLY_RERUN,
+            EVIDENCE_REGRESSION,
+            EVIDENCE_ZERO_TEST_DELETION,
+            enumerate_mutation_targets,
+        )
+        from fleet_graph.dd.self_gate_evidence import (
+            collect_gate_evidence,
+            diff_added_lines,
+        )
+
+        workspace, base, head = _make_workspace(tmp_path)
+        dd_root = tmp_path / "dd"
+        _seal_receipt(
+            dd_root,
+            "attempt-1",
+            "implement-receipt.json",
+            {
+                "output_commit": head,
+                "verification_record": {
+                    "verification_commands": [{"argv": FROZEN_ARGV, "exit_code": 0}]
+                },
+            },
+        )
+        enumerated = enumerate_mutation_targets(diff_added_lines(workspace, base, head))
+        _seal_receipt(
+            dd_root,
+            "attempt-1",
+            "final-review-receipt.json",
+            {
+                "implementation_subject_commit": head,
+                "mutation_targets": [
+                    {"file": t.file, "line": t.line, "call": t.call, "red": True}
+                    for t in enumerated
+                ],
+                "verified_items": ["acceptance_frozen", "mutation_experiment"],
+            },
+        )
+        (workspace / ".dd-evidence").mkdir()
+        (workspace / ".dd-evidence" / "regression-baseline.json").write_text(
+            json.dumps(
+                {
+                    "base_commit": base,
+                    "passed": 10,
+                    "failed": 1,
+                    "skipped": 0,
+                    "failed_tests": ["tests/test_legacy.py::test_old"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        evidence = collect_gate_evidence(
+            development_id=DD_ID,
+            dd=_record_dd(workspace, base),
+            dd_root=dd_root,
+            rerun=lambda _ws, _argv: ("gate-ok\n", 0),
+            regression_probe=lambda _ws: {"tests/test_legacy.py::test_old"},
+        )
+
+        assert {item.id for item in evidence} == {
+            EVIDENCE_ACCEPTANCE_FROZEN,
+            EVIDENCE_DIFF_WITHIN_SCOPE,
+            EVIDENCE_ZERO_TEST_DELETION,
+            EVIDENCE_PERSONALLY_RERUN,
+            EVIDENCE_MUTATION_RECEIPT,
+            EVIDENCE_REGRESSION,
+        }
+        assert all(item.passed for item in evidence), {
+            item.id: item.detail for item in evidence if not item.passed
+        }
+
+    def test_a_final_review_receipt_without_the_record_fails_the_mutation_obligation(
+        self, tmp_path: Path
+    ) -> None:
+        from fleet_graph.dd.self_gate import EVIDENCE_MUTATION_RECEIPT
+        from fleet_graph.dd.self_gate_evidence import collect_gate_evidence
+
+        workspace, base, head = _make_workspace(tmp_path)
+        dd_root = tmp_path / "dd"
+        _seal_receipt(
+            dd_root,
+            "attempt-1",
+            "implement-receipt.json",
+            {
+                "output_commit": head,
+                "verification_record": {
+                    "verification_commands": [{"argv": FROZEN_ARGV, "exit_code": 0}]
+                },
+            },
+        )
+        _seal_receipt(
+            dd_root,
+            "attempt-1",
+            "final-review-receipt.json",
+            {"implementation_subject_commit": head, "findings": []},
+        )
+        (workspace / ".dd-evidence").mkdir()
+        (workspace / ".dd-evidence" / "regression-baseline.json").write_text(
+            json.dumps({"base_commit": base, "failed_tests": []}), encoding="utf-8"
+        )
+
+        evidence = collect_gate_evidence(
+            development_id=DD_ID,
+            dd=_record_dd(workspace, base),
+            dd_root=dd_root,
+            rerun=lambda _ws, _argv: ("gate-ok\n", 0),
+            regression_probe=lambda _ws: set(),
+        )
+
+        mutation = next(item for item in evidence if item.id == EVIDENCE_MUTATION_RECEIPT)
+        assert mutation.passed is False
+        assert "mutation_targets" in mutation.detail
+        assert "verified_items" in mutation.detail
+
+    def test_a_mutation_receipt_short_of_the_enumeration_is_refused(self, tmp_path: Path) -> None:
+        from fleet_graph.dd.self_gate import EVIDENCE_MUTATION_RECEIPT
+        from fleet_graph.dd.self_gate_evidence import collect_gate_evidence
+
+        workspace, base, head = _make_workspace(tmp_path)
+        dd_root = tmp_path / "dd"
+        _seal_receipt(
+            dd_root,
+            "attempt-1",
+            "final-review-receipt.json",
+            {
+                "implementation_subject_commit": head,
+                "mutation_targets": [],  # enumerated the call site, receipt names none
+                "verified_items": ["mutation_experiment"],
+            },
+        )
+        (workspace / ".dd-evidence").mkdir()
+        (workspace / ".dd-evidence" / "regression-baseline.json").write_text(
+            json.dumps({"base_commit": base, "failed_tests": []}), encoding="utf-8"
+        )
+
+        evidence = collect_gate_evidence(
+            development_id=DD_ID,
+            dd=_record_dd(workspace, base),
+            dd_root=dd_root,
+            rerun=lambda _ws, _argv: ("gate-ok\n", 0),
+            regression_probe=lambda _ws: set(),
+        )
+
+        mutation = next(item for item in evidence if item.id == EVIDENCE_MUTATION_RECEIPT)
+        assert mutation.passed is False
+        assert "src/pkg/api.py" in mutation.detail
+
+    def test_a_baseline_anchored_on_a_drifted_head_is_refused(self, tmp_path: Path) -> None:
+        from fleet_graph.dd.self_gate import EVIDENCE_REGRESSION
+        from fleet_graph.dd.self_gate_evidence import collect_gate_evidence
+
+        workspace, base, head = _make_workspace(tmp_path)
+        dd_root = tmp_path / "dd"
+        _seal_receipt(
+            dd_root,
+            "attempt-1",
+            "implement-receipt.json",
+            {
+                "output_commit": head,
+                "verification_record": {
+                    "verification_commands": [{"argv": FROZEN_ARGV, "exit_code": 0}]
+                },
+            },
+        )
+        _seal_receipt(
+            dd_root,
+            "attempt-1",
+            "final-review-receipt.json",
+            {
+                "implementation_subject_commit": head,
+                "mutation_targets": [],
+                "verified_items": ["x"],
+            },
+        )
+        (workspace / ".dd-evidence").mkdir()
+        (workspace / ".dd-evidence" / "regression-baseline.json").write_text(
+            json.dumps(
+                {
+                    "base_commit": "f" * 40,  # a drifted main head, not the frozen base
+                    "failed_tests": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        evidence = collect_gate_evidence(
+            development_id=DD_ID,
+            dd=_record_dd(workspace, base),
+            dd_root=dd_root,
+            rerun=lambda _ws, _argv: ("gate-ok\n", 0),
+            regression_probe=lambda _ws: set(),
+        )
+
+        regression = next(item for item in evidence if item.id == EVIDENCE_REGRESSION)
+        assert regression.passed is False
+        assert "drifted" in regression.detail
+
+    def test_a_failed_personal_rerun_fails_the_obligation_with_the_echo(
+        self, tmp_path: Path
+    ) -> None:
+        from fleet_graph.dd.self_gate import EVIDENCE_PERSONALLY_RERUN
+        from fleet_graph.dd.self_gate_evidence import collect_gate_evidence
+
+        workspace, base, head = _make_workspace(tmp_path)
+        dd_root = tmp_path / "dd"
+        _seal_receipt(
+            dd_root,
+            "attempt-1",
+            "implement-receipt.json",
+            {
+                "output_commit": head,
+                "verification_record": {
+                    "verification_commands": [{"argv": FROZEN_ARGV, "exit_code": 0}]
+                },
+            },
+        )
+        _seal_receipt(
+            dd_root,
+            "attempt-1",
+            "final-review-receipt.json",
+            {
+                "implementation_subject_commit": head,
+                "mutation_targets": [],
+                "verified_items": ["x"],
+            },
+        )
+        (workspace / ".dd-evidence").mkdir()
+        (workspace / ".dd-evidence" / "regression-baseline.json").write_text(
+            json.dumps({"base_commit": base, "failed_tests": []}), encoding="utf-8"
+        )
+
+        evidence = collect_gate_evidence(
+            development_id=DD_ID,
+            dd=_record_dd(workspace, base),
+            dd_root=dd_root,
+            rerun=lambda _ws, _argv: ("FAILED tests/test_api.py\n", 1),
+            regression_probe=lambda _ws: set(),
+        )
+
+        rerun_item = next(item for item in evidence if item.id == EVIDENCE_PERSONALLY_RERUN)
+        assert rerun_item.passed is False
+        assert "FAILED tests/test_api.py" in rerun_item.detail
+
+    def test_an_unresolvable_single_fails_every_obligation_closed(self, tmp_path: Path) -> None:
+        from fleet_graph.dd.self_gate import REQUIRED_EVIDENCE
+        from fleet_graph.dd.self_gate_evidence import collect_gate_evidence
+
+        class DyingDd:
+            def get(self, development_id: str) -> dict[str, Any]:
+                raise RuntimeError("dd root unreadable")
+
+        evidence = collect_gate_evidence(
+            development_id=DD_ID,
+            dd=DyingDd(),
+            rerun=lambda _ws, _argv: ("", 0),
+            regression_probe=lambda _ws: set(),
+        )
+
+        assert {item.id for item in evidence} == set(REQUIRED_EVIDENCE)
+        assert all(item.passed is False for item in evidence)
+        assert all("gate evidence collection fault" in item.detail for item in evidence)
+
+    def test_the_default_rerun_runs_the_frozen_argv_and_keeps_the_exit(
+        self, tmp_path: Path
+    ) -> None:
+        from fleet_graph.dd.self_gate_evidence import default_rerun
+
+        echo, exit_code = default_rerun(tmp_path, ["bash", "-lc", "echo personal; exit 3"])
+        assert "personal" in echo
+        assert exit_code == 3

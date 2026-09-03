@@ -68,6 +68,12 @@ class LaunchSpec:
     #: rules. Absent (None) for a normal launch -- the line then carries no
     #: `revival` fact into its round-1 coordinator input.
     revival: dict[str, Any] | None = None
+    #: M3: the development a ``dd_awaiting_gate`` wake names, forwarded as
+    #: ``--dd-awaiting-gate`` so the woken line self-delivers that single's
+    #: gate decision (six mechanically produced evidence obligations, then
+    #: ``decision_deliver``). Empty means an ordinary run: the launch never
+    #: invents a wake identity the scheduler did not observe.
+    dd_awaiting_gate_development_id: str = ""
 
     @property
     def log_file(self) -> Path:
@@ -138,6 +144,11 @@ class LaunchSpec:
             argv += ["--board-card", self.board_card_entity_id]
         if self.revival is not None:
             argv += ["--revival", json.dumps(self.revival, ensure_ascii=False)]
+        if self.dd_awaiting_gate_development_id:
+            argv += [
+                "--dd-awaiting-gate",
+                self.dd_awaiting_gate_development_id,
+            ]
         return argv
 
 

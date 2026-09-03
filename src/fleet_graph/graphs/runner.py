@@ -22,6 +22,7 @@ from fleet_graph.bus.client import BusClient
 from fleet_graph.bus.inbox import Inbox
 from fleet_graph.bus.tokens import resolve_line_token
 from fleet_graph.dd.self_gate import deliver_self_gate_decision
+from fleet_graph.dd.self_gate_evidence import collect_gate_evidence
 from fleet_graph.executors.agent_run import AgentRunLauncher
 from fleet_graph.executors.agent_session import (
     AgentSessionSeat,
@@ -428,6 +429,25 @@ def _build_line_inbox(config: LineConfig) -> Any:
     return Inbox(BusClient(token=resolution.token), alias)
 
 
+def _persist_self_gate_record(config: LineConfig, result: Any) -> None:
+    """Land the six-obligation record and the verdict under the run root.
+
+    Spec item 4: the evidence and the conclusion are archived as the
+    ``decision_deliver`` rationale payload. The delivery already carries the
+    rationale as its ``reason``; this durable copy makes the same facts
+    readable later from the line's run root without a dd-root dig. A write
+    that cannot land never changes the verdict -- archiving, not deciding.
+    """
+    payload = {
+        "development_id": config.dd_awaiting_gate_development_id,
+        "principal": config.folder_id,
+        "at": iso(time.time()),
+        "result": getattr(result, "as_dict", lambda: {"status": str(result)})(),
+    }
+    with suppress(OSError):
+        write_json_durable(config.run_root / "self-gate.json", payload)
+
+
 def resume_start(compiled: Any, invoke_config: dict[str, Any]) -> dict[str, Any] | None:
     """The input that continues this thread rather than replaying it.
 
@@ -488,9 +508,18 @@ def run_self_gate(
 
 def run_line(config: LineConfig, *, run_id: str | None = None) -> dict[str, Any]:
     # M3: on a dd_awaiting_gate wake the line is its own gate and seals its
-    # verdict before the run proceeds (D5: "DD gate needs no human"). An
+    # verdict before the run proceeds (D5: "DD gate needs no human"). The six
+    # obligations are *mechanically produced* here (rework rc-aa907dfb): the
+    # collector reads the frozen record, the sealed receipts, the workspace
+    # diff, its own acceptance rerun, and the regression baseline -- an empty
+    # or guessed evidence list would refuse the delivery, never pass it. An
     # ordinary run (no wake id) is a no-op here.
-    run_self_gate(config)
+    if config.dd_awaiting_gate_development_id:
+        gate_result = run_self_gate(
+            config,
+            evidence=collect_gate_evidence(development_id=config.dd_awaiting_gate_development_id),
+        )
+        _persist_self_gate_record(config, gate_result)
     graph, deps = build_line(config, run_id=run_id)
     invoke_config: dict[str, Any] = {
         "configurable": {"thread_id": config.thread_id},
