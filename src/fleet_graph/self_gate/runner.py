@@ -26,8 +26,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.acceptance import EXIT_TIMEOUT
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.mutation import (
+    MUTATION_ACCEPTANCE_TIMEOUT_SECONDS,
     enumerate_mutation_targets,
     verify_mutation_receipt,
 )
@@ -63,12 +65,39 @@ TEST_PATH = re.compile(r"(^|/)tests?(/|$)|(^|/)test_[^/]*\.py$|_test\.py$|(^|/)c
 
 AcceptanceRunner = Callable[[Path, list[str]], int]
 
+#: The gate-side acceptance re-run gets the same per-command bound the engine
+#: gives its own acceptance stage (1800s). The gate re-runs the same frozen
+#: argv a hanging target could have made unbounded; a wedged duty would hang
+#: the wake -- and a wake that never answers is not a gate verdict.
+GATE_ACCEPTANCE_TIMEOUT_SECONDS = MUTATION_ACCEPTANCE_TIMEOUT_SECONDS
+
+
+class AcceptanceRunTimeout(RuntimeError):
+    """Duty 4's frozen acceptance outlived its bound and never returned."""
+
 
 #: The production acceptance runner: run the argv, capture everything, keep
 #: the exit code. The echo captured for the evidence payload is the argv plus
-#: the exit code -- a gate-side re-run must leave a visible trace.
-def _production_acceptance_runner(cwd: Path, argv: list[str]) -> int:
-    completed = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, check=False)
+#: the exit code -- a gate-side re-run must leave a visible trace. Bounded:
+#: a command that never returns is a failed duty with a recorded reason
+#: (exit code 124, the shell's timeout convention), never a hung gate.
+def _production_acceptance_runner(
+    cwd: Path, argv: list[str], timeout_seconds: float | None = None
+) -> int:
+    bound = GATE_ACCEPTANCE_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=bound,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AcceptanceRunTimeout(
+            f"frozen acceptance re-run timed out after {bound}s: {list(argv)}"
+        ) from exc
     return completed.returncode
 
 
@@ -201,14 +230,31 @@ def duty_acceptance_run(
 
     The line never trusts the implement stage's claimed green: it runs the
     frozen argv again at the gate and records each command's exit code as the
-    receipt of having personally run it.
+    receipt of having personally run it. A command that outlives its bound is
+    itself a failed run -- recorded with the timeout exit code (124) and the
+    reason, so the gate refuses delivery instead of hanging forever.
     """
     run = runner or _production_acceptance_runner
     results = []
     for argv in acceptance_commands:
-        code = run(cwd, list(argv))
+        try:
+            code = run(cwd, list(argv))
+        except AcceptanceRunTimeout as exc:
+            results.append(
+                {
+                    "argv": list(argv),
+                    "exit_code": EXIT_TIMEOUT,
+                    "timed_out": True,
+                    "detail": str(exc),
+                }
+            )
+            continue
         results.append({"argv": list(argv), "exit_code": code})
-    passed = bool(results) and all(item["exit_code"] == 0 for item in results)
+    passed = (
+        bool(results)
+        and all(item["exit_code"] == 0 for item in results)
+        and not any(item.get("timed_out") for item in results)
+    )
     return _entry(
         DUTY_ACCEPTANCE_RUN,
         passed,
@@ -517,6 +563,8 @@ __all__ = [
     "DUTY_REGRESSION_BASELINE",
     "DUTY_ZERO_TEST_DELETIONS",
     "EVIDENCE_VERSION",
+    "GATE_ACCEPTANCE_TIMEOUT_SECONDS",
+    "AcceptanceRunTimeout",
     "SelfGateDecision",
     "changed_product_files",
     "deliver_self_gate_decision",

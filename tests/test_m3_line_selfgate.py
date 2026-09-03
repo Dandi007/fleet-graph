@@ -21,6 +21,7 @@ import ast
 import json
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,7 @@ from fleet_graph.decision_mcp import (
     OUTCOME_REFUSED,
     deliver_decision,
 )
+from fleet_graph.self_gate import runner as self_gate_runner_module
 from fleet_graph.self_gate.runner import (
     DUTY_ACCEPTANCE_RUN,
     DUTY_ACCEPTANCE_THREE_WAY,
@@ -56,6 +58,7 @@ from fleet_graph.self_gate.runner import (
     DUTY_PRODUCT_DIFF_BOUNDARY,
     DUTY_REGRESSION_BASELINE,
     DUTY_ZERO_TEST_DELETIONS,
+    AcceptanceRunTimeout,
     deliver_self_gate_decision,
     duty_acceptance_run,
     duty_acceptance_three_way,
@@ -378,6 +381,28 @@ class TestDuty4AcceptanceRunAtGate:
     def test_a_red_rerun_refuses(self, dev_repo: DevRepo) -> None:
         entry = duty_acceptance_run(FROZEN_ACCEPTANCE, dev_repo.path, lambda cwd, argv: 1)
         assert entry["passed"] is False
+
+    def test_a_rerun_that_outlives_its_bound_is_a_failed_run_not_a_hung_gate(
+        self, dev_repo: DevRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """挂死的验收是失败义务，不是永动的闸：超时按 124 记账、义务判红，
+        投递被拒——绝不允许把唤醒路径永远吊住。"""
+        monkeypatch.setattr(self_gate_runner_module, "GATE_ACCEPTANCE_TIMEOUT_SECONDS", 0.3)
+        hanging = [[sys.executable, "-c", "import time; time.sleep(30)"]]
+        entry = duty_acceptance_run(hanging, dev_repo.path)
+        assert entry["passed"] is False
+        assert entry["runs"][0]["exit_code"] == 124
+        assert entry["runs"][0]["timed_out"] is True
+        assert "timed out after 0.3s" in entry["runs"][0]["detail"]
+
+    def test_the_production_runner_raises_a_typed_timeout(
+        self, dev_repo: DevRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(self_gate_runner_module, "GATE_ACCEPTANCE_TIMEOUT_SECONDS", 0.3)
+        with pytest.raises(AcceptanceRunTimeout, match=r"timed out after 0\.3s"):
+            self_gate_runner_module._production_acceptance_runner(
+                dev_repo.path, [sys.executable, "-c", "import time; time.sleep(30)"]
+            )
 
 
 class TestDuty5MutationReceipt:
@@ -907,6 +932,30 @@ class TestS12OneShotCopyExecution:
         assert ok is False
         assert any(MUTATION_TARGET_NOT_RED in violation for violation in violations)
 
+    def test_an_acceptance_that_outlives_its_bound_fails_closed_not_forever(
+        self, dev_repo: DevRepo
+    ) -> None:
+        """删掉的行恰好能把有界测试改成无界；无界 runner 会把 final_review 永久
+        吊死——默认 runner 必须有界，超时走 RuntimeError（= 既有
+        MUTATION_EXECUTION_FAILED 失败闭环），一次性副本照样清走。"""
+        hanging = [[sys.executable, "-c", "import time; time.sleep(30)"]]
+        with pytest.raises(RuntimeError, match=r"timed out after 0\.3s"):
+            execute_final_review_mutations(
+                dev_repo.path,
+                dev_repo.base,
+                dev_repo.head,
+                hanging,
+                worktree_parent=dev_repo.path.parent,
+                acceptance_timeout_seconds=0.3,
+            )
+        assert (
+            (dev_repo.path / "app.py")
+            .read_text(encoding="utf-8")
+            .endswith("result = handler(value)\n")
+        )
+        listed = _git(dev_repo.path, "worktree", "list", "--porcelain")
+        assert listed.count("worktree") == 1
+
 
 class TestS12GateVerifiesReceiptOnly:
     def test_target_set_must_equal_the_mechanical_enumeration(self, dev_repo: DevRepo) -> None:
@@ -1128,6 +1177,35 @@ class TestS12InstanceTargetAndReachability:
         )
         assert outcome.event == FAILURE_EVENT
         assert outcome.failure_code == MUTATION_EXECUTION_FAILED
+
+    def test_a_hanging_acceptance_fails_the_stage_closed(self, dev_repo: DevRepo) -> None:
+        """挂死的变异验收走同一个失败闭环：stage 失败 MUTATION_EXECUTION_FAILED
+        交还有界重试——不是永不返回、更不是静默放行。"""
+        from fleet_graph.dd.lifecycle import Lifecycle
+        from fleet_graph.graphs.dd_actors import AgentRunStageActor
+        from fleet_graph.graphs.dd_pipeline import FAILURE_EVENT, StageOutcome
+
+        actor = AgentRunStageActor(
+            launcher=None,
+            development_id=DD_ID,
+            run_root=dev_repo.path.parent,
+            lifecycle=Lifecycle.load(),
+            mutation_inputs=lambda dispatch: {
+                "repo": dev_repo.path,
+                "base": dev_repo.base,
+                "head": dev_repo.head,
+                "acceptance_commands": [[sys.executable, "-c", "import time; time.sleep(30)"]],
+                "worktree_parent": dev_repo.path.parent,
+                "acceptance_timeout_seconds": 0.3,
+            },
+        )
+        stage = actor.lifecycle.stages["final_review"]
+        outcome = actor._with_final_review_mutations(
+            stage, {"input_commit": dev_repo.head}, StageOutcome(event="APPROVE")
+        )
+        assert outcome.event == FAILURE_EVENT
+        assert outcome.failure_code == MUTATION_EXECUTION_FAILED
+        assert "timed out" in (outcome.detail or "")
 
     def test_the_gate_side_helper_exists_for_the_walker(self) -> None:
         from fleet_graph.graphs.dd_actors import final_review_mutation_receipt

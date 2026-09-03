@@ -118,6 +118,7 @@ def final_review_mutation_receipt(
     acceptance_commands: list[list[str]],
     runner: Any = None,
     worktree_parent: Any = None,
+    acceptance_timeout_seconds: float | None = None,
 ) -> dict[str, Any] | None:
     """Execute the final_review stage's mutation gate, engine-side (S12.3).
 
@@ -137,6 +138,7 @@ def final_review_mutation_receipt(
         acceptance_commands,
         runner=runner,
         worktree_parent=worktree_parent,
+        acceptance_timeout_seconds=acceptance_timeout_seconds,
     )
 
 
@@ -473,9 +475,10 @@ class AgentRunStageActor:
         "gate 只核验回执"). Unwired or non-final stages pass through untouched.
 
         A gate that cannot execute is never a pass: a diff that will not
-        resolve or a copy that will not open fails the stage with
-        ``MUTATION_EXECUTION_FAILED`` so the bounded retry machinery owns it,
-        instead of crashing the walk or quietly waving the review through.
+        resolve, a copy that will not open, or a frozen acceptance that
+        outlives its bound fails the stage with ``MUTATION_EXECUTION_FAILED``
+        so the bounded retry machinery owns it, instead of crashing the walk,
+        wedging forever, or quietly waving the review through.
         """
         provider = self.mutation_inputs
         if (
@@ -501,6 +504,7 @@ class AgentRunStageActor:
                 acceptance_commands=commands,
                 runner=inputs.get("runner"),
                 worktree_parent=inputs.get("worktree_parent"),
+                acceptance_timeout_seconds=inputs.get("acceptance_timeout_seconds"),
             )
             expected = enumerate_mutation_targets(repo, base, head)
         except RuntimeError as exc:

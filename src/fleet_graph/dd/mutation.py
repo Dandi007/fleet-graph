@@ -114,15 +114,33 @@ MUTATION_TARGET_NOT_RED = "MUTATION_TARGET_NOT_RED"
 #: retry machinery owns what happens next.
 MUTATION_EXECUTION_FAILED = "MUTATION_EXECUTION_FAILED"
 
+#: Per-command bound on the default acceptance runner, matching the engine's
+#: own AcceptanceStage (1800s). A deleted line is exactly the kind of edit
+#: that can turn a bounded test into an unbounded one; an unbounded runner
+#: here would wedge final_review forever -- never reaching the
+#: MUTATION_EXECUTION_FAILED fail-closed path this module promises.
+MUTATION_ACCEPTANCE_TIMEOUT_SECONDS = 1800.0
+
 Runner = Callable[[Path, list[str]], int]
 
 
 #: The production default: run the frozen acceptance argv in the copy, capture
-#: everything, report only the exit code.
-def _default_runner(cwd: Path, argv: list[str]) -> int:
-    return subprocess.run(
-        argv, cwd=str(cwd), capture_output=True, text=True, check=False
-    ).returncode
+#: everything, report only the exit code -- bounded, because a hanging target
+#: must surface as an execution failure, not as a wedged stage.
+def _default_runner(cwd: Path, argv: list[str], timeout_seconds: float | None = None) -> int:
+    bound = MUTATION_ACCEPTANCE_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=bound,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"frozen acceptance timed out after {bound}s: {list(argv)}") from exc
+    return completed.returncode
 
 
 @dataclass(frozen=True)
@@ -279,6 +297,7 @@ def execute_final_review_mutations(
     *,
     runner: Runner | None = None,
     worktree_parent: Path | None = None,
+    acceptance_timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     """The final_review stage's mutation execution -- the engine-side entry.
 
@@ -286,9 +305,17 @@ def execute_final_review_mutations(
     read, never written): every mechanically enumerated target is deleted in
     turn and the frozen acceptance commands run there. The receipt records each
     target's location and red/green result, plus the mandatory checklists. The
-    copy is always removed, including on failure.
+    copy is always removed, including on failure. Without a caller-supplied
+    runner the default is the bounded production runner -- an acceptance that
+    exceeds its bound raises, which is the same fail-closed path as any other
+    execution failure, never a wedged stage.
     """
-    run = runner or _default_runner
+    if runner is None:
+
+        def run(cwd: Path, argv: list[str]) -> int:
+            return _default_runner(cwd, argv, timeout_seconds=acceptance_timeout_seconds)
+    else:
+        run = runner
     targets = enumerate_mutation_targets(repo, base, head)
     tmp, copy = _one_shot_copy(repo, head, worktree_parent)
     results: list[dict[str, Any]] = []
@@ -471,6 +498,7 @@ def static_call_reachable(path: Path, entry: str, target: str) -> bool:
 __all__ = [
     "CHECKED_ITEMS_FIELD",
     "EXCLUDED_DIFF_PREFIXES",
+    "MUTATION_ACCEPTANCE_TIMEOUT_SECONDS",
     "MUTATION_EXECUTION_FAILED",
     "MUTATION_RECEIPT_INVALID",
     "MUTATION_RECEIPT_VERSION",
