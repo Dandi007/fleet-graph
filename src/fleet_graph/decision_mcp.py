@@ -137,6 +137,15 @@ CODE_DD_NOT_AWAITING_GATE = "DD_NOT_AWAITING_GATE"
 CODE_NOT_DISPATCHING_LINE = "NOT_DISPATCHING_LINE"
 CODE_DD_UNKNOWN = "DD_UNKNOWN"
 
+#: M3 S10 dd-gate delivery refusals. The success criterion is "consumed", not
+#: "a unit was started": a resume whose workspace path is already missing is
+#: refused *before* a unit is launched, and a resume whose re-read still shows
+#: the single in ``awaiting_gate`` (the unit died -- measured 889ms ``75/TEMPFAIL``
+#: on dev-fg-36c2d76baca7) is refused with the unit's exit code. Both refusals
+#: leave a trace on the single (``gate_refused`` + an ``events.jsonl`` entry).
+CODE_DD_WORKSPACE_MISSING = "DD_WORKSPACE_MISSING"
+CODE_DD_GATE_NOT_CONSUMED = "DD_GATE_NOT_CONSUMED"
+
 #: Prometheus metric names emitted by the ledger's textfile.
 METRIC_DELIVERED = "fleet_graph_decision_delivered_total"
 METRIC_REFUSED = "fleet_graph_decision_refused_total"
@@ -332,6 +341,65 @@ def _wake_dispatching_line(run_root: Path, folder_id: str, at: float) -> None:
         pass
 
 
+def _workspace_of(status: dict[str, Any]) -> str:
+    """The single's workspace path, from whichever field the read model carries.
+
+    The dd control plane's ``get`` surfaces the record ``repo_path`` under
+    ``worktree_path``/``repo_path``; duck-typed fakes may use ``workspace``.
+    Empty means "not exposed" -- the caller must not refuse on a path it never
+    saw, so a pre-M3 read model keeps the old behaviour.
+    """
+    for key in ("workspace", "worktree_path", "repo_path"):
+        value = str(status.get(key) or "")
+        if value:
+            return value
+    return ""
+
+
+def _unit_exit_code(status: dict[str, Any] | None) -> str:
+    """The unit's exit code from a re-read status, when it carries one.
+
+    Prefers ``gate_refused``'s own exit code (written by the refusal trace),
+    then a terminal code. Empty when none is recorded.
+    """
+    if not status:
+        return ""
+    refused = status.get("gate_refused")
+    if isinstance(refused, dict):
+        for key in ("unit_exit_code", "exit_code", "code"):
+            value = refused.get(key)
+            if value:
+                return str(value)
+    for key in ("terminal_code", "exit_code", "unit_exit_code"):
+        value = status.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _record_gate_refusal(
+    dd: Any,
+    development_id: str,
+    *,
+    code: str,
+    reason: str,
+    unit_exit_code: str | None = None,
+) -> None:
+    """S10 item 2: leave the refusal on the single, never a silent swallow.
+
+    The refusal trace (``gate_refused`` reason + unit exit code + one
+    ``events.jsonl`` entry) is written by the owner it names, when that owner
+    exposes ``record_gate_refusal``. A fake or an owner without the hook simply
+    records nothing -- the refusal result still travels to the caller, so the
+    delivery is never falsely green.
+    """
+    recorder = getattr(dd, "record_gate_refusal", None)
+    if not callable(recorder):
+        return
+    with contextlib.suppress(Exception):
+        recorder(development_id, code=code, reason=reason, unit_exit_code=unit_exit_code)
+
+
 def _deliver_dd(
     *,
     development_id: str,
@@ -390,6 +458,33 @@ def _deliver_dd(
             decision=decision,
         )
 
+    # S10 item 3: the success criterion is "consumed", not "a unit was started".
+    # A workspace path that is already gone must be refused *before* any unit is
+    # launched -- the measured failure (dev-fg-36c2d76baca7) was a resume that
+    # started a unit destined to die 889ms later on 75/TEMPFAIL, and that death
+    # left no trace. Refuse now, with the trace, and never touch the gate.
+    workspace = _workspace_of(status)
+    if workspace and not Path(workspace).is_dir():
+        _record_gate_refusal(
+            dd,
+            development_id,
+            code=CODE_DD_WORKSPACE_MISSING,
+            reason=f"workspace {workspace!r} does not exist; refusing before any unit is started",
+        )
+        return DeliveryResult(
+            status=OUTCOME_REFUSED,
+            code=CODE_DD_WORKSPACE_MISSING,
+            message=(
+                f"workspace {workspace!r} does not exist for {development_id!r}; "
+                "refused before starting a unit"
+            ),
+            line=development_id,
+            decision=decision,
+            generation=int(status.get("generation") or 1),
+            question_note_id=str((status.get("awaiting") or {}).get("question_note_id") or ""),
+            card_entity_id=str((status.get("awaiting") or {}).get("card_entity_id") or ""),
+        )
+
     generation = int(status.get("generation") or 1)
     awaiting = status.get("awaiting") or {}
     question_note_id = str(awaiting.get("question_note_id") or "")
@@ -400,10 +495,12 @@ def _deliver_dd(
         result = dd.gate(development_id, resume=True, action_key=action_key)
     except Exception as exc:  # the gate refused: report it, never a swallow
         code = str(getattr(exc, "code", "") or CODE_DD_NOT_AWAITING_GATE)
+        message = f"gate resume refused for {development_id!r}: {type(exc).__name__}: {exc}"
+        _record_gate_refusal(dd, development_id, code=code, reason=message)
         return DeliveryResult(
             status=OUTCOME_REFUSED,
             code=code,
-            message=f"gate resume refused for {development_id!r}: {type(exc).__name__}: {exc}",
+            message=message,
             line=development_id,
             decision=decision,
             generation=generation,
@@ -412,10 +509,46 @@ def _deliver_dd(
         )
 
     if not (isinstance(result, dict) and result.get("resume")):
+        message = f"gate did not resume {development_id!r}"
+        _record_gate_refusal(dd, development_id, code=CODE_DD_NOT_AWAITING_GATE, reason=message)
         return DeliveryResult(
             status=OUTCOME_REFUSED,
             code=CODE_DD_NOT_AWAITING_GATE,
-            message=f"gate did not resume {development_id!r}",
+            message=message,
+            line=development_id,
+            decision=decision,
+            generation=generation,
+            question_note_id=question_note_id,
+            card_entity_id=card_entity_id,
+        )
+
+    # S10 item 1: the success criterion is "consumed", not "a unit was started".
+    # Re-read the single after the resume and confirm it *left* ``awaiting_gate``;
+    # a single still sitting at the gate (the unit died, e.g. 889ms 75/TEMPFAIL)
+    # is a refusal carrying the unit's exit code -- never a delivered/consumed.
+    try:
+        after = dd.get(development_id)
+    except Exception:
+        after = None
+    if after is None or after.get("state") == STATE_AWAITING_GATE:
+        unit_exit_code = _unit_exit_code(after)
+        message = (
+            f"decision not consumed for {development_id!r}: the single is still "
+            f"awaiting_gate after the resume"
+        )
+        if unit_exit_code:
+            message += f" (unit exit code {unit_exit_code})"
+        _record_gate_refusal(
+            dd,
+            development_id,
+            code=CODE_DD_GATE_NOT_CONSUMED,
+            reason=message,
+            unit_exit_code=unit_exit_code or None,
+        )
+        return DeliveryResult(
+            status=OUTCOME_REFUSED,
+            code=CODE_DD_GATE_NOT_CONSUMED,
+            message=message,
             line=development_id,
             decision=decision,
             generation=generation,
@@ -990,9 +1123,11 @@ def serve(
 __all__ = [
     "ALLOWED_DECISIONS",
     "ALLOWED_TARGET_KINDS",
+    "CODE_DD_GATE_NOT_CONSUMED",
     "CODE_DD_NOT_AWAITING_GATE",
     "CODE_DD_NOT_FOUND",
     "CODE_DD_UNKNOWN",
+    "CODE_DD_WORKSPACE_MISSING",
     "CODE_LINE_NOT_PARKED",
     "CODE_NOT_DISPATCHING_LINE",
     "CODE_NO_WAITING_PARTY",

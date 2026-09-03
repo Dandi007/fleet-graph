@@ -82,6 +82,10 @@ class FakeDdPlane:
     ) -> dict[str, Any]:
         assert resume is True
         self.resumed.append((development_id, action_key or ""))
+        # M3 S10: a successful resume means the single *consumed* the decision and
+        # left ``awaiting_gate`` -- the delivery's re-read keys on this. A resume
+        # that leaves the single parked at the gate is the refusal path.
+        self.state = "running"
         return {
             "state": self.state,
             "development_id": development_id,

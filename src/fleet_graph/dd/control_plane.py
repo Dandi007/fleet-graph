@@ -56,6 +56,7 @@ on the bus, published by a human; this module has no way to publish one.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -128,6 +129,12 @@ LOG_FILE = "dd.log"
 #: (adoption) and the decision is tamper-evident (recovery).
 ADOPTIONS_FILE = "adoptions.jsonl"
 RECOVERIES_FILE = "recoveries.jsonl"
+#: M3 S10: the decision MCP's refusal trace (``record_gate_refusal``) persists the
+#: reason and unit exit code here, one generation's root. ``rebuild_status`` reads
+#: it as a fallback when the run never wrote ``result.json`` (the measured 889ms
+#: 75/TEMPFAIL death leaves no result), so a refusal is visible on the single even
+#: when the process died before it could say anything itself.
+GATE_REFUSED_FILE = "gate-refusal.json"
 
 UNIT_PREFIX = "fleet-graph-dd"
 
@@ -1128,6 +1135,11 @@ class DdControlPlane:
             awaiting = dict(raw_awaiting) if isinstance(raw_awaiting, dict) else None
             raw_gate_refused = result.get("gate_refused")
             gate_refused = dict(raw_gate_refused) if isinstance(raw_gate_refused, dict) else None
+        if gate_refused is None:
+            # M3 S10: a refusal the decision MCP recorded on a single whose run
+            # never wrote result.json (the unit died before the graph ran). The
+            # trace is the marker ``record_gate_refusal`` left behind.
+            gate_refused = self._read_gate_refusal_marker(development_id, generation)
 
         if active_unit:
             state = STATE_RUNNING
@@ -1508,6 +1520,55 @@ class DdControlPlane:
                 sort_keys=True,
             )
         return True
+
+    def record_gate_refusal(
+        self,
+        development_id: str,
+        *,
+        code: str,
+        reason: str,
+        unit_exit_code: str | None = None,
+    ) -> dict[str, Any]:
+        """S10 item 2: persist a decision-delivery refusal on the single.
+
+        The measured defect was a resume whose unit died 889ms in and left the
+        single "一个字没变" -- ``gate_refused=None``, no ``events.jsonl`` entry,
+        and the delivery reported ``delivered/consumed``. This writes both halves
+        of the trace: one ``events.jsonl`` entry under the current generation, and
+        a ``gate-refusal.json`` marker that :meth:`rebuild_status` surfaces as
+        ``gate_refused`` even when the run never wrote ``result.json``. Best-effort
+        on the filesystem: a write that cannot land must never fail the refusal
+        result flowing back to the caller.
+        """
+        record = self._record(development_id)
+        generation = self._generation(record)
+        payload = {"code": str(code or ""), "reason": str(reason or "")}
+        if unit_exit_code:
+            payload["unit_exit_code"] = str(unit_exit_code)
+        gen_root = self._gen_root(development_id, generation)
+        event = {"at": iso(self.clock()), "type": "gate_refused", **payload}
+        try:
+            gen_root.mkdir(parents=True, exist_ok=True)
+            with (gen_root / EVENTS_FILE).open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        except OSError:
+            pass
+        with contextlib.suppress(OSError):
+            write_json_durable(gen_root / GATE_REFUSED_FILE, payload)
+        self.rebuild_status(development_id)
+        return payload
+
+    def _read_gate_refusal_marker(
+        self, development_id: str, generation: int = 1
+    ) -> dict[str, Any] | None:
+        path = self._gen_root(development_id, generation) / GATE_REFUSED_FILE
+        if not path.is_file():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            return None
+        return dict(raw) if isinstance(raw, dict) else None
 
     def _committed_gate_decision(
         self, record: dict[str, Any], generation: int = 1
