@@ -24,7 +24,11 @@ from fleet_graph.executors.agent_run import (
     derive_run_id,
     find_result,
 )
-from fleet_graph.executors.agent_session import AgentSessionSeat, SeatHandle
+from fleet_graph.executors.agent_session import (
+    AgentSessionSeat,
+    SeatHandle,
+    read_session_meta,
+)
 from fleet_graph.state.run_artifacts import write_json_durable
 from fleet_graph.work_report import (
     MEDIA_TYPE_PLAIN,
@@ -229,6 +233,32 @@ class AgentSessionWorker:
         handle = self.open()
         envelope = self.seat.send(handle, prompt, timeout_seconds=self.turn_timeout_seconds)
         return parse_worker_envelope(envelope, round_no=round_no)
+
+    def turn_variables(self) -> dict[str, Any]:
+        """The defect-⑩ variable matrix this seat turns under.
+
+        `seat` is the agents.yaml seat name the roster declared; `model` is
+        read from the seat's own session metadata when the runtime recorded it
+        there (agent-session owns the model choice; we only observe it) and is
+        an honest None when it did not -- the matrix field is still recorded,
+        so a runtime that never names its model buckets as seat-only evidence
+        instead of silently looking attributed. `turn_timeout_seconds` is the
+        exact budget this adapter passes to `send`.
+        """
+        return {
+            "seat": getattr(self.seat_spec, "agent", None),
+            "model": self._session_model(),
+            "turn_timeout_seconds": self.turn_timeout_seconds,
+        }
+
+    def _session_model(self) -> str | None:
+        if self._handle is None:
+            return None
+        meta = read_session_meta(self._handle.session_root, self._handle.session_id)
+        if not meta:
+            return None
+        model = meta.get("model")
+        return str(model) if model else None
 
 
 __all__ = [
