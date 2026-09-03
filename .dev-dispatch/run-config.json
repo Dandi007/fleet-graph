@@ -1,0 +1,18 @@
+{
+ "development_id": "dev-fg-3bb9789c87ed",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "bash",
+   "-lc",
+   "uv sync --frozen && uv run pytest -q tests/test_rework_contract.py"
+  ],
+  [
+   "bash",
+   "-lc",
+   "make verify"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
