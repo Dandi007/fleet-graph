@@ -1,0 +1,15 @@
+{
+  "_comment": "M4 座位单一来源：dd stage_models 座位校验的 registry 投影（role registry 本体在 agent-runtime，收口归 wf-9b5931/S7）。default_seats = 出厂值（2026-09-03 用户拍板 impl=glm-5.3-flash / cr=glm-5.3 / fr=claude-opus-5，与 deploy/systemd/fleet-graph-dd-mcp.service 注记一致）；allowed_seats = 本舰队实际接线的座位家族（GLM 只用 5.3/5.3-flash、DS 用 pro/flash，claude-opus-5 为 fr 出厂座）。development_create 的 stage_models 形参按此校验：阶段键必须 Lifecycle 声明的 llm 阶段，座位值必须在 allowed_seats 内，否则结构化拒绝（STAGE_SEAT_STAGE_UNKNOWN / STAGE_SEAT_NOT_ALLOWED），单不建立。",
+  "default_seats": {
+    "implement": "glm-5.3-flash",
+    "continuous_review": "glm-5.3",
+    "final_review": "claude-opus-5"
+  },
+  "allowed_seats": [
+    "glm-5.3-flash",
+    "glm-5.3",
+    "claude-opus-5",
+    "deepseek-v4-pro",
+    "deepseek-flash"
+  ]
+}

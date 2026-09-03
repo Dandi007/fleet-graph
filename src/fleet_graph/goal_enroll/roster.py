@@ -53,16 +53,24 @@ class RealRosterReader:
             folder_id = entry.get("folder_id")
             if not folder_id:
                 continue
-            out.append(
-                {
-                    "folder_id": str(folder_id),
-                    "seat": str(entry.get("seat") or ""),
-                    "alias": str(entry.get("alias") or ""),
-                    "max_rounds": entry.get("max_rounds"),
-                    "enabled": bool(entry.get("enabled", False)),
-                    "generation": entry.get("generation"),
-                }
-            )
+            projected: dict[str, Any] = {
+                "folder_id": str(folder_id),
+                "seat": str(entry.get("seat") or ""),
+                "alias": str(entry.get("alias") or ""),
+                "max_rounds": entry.get("max_rounds"),
+                "enabled": bool(entry.get("enabled", False)),
+                "generation": entry.get("generation"),
+            }
+            # M4 acceptance-freeze pin (both optional, roster-PR authored):
+            # the dd-acceptance block digest pinned at enlistment, and the
+            # declared acceptance argv when the roster carries it. Absent
+            # fields stay absent -- never guessed.
+            if entry.get("acceptance_digest"):
+                projected["acceptance_digest"] = str(entry["acceptance_digest"])
+            declared_argv = entry.get("acceptance_argv") or entry.get("acceptance")
+            if declared_argv:
+                projected["acceptance_argv"] = declared_argv
+            out.append(projected)
         return tuple(out)
 
     def get(self, folder_id: str) -> dict[str, Any] | None:

@@ -228,6 +228,7 @@ class RunArtifacts:
         self._rounds_path = self.run_root / "rounds.jsonl"
         self._heartbeat_path = self.run_root / "heartbeat.json"
         self._terminal_path = self.run_root / "terminal.json"
+        self._acks_path = self.run_root / "line-message-acks.jsonl"
 
         self._hb_round: int | None = None
         self._hb_phase: str | None = None
@@ -306,6 +307,39 @@ class RunArtifacts:
             if raw.strip():
                 rounds.append(json.loads(raw))
         return rounds
+
+    # --- line-message acks (M4) ------------------------------------------
+
+    def record_line_message_acks(self, round_no: int, acks: list[dict[str, Any]]) -> bool:
+        """Append one round's line-message ack rows; never rewrites history.
+
+        The durable side of the M4 ack obligation: the read model folds this
+        ledger into the line's wake_facts, so an ack is observable on the
+        state face without re-reading rounds.jsonl. A lost append degrades
+        observability only -- it must never block the loop.
+        """
+        if not acks:
+            return True
+        try:
+            with self._acks_path.open("a", encoding="utf-8") as handle:
+                for ack in acks:
+                    row = {"round": round_no, "at": iso(self._clock()), **ack}
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                handle.flush()
+            return True
+        except OSError as exc:
+            log.warning("line-message acks append failed (not blocking the loop): %s", exc)
+            return False
+
+    def read_line_message_acks(self) -> list[dict[str, Any]]:
+        """The line's ack ledger, in arrival order. For tests and the read model."""
+        if not self._acks_path.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        for raw in self._acks_path.read_text(encoding="utf-8").splitlines():
+            if raw.strip():
+                rows.append(json.loads(raw))
+        return rows
 
     # --- worker turn report ----------------------------------------------
 

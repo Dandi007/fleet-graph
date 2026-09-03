@@ -239,9 +239,12 @@ def test_the_create_tool_admits_only_the_derivation_inputs() -> None:
     """Admission is server-side derivation: no handoff, digest, receipt,
     idempotency or policy parameter exists to guess at.
 
-    The one exception is the per-stage run-fence override `timeouts`
-    ({stage_id: positive seconds}): it tunes *how* a stage's run is fenced,
-    not *what* the order is, and the server validates and records it."""
+    Two tuned inputs exist. The per-stage run-fence override `timeouts`
+    ({stage_id: positive seconds}) tunes *how* a stage's run is fenced.
+    The M4 seat channel `stage_models` ({llm_stage: seat}) freezes which
+    seat each agent stage runs under -- validated against the registry and
+    recorded in record.json, which is then the single source. Both are
+    server-validated and recorded; neither changes *what* the order is."""
     server = build_mcp_server(FakeControlPlane())
     tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
     schema = tools["development_create"].parameters
@@ -252,6 +255,7 @@ def test_the_create_tool_admits_only_the_derivation_inputs() -> None:
         "spec_path",
         "dispatched_by",
         "timeouts",
+        "stage_models",
     }
     assert schema["required"] == ["repo_path"]
 
@@ -313,6 +317,7 @@ def test_every_supported_tool_drives_the_control_plane_over_the_running_endpoint
                 "target_base": "refs/remotes/origin/main",
                 "spec_text": "# spec",
                 "timeouts": {"implement": 7200},
+                "stage_models": {"implement": "glm-5.3-flash"},
             },
         ),
         ("development_start", {"development_id": "dev-1"}),
@@ -377,6 +382,7 @@ def test_every_supported_tool_drives_the_control_plane_over_the_running_endpoint
                 "spec_path": None,
                 "dispatched_by": "",
                 "timeouts": {"implement": 7200},
+                "stage_models": {"implement": "glm-5.3-flash"},
             },
         ),
         ("start", {"development_id": "dev-1"}),
@@ -517,6 +523,7 @@ def test_the_fake_control_plane_mirrors_the_real_surface() -> None:
         "spec_path",
         "dispatched_by",
         "timeouts",
+        "stage_models",
     }
     gate = {
         name

@@ -48,6 +48,11 @@ log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = "1"
 
+#: M4: how many line-message ack rows the state face folds into wake_facts
+#: (latest first). A ledger cap, not a retention policy -- the run's
+#: line-message-acks.jsonl keeps everything.
+ACK_TAIL_LIMIT = 50
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7494
 DEFAULT_RUN_ROOT = Path("/data/fleet-graph/runs")
@@ -531,6 +536,15 @@ class FleetStateView:
             wake_facts_stale = terminal is not None and (
                 live_run_id is None or declared_run_id is None or live_run_id != declared_run_id
             )
+
+            # M4 ack obligation on the state face: the line's line-message ack
+            # ledger, folded into wake_facts (latest first, capped) so an
+            # operator can see an instruction was answered without re-reading
+            # the run's rounds. A missing/failed read degrades to absent --
+            # never a 5xx, never a fabricated ledger.
+            acks = _read_jsonl(run_root / folder_id / "line-message-acks.jsonl")
+            if acks:
+                wake_facts["line_message_acks"] = list(reversed(acks))[:ACK_TAIL_LIMIT]
 
             generation = self._generation_for(run_root, folder_id, roster_generation)
             line_objs.append(

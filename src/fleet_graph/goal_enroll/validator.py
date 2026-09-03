@@ -69,6 +69,7 @@ from fleet_graph.goal_enroll.contract import (
     GoalEnrollError,
     iso_timestamp,
 )
+from fleet_graph.goal_enroll.freeze import acceptance_block_digest
 
 GOAL_MD = "goal.md"
 GOLDEN_ORDER_MD = "golden-order.md"
@@ -355,6 +356,10 @@ class GoalEnrollValidator:
             "max_rounds": max_rounds,
             "briefing_version": self._briefing_version,
             "acceptance_argv": tuple(tuple(argv) for argv in acceptance_argv),
+            # M4 acceptance-command freeze: pin the carrier's dd-acceptance
+            # block digest at enlistment. The goal.md is already in hand from
+            # gate 2, so the pin is exact -- not recomputed from a re-read.
+            "acceptance_digest": acceptance_block_digest(goal_md),
             "liveness": tuple(liveness),
             "lint_warnings": tuple(lint_warnings),
             "mechanism": GOAL_ENROLL_MECHANISM,

@@ -49,6 +49,7 @@ from fleet_graph.goal_enroll.contract import (
     QUEUE_STATUS_REJECTED,
     GoalEnrollError,
 )
+from fleet_graph.goal_enroll.freeze import ACCEPTANCE_DIGEST_MISMATCH
 from fleet_graph.goal_enroll.queue import EnrollQueue
 from fleet_graph.goal_enroll.roster import RealRosterReader
 from fleet_graph.goal_enroll.validator import GoalEnrollValidator
@@ -91,6 +92,7 @@ class GoalEnrollService:
         board: Any = None,
         submitted_by: str = DEFAULT_SUBMITTED_BY,
         supervisor_identity_check: Any = None,
+        goal_carrier_digest: Any = None,
     ) -> None:
         self._validator = validator
         self._queue = queue if queue is not None else EnrollQueue()
@@ -105,6 +107,11 @@ class GoalEnrollService:
             if supervisor_identity_check is not None
             else _default_supervisor_identity_check()
         )
+        #: M4 acceptance-freeze seam: ``(folder_id) -> digest | None`` reading
+        #: the goal carrier's current dd-acceptance block digest. None (or a
+        #: None answer) disables the mismatch report -- a carrier that cannot
+        #: be read is never reported as a mismatch.
+        self._goal_carrier_digest = goal_carrier_digest
 
     # --- submission -------------------------------------------------------
 
@@ -159,6 +166,7 @@ class GoalEnrollService:
                 "note": note,
                 "mechanism": facts["mechanism"],
                 "acceptance_argv": [list(argv) for argv in facts["acceptance_argv"]],
+                "acceptance_digest": facts["acceptance_digest"],
                 "liveness": [dict(result) for result in facts["liveness"]],
                 "lint_warnings": list(facts["lint_warnings"]),
             }
@@ -266,11 +274,23 @@ class GoalEnrollService:
         return {"entries": roster_entries + queue_entries}
 
     def status(self, folder_id: str) -> dict[str, Any]:
-        """One application's detail: roster/pending entry + rejection history."""
+        """One application's detail: roster/pending entry + rejection history.
+
+        M4 acceptance-command freeze face: for every enlisted goal the
+        response exposes ``acceptance`` (the pinned argv declaration) and
+        ``acceptance_digest`` (the goal carrier's ```dd-acceptance block
+        digest pinned at enlistment), recomputes the carrier's current
+        digest, and reports the structured code ``ACCEPTANCE_DIGEST_MISMATCH``
+        when the carrier no longer says what was enlisted -- changing the
+        acceptance commands means re-enlisting. A goal with no pin
+        (pre-M4 entry) or an unreadable carrier exposes the fields as
+        None/False: a missing pin can never mismatch, and an unreadable
+        carrier is never reported as one.
+        """
         roster_entry = self._roster.get(folder_id)
         queue_entry = self._queue.get(folder_id)
         rejections = list(self._queue.rejections(folder_id))
-        return {
+        response: dict[str, Any] = {
             "folder_id": folder_id,
             "roster": roster_entry,
             "queue": queue_entry,
@@ -286,6 +306,18 @@ class GoalEnrollService:
                 else (queue_entry.get("status") if queue_entry is not None else None)
             ),
         }
+        pinned_source = roster_entry or queue_entry or {}
+        pinned_digest = pinned_source.get("acceptance_digest")
+        pinned_argv = pinned_source.get("acceptance_argv") or pinned_source.get("acceptance")
+        current_digest = self._goal_carrier_digest(folder_id) if self._goal_carrier_digest else None
+        mismatch = bool(pinned_digest and current_digest and pinned_digest != current_digest)
+        response["acceptance"] = pinned_argv
+        response["acceptance_digest"] = pinned_digest
+        response["acceptance_digest_current"] = current_digest
+        response["acceptance_digest_mismatch"] = mismatch
+        if mismatch:
+            response["code"] = ACCEPTANCE_DIGEST_MISMATCH
+        return response
 
     # --- admission (U4 supervisor release path) ----------------------------
 
@@ -401,6 +433,11 @@ class GoalEnrollService:
         self._queue.record_rejection(folder_id, code=code, detail=detail, alias=alias)
 
     # --- compatibility reads ---------------------------------------------
+
+    def is_supervisor(self, identity: str) -> bool:
+        """The supervisor-plane identity guard, shared by the M4 line_message
+        edge: True only for a supervisor-plane principal."""
+        return bool(self._supervisor_identity_check(identity))
 
     def queue_entries(self) -> tuple[dict[str, Any], ...]:
         return self._queue.entries()

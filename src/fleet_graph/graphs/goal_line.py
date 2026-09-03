@@ -34,6 +34,11 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
 from fleet_graph.acceptance import STATUS_ERROR, STATUS_NOT_DECLARED
+from fleet_graph.goal.line_message import (
+    ack_rows_for_round,
+    marker_from_payload,
+    parse_verdict_acks,
+)
 from fleet_graph.goal_interrupt.contract import (
     DecisionInput,
     InterruptCheckpoint,
@@ -576,6 +581,72 @@ def _verdict_update(
     return {"pending_prompt": prompt, "pending_sha": check.sha256}
 
 
+def _drained_line_messages(drain: Any) -> list[tuple[str, dict[str, Any]]]:
+    """The round's drained supervisor line-messages as ``(message_id, payload)``.
+
+    Works over the real ``Drain`` (``Delivery`` objects carrying the raw bus
+    payload) and over the plain message-dict lists tests and drills use. Only
+    payloads carrying the ``line_message`` marker count -- every other inbox
+    message is none of the ack obligation's business.
+    """
+    deliveries = getattr(drain, "deliveries", None)
+    raw: list[Any] = (
+        deliveries if deliveries is not None else (drain if isinstance(drain, list) else [])
+    )
+    messages: list[tuple[str, dict[str, Any]]] = []
+    for delivery in raw:
+        message = getattr(delivery, "message", None)
+        if message is not None:
+            payload = getattr(delivery, "payload", {})
+            message_id = str(getattr(delivery, "message_id", "") or "")
+        elif isinstance(delivery, dict):
+            payload = delivery.get("payload")
+            payload = payload if isinstance(payload, dict) else {}
+            message_id = str(delivery.get("message_id") or "")
+        else:
+            continue
+        if marker_from_payload(payload) is not None:
+            messages.append((message_id, payload))
+    return messages
+
+
+def _apply_ack_obligation(
+    deps: LineDeps, drain: Any, result: dict[str, Any], round_no: int
+) -> None:
+    """The M4 回执义务: every drained instruction is answered or counted idle.
+
+    The coordinator's verdict may declare acks (``acks: [{message_id,
+    outcome, reason}]``); they are validated and recorded. The pump's own
+    mechanical guard runs first: an instruction whose text is a bare
+    decision token is acked ``rejected`` / ``message_is_not_a_decision`` --
+    a message can never be executed *as* a verdict. Instructions left
+    unacked land in the round record's ``unacked_instructions`` and count
+    the round idle (``record_noop`` -- the R8 口径; the alert rules over the
+    count are wf-6475fd's scope). ``info`` messages carry no obligation.
+
+    Ack rows are appended to the run's ``line-message-acks.jsonl`` ledger
+    (the state face folds it into wake_facts) and mirrored into the round
+    record -- progress and state face, both.
+    """
+    messages = _drained_line_messages(drain)
+    if not messages:
+        return
+    verdict_acks = parse_verdict_acks(result)
+    acks, unacked = ack_rows_for_round(messages, verdict_acks)
+    if acks:
+        deps.artifacts.record_line_message_acks(round_no, acks)
+    if acks or unacked:
+        deps.artifacts.append_round(
+            {
+                "round": round_no,
+                "line_message_acks": acks,
+                "unacked_instructions": unacked,
+            }
+        )
+    if unacked:
+        deps.guards.record_noop()
+
+
 def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     def check_bounds(state: LineState) -> LineState:
         """INV-8. Pure counting, no judgement."""
@@ -604,7 +675,9 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             if deps.persist_coord_input is not None:
                 deps.persist_coord_input(round_no, coord_input)
 
-        deps.inbox.drain_then_ack(persist)
+        # The drain is kept so the M4 ack obligation can see which of the
+        # round's deliveries were supervisor line-messages.
+        drain = deps.inbox.drain_then_ack(persist)[0]
 
         # G1: the moment this round consumes goal.md. The coordinator reads the
         # goal; the revision we snapshot here is the one this round actually
@@ -621,6 +694,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
                 consumed_revision = None
 
         result = deps.coordinator.turn(round_no, coord_input)
+        _apply_ack_obligation(deps, drain, result, round_no)
         update = _verdict_update(deps, state, round_no, result)
         if consumed_revision:
             update["goal_revision"] = consumed_revision

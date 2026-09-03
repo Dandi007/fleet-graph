@@ -360,6 +360,7 @@ def build_mcp_server(
         spec_path: str | None = None,
         dispatched_by: str = "",
         timeouts: dict[str, int] | None = None,
+        stage_models: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Admit one development. Everything else is derived server-side.
 
@@ -377,6 +378,15 @@ def build_mcp_server(
         (`{stage_id: positive seconds}`, e.g. `{"implement": 7200}`); an
         unknown stage id is refused. Not passing it keeps the 3600s default
         for every stage -- existing behavior unchanged.
+
+        `stage_models` (M4) is the seat parameter channel: `{llm_stage ->
+        seat}` (e.g. `{"implement": "glm-5.3-flash"}`), validated against the
+        registry's allowed seat set -- an unknown stage or a disallowed seat
+        refuses with a structured code and no unit is created. Every llm
+        stage is frozen into record.json as `seats` (with per-stage source:
+        `line-explicit` / `registry-default`); every launch of this
+        development runs exactly those seats. There is no server-wide
+        stage-model override any more -- the record is the single source.
         """
         return call(
             "create",
@@ -386,6 +396,7 @@ def build_mcp_server(
             spec_path=spec_path,
             dispatched_by=dispatched_by,
             timeouts=timeouts,
+            stage_models=stage_models,
         )
 
     @mcp.tool()
@@ -561,7 +572,6 @@ def serve(
     plugin_binding: str | None = None,
     working_directory: str | None = None,
     executable: str | None = None,
-    stage_models: dict[str, str] | None = None,
     auto_resume: bool | None = None,
     auto_resume_interval: float | None = None,
     work_folder_root: str | None = None,
@@ -577,8 +587,6 @@ def serve(
         overrides["working_directory"] = working_directory
     if executable:
         overrides["executable"] = executable
-    if stage_models:
-        overrides["stage_models"] = stage_models
     control = DdControlPlane(**overrides)
     # B3 binding: the concrete wf_reconcile source is bound here, not left
     # unbound (RECONCILE_SOURCE_UNBOUND). The root comes from the flag or the
