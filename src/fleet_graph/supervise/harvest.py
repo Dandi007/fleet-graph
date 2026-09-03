@@ -518,8 +518,10 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         outcome = None
         if gaps or occupied is not None:
             outcome = OUTCOME_ESCALATED
-        # 案A改写①：命中 allowlist 条目后，该单的生效 default_branch / deploy_command
-        # 取自条目（逐仓生效值）；条目未指定时才退回全局 deps.* 缺省。授权判定仍在
+        # 案A改写①/②：命中 allowlist 条目后，该单的生效 default_branch /
+        # deploy_command 取自条目（逐仓生效值）；条目未指定时才退回全局 deps.*
+        # 缺省——但 `allowed_deploy: []`（merge-only）条目的生效 deploy 命令恒为
+        # 空 argv（只授合并权、不部署），绝不退回全局误伤成 deny。授权判定仍在
         # gate 独立进行，这里只决定「生效值取哪份」，不放宽也不收紧写权。
         resolved_repo_path = str(repo) if repo is not None else ""
         effective_default_branch = deps.allowlist.effective_default_branch(
@@ -1030,9 +1032,14 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
                 "steps": _record_auth(state, auth, "deploy"),
                 "outcome": OUTCOME_REFUSED,
             }
-        steps = _record_step(state, "deploy", command=command)
         if not command:
+            # 案A改写②：merge-only 条目（allowed_deploy: []）的生效 deploy 命令
+            # 恒为空 argv -> 合法 no-op：不执行任何部署原语，deploy_exit_code 恒 0；
+            # postconditions 不得因此判红、不得当作未执行写步、不得判部署失败
+            # （合并权照常行使：只合并、不部署）。
+            steps = _record_step(state, "deploy", ok=True, exit_code=0, noop=True, command=command)
             return {"steps": steps, "deploy_exit_code": 0}
+        steps = _record_step(state, "deploy", command=command)
         repo = Path(state.get("repo_path") or "")
         try:
             exit_code = int(deps.ops.deploy(command, repo))
@@ -1160,6 +1167,10 @@ def build_harvest_graph(deps: HarvestDeps) -> StateGraph:
         假（机械事实，非自述）也计缺失 -> escalated——「收割链里非零退出必须
         停下来交人工」落进代码，任何中途 step 的 ok:false 都不再被静默吞掉
         （H2 终局语义缺口修复）。
+
+        案A改写②：deploy 节点的空命令 no-op（merge-only 收割）记 `ok=True,
+        exit_code=0`——是合法已行使的步骤，绝不当未执行写步/部署失败判红；
+        真正的部署失败（执行了命令且退出码非零）仍走 ok:false 被本扫描判红。
         """
         missing: list[str] = []
         if not state.get("pr_merged"):

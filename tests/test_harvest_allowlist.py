@@ -341,3 +341,122 @@ class TestEntryEffectiveValues:
                     ]
                 }
             )
+
+
+class TestMergeOnlyDeploy:
+    """案A改写②：`allowed_deploy: []`（merge-only）不误拒；声明与白名单不符才拒。
+
+    - merge-only 条目（未声明 `deploy_command`）：生效 deploy 命令恒为空 argv，
+      绝不退回全局 fallback——退回全局正是它被 authorize 误伤成 deny 的根因；
+      authorize 对空 deploy 恒放行（分支命中时）。
+    - 条目声明 `deploy_command` 而该命令不在 `allowed_deploy` 白名单内（「声明
+      与白名单不符」）-> 拒 + reasons 指名 offending 命令与缺失授权。
+    """
+
+    def _merge_only(self) -> HarvestAllowlist:
+        return parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": "/data/code/self/fleet-graph",
+                        "allowed_branches": ["refs/heads/main"],
+                        "allowed_deploy": [],
+                    }
+                ]
+            }
+        )
+
+    def test_merge_only_effective_deploy_command_is_empty_not_global(self) -> None:
+        """阳性根因口：merge-only 条目生效 deploy 命令恒为空，绝不读全局 fallback。"""
+        allow = self._merge_only()
+        assert (
+            allow.effective_deploy_command(
+                "/data/code/self/fleet-graph", ["bash", "scripts/deploy.sh"]
+            )
+            == []
+        )
+
+    def test_merge_only_entry_authorizes_empty_deploy(self) -> None:
+        allow = self._merge_only()
+        auth = allow.authorize(
+            repo_path="/data/code/self/fleet-graph",
+            branch="refs/heads/main",
+            deploy=(),
+        )
+        assert auth.granted is True
+        assert auth.reasons == ()
+
+    def test_merge_only_entry_still_refuses_outside_branch(self) -> None:
+        """merge-only 只豁免部署校验，分支白名单铁律不变。"""
+        allow = self._merge_only()
+        auth = allow.authorize(
+            repo_path="/data/code/self/fleet-graph",
+            branch="refs/heads/other",
+            deploy=(),
+        )
+        assert auth.granted is False
+
+    def test_declared_command_in_whitelist_authorizes(self) -> None:
+        allow = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": "/data/code/self/fleet-graph",
+                        "allowed_branches": ["refs/heads/main"],
+                        "allowed_deploy": [["make", "deploy"]],
+                        "deploy_command": ["make", "deploy"],
+                    }
+                ]
+            }
+        )
+        auth = allow.authorize(
+            repo_path="/data/code/self/fleet-graph",
+            branch="refs/heads/main",
+            deploy=("make", "deploy"),
+        )
+        assert auth.granted is True
+
+    def test_declared_command_outside_whitelist_is_refused_naming_offender(self) -> None:
+        """反向：声明与白名单不符 -> 拒 + reasons 指名 offending 命令与缺失授权。"""
+        allow = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": "/data/code/self/fleet-graph",
+                        "allowed_branches": ["refs/heads/main"],
+                        "allowed_deploy": [["bash", "scripts/deploy.sh"]],
+                        "deploy_command": ["make", "deploy"],
+                    }
+                ]
+            }
+        )
+        auth = allow.authorize(
+            repo_path="/data/code/self/fleet-graph",
+            branch="refs/heads/main",
+            deploy=("make", "deploy"),
+        )
+        assert auth.granted is False
+        assert any("['make', 'deploy']" in r for r in auth.reasons)
+        assert any("不在白名单" in r for r in auth.reasons)
+
+    def test_declared_command_on_merge_only_entry_is_refused(self) -> None:
+        """merge-only 条目声明了部署命令 = 声明与（空）白名单不符 -> 拒，不静默吞。"""
+        allow = parse_harvest_allowlist(
+            {
+                "entries": [
+                    {
+                        "repo_path": "/data/code/self/fleet-graph",
+                        "allowed_branches": ["refs/heads/main"],
+                        "allowed_deploy": [],
+                        "deploy_command": ["make", "deploy"],
+                    }
+                ]
+            }
+        )
+        auth = allow.authorize(
+            repo_path="/data/code/self/fleet-graph",
+            branch="refs/heads/main",
+            deploy=("make", "deploy"),
+        )
+        assert auth.granted is False
+        assert any("['make', 'deploy']" in r for r in auth.reasons)
