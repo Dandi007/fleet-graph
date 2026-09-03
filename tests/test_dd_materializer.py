@@ -49,7 +49,13 @@ IMPLEMENT_DIGEST = "sha256:" + "a" * 64
 
 
 def review_receipt() -> dict[str, Any]:
-    return {"review_result": {"verdict": "APPROVE", "findings": []}}
+    return {
+        "review_result": {
+            "verdict": "APPROVE",
+            "findings": [],
+            "checked_items": ["spec clauses", "product diff surface"],
+        }
+    }
 
 
 def make_materializer(repo: Path) -> PluginMaterializer:
@@ -732,3 +738,142 @@ class TestTheCapabilityCheckIsNotBypassed:
         assert "invoke_review_materializer" in body
         assert "materialize-handoff" not in body
         assert "subprocess" not in body
+
+
+class TestTheFinalReviewOwesTheS12Receipt:
+    """S12.3/S12.5: the checklist is seal-gated, the final review's mutation
+    experiment is executed engine-side, and both land as engine-side sidecars
+    beside the sealed receipt (the pinned plugin field set cannot carry them).
+    """
+
+    def _materializer(self, repo: Path, base: str, acceptance: list[list[str]]):
+        builder = StageDispatchBuilder(
+            DevelopmentChain(
+                development_id=DEVELOPMENT_ID,
+                workspace_path=str(repo),
+                target_base_commit=base,
+                root_handoff_digest="sha256:" + "c" * 64,
+            )
+        )
+        return PluginMaterializer(
+            builder=builder,
+            binding=object(),
+            target=MaterializationTarget(
+                remote_url="https://example.invalid/repo.git",
+                remote_ref="refs/heads/dev-001",
+                worktree=str(repo),
+                state_root=str(repo / ".state"),
+            ),
+            acceptance_commands=acceptance,
+        )
+
+    def _two_commit_repo(self, repo: Path) -> tuple[str, str]:
+        (repo / "src").mkdir()
+        (repo / "src" / "api.py").write_text("def serve():\n    return 1\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "base")
+        base = head(repo)
+        (repo / "src" / "api.py").write_text("def serve():\n    return gate()\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "head")
+        return base, head(repo)
+
+    def test_a_review_without_a_checklist_fails_the_seal(self, repo: Path) -> None:
+        materializer = self._materializer(repo, "b" * 40, [])
+        dispatch = dispatch_for(repo, "continuous_review")
+        seal_implement_receipt(repo, materializer.builder.build(dispatch)["attempt_id"])
+        with pytest.raises(MaterializationFailed, match="checked/verified_items"):
+            materializer.request(
+                REVIEW,
+                dispatch,
+                StageOutcome(receipt={"review_result": {"verdict": "APPROVE", "findings": []}}),
+            )
+
+    def test_the_final_review_seal_executes_and_records_the_mutation_experiment(
+        self, repo: Path, monkeypatch: Any
+    ) -> None:
+        base, product_head = self._two_commit_repo(repo)
+        acceptance = [["true"]]
+        materializer = self._materializer(repo, base, acceptance)
+        attempt_id = materializer.builder.build(dispatch_for(repo, "final_review"))["attempt_id"]
+        # The parents both reviews name, exactly as the real sealers write them.
+        receipts = repo / ".state" / "receipts" / attempt_id
+        receipts.mkdir(parents=True)
+        (receipts / "implement-receipt.json").write_bytes(b'{"ok":1}')
+        (receipts / "continuous-review-receipt.json").write_bytes(b'{"ok":2}')
+
+        monkeypatch.setattr(
+            plugin_adapter,
+            "invoke_review_materializer",
+            lambda *a, **k: {"output_commit": SEALED_COMMIT, "verdict": "APPROVE"},
+        )
+
+        declared = {
+            "review_result": {
+                "verdict": "APPROVE",
+                "findings": [],
+                "checked_items": ["spec clauses", "product diff surface"],
+            }
+        }
+        materializer.materialize(
+            LIFECYCLE.stages["final_review"],
+            dispatch_for(repo, "final_review"),
+            StageOutcome(event="APPROVE", receipt=declared),
+        )
+
+        record = json.loads((receipts / "final-review-mutation.json").read_text(encoding="utf-8"))
+        assert record["implementation_subject_commit"] == product_head
+        assert record["target_base_commit"] == base
+        assert record["acceptance_commands"] == acceptance
+        assert record["checked_items"] == ["spec clauses", "product diff surface"]
+        assert record["verified_items"]
+        # The enumerated target is the added ``gate()`` call; the acceptance
+        # ("true") cannot go red, so the record says so honestly.
+        assert record["mutation_targets"] == [
+            {
+                "file": "src/api.py",
+                "line": 2,
+                "call": "gate",
+                "red": False,
+                "acceptance_exit_code": 0,
+            }
+        ]
+
+        # And the gate's schema accepts this receipt view, while the verdict
+        # it carries (an uncovered target) is exactly what the mutation
+        # obligation exists to catch.
+        from fleet_graph.dd.final_review import review_receipt_defects
+        from fleet_graph.dd.self_gate import enumerate_mutation_targets, verify_mutation_receipt
+        from fleet_graph.dd.self_gate_evidence import diff_added_lines
+
+        assert review_receipt_defects(record, phase="final") == []
+        verdict = verify_mutation_receipt(
+            enumerated=enumerate_mutation_targets(diff_added_lines(repo, base, product_head)),
+            receipt_targets=record["mutation_targets"],
+        )
+        assert verdict.passed is False, "an uncovered call site must hold the verdict"
+
+    def test_the_continuous_review_seal_persists_the_checklist(
+        self, repo: Path, monkeypatch: Any
+    ) -> None:
+        materializer = self._materializer(repo, "b" * 40, [])
+        attempt_id = materializer.builder.build(dispatch_for(repo, "continuous_review"))[
+            "attempt_id"
+        ]
+        receipts = repo / ".state" / "receipts" / attempt_id
+        receipts.mkdir(parents=True)
+        (receipts / "implement-receipt.json").write_bytes(b'{"ok":1}')
+        monkeypatch.setattr(
+            plugin_adapter,
+            "invoke_review_materializer",
+            lambda *a, **k: {"output_commit": SEALED_COMMIT, "verdict": "APPROVE"},
+        )
+        materializer.materialize(
+            REVIEW,
+            dispatch_for(repo, "continuous_review"),
+            StageOutcome(event="APPROVE", receipt=review_receipt()),
+        )
+        checked = json.loads(
+            (receipts / "continuous-review-checked.json").read_text(encoding="utf-8")
+        )
+        assert checked["checked_items"] == ["spec clauses", "product diff surface"]

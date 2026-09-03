@@ -89,7 +89,14 @@ class AgentRunStub:
                 },
             }
         else:
-            declared = {"verdict": verdict, "findings": [], "review_phase": stage.id}
+            declared = {
+                "verdict": verdict,
+                "findings": [],
+                "review_phase": stage.id,
+                # S12: every review receipt names what it checked, even at
+                # findings=0 -- the seal refuses a declaration without it.
+                "checked_items": ["spec clauses", "product diff surface"],
+            }
         return RunStatus("succeeded", {"structured_result": declared})
 
 

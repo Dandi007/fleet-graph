@@ -44,6 +44,13 @@ from fleet_graph.dd.dispatch import (
     derive_attempt_id,
     read_committed_refs,
 )
+from fleet_graph.dd.final_review import (
+    declared_review_defects,
+    execute_mutation_experiment,
+    faulted_experiment,
+    write_checked_items,
+    write_mutation_receipt,
+)
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.dd.vendor import plugin_adapter
 from fleet_graph.graphs.dd_actors import (
@@ -241,6 +248,11 @@ class PluginMaterializer:
     target: MaterializationTarget
     lifecycle: Lifecycle = field(default_factory=Lifecycle.load)
     verify_worktree_head: bool = True
+    # The frozen acceptance argv the single was admitted with. The final
+    # review's mutation experiment (S12.3) reruns exactly these against each
+    # mechanically enumerated target, in a one-shot copy. Empty (an un-wired
+    # caller) leaves the experiment faulted-on-record rather than invented.
+    acceptance_commands: list[list[str]] = field(default_factory=list)
 
     @property
     def implement_stage(self) -> str | None:
@@ -375,14 +387,61 @@ class PluginMaterializer:
                     "INVALID_HANDOFF_SCHEMA",
                     "a review actor result must declare a review_result object",
                 )
+            # S12.5, engine-side schema: a review that does not say what it
+            # checked produces an invalid receipt, so it never reaches the
+            # sealer. The checklist itself is engine-side state (the pinned
+            # plugin schema cannot grow a field); it is persisted in the
+            # phase's sidecar after the seal.
+            defects = declared_review_defects(review_result)
+            if defects:
+                raise MaterializationFailed(
+                    "INVALID_HANDOFF_SCHEMA",
+                    "review_result is not a valid receipt: " + "; ".join(defects),
+                )
             request["review_result"] = review_actor_result(review_result)
             request["implementation_handoff_receipt_digest"] = self._implement_digest(
                 stage_dispatch
             )
         return request
 
+    def _final_review_stage(self) -> str | None:
+        """The last review stage in the chain -- the one that owes the mutation receipt."""
+        reviews = self.review_stages
+        return reviews[-1] if reviews else None
+
+    def _run_final_review_experiment(self, stage_dispatch: dict[str, Any]) -> dict[str, Any]:
+        """Execute the final review's mutation experiment (S12.3), fail-closed.
+
+        The experiment runs pre-seal, against the reviewed tree (the dispatch's
+        ``input_commit`` -- metadata-only seals never move the product tree),
+        on the frozen base the single was admitted with. A mechanical fault
+        becomes a *faulted* receipt record -- present, but verifying nothing --
+        so the gate's schema refuses the verdict instead of the engine passing
+        silence off as evidence.
+        """
+        base = str(stage_dispatch.get("target_base_commit") or "")
+        head = str(stage_dispatch.get("input_commit") or "")
+        try:
+            return execute_mutation_experiment(
+                workspace=Path(self.target.worktree),
+                base=base,
+                head=head,
+                acceptance_commands=self.acceptance_commands,
+            )
+        except Exception as exc:
+            return faulted_experiment(f"{type(exc).__name__}: {exc}", base=base, head=head)
+
     def materialize(self, stage: Stage, dispatch: Dispatch, outcome: StageOutcome) -> Sealed:
         request = self.request(stage, dispatch, outcome)
+        stage_dispatch = request["dispatch"]
+
+        # The final_review stage executes its mutation experiment before the
+        # seal: a mechanical fault must leave nothing sealed rather than a
+        # receipt whose evidence was never produced (S12.3).
+        mutation_payload: dict[str, Any] | None = None
+        if stage.id == self._final_review_stage() and str(outcome.event).upper() == "APPROVE":
+            mutation_payload = self._run_final_review_experiment(stage_dispatch)
+
         invoke = (
             plugin_adapter.invoke_implement_materializer
             if stage.id == self.implement_stage
@@ -390,6 +449,28 @@ class PluginMaterializer:
         )
         result = invoke(self.binding, request, verify_worktree_head=self.verify_worktree_head)
         sealed = self._read(stage, result)
+
+        # Engine-side receipt completion (S12.5): the checklist the reviewer
+        # declared -- and, for the final review, the mutation record the stage
+        # executed -- persist as sidecars beside the sealed receipt. The sealed
+        # receipt's own bytes are the sealer's and stay untouched; the gate
+        # merges this view. The checklist rides the actor's raw declaration
+        # (the narrowed request copy strips it for the pinned plugin schema).
+        raw_review = (outcome.receipt or {}).get("review_result")
+        checked = raw_review.get("checked_items") if isinstance(raw_review, dict) else None
+        if stage.id == self._final_review_stage() and mutation_payload is not None:
+            if isinstance(checked, list):
+                mutation_payload["checked_items"] = checked
+            write_mutation_receipt(
+                self.target.state_root, str(stage_dispatch["attempt_id"]), mutation_payload
+            )
+        elif stage.id in self.review_stages and isinstance(checked, list):
+            write_checked_items(
+                self.target.state_root,
+                str(stage_dispatch["attempt_id"]),
+                checked_items=checked,
+            )
+
         # The sealer wrote the stage's artifacts, so it -- not the agent --
         # is what output_verify should be believing.
         return Sealed(

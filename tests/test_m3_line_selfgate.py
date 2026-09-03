@@ -18,6 +18,7 @@ dd root, no live git repo, no live pytest run is required.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -1259,3 +1260,322 @@ class TestMechanicalCollector:
         echo, exit_code = default_rerun(tmp_path, ["bash", "-lc", "echo personal; exit 3"])
         assert "personal" in echo
         assert exit_code == 3
+
+
+# --- S12 closure: the final_review stage executes the mutation experiment ---
+# --- (engine side, in a one-shot copy); the review receipt schema is       ---
+# --- engine-enforced; the execution entry is statically reachable (D8).    ---
+
+
+def _mutation_workspace(tmp_path: Path) -> tuple[Path, str, str]:
+    """A two-commit repo whose head adds two production call sites: one the
+    frozen acceptance covers (``api.gate``), one it does not (``orphan.helper``)."""
+    workspace = tmp_path / "mws"
+    (workspace / "src" / "pkg").mkdir(parents=True)
+    (workspace / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    _git(workspace, "init", "-q")
+    _git(workspace, "config", "user.email", "gate@example.invalid")
+    _git(workspace, "config", "user.name", "gate")
+    _git(workspace, "add", "-A")
+    _git(workspace, "commit", "-q", "-m", "base")
+    base = _git_head(workspace)
+
+    (workspace / "src" / "pkg" / "api.py").write_text(
+        "def serve():\n    return gate()\n", encoding="utf-8"
+    )
+    (workspace / "src" / "pkg" / "orphan.py").write_text(
+        "def stray():\n    helper()\n", encoding="utf-8"
+    )
+    _git(workspace, "add", "-A")
+    _git(workspace, "commit", "-q", "-m", "head")
+    return workspace, base, _git_head(workspace)
+
+
+def _covered_acceptance() -> list[list[str]]:
+    return [[sys.executable, "-c", "import sys; sys.path.insert(0, 'src'); import pkg.api"]]
+
+
+class TestFinalReviewMutationExperiment:
+    """S12.3: the engine executes the experiment; the receipt is mechanical."""
+
+    def test_every_enumerated_target_is_mutated_and_only_covered_ones_land_red(
+        self, tmp_path: Path
+    ) -> None:
+        from fleet_graph.dd.final_review import execute_mutation_experiment
+        from fleet_graph.dd.self_gate import enumerate_mutation_targets
+        from fleet_graph.dd.self_gate_evidence import diff_added_lines
+
+        workspace, base, head = _mutation_workspace(tmp_path)
+        payload = execute_mutation_experiment(
+            workspace=workspace,
+            base=base,
+            head=head,
+            acceptance_commands=_covered_acceptance(),
+        )
+
+        enumerated = enumerate_mutation_targets(diff_added_lines(workspace, base, head))
+        recorded = {(t["file"], t["line"], t["call"]): t for t in payload["mutation_targets"]}
+        assert set(recorded) == {(t.file, t.line, t.call) for t in enumerated}, (
+            "the receipt's target set must be exactly the mechanical enumeration"
+        )
+        assert recorded["src/pkg/api.py", 2, "gate"]["red"] is True
+        assert recorded["src/pkg/orphan.py", 2, "helper"]["red"] is False
+        assert payload["verified_items"], "the receipt must list what was checked"
+
+    def test_the_subject_workspace_stays_read_only_and_the_copy_is_discarded(
+        self, tmp_path: Path
+    ) -> None:
+        from fleet_graph.dd.final_review import execute_mutation_experiment
+
+        workspace, base, head = _mutation_workspace(tmp_path)
+
+        def snapshot() -> dict[Path, bytes]:
+            return {
+                path.relative_to(workspace): path.read_bytes()
+                for path in sorted(workspace.rglob("*"))
+                if path.is_file() and ".git" not in path.parts
+            }
+
+        before = snapshot()
+        copies = tmp_path / "copies"
+        copies.mkdir()
+        execute_mutation_experiment(
+            workspace=workspace,
+            base=base,
+            head=head,
+            acceptance_commands=_covered_acceptance(),
+            copy_root=copies,
+        )
+
+        assert snapshot() == before, (
+            "a verification experiment that writes the subject workspace "
+            "voids the conclusion (S12 revision 1)"
+        )
+        import subprocess
+
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert status.stdout.strip() == ""
+        assert list(copies.iterdir()) == [], "the one-shot copy must be discarded"
+
+    def test_an_experiment_without_a_frozen_command_cannot_pass_silently(
+        self, tmp_path: Path
+    ) -> None:
+        from fleet_graph.dd.final_review import execute_mutation_experiment
+
+        workspace, base, head = _mutation_workspace(tmp_path)
+        with pytest.raises(RuntimeError, match="frozen acceptance"):
+            execute_mutation_experiment(
+                workspace=workspace, base=base, head=head, acceptance_commands=[]
+            )
+
+    def test_a_faulted_experiment_verifies_nothing(self) -> None:
+        from fleet_graph.dd.final_review import faulted_experiment, review_receipt_defects
+
+        payload = faulted_experiment("diff exploded", base="b" * 40, head="h" * 40)
+        assert payload["mutation_targets"] == []
+        assert payload["verified_items"] == []
+        assert review_receipt_defects(payload, phase="final"), (
+            "the gate must refuse a faulted experiment, never read it as a pass"
+        )
+
+
+class TestEngineSideReceiptSchema:
+    """S12.5: the checklist is a required receipt field, engine-enforced."""
+
+    def test_a_receipt_without_the_checklist_is_invalid_in_both_phases(self) -> None:
+        from fleet_graph.dd.final_review import review_receipt_defects
+
+        for phase in ("continuous", "final"):
+            defects = review_receipt_defects({"verdict": "APPROVE", "findings": []}, phase=phase)
+            assert any("checked/verified_items" in defect for defect in defects), phase
+        assert review_receipt_defects({"checked_items": []}, phase="continuous")
+        assert review_receipt_defects({"verified_items": ["", "  "]}, phase="final")
+
+    def test_a_final_receipt_without_per_target_red_green_is_invalid(self) -> None:
+        from fleet_graph.dd.final_review import review_receipt_defects
+
+        defects = review_receipt_defects({"verified_items": ["x"]}, phase="final")
+        assert any("mutation_targets" in defect for defect in defects)
+        partial = review_receipt_defects(
+            {
+                "verified_items": ["x"],
+                "mutation_targets": [{"file": "a.py", "line": 3, "call": "f"}],
+            },
+            phase="final",
+        )
+        assert any("red/green" in defect for defect in partial)
+        valid = review_receipt_defects(
+            {
+                "verified_items": ["x"],
+                "mutation_targets": [{"file": "a.py", "line": 3, "call": "f", "red": True}],
+            },
+            phase="final",
+        )
+        assert valid == []
+        # the continuous receipt owes the checklist, not the mutation record
+        assert review_receipt_defects({"checked_items": ["spec clauses"]}, phase="continuous") == []
+
+    def test_a_declared_review_without_the_checklist_is_refused_at_the_seal(self) -> None:
+        from fleet_graph.dd.final_review import declared_review_defects
+
+        assert declared_review_defects({"verdict": "APPROVE", "findings": []})
+        assert (
+            declared_review_defects(
+                {"verdict": "APPROVE", "findings": [], "checked_items": ["obligations"]}
+            )
+            == []
+        )
+
+
+class TestGateConsumesTheMutationSidecar:
+    """The gate merges the engine-side sidecar into the sealed receipt's view."""
+
+    def _evidence(self, tmp_path: Path, mutation: dict[str, Any]) -> list[Any]:
+        workspace, base, head = _make_workspace(tmp_path)
+        dd_root = tmp_path / "dd"
+        _seal_receipt(
+            dd_root,
+            "attempt-1",
+            "final-review-receipt.json",
+            {"implementation_subject_commit": head, "verdict": "APPROVE"},
+        )
+        # The sidecar names the same subject the sealed receipt does: the gate
+        # selects the receipt view whose subject sits on the gated head.
+        mutation = {"implementation_subject_commit": head, **mutation}
+        _seal_receipt(dd_root, "attempt-1", "final-review-mutation.json", mutation)
+        from fleet_graph.dd.self_gate import EVIDENCE_MUTATION_RECEIPT
+        from fleet_graph.dd.self_gate_evidence import collect_gate_evidence
+
+        return [
+            item
+            for item in collect_gate_evidence(
+                development_id=DD_ID,
+                dd=_record_dd(workspace, base),
+                dd_root=dd_root,
+                rerun=lambda _ws, _argv: ("gate-ok\n", 0),
+                regression_probe=lambda _ws: set(),
+            )
+            if item.id == EVIDENCE_MUTATION_RECEIPT
+        ]
+
+    def test_the_sidecar_completes_the_receipt_view_and_passes(self, tmp_path: Path) -> None:
+        mutation = {
+            "mutation_targets": [
+                {"file": "src/pkg/api.py", "line": 2, "call": "gate", "red": True}
+            ],
+            "verified_items": ["mechanical enumeration", "one-shot experiment"],
+        }
+        (item,) = self._evidence(tmp_path, mutation)
+        assert item.passed is True
+
+    def test_a_sidecar_target_that_survives_is_refused(self, tmp_path: Path) -> None:
+        mutation = {
+            "mutation_targets": [
+                {"file": "src/pkg/api.py", "line": 2, "call": "gate", "red": False}
+            ],
+            "verified_items": ["mechanical enumeration"],
+        }
+        (item,) = self._evidence(tmp_path, mutation)
+        assert item.passed is False
+        assert "did not land red" in item.detail
+
+
+class TestD8TheExecutionEntryIsStaticallyReachable:
+    """D8: the equivalence assertion is a static call-graph check, never a
+    "some process is running" check -- unreachable must be red."""
+
+    def test_the_import_chain_from_the_review_modules_reaches_the_entry(self) -> None:
+        import ast
+
+        src_root = Path(__file__).resolve().parent.parent / "src"
+        entry = Path("fleet_graph") / "dd" / "final_review.py"
+
+        def local_imports(relative: Path) -> set[str]:
+            tree = ast.parse((src_root / relative).read_text(encoding="utf-8"))
+            modules: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    modules.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                    modules.add(node.module)
+            return modules
+
+        def resolve(module: str) -> Path | None:
+            candidate = src_root.joinpath(*module.split("."))
+            for path in (candidate.with_suffix(".py"), candidate / "__init__.py"):
+                if path.is_file():
+                    return path.relative_to(src_root)
+            return None
+
+        reached: set[Path] = set()
+        frontier = [Path("fleet_graph") / "graphs" / "dd_materializer.py"]
+        while frontier:
+            current = frontier.pop()
+            if current in reached:
+                continue
+            reached.add(current)
+            for module in local_imports(current):
+                path = resolve(module)
+                if path is not None and path not in reached:
+                    frontier.append(path)
+
+        assert entry in reached, (
+            "the final_review mutation execution entry must be reachable in "
+            "the production review module call graph (D8)"
+        )
+
+    def test_the_entry_is_the_production_function_not_a_stub(self) -> None:
+        import fleet_graph.dd.final_review as final_review
+        import fleet_graph.graphs.dd_materializer as materializer
+
+        assert callable(final_review.execute_mutation_experiment)
+        assert final_review.execute_mutation_experiment.__module__ == "fleet_graph.dd.final_review"
+        assert materializer.execute_mutation_experiment is final_review.execute_mutation_experiment
+
+
+class TestReviewPromptCarriesTheS12Contract:
+    def _render(self, phase: str) -> str:
+        from fleet_graph.dd.prompt import render_review_prompt
+
+        return render_review_prompt(
+            {
+                "input_commit": "1" * 40,
+                "contract_version": "dev-dispatch.attempt-context/v1",
+                "attempt_id": "attempt-1",
+                "spec_ref": {"digest": "sha256:" + "a" * 64},
+            },
+            phase=phase,
+            worktree_path="/tmp/wt",
+            reviewer_job_id="job-1",
+            implementation_subject_commit="2" * 40,
+            spec_path=".dev-dispatch/spec/approved.md",
+            index_path=".dev-dispatch/feedback/index.json",
+        )
+
+    def test_read_only_wording_names_the_one_shot_copy(self) -> None:
+        """S12.1 (修订一): experiments live in a one-shot copy; the subject
+        workspace is read-only and writing it still voids the verdict."""
+        for phase in ("continuous", "final"):
+            prompt = self._render(phase)
+            assert "subject workspace is read-only" in prompt
+            assert "one-shot copy" in prompt
+            assert "discarded afterwards" in prompt
+            assert "still voids its verdict" in prompt
+            assert "Do not modify anything" not in prompt
+
+    def test_checked_items_is_a_required_result_field(self) -> None:
+        prompt = self._render("continuous")
+        assert "checked_items" in prompt
+        assert "All twelve keys" in prompt
+
+    def test_only_the_final_prompt_carries_the_mutation_contract(self) -> None:
+        final = self._render("final")
+        assert "mutation experiment" in final
+        assert "final-review-mutation.json" in final
+        assert "final-review-mutation.json" not in self._render("continuous")

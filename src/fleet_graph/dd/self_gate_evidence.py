@@ -69,6 +69,21 @@ from fleet_graph.dd.self_gate import (
     verify_mutation_receipt,
 )
 
+
+def _review_sidecar_files() -> dict[str, str]:
+    """The engine-side sidecars per review stage (lazy: the module also imports
+    this one, and the collector must not close that cycle at import time)."""
+    from fleet_graph.dd.final_review import REVIEW_SIDECAR_FILES
+
+    return REVIEW_SIDECAR_FILES
+
+
+def _review_receipt_defects(payload: dict[str, Any], *, phase: str) -> list[str]:
+    from fleet_graph.dd.final_review import review_receipt_defects
+
+    return review_receipt_defects(payload, phase=phase)
+
+
 #: The dd control plane's root; the same default the decision surface reads.
 DEFAULT_DD_ROOT = Path("/data/fleet-graph/dd")
 
@@ -132,6 +147,12 @@ def load_stage_receipts(
     All attempts are returned in directory order; the caller selects the one
     on the gated head. A receipt that cannot be read is skipped -- a torn
     receipt file is "no receipt", which the obligations fail on.
+
+    Review receipts are returned as their *view*: the sealed receipt merged
+    with its engine-side sidecar (S12), the sidecar winning on the fields it
+    owns. The sealed receipt's fixed field set cannot carry the mutation
+    record or the checklist, so an un-merged receipt would read as invalid
+    even when the stage produced its evidence.
     """
     gen_root = (
         Path(dd_root) / development_id
@@ -139,6 +160,7 @@ def load_stage_receipts(
         else Path(dd_root) / development_id / f"g{generation}"
     )
     receipts = gen_root / "state" / "receipts"
+    sidecars = _review_sidecar_files()
     out: dict[str, list[dict[str, Any]]] = {}
     if not receipts.is_dir():
         return out
@@ -151,8 +173,19 @@ def load_stage_receipts(
                 receipt = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if isinstance(receipt, dict):
-                out.setdefault(stage, []).append(receipt)
+            if not isinstance(receipt, dict):
+                continue
+            view = dict(receipt)
+            sidecar_name = sidecars.get(stage)
+            sidecar_path = entry / sidecar_name if sidecar_name else None
+            if sidecar_path is not None and sidecar_path.is_file():
+                try:
+                    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    sidecar = None
+                if isinstance(sidecar, dict):
+                    view.update(sidecar)
+            out.setdefault(stage, []).append(view)
     return out
 
 
@@ -455,18 +488,20 @@ def _obligation_mutation_receipt(
             "no sealed final_review receipt on the gated head; the mutation "
             "experiment cannot be verified",
         )
-    targets = receipt.get("mutation_targets")
-    verified_items = receipt.get("verified_items")
-    if not isinstance(targets, list) or not isinstance(verified_items, list) or not verified_items:
+    # S12.5, engine-side schema: the receipt's view (sealed receipt + sidecar)
+    # must carry the 已核验项 checklist and a position plus a red/green result
+    # for every target. Missing any of it is 回执无效 -- refused, never repaired.
+    defects = _review_receipt_defects(receipt, phase="final")
+    if defects:
         return EvidenceItem(
             EVIDENCE_MUTATION_RECEIPT,
             "mutation receipt verified",
             False,
-            "final_review receipt carries no verifiable mutation record: it "
-            "must list 'mutation_targets' (per-target file/line/call/red) and "
-            "a non-empty 'verified_items' checklist (S12)",
+            "final_review receipt is not a verifiable mutation record: " + "; ".join(defects),
         )
-    return verify_mutation_receipt(enumerated=enumerated, receipt_targets=targets)
+    return verify_mutation_receipt(
+        enumerated=enumerated, receipt_targets=receipt["mutation_targets"]
+    )
 
 
 def _obligation_regression(

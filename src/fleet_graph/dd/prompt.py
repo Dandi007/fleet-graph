@@ -228,8 +228,11 @@ every review artifact it references; together with the immutable cross-generatio
 feedback archive at `{history_path}` (older generations' entries, never erased)
 they are the complete feedback history. The live index is scoped to the current
 generation's attempt chain, so earlier-generation records appear in the archive,
-not in the index. Do not modify anything: this is a read-only review, and a
-reviewer that writes to the subject workspace has its verdict discarded.
+not in the index. The **subject workspace is read-only**: verification
+experiments (the mutation experiment, dependency installs, any rerun) belong in
+a **one-shot copy** -- a separate worktree or a temporary directory, made for
+the purpose and **discarded afterwards** -- never in the subject workspace
+itself. A reviewer that writes to the subject workspace still voids its verdict.
 
 ## Your verdict
 
@@ -255,15 +258,40 @@ key, no outer `effects` key. Echo these back verbatim:
 }}
 ```
 
-and add these three, which are yours to determine:
+and add these four, which are yours to determine:
 
 - `verdict`: `APPROVE` or `REJECT`
 - `findings`: an array, possibly empty, of
   `{{"severity": "blocker"|"major"|"minor"|"note", "summary": "...", "location": "..."}}`
   -- `location` is optional; `severity` and `summary` are not
 - `reviewer_model`: the model you are running as
+- `checked_items`: a non-empty array of short strings naming what you actually
+  checked (the spec clauses, diff surfaces, and obligations your verdict
+  covers). Required **even when `findings` is empty** -- a receipt that lists
+  nothing it verified is invalid and the seal refuses it (S12).
 
-All eleven keys must be present, and nothing else.\
+All twelve keys must be present, and nothing else.\
+"""
+
+# The final_review stage owes the mutation receipt on top of the shared review
+# contract (S12.3): the engine executes the experiment mechanically -- this
+# text tells the reviewer what the stage's receipt must carry and what stays
+# out of the reviewer's own hands.
+FINAL_MUTATION_CONTRACT = """\
+
+## The mutation receipt this stage owes (S12)
+
+The engine executes this stage's mutation experiment mechanically, in a
+one-shot copy: it enumerates this single's new production call sites from the
+`base..head` product diff, deletes each in the copy, and reruns the frozen
+acceptance command there. The per-target positions and red/green results land
+in the stage's receipt artifact (`final-review-mutation.json` beside the
+sealed review receipt) together with the verified-items checklist. A target
+whose deletion leaves the acceptance green has no test coverage, and the gate
+refuses the verdict unless the receipt names exactly the enumerated set and
+every target landed red. This is engine work, not yours: do not run the
+experiment against the subject workspace -- it is read-only for you, and a
+verdict the gate cannot verify against the receipt is refused.\
 """
 
 
@@ -317,10 +345,11 @@ def render_review_prompt(
     rebuilding that here would be rebuilding its workflow engine. What this
     does is narrower and sufficient: state the task, and state the result
     contract -- because seven of `review.result.v2`'s eleven fields are values
-    we already hold and the reviewer only has to echo. Four are its own:
-    verdict, findings, reviewer_job_id, reviewer_model.
+    we already hold and the reviewer only has to echo. Five are its own:
+    verdict, findings, reviewer_job_id, reviewer_model, and the checked_items
+    checklist S12 makes a required field of every review receipt.
     """
-    return REVIEW_PROMPT.format(
+    rendered = REVIEW_PROMPT.format(
         phase=phase,
         subject_commit=stage_dispatch["input_commit"],
         spec_path=spec_path,
@@ -335,6 +364,9 @@ def render_review_prompt(
         spec_digest=stage_dispatch["spec_ref"]["digest"],
         reviewer_job_id=reviewer_job_id,
     )
+    if phase == str(ReviewPhase.FINAL):
+        rendered += FINAL_MUTATION_CONTRACT
+    return rendered
 
 
 @dataclass
@@ -413,6 +445,7 @@ class PluginPromptSource:
 
 
 __all__ = [
+    "FINAL_MUTATION_CONTRACT",
     "IMPLEMENT_EVIDENCE",
     "IMPLEMENT_PERSONA",
     "IMPLEMENT_TEMPLATE",

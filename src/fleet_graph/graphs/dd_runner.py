@@ -210,6 +210,10 @@ def build_pipeline(
             worktree=str(config.workspace_path),
             state_root=str(config.state_root),
         ),
+        # The same frozen declaration configure wrote down. The final review's
+        # mutation experiment (S12.3) reruns exactly these -- never whatever
+        # the worktree ended up containing.
+        acceptance_commands=[list(c) for c in (config.run_config.get("acceptance_commands") or [])],
         verify_worktree_head=config.verify_worktree_head,
     )
 
