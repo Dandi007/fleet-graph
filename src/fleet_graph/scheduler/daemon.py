@@ -181,7 +181,7 @@ class TickResult:
     parked: bool = False
     #: What the parking machinery did this tick, when anything happened:
     #: "established", "woken:inbox", "woken:goal_revision",
-    #: "woken:decision_consumed", "woken:probe_failed".
+    #: "woken:board_decision", "woken:decision_consumed", "woken:probe_failed".
     park_event: str | None = None
     #: Wake fact 4 observability: the red missed-delivery annotation. Filled
     #: on the wake tick when a decision for a dd development this line
@@ -1057,7 +1057,12 @@ class Scheduler:
     #   4. the decision bridge consumed a `work.decision.v1` for a dd
     #      development this line dispatched (`dispatched_by == folder_id`):
     #      `dispatched_decision_consumed_at` lands in the stall-state file and
-    #      the next tick wakes the line (`woken:decision_consumed`).
+    #      the next tick wakes the line (`woken:decision_consumed`);
+    #   5. a `work.decision.v1` landed on `board:work-notes` referencing the
+    #      park's own question note after the parking instant, signed
+    #      (`woken:board_decision`). The wake only brings the line back to
+    #      observe the ruling -- consuming it stays the decision surface's
+    #      (M2 path) job, exactly like the inbox wake.
     #
     # Wake fact 4 also carries the observability half of the spec: a line that
     # *stays* parked with a consumed decision past the stall threshold
@@ -1200,6 +1205,23 @@ class Scheduler:
         if state.get("dispatched_decision_consumed_at") is not None:
             stall = self._decision_wake_stall(line, state)
             return self._wake(line, state, "woken:decision_consumed", stall=stall)
+
+        # The board-decision fact (D5): the human gate ruled and the ruling
+        # landed on `board:work-notes` targeting this park's own question note
+        # (persisted as `board_question_note_id` at establishment -- reused,
+        # never re-created) after the parking instant, signed. Wake = ignite
+        # the next generation, nothing more: the ruling's consumption stays
+        # with the decision surface (M2 path), exactly like the inbox wake --
+        # the wake only brings the line back to observe the fact, so nothing
+        # here writes any ruling state. A probe failure fails open like every
+        # other source: a broken probe must never lock the line shut.
+        note_id = str(state.get("board_question_note_id") or "")
+        if note_id and self.wake is not None:
+            try:
+                if self.wake.decision_landed(note_id, float(state["parked_at"])):
+                    return self._wake(line, state, "woken:board_decision")
+            except Exception as exc:  # fail open, by design
+                return self._wake(line, state, f"woken:probe_failed:{probe_error_tag(exc)}")
 
         # The inbox source is consulted only if the establishment probe found
         # it usable (`parked_inbox_available`), and its availability is *not*

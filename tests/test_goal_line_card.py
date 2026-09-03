@@ -93,6 +93,9 @@ class FakeWake:
     def goal_revision(self, folder_id: str) -> str:
         return "sha256:rev-1"
 
+    def decision_landed(self, question_note_id: str, after_epoch: float) -> bool:
+        return False
+
 
 class FakeTicket:
     question_note_id = "note-123"
