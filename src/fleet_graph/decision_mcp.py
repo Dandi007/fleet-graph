@@ -49,7 +49,7 @@ import json
 import os
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -61,6 +61,7 @@ from fleet_graph.dd.selfgate import (
     CODE_SELFGATE_REGRESSION,
     SelfGateEvidence,
     decide,
+    parse_self_gate_evidence,
 )
 from fleet_graph.decision_bridge.owners import (
     OWNER_KIND_DD,
@@ -511,6 +512,61 @@ def deliver_self_gate_decision(
     return delivery
 
 
+def _coerce_self_gate_evidence(evidence: Any) -> SelfGateEvidence | None:
+    """Normalise a self-gate evidence payload to typed evidence, or None.
+
+    The delivery surface may receive the six-duty evidence as a JSON object (a
+    ``Mapping``), a JSON string, or an already-typed :class:`SelfGateEvidence`.
+    Anything unparseable is ``None`` -- the caller refuses rather than guessing.
+    """
+    if isinstance(evidence, SelfGateEvidence):
+        return evidence
+    if isinstance(evidence, str):
+        try:
+            evidence = json.loads(evidence)
+        except ValueError:
+            return None
+    if isinstance(evidence, Mapping):
+        return parse_self_gate_evidence(evidence)
+    return None
+
+
+def _self_gate_delivery(
+    *,
+    evidence: Any,
+    development_id: str,
+    run_root: Path,
+    dd: Any,
+    clock: Callable[[], float],
+) -> DeliveryResult:
+    """Route a self-judged dd delivery through the six-duty gate.
+
+    M3 wiring: the engine default delivery path runs ``decide(evidence)`` before
+    the M2 dd gate is touched. Unparseable evidence is refused as
+    ``SELFGATE_INCOMPLETE`` -- the six duties are required fields, never
+    guessable defaults.
+    """
+    parsed = _coerce_self_gate_evidence(evidence)
+    if parsed is None:
+        return DeliveryResult(
+            status=OUTCOME_REFUSED,
+            code=CODE_SELFGATE_INCOMPLETE,
+            message=(
+                "self-gate evidence could not be parsed; the six evidence duties "
+                "are required fields of a self-judged delivery"
+            ),
+            line=development_id,
+            decision="",
+        )
+    return deliver_self_gate_decision(
+        parsed,
+        development_id=development_id,
+        run_root=run_root,
+        dd=dd,
+        clock=clock,
+    )
+
+
 def deliver_decision(
     *,
     line: str,
@@ -524,6 +580,7 @@ def deliver_decision(
     dd_source: DdOwnerSource | None = None,
     principal: str = "",
     dd: Any = None,
+    evidence: Any = None,
 ) -> DeliveryResult:
     """The synchronous delivery core, testable without the MCP transport.
 
@@ -537,7 +594,23 @@ def deliver_decision(
 
     M2: a ``dev-fg-<id>`` ``line`` routes to the dd gate path, validated against
     the caller's ``principal`` (which must equal the single's ``dispatched_by``).
+
+    M3: when ``evidence`` (the line's assembled six-duty evidence, a JSON object
+    or a :class:`SelfGateEvidence`) is supplied, the delivery runs through the
+    self-gate first -- the engine default path for a dispatching line's
+    self-judged verdict. A missing/vacuous duty, a non-dispatching principal, or
+    a regression vs. the frozen ``target_base_commit`` baseline refuses before
+    the single is touched, regardless of the ``line``/``target_kind`` arguments.
     """
+    if evidence is not None:
+        return _self_gate_delivery(
+            evidence=evidence,
+            development_id=line if _is_dd_target(line) else (target_id or line),
+            run_root=run_root,
+            dd=dd,
+            clock=clock,
+        )
+
     kind = _normalize_target_kind(target_kind)
     if kind == TARGET_KIND_DD:
         return deliver_decision_dd(
@@ -947,6 +1020,7 @@ def build_decision_mcp_server(
         target_kind: str = TARGET_KIND_LINE,
         target_id: str = "",
         principal: str = "",
+        evidence: Any = None,
     ) -> DeliveryResult:
         return deliver_decision(
             line=line,
@@ -959,6 +1033,7 @@ def build_decision_mcp_server(
             dd_source=dd_source,
             principal=principal,
             dd=dd,
+            evidence=evidence,
         )
 
     deliverer = deliver or _deliver
@@ -981,6 +1056,7 @@ def build_decision_mcp_server(
         target_kind: str = TARGET_KIND_LINE,
         target_id: str = "",
         principal: str = "",
+        evidence: Any = None,
     ) -> dict[str, Any]:
         """Deliver one decision to a parked goal line or a dd gate, synchronously.
 
@@ -995,6 +1071,14 @@ def build_decision_mcp_server(
         M2: ``line`` may name a dd single (``dev-fg-<id>``), in which case
         ``principal`` must equal the single's ``dispatched_by``; the single is
         resumed through its gate and the dispatching line is woken.
+
+        M3: ``evidence`` is the dispatching line's assembled six-duty evidence
+        (a JSON object). When supplied, the delivery runs the self-gate first:
+        a missing/vacuous duty, a non-dispatching principal, or a regression vs.
+        the frozen ``target_base_commit`` baseline refuses before the single is
+        touched. ``decided_by`` is ``evidence.principal``, validated against the
+        single's ``record.json.dispatched_by`` -- the engine default path for a
+        self-judged dd verdict.
         """
         try:
             result = deliverer(
@@ -1004,6 +1088,7 @@ def build_decision_mcp_server(
                 target_kind=target_kind,
                 target_id=target_id,
                 principal=principal,
+                evidence=evidence,
             )
         except DecisionPayloadError as exc:
             refuse(f"invalid payload: {exc}")

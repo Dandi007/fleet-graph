@@ -202,6 +202,42 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
 
     inbox: Any = _build_line_inbox(config)
 
+    def _self_gate_delivery(evidence: Any, development_id: str) -> dict[str, Any]:
+        """The production self-gate delivery port (M3): evidence -> gate -> dd.
+
+        Parses the line's assembled six-duty evidence and hands it to the
+        engine's self-gate (``deliver_self_gate_decision``), which runs
+        ``decide`` and, on admission, the M2 dd delivery against this line's
+        run root. Returns the delivery result as a dict (status/code/message),
+        never raises -- the graph records the outcome and moves on. The six
+        duties are required fields: unparseable evidence refuses as incomplete.
+        """
+        import json as _json
+
+        from fleet_graph.dd.selfgate import CODE_SELFGATE_INCOMPLETE, parse_self_gate_evidence
+        from fleet_graph.decision_mcp import deliver_self_gate_decision
+
+        parsed_evidence = evidence
+        if isinstance(parsed_evidence, str):
+            try:
+                parsed_evidence = _json.loads(parsed_evidence)
+            except ValueError:
+                parsed_evidence = None
+        parsed = (
+            parse_self_gate_evidence(parsed_evidence) if isinstance(parsed_evidence, dict) else None
+        )
+        if parsed is None:
+            return {
+                "status": "refused",
+                "code": CODE_SELFGATE_INCOMPLETE,
+                "message": "self-gate evidence could not be parsed; six duties are required fields",
+                "line": development_id,
+            }
+        result = deliver_self_gate_decision(
+            parsed, development_id=development_id, run_root=config.run_root
+        )
+        return result.as_dict()
+
     deps = LineDeps(
         coordinator=coordinator,
         worker=worker,
@@ -243,6 +279,10 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         # back to a best-effort default over the work-folder MCP when the config
         # does not inject one.
         goal_revision=config.goal_revision or _build_goal_revision_reader(config),
+        # M3: the production self-gate delivery port. The line, once it assembles
+        # its six-duty evidence for a dispatched single, delivers through the
+        # engine's self-gate and M2 dd path instead of a human board decision.
+        self_gate=_self_gate_delivery,
     )
     return build_goal_line_graph(deps), deps
 

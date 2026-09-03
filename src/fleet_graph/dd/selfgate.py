@@ -501,6 +501,163 @@ def decide(evidence: SelfGateEvidence) -> SelfGateResult:
     )
 
 
+def _argv_sets(raw: Any) -> tuple[tuple[str, ...], ...] | None:
+    """A JSON list of argv lists -> tuple of tuples; malformed -> None.
+
+    Each argv is a list of strings. A present-but-empty list yields ``()``;
+    an absent/malformed value yields None so the caller can tell "vacuous"
+    (empty triple) from "missing" (no field).
+    """
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return None
+    sets: list[tuple[str, ...]] = []
+    for entry in raw:
+        if not isinstance(entry, Sequence) or isinstance(entry, (str, bytes)):
+            return None
+        if any(not isinstance(part, str) for part in entry):
+            return None
+        sets.append(tuple(str(part) for part in entry))
+    return tuple(sets)
+
+
+def _str_list(raw: Any) -> tuple[str, ...] | None:
+    """A JSON list of strings -> tuple; malformed/absent -> None."""
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return None
+    if any(not isinstance(item, str) for item in raw):
+        return None
+    return tuple(str(item) for item in raw)
+
+
+def _str(raw: Any) -> str | None:
+    return raw if isinstance(raw, str) else None
+
+
+def _int(raw: Any) -> int | None:
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
+
+
+def parse_self_gate_evidence(raw: Mapping[str, Any]) -> SelfGateEvidence | None:
+    """Parse a JSON-serializable six-duty evidence object into typed evidence.
+
+    The engine's default delivery surface (``decision_deliver``) receives the
+    dispatching line's assembled evidence as a plain JSON object; this converts
+    it into the typed :class:`SelfGateEvidence` the gate judges. Any missing or
+    malformed field yields ``None`` -- the caller refuses (SELFGATE_INCOMPLETE),
+    never guesses a default that would let a vacuous duty pass. Each of the six
+    duties is parsed independently, so an absent duty lands as ``None`` and is
+    judged missing exactly as if it had never been supplied.
+    """
+    if not isinstance(raw, Mapping):
+        return None
+
+    principal = _str(raw.get("principal"))
+    dispatched_by = _str(raw.get("dispatched_by"))
+    decision = _str(raw.get("decision"))
+    target_base_commit = _str(raw.get("target_base_commit"))
+    if principal is None or dispatched_by is None or decision is None or target_base_commit is None:
+        return None
+
+    fields: dict[str, Any] = {
+        "principal": principal,
+        "dispatched_by": dispatched_by,
+        "decision": decision,
+        "target_base_commit": target_base_commit,
+    }
+
+    triple_raw = raw.get("acceptance_triple")
+    if isinstance(triple_raw, Mapping):
+        spec_argv = _argv_sets(triple_raw.get("spec_argv"))
+        record_argv = _argv_sets(triple_raw.get("record_argv"))
+        receipt_argv = _argv_sets(triple_raw.get("receipt_argv"))
+        fields["acceptance_triple"] = (
+            AcceptanceTriple(
+                spec_argv=spec_argv, record_argv=record_argv, receipt_argv=receipt_argv
+            )
+            if spec_argv is not None and record_argv is not None and receipt_argv is not None
+            else None
+        )
+    else:
+        fields["acceptance_triple"] = None
+
+    boundary_raw = raw.get("diff_boundary")
+    if isinstance(boundary_raw, Mapping):
+        changed = _str_list(boundary_raw.get("changed_product_paths"))
+        declared = _str_list(boundary_raw.get("spec_declared_paths"))
+        fields["diff_boundary"] = (
+            DiffBoundary(changed_product_paths=changed, spec_declared_paths=declared)
+            if changed is not None and declared is not None
+            else None
+        )
+    else:
+        fields["diff_boundary"] = None
+
+    fields["zero_test_deletion"] = _str_list(raw.get("zero_test_deletion"))
+
+    self_run_raw = raw.get("self_run")
+    if isinstance(self_run_raw, Mapping):
+        argv = _str_list(self_run_raw.get("argv"))
+        exit_code = _int(self_run_raw.get("exit_code"))
+        tail = self_run_raw.get("tail")
+        fields["self_run"] = (
+            SelfRun(argv=argv, exit_code=exit_code, tail=str(tail) if isinstance(tail, str) else "")
+            if argv is not None and exit_code is not None
+            else None
+        )
+    else:
+        fields["self_run"] = None
+
+    gun_raw = raw.get("mutation_gun")
+    if isinstance(gun_raw, Mapping):
+        shots_raw = gun_raw.get("shots")
+        shots: list[MutationShot] = []
+        shots_ok = isinstance(shots_raw, Sequence) and not isinstance(shots_raw, (str, bytes))
+        if shots_ok:
+            for entry in shots_raw:
+                if not isinstance(entry, Mapping):
+                    shots_ok = False
+                    break
+                index = _int(entry.get("index"))
+                mutator = _str(entry.get("mutator"))
+                acceptance_exit_code = _int(entry.get("acceptance_exit_code"))
+                if index is None or mutator is None or acceptance_exit_code is None:
+                    shots_ok = False
+                    break
+                shots.append(
+                    MutationShot(
+                        index=index,
+                        mutator=mutator,
+                        acceptance_exit_code=acceptance_exit_code,
+                    )
+                )
+        restored_sha = _str(gun_raw.get("restored_sha"))
+        expected_sha = _str(gun_raw.get("expected_sha"))
+        mode_ok = gun_raw.get("restored_mode_ok", True)
+        fields["mutation_gun"] = (
+            MutationGun(
+                shots=tuple(shots),
+                restored_sha=restored_sha or "",
+                expected_sha=expected_sha or "",
+                restored_mode_ok=bool(mode_ok),
+            )
+            if shots_ok
+            else None
+        )
+    else:
+        fields["mutation_gun"] = None
+
+    baseline_raw = raw.get("regression_baseline")
+    fields["regression_baseline"] = (
+        RegressionBaseline.from_dict(baseline_raw) if isinstance(baseline_raw, Mapping) else None
+    )
+
+    fields["current_failed_tests"] = frozenset(_str_list(raw.get("current_failed_tests")) or ())
+    fields["flaky_tests"] = frozenset(_str_list(raw.get("flaky_tests")) or ())
+    fields["flaky_attribution"] = frozenset(_str_list(raw.get("flaky_attribution")) or ())
+
+    return SelfGateEvidence(**fields)
+
+
 def harvest_trigger(decision: str, *, merged: bool) -> bool:
     """S7: the harvest reactor fires only after merge, never straight off the gate.
 
@@ -546,4 +703,5 @@ __all__ = [
     "decide",
     "harvest_trigger",
     "merge_then_harvest",
+    "parse_self_gate_evidence",
 ]

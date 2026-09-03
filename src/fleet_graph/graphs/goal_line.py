@@ -314,6 +314,13 @@ class LineState(TypedDict, total=False):
     waiting_on_declared: str
     #: M1: the development id a ``waiting_on: "dd"`` terminal is parked on.
     dd_development_id: str
+    #: M3: the dispatching line's assembled six-duty evidence (a JSON object
+    #: ready for the self-gate). When set, ``self_gate_step`` delivers it and
+    #: clears the field so the delivery fires exactly once per wake.
+    self_gate_evidence: dict[str, Any]
+    #: M3: the recorded outcome of the self-gate delivery (status/code/message),
+    #: surfaced to the next coordinator turn exactly like ``last_acceptance``.
+    self_gate_delivery: dict[str, Any]
     pump_fault: bool
     rounds_recorded: int
     #: Facts from the last acceptance step: status plus per-command exit codes
@@ -364,10 +371,26 @@ class AcceptancePort(Protocol):
     def run(self) -> dict[str, Any]: ...
 
 
+class SelfGateDeliveryPort(Protocol):
+    """M3: the line's self-judged dd delivery, with the six-duty evidence.
+
+    The port is the one thing the line graph needs to hand an assembled
+    six-duty evidence object off to the engine's self-gate (``decide``) and,
+    on admission, the M2 dd delivery. It returns a machine-readable outcome
+    dict (``status`` / ``code`` / ``message`` ...) the line records rather
+    than interpreting -- execution is delivery, judgement stays in the gate.
+    """
+
+    def deliver(self, evidence: Any, development_id: str) -> dict[str, Any]: ...
+
+
 class ArtifactsPort(Protocol):
     def heartbeat(self, round_no: int, phase: str, *, force: bool = False) -> bool: ...
+
     def append_round(self, line: dict[str, Any]) -> bool: ...
+
     def write_worker_report(self, round_no: int, report: dict[str, Any]) -> Any: ...
+
     def write_terminal(
         self,
         *,
@@ -437,6 +460,12 @@ class LineDeps:
     #: then absent, and the scheduler fails open (never locks) on the missing
     #: baseline.
     goal_revision: Any = None
+    #: M3: the self-gate delivery port. Non-None lets a line that assembled its
+    #: six-duty evidence (``LineState.self_gate_evidence``) hand it to the
+    #: engine's self-gate and M2 dd delivery. None keeps the graph unchanged --
+    #: the ``self_gate_step`` node degrades to a recorded ``unwired`` outcome
+    #: instead of faulting.
+    self_gate: SelfGateDeliveryPort | None = None
 
     def now(self) -> float | None:
         return self.clock() if self.clock is not None else None
@@ -474,6 +503,10 @@ def _coordinator_input(
         coord_input["last_turn_report"] = state["last_turn_report"]
     if state.get("last_acceptance"):
         coord_input["last_acceptance"] = state["last_acceptance"]
+    if state.get("self_gate_delivery"):
+        # M3: the self-gate delivery outcome is a mechanical fact the
+        # coordinator may weigh, never prose -- same channel as last_acceptance.
+        coord_input["self_gate_delivery"] = state["self_gate_delivery"]
     if deps.resume_verification is not None:
         coord_input["resume_verification"] = deps.resume_verification
     if round_no == 1 and deps.prior_terminal is not None:
@@ -752,6 +785,39 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
                 }
         return {**cleared, **_verdict_update(deps, state, round_no, result)}
 
+    def self_gate_step(state: LineState) -> LineState:
+        """M3: deliver the line's assembled six-duty evidence through the self-gate.
+
+        Reached only when ``deps.self_gate`` is wired and the line holds
+        ``self_gate_evidence`` (a self-judged dd verdict awaits the gate). The
+        evidence is handed to the engine's self-gate (``decide``) and, on
+        admission, the M2 dd delivery; the machine-readable outcome is recorded
+        and the evidence cleared so the delivery fires exactly once per wake,
+        never re-delivered on a later round. A missing port records ``unwired``
+        rather than faulting -- a line without a gate is an observability gap,
+        not a crash.
+        """
+        evidence = state.get("self_gate_evidence")
+        development_id = str(state.get("dd_development_id") or "")
+        if deps.self_gate is None:
+            return {
+                "self_gate_delivery": {
+                    "status": "unwired",
+                    "message": "no self-gate delivery port wired; evidence not delivered",
+                },
+                "self_gate_evidence": None,
+            }
+        try:
+            outcome = deps.self_gate.deliver(evidence, development_id)
+        except Exception as exc:  # a broken delivery must not fault the line
+            outcome = {
+                "status": "refused",
+                "message": f"{type(exc).__name__}: {exc}"[:400],
+            }
+        if not isinstance(outcome, dict):
+            outcome = {"status": str(outcome)}
+        return {"self_gate_delivery": outcome, "self_gate_evidence": None}
+
     def worker_turn(state: LineState) -> LineState:
         round_no = state.get("round_no", 1)
         deps.artifacts.heartbeat(round_no, "worker")
@@ -952,7 +1018,13 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         return {"run_id": deps.run_id}
 
     def after_bounds(state: LineState) -> str:
-        return "finalise" if state.get("terminal") else "coordinator_turn"
+        if state.get("terminal"):
+            return "finalise"
+        # M3: a wired self-gate with pending evidence delivers before the
+        # coordinator turn, so the coordinator weighs the delivery outcome.
+        if deps.self_gate is not None and state.get("self_gate_evidence"):
+            return "self_gate_step"
+        return "coordinator_turn"
 
     def after_coordinator(state: LineState) -> str:
         if state.get("terminal"):
@@ -978,6 +1050,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     graph.add_node("acceptance_step", acceptance_step)
     graph.add_node("finalise", finalise)
     graph.add_node("decision_interrupt", decision_interrupt)
+    graph.add_node("self_gate_step", self_gate_step)
 
     graph.add_edge(START, "check_bounds")
     graph.add_conditional_edges("check_bounds", after_bounds)
@@ -985,6 +1058,9 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     # The interrupt node resumes into the same round's coordinator result, so it
     # routes exactly like a coordinator turn.
     graph.add_conditional_edges("decision_interrupt", after_coordinator)
+    # M3: an admitted/refused self-gate delivery feeds straight back into the
+    # coordinator turn, which weighs the delivered outcome on the same round.
+    graph.add_edge("self_gate_step", "coordinator_turn")
     # Unconditional: the facts are gathered even after a worker timeout --
     # they are cheap, and the coordinator judging a timeout deserves them too.
     graph.add_edge("worker_turn", "acceptance_step")
@@ -1010,6 +1086,7 @@ __all__ = [
     "LineDeps",
     "LineMetricsPort",
     "LineState",
+    "SelfGateDeliveryPort",
     "acknowledges_decision",
     "build_goal_line_graph",
     "claims_resume_verification_broken",

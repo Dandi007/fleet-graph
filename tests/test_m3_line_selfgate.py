@@ -17,9 +17,12 @@ or a branch flipped turns a specific test red).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
+
+from langgraph.checkpoint.memory import InMemorySaver
 
 from fleet_graph.dd.selfgate import (
     APPROVE,
@@ -46,12 +49,17 @@ from fleet_graph.dd.selfgate import (
     decide,
     harvest_trigger,
     merge_then_harvest,
+    parse_self_gate_evidence,
 )
 from fleet_graph.decision_mcp import (
     OUTCOME_DELIVERED,
     OUTCOME_REFUSED,
+    build_decision_mcp_server,
+    deliver_decision,
     deliver_self_gate_decision,
 )
+from fleet_graph.graphs.goal_line import LineDeps, build_goal_line_graph
+from fleet_graph.graphs.guards import LineBounds, LineGuards
 
 LINE = "wf-1"
 FROZEN_BASE = "d9c04295a3cddce863d4118d7b0ea58f8e2bacfe"
@@ -110,6 +118,48 @@ def complete_evidence(**overrides: Any) -> SelfGateEvidence:
     }
     fields.update(overrides)
     return SelfGateEvidence(**fields)
+
+
+def evidence_dict(**overrides: Any) -> dict[str, Any]:
+    """The six-duty evidence as the delivery surface receives it: a JSON object."""
+    fields: dict[str, Any] = {
+        "principal": LINE,
+        "dispatched_by": LINE,
+        "decision": APPROVE,
+        "target_base_commit": FROZEN_BASE,
+        "acceptance_triple": {
+            "spec_argv": [list(a) for a in SPEC_ARGV],
+            "record_argv": [list(a) for a in SPEC_ARGV],
+            "receipt_argv": [list(a) for a in SPEC_ARGV],
+        },
+        "diff_boundary": {
+            "changed_product_paths": ["src/fleet_graph/dd/selfgate.py"],
+            "spec_declared_paths": ["src/fleet_graph/dd/"],
+        },
+        "zero_test_deletion": [],
+        "self_run": {"argv": list(SPEC_ARGV[0]), "exit_code": 0, "tail": "9 passed"},
+        "mutation_gun": {
+            "shots": [
+                {"index": 0, "mutator": "mutate #0", "acceptance_exit_code": 1},
+                {"index": 1, "mutator": "mutate #1", "acceptance_exit_code": 1},
+            ],
+            "restored_sha": "sha256:restored",
+            "expected_sha": "sha256:restored",
+            "restored_mode_ok": True,
+        },
+        "regression_baseline": {
+            "target_base_commit": FROZEN_BASE,
+            "passed": 2614,
+            "failed": 0,
+            "skipped": 0,
+            "failed_tests": [],
+        },
+        "current_failed_tests": [],
+        "flaky_tests": [],
+        "flaky_attribution": [],
+    }
+    fields.update(overrides)
+    return fields
 
 
 # --- duty 1: acceptance triple equal ----------------------------------------
@@ -546,3 +596,187 @@ class TestSelfGateApprovedThenMergeHarvest:
         assert harvest_trigger(APPROVE, merged=False) is False
         # After the merge segment the harvest fires.
         assert harvest_trigger(APPROVE, merged=True) is True
+
+
+# --- the engine surface wiring (M3 blocker): decision_deliver carries the
+# six-duty evidence and runs the self-gate; the goal line has a delivery port ---
+
+
+class TestParseSelfGateEvidence:
+    def test_a_complete_json_object_parses_and_admits(self) -> None:
+        evidence = parse_self_gate_evidence(evidence_dict())
+        assert evidence is not None
+        assert decide(evidence).outcome == "approve"
+
+    def test_a_missing_duty_is_parsed_as_missing_not_silently_green(self) -> None:
+        evidence = parse_self_gate_evidence(evidence_dict(self_run=None))
+        assert evidence is not None
+        assert DUTY_SELF_RUN_ACCEPTANCE in evidence.missing_duties()
+
+    def test_a_malformed_payload_is_none(self) -> None:
+        assert parse_self_gate_evidence({}) is None
+        assert parse_self_gate_evidence("not an object") is None  # type: ignore[arg-type]
+
+
+class TestEvidenceWiredIntoDeliverySurface:
+    def test_a_missing_duty_refuses_delivery_before_the_single_is_touched(
+        self, tmp_path: Path
+    ) -> None:
+        plane = FakeDdPlane()
+        result = deliver_decision(
+            line=DD_ID,
+            decision=APPROVE,
+            reason="line self-judged",
+            run_root=tmp_path,
+            lines=[],
+            dd=plane,
+            evidence=evidence_dict(self_run=None),
+        )
+        assert result.status == OUTCOME_REFUSED
+        assert result.code == CODE_SELFGATE_INCOMPLETE
+        assert DUTY_SELF_RUN_ACCEPTANCE in result.message
+        assert plane.queried is False
+        assert plane.resumed == []
+
+    def test_complete_evidence_delivers_and_wakes_the_line(self, tmp_path: Path) -> None:
+        plane = FakeDdPlane()
+        _stall(tmp_path)
+        result = deliver_decision(
+            line=DD_ID,
+            decision=APPROVE,
+            reason="line self-judged",
+            run_root=tmp_path,
+            lines=[],
+            dd=plane,
+            evidence=evidence_dict(),
+            clock=lambda: 1_700_000_123.0,
+        )
+        assert result.status == OUTCOME_DELIVERED
+        assert result.as_dict()["outcome"] == "consumed"
+        assert result.target is not None
+        assert result.target["self_gate"]["decided_by"] == LINE
+        assert result.target["self_gate"]["dispatched_by"] == LINE
+        assert plane.resumed == [(DD_ID, f"mcp:dd:{DD_ID}:g2:APPROVE")]
+
+    def test_unparseable_evidence_refuses_without_touching_the_single(self, tmp_path: Path) -> None:
+        plane = FakeDdPlane()
+        result = deliver_decision(
+            line=DD_ID,
+            decision=APPROVE,
+            reason="line self-judged",
+            run_root=tmp_path,
+            lines=[],
+            dd=plane,
+            evidence={"principal": LINE},
+        )
+        assert result.status == OUTCOME_REFUSED
+        assert result.code == CODE_SELFGATE_INCOMPLETE
+        assert plane.queried is False
+
+
+class TestDecisionDeliverToolEvidenceSurface:
+    def test_the_tool_registers_an_evidence_argument(self) -> None:
+        server = build_decision_mcp_server(Path("/tmp"), [])
+        tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
+        schema = tools["decision_deliver"].parameters
+        assert "evidence" in schema["properties"]
+
+
+class _SelfGateFake:
+    def __init__(self, outcome: dict[str, Any] | None = None) -> None:
+        self.outcome = outcome or {"status": "delivered", "code": "", "line": DD_ID}
+        self.calls: list[tuple[Any, str]] = []
+
+    def deliver(self, evidence: Any, development_id: str) -> dict[str, Any]:
+        self.calls.append((evidence, development_id))
+        return self.outcome
+
+
+class _OrchCoordinator:
+    def __init__(self) -> None:
+        self.inputs: list[dict[str, Any]] = []
+
+    def turn(self, round_no: int, coord_input: dict[str, Any], *, resume: bool = False) -> Any:
+        self.inputs.append(coord_input)
+        return {"verdict": "done", "reason": "self-judged delivered"}
+
+
+class _OrchWorker:
+    def turn(self, prompt: str, round_no: int) -> Any:
+        raise AssertionError("self-gate delivery must not reach the worker")
+
+
+class _OrchInbox:
+    def drain_then_ack(self, persist: Any) -> tuple[Any, list[str]]:
+        persist([])
+        return [], []
+
+
+class _OrchArtifacts:
+    def __init__(self) -> None:
+        self.terminal: dict[str, Any] | None = None
+
+    def heartbeat(self, round_no: int, phase: str, *, force: bool = False) -> bool:
+        return True
+
+    def append_round(self, line: dict[str, Any]) -> bool:
+        return True
+
+    def write_worker_report(self, round_no: int, report: dict[str, Any]) -> Any:
+        return "worker-report.json"
+
+    def write_terminal(self, **kwargs: Any) -> Any:
+        self.terminal = kwargs
+        return "terminal.json"
+
+
+class TestGoalLineSelfGateOrchestration:
+    def test_pending_evidence_is_delivered_on_wake_and_recorded(self) -> None:
+        """The goal line delivers its six-duty evidence through the self-gate port
+        before the coordinator turn (the M3 default path, wired at the graph)."""
+        self_gate = _SelfGateFake()
+        coordinator = _OrchCoordinator()
+        artifacts = _OrchArtifacts()
+        deps = LineDeps(
+            coordinator=coordinator,
+            worker=_OrchWorker(),
+            inbox=_OrchInbox(),
+            artifacts=artifacts,
+            guards=LineGuards(bounds=LineBounds()),
+            folder_id=LINE,
+            self_gate=self_gate,
+        )
+        graph = build_goal_line_graph(deps).compile(checkpointer=InMemorySaver())
+        state = graph.invoke(
+            {"round_no": 1, "self_gate_evidence": evidence_dict(), "dd_development_id": DD_ID},
+            config={"configurable": {"thread_id": "wf-1:g1"}, "recursion_limit": 100},
+        )
+        assert self_gate.calls == [(evidence_dict(), DD_ID)]
+        assert state["self_gate_delivery"]["status"] == "delivered"
+        # Evidence cleared: the delivery fires exactly once, not every round.
+        assert state["self_gate_evidence"] is None
+        # The coordinator weighed the delivery outcome as a mechanical fact.
+        assert coordinator.inputs and "self_gate_delivery" in coordinator.inputs[0]
+        assert artifacts.terminal is not None
+        assert artifacts.terminal["terminal"] == "done"
+
+    def test_an_unwired_graph_runs_the_line_unchanged(self) -> None:
+        """A line without a self-gate port keeps the exact prior routing."""
+        artifacts = _OrchArtifacts()
+        deps = LineDeps(
+            coordinator=_OrchCoordinator(),
+            worker=_OrchWorker(),
+            inbox=_OrchInbox(),
+            artifacts=artifacts,
+            guards=LineGuards(bounds=LineBounds()),
+            folder_id=LINE,
+            self_gate=None,
+        )
+        graph = build_goal_line_graph(deps).compile(checkpointer=InMemorySaver())
+        state = graph.invoke(
+            {"round_no": 1, "self_gate_evidence": evidence_dict(), "dd_development_id": DD_ID},
+            config={"configurable": {"thread_id": "wf-1:g2"}, "recursion_limit": 100},
+        )
+        assert artifacts.terminal is not None
+        assert artifacts.terminal["terminal"] == "done"
+        assert "self_gate_delivery" not in state
