@@ -685,8 +685,32 @@ class TestTheHumanGateWaitsRatherThanDecides:
         assert sealed["question_note_id"] == "note-1"
         assert sealed["development_id"] == "dev-1"
 
-    def test_a_refused_gate_writes_nothing(self, tmp_path: Path) -> None:
-        """A REJECT is not a gate_decision artifact; the stage produced none."""
+    def test_a_refused_gate_seals_its_verdict_record(self, tmp_path: Path) -> None:
+        """A REJECT terminalises at the actor step (no gate_decision artifact
+        is produced), but its verdict record is sealed at the same decision
+        path an APPROVE gets: the next generation's start must be able to read
+        the rejecting verdict -- message id, decided_by, rationale -- as its
+        authoritative rework input (wf-8d9737 rework contract A, which
+        supersedes the old "a refused gate writes nothing" pin)."""
+        from fleet_graph.graphs.dd_scripts import GATE_PATH
+
+        board = FakeBoard(a_decision("REJECT", by="青林"))
+        gate = BoardGate(
+            board=board,  # type: ignore[arg-type]
+            card_entity_id="card-1",
+            development_id="dev-1",
+            repo=tmp_path,
+        )
+        with pytest.raises(StageRefused):
+            gate.act(GATE, dispatch_for(GATE))
+
+        sealed = json.loads((tmp_path / GATE_PATH.format(generation=1)).read_text(encoding="utf-8"))
+        assert sealed["decision"] == "REJECT"
+        assert sealed["decided_by"] == "青林"
+        assert sealed["decision_message_id"] == "msg-decision"
+
+    def test_a_refused_gate_without_a_repo_seals_nowhere(self, tmp_path: Path) -> None:
+        """No repo wired, no record: the refusal still stands on its own."""
         from fleet_graph.graphs.dd_scripts import GATE_PATH
 
         board = FakeBoard(a_decision("REJECT"))
@@ -694,7 +718,6 @@ class TestTheHumanGateWaitsRatherThanDecides:
             board=board,  # type: ignore[arg-type]
             card_entity_id="card-1",
             development_id="dev-1",
-            repo=tmp_path,
         )
         with pytest.raises(StageRefused):
             gate.act(GATE, dispatch_for(GATE))

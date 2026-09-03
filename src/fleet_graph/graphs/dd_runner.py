@@ -25,6 +25,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from fleet_graph.dd.capability import CapabilityLock
 from fleet_graph.dd.cost_obs import build_cost_plane
 from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder
+from fleet_graph.dd.git import run_git
 from fleet_graph.dd.lifecycle import Lifecycle
 from fleet_graph.dd.prompt import PluginPromptSource
 from fleet_graph.executors.agent_run import AgentRunLauncher
@@ -43,6 +44,7 @@ from fleet_graph.graphs.dd_pipeline import (
 )
 from fleet_graph.graphs.dd_replay import ReceiptReplayer, prior_generation_state_roots
 from fleet_graph.graphs.dd_scripts import (
+    GATE_PATH,
     AcceptanceStage,
     ConfigureStage,
     MergeStage,
@@ -63,6 +65,29 @@ RUN_CONFIG = "run_config"
 ACCEPTANCE_RESULT = "acceptance_result"
 MERGE_RESULT = "merge_result"
 GATE_DECISION = "gate_decision"
+
+#: Rework contract B (wf-8d9737). The structured refusal code for a
+#: generation that would open without a new implement dispatch -- a sealed
+#: receipt replay marching a "new generation" straight past the work, as
+#: measured on dev-fg-79d528db4375 g2 (re-seal replay: no implement prompt,
+#: no new agent run, only acceptance.json changed).
+REWORK_REPLAY_REFUSED = "REWORK_REPLAY_REFUSED"
+
+
+class ReworkReplayRefused(RuntimeError):
+    """A gate-rework generation the engine cannot assemble real work for.
+
+    Raised before the pipeline is built, so a refused generation never
+    launches a stage, seals a receipt, or writes a result. `missing` names
+    what a real rework would have produced (a new implement prompt, a new
+    agent run) and did not.
+    """
+
+    def __init__(self, message: str, *, missing: list[str]) -> None:
+        super().__init__(f"{REWORK_REPLAY_REFUSED}: {message}")
+        self.code = REWORK_REPLAY_REFUSED
+        self.detail = message
+        self.missing = list(missing)
 
 
 @dataclass
@@ -117,6 +142,12 @@ class DevelopmentConfig:
     #: `dispatched_by`. Empty lets the actor fall back to the dispatcher. Never
     #: a run_id/uuid: the label must name a bounded subject, not an identity.
     dispatched_by: str = ""
+    #: The gate REJECT verdict this generation reworks from (wf-8d9737 rework
+    #: contract A), read by `dd run` from `--gate-reject-file` and injected
+    #: into the implement prompt at the engine-side builder. Empty means the
+    #: generation is not a gate rework: no anchor is ever injected and the
+    #: receipt replay path behaves exactly as before.
+    gate_reject: dict[str, Any] = field(default_factory=dict)
 
     @property
     def thread_id(self) -> str:
@@ -139,7 +170,44 @@ def build_pipeline(
     """Wire a development. Returns the graph and the deps it holds."""
     lifecycle = Lifecycle.load()
 
-    if replayer is None and config.generation > 1:
+    # Rework contract B (wf-8d9737): a gate-rework generation must open with a
+    # NEW implement dispatch -- a new prompt carrying the rejecting verdict
+    # and a new agent run behind it. A receipt replayer marching the sealed
+    # prefix of the rejected generation straight past implement would produce
+    # a fake new generation (the dev-fg-79d528db4375 g2 shape), so a replayer
+    # alongside a gate rework is refused outright...
+    gate_rework = bool(config.gate_reject)
+    if gate_rework and replayer is not None:
+        raise ReworkReplayRefused(
+            f"development {config.development_id} g{config.generation} is a gate-rework "
+            "generation; a receipt replayer would re-enter the sealed prefix instead of "
+            "dispatching a new implementer",
+            missing=["new-implement-prompt", "new-agent-run"],
+        )
+    if replayer is None and config.generation > 1 and not gate_rework:
+        # ...and a generation whose own tree seals a rejecting gate verdict
+        # for the previous generation but whose launch carries no rework
+        # mandate is refused too: replaying there would open exactly the fake
+        # generation contract B forbids. The durable rework launch is the
+        # control plane's, with --gate-reject-file set.
+        prior = run_git(
+            config.workspace_path,
+            "show",
+            f"HEAD:{GATE_PATH.format(generation=config.generation - 1)}",
+        )
+        if prior.returncode == 0:
+            try:
+                prior_decision = json.loads(prior.stdout)
+            except ValueError:
+                prior_decision = {}
+            if str(prior_decision.get("decision") or "").strip().upper() == "REJECT":
+                raise ReworkReplayRefused(
+                    f"development {config.development_id} g{config.generation} starts after "
+                    f"a gate REJECT of g{config.generation - 1} but carries no "
+                    "--gate-reject-file; replaying the sealed prefix would open a new "
+                    "generation with no new implement dispatch",
+                    missing=["new-implement-prompt", "new-agent-run"],
+                )
         # A restarted generation replays the receipt-sealed prefix of the
         # previous one instead of re-dispatching agents against work already
         # in the tree (F4). Generation 1 has nothing behind it, and a layout
@@ -185,13 +253,16 @@ def build_pipeline(
         # data plane is wired in for the stage producing each one.
         cost_plane=cost_plane,
         # The stage's prompt comes from the bundle the capability check
-        # admitted, not from the role's own persona. See dd/prompt.py.
+        # admitted, not from the role's own persona. See dd/prompt.py. A
+        # gate-rework generation's prompt source carries the rejecting verdict
+        # so the implement prompt is assembled with it (wf-8d9737 contract A).
         prompts=PluginPromptSource(
             binding=config.plugin_binding,
             builder=builder,
             worktree_path=str(config.workspace_path),
             acceptance_commands=list(config.run_config.get("acceptance_commands") or []),
             verify_worktree_head=config.verify_worktree_head,
+            gate_reject=dict(config.gate_reject) if gate_rework else None,
         ),
         dispatched_by=config.dispatched_by,
         # Before a fresh dispatch, restore the worktree to the attempt's input
@@ -460,8 +531,10 @@ def gate_refusal(state: dict[str, Any]) -> dict[str, Any] | None:
 __all__ = [
     "EVENTS_FILE",
     "RESULT_FILE",
+    "REWORK_REPLAY_REFUSED",
     "SPEC_ARTIFACT",
     "DevelopmentConfig",
+    "ReworkReplayRefused",
     "awaiting_decision",
     "build_pipeline",
     "gate_refusal",

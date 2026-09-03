@@ -536,6 +536,43 @@ class BoardGate:
             idempotency_key=f"dd-gate:{self.development_id}:g{dispatch['generation']}",
         )
 
+    def _seal_decision(
+        self,
+        dispatch: Dispatch,
+        verdict: str,
+        normalized: Any,
+        decision: Any,
+        ticket: GateTicket,
+    ) -> None:
+        """Write the verdict record to the gate's decision path.
+
+        An APPROVE is sealed by the stage's own materialize step (the
+        WorkspaceSealer commits it); a REJECT terminalises at the actor step,
+        so its record would otherwise exist nowhere but the board. Sealing
+        both is what lets the next generation's start read the rejecting
+        verdict -- message id, decided_by, rationale -- as its authoritative
+        rework input (wf-8d9737 rework contract A). The control plane commits
+        the worktree copy when it starts that generation.
+        """
+        if self.repo is None:
+            return
+        write_json(
+            self.repo,
+            GATE_PATH.format(generation=dispatch.get("generation", 1)),
+            {
+                "development_id": self.development_id,
+                "decision": verdict,
+                "raw_decision": normalized.raw,
+                "normalization_form": normalized.form,
+                "decided_by": decision.decided_by,
+                "decision_message_id": decision.message_id,
+                "rationale": str(getattr(decision, "rationale", "") or ""),
+                "question_note_id": ticket.question_note_id,
+                "card_entity_id": ticket.card_entity_id,
+                "output_commit": dispatch["input_commit"],
+            },
+        )
+
     def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
         ticket = self._ticket(dispatch)
         decision = self.board.decision_for(ticket)
@@ -565,6 +602,7 @@ class BoardGate:
             )
         if verdict != self.approve:
             operator = decision.decided_by or "an operator"
+            self._seal_decision(dispatch, verdict, normalized, decision, ticket)
             raise StageRefused(f"gate decision {verdict} by {operator}", code="GATE_REJECTED")
 
         record = {
@@ -574,6 +612,7 @@ class BoardGate:
             "normalization_form": normalized.form,
             "decided_by": decision.decided_by,
             "decision_message_id": decision.message_id,
+            "rationale": str(getattr(decision, "rationale", "") or ""),
             "question_note_id": ticket.question_note_id,
             "card_entity_id": ticket.card_entity_id,
             "output_commit": dispatch["input_commit"],
@@ -582,14 +621,7 @@ class BoardGate:
             # Sealed into the product tree, like the reviews and the merge
             # result. A gate whose verdict is not attributable afterwards is
             # a gate nobody can audit.
-            write_json(
-                self.repo,
-                GATE_PATH.format(generation=dispatch.get("generation", 1)),
-                {
-                    "development_id": self.development_id,
-                    **{k: v for k, v in record.items() if k != "stage"},
-                },
-            )
+            self._seal_decision(dispatch, verdict, normalized, decision, ticket)
         return StageOutcome(
             event=SPINE_EVENT,
             receipt=record,

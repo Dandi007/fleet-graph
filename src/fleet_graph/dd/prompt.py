@@ -45,6 +45,12 @@ REVIEW_ID_PREFIX = {
     str(ReviewPhase.FINAL): "rf-",
 }
 
+#: The greppable anchor every gate-rework implement prompt carries (wf-8d9737
+#: rework contract A). The section header is followed by the rejecting
+#: verdict's message id, so an acceptance check can mechanically assert both:
+#: `grep gate-reject-rationale:` and `grep <decision_message_id>`.
+GATE_REJECT_ANCHOR = "gate-reject-rationale:"
+
 PLACEHOLDER = re.compile(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)(\?)?\}\}")
 
 # Where the bundle keeps each stage's prompt parts, keyed as
@@ -337,6 +343,39 @@ def render_review_prompt(
     )
 
 
+def render_gate_reject_section(payload: dict[str, Any]) -> str:
+    """The gate REJECT rationale, as the rework generation's mandated input.
+
+    This is the engine-side injection point of rework contract A (wf-8d9737):
+    a generation started after a human_gate REJECT must dispatch its
+    implementer with the rejecting verdict mechanically attached -- the
+    decision message id on the anchor line, `decision: REJECT`, and the
+    rationale (full text where the gate sealed one, the terminal's own minimal
+    face where a legacy record predates it). The anchor is deliberately
+    greppable so acceptance can assert the injection landed.
+    """
+    message_id = str(payload.get("decision_message_id") or "")
+    rationale = str(payload.get("rationale") or "").strip()
+    rationale_line = rationale or (
+        f"(no rationale text sealed; the verdict message id on the "
+        f"{GATE_REJECT_ANCHOR} line is the anchor)"
+    )
+    lines = [
+        f"## {GATE_REJECT_ANCHOR} {message_id}".rstrip(),
+        "",
+        "The human gate REJECTED the previous generation of this development. "
+        "This verdict is the authoritative input for this rework generation:",
+        "",
+        f"- decision: {payload.get('decision') or 'REJECT'!s}",
+        f"- decided_by: {payload.get('decided_by') or ''!s}",
+        f"- rejected_generation: {payload.get('rejected_generation', '')}",
+        f"- rationale: {rationale_line}",
+        "",
+        "Address this rationale in the rework before re-presenting the work.",
+    ]
+    return "\n".join(lines)
+
+
 @dataclass
 class PluginPromptSource:
     """The implement prompt, read from the bundle the capability check admitted.
@@ -354,6 +393,11 @@ class PluginPromptSource:
     worktree_path: str
     acceptance_commands: list[list[str]] = field(default_factory=list)
     verify_worktree_head: bool = True
+    #: The gate REJECT verdict this generation must rework from (wf-8d9737
+    #: rework contract A), read by the control plane at generation start and
+    #: forwarded here. None/empty means the generation is not a gate rework
+    #: and nothing is injected -- non-REJECT exits must never see the anchor.
+    gate_reject: dict[str, Any] | None = None
     _cache: dict[str, str] | None = None
 
     def resources(self) -> dict[str, str]:
@@ -398,7 +442,7 @@ class PluginPromptSource:
                 spec_path=self.builder.spec_path,
                 index_path=self.builder.index_path,
             )
-        return render_stage_prompt(
+        rendered = render_stage_prompt(
             self.resources(),
             IMPLEMENT_PERSONA,
             IMPLEMENT_TEMPLATE,
@@ -410,9 +454,13 @@ class PluginPromptSource:
                 acceptance_commands=self.acceptance_commands,
             ),
         )
+        if self.gate_reject:
+            rendered = rendered + "\n\n---\n\n" + render_gate_reject_section(self.gate_reject)
+        return rendered
 
 
 __all__ = [
+    "GATE_REJECT_ANCHOR",
     "IMPLEMENT_EVIDENCE",
     "IMPLEMENT_PERSONA",
     "IMPLEMENT_TEMPLATE",
@@ -427,6 +475,7 @@ __all__ = [
     "derive_review_id",
     "implement_product_commit",
     "render_commands",
+    "render_gate_reject_section",
     "render_review_prompt",
     "render_stage_prompt",
     "render_template",
