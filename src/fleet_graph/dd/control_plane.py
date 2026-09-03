@@ -1462,20 +1462,112 @@ class DdControlPlane:
         # that never ran, so carry it out now instead -- the interrupted
         # recovery completes exactly once. (``_claim_resume_action`` runs inside
         # this condition: it must claim before a fresh launch below.)
-        if (
-            action_key
-            and not self._claim_resume_action(development_id, generation, action_key)
-            and self._resume_launched(development_id, generation)
-        ):
-            gate_report["resume"] = {
-                "development_id": development_id,
-                "generation": generation,
-                "already_resumed": True,
-            }
-            gate_report["already_resumed"] = True
-            return gate_report
+        if action_key and not self._claim_resume_action(development_id, generation, action_key):
+            if not self._resume_launched(development_id, generation):
+                # Claim/act window: the interrupted recovery completes now.
+                pass
+            elif status["state"] != STATE_AWAITING_GATE:
+                # The single transferred per its verdict semantics, so the
+                # decision truly was consumed: the same action key dedupes.
+                gate_report["resume"] = {
+                    "development_id": development_id,
+                    "generation": generation,
+                    "already_resumed": True,
+                }
+                gate_report["already_resumed"] = True
+                return gate_report
+            else:
+                # M3.1 defect 2: the earlier resume launched but the single is
+                # still parked at the gate -- the verdict was never consumed
+                # (the unit died, e.g. TEMPFAIL). A one-shot claim burned by a
+                # *failed* resume would refuse the same verdict forever. Return
+                # the claim so the redelivery re-attempts the resume; only a
+                # consumed verdict dedupes (the branch above).
+                self._release_resume_claim(development_id, generation, action_key)
+                if not self._claim_resume_action(development_id, generation, action_key):
+                    raise ControlPlaneError(
+                        "RESUME_CLAIM_CONTESTED",
+                        f"{development_id} g{generation} resume claim for this action key "
+                        "was re-taken concurrently; retry the delivery",
+                        retryable=True,
+                    )
         gate_report["resume"] = self._launch(record, resume=True, generation=generation)
         return gate_report
+
+    def publish_gate_decision(
+        self,
+        development_id: str,
+        *,
+        decision: str,
+        decided_by: str,
+        reason: str = "",
+        action_key: str = "",
+    ) -> dict[str, Any]:
+        """Deliver one verdict to the single's decision read model (the board).
+
+        M3.1 defect 1 (S10 裁决送达必须落地): the gate resume is valueless by
+        design -- the resumed graph re-reads the board -- so a delivery that
+        only resumed never gave the single the verdict. Delivering means
+        publishing the verdict as a ``work.decision.v1`` answering the
+        single's pending question note (a ref to the note is what makes
+        ``Board.decision_for`` resolve it), with ``decided_by`` the already-
+        authorized principal and the delivery's reason as the rationale. The
+        publish is idempotency-keyed on the delivery's action key, so a
+        redelivered verdict republishes nothing. The caller then resumes: the
+        graph consumes the verdict -- REJECT terminalises the single as
+        ``refused``, APPROVE proceeds through merge.
+
+        The Board class itself still publishes no decisions (the structural
+        rule stands): this goes through the board's bus client, the same
+        channel the human Q&A verdicts ride. No board, or no pending question
+        to answer, is a structured refusal -- never a valueless resume that
+        silently drops the verdict.
+        """
+        record = self._record(development_id)
+        status = self.rebuild_status(development_id)
+        awaiting = status.get("awaiting") or {}
+        question_note_id = str(awaiting.get("question_note_id") or "")
+        card_entity_id = str(awaiting.get("card_entity_id") or "")
+        if not question_note_id:
+            raise ControlPlaneError(
+                "GATE_TICKET_UNRESOLVED",
+                f"{development_id} carries no pending question note; "
+                "there is no question for a verdict to answer",
+            )
+        board = self._board_factory()
+        if board is None:
+            raise ControlPlaneError(
+                "GATE_BOARD_UNAVAILABLE",
+                "no board is configured; the verdict cannot reach the single's decision read model",
+            )
+        from fleet_graph.bus.board import DECISION_KIND, WORK_NOTES
+
+        payload = {
+            "card_entity_id": card_entity_id,
+            "question": "",
+            "decision": decision,
+            "decided_by": decided_by,
+            "rationale": reason,
+        }
+        idempotency_key = action_key or (
+            f"dd-gate:{development_id}:g{self._generation(record)}:{decision}"
+        )
+        published = board.client.publish(
+            WORK_NOTES,
+            DECISION_KIND,
+            payload,
+            idempotency_key,
+            refs=[{"target_entity": question_note_id}],
+        )
+        return {
+            "development_id": development_id,
+            "question_note_id": question_note_id,
+            "card_entity_id": card_entity_id,
+            "decision": decision,
+            "decided_by": decided_by,
+            "message_id": str(getattr(published, "message_id", "") or ""),
+            "idempotency_key": idempotency_key,
+        }
 
     def _resume_claim_path(self, development_id: str, generation: int, action_key: str) -> Path:
         digest = hashlib.sha256(action_key.encode("utf-8")).hexdigest()
@@ -1509,6 +1601,40 @@ class DdControlPlane:
                 sort_keys=True,
             )
         return True
+
+    def _release_resume_claim(self, development_id: str, generation: int, action_key: str) -> None:
+        """Return a burned claim after a resume that did not consume (M3.1
+        defect 2).
+
+        The claim exists to make a resume exactly-once against duplicate
+        transport calls -- not to spend the verdict's only delivery on a unit
+        that died unconsumed. Unlinking the claim lets the same action key be
+        claimed again; the release is traced into the generation's
+        ``events.jsonl`` (best-effort) so the return is auditable like every
+        other gate action.
+        """
+        path = self._resume_claim_path(development_id, generation, action_key)
+        with contextlib.suppress(OSError):
+            path.unlink()
+        with contextlib.suppress(OSError):
+            event_path = self._gen_root(development_id, generation) / EVENTS_FILE
+            event_path.parent.mkdir(parents=True, exist_ok=True)
+            with event_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "at": iso(self.clock()),
+                            "event": "resume_claim_released",
+                            "development_id": development_id,
+                            "generation": generation,
+                            "action_key": action_key,
+                            "reason": "previous resume did not consume the verdict",
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
 
     def _committed_gate_decision(
         self, record: dict[str, Any], generation: int = 1

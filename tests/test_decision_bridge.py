@@ -681,7 +681,27 @@ class TestDdOwnerSideDedup:
             encoding="utf-8",
         )
 
-    def test_a_duplicate_resume_claim_does_not_launch_again(self, tmp_path: Path) -> None:
+    def _consume(self, plane: Any, dev: str) -> None:
+        """Simulate the resumed unit consuming the verdict: the single leaves
+        the gate (its authority result.json no longer carries ``awaiting``)."""
+        from fleet_graph.dd.control_plane import RESULT_FILE
+
+        result_path = plane.root / dev / RESULT_FILE
+        result_path.write_text(
+            json.dumps(
+                {
+                    "development_id": dev,
+                    "terminal": "complete",
+                    "awaiting": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_a_consumed_decision_dedupes_on_redelivery(self, tmp_path: Path) -> None:
+        """Only a *consumed* decision dedupes (M3.1 defect 2): once the single
+        transferred per the verdict's semantics, the same action key is the
+        same logical success -- never a second launch."""
         plane, launcher = self._plane(tmp_path)
         self._suspended(plane, "dev-abc", tmp_path)
         action_key = "e1:d-1:dd:dev-abc:1"
@@ -689,6 +709,8 @@ class TestDdOwnerSideDedup:
         first = plane.gate("dev-abc", resume=True, action_key=action_key)
         assert first["resume"]["mode"] == "resume"
         assert not first.get("already_resumed")
+
+        self._consume(plane, "dev-abc")
 
         second = plane.gate("dev-abc", resume=True, action_key=action_key)
         assert second["resume"]["already_resumed"] is True
@@ -712,6 +734,7 @@ class TestDdOwnerSideDedup:
         action_key = "e1:d-1:dd:dev-abc:1"
 
         assert source.resume(target, action_key).status == RESUME_RESUMED
+        self._consume(plane, "dev-abc")
         replay = source.resume(target, action_key)
         assert replay.status == RESUME_ALREADY_RESUMED
 

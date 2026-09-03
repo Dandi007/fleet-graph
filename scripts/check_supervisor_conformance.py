@@ -85,6 +85,18 @@ DECISION_NAMES = frozenset({"DECISION_KIND", "DECISION_KIND_V2"})
 # Guard B exemption: the single sanctioned decision publisher (R4-3).
 DECISION_PUBLISHER_RELPATH = "fleet_graph/supervise/decision_publisher.py"
 
+#: M3.1 (S10 裁决送达必须落地): the dd gate-delivery publish point. The dd
+#: control plane's ``publish_gate_decision`` is the second sanctioned decision
+#: publish path: reachable only behind the S11 ``dispatched_by`` authority
+#: check (the decision MCP's dd delivery and the line self-gate -- the
+#: authorized principal is exactly what the publish records as ``decided_by``),
+#: never from an llm execution path. The exemption is scoped to exactly this
+#: function in exactly this module; any other call anywhere -- including any
+#: other function in the same module -- still trips the guard.
+GUARD_B_PUBLISH_POINTS = {
+    ("fleet_graph/dd/control_plane.py", "publish_gate_decision"),
+}
+
 # Guard C: who may import the publisher. The act script node, and nobody else.
 DECISION_PUBLISHER_MODULE = "fleet_graph.supervise.decision_publisher"
 DECISION_PUBLISHER_IMPORTERS = frozenset({"fleet_graph/graphs/supervisor.py"})
@@ -228,21 +240,48 @@ def _is_decision_reference(node: ast.expr) -> bool:
     return isinstance(node, ast.Attribute) and node.attr in DECISION_NAMES
 
 
-def check_no_decision_publish(path: Path, tree: ast.AST) -> list[str]:
-    errors: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        arguments = list(node.args) + [kw.value for kw in node.keywords]
-        for argument in arguments:
-            if _is_decision_reference(argument):
-                errors.append(
-                    f"{path}:{node.lineno}: a call carries "
-                    f"{'/'.join(sorted(DECISION_LITERALS | DECISION_NAMES))} "
-                    "as an argument -- the only sanctioned decision publish "
-                    f"path is {DECISION_PUBLISHER_RELPATH}"
-                )
-    return errors
+class _DecisionPublishScan(ast.NodeVisitor):
+    """Guard B's scan: every call carrying a decision kind, except the
+    sanctioned publish points (the R4-3 publisher module and the M3.1
+    S11-gated dd gate-delivery function)."""
+
+    def __init__(self, relpath: str) -> None:
+        self.relpath = relpath
+        self.function_stack: list[str] = []
+        self.errors: list[str] = []
+
+    def _exempt(self) -> bool:
+        return any((self.relpath, name) in GUARD_B_PUBLISH_POINTS for name in self.function_stack)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.function_stack.append(node.name)
+        self.generic_visit(node)
+        self.function_stack.pop()
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.function_stack.append(node.name)
+        self.generic_visit(node)
+        self.function_stack.pop()
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if not self._exempt():
+            arguments = list(node.args) + [kw.value for kw in node.keywords]
+            for argument in arguments:
+                if _is_decision_reference(argument):
+                    self.errors.append(
+                        f"{self.relpath}:{node.lineno}: a call carries "
+                        f"{'/'.join(sorted(DECISION_LITERALS | DECISION_NAMES))} "
+                        "as an argument -- the only sanctioned decision publish "
+                        f"paths are {DECISION_PUBLISHER_RELPATH} and the S11-gated "
+                        "dd gate delivery"
+                    )
+        self.generic_visit(node)
+
+
+def check_no_decision_publish(path: Path, relpath: str, tree: ast.AST) -> list[str]:
+    scan = _DecisionPublishScan(relpath)
+    scan.visit(tree)
+    return scan.errors
 
 
 def check_publisher_import_whitelist(path: Path, relpath: str, tree: ast.AST) -> list[str]:
@@ -397,7 +436,7 @@ def run(src_root: Path) -> list[str]:
         relpath = path.relative_to(src_root).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         if relpath != DECISION_PUBLISHER_RELPATH:
-            errors.extend(check_no_decision_publish(path, tree))
+            errors.extend(check_no_decision_publish(path, relpath, tree))
         errors.extend(check_publisher_import_whitelist(path, relpath, tree))
         errors.extend(check_harvest_write_gating(path, relpath, tree))
         errors.extend(check_e6_stop_gating(path, relpath, tree))

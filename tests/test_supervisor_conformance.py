@@ -196,6 +196,50 @@ class TestGuardBDecision:
         assert proc.returncode == 1
         assert "decision_publisher" in proc.stderr
 
+    def test_the_s11_gated_dd_gate_delivery_publish_survives(self, tmp_path: Path) -> None:
+        """M3.1 (S10 裁决送达必须落地): the dd control plane's
+        ``publish_gate_decision`` is the second sanctioned publish point --
+        reachable only behind the dispatched_by authority check."""
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/dd/control_plane.py",
+            "from fleet_graph.bus.board import DECISION_KIND\n"
+            "def publish_gate_decision(self):\n"
+            '    client.publish("board:work-notes", DECISION_KIND, {}, "key")\n',
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 0, proc.stderr
+
+    def test_a_publish_outside_the_exempt_function_in_the_same_module_is_caught(
+        self, tmp_path: Path
+    ) -> None:
+        """The exemption is scoped to the function, not the module: any other
+        function in control_plane.py still trips the guard."""
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/dd/control_plane.py",
+            "from fleet_graph.bus.board import DECISION_KIND\n"
+            "def sneaky(self):\n"
+            '    client.publish("board:work-notes", DECISION_KIND, {}, "key")\n',
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "decision publish" in proc.stderr
+
+    def test_the_dd_gate_delivery_name_does_not_sanctify_other_modules(
+        self, tmp_path: Path
+    ) -> None:
+        """The exemption is scoped to the (module, function) pair: the same
+        function name elsewhere is still a violation."""
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/sneaky.py",
+            "def publish_gate_decision():\n"
+            '    client.publish("board:work-notes", "work.decision.v1", {}, "key")\n',
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+
 
 class TestGuardCPublisherImports:
     """Only the supervisor act node may reach the decision publisher."""

@@ -1,7 +1,7 @@
 """读模型 /v1/decisions 的终结对账回归（spec: 从「快照」改「对账」）。
 
 consumed / swallowed 不再单凭 bridge receipt 瞬时 status：有 dd 目标时，拿单据侧
-（events.jsonl ``human_gate success`` / status.json 离开 ``awaiting_gate``）再对一声。
+（events.jsonl ``human_gate success`` / 权威 result.json 离开 ``awaiting_gate``）再对一声。
 
 - 阳性：栽「发布后单据立刻推进」→ 单据侧证明消费 → 该裁决必须记 consumed。
 - 阴性：真丢（refs 空 / 卡片错配）→ 单据侧无消费证据 → 仍必须 swallowed。
@@ -80,11 +80,23 @@ def _write_record(dd_root: Path, development_id: str, *, card_entity_id: str) ->
     )
 
 
-def _write_status(dd_root: Path, development_id: str, *, state: str) -> None:
+def _write_result(dd_root: Path, development_id: str, *, awaiting: bool) -> None:
+    """M3.1 defect 6: the reconciliation reads the generation's authority
+    result.json -- awaiting on it means "still waiting", its absence means the
+    single left the gate."""
     dev = dd_root / development_id
     dev.mkdir(parents=True, exist_ok=True)
-    (dev / "status.json").write_text(
-        json.dumps({"development_id": development_id, "state": state}), encoding="utf-8"
+    (dev / "result.json").write_text(
+        json.dumps(
+            {
+                "development_id": development_id,
+                "terminal": None if awaiting else "complete",
+                "awaiting": (
+                    {"question_note_id": "q-1", "card_entity_id": "card-1"} if awaiting else None
+                ),
+            }
+        ),
+        encoding="utf-8",
     )
 
 
@@ -153,7 +165,7 @@ class TestPositiveReconciliation:
             target_id="dev-ok",
             seq=1,
         )
-        _write_status(dd_root, "dev-ok", state="complete")
+        _write_result(dd_root, "dev-ok", awaiting=False)
 
         decision = _by_id(_decisions(tmp_path, dd_root, bridge_dir))["d-2"]
 
@@ -231,7 +243,7 @@ class TestNegativeReconciliation:
             target_id="dev-wait",
             seq=1,
         )
-        _write_status(dd_root, "dev-wait", state="awaiting_gate")
+        _write_result(dd_root, "dev-wait", awaiting=True)
 
         decision = _by_id(_decisions(tmp_path, dd_root, bridge_dir))["d-wait"]
 
@@ -309,7 +321,7 @@ class TestOwnerIdEmptyReconciliation:
             seq=1,
         )
         _write_record(dd_root, "dev-owned", card_entity_id="card-owned")
-        _write_status(dd_root, "dev-owned", state="awaiting_gate")
+        _write_result(dd_root, "dev-owned", awaiting=True)
 
         decision = _by_id(_decisions(tmp_path, dd_root, bridge_dir))["d-owner-wait"]
 

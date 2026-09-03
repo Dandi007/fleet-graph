@@ -42,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from fleet_graph.state.run_artifacts import normalize_waiting_on
+from fleet_graph.state.run_artifacts import normalize_waiting_on, parked_decision_state
 
 log = logging.getLogger(__name__)
 
@@ -92,8 +92,9 @@ _RECEIPT_STATE: dict[str, tuple[str, str | None]] = {
 }
 
 #: dd 单据侧对账的机械事实词汇。human gate 走完（events.jsonl ``human_gate`` +
-#: ``success``）或 status.json 离开 ``awaiting_gate``，都证明该裁决真被消费，
-#: 而不是 bridge receipt 在某个评估瞬间看到的快照。
+#: ``success``）或单据权威 run 工件（该代 result.json）已离开
+#: ``awaiting_gate``，都证明该裁决真被消费，而不是 bridge receipt 在某个评估
+#: 瞬间看到的快照。
 GATE_STAGE = "human_gate"
 GATE_SUCCESS_EVENT = "success"
 DD_AWAITING_GATE = "awaiting_gate"
@@ -172,6 +173,29 @@ def _generation_events_path(dd_root: Path, development_id: str, generation: int)
     return dev_root / f"g{generation}" / "events.jsonl"
 
 
+def _generation_result_path(dd_root: Path, development_id: str, generation: int) -> Path:
+    """Where one generation's ``result.json`` lives (g1 at the dev root).
+
+    The authority artifact for a development's stage/terminal/awaiting facts:
+    the same file the control plane's ``rebuild_status`` derives everything
+    from. The rebuildable status cache file is never consumed here
+    (M3.1 defect 6).
+    """
+    dev_root = dd_root / development_id
+    if generation and generation <= 1:
+        return dev_root / "result.json"
+    return dev_root / f"g{generation}" / "result.json"
+
+
+def _development_generation(dd_root: Path, development_id: str) -> int:
+    """The development's current generation from its admission record; 1 fail-soft."""
+    record = _read_json(dd_root / development_id / "record.json")
+    try:
+        return max(1, int((record or {}).get("generation") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _document_gate_consumed(dd_root: Path, development_id: str, generation: int) -> str:
     """对账单个 dd 单据：该裁决是否真被消费（而非 receipt 瞬时快照）。
 
@@ -179,20 +203,22 @@ def _document_gate_consumed(dd_root: Path, development_id: str, generation: int)
       - ``human_gate_success`` / ``left_awaiting_gate`` → 单据侧证明消费；
       - ``document_awaiting`` → 单据侧可读、仍在等待，真没消费；
       - ``unreconciled`` → 单据侧缺失/不可读，显式标注对不上。
-    顺序：先看 status.json（权威重建态）是否已离开 ``awaiting_gate``，再看
+    顺序：先看单据权威 run 工件（该代 ``result.json``，M3.1 defect 6：不再读
+    无失效逻辑的状态缓存）是否已离开 ``awaiting_gate``，再看
     events.jsonl 是否记了 ``human_gate`` + ``success``。
     """
     dev_root = dd_root / development_id
     if not dev_root.is_dir():
         return BASIS_UNRECONCILED
-    status = _read_json(dev_root / "status.json")
-    state = str(status.get("state") or "") if status else ""
-    if state and state != DD_AWAITING_GATE:
+    result = _read_json(_generation_result_path(dd_root, development_id, generation))
+    if result is not None and not result.get("awaiting"):
+        # A readable authority artifact with no pending question: the single
+        # left the gate (running/terminal), so the verdict was consumed.
         return BASIS_LEFT_AWAITING_GATE
     for entry in _read_jsonl(_generation_events_path(dd_root, development_id, generation)):
         if entry.get("stage") == GATE_STAGE and entry.get("event") == GATE_SUCCESS_EVENT:
             return BASIS_HUMAN_GATE_SUCCESS
-    if status is not None and state == DD_AWAITING_GATE:
+    if result is not None and result.get("awaiting"):
         return BASIS_DOCUMENT_AWAITING
     return BASIS_UNRECONCILED
 
@@ -333,7 +359,7 @@ def _receipt_to_decision(receipt: dict[str, Any], *, dd_root: Path | None = None
     owner_id = str(receipt.get("target_id") or "")
 
     # 终结对账：bridge receipt 定终结态不再单凭快照——有 dd 目标时拿单据侧
-    # （events.jsonl human_gate success / status.json 离开 awaiting_gate）再对
+    # （events.jsonl human_gate success / 权威 result.json 离开 awaiting_gate）再对
     # 一声。单据侧证明被消费 → 提升为 consumed（修正「已送达且被消费却误记
     # swallowed」）；可读但仍 waiting → 维持 swallowed 并标注；对不上 → 显式
     # 标注 unreconciled，不静默归 consumed 或 swallowed。
@@ -533,6 +559,14 @@ class FleetStateView:
             )
 
             generation = self._generation_for(run_root, folder_id, roster_generation)
+            # M3.1 defect 5: ``parked`` derives from the single parked-state
+            # authority (the scheduler's stall snapshot, run-consistent with
+            # the line's own terminal declaration) -- the same derivation the
+            # decision MCP's delivery path answers to, so the read model and
+            # the delivery surface can no longer disagree about a forked
+            # park (``waiting_on`` alone used to report a park the scheduler
+            # had retracted, and vice versa).
+            park = parked_decision_state(run_root, folder_id)
             line_objs.append(
                 {
                     "folder_id": folder_id,
@@ -541,7 +575,7 @@ class FleetStateView:
                     "phase": heartbeat.get("phase") if heartbeat else None,
                     "heartbeat_age_s": heartbeat_age_s,
                     "terminal": terminal.get("terminal") if terminal else None,
-                    "parked": waiting_on == "decision",
+                    "parked": park.parked,
                     "wake_facts": wake_facts,
                     "run_id": live_run_id,
                     "wake_facts_stale": wake_facts_stale,
@@ -622,11 +656,17 @@ class FleetStateView:
                 # nothing mechanical to say, so nothing to report.
                 continue
             development_id = str(record.get("development_id") or entry.name)
-            status = _read_json(entry / "status.json")
-            if status is None:
-                # Unreadable/missing status degrades the entry away.
+            # The terminal verdict comes from the generation's authority run
+            # artifact, not the rebuildable status cache (M3.1 defect 6).
+            result = _read_json(
+                _generation_result_path(
+                    dd_root, development_id, _development_generation(dd_root, development_id)
+                )
+            )
+            if result is None:
+                # Unreadable/missing authority run artifact degrades the entry away.
                 continue
-            terminal = str(status.get("terminal") or "")
+            terminal = str(result.get("terminal") or "")
             # refused / fault / any non-complete terminal / in-flight never
             # listed (目标语义): only `complete` can be approved_unharvested.
             if terminal != "complete":
@@ -645,8 +685,8 @@ class FleetStateView:
             developments.append(
                 {
                     "development_id": development_id,
-                    "head_commit": str(status.get("head_commit") or ""),
-                    "stage": str(status.get("stage") or ""),
+                    "head_commit": str(result.get("head_commit") or ""),
+                    "stage": str(result.get("stage") or ""),
                     "terminal": terminal,
                 }
             )

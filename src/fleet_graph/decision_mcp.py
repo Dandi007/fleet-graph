@@ -63,6 +63,7 @@ from fleet_graph.decision_bridge.owners import (
     LineOwnerSource,
     OwnerTarget,
 )
+from fleet_graph.state.run_artifacts import parked_decision_state
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5614
@@ -131,6 +132,11 @@ CODE_OWNER_REFUSED = "OWNER_REFUSED"
 CODE_DD_NOT_FOUND = "DD_NOT_FOUND"
 CODE_DD_NOT_AWAITING_GATE = "DD_NOT_AWAITING_GATE"
 
+#: M3.1 defect 1 (S10 裁决送达必须落地): a dd delivery that cannot put the
+#: verdict on the single's decision read model is refused -- a resume that
+#: would only restart a waiting unit is not a delivery.
+CODE_GATE_VERDICT_UNDELIVERED = "GATE_VERDICT_UNDELIVERED"
+
 #: M2 dd-gate delivery refusals. A principal that is not the dispatching line
 #: is refused before the single is touched (``dispatched_by`` is the authority);
 #: a dd read that cannot resolve maps to ``DD_UNKNOWN`` rather than a swallow.
@@ -166,6 +172,11 @@ DEFAULT_DD_ROOT = Path("/data/fleet-graph/dd")
 #: decision may be delivered against.
 DD_DEV_PREFIX = "dev-fg-"
 STATE_AWAITING_GATE = "awaiting_gate"
+
+#: M3.1 defect 1: the dd single's terminal state for a consumed REJECT. The
+#: delivery's read-back proves the verdict actually transferred the single
+#: (REJECT ⇒ ``refused``), not merely that a unit was started.
+STATE_REFUSED = "refused"
 
 
 class DecisionPayloadError(RuntimeError):
@@ -403,19 +414,27 @@ def _deliver_dd(
     *,
     development_id: str,
     decision: str,
+    reason: str,
     principal: str,
     run_root: Path,
     dd: Any,
     clock: Callable[[], float],
 ) -> DeliveryResult:
-    """The synchronous dd-gate delivery (M2).
+    """The synchronous dd-gate delivery (M2; verdict-carrying since M3.1).
 
     A dd single is delivered through its existing gate-release path: the
     caller's ``principal`` must equal the single's ``record.json.dispatched_by``
     (else ``NOT_DISPATCHING_LINE`` and the development is untouched), the single
-    must be ``awaiting_gate``, and the gate resume then wakes the dispatching
-    line. Every refusal is a structured :class:`DeliveryResult`, never a
+    must be ``awaiting_gate``, the verdict (decision + reason) must reach the
+    single's decision read model, and the gate resume then wakes the graph that
+    consumes it. Every refusal is a structured :class:`DeliveryResult`, never a
     swallowed HTTP-200.
+
+    M3.1 defect 1 (S10): the resume is valueless by design -- the resumed graph
+    re-reads the board -- so this surface publishes the verdict first (idempotent
+    on the action key), resumes, and only reports ``delivered/consumed`` when the
+    read-back proves the single transferred per the verdict's semantics: REJECT
+    ⇒ terminal ``refused``, APPROVE ⇒ off the gate.
     """
     try:
         status = dd.get(development_id)
@@ -462,15 +481,15 @@ def _deliver_dd(
         status.get("worktree_path") or status.get("workspace") or status.get("repo_path") or ""
     )
     if workspace and not Path(workspace).is_dir():
-        reason = (
+        reason_missing = (
             f"workspace {workspace!r} for {development_id!r} does not exist; "
             "the resume would start a unit on a missing path"
         )
-        _record_gate_refusal(dd, development_id, code=CODE_WORKSPACE_MISSING, reason=reason)
+        _record_gate_refusal(dd, development_id, code=CODE_WORKSPACE_MISSING, reason=reason_missing)
         return DeliveryResult(
             status=OUTCOME_REFUSED,
             code=CODE_WORKSPACE_MISSING,
-            message=reason,
+            message=reason_missing,
             line=development_id,
             decision=decision,
         )
@@ -480,6 +499,58 @@ def _deliver_dd(
     question_note_id = str(awaiting.get("question_note_id") or "")
     card_entity_id = str(awaiting.get("card_entity_id") or "")
     action_key = f"mcp:dd:{development_id}:g{generation}:{decision}"
+
+    # M3.1 defect 1: the verdict must land on the single's decision read model
+    # *before* the resume -- the resumed gate re-reads the board, so resuming
+    # without the published verdict only restarts a unit that then waits again.
+    publish = getattr(dd, "publish_gate_decision", None)
+    if publish is None:
+        message = (
+            f"dd control plane for {development_id!r} cannot publish gate decisions; "
+            "the verdict would be dropped and the resume would be valueless"
+        )
+        _record_gate_refusal(
+            dd,
+            development_id,
+            code=CODE_GATE_VERDICT_UNDELIVERED,
+            reason=message,
+        )
+        return DeliveryResult(
+            status=OUTCOME_REFUSED,
+            code=CODE_GATE_VERDICT_UNDELIVERED,
+            message=message,
+            line=development_id,
+            decision=decision,
+            generation=generation,
+            question_note_id=question_note_id,
+            card_entity_id=card_entity_id,
+        )
+    try:
+        publish(
+            development_id,
+            decision=decision,
+            decided_by=principal,
+            reason=reason,
+            action_key=action_key,
+        )
+    except Exception as exc:  # an undeliverable verdict is a refusal, not a swallow
+        message = f"gate verdict publish failed for {development_id!r}: {type(exc).__name__}: {exc}"
+        _record_gate_refusal(
+            dd,
+            development_id,
+            code=CODE_GATE_VERDICT_UNDELIVERED,
+            reason=message,
+        )
+        return DeliveryResult(
+            status=OUTCOME_REFUSED,
+            code=CODE_GATE_VERDICT_UNDELIVERED,
+            message=message,
+            line=development_id,
+            decision=decision,
+            generation=generation,
+            question_note_id=question_note_id,
+            card_entity_id=card_entity_id,
+        )
 
     try:
         result = dd.gate(development_id, resume=True, action_key=action_key)
@@ -512,26 +583,43 @@ def _deliver_dd(
     # consumed". Re-read the single and confirm it actually left
     # ``awaiting_gate``; a resume that started but did not consume (the unit
     # died, the single is still parked) is a refusal with the unit's exit code,
-    # never a ``delivered/consumed`` receipt.
+    # never a ``delivered/consumed`` receipt. For a REJECT the consumption
+    # criterion is stricter still (M3.1 defect 1): the single must sit at
+    # terminal ``refused`` -- a REJECT that merely restarted the unit did not
+    # transfer the single per the verdict's semantics.
     try:
         after = dd.get(development_id)
     except Exception:
         after = {}
-    if after.get("state") == STATE_AWAITING_GATE:
+    after_state = str(after.get("state") or "")
+    unconsumed: str | None = None
+    if after_state == STATE_AWAITING_GATE:
         exit_code = _unit_exit_code(result)
-        reason = (
+        unconsumed = (
             f"resume started for {development_id!r} but the single stayed at "
             f"{STATE_AWAITING_GATE!r} after the unit exited"
             + (f" (unit exit {exit_code})" if exit_code else "")
             + "; the verdict was not consumed"
         )
+    elif decision == DECISION_REJECT and after_state != STATE_REFUSED:
+        unconsumed = (
+            f"resume started for {development_id!r} but the single moved to "
+            f"{after_state!r} instead of {STATE_REFUSED!r}; a REJECT is only "
+            "consumed when the single terminalises as refused"
+        )
+    if unconsumed is not None:
+        exit_code = _unit_exit_code(result)
         _record_gate_refusal(
-            dd, development_id, code=CODE_GATE_NOT_CONSUMED, reason=reason, exit_code=exit_code
+            dd,
+            development_id,
+            code=CODE_GATE_NOT_CONSUMED,
+            reason=unconsumed,
+            exit_code=exit_code,
         )
         return DeliveryResult(
             status=OUTCOME_REFUSED,
             code=CODE_GATE_NOT_CONSUMED,
-            message=reason,
+            message=unconsumed,
             line=development_id,
             decision=decision,
             generation=generation,
@@ -551,8 +639,9 @@ def _deliver_dd(
         card_entity_id=card_entity_id,
         action_key=action_key,
         message=(
-            "delivered and consumed: dd single resumed through its gate and the "
-            f"dispatching line {dispatched_by!r} was woken"
+            "delivered and consumed: the verdict reached the single's decision "
+            f"read model and the single transferred per its semantics "
+            f"(state={after_state!r}); dispatching line {dispatched_by!r} was woken"
         ),
         target={
             "kind": OWNER_KIND_DD,
@@ -612,6 +701,7 @@ def deliver_decision(
         return _deliver_dd(
             development_id=line,
             decision=decision,
+            reason=reason,
             principal=principal,
             run_root=run_root,
             dd=dd,
@@ -627,13 +717,18 @@ def deliver_decision(
             decision=decision,
         )
 
-    state = _read_stall(run_root, line)
-    if not state.get("parked_run_id") or state.get("parked_at") is None:
+    # M3.1 defects 4+5: the parked claim has one authority (the scheduler's
+    # stall snapshot, run-consistent with the line's own terminal), and the
+    # refusal names the line's *actual* current state as dynamically read --
+    # never a hardcoded word standing in for a state the line may not be in.
+    park = parked_decision_state(run_root, line)
+    if not park.parked:
         return DeliveryResult(
             status=OUTCOME_REFUSED,
             code=CODE_LINE_NOT_PARKED,
             message=(
-                f"line not parked: {line!r} is not parked (waiting_on=decision). "
+                f"line not parked: {line!r} is currently {park.state_word}; a decision "
+                "can only be delivered to a line parked with waiting_on=decision. "
                 "Wait for the line to park with waiting_on=decision, then retry"
             ),
             retryable=True,
@@ -641,6 +736,7 @@ def deliver_decision(
             decision=decision,
         )
 
+    state = _read_stall(run_root, line)
     question_note_id = str(state.get("board_question_note_id") or "")
     card_entity_id = str(state.get("board_card_entity_id") or "")
     if not question_note_id or not card_entity_id:
@@ -1125,6 +1221,7 @@ __all__ = [
     "CODE_DD_NOT_FOUND",
     "CODE_DD_UNKNOWN",
     "CODE_GATE_NOT_CONSUMED",
+    "CODE_GATE_VERDICT_UNDELIVERED",
     "CODE_LINE_NOT_PARKED",
     "CODE_NOT_DISPATCHING_LINE",
     "CODE_NO_WAITING_PARTY",
@@ -1145,6 +1242,7 @@ __all__ = [
     "OUTCOME_REFUSED",
     "RESERVED_PORTS_FILE",
     "STATE_AWAITING_GATE",
+    "STATE_REFUSED",
     "TARGET_KIND_DD",
     "TARGET_KIND_LINE",
     "DecisionPayloadError",
