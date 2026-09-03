@@ -33,6 +33,7 @@ from typing import Any
 
 from fleet_graph.bus.board import DECISION_KIND, NOTE_KIND, WORK_NOTES
 from fleet_graph.decision_bridge.owners import (
+    OWNER_KIND_DD,
     RESUME_ALREADY_RESUMED,
     RESUME_REFUSED,
     RESUME_RESUMED,
@@ -153,6 +154,31 @@ class DecisionBridge:
             [dd_source, line_source], kinds={"dd": dd_source, "line": line_source}
         )
         return self.owner_source
+
+    def _record_dispatched_decision_consumed(self, target: OwnerTarget) -> None:
+        """Wake fact 4: a consumed dd decision must wake the parked line that
+        dispatched the development (``dispatched_by == line folder``).
+
+        The line is woken by the scheduler, not here: the fact is written into
+        the line's stall-state file and the scheduler's next tick reads it as a
+        wake fact and clears the parked fields through its own ``_wake``. The
+        dispatch provenance comes from the resolved target when it is present
+        (fresh path) or from the owner source's admission record on the replay
+        path, where the reconstructed target carries none. Best-effort and
+        never raising: a wake-fact write must never fail the terminal seal.
+        """
+        if target.kind != OWNER_KIND_DD:
+            return
+        dispatched_by = target.dispatched_by
+        if not dispatched_by:
+            try:
+                dispatched_by = self._ensure_owner_source().dispatched_by(target.id)
+            except Exception:
+                dispatched_by = ""
+        if not dispatched_by:
+            return
+        with contextlib.suppress(Exception):  # best-effort, never fails the seal
+            self._ensure_owner_source().record_decision_consumed(dispatched_by, self.clock())
 
     def _ensure_store(self) -> BridgeStore:
         if self.store is None:
@@ -444,6 +470,16 @@ class DecisionBridge:
         )
         if origin and not reason:
             reason = origin
+
+        if status == STATUS_RESUMED:
+            # Wake fact 4 (the decision-bridge wake): a dd development left
+            # `awaiting_gate` because this decision consumed its gate, and the
+            # development was dispatched by a parked line. Record the fact on
+            # that line so the scheduler wakes it on its next tick (it reads
+            # `dispatched_decision_consumed_at`; the wake goes through the
+            # scheduler's own `_wake`, never a direct ignition). Best-effort:
+            # a wake-fact write must never fail the receipt.
+            self._record_dispatched_decision_consumed(target)
 
         if self.config.kill_window_file is not None:
             self._hold_kill_window(source_message_id)

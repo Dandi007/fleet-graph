@@ -110,6 +110,11 @@ _EMPTY_PARK_FIELDS: dict[str, Any] = {
     "parked_at": None,
     "parked_goal_revision": None,
     "parked_inbox_available": None,
+    #: 4th wake fact: the instant the decision bridge consumed a decision for a
+    #: dd development this line dispatched (``dispatched_by == folder_id``).
+    #: The scheduler reads it as a wake fact and, when a line stays parked past
+    #: the stall threshold, as a red signal with the line id and wait duration.
+    "dispatched_decision_consumed_at": None,
 }
 
 
@@ -157,8 +162,14 @@ class TickResult:
     #: decision, no wake fact yet).
     parked: bool = False
     #: What the parking machinery did this tick, when anything happened:
-    #: "established", "woken:inbox", "woken:goal_revision", "woken:probe_failed".
+    #: "established", "woken:inbox", "woken:goal_revision",
+    #: "woken:decision_consumed", "woken:probe_failed".
     park_event: str | None = None
+    #: Wake fact 4 observability: the red missed-delivery annotation. Filled
+    #: on the wake tick when a decision for a dd development this line
+    #: dispatched was consumed but the line stayed parked past the stall
+    #: threshold: ``{"folder_id", "wait_seconds"}`` (spec判据 §3.1).
+    decision_wake_stall: dict[str, Any] | None = None
     #: The blocked terminal's reason, truncated. Display only -- an operator
     #: scanning the log should see *what* the line is waiting on without
     #: opening the run root. Never an input to any decision here (INV-3).
@@ -204,6 +215,8 @@ class TickResult:
             record["parked"] = True
         if self.park_event is not None:
             record["park_event"] = self.park_event
+        if self.decision_wake_stall is not None:
+            record["decision_wake_stall"] = self.decision_wake_stall
         if self.blocker is not None:
             record["blocker"] = self.blocker
         if self.board_question is not None:
@@ -223,6 +236,11 @@ class ParkOutcome:
     event: str | None = None
     blocker: str | None = None
     board_question: str | None = None
+    #: Wake fact 4 observability: set on the wake tick when a decision for a
+    #: dd development this line dispatched was consumed but the line stayed
+    #: parked past the stall threshold. The annotation carries the line id and
+    #: the wait duration (spec判据: 信号/告警红, 带 line id 与等待时长).
+    decision_wake_stall: dict[str, Any] | None = None
 
 
 class UnitProbe(Protocol):
@@ -291,6 +309,11 @@ class SchedulerConfig:
     read_model_base_url: str = "http://127.0.0.1:7494"
     #: M2 E6: a line is stale when its heartbeat_age_s exceeds this.
     heartbeat_stale_threshold_seconds: float = 300.0
+    #: Wake fact 4 stall threshold: a line parked with a consumed decision
+    #: (`dispatched_decision_consumed_at` set) is a missed delivery when it
+    #: stays parked past this many scheduler ticks. On the wake tick the
+    #: stall annotation records line id + wait duration (spec判据 §3.1).
+    decision_wake_stall_ticks: int = 3
     #: M3 E5 harvest: 补传 supervisor run 的 harvest 写权旗标。全部缺省
     #: None/空 → 不发射任何 harvest 旗标，supervisor run 默认 deny-all +
     #: main（默认拒绝零放宽）。纯配置透传，无业务逻辑。
@@ -331,6 +354,7 @@ class SchedulerConfig:
             heartbeat_stale_threshold_seconds=float(
                 raw.get("heartbeat_stale_threshold_seconds", 300.0)
             ),
+            decision_wake_stall_ticks=int(raw.get("decision_wake_stall_ticks", 3)),
             backoff_cap_seconds=float(raw.get("backoff_cap_seconds", DEFAULT_BACKOFF_CAP_SECONDS)),
             extra_line_environment=dict(raw.get("line_environment", {})),
             # M3 E5 harvest: 纯配置透传（无业务逻辑）。缺省 None/空 → 不发射
@@ -734,6 +758,12 @@ class Scheduler:
             "parked_at": state.get("parked_at"),
             "parked_goal_revision": state.get("parked_goal_revision"),
             "parked_inbox_available": state.get("parked_inbox_available"),
+            # Wake fact 4: when the decision bridge consumed a decision for a
+            # dd development this line dispatched (`dispatched_by ==
+            # folder_id`). Written by the bridge into the same stall-state
+            # file; the scheduler reads it back here as a wake fact and, past
+            # the stall threshold, as a red signal.
+            "dispatched_decision_consumed_at": state.get("dispatched_decision_consumed_at"),
             # The line's board card entity (`work.card.v1` on board:work-index),
             # materialised by the first escalation. Per line, not per parking:
             # it survives new terminals and re-parkings, so later question
@@ -947,13 +977,24 @@ class Scheduler:
     # waiting for a human, and no amount of backoff-paced relaunching changes
     # that -- each relaunch re-derives the same blockage at full coordinator
     # cost. So the scheduler *parks* it: refuses ignition until a mechanical
-    # wake fact appears. Three wake sources, all facts and no prose:
+    # wake fact appears. Four wake sources, all facts and no prose:
     #
     #   1. a message arrived in the line's inbox after the blocked terminal;
     #   2. goal.md's content_revision changed since the parking snapshot;
     #   3. an operator cleared the `parked_*` fields from the stall-state file
     #      (the runbook escape hatch -- `park_considered_run_id` stays behind
-    #      so the same terminal is not immediately re-parked).
+    #      so the same terminal is not immediately re-parked);
+    #   4. the decision bridge consumed a `work.decision.v1` for a dd
+    #      development this line dispatched (`dispatched_by == folder_id`):
+    #      `dispatched_decision_consumed_at` lands in the stall-state file and
+    #      the next tick wakes the line (`woken:decision_consumed`).
+    #
+    # Wake fact 4 also carries the observability half of the spec: a line that
+    # *stays* parked with a consumed decision past the stall threshold
+    # (`decision_wake_stall_ticks`) is a missed delivery -- a decision landed
+    # and a ticket consumed it, but the line has not ignited. That must never
+    # be silent again, so the wake tick records a red `decision_wake_stall`
+    # annotation carrying the line id and the wait duration.
     #
     # Failure discipline: parking is an optimisation, never a judgement. Any
     # failure to observe a wake fact -- no bus token, MCP down, timeout --
@@ -1069,6 +1110,19 @@ class Scheduler:
     def _check_wake(
         self, line: LineSpec, record: dict[str, Any], state: dict[str, Any]
     ) -> ParkOutcome:
+        # Wake fact 4 (the decision-bridge fact): a `work.decision.v1` that
+        # hit a dd development this line dispatched has been consumed. The
+        # bridge wrote `dispatched_decision_consumed_at` into this stall-state
+        # file; nothing here re-reads the board or the gate, so it is a pure
+        # fact like the other two. Check it first: a decision the line was
+        # waiting for is the strongest signal there is. The same field is what
+        # makes a *missed* delivery observable -- if the line is still parked
+        # past the stall threshold, the wake tick records the red
+        # `decision_wake_stall` annotation (line id + wait duration).
+        if state.get("dispatched_decision_consumed_at") is not None:
+            stall = self._decision_wake_stall(line, state)
+            return self._wake(line, state, "woken:decision_consumed", stall=stall)
+
         # The inbox source is consulted only if the establishment probe found
         # it usable (`parked_inbox_available`), and its availability is *not*
         # re-assessed during the park: a source that was down when parking
@@ -1098,7 +1152,46 @@ class Scheduler:
             return self._wake(line, state, f"woken:probe_failed:{probe_error_tag(exc)}")
         return ParkOutcome(parked=True, blocker=self.blocker_summary(line.folder_id))
 
-    def _wake(self, line: LineSpec, state: dict[str, Any], event: str) -> ParkOutcome:
+    def _decision_wake_stall(self, line: LineSpec, state: dict[str, Any]) -> dict[str, Any] | None:
+        """The red missed-delivery annotation, or None.
+
+        Fires when the line's parked-with-decision window has exceeded
+        `decision_wake_stall_ticks` scheduler ticks since the consumed decision
+        landed (wake fact 4). The stall is measured from the *later* of the
+        parking snapshot and the decision-consumption instant, so a decision
+        that was consumed before this park is not counted against the line. The
+        annotation carries the line id and the wait duration so an operator sees
+        *what* is red without opening the run root (spec判据 §3.1).
+        """
+        consumed_at = state.get("dispatched_decision_consumed_at")
+        if consumed_at is None:
+            return None
+        try:
+            consumed_epoch = float(consumed_at)
+        except (TypeError, ValueError):
+            return None
+        parked_at = state.get("parked_at")
+        try:
+            parked_epoch = float(parked_at) if parked_at is not None else None
+        except (TypeError, ValueError):
+            parked_epoch = None
+        baseline = max(
+            [epoch for epoch in (consumed_epoch, parked_epoch) if epoch is not None] or [0.0]
+        )
+        wait_seconds = max(0.0, self._now() - baseline)
+        stall_seconds = self.config.decision_wake_stall_ticks * self.config.interval_seconds
+        if wait_seconds < stall_seconds:
+            return None
+        return {"folder_id": line.folder_id, "wait_seconds": round(wait_seconds, 1)}
+
+    def _wake(
+        self,
+        line: LineSpec,
+        state: dict[str, Any],
+        event: str,
+        *,
+        stall: dict[str, Any] | None = None,
+    ) -> ParkOutcome:
         """Clear the parking snapshot; the normal decide order takes over.
 
         `park_considered_run_id` deliberately survives: this terminal has had
@@ -1111,9 +1204,10 @@ class Scheduler:
             "parked_at": None,
             "parked_goal_revision": None,
             "parked_inbox_available": None,
+            "dispatched_decision_consumed_at": None,
         }
         self._write_stall_state(line.folder_id, cleared)
-        return ParkOutcome(parked=False, event=event)
+        return ParkOutcome(parked=False, event=event, decision_wake_stall=stall)
 
     def _ask_board(
         self,
@@ -1390,6 +1484,7 @@ class Scheduler:
                 decision,
                 parked=park.parked,
                 park_event=park.event,
+                decision_wake_stall=park.decision_wake_stall,
                 blocker=park.blocker,
                 board_question=park.board_question,
                 seat_roster=seat_roster,

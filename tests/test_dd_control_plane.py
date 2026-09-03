@@ -1016,7 +1016,7 @@ def failed_result(dev: str, *, code: str, reason: str, detail: str = "") -> dict
 class TestFailureClassification:
     """One failure record per non-complete terminal: cause class, one
     mechanical code, the raw error verbatim, retryability, and which of the
-    three exits is open."""
+    exits is open. Rejection is a fourth class but a verdict, not a fault."""
 
     def test_an_environment_code_opens_the_reconfigure_exit(self) -> None:
         from fleet_graph.dd.control_plane import classify_failure
@@ -1038,7 +1038,7 @@ class TestFailureClassification:
     def test_an_implementation_code_points_back_at_rework(self) -> None:
         from fleet_graph.dd.control_plane import classify_failure
 
-        for code in ("GATE_REJECTED", "REWORK_LIMIT_REACHED", "REVIEWER_GIT_MUTATION"):
+        for code in ("REWORK_LIMIT_REACHED", "REVIEWER_GIT_MUTATION"):
             failure = classify_failure("failed", f"x failed ({code})", code)
             assert failure is not None
             assert (failure["class"], failure["exit"], failure["retryable"]) == (
@@ -1046,6 +1046,72 @@ class TestFailureClassification:
                 "rework",
                 True,
             ), code
+
+    def test_a_gate_rejection_is_a_verdict_not_a_fault(self) -> None:
+        """human_gate REJECT classifies as `rejected`, independent of the three
+        fault classes -- never implementation / environment_contract -- so a
+        REJECT cannot be sold as a DevelopmentTerminalFault false positive."""
+        from fleet_graph.dd.control_plane import (
+            CLASS_REJECTED,
+            FAULT_CLASSES,
+            classify_failure,
+        )
+
+        failure = classify_failure(
+            "refused",
+            "gate decision REJECT by 青林",
+            "GATE_REJECTED",
+            "the gate's question was answered REJECT",
+        )
+        assert failure is not None
+        assert failure["class"] == CLASS_REJECTED
+        assert failure["class"] not in FAULT_CLASSES
+        assert failure["code"] == "GATE_REJECTED"
+        assert failure["exit"] == "rework"
+        assert failure["retryable"] is True
+
+    def test_a_rejected_order_carries_no_fault_signal_in_derived_status(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        """The derived status's failure record for a REJECT is a rejection, so
+        the fault signal stays 0 (fleet-graph side), and the same record clears
+        once a new generation starts."""
+        from fleet_graph.dd.control_plane import CLASS_REJECTED, FAULT_CLASSES
+
+        plane = make_plane(tmp_path)
+        dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
+        plane.start(dev)  # g1 launched
+        (plane.root / dev / CHECKPOINT_FILE).touch()
+        write_result(
+            plane,
+            dev,
+            {
+                "development_id": dev,
+                "terminal": "refused",
+                "terminal_reason": "gate decision REJECT by 青林",
+                "terminal_code": "GATE_REJECTED",
+                "terminal_detail": "the gate's question was answered REJECT",
+                "stage": "final_review",
+                "head_commit": head(scratch),
+                "awaiting": None,
+                "history": [],
+            },
+        )
+
+        before = plane.rebuild_status(dev)
+        assert before["failure"] is not None
+        assert before["failure"]["class"] == CLASS_REJECTED
+        assert before["failure"]["class"] not in FAULT_CLASSES
+        assert before["failure"]["code"] == "GATE_REJECTED"
+
+        # The exit: start a new generation and the derived status's failure
+        # record is cleared (fault signal gone = the alert can exit), never a
+        # sticky permanent alarm.
+        started = plane.start(dev)
+        assert started["generation"] == 2
+        after = plane.rebuild_status(dev)
+        assert after["generation"] == 2
+        assert after["failure"] is None
 
     def test_the_fabrication_family_is_final(self) -> None:
         from fleet_graph.dd.control_plane import FABRICATION_CODES, classify_failure

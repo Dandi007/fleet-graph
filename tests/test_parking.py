@@ -395,6 +395,94 @@ class TestWakeFacts:
         assert result.decision.refusal is not Refusal.PARKED_AWAITING_DECISION
 
 
+class TestDecisionConsumedWake:
+    """Wake fact 4: the decision bridge consumed a `work.decision.v1` for a dd
+    development this line dispatched (`dispatched_by == folder_id`). The bridge
+    writes `dispatched_decision_consumed_at` into the stall-state file; the
+    scheduler reads it as a wake fact and, past the stall threshold, as a red
+    missed-delivery annotation (spec判据 §3.1).
+
+    Positive: the consumed fact wakes the line within the stall window --
+    `parked_run_id` is cleared and decide ignites.
+    Negative: a line parked awaiting a decision that has not landed must not
+    be woken and must not raise the red signal; the mutation "wake on merely
+    being parked" must stay red (the line stays parked).
+    """
+
+    def _park_and_write_consumed(self, tmp_path: Path, consumed_at: float) -> Any:
+        """A parked line, then the bridge records the consumed-decision fact
+        (as it would when resuming the dispatched dd single)."""
+        scheduler, clock, launcher = blocked_line(tmp_path, wake=FakeWake())
+        assert scheduler.tick()[0].decision.refusal is Refusal.PARKED_AWAITING_DECISION
+        state = json.loads(stall_file(tmp_path).read_text(encoding="utf-8"))
+        state["dispatched_decision_consumed_at"] = consumed_at
+        stall_file(tmp_path).write_text(json.dumps(state), encoding="utf-8")
+        return scheduler, clock, launcher
+
+    def test_a_consumed_dispatched_decision_wakes_the_line(self, tmp_path: Path) -> None:
+        scheduler, clock, _ = blocked_line(tmp_path, wake=FakeWake())
+        assert scheduler.tick()[0].decision.refusal is Refusal.PARKED_AWAITING_DECISION
+        state = json.loads(stall_file(tmp_path).read_text(encoding="utf-8"))
+        state["dispatched_decision_consumed_at"] = TICK_EPOCH + 1.0
+        stall_file(tmp_path).write_text(json.dumps(state), encoding="utf-8")
+
+        clock.now += 60.0
+        result = scheduler.tick()[0]
+        assert result.park_event == "woken:decision_consumed"
+        assert result.decision.ignite
+        after = json.loads(stall_file(tmp_path).read_text(encoding="utf-8"))
+        assert after["parked_run_id"] is None
+        assert after["dispatched_decision_consumed_at"] is None
+
+    def test_the_line_wakes_within_the_stall_window_without_a_red_annotation(
+        self, tmp_path: Path
+    ) -> None:
+        """The wake fact is consumed just after the park: the line wakes on the
+        next tick, well inside the 3-tick stall window, so no red annotation."""
+        scheduler, clock, _ = self._park_and_write_consumed(tmp_path, consumed_at=TICK_EPOCH + 1.0)
+        clock.now += 60.0
+        result = scheduler.tick()[0]
+        assert result.park_event == "woken:decision_consumed"
+        assert result.decision_wake_stall is None
+
+    def test_a_decision_consumed_past_the_stall_threshold_is_red(self, tmp_path: Path) -> None:
+        """The observability half: a decision that was consumed long ago (the
+        bridge recorded it, the line stayed parked) must surface as a red
+        `decision_wake_stall` annotation carrying the line id and wait duration."""
+        scheduler, clock, _ = self._park_and_write_consumed(tmp_path, consumed_at=TICK_EPOCH + 1.0)
+        clock.now += 400.0
+        result = scheduler.tick()[0]
+        assert result.park_event == "woken:decision_consumed"
+        assert result.decision_wake_stall is not None
+        assert result.decision_wake_stall["folder_id"] == "wf-1"
+        assert result.decision_wake_stall["wait_seconds"] >= 300.0
+        assert result.decision.ignite
+
+    def test_the_red_annotation_appears_in_the_observe_record(self, tmp_path: Path) -> None:
+        """`as_dict` exposes the stall annotation so an operator scanning the
+        log sees what is red and how long the line has been waiting."""
+        scheduler, clock, _ = self._park_and_write_consumed(tmp_path, consumed_at=TICK_EPOCH + 1.0)
+        clock.now += 400.0
+        record = scheduler.tick()[0].as_dict()
+        assert record["decision_wake_stall"]["folder_id"] == "wf-1"
+        assert record["decision_wake_stall"]["wait_seconds"] >= 300.0
+
+    def test_a_parked_line_without_a_landed_decision_is_not_woken_or_red(
+        self, tmp_path: Path
+    ) -> None:
+        """Negative: the line is parked awaiting a decision that has not
+        landed (like wf-6475fd at the time of the incident). No wake fact
+        means no wake and no red signal -- the mutation "wake whenever parked"
+        would ignite here and this turns red."""
+        scheduler, clock, launcher = blocked_line(tmp_path, wake=FakeWake())
+        for _ in range(5):
+            clock.now += 60.0
+            result = scheduler.tick()[0]
+            assert result.decision.refusal is Refusal.PARKED_AWAITING_DECISION
+            assert result.decision_wake_stall is None
+        assert launcher.launched == []
+
+
 class TestFailOpen:
     def test_a_probe_error_while_parked_falls_back_to_backoff(self, tmp_path: Path) -> None:
         """Parking saves money; a broken probe must never lock a line shut."""
