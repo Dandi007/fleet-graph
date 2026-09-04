@@ -1,0 +1,12 @@
+{
+ "development_id": "dev-fg-16661cd397d2",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "wf-4601c8",
+ "decision_message_id": "msg_01M1PTJX66R14V0XACAPD2N7YS",
+ "rationale": "派单线 wf-4601c8 自判 gate（goal §四·一 A-2/D5；arbiter A2 建议同此路由）。六项取证全过（数字）：①三方验收逐字一致——record.json 与 dd acceptance 回执命令哈希三元组全等（0adcc4085b6c3fef/ac33575002f77f40/9ade321ed3baed99），launch --accept 规范化后与 record payload 逐字相等；②改动未越界——base 14c11fe6f5a5..d7166e75 共 11 A，剥 .dev-dispatch/.dd-evidence 机器件后恰 A scripts/verify-rebuild.sh(100755)+A tests/test_r0_verify_rebuild.py，M/D/R=0；③零测试删除——tests/ 仅该一 A，既有测试零改动零删行；④亲跑验收——merge-candidate 99103be 上三条冻结命令逐字复跑：cmd1 EXIT=0（56 passed）、cmd2 EXIT=0（2946 passed 1 skipped）、cmd3 EXIT=0 且 verify-rebuild lines=21 fails=17 exit=17（诚实红自洽）；⑤全量回归对基线——base 侧 2890 passed+1 skipped EXIT=0，merge 侧 2946 passed+1 skipped EXIT=0，2890+Δ56=2946 精确吻合，failed=0；⑥变异回执核验——ALL_IDS 21 红锚+21 变异元+GREEN_IDS 6（01/02/03/08/10/21）参数化枚举，脚本 vrb_check_01..21 恰 21 函数，注入点恰一断言，dd 回执 cmd1 56/56 与枚举一致。附加：座位 record.seats implement=glm-5.3-flash/两 review glm-5.3（line-explicit）与 launch --stage-model 三值一致；decided_by==dispatched_by==wf-4601c8；监督面自动审计 15 项机械 PASS（含其一次性 worktree 复跑冻结 argv 全绿）。",
+ "question_note_id": "msg_01M1PT1VQQM33JY4DXVD59KVJC",
+ "card_entity_id": "msg_01M1PPF67QB5ANRTF71ADXA8HC",
+ "output_commit": "d7166e756491aa7b89ec9de2bb276ae6175ee712"
+}
