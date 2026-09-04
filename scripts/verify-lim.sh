@@ -34,6 +34,26 @@ unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy no_proxy
 TOKEN_FILE="/data/agent-bus/tokens/fleet-graph.token"
 BUS_TOKEN="$(cat "$TOKEN_FILE" 2>/dev/null)"
 
+# spec-m4b：本仓库根（check 15/16 的现场合成靶探针从这份源码起靶栈）。
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# run_m4b_probe <nn> — 跑 spec-m4b 的现场合成靶探针（scripts/lim_probe_m4b.py），
+# 优先用本仓 .venv 的解释器（验收序列 uv sync --frozen 先行），缺失时退回
+# uv run。stdout 压缩成末行依据回显；退出码原样透传（0=探针全绿）。
+run_m4b_probe() {
+    local nn="$1"
+    local py="$REPO_ROOT/.venv/bin/python"
+    local out rc
+    if [ -x "$py" ]; then
+        out="$(cd "$REPO_ROOT" && "$py" scripts/lim_probe_m4b.py --check "$nn" 2>&1)"
+    else
+        out="$(cd "$REPO_ROOT" && uv run python scripts/lim_probe_m4b.py --check "$nn" 2>&1)"
+    fi
+    rc=$?
+    printf '%s' "$(printf '%s' "$out" | tail -n 2 | tr '\n' ' ' | sanitize)"
+    return "$rc"
+}
+
 STATE_PORT=7494
 BUS_MCP=5608
 DD_MCP=5610
@@ -500,27 +520,49 @@ if needs_check 14; then
 fi
 
 # ---------------- 15 message-delivered-and-acked ----------------
+# spec-m4b 交付面 3：占位 FAIL 脚手架改为真实探针。先决仍是部署面 fact
+# （goal MCP :5611 必须暴露 line_message），随后按 check 12 先例现场合成
+# 靶线（scripts/lim_probe_m4b.py：靶栈全在本仓产品代码 + 一次性临时目录，
+# 跑完即清，生产名册/生产线/总线零触碰）：投递 instruction/info/bare
+# "APPROVE" 三条 → 线一个 round 消费 → 按最近 instruction 的 message_id
+# 比对台账行形状与 /v1/lines wake_facts.line_message_acks（最新在前），
+# 并核阴性①（info 无回执行）与阴性②（守卫拒绝、不冒充裁决）。
 if needs_check 15; then
     gt="$(mcp_tool_names "$GOAL_MCP")"
     has_lm="$(printf '%s\n' "$gt" | grep -cx 'line_message')"
     if [ "${has_lm:-0}" = "0" ]; then
         emit 15 message-delivered-and-acked FAIL "goal MCP :$GOAL_MCP tools/list 无 line_message 工具（实测: $(printf '%s' "$gt" | tr '\n' ' ')）"
     else
-        emit 15 message-delivered-and-acked FAIL "line_message 工具已在位但最近一条给线 inbox instruction 无 ack 落档（机制未上线）"
+        probe_result="$(run_m4b_probe 15)"
+        probe_rc="$?"
+        if [ "$probe_rc" = "0" ]; then
+            emit 15 message-delivered-and-acked PASS "合成靶探针双绿（台账+state 面按 message_id 机械比对一致，阴性①②全绿）：${probe_result}；探针合成靶已清理，无真实单/生产线被触碰"
+        else
+            emit 15 message-delivered-and-acked FAIL "合成靶探针失败(rc=${probe_rc})：${probe_result}"
+        fi
     fi
 fi
 
 # ---------------- 16 message-cannot-impersonate-decision ----------------
+# spec-m4b 交付面 3：占位 FAIL 脚手架改为真实探针，参照 check 12 先例现场
+# 合成靶（探针自备：投一条 line_message → 驱动调度 tick → tick 前后快照
+# 驻停字段 → 断言不变；跑完即清，无真实单/生产线被触碰）。探针走完整收信
+# 事件：建驻停 → BEFORE 快照 → 投递 → woken:inbox tick → 线重跑（回执后
+# 仍无裁决、再次 blocked）→ 再驻停 → AFTER 快照；断言 waiting_decision
+# 事实字段 diff 为空、无任何裁决事实、bare "APPROVE" 回执是守卫拒绝。
 if needs_check 16; then
     gt="$(mcp_tool_names "$GOAL_MCP")"
     has_lm="$(printf '%s\n' "$gt" | grep -cx 'line_message')"
-    waiting_decision="$(grep -l 'waiting_decision' "$SCHED_DIR"/wf-*.json 2>/dev/null)"
     if [ "${has_lm:-0}" = "0" ]; then
         emit 16 message-cannot-impersonate-decision FAIL "先决不满足：goal MCP :$GOAL_MCP tools/list 无 line_message 工具（实测: $(printf '%s' "$gt" | tr '\n' ' ')），无法验证『仅 inbox 消息不解除 waiting_decision 驻停』"
-    elif [ -z "$waiting_decision" ]; then
-        emit 16 message-cannot-impersonate-decision FAIL "line_message 在位但无 waiting_decision 驻停样本可对照（.scheduler 无 waiting_decision 字段）"
     else
-        emit 16 message-cannot-impersonate-decision FAIL "line_message 在位，但最近一条 inbox 消息前后驻停字段对照无法证明『仅 inbox 不解除 waiting_decision』（机制未上线）"
+        probe_result="$(run_m4b_probe 16)"
+        probe_rc="$?"
+        if [ "$probe_rc" = "0" ]; then
+            emit 16 message-cannot-impersonate-decision PASS "合成靶收信事件 tick 前后驻停快照 diff 为空（仅 inbox 不解除 waiting_decision；bare APPROVE 回执=守卫拒绝，零裁决事实）：${probe_result}；探针合成靶已清理，无真实单/生产线被触碰"
+        else
+            emit 16 message-cannot-impersonate-decision FAIL "合成靶探针失败(rc=${probe_rc})：${probe_result}"
+        fi
     fi
 fi
 

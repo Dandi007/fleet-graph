@@ -185,6 +185,25 @@ SCHEDULER_STALL_SUBDIR = ".scheduler"
 HEARTBEAT_FILE = "heartbeat.json"
 TERMINAL_ARTIFACT = "terminal.json"
 
+#: The M4 line-message ack ledger's file name (spec-m4b 交付面 1). One
+#: append-only JSONL per line, written by the pump's ack obligation and read
+#: by the state face; the constant is the single spelling both sides share so
+#: a probe never has to guess the ledger's name (台账路径发现).
+LINE_MESSAGE_ACKS_FILE = "line-message-acks.jsonl"
+
+
+def line_message_acks_path(run_root: str | Path, folder_id: str) -> Path:
+    """Where one line's ack ledger lives, discovered from the run root.
+
+    ``run_root`` is the fleet run root (the scheduler's ``config.run_root``),
+    not the line folder: the ledger of line ``<line>`` is
+    ``<run_root>/<line>/line-message-acks.jsonl`` -- the exact path the state
+    face folds and the only path ``RunArtifacts`` (constructed with the line
+    folder as its run root) ever writes. A read model or probe resolves the
+    ledger through this helper, never by re-assembling the name.
+    """
+    return Path(run_root) / folder_id / LINE_MESSAGE_ACKS_FILE
+
 
 def scheduler_stall_path(run_root: Path, folder_id: str) -> Path:
     """Where the scheduler persists one line's stall/park state."""
@@ -346,7 +365,7 @@ class RunArtifacts:
         self._rounds_path = self.run_root / "rounds.jsonl"
         self._heartbeat_path = self.run_root / "heartbeat.json"
         self._terminal_path = self.run_root / "terminal.json"
-        self._acks_path = self.run_root / "line-message-acks.jsonl"
+        self._acks_path = self.run_root / LINE_MESSAGE_ACKS_FILE
 
         self._hb_round: int | None = None
         self._hb_phase: str | None = None
@@ -618,6 +637,7 @@ __all__ = [
     "HEARTBEAT_FILE",
     "HEARTBEAT_INTERVAL_SECONDS",
     "ISO_FORMAT",
+    "LINE_MESSAGE_ACKS_FILE",
     "LINE_STATE_DONE",
     "LINE_STATE_FAILED",
     "LINE_STATE_VALUES",
@@ -636,6 +656,7 @@ __all__ = [
     "capture_release_id",
     "derive_line_state",
     "iso",
+    "line_message_acks_path",
     "normalize_waiting_on",
     "parked_decision_state",
     "scheduler_stall_path",
