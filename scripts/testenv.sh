@@ -46,8 +46,8 @@
 # 拒绝清单默认内置；FGT_DENY_PATHS（冒号分隔）/ FGT_DENY_PORTS（空白分隔）仅供
 # 测试替换 fixture 用——这是测试后门，生产不设此二环境变量。同类的测试后门还有：
 # FGT_READY_TIMEOUT（就绪等待上限，默认 60s）、FGT_PROD_GREP_ROOT（prod_references
-# 的 grep 根，默认 /data/fleet-graph）、FGT_AGENT_BUS_ROOT（agent-bus 代码源，
-# 默认 /data/code/self/agent-bus）。生产一律不设。
+# 的 grep 根与生产基线 runs 树快照根，默认 /data/fleet-graph，对生产只读）、
+# FGT_AGENT_BUS_ROOT（agent-bus 代码源，默认 /data/code/self/agent-bus）。生产一律不设。
 #
 # 固定端口映射（可用 FGT_PORT_<面> 覆盖）：bus HTTP 27490、bus MCP 25608、
 # dd MCP 25610、goal MCP 25611、decision MCP 25614、state HTTP 27494、workfolder 25618。
@@ -204,11 +204,12 @@ te_launch() {
 }
 
 te_spawn_faces() {
+    # dd 面的 plugin-binding：TEST_ROOT 内自生成（§四边界——对 /data/fleet-graph
+    # 的只读面只有基线快照与 prod_references grep 两处，binding 不再成为第三处）。
+    # 最小绑定只承载 dd 启动检查的 fail-closed 语义（binding 仅在真派单 launch
+    # 时被读）；测试环境内真派单由派单流自带绑定，不经本脚本。
     local bind="$TEST_ROOT/config/plugin-binding.json"
-    if [ ! -f "$bind" ] && [ -f /data/fleet-graph/dd/plugin-binding.json ]; then
-        cp /data/fleet-graph/dd/plugin-binding.json "$bind" 2>/dev/null || bind=""
-    fi
-    [ -f "$bind" ] || bind="$TEST_ROOT/config/plugin-binding.json"
+    [ -f "$bind" ] || printf '%s\n' '{"plugin_producer": {}}' > "$bind"
 
     local fg
     if [ -x "$REPO_ROOT/.venv/bin/fleet-graph" ]; then
@@ -562,8 +563,10 @@ EOF
 
 prod_baseline_snapshot() {
     # 基线留痕（信息性，不作硬断言）：GET 生产 :7494/v1/lines（jq 排序快照）与
-    # /data/fleet-graph/runs 树清单（路径+mtime）。对生产只读；失败留注记不阻塞。
-    local dir="$TEST_ROOT/prod-baseline"
+    # 生产 runs 树清单（路径+mtime）。对生产只读；失败留注记不阻塞。runs 树根
+    # = FGT_PROD_GREP_ROOT（默认 /data/fleet-graph，与 prod_references 同根——
+    # 测试 fixture 指 tmp 时基线侧同样离线自足）。
+    local dir="$TEST_ROOT/prod-baseline" proot="${FGT_PROD_GREP_ROOT:-/data/fleet-graph}"
     mkdir -p "$dir"
     if [ "$(http_code "http://127.0.0.1:7494/v1/lines")" = "200" ]; then
         curl -s --noproxy '*' -m 5 "http://127.0.0.1:7494/v1/lines" 2>/dev/null \
@@ -571,7 +574,7 @@ prod_baseline_snapshot() {
     else
         printf 'state-read-model-unreachable\n' > "$dir/lines.json"
     fi
-    timeout 10 find /data/fleet-graph/runs -maxdepth 2 \( -type f -o -type d \) \
+    timeout 10 find "$proot/runs" -maxdepth 2 \( -type f -o -type d \) \
         -printf '%p %T@\n' 2>/dev/null | sort > "$dir/runs-tree.txt" \
         || printf 'runs-tree-listing-failed\n' > "$dir/runs-tree.txt"
 }
@@ -745,14 +748,23 @@ cmd_down() {
     local refs
     refs="$(prod_references)"
     printf 'down=1 prod_references=%s\n' "$refs"
-    # 基线 diff（信息性——生产自身在跑会自然演进，不作硬断言）
-    if [ -f "$TEST_ROOT/prod-baseline/lines.json" ]; then
-        local now
-        if [ "$(http_code "http://127.0.0.1:7494/v1/lines")" = "200" ]; then
-            now="$(curl -s --noproxy '*' -m 5 "http://127.0.0.1:7494/v1/lines" 2>/dev/null | jq -S . 2>/dev/null)"
-            [ -n "$now" ] && diff "$TEST_ROOT/prod-baseline/lines.json" <(printf '%s\n' "$now") \
-                | sed 's/^/baseline-diff: /' || true
+    # 基线 diff（信息性——生产自身在跑会自然演进，不作硬断言）。两个基线工件
+    # （lines.json 与 runs-tree.txt）down 时都重取并 diff 进输出（§一·4 基线留痕）。
+    local base="$TEST_ROOT/prod-baseline" proot="${FGT_PROD_GREP_ROOT:-/data/fleet-graph}" now
+    if [ -f "$base/lines.json" ] && [ "$(http_code "http://127.0.0.1:7494/v1/lines")" = "200" ]; then
+        now="$(curl -s --noproxy '*' -m 5 "http://127.0.0.1:7494/v1/lines" 2>/dev/null | jq -S . 2>/dev/null)"
+        [ -n "$now" ] && diff "$base/lines.json" <(printf '%s\n' "$now") \
+            | sed 's/^/baseline-diff: /' || true
+    fi
+    if [ -f "$base/runs-tree.txt" ]; then
+        if timeout 10 find "$proot/runs" -maxdepth 2 \( -type f -o -type d \) \
+            -printf '%p %T@\n' 2>/dev/null | sort > "$base/runs-tree-now.txt"; then
+            diff "$base/runs-tree.txt" "$base/runs-tree-now.txt" \
+                | sed 's/^/runs-tree-diff: /' || true
+        else
+            printf 'runs-tree-diff: runs 树重取失败（信息性，不阻塞）\n'
         fi
+        rm -f "$base/runs-tree-now.txt"
     fi
     if [ "$PURGE" = "1" ]; then
         rm -rf "$TEST_ROOT"

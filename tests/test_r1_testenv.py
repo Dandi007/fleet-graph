@@ -26,7 +26,7 @@
 7. ``test_verify_rebuild_default_mode_unchanged``：``bash -n`` 两脚本；01-21
    ``vrb_check_NN`` 函数名仍在；``--check 99`` 非零；``--env`` 缺参数报错。
 8. 元/结构：testenv.sh 可执行位；up 摘要与 status/down token 行格式；mkrepo
-   幂等；零测试删除断言（R0 测试文件与 git HEAD 的 blob 一致）。
+   幂等；零测试删除断言（R0 测试文件与 R1 前基线 commit 99103be 的 blob 一致）。
 
 注入翻全部在 tmp 脚本副本上做（``mutated_testenv`` / 副本改写），副本自定位的
 REPO_ROOT 指 tmp（无 pyproject/.venv），任何「拒绝被摘除后继续走」的路径都会在
@@ -595,14 +595,24 @@ def test_up_summary_and_status_down_token_format(tmp_path: Path) -> None:
 
 
 def test_zero_test_deletion_r0_file_unchanged() -> None:
-    """零测试删除断言：既有 tests/test_r0_verify_rebuild.py 与 git HEAD 的 blob 一致。"""
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD:tests/test_r0_verify_rebuild.py"],
+    """零测试删除断言：既有 tests/test_r0_verify_rebuild.py 与 R1 前基线
+    （R0 合流头 = target_base_commit 99103be）的 blob 一致。
+
+    与 HEAD 比对是自指的：R1 落 commit 之后 HEAD 即含 R1，比对永远通过，
+    检不出「已 commit 的改动/删除」。对基线 commit 的 blob 比对才有承诺里的
+    保证——R1 之后任何对 R0 测试文件的 commit 级改动都会在此变红。
+    """
+    base_blob = subprocess.run(
+        [
+            "git",
+            "rev-parse",
+            "99103be319027c6b2cfa38eb0769f2d0be04c0dc:tests/test_r0_verify_rebuild.py",
+        ],
         capture_output=True,
         text=True,
         cwd=str(REPO_ROOT),
     )
-    assert head.returncode == 0, head.stderr
+    assert base_blob.returncode == 0, base_blob.stderr
     worktree_blob = subprocess.run(
         ["git", "hash-object", str(R0_TEST)],
         capture_output=True,
@@ -610,6 +620,6 @@ def test_zero_test_deletion_r0_file_unchanged() -> None:
         cwd=str(REPO_ROOT),
     )
     assert worktree_blob.returncode == 0
-    assert worktree_blob.stdout.strip() == head.stdout.strip(), (
+    assert worktree_blob.stdout.strip() == base_blob.stdout.strip(), (
         "tests/test_r0_verify_rebuild.py 被改动——R1 零测试删除（一行不动）"
     )

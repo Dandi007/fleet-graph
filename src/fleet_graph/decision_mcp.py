@@ -1083,8 +1083,10 @@ def build_decision_mcp_server(
     ``run_root`` + ``lines`` bind the server-side parked-state resolution;
     ``ledger`` / ``deliver`` / ``dd_source`` are seams so tests can drive the
     surface against a scratch state dir, an injectable deliverer, and an
-    isolated dd owner. The one tool, ``decision_deliver``, is the synchronous
-    delivery contract described in the module docstring: ``target_kind``
+    isolated dd owner. Two tools are registered: the read-only
+    ``decision_list`` (which registered lines are parked waiting on a decision,
+    derived from the same parked-state authority the delivery path uses) and
+    the synchronous delivery contract ``decision_deliver``: ``target_kind``
     explicitly separates the ``line`` path (the historic ``line`` + ``decision``
     + ``reason`` three-arg delivery, still accepted) from the ``dd`` path
     (``decision`` + ``reason`` + ``target_id``).
@@ -1137,6 +1139,37 @@ def build_decision_mcp_server(
                 sort_keys=True,
             )
         )
+
+    @mcp.tool()
+    def decision_list() -> dict[str, Any]:
+        """Read-only view: which registered lines are parked waiting on a decision.
+
+        Derives from the exact same parked-state authority the delivery path
+        resolves against (:func:`fleet_graph.state.run_artifacts.parked_decision_state`
+        -- the scheduler's stall snapshot, reconciled with the line's terminal
+        declaration), so a line listed here is a line ``decision_deliver`` would
+        actually reach, and a line absent here is one it would refuse with
+        ``LINE_NOT_PARKED``. Pure read: touches nothing but run-root artifacts.
+        """
+        registered: list[dict[str, Any]] = []
+        awaiting: list[dict[str, Any]] = []
+        for line in lines:
+            if isinstance(line, dict):
+                folder_id = str(line.get("folder_id") or "")
+            else:
+                folder_id = str(getattr(line, "folder_id", line))
+            if not folder_id:
+                continue
+            state = parked_decision_state(run_root, folder_id)
+            registered.append({"folder_id": folder_id, "state": state.state_word})
+            if state.parked:
+                awaiting.append({"folder_id": folder_id, "state": state.state_word})
+        return {
+            "awaiting_decisions": awaiting,
+            "registered": registered,
+            "total": len(registered),
+            "awaiting": len(awaiting),
+        }
 
     @mcp.tool()
     def decision_deliver(
