@@ -1,0 +1,12 @@
+{
+ "development_id": "dev-fg-67ba2a20f5c8",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "wf-4601c8",
+ "decision_message_id": "msg_01M1QCS36D6JBR38ZV52B5W8TM",
+ "rationale": "gate 自判（goal §四·一 A-2，specs/r0-gate-checklist.md 六项模式，常量本轮 development_get/development_evidence 现值重 derive：base=9c83eb3、head=6c75fc8、spec_digest=c968acc9）六项全绿：① 四方验收 argv 一致——record.json/冻结 spec §dd-acceptance/acceptance 回执/implement.json 归一哈希全等 list=sha256:bb3705305a090e238e336037685f04884407310f759f82dbc2714de490bc78d8，per-cmd=5ca31557b9d3f224/f4b4bc207ab3045d/1ea35962f8d98481（3 条）；② 改动未越界——9c83eb3..6c75fc8 剥 .dev-dispatch(8件)+.dd-evidence(1件) 后恰 M src/fleet_graph/goal/line_message.py(numstat 13/1，仅 BusLineMessageSink 缺省解析：None→FLEET_GRAPH_BUS_URL 或 DEFAULT_BUS_URL，构造时点解析)＋A tests/test_x1_line_message_baseurl.py(283行,6用例)＋A specs/x1-line-message-baseurl.md(60行,本线派单材料 38e98d2)；src/fleet_graph/bus/client.py blob 0bcfa645 与 src/fleet_graph/goal/service.py blob f05f3473 base↔head 逐字节相同（client.py 行为面零改动）；M=1/A=2/D=0/R=0；③ 零测试删除——tests/ 仅该一 A，既有全部测试文件 blob base↔head 逐字节相同，test_zero_test_deletion_baseline_blobs_unchanged 在卷；④ 亲跑验收（独立 --detach worktree @6c75fc8，三条 argv 经 subprocess 逐字执行）——cmd1 EXIT=0（[100%]×3，exit 9 守护未触发），cmd2 EXIT=0（356.2s，make verify ×3，exit 8 守护未触发），cmd3 EXIT=0 回显逐字 e2e_rc=0 e2e_lines=1；⑤ 全量回归对基线——base 9c83eb3 侧 make verify EXIT=0 2969 passed 1 skipped（115.81s），head 侧 2975 passed 1 skipped ×3（117.17/108.80/122.35s），Δ=6=新增用例数（collect-only 6），failed=0 双侧，skip 1=1 无新增；⑥ review/变异回执——rc-786b7e04 APPROVE（subject c0475be）＋rf-786b7e04 APPROVE（subject f58d41c），spec_digest 均 c968acc9 匹配，feedback index 2 条；变异对 fail-closed 在卷（test_mutation_red_default_resolution_removed：缺省解析摘除的变异副本断言 AttributeError 'NoneType' rstrip＋包成 LINE_MESSAGE_DELIVERY_FAILED，真模块同路径绿成对背书；implement 回执 cmd1 6/6 failed=0、acceptance 回执 [100%]×3）。附加核验：seats implement=glm-5.3-flash/两 review=glm-5.3 全 line-explicit 且 launch argv --stage-model 三值一致；decided_by=wf-4601c8==dispatched_by（M2）。",
+ "question_note_id": "msg_01M1QATW31XCW2V13A3VWACGDP",
+ "card_entity_id": "msg_01M1Q9JTAQR2VJ2X6KD3G95WR7",
+ "output_commit": "6c75fc8ef4291f98c72a808bcb2af890a0f3dbff"
+}
