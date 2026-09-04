@@ -1117,6 +1117,10 @@ class TestFailureClassification:
             "raw_error": "acceptance failed: [['make', 'verify']]; tsc: not found",
             "retryable": True,
             "exit": "reconfigure",
+            # The layered root cause (spec 交付面 3) every failure structure
+            # carries: a business refusal stays business even though the
+            # control-plane class routes it through reconfigure.
+            "root_cause": "business",
         }
 
     def test_an_implementation_code_points_back_at_rework(self) -> None:

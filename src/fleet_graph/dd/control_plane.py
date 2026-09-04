@@ -84,6 +84,7 @@ from fleet_graph.dd.bootstrap import (
     committed_target_base,
     digest_of,
 )
+from fleet_graph.dd.egress import EgressRepoError, TransportExhausted, retry_remote, root_cause_for
 from fleet_graph.dd.evidence import (
     KIND_ADOPTION,
     KIND_HUMAN_RECOVERY,
@@ -315,6 +316,11 @@ def classify_failure(
         "raw_error": raw_error,
         "retryable": retryable,
         "exit": exit_,
+        # The layered root cause (spec 交付面 3): transport / execution /
+        # business, with its disposition readable from
+        # ROOT_CAUSE_DISPOSITION. Every failure structure this plane writes
+        # -- status.json and the evidence chain alike -- carries it.
+        "root_cause": root_cause_for(code, raw_error),
     }
 
 
@@ -2294,13 +2300,21 @@ class DdControlPlane:
     def _remote_ref_matches(self, record: dict[str, Any], head_commit: str) -> bool:
         if not head_commit:
             return False
-        listed = run_git(
-            Path(str(record["repo_path"])),
-            "ls-remote",
-            str(record["remote_url"]),
-            str(record["remote_ref"]),
-        )
-        if listed.returncode != 0:
+        try:
+            # The remote probe is exactly where egress jitter lands, so it
+            # retries transport-class failures under the bounded backoff; a
+            # probe that is still dark after the budget (or a repo-layer
+            # refusal) reads as unverified -- the pre-existing semantics.
+            listed = retry_remote(
+                lambda: run_git(
+                    Path(str(record["repo_path"])),
+                    "ls-remote",
+                    str(record["remote_url"]),
+                    str(record["remote_ref"]),
+                ),
+                op_name="ls-remote",
+            )
+        except (TransportExhausted, EgressRepoError):
             return False
         heads = [line.split()[0] for line in listed.stdout.splitlines() if line.strip()]
         return bool(heads) and heads[0] == head_commit

@@ -30,6 +30,7 @@ from fleet_graph.bus.board import Board, GateTicket, normalize_decision
 from fleet_graph.cost_obs import CostDataPlane
 from fleet_graph.cost_obs.classify import LAUNCH, REVIEW
 from fleet_graph.dd.dispatch import derive_attempt_id
+from fleet_graph.dd.egress import PROVIDER_UNAVAILABLE
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.executors.agent_run import (
@@ -97,8 +98,8 @@ GATE_APPROVE = "APPROVE"
 
 # Failure codes from the contract's own taxonomy. Nothing here invents one:
 # an unknown code is not retryable, so guessing would turn a broken run into a
-# bounded retry it never earned.
-PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+# bounded retry it never earned. PROVIDER_UNAVAILABLE is the egress layer's
+# flat code -- the legacy alias whose root cause reads `transport`.
 INVALID_HANDOFF_SCHEMA = "INVALID_HANDOFF_SCHEMA"
 
 
