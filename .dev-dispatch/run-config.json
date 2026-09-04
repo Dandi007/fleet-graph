@@ -1,0 +1,23 @@
+{
+ "development_id": "dev-fg-67ba2a20f5c8",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "bash",
+   "-lc",
+   "uv sync --frozen && for i in 1 2 3; do uv run pytest -q tests/test_x1_line_message_baseurl.py || exit 9; done"
+  ],
+  [
+   "bash",
+   "-lc",
+   "for i in 1 2 3; do env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy make verify || exit 8; done"
+  ],
+  [
+   "bash",
+   "-lc",
+   "env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy bash -c 'O=$(uv run pytest -q -s tests/test_x1_line_message_baseurl.py -k end_to_end 2>&1); rc=$?; line=$(printf \"%s\\n\" \"$O\" | grep -cE \"^e2e delivered=1 code=- message_id=\\S+ http_hits=[1-9][0-9]* prod_touch=0$\"); echo \"e2e_rc=$rc e2e_lines=$line\"; test \"$rc\" -eq 0 -a \"$line\" -ge 1'"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
