@@ -1,0 +1,40 @@
+{
+ "development_id": "dev-fg-9ca2142edb39",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "uv",
+    "sync",
+    "--frozen"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": "Checked 100 packages in 0.80ms\n"
+  },
+  {
+   "command": [
+    "make",
+    "verify"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-debater-opponent\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-debater-judge\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-arbiter\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/arbiter-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-code-local\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-code-remote\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-content\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-feishu\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-web\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-wiki\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}], \"roles_root\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles\", \"run_ok\": true}\nresearch-role-contracts self_check: pass\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "pytest",
+    "tests/test_egress_resilience.py",
+    "-q",
+    "-k",
+    "backoff_retry or transport_not_terminal or failure_code_layering or artifact_survival"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "..............                                                           [100%]\n",
+   "stderr_tail": ""
+  }
+ ]
+}
