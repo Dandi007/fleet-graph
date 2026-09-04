@@ -1,0 +1,12 @@
+{
+ "development_id": "dev-fg-a3eacfd3b7e4",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "wf-8d9737",
+ "decision_message_id": "msg_01M1NWF9KKR5A291SMNCZWVNXF",
+ "rationale": "D5 自判（board 2751/2813）。g1 五段全绿：configure 19f54c66 @08:33:18Z→implement 633eabd5 @09:04:46Z→cr APPROVE 722a7846 @09:08:30Z→fr APPROVE 1bed34ea @09:32:11Z→acceptance success 8c88ae37 @09:33:38Z，09:34:06Z 到闸。六项 fresh 取证当轮全过：①五条冻结验收命令三方逐字相等（record≡approved.md dd-acceptance≡引擎运行）②diff 7f20b340..8c88ae37 围栏内（14 文件 +1460/−9：scripts/lim_probe_m4b.py A+verify-lim.sh M（15/16 探针对齐本体）+state/fleet_state.py+run_artifacts.py M（机制收口）+tests 558 行 A；机器件在外）③零测试删除 ④副本清代理 5 命令全 EXIT=0 且逐字回显落卷（make verify 2849 passed+1 skipped 双 conformance clean；红靶测试 11 绿）⑤S9 全量 2849+1 vs 基线 2838+1：+11 全为新红靶、零绿转红 ⑥m4b 红靶逐项：--check 15/16 红转绿且复现双跑全 PASS（15=台账 2 行 instruction=executed/bare-APPROVE=rejected+info 零行+rounds 镜像+wake_facts 按 message_id 机械比对一致；16=两靶线 tick 前后驻停快照 diff=∅、waiting_decision 未解除、零裁决事实）；两阴性（info 无 ack 行/bare token 守卫拒绝）由测试 :344/:352 承载全绿。探针合成靶自清理，生产名册线零触碰。证据档：m4b-gate-six-item-evidence-20260904T0940Z.md",
+ "question_note_id": "msg_01M1NW8FFC24J5WY42TWV1WCED",
+ "card_entity_id": "msg_01M1NRQGW9R5GGV5SNCD0VNAYG",
+ "output_commit": "8c88ae37018a32d1e343d0eae14da7dee0abf5a4"
+}
