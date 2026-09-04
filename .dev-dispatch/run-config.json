@@ -1,0 +1,36 @@
+{
+ "development_id": "dev-fg-a3eacfd3b7e4",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_line_message_ack_evidence.py",
+   "-q"
+  ],
+  [
+   "bash",
+   "scripts/verify-lim.sh",
+   "--check",
+   "15"
+  ],
+  [
+   "bash",
+   "scripts/verify-lim.sh",
+   "--check",
+   "16"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
