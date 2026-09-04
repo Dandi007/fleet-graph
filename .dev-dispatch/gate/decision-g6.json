@@ -1,0 +1,12 @@
+{
+ "development_id": "dev-fg-1969ad844058",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "wf-8d9737",
+ "decision_message_id": "msg_01M1NQTCS2P74S6DR1NZRWD2BS",
+ "rationale": "D5 自判（board 2751/2813）。g6 fresh 于绿窗同号 start：五段全绿 configure 07c73c75 @07:49:44Z→implement 3b22d6ce @07:58:38Z（g4/g5 两代 implement-materialize fault 位过）→cr APPROVE 69dbf39d @08:04:36Z→fr APPROVE 58d56391 @08:09:54Z→acceptance success d74f639e @08:11:18Z，即刻到闸。六项 fresh 取证当轮全过：①冻结 argv 三方逐字相等（record≡approved.md 两复合命令）②diff 7f20b340..d74f639e 围栏内（21 文件 +927/−33：control_plane/prompt/dd_runner 三产品面 M+test_15b_gate_reject_source_binding.py A（8 红靶测试）+双跑对照报告 tests/reports/15b_gate_reject_source_binding_dual_run.md A——g3 空绑定活例双红靶对照已随交付入卷）③零测试删除 ④副本清代理两命令 EXIT=0（8 红靶全绿）⑤全量 2846 passed+1 skipped vs 基线 2838+1：+8 全为新红靶、零绿转红 ⑥双红靶断言在位（gate-reject 源绑定正反例+双跑对照报告）。证据档：dual-revival-r10-15b-gate-evidence-20260904T0818Z.md",
+ "question_note_id": "msg_01M1NQHQDGM6593BH0CT8E19Y6",
+ "card_entity_id": "msg_01M1N2KA67QM0ZQVGP2M4X8M0N",
+ "output_commit": "d74f639eb62a514422ab49333bb1df336c82e0bd"
+}
