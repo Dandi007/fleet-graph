@@ -39,6 +39,7 @@ from fleet_graph.bus.board import Decision
 from fleet_graph.dd.control_plane import (
     CHECKPOINT_FILE,
     GATE_REJECT_FILE,
+    GATE_REWORK_REFUSALS_FILE,
     ControlPlaneError,
     DdControlPlane,
 )
@@ -408,6 +409,54 @@ class TestUnboundVerdictRefusesDispatch:
         assert not (plane.root / dev / "g2" / "events.jsonl").exists(), (
             "no gate_rework_dispatch event may exist for an unbound verdict"
         )
+
+    def test_the_refused_start_leaves_a_durable_refusal_trace(
+        self, scratch: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Face ③'s observability clause, made durable: the refused start
+        appends a structured `gate_rework_refused` line under the
+        development's own root, so the refusal survives restarts instead of
+        living only in the caller's exception and the process journal."""
+        stub_plugin_seals(scratch, monkeypatch)
+        launcher = RecordingLauncher()
+        plane = make_plane(tmp_path, launcher)
+        dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
+
+        unbound_board = FakeBoard()
+        unbound_board.decision = decision("")  # the binding is unavailable
+        first = execute_generation(
+            plane, scratch, dev, generation=1, board=unbound_board, launcher=approve_stub()
+        )
+        assert first["terminal_code"] == "GATE_REJECTED"
+
+        launches_before = launch_count(plane, dev)
+        with pytest.raises(ControlPlaneError) as refused:
+            plane.start(dev)
+        assert refused.value.code == "REWORK_DECISION_UNBOUND"
+
+        trail = plane.root / dev / GATE_REWORK_REFUSALS_FILE
+        assert trail.is_file(), "the refusal must land in the development's own state"
+        entries = [json.loads(line) for line in trail.read_text().splitlines() if line]
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["event"] == "gate_rework_refused"
+        assert entry["code"] == "REWORK_DECISION_UNBOUND"
+        assert entry["development_id"] == dev
+        assert entry["generation"] == 2
+        assert entry["rejected_generation"] == 1
+        assert "decision_message_id" in entry["detail"]
+        assert entry["at"]
+
+        # And a refused start stays refused: the trail records each attempt,
+        # still with nothing launched and nothing sealed for g2.
+        with pytest.raises(ControlPlaneError) as again:
+            plane.start(dev)
+        assert again.value.code == "REWORK_DECISION_UNBOUND"
+        entries = [json.loads(line) for line in trail.read_text().splitlines() if line]
+        assert len(entries) == 2
+        assert launch_count(plane, dev) == launches_before
+        assert not (plane.root / dev / "g2" / GATE_REJECT_FILE).exists()
+        assert not (plane.root / dev / "g2" / "events.jsonl").exists()
 
     def test_a_missing_verdict_record_refuses_instead_of_terminal_facts(
         self, scratch: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

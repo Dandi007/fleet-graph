@@ -154,6 +154,14 @@ CODE_REWORK_REPLAY_REFUSED = "REWORK_REPLAY_REFUSED"
 #: dispatching a task book with an empty binding (the g3 defect this kills).
 CODE_REWORK_DECISION_UNBOUND = "REWORK_DECISION_UNBOUND"
 
+#: Spec ⑮-b (wf-8d9737): the append-only trail, under the development's own
+#: root next to ``launches.jsonl``, where a refused gate-rework start is traced
+#: (one ``gate_rework_refused`` record per line). The refusal must be loud AND
+#: durably observable: visible in the development's state after restarts, not
+#: only in the caller's exception and the process journal. The run root's own
+#: ``events.jsonl`` stays untouched -- a refused generation seals nothing.
+GATE_REWORK_REFUSALS_FILE = "gate-rework-refusals.jsonl"
+
 
 def gate_decision_path(generation: int) -> str:
     """Where the gate seals its verdict for one generation (dd_scripts.GATE_PATH)."""
@@ -1451,7 +1459,14 @@ class DdControlPlane:
         # generation.
         gate_reject_file = ""
         if generation > 1:
-            gate_reject = self._seal_gate_rework(record, generation)
+            try:
+                gate_reject = self._seal_gate_rework(record, generation)
+            except ControlPlaneError as exc:
+                # Spec ⑮-b: the refusal is loud AND durably observable -- the
+                # structured code still raises to the caller, and the trail
+                # keeps the refusal in the development's own state.
+                self._trace_gate_rework_refusal(record, generation, exc)
+                raise
             if gate_reject is not None:
                 path = run_root / GATE_REJECT_FILE
                 write_json_durable(path, gate_reject)
@@ -1536,6 +1551,39 @@ class DdControlPlane:
             "thread_id": f"{development_id}:g{generation}",
             "checkpoint": str(dev_root / CHECKPOINT_FILE),
         }
+
+    def _trace_gate_rework_refusal(
+        self, record: dict[str, Any], generation: int, exc: ControlPlaneError
+    ) -> None:
+        """Durably trace a refused gate-rework start (spec ⑮-b, face ③).
+
+        The refusal itself is the raised ``ControlPlaneError`` -- loud by
+        construction. This trail is its durable half: one append-only
+        `gate_rework_refused` line under the development's own root (next to
+        ``launches.jsonl``), so the refused start is observable in the
+        development's state after restarts, not only in the caller's
+        exception and the process journal -- the same bar ``record_gate_refusal``
+        set for delivery-path refusals. The refused generation seals nothing:
+        no launch, no mandate file, no run-root events line. Best-effort: a
+        trace that cannot land never changes the refusal itself.
+        """
+        development_id = str(record["development_id"])
+        entry = {
+            "at": iso(self.clock()),
+            "event": "gate_rework_refused",
+            "code": exc.code,
+            "development_id": development_id,
+            "generation": generation,
+            "rejected_generation": generation - 1,
+            "detail": str(exc),
+        }
+        with (
+            contextlib.suppress(OSError),
+            (self._dev_root(development_id) / GATE_REWORK_REFUSALS_FILE).open(
+                "a", encoding="utf-8"
+            ) as handle,
+        ):
+            handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
 
     def _seal_gate_rework(self, record: dict[str, Any], generation: int) -> dict[str, Any] | None:
         """The gate REJECT verdict generation `generation` must rework from.
