@@ -1,0 +1,26 @@
+{
+ "development_id": "dev-fg-9ca2142edb39",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ],
+  [
+   "make",
+   "verify"
+  ],
+  [
+   "uv",
+   "run",
+   "pytest",
+   "tests/test_egress_resilience.py",
+   "-q",
+   "-k",
+   "backoff_retry or transport_not_terminal or failure_code_layering or artifact_survival"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
