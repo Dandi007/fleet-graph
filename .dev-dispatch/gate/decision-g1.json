@@ -1,0 +1,12 @@
+{
+ "development_id": "dev-fg-7cfb911cef21",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "wf-8d9737",
+ "decision_message_id": "msg_01M1P2VJW4BYTV4ADQPS9JTF8S",
+ "rationale": "D5 自判（board 2751/2813/2838 先例，dispatched_by 自裁）。g1 五段全绿：configure 2ad84c35→implement bdf927b4→cr APPROVE 7c463de2→fr APPROVE 40714fba→acceptance success 6417e335，rev5 到闸。六项 fresh 取证当轮全过：①两条冻结验收 argv 三方逐字相等（spec dd-acceptance≡record≡receipt，run-config 亦一致）②diff 422fac784bf7..6417e3353a91 围栏内：10 文件零 D，唯一产品文件=tests/test_d12b_audit_note_targets.py，9 个机器件在 .dev-dispatch/.dd-evidence，src/ 零触碰③零测试删除（17→19 def test_，仅新增 2，零 -def 行）④一次性副本 worktree（clone+detach，独立于 dd worktree）清代理亲跑两冻结命令：定向 pytest EXIT=0 19 passed 0 deselect；全量 make verify EXIT=0『2890 passed, 1 skipped in 87.94s』+双 conformance clean+role-contracts pass，零 deselect，原红测转绿⑤S9：base 422fac7 定向 EXIT=1 红样与 r12 诊断逐字一致、全量 EXIT=2『1 failed, 2887 passed, 1 skipped』；head 全绿⇒无绿转红，2889→2891 增量=+2 新测试，+3 计数差额（对 spec 文案 2887+1）全账=+1 红转绿+2 新增⑥防泛化红靶在场：test_whitelisted_product_path_must_exist 证非机器件白名单路径缺席仍红（pytest.raises does not exist），容错仅限 .dev-dispatch/.dd-evidence 前缀；hits⊆whitelist/产品面必含短语/条目须有理由三语义未放松。监督面自动审计 board 2839 15 项机械检查全 PASS；其 hold 建议所引 preauth 疑点经查与本单无关（本单 run-config 无 preauth 字段）。证据档：12c-gate-six-item-evidence-20260904T1127Z.md。闸后收割续链按 R11/R14 剥离合入 release/wf-8d9737，全绿后按 board 2818 前置探测自决 push。",
+ "question_note_id": "msg_01M1P12NBBSR0W2MXBGGM8VN25",
+ "card_entity_id": "msg_01M1NYXCC4ZG0MVRZ37QF0814W",
+ "output_commit": "6417e3353a91e539cac5b6c4a6d20bb5eb7262a5"
+}
