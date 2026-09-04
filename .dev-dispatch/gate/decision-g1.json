@@ -1,0 +1,12 @@
+{
+ "development_id": "dev-fg-a0b487ff17b6",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "wf-4601c8",
+ "decision_message_id": "msg_01M1QKB00TCX4MXRSQFP1EBM2M",
+ "rationale": "A-2 gate 六项取证全绿（goal §四·一，specs/r0-gate-checklist.md 六项模式；常量本轮重 derive：单 dev-fg-a0b487ff17b6，base=d9914c8bb69c7bbb7c2c62cab7b6c9809cd0b569，head=25c71ad81e381ce8b84d2dcacbaa61026834f3ce，spec_digest=sha256:de7f95d42aed564e5a83a0128640b7f460ef66f691e4b429d093574bc83258ad，9932B）。①四方验收 argv 一致：record.json／spec 冻结 dd-acceptance 块／acceptance 回执／implement verification_commands 四方归一哈希全等 5a7ab7b26d4458da69037ac8ae959e89ae3b03c130ff227d5a1e351e091b4a2f；bootstrap(93397d0) 内冻结 spec 亲算 sha256=de7f95d4…与 record 一致。②改动未越界：base..head name-status 剥 .dev-dispatch/.dd-evidence 机器件后恰 13 个产品文件（9 改 4 新，全部落 spec 交付物 1-3 契约内：engine 触点 8 文件＋testenv.sh＋新测试）；Makefile/verify-rebuild.sh numstat 为空、scripts/ 无新增；全 diff 亲读无越界编辑。③零测试删除：tests/ base 131 文件↔head 132，D=0，128 文件 blob 逐字节不变，仅 3 文件属 spec 明许信道改写（docstring／schema 断言／一条改名重绑），既有文件测试函数数 2759→2759 不减，新增 tests/test_r2_graph_unification.py 17 用例。④亲跑验收：独立 --detach 一次性 worktree @head 三条 argv 原数组逐字执行 exit 0/0/0，cmd3 回显逐字 up=0 lines=21 c05=1 c18=1 c19=1 down=0 prod_references=0。⑤全量回归对基线：base 侧 make verify exit 0（2975 passed, 1 skipped），head 侧 exit 0（2992 passed, 1 skipped），Δ=17 恰等于新增用例数（collect-only 17），skip 1=1 不变，两侧 failed=0。⑥review/变异回执：rc-578fdb84 与 rf-578fdb84 两张 review.json spec_digest 均=de7f95d4…，双 APPROVE（glm-5.3）；feedback index 2 条；findings 仅 minor/note（审计性缺口，非行为缺陷）；R2 变异对 fail-closed 在卷（2 条 _mutation 显式对＋盘面伪造/重复派单/工具集混入/诚实 404 内联红锚）；implement 回执 cmd1 17/17 pass、cmd2 2992 pass 0 fail；R0/R1 变异族在 head make verify 中仍全量执行（pytest tmp 实证）。附加核验：座位 implement=glm-5.3-flash、两 review=glm-5.3 全 line-explicit 且 launches argv 三值与 record 一致；阶段链 push→configure→implement→continuous_review→final_review→acceptance 全绿无缺号。放行 merge。",
+ "question_note_id": "msg_01M1QJ6CSF4R0E12WBB66XS4ZG",
+ "card_entity_id": "msg_01M1QDND2X7KWBP8RKJBZWHRDB",
+ "output_commit": "25c71ad81e381ce8b84d2dcacbaa61026834f3ce"
+}
