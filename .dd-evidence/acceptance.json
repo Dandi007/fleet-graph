@@ -1,0 +1,60 @@
+{
+ "development_id": "dev-fg-a3eacfd3b7e4",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "uv",
+    "sync",
+    "--frozen"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "",
+   "stderr_tail": "Checked 100 packages in 1ms\n"
+  },
+  {
+   "command": [
+    "make",
+    "verify"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-debater-opponent\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-debater-judge\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-arbiter\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/arbiter-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-code-local\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-code-remote\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-content\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-feishu\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-web\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-wiki\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}], \"roles_root\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles\", \"run_ok\": true}\nresearch-role-contracts self_check: pass\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "uv",
+    "run",
+    "pytest",
+    "tests/test_line_message_ack_evidence.py",
+    "-q"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "...........                                                              [100%]\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "bash",
+    "scripts/verify-lim.sh",
+    "--check",
+    "15"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "15 message-delivered-and-acked PASS — 合成靶探针双绿（台账+state 面按 message_id 机械比对一致，阴性①②全绿）：M4B-PROBE 15 PASS — 台账 2 行（instruction=executed, bare-APPROVE=rejected/message_is_not_a_decision, info 零行）+ rounds 镜像在 + /v1/lines wake_facts.line_message_acks 最新在前且最新一条 message_id=limmsg-25256d2a72… 机械比对一致；探针合成靶已清理，无真实单/生产线被触碰\nTOTAL pass=1 fail=0\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "bash",
+    "scripts/verify-lim.sh",
+    "--check",
+    "16"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "16 message-cannot-impersonate-decision PASS — 合成靶收信事件 tick 前后驻停快照 diff 为空（仅 inbox 不解除 waiting_decision；bare APPROVE 回执=守卫拒绝，零裁决事实）：M4B-PROBE 16 PASS — 两条靶线（instruction / bare-APPROVE）完整收信事件 tick 前后驻停快照字段 diff 为空（waiting_decision 未解除、无任何裁决事实），且 wake=inbox 唤醒与台账回执均在：a: diff=∅, wake=woken:inbox, ack=executed; b: diff=∅, wake=woken:inbox, ack=rejected；探针合成靶已清理，无真实单/生产线被触碰\nTOTAL pass=1 fail=0\n",
+   "stderr_tail": ""
+  }
+ ]
+}
