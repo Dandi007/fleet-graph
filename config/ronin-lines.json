@@ -232,8 +232,16 @@
       "seat": "opencode-glm53",
       "max_rounds": 9999,
       "alias": "ronin-lim",
+      "enabled": false,
+      "_provenance": "2026-09-03 第十四波入编（用户令「给 goal agent 端到端完成整体重构的开发工作」）：舰队 less-is-more 重构线。经 goal MCP 走完 goal_enroll -> goal_admit，放行裁决 msg_01M1HFDDBJFPVY387TP1D9YF1D（board:work-notes seq 2325）。北极星是把 wf-8d9737/design.md 落成生产事实：6 个必要元素成为真机事实、§7.1 九项立即删除项消失、§7.2 十三项双轨按退役条件逐项退役、§8 十六条验收全绿。判据 SSoT 是 design.md §8（用户拍板 D1–D7 在 §1.2，原文在 golden-order.md），本线只实现不得改判据。入编时判据脚本 scripts/verify-lim.sh 尚不存在（liveness started=true exit=127）——判据全红是 goal 线的正常起点，首轮 M0 把它补成「存在且逐项诚实报红、退出码=失败项数」。座位 opencode-glm53：入编前 glm53 座全空，遵 2026-08-29 家族分流令；该座已在 src/fleet_graph/scheduler/probe.py:92 注册功能探针。 ｜ 2026-09-05 监督面结案（用户 2026-09-04 23:5x 令「停掉重开」）：D18–D20 与宪法 v2 取代了本线 goal/design 的派单与 gate 机制，继续叠更正等于补丁叠补丁；enabled=false 进 CLOSED_BY_SUPERVISOR，产物保留在 release/wf-8d9737（tip 29f2130），由后继线 wf-4601c8（ronin-rebuild）自该 tip 切分支继承。"
+    },
+    {
+      "folder_id": "wf-4601c8",
+      "seat": "opencode-glm53",
+      "max_rounds": 9999,
+      "alias": "ronin-rebuild",
       "enabled": true,
-      "_provenance": "2026-09-03 第十四波入编（用户令「给 goal agent 端到端完成整体重构的开发工作」）：舰队 less-is-more 重构线。经 goal MCP 走完 goal_enroll -> goal_admit，放行裁决 msg_01M1HFDDBJFPVY387TP1D9YF1D（board:work-notes seq 2325）。北极星是把 wf-8d9737/design.md 落成生产事实：6 个必要元素成为真机事实、§7.1 九项立即删除项消失、§7.2 十三项双轨按退役条件逐项退役、§8 十六条验收全绿。判据 SSoT 是 design.md §8（用户拍板 D1–D7 在 §1.2，原文在 golden-order.md），本线只实现不得改判据。入编时判据脚本 scripts/verify-lim.sh 尚不存在（liveness started=true exit=127）——判据全红是 goal 线的正常起点，首轮 M0 把它补成「存在且逐项诚实报红、退出码=失败项数」。座位 opencode-glm53：入编前 glm53 座全空，遵 2026-08-29 家族分流令；该座已在 src/fleet_graph/scheduler/probe.py:92 注册功能探针。"
+      "_provenance": "2026-09-05 第十五波入编（用户 2026-09-04 23:5x 令「开新的 Workboard，核心是端到端地把旧引擎全部替换成新的开发方式，最终以新的形态落地」）：浪人舰队引擎重建线，wf-8d9737 的后继。正本 = 宪法页 v2（L0 十三条 + L1 七条）与目标架构页（D1–D20），本线只实现不改判据；里程碑 R0–R7 在 wf-4601c8/goal.md，验收标准 v2 二十一项在其 design.md §4。改动单目标分支 release/wf-4601c8（自 release/wf-8d9737 @29f2130 切出）。入编时 scripts/verify-rebuild.sh 尚不存在（liveness 诚实红），R0 补成逐项报、exit=失败项数。座位 opencode-glm53（probe.py 已注册探针）；implement glm-5.3-flash，两道 review glm-5.3，经 development_create.stage_models 传入。"
     }
   ],
   "line_environment": {
