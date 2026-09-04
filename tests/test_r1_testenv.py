@@ -272,25 +272,46 @@ def test_denies_production_and_occupied_port(tmp_path: Path) -> None:
 
 
 def test_denies_production_port_mutation(tmp_path: Path) -> None:
-    """注入翻转：摘除生产端口集判定后，7490 场景不再点名「生产端口集」。
+    """注入翻转：摘除生产端口集判定后，生产端口集场景不再点名「属生产端口集」。
 
-    变异副本会越过端口集判定，但 7490 被生产 bus 实际监听时会被 bind 探测拦下；
-    为离线自足，这里改用「生产端口集内的一个本机空闲端口」场景：变异后 bind
-    探测也放行 → 继续走到布局/拉起路径——副本的 REPO_ROOT 指 tmp（无 venv）、
-    FGT_AGENT_BUS_ROOT 指不存在处，就绪等待（FGT_READY_TIMEOUT=3s）确定地
-    exit 4，全程零真实副作用。红锚断言「属生产端口集」字样消失 → 变红。
+    密闭化（R1-fix spec §二·2）：TEST_ROOT 用 tmp_root() 落真实 /tmp（不用 pytest
+    tmp_path——basetemp 落生产根下时拒绝清单条 3 会提前拦下、未建 pids 目录，
+    造成空真绿）；七个 FGT_PORT_* 全部由测试自选空闲端口（make_testenv_env 基座），
+    不固定任何生产端口集成员（含 17590）或机器默认端口；「生产端口集」判定经
+    FGT_DENY_PORTS 测试后门验证——把测试自选的一个端口注入测试自设 deny 集
+    （原 R1 spec §一·3 明文的测试替换面），拒绝路径真实命中且与机器当刻端口
+    占用无关。变异副本越过端口集判定后 bind 探测也放行 → 继续走到布局/拉起
+    路径——副本的 REPO_ROOT 指 tmp（无 venv）、FGT_AGENT_BUS_ROOT 指不存在处，
+    就绪等待（FGT_READY_TIMEOUT=3s）确定地 exit 4，全程零真实副作用。
+    红锚（未变异，同 env 跑真 testenv.sh up）：非零退出、stderr 点名「属生产
+    端口集」与注入端口、TEST_ROOT/pids 未建（拒绝零副作用）。变异侧：显式断言
+    returncode == 4、「属生产端口集」字样消失 → 变红、TEST_ROOT/pids 不存在
+    或为空（up 失败路径完全回收的验收锚）。
     """
     mutated = mutated_testenv(
         tmp_path,
         'if port_in_deny_list "$port"; then',
         'if [ "$port" = "__never__" ]; then',
     )
-    env = make_testenv_env(FGT_PORT_BUS_HTTP="17590")
-    proc = run_bash(mutated, ["up", "--root", str(tmp_path / "r")], env)
-    assert "属生产端口集" not in proc.stderr, "变异后红锚必须变红（不再点名生产端口集）"
-    assert not (tmp_path / "r" / "pids").is_dir() or not list(
-        (tmp_path / "r" / "pids").iterdir()
-    ), "变异副本的就绪失败路径必须已把进程全部击杀回收"
+    env = make_testenv_env()
+    injected = env["FGT_PORT_BUS_HTTP"]
+    env["FGT_DENY_PORTS"] = injected
+    root = tmp_root()
+    try:
+        anchor = run_testenv(["up", "--root", str(root)], env)
+        assert anchor.returncode != 0, (anchor.returncode, anchor.stdout, anchor.stderr)
+        assert "属生产端口集" in anchor.stderr, anchor.stderr
+        assert injected in anchor.stderr, anchor.stderr
+        assert not (root / "pids").exists(), "拒绝必须零布局副作用"
+
+        proc = run_bash(mutated, ["up", "--root", str(root)], env)
+        assert proc.returncode == 4, (proc.returncode, proc.stdout, proc.stderr)
+        assert "属生产端口集" not in proc.stderr, "变异后红锚必须变红（不再点名生产端口集）"
+        assert not (root / "pids").is_dir() or not list((root / "pids").iterdir()), (
+            "变异副本的就绪失败路径必须已把进程全部击杀回收"
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 # ----------------------------------- 3. --env test 缺 knobs 时 fail-closed

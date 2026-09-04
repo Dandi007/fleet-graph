@@ -19,7 +19,8 @@
 #   --root 缺省 $FGT_ROOT，再缺省 /tmp/fleet-graph-testenv（下称 TEST_ROOT）。
 #
 #   up        布局与拒绝清单检查（零副作用）→ 幂等判定 → 逐面拉起 → 就绪等待
-#             （每面 TCP+tools/list 或等价 GET，总计 ≤60s；超时全部击杀、exit 4、
+#             （每面 TCP+tools/list 或等价 GET，总计 ≤60s；超时全部击杀并核验
+#             全灭、删除面 pid 文件——核验不灭则保留 pid 文件取证——exit 4、
 #             点名未就绪面）→ 写 env/knobs.sh → 生产基线留痕 →
 #             打印 `up=1 surfaces=<alive>/<total> root=<TEST_ROOT>`。
 #             幂等：全部 pid 存活时重复 up → 只打印摘要 exit 0；部分存活 →
@@ -367,6 +368,27 @@ kill_all() {
     sleep 1
 }
 
+reclaim_after_kill() {
+    # up 失败路径完全回收（R1-fix）：击杀后核验全灭（与 down 同一核验口径：
+    # pid_alive 假 = kill -0 不可达或仅剩 Z）。
+    #   全灭 → 删除全部面 pid 文件：exit 4 终态＝无存活面进程 且 TEST_ROOT/pids
+    #          为空，失败后的下一次 up 不再触发「部分存活 0/N → exit 3」；
+    #   有未灭（理论 D 态）→ 如实点名未灭面、保留 pid 文件取证——宁留证据，
+    #          不假报回收。返回 0=已完全回收；1=有未灭面。
+    local f p pf unverified=""
+    for f in $KILL_ALL_FACES; do
+        p="$(cat "$TEST_ROOT/pids/$f.pid" 2>/dev/null)"
+        pid_alive "$p" && unverified="$unverified $f"
+    done
+    if [ -n "$unverified" ]; then
+        printf '%s\n' "testenv: 击杀后核验未全灭，未灭面:${unverified}（pid 文件保留取证）" >&2
+        return 1
+    fi
+    pf="$(pid_files)"
+    [ -n "$pf" ] && rm -f $pf
+    return 0
+}
+
 await_ready() {
     # 就绪上限 §一·4 默认 60s；FGT_READY_TIMEOUT 仅供测试缩短（同 FGT_DENY_* 的
     # 测试后门定位，生产不设）。
@@ -381,7 +403,10 @@ await_ready() {
         [ "$(date +%s)" -ge "$deadline" ] && {
             kill_all
             sleep 1
-            die "就绪等待超时（≤60s）：未就绪面:${pending}；已全部击杀" 4
+            if reclaim_after_kill; then
+                die "就绪等待超时（≤60s）：未就绪面:${pending}；已全部击杀并回收 pid 文件" 4
+            fi
+            die "就绪等待超时（≤60s）：未就绪面:${pending}；击杀后核验未全灭，pid 文件保留取证" 4
         }
         sleep 1
     done
