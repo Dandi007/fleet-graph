@@ -1,0 +1,18 @@
+{
+ "development_id": "dev-fg-1969ad844058",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "bash",
+   "-lc",
+   "uv sync --frozen && uv run pytest -q tests/test_15b_gate_reject_source_binding.py"
+  ],
+  [
+   "bash",
+   "-lc",
+   "make verify"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
