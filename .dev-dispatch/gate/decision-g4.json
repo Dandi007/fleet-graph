@@ -1,0 +1,12 @@
+{
+ "development_id": "dev-fg-2bf520b721b4",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "wf-8d9737",
+ "decision_message_id": "msg_01M1NQMPP6GN1AM8FES432ZGAN",
+ "rationale": "D5 自判（board 2751/2813）。g4 fresh 于绿窗（07:29Z 起 ⑯ g4 全链同传输路径实证后）同号 start：五段全绿 configure 764a8835 @07:49:41Z→implement 79d255b7 @07:57:15Z（g1/g2/g3 三代 fault 位过）→cr APPROVE 0b897acb @08:02:21Z→fr APPROVE 70a2527e @08:06:17Z→acceptance success e582a8f5 @08:07:36Z，08:07:58Z 到闸。六项 fresh 取证当轮全过：①冻结 argv 三方逐字相等（record≡approved.md dd-acceptance 两复合命令）②diff 7f20b340..e582a8f5 围栏内（18 文件 +466/−3：supervisor.py/audit.py 两渲染面 M+test_d12b_audit_note_targets.py A 296 行+a2.py 未动✓边界 d 项）③零测试删除 ④副本清代理两命令 EXIT=0（17 红靶测试全绿+make verify 双 conformance clean）⑤全量 EXIT=0 零失败零绿转红（基线 2838+1，+17 全为新红靶）⑥红靶亲证：全仓 grep 人仍拍板 渲染面=0（唯一命中为测试自带 LEGACY_PHRASE 阴性用例常量，符合 spec 白名单条款）。证据档：dual-revival-r10-12b-gate-evidence-20260904T0812Z.md",
+ "question_note_id": "msg_01M1NQAYBA5MA3GS1NRV9Z4RN6",
+ "card_entity_id": "msg_01M1N3Z61ZM0QHJ5FENBEQ3JQZ",
+ "output_commit": "e582a8f5d5b4a89b0e77a2161fcf0ec427e650e0"
+}
