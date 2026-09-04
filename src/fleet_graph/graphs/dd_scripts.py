@@ -16,12 +16,22 @@ explicit choice rather than a default.
 from __future__ import annotations
 
 import json
+import random
 import subprocess
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from fleet_graph.cost_obs import CostDataPlane
+from fleet_graph.dd.egress import (
+    DEFAULT_EGRESS_POLICY,
+    EgressPolicy,
+    EgressRepoError,
+    RemoteResult,
+    retry_remote,
+)
 from fleet_graph.dd.feedback_scope import scope_index_for_generation
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.vendor import git_ops
@@ -70,6 +80,16 @@ class WorkspaceSealer:
     # locally and never publishes severs the link before the next stage runs.
     remote_url: str = ""
     remote_ref: str = ""
+    # Egress resilience: the publish retries transport-class failures under
+    # this policy, never sleeping past `fence_seconds` (the stage's run
+    # fence). Each attempt lands one probe-protocol evidence line through
+    # `evidence` when wired (the run's event sink).
+    egress_policy: EgressPolicy = field(default_factory=lambda: DEFAULT_EGRESS_POLICY)
+    fence_seconds: float | None = None
+    sleep: Callable[[float], None] = time.sleep
+    rand: Callable[[], float] = random.random
+    now: Callable[[], str] | None = None
+    evidence: Callable[[dict[str, Any]], None] | None = None
 
     def materialize(self, stage: Any, dispatch: Dispatch, outcome: StageOutcome) -> Sealed:
         stamp = str(dispatch.get("attempt_started_at") or "")
@@ -95,7 +115,7 @@ class WorkspaceSealer:
         )
         commit = self._git(["rev-parse", "HEAD"], env).strip()
         if self.remote_url and self.remote_ref:
-            self._git(["push", "--quiet", self.remote_url, f"HEAD:{self.remote_ref}"], env)
+            self._publish(env)
 
         receipt: dict[str, Any] = {
             "stage": stage.id,
@@ -106,6 +126,36 @@ class WorkspaceSealer:
         if declared:
             receipt["verdict"] = declared
         return Sealed(commit=commit, receipt=receipt)
+
+    def _publish(self, env: dict[str, str]) -> None:
+        """Push the sealed commit to the durable ref, with egress backoff.
+
+        Transport-class failures (the GnuTLS handshake family) retry with
+        exponential backoff inside the stage's run fence; each attempt lands
+        one evidence line. A repo-layer outcome -- the remote rejected the
+        push, or the chain conflicts -- is the remote's verdict about the
+        chain, not the network's, so it is never retried here.
+        """
+        try:
+            retry_remote(
+                lambda: run_git(
+                    self.repo,
+                    "push",
+                    "--quiet",
+                    self.remote_url,
+                    f"HEAD:{self.remote_ref}",
+                    env=env,
+                ),
+                op_name="push",
+                policy=self.egress_policy,
+                fence_seconds=self.fence_seconds,
+                sleep=self.sleep,
+                rand=self.rand,
+                now=self.now,
+                evidence=self.evidence,
+            )
+        except EgressRepoError as exc:
+            raise PipelineFault(f"git push failed: {exc.stderr.strip()[:400]}") from exc
 
     def _git(self, args: list[str], env: dict[str, str]) -> str:
         # Guarded: this runs on a worktree an agent wrote, and a repo-local
@@ -293,6 +343,15 @@ class MergeStage:
     # (merge) lifecycle fact the cost-observability rules consume. None means
     # no collection -- the merge still happens, it just does not emit.
     cost_plane: CostDataPlane | None = None
+    # Egress resilience: the remote probe and the CAS fast-forward retry
+    # transport-class failures under this policy, never sleeping past
+    # `fence_seconds`. Each attempt lands one probe-protocol evidence line.
+    egress_policy: EgressPolicy = field(default_factory=lambda: DEFAULT_EGRESS_POLICY)
+    fence_seconds: float | None = None
+    sleep: Callable[[float], None] = time.sleep
+    rand: Callable[[], float] = random.random
+    now: Callable[[], str] | None = None
+    evidence: Callable[[dict[str, Any]], None] | None = None
 
     def act(self, stage: Any, dispatch: Dispatch) -> StageOutcome:
         result = MERGED if self.publish else PREPARED
@@ -319,11 +378,26 @@ class MergeStage:
             )
         return StageOutcome(produced=tuple(stage.produced_artifacts))
 
-    def _fast_forward(self, dispatch: Dispatch) -> dict[str, Any]:
-        subject = str(dispatch.get("input_commit", ""))
+    def _retry_kwargs(self) -> dict[str, Any]:
+        return {
+            "policy": self.egress_policy,
+            "fence_seconds": self.fence_seconds,
+            "sleep": self.sleep,
+            "rand": self.rand,
+            "now": self.now,
+            "evidence": self.evidence,
+        }
+
+    def _probe_target_head(self) -> RemoteResult:
         try:
-            observed = git_ops.resolve_remote_ref(self.remote_url, self.target_ref)
-            git_ops.cas_fast_forward_target(
+            head = git_ops.resolve_remote_ref(self.remote_url, self.target_ref)
+        except git_ops.ExactWorkspaceError as exc:
+            return RemoteResult(1, str(exc))
+        return RemoteResult(0, "", head)
+
+    def _cas_fast_forward(self, subject: str, observed: str) -> RemoteResult:
+        try:
+            merged = git_ops.cas_fast_forward_target(
                 workspace_path=str(self.repo),
                 remote_url=self.remote_url,
                 target_ref=self.target_ref,
@@ -331,6 +405,28 @@ class MergeStage:
                 handoff_commit=subject,
             )
         except git_ops.ExactWorkspaceError as exc:
+            return RemoteResult(1, str(exc))
+        return RemoteResult(0, "", merged)
+
+    def _fast_forward(self, dispatch: Dispatch) -> dict[str, Any]:
+        """The CAS publish, with egress backoff on both remote operations.
+
+        The probe (`ls-remote`) and the CAS fast-forward each retry
+        transport-class failures under the stage fence. A repo-layer verdict
+        -- target moved, ref missing, remote rejected -- keeps the existing
+        `MERGE_REFUSED` semantics; only the network's own failures retry.
+        """
+        subject = str(dispatch.get("input_commit", ""))
+        try:
+            observed = retry_remote(
+                self._probe_target_head, op_name="ls-remote", **self._retry_kwargs()
+            )
+            retry_remote(
+                lambda: self._cas_fast_forward(subject, observed),
+                op_name="cas-fast-forward",
+                **self._retry_kwargs(),
+            )
+        except EgressRepoError as exc:
             raise StageRefused(f"merge refused: {exc}", code="MERGE_REFUSED") from exc
         return {"previous_target_head": observed}
 

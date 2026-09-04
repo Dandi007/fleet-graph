@@ -60,6 +60,10 @@ SPEC_ARTIFACT = "spec"
 EVENTS_FILE = "events.jsonl"
 RESULT_FILE = "result.json"
 
+# The stage run fence every remote retry budget defers to when the admission
+# record declares no per-stage override -- the runner's own default fence.
+DEFAULT_STAGE_FENCE_SECONDS = 3600
+
 # Artifact kinds used to find the stage that owns each script default.
 RUN_CONFIG = "run_config"
 ACCEPTANCE_RESULT = "acceptance_result"
@@ -286,6 +290,7 @@ def build_pipeline(
 
     # Defaults that make an assembled pipeline runnable. A caller-supplied
     # entry always wins; nothing here is mandatory.
+    merge_stage = stage_producing(lifecycle, MERGE_RESULT)
     registered: dict[str, Actor] = {
         stage_producing(lifecycle, RUN_CONFIG): ConfigureStage(
             repo=config.workspace_path, run_config=config.run_config
@@ -302,13 +307,17 @@ def build_pipeline(
             env=dict(config.run_config.get("acceptance_env") or {}),
             timeout_seconds=config.acceptance_timeout_seconds,
         ),
-        stage_producing(lifecycle, MERGE_RESULT): MergeStage(
+        merge_stage: MergeStage(
             repo=config.workspace_path,
             remote_url=config.remote_url,
             target_ref=config.remote_ref,
             publish=config.publish_merge,
             # The promotion (merge) lifecycle fact is emitted by this stage.
             cost_plane=cost_plane,
+            # Egress: the CAS publish retries transport-class failures under
+            # the stage's run fence, landing one evidence line per attempt.
+            fence_seconds=float(config.timeouts.get(merge_stage, DEFAULT_STAGE_FENCE_SECONDS)),
+            evidence=observe,
         ),
     }
     if board is not None and gate_card_entity_id:
@@ -342,6 +351,11 @@ def build_pipeline(
                         repo=config.workspace_path,
                         remote_url=config.remote_url,
                         remote_ref=config.remote_ref,
+                        # Egress: the durable-ref publish retries
+                        # transport-class failures inside the stage's run
+                        # fence; every attempt lands one evidence line.
+                        fence_seconds=float(config.timeouts.get(name, DEFAULT_STAGE_FENCE_SECONDS)),
+                        evidence=observe,
                     )
                     for name in lifecycle.stages
                     if name not in sealer.sealed_stages
