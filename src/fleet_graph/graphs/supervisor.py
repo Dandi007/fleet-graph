@@ -43,6 +43,11 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from fleet_graph.arbiter.a2 import (
+    ESCALATION_DISPATCHING_LINE,
+    ESCALATION_NEEDS_EVIDENCE,
+    ESCALATION_SUPERVISOR_ESCALATION,
+)
 from fleet_graph.bus.board import DECISION_KIND_V2, NOTE_KIND, WORK_NOTES, Board, GateTicket
 from fleet_graph.bus.client import DEFAULT_BUS_URL, BusClient
 from fleet_graph.dd.control_plane import DEFAULT_DD_ROOT, RECORD_FILE
@@ -70,6 +75,7 @@ from fleet_graph.supervise.events import (
     EVENT_BOARD_QUESTION,
     EVENT_CAP_BREAKER,
     EVENT_DECISION_SWALLOWED,
+    EVENT_ENROLLMENT_PENDING,
     EVENT_HEARTBEAT_STALE,
     EVENT_LINE_FAULT,
     SupervisorEvent,
@@ -339,6 +345,47 @@ def validate_audit_verdict(parsed: dict[str, Any]) -> dict[str, Any]:
     return parsed
 
 
+#: Subject form (event type) -> named escalation target for the non-preauth
+#: board note (缺陷⑫ 收尾). The destination is named from arbiter/a2.py's
+#: closed vocabulary -- never again a bare human-decides broadcast, which
+#: could not tell apart the three genuinely different destinations: a dd unit
+#: at or past its gate (the dispatching line self-judges, D5), a B-class
+#: direction/production-action escalation (the supervisor answers), and a
+#: thin-signal audit that first needs evidence. A subject form not in this
+#: table degrades to needs_evidence -- go back and name what is missing.
+_ESCALATION_TARGET_BY_SUBJECT = {
+    EVENT_BLOCKED_DECISION: ESCALATION_DISPATCHING_LINE,
+    EVENT_APPROVED_UNHARVESTED: ESCALATION_DISPATCHING_LINE,
+    EVENT_BOARD_QUESTION: ESCALATION_SUPERVISOR_ESCALATION,
+    EVENT_LINE_FAULT: ESCALATION_SUPERVISOR_ESCALATION,
+    EVENT_CAP_BREAKER: ESCALATION_SUPERVISOR_ESCALATION,
+    EVENT_DECISION_SWALLOWED: ESCALATION_SUPERVISOR_ESCALATION,
+    EVENT_HEARTBEAT_STALE: ESCALATION_NEEDS_EVIDENCE,
+    EVENT_ENROLLMENT_PENDING: ESCALATION_NEEDS_EVIDENCE,
+}
+
+#: The one-line rationale the note carries next to the named target, so the
+#: board reads the routing, not just the label.
+_ESCALATION_TARGET_RATIONALE = {
+    ESCALATION_DISPATCHING_LINE: "派单线自判（D5：派单线拥有自己的闸）",
+    ESCALATION_SUPERVISOR_ESCALATION: "B 类升报：监督面裁定方向/生产动作",
+    ESCALATION_NEEDS_EVIDENCE: "证据不足：回补缺口（见上方断言/GAP 所点名项）后再判",
+}
+
+
+def _escalation_target(classification: str, event_type: str) -> str:
+    """The named destination for this audit note, by the subject's form.
+
+    A rejection grounded in REJECT_GROUNDS is unit-gate business with complete
+    mechanical evidence -- it goes back through the dispatching line (D5) and
+    outranks the subject form. Everything else routes by the event's subject
+    shape; an unknown shape degrades to needs_evidence, never a bare human.
+    """
+    if classification == CLASSIFY_RECOMMEND_REJECT:
+        return ESCALATION_DISPATCHING_LINE
+    return _ESCALATION_TARGET_BY_SUBJECT.get(event_type, ESCALATION_NEEDS_EVIDENCE)
+
+
 def render_supervisor_note(
     event: SupervisorEvent,
     report: dict[str, Any],
@@ -348,7 +395,10 @@ def render_supervisor_note(
     preauth: dict[str, Any] | None = None,
 ) -> str:
     """The board-facing audit note. Recommends, or names the preauth it acted
-    on -- the one thing it never does is present a release as a human verdict."""
+    on -- the one thing it never does is present a release as a human verdict.
+    The non-preauth header may state that this unit emits no work.decision.v1,
+    but its destination is always named from the shared ESCALATION_TARGETS
+    vocabulary (缺陷⑫: no more broadcasting "a human decides" as a place)."""
     if classification == CLASSIFY_PREAUTH_RELEASE:
         header = (
             f"supervisor {event.type} {event.key}: {classification}"
@@ -356,9 +406,11 @@ def render_supervisor_note(
             f"scope=merge_only——合入≠部署，production promotion 仍停人闸）"
         )
     else:
+        target = _escalation_target(classification, event.type)
         header = (
             f"supervisor {event.type} {event.key}: {classification}"
-            f"（自动审计，本单不发 work.decision.v1——人仍拍板）"
+            f"（自动审计，本单不发 work.decision.v1——去向: {target}"
+            f"，{_ESCALATION_TARGET_RATIONALE[target]}）"
         )
     lines = [header]
     if preauth is not None and classification == CLASSIFY_PREAUTH_RELEASE:
