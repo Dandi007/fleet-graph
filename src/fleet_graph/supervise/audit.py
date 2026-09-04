@@ -43,6 +43,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from fleet_graph.arbiter.a2 import (
+    ESCALATION_DISPATCHING_LINE,
+    ESCALATION_NEEDS_EVIDENCE,
+    ESCALATION_SUPERVISOR_ESCALATION,
+)
 from fleet_graph.bus.board import NOTE_KIND, WORK_NOTES
 from fleet_graph.bus.client import BusClient, PublishResult
 from fleet_graph.dd.bootstrap import DEVELOPMENT_PATH, IdentityChanged, committed_target_base
@@ -1078,10 +1083,31 @@ def audit_goal_line(folder_id: str, *, run_root: Path) -> AuditReport:
 # --- board evidence note --------------------------------------------------
 
 
+def _note_escalation_target(report: AuditReport) -> str:
+    """The named destination for this evidence note, by the subject's form
+    (缺陷⑫ 收尾), from arbiter/a2.py's closed vocabulary -- never again the
+    bare human-decides broadcast:
+
+    - gaps in the report mean the evidence could not be gathered: go back and
+      fill the named gap first (`needs_evidence`);
+    - a development audit is dd-unit gate business: the dispatching line
+      self-judges (D5);
+    - a goal-line audit is production-line state: a class-B escalation the
+      supervisor answers (direction / production-action ruling).
+    """
+    if report.gaps:
+        return ESCALATION_NEEDS_EVIDENCE
+    if report.kind == "development":
+        return ESCALATION_DISPATCHING_LINE
+    return ESCALATION_SUPERVISOR_ESCALATION
+
+
 def render_note(report: AuditReport) -> str:
+    target = _note_escalation_target(report)
     lines = [
         f"supervise audit {report.target} ({report.kind}): "
-        f"{'全绿' if report.ok else '有红'}——机械审计，人仍拍板。",
+        f"{'全绿' if report.ok else '有红'}——机械审计，本单不发 work.decision.v1；"
+        f"去向: {target}。",
     ]
     for assertion in report.assertions:
         mark = "PASS" if assertion.ok else "FAIL"
