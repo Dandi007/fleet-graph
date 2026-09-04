@@ -1165,6 +1165,7 @@ class TestFailureClassification:
         the fault signal stays 0 (fleet-graph side), and the same record clears
         once a new generation starts."""
         from fleet_graph.dd.control_plane import CLASS_REJECTED, FAULT_CLASSES
+        from fleet_graph.graphs.dd_scripts import GATE_PATH
 
         plane = make_plane(tmp_path)
         dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
@@ -1184,6 +1185,27 @@ class TestFailureClassification:
                 "awaiting": None,
                 "history": [],
             },
+        )
+        # Spec ⑮-b: a gate rework generation starts only from a verdict bound
+        # to its board work.decision.v1. Seal the rejecting verdict the gate
+        # left behind (uncommitted, exactly as a real refusal terminalises)
+        # so the start carries its mandated rationale input.
+        (scratch / GATE_PATH.format(generation=1)).parent.mkdir(parents=True, exist_ok=True)
+        (scratch / GATE_PATH.format(generation=1)).write_text(
+            json.dumps(
+                {
+                    "development_id": dev,
+                    "decision": "REJECT",
+                    "decided_by": "青林",
+                    "decision_message_id": "msg_01M1GATEREJECTBOUND000000",
+                    "rationale": "返工面：derived status 断言需随绑定语义更新",
+                    "question_note_id": "note-1",
+                    "card_entity_id": "card-1",
+                    "output_commit": head(scratch),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
         )
 
         before = plane.rebuild_status(dev)

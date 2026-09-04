@@ -766,7 +766,11 @@ def test_the_anchor_renders_message_id_and_rationale() -> None:
     assert "decision: REJECT" in section
     assert REJECT_RATIONALE in section
 
-    # A legacy record with no rationale text still renders the anchor.
-    bare = render_gate_reject_section({"decision_message_id": "", "rationale": ""})
-    assert GATE_REJECT_ANCHOR in bare
-    assert "decision: REJECT" in bare
+    # Spec ⑮-b: an unbound verdict (no message id, no rationale) never
+    # renders -- the prompt layer refuses it loudly instead of shipping a
+    # placeholder task book with an empty binding.
+    from fleet_graph.dd.prompt import PromptError
+
+    with pytest.raises(PromptError) as unbound:
+        render_gate_reject_section({"decision_message_id": "", "rationale": ""})
+    assert "decision_message_id" in str(unbound.value)

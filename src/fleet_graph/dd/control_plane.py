@@ -147,6 +147,22 @@ GATE_REJECT_FILE = "gate-reject.json"
 #: start instead of being launched as a fake generation.
 CODE_REWORK_REPLAY_REFUSED = "REWORK_REPLAY_REFUSED"
 
+#: Spec ⑮-b (wf-8d9737): the structured refusal for a gate REJECT whose board
+#: ``work.decision.v1`` binding is unavailable -- the verdict record carries no
+#: ``decision_message_id`` (or no ``decided_by``/``rationale``), or no verdict
+#: record exists at all so only the terminal's one-line facts remain. An
+#: unbound verdict must refuse the rework dispatch instead of silently
+#: dispatching a task book with an empty binding (the g3 defect this kills).
+CODE_REWORK_DECISION_UNBOUND = "REWORK_DECISION_UNBOUND"
+
+#: Spec ⑮-b (wf-8d9737): the append-only trail, under the development's own
+#: root next to ``launches.jsonl``, where a refused gate-rework start is traced
+#: (one ``gate_rework_refused`` record per line). The refusal must be loud AND
+#: durably observable: visible in the development's state after restarts, not
+#: only in the caller's exception and the process journal. The run root's own
+#: ``events.jsonl`` stays untouched -- a refused generation seals nothing.
+GATE_REWORK_REFUSALS_FILE = "gate-rework-refusals.jsonl"
+
 
 def gate_decision_path(generation: int) -> str:
     """Where the gate seals its verdict for one generation (dd_scripts.GATE_PATH)."""
@@ -1449,7 +1465,14 @@ class DdControlPlane:
         # generation.
         gate_reject_file = ""
         if generation > 1:
-            gate_reject = self._seal_gate_rework(record, generation)
+            try:
+                gate_reject = self._seal_gate_rework(record, generation)
+            except ControlPlaneError as exc:
+                # Spec ⑮-b: the refusal is loud AND durably observable -- the
+                # structured code still raises to the caller, and the trail
+                # keeps the refusal in the development's own state.
+                self._trace_gate_rework_refusal(record, generation, exc)
+                raise
             if gate_reject is not None:
                 path = run_root / GATE_REJECT_FILE
                 write_json_durable(path, gate_reject)
@@ -1535,6 +1558,39 @@ class DdControlPlane:
             "checkpoint": str(dev_root / CHECKPOINT_FILE),
         }
 
+    def _trace_gate_rework_refusal(
+        self, record: dict[str, Any], generation: int, exc: ControlPlaneError
+    ) -> None:
+        """Durably trace a refused gate-rework start (spec ⑮-b, face ③).
+
+        The refusal itself is the raised ``ControlPlaneError`` -- loud by
+        construction. This trail is its durable half: one append-only
+        `gate_rework_refused` line under the development's own root (next to
+        ``launches.jsonl``), so the refused start is observable in the
+        development's state after restarts, not only in the caller's
+        exception and the process journal -- the same bar ``record_gate_refusal``
+        set for delivery-path refusals. The refused generation seals nothing:
+        no launch, no mandate file, no run-root events line. Best-effort: a
+        trace that cannot land never changes the refusal itself.
+        """
+        development_id = str(record["development_id"])
+        entry = {
+            "at": iso(self.clock()),
+            "event": "gate_rework_refused",
+            "code": exc.code,
+            "development_id": development_id,
+            "generation": generation,
+            "rejected_generation": generation - 1,
+            "detail": str(exc),
+        }
+        with (
+            contextlib.suppress(OSError),
+            (self._dev_root(development_id) / GATE_REWORK_REFUSALS_FILE).open(
+                "a", encoding="utf-8"
+            ) as handle,
+        ):
+            handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+
     def _seal_gate_rework(self, record: dict[str, Any], generation: int) -> dict[str, Any] | None:
         """The gate REJECT verdict generation `generation` must rework from.
 
@@ -1546,6 +1602,20 @@ class DdControlPlane:
         `gate_decision_path(N)`: committed first, then the worktree copy the
         gate's own refusal left behind (which is committed here, so the
         verdict becomes a durable part of the chain).
+
+        Spec ⑮-b (wf-8d9737): the verdict must be *bound* -- the three fields
+        the rework consumes (`decision_message_id`, `decided_by`, `rationale`)
+        all non-empty, sourced from the board ``work.decision.v1`` the gate
+        actually consumed, and carried verbatim. Two shapes cannot serve and
+        refuse the start with ``REWORK_DECISION_UNBOUND`` instead of
+        dispatching an empty-binding task book:
+
+        - a verdict record that says REJECT but is missing any of the three
+          fields (an unbound message id is exactly the g3 live defect), and
+        - a GATE_REJECTED terminal with no sealed verdict record anywhere
+          (a legacy result predating the seal) -- the terminal's one-line
+          facts are no longer a success-path substitute for the board
+          decision; the old ``terminal-facts`` fallback is gone.
 
         Returns None when generation N was not a gate rejection at all (no
         record anywhere, no GATE_REJECTED terminal) -- the ordinary reconfigure
@@ -1563,11 +1633,11 @@ class DdControlPlane:
         was_rejected = prior_failure is not None and prior_failure["code"] in REJECTION_CODES
 
         decision = self._committed_gate_decision(record, rejected)
-        source = "committed"
+        source_record = "committed"
         if decision is None:
             path = repo / gate_decision_path(rejected)
             if path.is_file():
-                source = "worktree"
+                source_record = "worktree"
                 try:
                     decision = dict(json.loads(path.read_text(encoding="utf-8")))
                 except (OSError, ValueError):
@@ -1593,19 +1663,20 @@ class DdControlPlane:
         if decision is None:
             if not was_rejected:
                 return None
-            # A GATE_REJECTED terminal with no sealed verdict record anywhere
-            # (a legacy result predating the seal). The terminal's own reason
-            # is the minimal rework face; the anchor still travels so the
-            # prompt always marks a gate rework as a gate rework.
-            return {
-                "development_id": development_id,
-                "rejected_generation": rejected,
-                "decision": "REJECT",
-                "decision_message_id": "",
-                "decided_by": "",
-                "rationale": str((prior_result or {}).get("terminal_reason") or ""),
-                "source": "terminal-facts",
-            }
+            # Spec ⑮-b: a GATE_REJECTED terminal with no sealed verdict record
+            # anywhere (a legacy result predating the seal) has no board
+            # binding to rework from. The terminal's one-line facts were the
+            # old ``terminal-facts`` fallback; that fallback dispatched task
+            # books with an empty binding (the g3 shape) and is now a refusal,
+            # not a success path.
+            raise ControlPlaneError(
+                CODE_REWORK_DECISION_UNBOUND,
+                f"{development_id} g{generation} cannot start as a gate rework: the "
+                f"GATE_REJECTED terminal of g{rejected} has no sealed verdict record at "
+                f"{gate_decision_path(rejected)}, so the board work.decision.v1 binding "
+                "(decision_message_id / decided_by / rationale) is unavailable; no new "
+                "implement dispatch will be assembled from terminal-facts (source: none)",
+            )
         if str(decision.get("decision") or "").strip().upper() != "REJECT":
             if not was_rejected:
                 return None
@@ -1617,6 +1688,25 @@ class DdControlPlane:
                 "GATE_REJECTED; no new implement dispatch will be assembled against "
                 "contradicting verdicts (missing: gate-reject-rationale)",
             )
+        # Spec ⑮-b: the verdict must be bound to the board work.decision.v1
+        # the gate actually consumed. An empty binding field means the
+        # rework's authoritative input is unavailable -- refuse the dispatch
+        # (observably, by code) instead of sealing and dispatching an empty
+        # task book.
+        binding = {
+            "decision_message_id": str(decision.get("decision_message_id") or "").strip(),
+            "decided_by": str(decision.get("decided_by") or "").strip(),
+            "rationale": str(decision.get("rationale") or "").strip(),
+        }
+        unbound = sorted(name for name, value in binding.items() if not value)
+        if unbound:
+            raise ControlPlaneError(
+                CODE_REWORK_DECISION_UNBOUND,
+                f"{development_id} g{generation} cannot start as a gate rework: the "
+                f"rejecting verdict at {gate_decision_path(rejected)} is not bound to "
+                f"its board work.decision.v1 (empty: {', '.join(unbound)}); no new "
+                "implement dispatch will be assembled with an empty binding",
+            )
         return {
             "development_id": development_id,
             "rejected_generation": rejected,
@@ -1625,7 +1715,11 @@ class DdControlPlane:
             "decided_by": str(decision.get("decided_by") or ""),
             "rationale": str(decision.get("rationale") or ""),
             "question_note_id": str(decision.get("question_note_id") or ""),
-            "source": source,
+            # The source of truth is the board work.decision.v1 the gate
+            # consumed; `source_record` names where the sealed copy was read
+            # from (committed chain, or the worktree copy now committed).
+            "source": "board:work.decision.v1",
+            "source_record": source_record,
         }
 
     def _commit_gate_record(self, repo: Path, relative: str, rejected: int) -> bool:
