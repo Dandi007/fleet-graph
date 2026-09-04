@@ -42,7 +42,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from fleet_graph.state.run_artifacts import normalize_waiting_on, parked_decision_state
+from fleet_graph.state.run_artifacts import (
+    line_message_acks_path,
+    normalize_waiting_on,
+    parked_decision_state,
+)
 
 log = logging.getLogger(__name__)
 
@@ -567,8 +571,10 @@ class FleetStateView:
             # ledger, folded into wake_facts (latest first, capped) so an
             # operator can see an instruction was answered without re-reading
             # the run's rounds. A missing/failed read degrades to absent --
-            # never a 5xx, never a fabricated ledger.
-            acks = _read_jsonl(run_root / folder_id / "line-message-acks.jsonl")
+            # never a 5xx, never a fabricated ledger. The ledger path comes
+            # from the one discovery seam (spec-m4b 台账路径发现), never a
+            # locally re-assembled name.
+            acks = _read_jsonl(line_message_acks_path(run_root, folder_id))
             if acks:
                 wake_facts["line_message_acks"] = list(reversed(acks))[:ACK_TAIL_LIMIT]
 
