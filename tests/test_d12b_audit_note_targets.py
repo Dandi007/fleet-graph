@@ -7,8 +7,11 @@ ESCALATION_TARGETS vocabulary (``dispatching_line`` / ``supervisor_escalation``
 again. Pinned here:
 
 - full-repo grep: the legacy phrase has zero product-surface occurrences,
-  against an explicit whitelist whose every entry is asserted to exist and to
-  carry a reason (spec 指令 c 项);
+  against an explicit whitelist whose every entry carries a reason and whose
+  product-surface entries really contain the phrase; machine-artifact entries
+  (``.dev-dispatch/`` / ``.dd-evidence/``) tolerate harvest-time stripping and
+  phrase-free rewrites (spec ⑫-c), while a missing or phraseless
+  product-surface entry still fails (spec 指令 c 项);
 - both render paths give named-target positives per subject form: the
   supervisor note (graphs/supervisor.py) for every event shape, the supervise
   evidence note (supervise/audit.py) for development / goal_line / gaps;
@@ -42,6 +45,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 import fleet_graph.arbiter.a2 as a2
 import fleet_graph.graphs.supervisor as supervisor_mod
 import fleet_graph.supervise.audit as audit_mod
@@ -73,11 +78,26 @@ DESTINATION_RE = re.compile(r"去向: (\S+?)[，。）]")
 
 #: Paths where the legacy phrase may still exist, each with its reason. The
 #: grep test asserts this list is exact: every repo hit is whitelisted, and
-#: every whitelisted path really contains the phrase.
+#: every whitelisted product-surface path really contains the phrase.
+#:
+#: Context tolerance (spec ⑫-c): machine-artifact content varies by context.
+#: The harvest chain strips ``.dev-dispatch/`` / ``.dd-evidence/`` entirely
+#: (R11/R14), and inside a dd unit tree the committed spec doc may or may not
+#: quote the phrase (this order's spec happens not to). A whitelist entry
+#: under those prefixes is therefore permitted, never required: absent or
+#: phraseless is fine, but a phrase occurrence there must still be whitelisted
+#: exactly as before. A missing or phraseless product-surface entry still
+#: fails (test_whitelisted_product_path_must_exist and the per-entry check).
 LEGACY_PHRASE_WHITELIST = {
     ".dev-dispatch/spec/approved.md": ("spec 原文引用旧措辞（禁令本身）——控制器保留文档，非渲染面"),
     "tests/test_d12b_audit_note_targets.py": ("本测试以旧措辞构造阴性断言——测试文本，非渲染面"),
 }
+
+#: Machine-artifact namespaces the harvest chain strips (R11/R14). Whitelist
+#: entries under one of these prefixes are permitted, never required: they may
+#: be absent from the tree or simply not quote the phrase. Entries elsewhere
+#: must exist and contain the phrase in every context.
+MACHINE_ARTIFACT_PREFIXES = (".dev-dispatch/", ".dd-evidence/")
 
 #: Directories that are not repo text surfaces (caches, dependency installs).
 GREP_SKIP_DIRS = {
@@ -103,6 +123,35 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _assert_whitelist_entry(root: Path, rel: str, reason: str, needle: bytes) -> None:
+    """Check one whitelist entry; shared by the grep test and its guards.
+
+    Spec ⑫-c context tolerance: a whitelisted path may be absent only when it
+    lives under a machine-artifact namespace the harvest chain strips, and
+    machine-artifact entries need not quote the phrase; a missing or
+    phraseless product-surface entry is still a failure, as is any repo hit
+    outside the whitelist.
+    """
+    assert reason.strip(), f"whitelist entry {rel} must document its reason"
+    whitelisted = root / rel
+    machine_artifact = rel.startswith(MACHINE_ARTIFACT_PREFIXES)
+    if not whitelisted.is_file():
+        assert machine_artifact, (
+            f"whitelisted path {rel} does not exist; only machine-artifact "
+            f"paths {MACHINE_ARTIFACT_PREFIXES} may be stripped from the tree"
+        )
+        return
+    if machine_artifact:
+        # Machine-artifact content varies by context (harvest strips these
+        # namespaces; a dd unit's spec doc may or may not quote the phrase),
+        # so the phrase is permitted here, never required.
+        return
+    assert needle in whitelisted.read_bytes(), (
+        f"whitelisted path {rel} no longer contains the phrase; "
+        "shrink the whitelist instead of keeping dead entries"
+    )
+
+
 # --- spec 指令 c 项: the full-repo legacy-phrase grep -----------------------
 
 
@@ -122,24 +171,49 @@ class TestLegacyPhraseGoneFromRepo:
             if count:
                 hits[rel] = count
 
-        assert set(hits) == set(LEGACY_PHRASE_WHITELIST), (
+        # A machine-artifact whitelist entry that produced no hit (stripped
+        # from the tree, or present without quoting the phrase) is tolerated;
+        # anything else outside the whitelist is still a failure, and a
+        # product-surface whitelist entry must produce a hit.
+        tolerated_machine_entries = {
+            rel
+            for rel in LEGACY_PHRASE_WHITELIST
+            if rel not in hits and rel.startswith(MACHINE_ARTIFACT_PREFIXES)
+        }
+        assert set(hits) | tolerated_machine_entries == set(LEGACY_PHRASE_WHITELIST), (
             f"legacy phrase hits outside the explicit whitelist: "
             f"{sorted(set(hits) - set(LEGACY_PHRASE_WHITELIST))}; full set: {hits}"
         )
         for rel, reason in LEGACY_PHRASE_WHITELIST.items():
-            assert reason.strip(), f"whitelist entry {rel} must document its reason"
-            whitelisted = root / rel
-            assert whitelisted.is_file(), f"whitelisted path {rel} does not exist"
-            assert needle in whitelisted.read_bytes(), (
-                f"whitelisted path {rel} no longer contains the phrase; "
-                "shrink the whitelist instead of keeping dead entries"
-            )
+            _assert_whitelist_entry(root, rel, reason, needle)
 
     def test_product_surface_has_zero_legacy_phrase(self) -> None:
         needle = LEGACY_PHRASE.encode("utf-8")
         root = _repo_root()
         for path in sorted((root / "src").rglob("*.py")):
             assert needle not in path.read_bytes(), f"legacy phrase in {path}"
+
+    def test_whitelisted_product_path_must_exist(self, tmp_path: Path) -> None:
+        """⑫-c 验收 2: absence tolerance must not generalize.
+
+        A whitelist entry that is declared to exist, is missing, and does not
+        live under a machine-artifact namespace must still fail the check.
+        """
+        needle = LEGACY_PHRASE.encode("utf-8")
+        with pytest.raises(AssertionError, match="does not exist"):
+            _assert_whitelist_entry(
+                tmp_path, "docs/quoted-phrase.md", "产品面引用旧措辞——非机器件", needle
+            )
+
+    def test_missing_machine_artifact_entry_is_tolerated(self, tmp_path: Path) -> None:
+        """The harvest-context shape: a stripped .dev-dispatch entry passes."""
+        needle = LEGACY_PHRASE.encode("utf-8")
+        _assert_whitelist_entry(
+            tmp_path,
+            ".dev-dispatch/spec/approved.md",
+            "spec 原文引用旧措辞（禁令本身）——控制器保留文档，非渲染面",
+            needle,
+        )
 
 
 # --- spec 指令 a/c 项: the supervisor note names its destination ------------
