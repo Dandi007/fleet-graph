@@ -1,0 +1,12 @@
+{
+ "development_id": "dev-fg-9ca2142edb39",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "wf-8d9737",
+ "decision_message_id": "msg_01M1NNK2D53S13VP12RRX2RNX6",
+ "rationale": "D5 自判（board 2751/2813）。g4 fresh 于绿窗 07:29Z GO 后同号 start：configure/implement/cr/fr 四段 checkpoint 重放（07:30:09Z，replayed=true，零重跑——spec-d16 交付面 5 实证）+ acceptance 重跑 success 3c6e1466（07:31:28Z），07:31:55Z 到新闸。六项 fresh 取证本轮全部重做并落卷：①冻结 argv 三方逐字相等 ②diff 7f20b340..3c6e1466 围栏内（18 文件 +1341/−28，产品改动全在 dd 引擎域）③零测试删除 ④副本清代理三命令 EXIT=0（make verify 2852 passed+1 skipped+双 conformance clean）⑤全量 2852+1 vs 基线 2838+1：+14 全为新红靶、零绿转红 ⑥五红靶在位（14 测试，GnuTLS 实测 fixture 逐字内嵌）。receipt_chain_linked 专查（board 2820）：cr.parent=sha256(implement-receipt)=120cdbd1…✓、fr.parent=sha256(cr-receipt)=78ed6075…✓、handoff.parent=ba09ca84 与 g3/g4 引擎回执一致且两代回执逐字节相同——g3 rev2 审计断链（ba09ca84≠ebbc19a3）未在 g4 复现，ebbc19a3 未见于任何文本证据，特此披露。证据档：d16-gate-g4-six-item-evidence-20260904T0736Z.md",
+ "question_note_id": "msg_01M1NN8SVT2J9K93F5FME6QHSE",
+ "card_entity_id": "msg_01M1NE3NYMV8VF1Y4YKRAWX194",
+ "output_commit": "3c6e146639723f349e0c209b37d1f73fc4fa4f25"
+}
