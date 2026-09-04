@@ -32,10 +32,12 @@ never widened for the supervisor's sake.
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from typing import Any
 
+from fleet_graph.bus.client import DEFAULT_BUS_URL
 from fleet_graph.state.run_artifacts import iso
 
 #: The closed message-kind vocabulary. ``instruction`` obliges an ack;
@@ -219,6 +221,13 @@ class BusLineMessageSink:
     client only when no token file resolves, exactly like the M1 wake probe.
     A failed publish raises; the tool layer turns it into
     ``LINE_MESSAGE_DELIVERY_FAILED``.
+
+    The sink's default ``base_url`` resolves once, at construction time: an
+    explicit ``base_url`` wins verbatim; ``None`` means "read
+    ``FLEET_GRAPH_BUS_URL``, else fall back to the bus client's
+    ``DEFAULT_BUS_URL``" -- so a default-constructed sink can never hand a
+    ``None`` down to :class:`~fleet_graph.bus.client.BusClient` (whose own
+    default a bare ``None`` would strike through).
     """
 
     def __init__(
@@ -227,7 +236,10 @@ class BusLineMessageSink:
         base_url: str | None = None,
         line_token_template: str | None = None,
     ) -> None:
-        self._base_url = base_url
+        if base_url is not None:
+            self._base_url = base_url
+        else:
+            self._base_url = os.environ.get("FLEET_GRAPH_BUS_URL", DEFAULT_BUS_URL)
         self.line_token_template = line_token_template
 
     def _client(self, alias: str) -> Any:
