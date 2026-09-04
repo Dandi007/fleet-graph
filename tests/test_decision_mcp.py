@@ -315,6 +315,74 @@ class TestMcpSurface:
         assert MCP_SERVER_NAME == "fleet-graph-decision"
         assert "decision_deliver" in names
 
+    def test_decision_list_readonly_view_lists_parked_lines(self, tmp_path: Path) -> None:
+        """``decision_list`` derives from the same parked-state authority as
+        delivery: a parked waiting_on=decision line is listed as awaiting; a
+        line with no park state is registered but not awaiting."""
+        from fastmcp import Client
+
+        from test_dd_service import running_server
+
+        _stall(tmp_path, "wf-1")
+        server = build_decision_mcp_server(tmp_path, ROSTER)
+
+        async def call(url: str) -> dict[str, Any]:
+            async with Client(url) as client:
+                result = await client.call_tool("decision_list", {})
+                return json.loads(result.content[0].text)
+
+        with running_server(server) as url:
+            payload = asyncio.run(call(url))
+        assert payload["total"] == 1
+        assert payload["awaiting"] == 1
+        assert payload["awaiting_decisions"] == [
+            {"folder_id": "wf-1", "state": "parked waiting_on=decision"}
+        ]
+        assert payload["registered"][0]["folder_id"] == "wf-1"
+
+    def test_decision_list_is_a_pure_read(self, tmp_path: Path) -> None:
+        """The list tool touches nothing: the stall file is byte-identical
+        after the call and no ledger/state dir appears (read-only face)."""
+        from fastmcp import Client
+
+        from test_dd_service import running_server
+
+        stall = _stall(tmp_path, "wf-1")
+        before = stall.read_bytes()
+        server = build_decision_mcp_server(tmp_path, ROSTER)
+
+        async def call(url: str) -> dict[str, Any]:
+            async with Client(url) as client:
+                result = await client.call_tool("decision_list", {})
+                return json.loads(result.content[0].text)
+
+        with running_server(server) as url:
+            payload = asyncio.run(call(url))
+        assert payload["awaiting"] == 1
+        assert stall.read_bytes() == before
+        assert not (tmp_path / "state").exists()
+
+    def test_decision_without_park_state_is_registered_but_not_awaiting(
+        self, tmp_path: Path
+    ) -> None:
+        from fastmcp import Client
+
+        from test_dd_service import running_server
+
+        server = build_decision_mcp_server(tmp_path, ROSTER)
+
+        async def call(url: str) -> dict[str, Any]:
+            async with Client(url) as client:
+                result = await client.call_tool("decision_list", {})
+                return json.loads(result.content[0].text)
+
+        with running_server(server) as url:
+            payload = asyncio.run(call(url))
+        assert payload["awaiting"] == 0
+        assert payload["awaiting_decisions"] == []
+        assert payload["total"] == 1
+        assert payload["registered"][0]["folder_id"] == "wf-1"
+
     def test_decision_deliver_is_not_on_dd_or_goal_faces(self) -> None:
         from fleet_graph.dd.service import build_mcp_server
         from test_dd_service import FakeControlPlane

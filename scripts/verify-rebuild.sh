@@ -25,6 +25,11 @@
 #   bash scripts/verify-rebuild.sh                 # 跑全部 21 项
 #   bash scripts/verify-rebuild.sh --check 03      # 只跑指定项（01–21；其他值报错退出非零）
 #   bash scripts/verify-rebuild.sh --window-seconds 3600   # 覆盖时间窗（03/05/07/11/13/14）
+#   bash scripts/verify-rebuild.sh --env test --root TEST_ROOT   # R1：source
+#                    TEST_ROOT/env/knobs.sh 后按既有 01–21 主循环跑测试环境
+#                    （fail-closed：knobs/TEST_ROOT 缺失或 knob 越界 → exit 2，
+#                    绝不回退生产默认值；缺 --root 时依 $FGT_ROOT，再缺省
+#                    /tmp/fleet-graph-testenv）
 #
 # 退出码：等于 FAIL 项数（0–21，全绿为 0）。
 #        单项探针出错（curl 非零 / jq 解析失败 / 文件缺失 / 超时）→ 该项 FAIL 并带错误原文，
@@ -62,6 +67,155 @@ set -u
 set -o pipefail
 
 unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy no_proxy NO_PROXY 2>/dev/null || true
+
+# ---------------- R1：--env test 模式预扫描（fail-closed；先于任何 VRB_ 默认值） ----------------
+# 新增参数 --env test [--root PATH]：在 unset 代理之后、任何探针之前 source
+# TEST_ROOT/env/knobs.sh（testenv.sh up 的唯一输出）。knobs.sh 缺失、TEST_ROOT
+# 不存在、或任一 VRB_* 值命中拒绝清单（一·3 之 3/4 条）→ 立即 exit 2、stderr
+# 点名缺失/越界的 knob，绝不回退生产默认值、不输出任何 `NN … PASS|FAIL` 行。
+ENV_TEST=""
+TEST_ROOT_ARG=""
+_vrb_ps=("$@")
+if [ "${#_vrb_ps[@]}" -gt 0 ]; then
+    _vrb_i=0
+    while [ "$_vrb_i" -lt "${#_vrb_ps[@]}" ]; do
+        case "${_vrb_ps[$_vrb_i]}" in
+            --env)
+                if [ "$((_vrb_i + 1))" -ge "${#_vrb_ps[@]}" ]; then
+                    printf 'verify-rebuild: --env 需要一个参数\n' >&2; exit 2
+                fi
+                ENV_TEST="${_vrb_ps[((_vrb_i + 1))]}"; _vrb_i=$(( _vrb_i + 2 )) ;;
+            --root)
+                if [ "$((_vrb_i + 1))" -ge "${#_vrb_ps[@]}" ]; then
+                    printf 'verify-rebuild: --root 需要一个参数\n' >&2; exit 2
+                fi
+                TEST_ROOT_ARG="${_vrb_ps[((_vrb_i + 1))]}"; _vrb_i=$(( _vrb_i + 2 )) ;;
+            --check|--window-seconds)
+                _vrb_i=$(( _vrb_i + 2 )) ;;
+            *)
+                _vrb_i=$(( _vrb_i + 1 )) ;;
+        esac
+    done
+fi
+if [ -n "$ENV_TEST" ] && [ "$ENV_TEST" != "test" ]; then
+    printf 'verify-rebuild: --env 仅接受 test，得到: %s\n' "$ENV_TEST" >&2
+    exit 2
+fi
+if [ "$ENV_TEST" = "test" ]; then
+    VRB_TEST_ROOT="${TEST_ROOT_ARG:-${FGT_ROOT:-/tmp/fleet-graph-testenv}}"
+    VRB_TEST_ROOT="$(readlink -m "$VRB_TEST_ROOT" 2>/dev/null || printf '%s' "$VRB_TEST_ROOT")"
+    if [ ! -d "$VRB_TEST_ROOT" ]; then
+        printf 'verify-rebuild --env test: TEST_ROOT 不存在: %s\n' "$VRB_TEST_ROOT" >&2
+        exit 2
+    fi
+    if [ ! -r "$VRB_TEST_ROOT/env/knobs.sh" ]; then
+        printf 'verify-rebuild --env test: knobs.sh 缺失: %s/env/knobs.sh\n' "$VRB_TEST_ROOT" >&2
+        exit 2
+    fi
+    # 唯一输入：source knobs.sh（纯 VRB_*=值 赋值）。source 之后下方既有
+    # `${VRB_*:-默认}` 全部成为 no-op——test 模式绝不回退生产默认值。
+    . "$VRB_TEST_ROOT/env/knobs.sh"
+    # check 19/20 会在探针内调用 $VRB_CURRENT/scripts/testenv.sh（不带 --root），
+    # 导出 FGT_ROOT 令其指向同一 TEST_ROOT（幂等摘要 / 拒绝，零副作用）。
+    export FGT_ROOT="$VRB_TEST_ROOT"
+    # 拒绝清单（一·3 条 3/4；默认内置；FGT_DENY_PATHS/FGT_DENY_PORTS 仅测试 fixture 用）。
+    _vrb_deny_paths="${FGT_DENY_PATHS:-/data/fleet-graph:/data/apps:/data/ronin:/data/agent-bus:/data/code/self:/data}"
+    _vrb_deny_ports="${FGT_DENY_PORTS:-5608 5610 5611 5614 7490 7491 7493 7494 17590 9090 15722}"
+    _vrb_fail=""
+    for _vrb_k in VRB_SYSTEMCTL VRB_CURRENT VRB_BUS_BASE VRB_BUS_TOKEN_FILE \
+                  VRB_STATE_BASE VRB_MCP_BUS VRB_MCP_DD VRB_MCP_GOAL VRB_MCP_DECISION \
+                  VRB_RUNS_ROOT VRB_SCHED_DIR VRB_DD_ROOT VRB_ROSTER VRB_SKILL_FILE \
+                  VRB_PERSONA_FILES VRB_SUPERVISOR_ROOT VRB_SECRETS_DIR VRB_LLM_LEDGER; do
+        # 缺 knob（未赋值）即退；空串值（如 VRB_PERSONA_FILES=""）是合法形态。
+        eval "_vrb_set=\${$_vrb_k+set}"
+        if [ -z "$_vrb_set" ]; then
+            printf 'verify-rebuild --env test: knobs.sh 缺失 knob: %s\n' "$_vrb_k" >&2
+            _vrb_fail=1
+        fi
+    done
+    _vrb_path_under_deny() {
+        # $1=knob 名 $2=路径：等于或位于任一生产根之下（readlink -m 解析 symlink）→ 报并记。
+        local knob="$1" path="$2" dr pr
+        [ -n "$path" ] || return 1
+        pr="$(readlink -m "$path" 2>/dev/null || printf '%s' "$path")"
+        local IFS=':'
+        for dr in $_vrb_deny_paths; do
+            [ -n "$dr" ] || continue
+            dr="$(readlink -m "$dr" 2>/dev/null || printf '%s' "$dr")"
+            if [ "$pr" = "$dr" ] || [ "${pr#"$dr"/}" != "$pr" ]; then
+                printf 'verify-rebuild --env test: knob %s 越界指向生产根: %s (→ %s)\n' "$knob" "$path" "$dr" >&2
+                return 0
+            fi
+        done
+        return 1
+    }
+    _vrb_port_in_deny() {
+        local p
+        for p in $_vrb_deny_ports; do
+            [ "$p" = "$1" ] && return 0
+        done
+        return 1
+    }
+    for _vrb_k in VRB_SYSTEMCTL VRB_CURRENT VRB_RUNS_ROOT VRB_SCHED_DIR VRB_DD_ROOT \
+                  VRB_ROSTER VRB_SKILL_FILE VRB_SUPERVISOR_ROOT VRB_SECRETS_DIR \
+                  VRB_BUS_TOKEN_FILE; do
+        eval "_vrb_v=\"\${$_vrb_k:-}\""
+        _vrb_path_under_deny "$_vrb_k" "$_vrb_v" && _vrb_fail=1
+    done
+    # VRB_PERSONA_FILES：冒号分隔的路径集，逐个同判。
+    eval "_vrb_v=\"\${VRB_PERSONA_FILES:-}\""
+    _vrb_ifs_save="$IFS"
+    IFS=':'
+    for _vrb_p in $_vrb_v; do
+        [ -n "$_vrb_p" ] || continue
+        _vrb_path_under_deny VRB_PERSONA_FILES "$_vrb_p" && _vrb_fail=1
+    done
+    IFS="$_vrb_ifs_save"
+    # VRB_LLM_LEDGER：file:// 取路径部分同判；http(s):// 取端口判生产端口。
+    eval "_vrb_v=\"\${VRB_LLM_LEDGER:-}\""
+    case "$_vrb_v" in
+        file://*)
+            _vrb_path_under_deny VRB_LLM_LEDGER "${_vrb_v#file://}" && _vrb_fail=1 ;;
+        http://*|https://*)
+            _vrb_port="${_vrb_v#*://}"; _vrb_port="${_vrb_port%%/*}"; _vrb_port="${_vrb_port##*:}"
+            case "$_vrb_port" in ''|*[!0-9]*) : ;;
+                *) _vrb_port_in_deny "$_vrb_port" && {
+                       printf 'verify-rebuild --env test: knob VRB_LLM_LEDGER 越界指向生产端口: %s\n' "$_vrb_port" >&2
+                       _vrb_fail=1
+                   } ;;
+            esac ;;
+        *) : ;;
+    esac
+    # 端口类 knob：四个 VRB_MCP_*（纯端口）与 VRB_BUS_BASE/VRB_STATE_BASE（URL 内端口）。
+    for _vrb_k in VRB_MCP_BUS VRB_MCP_DD VRB_MCP_GOAL VRB_MCP_DECISION; do
+        eval "_vrb_v=\"\${$_vrb_k:-}\""
+        [ -n "$_vrb_v" ] || continue
+        case "$_vrb_v" in
+            ''|*[!0-9]*)
+                printf 'verify-rebuild --env test: knob %s 非纯端口值: %s\n' "$_vrb_k" "$_vrb_v" >&2
+                _vrb_fail=1 ;;
+            *)  _vrb_port_in_deny "$_vrb_v" && {
+                    printf 'verify-rebuild --env test: knob %s 越界指向生产端口: %s\n' "$_vrb_k" "$_vrb_v" >&2
+                    _vrb_fail=1
+                } ;;
+        esac
+    done
+    for _vrb_k in VRB_BUS_BASE VRB_STATE_BASE; do
+        eval "_vrb_v=\"\${$_vrb_k:-}\""
+        [ -n "$_vrb_v" ] || continue
+        _vrb_port="${_vrb_v#*://}"; _vrb_port="${_vrb_port%%/*}"; _vrb_port="${_vrb_port##*:}"
+        case "$_vrb_port" in
+            ''|*[!0-9]*)
+                printf 'verify-rebuild --env test: knob %s 无法解析端口: %s\n' "$_vrb_k" "$_vrb_v" >&2
+                _vrb_fail=1 ;;
+            *)  _vrb_port_in_deny "$_vrb_port" && {
+                    printf 'verify-rebuild --env test: knob %s 越界指向生产端口: %s\n' "$_vrb_k" "$_vrb_port" >&2
+                    _vrb_fail=1
+                } ;;
+        esac
+    done
+    [ -n "$_vrb_fail" ] && exit 2
+fi
 
 # ---------------- VRB_* 覆盖键 ----------------
 VRB_SYSTEMCTL="${VRB_SYSTEMCTL:-systemctl}"
@@ -116,6 +270,16 @@ while [ $# -gt 0 ]; do
         --window-seconds)
             [ $# -ge 2 ] || { printf 'verify-rebuild: --window-seconds 需要一个参数\n' >&2; exit 2; }
             WINDOW_SECONDS="$2"; shift 2 ;;
+        --env)
+            # R1：值与语义已在顶部预扫描（fail-closed source knobs.sh）完成；
+            # 此处仅接受该参数，保持未知参数报错语义不变。
+            [ $# -ge 2 ] || { printf 'verify-rebuild: --env 需要一个参数\n' >&2; exit 2; }
+            [ "$2" = "test" ] || { printf 'verify-rebuild: --env 仅接受 test，得到: %s\n' "$2" >&2; exit 2; }
+            shift 2 ;;
+        --root)
+            # R1：TEST_ROOT 已在顶部预扫描消费；此处仅接受该参数。
+            [ $# -ge 2 ] || { printf 'verify-rebuild: --root 需要一个参数\n' >&2; exit 2; }
+            shift 2 ;;
         *)
             printf 'verify-rebuild: 未知参数: %s\n' "$1" >&2; exit 2 ;;
     esac
