@@ -199,6 +199,13 @@ ENROLLED = {
     # 放行裁决 msg_01M1HFDDBJFPVY387TP1D9YF1D（board:work-notes seq 2325）。
     # 座位 opencode-glm53（入编前该座全空，遵家族分流令；probe.py:92 已注册功能探针）。
     "wf-8d9737",
+    # 2026-09-05 第十五波（用户 2026-09-04 23:5x 令「开新的 Workboard，核心是端到端地把
+    # 旧引擎全部替换成新的开发方式，最终以新的形态落地」）：引擎重建线 ronin-rebuild，
+    # wf-8d9737 的后继。正本 = 宪法页 v2 与目标架构页（D1-D20），验收标准 v2 二十一项在
+    # wf-4601c8/design.md §4；改动单目标分支 release/wf-4601c8（自 release/wf-8d9737 切出）。
+    # 入编时 scripts/verify-rebuild.sh 尚不存在（liveness 诚实红），R0 补齐。
+    # 座位 opencode-glm53；implement glm-5.3-flash、两道 review glm-5.3。
+    "wf-4601c8",
 }
 
 # 2026-08-29 复活：曾在 MIGRATED 里 enabled=false 停摆的线被用户令重新点亮。
@@ -207,7 +214,13 @@ ENROLLED = {
 # 2026-08-31 监督面收线：C5 五次冷启动终验失败取证完备，B 拍板由 wf-66300e 承接，
 # 本线历史使命结束（progress 终局代账 + wf_save 归档在案）。成员资格保留（全集断言），
 # enabled 期望移除。
-CLOSED_BY_SUPERVISOR: set[str] = set()
+CLOSED_BY_SUPERVISOR: set[str] = {
+    # 2026-09-05 监督面结案 wf-8d9737（ronin-lim，用户 2026-09-04 23:5x 令「停掉重开」）：
+    # D18-D20 与宪法 v2 取代了它 goal/design 里的派单与 gate 机制，继续叠更正等于补丁
+    # 叠补丁。既不是 CONVERGED（使命未完成）也不是 RETIRED（产物未闭卷审计），是监督面
+    # 收线。产物保留在 release/wf-8d9737（tip 29f2130），后继线 wf-4601c8 自该 tip 切分支。
+    "wf-8d9737",
+}
 # 2026-09-02 监督面推翻上一任的收口判断：wf-3f87f3 移出本集合，故此处为空
 # （集合本身保留，语义仍在，供日后再有需要时使用）。
 #
