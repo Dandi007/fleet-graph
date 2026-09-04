@@ -73,6 +73,32 @@ GATE_DECISION = "gate_decision"
 #: no new agent run, only acceptance.json changed).
 REWORK_REPLAY_REFUSED = "REWORK_REPLAY_REFUSED"
 
+#: Spec ⑮-b (wf-8d9737). The structured refusal code for a gate-rework launch
+#: whose verdict is not bound to the board ``work.decision.v1`` it came from
+#: (empty ``decision_message_id`` / ``decided_by`` / ``rationale``). Dispatch
+#: face defense: even if an unbound mandate file reaches ``dd run``, the run
+#: refuses instead of injecting an empty task book into an implement prompt.
+REWORK_DECISION_UNBOUND = "REWORK_DECISION_UNBOUND"
+
+#: The binding fields a gate-rework verdict must carry non-empty (spec ⑮-b).
+REWORK_BINDING_FIELDS = ("decision_message_id", "decided_by", "rationale")
+
+
+class ReworkDecisionUnbound(RuntimeError):
+    """A gate-rework launch whose verdict has no board binding.
+
+    Raised before the pipeline is built, so a refused generation never
+    launches a stage, seals a receipt, or writes a result. The refusal is the
+    observable failure the spec demands: an empty binding must never silently
+    dispatch a "rework" whose task book says nothing.
+    """
+
+    def __init__(self, message: str, *, unbound: list[str]) -> None:
+        super().__init__(f"{REWORK_DECISION_UNBOUND}: {message}")
+        self.code = REWORK_DECISION_UNBOUND
+        self.detail = message
+        self.unbound = list(unbound)
+
 
 class ReworkReplayRefused(RuntimeError):
     """A gate-rework generation the engine cannot assemble real work for.
@@ -177,6 +203,26 @@ def build_pipeline(
     # a fake new generation (the dev-fg-79d528db4375 g2 shape), so a replayer
     # alongside a gate rework is refused outright...
     gate_rework = bool(config.gate_reject)
+    if gate_rework:
+        # Spec ⑮-b: the verdict must be bound to the board work.decision.v1
+        # the gate consumed. An unbound mandate (empty decision_message_id /
+        # decided_by / rationale) is refused at the dispatch face too -- the
+        # control plane refuses at start; this keeps a hand-launched `dd run`
+        # with a stale or hand-written unbound file from silently opening the
+        # generation with an empty task book.
+        unbound = [
+            name
+            for name in REWORK_BINDING_FIELDS
+            if not str(config.gate_reject.get(name) or "").strip()
+        ]
+        if unbound:
+            raise ReworkDecisionUnbound(
+                f"development {config.development_id} g{config.generation} is a gate-rework "
+                "generation whose verdict is not bound to its board work.decision.v1 "
+                f"(empty: {', '.join(sorted(unbound))}); refusing to dispatch a rework "
+                "with an empty binding",
+                unbound=sorted(unbound),
+            )
     if gate_rework and replayer is not None:
         raise ReworkReplayRefused(
             f"development {config.development_id} g{config.generation} is a gate-rework "
@@ -531,9 +577,12 @@ def gate_refusal(state: dict[str, Any]) -> dict[str, Any] | None:
 __all__ = [
     "EVENTS_FILE",
     "RESULT_FILE",
+    "REWORK_BINDING_FIELDS",
+    "REWORK_DECISION_UNBOUND",
     "REWORK_REPLAY_REFUSED",
     "SPEC_ARTIFACT",
     "DevelopmentConfig",
+    "ReworkDecisionUnbound",
     "ReworkReplayRefused",
     "awaiting_decision",
     "build_pipeline",
