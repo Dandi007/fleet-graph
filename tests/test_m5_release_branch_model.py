@@ -592,6 +592,49 @@ class TestReleaseBehindMetric:
             is None
         )
 
+    def test_a_configured_remote_is_measured_not_the_checkout_cache(
+        self, line_repo: _LineRepo
+    ) -> None:
+        """部署态点名了 remote：分支的 ref 以共享远端为准（admission/rebase/
+        merger 全在那里读写），度量必须取远端新鲜真值——绝不能拿 checkout 里
+        恰好缓存的本地旧 ref 充数（否则 :7494/:5615 会把 wf-6475fd 要消费的
+        指标报错方向）。构造：rebase 已把远端线分支接上新 main（真值 0），本地
+        却残留一枚 rebase 前的旧线 ref（本地读数 1）。"""
+        base = line_repo.advance_main("first.txt")
+        stale_line_head = line_repo.publish_line_branch(base)
+        line_repo.advance_main("second.txt")
+        line_repo.start_attempt(stale_line_head)
+        rebase_stage(line_repo).act(configure_stage_double(), dispatch())
+        # 远端真值：rebase 后落后 0。
+        url = remote_url(line_repo.work)
+        assert release_behind_count(line_repo.work, line_ref=LINE_REF, remote_url=url) == 0
+        # 本地残留一枚旧线 ref（一次旧 checkout 会留下的形状），本地读数是 1。
+        git(line_repo.work, "update-ref", LINE_REF, stale_line_head)
+        assert release_behind_count(line_repo.work, line_ref=LINE_REF, remote_url="") == 1
+        # 点名 remote 后量的是远端：0，不是本地缓存的 1。
+        assert release_behind_count(line_repo.work, line_ref=LINE_REF, remote_url=url) == 0
+        reader = git_release_behind_reader(line_repo.work, remote_url=url)
+        assert reader(LINE) == 0
+
+    def test_an_unreachable_configured_remote_is_unknown_not_a_stale_local_count(
+        self, line_repo: _LineRepo
+    ) -> None:
+        """点名了 remote 而远端读不到：诚实降级为 None——绝不退回本地缓存
+        的旧读数（「未知」与「过期」必须机器可分）。"""
+        base = line_repo.advance_main()
+        line_head = line_repo.publish_line_branch(base)
+        line_repo.advance_main("ahead.txt")
+        # 本地 ref 齐全（旧真值：落后 1）——未接线时它会应答。
+        git(line_repo.work, "update-ref", LINE_REF, line_head)
+        assert release_behind_count(line_repo.work, line_ref=LINE_REF, remote_url="") == 1
+        # 点名的远端读不到：None，不是本地那份 1。
+        assert (
+            release_behind_count(line_repo.work, line_ref=LINE_REF, remote_url="/no/such/remote")
+            is None
+        )
+        reader = git_release_behind_reader(line_repo.work, remote_url="/no/such/remote")
+        assert reader(LINE) is None
+
     def test_the_over_threshold_port_answers_mechanically(self) -> None:
         # 历史反例的阈值：design §6.4「落后 160 提交搁浅 54 个的死分支」。
         assert DEFAULT_RELEASE_BEHIND_THRESHOLD == 160

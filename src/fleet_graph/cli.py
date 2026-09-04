@@ -1922,9 +1922,10 @@ def build_parser() -> argparse.ArgumentParser:
     line_state_serve.add_argument(
         "--release-behind-remote",
         default="",
-        help="optional remote name/URL the release_behind reader uses to "
-        "resolve release/target refs missing locally (e.g. origin); empty "
-        "reads local refs only",
+        help="the remote (name/URL, e.g. origin) the release_behind reader "
+        "measures -- the shared remote is the refs of record, so a named "
+        "remote is read fresh, never the checkout's cached local refs; "
+        "empty reads local refs only",
     )
     line_state_serve.add_argument(
         "--release-behind-threshold",
@@ -1989,9 +1990,10 @@ def build_parser() -> argparse.ArgumentParser:
     state_serve.add_argument(
         "--release-behind-remote",
         default="",
-        help="optional remote name/URL the release_behind reader uses to "
-        "resolve release/target refs missing locally (e.g. origin); empty "
-        "reads local refs only",
+        help="the remote (name/URL, e.g. origin) the release_behind reader "
+        "measures -- the shared remote is the refs of record, so a named "
+        "remote is read fresh, never the checkout's cached local refs; "
+        "empty reads local refs only",
     )
     state_serve.add_argument(
         "--release-behind-threshold",

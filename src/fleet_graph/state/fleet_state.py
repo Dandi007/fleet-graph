@@ -149,8 +149,9 @@ class FleetStateConfig:
     #: checkout 本身）。**None = 未接线**：默认 reader 就地退化为恒 None——
     #: 「未知」绝不伪造成 0（也是测试环境无关性的保证：不配就不碰 git）。
     release_behind_repo: Path | None = None
-    #: 默认 reader 解析本地缺失 ref 时用的 remote（名字或 URL，如 ``origin``）；
-    #: 空 = 只读本地 ref，绝不 fetch。
+    #: 默认 reader 的度量基准（名字或 URL，如 ``origin``）：线分支与目标分支的
+    #: ref 以共享远端为准，配置了就量远端的新鲜真值，绝不拿 checkout 缓存的
+    #: 本地 ref 充数；空 = 只读本地 ref，绝不 fetch。
     release_behind_remote: str = ""
     #: M5 超阈判定阈值（判定口在本仓；告警规则本体归 wf-6475fd）。默认取
     #: design §6.4 的历史反例：落后 160 提交搁浅 54 个的死分支。

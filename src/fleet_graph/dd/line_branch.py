@@ -410,26 +410,36 @@ def release_behind_count(
     branch has that the line branch does not (``rev-list --count line..target``);
     0 means the line contains the target head -- the post-rebase resting
     state. Returns None (unknown, never a fake 0) when either ref cannot be
-    resolved locally or on the named remote.
+    resolved.
+
+    The branches of record live on the shared remote -- admission, the
+    pre-dispatch rebase, and the merger all read and publish them there -- so
+    when a ``remote_url`` is configured, that remote is what gets measured:
+    freshly resolved and fetched, never the checkout's cached refs, and a
+    failed remote read degrades to None rather than answering from whatever
+    a leftover local ref remembers. Local refs are measured only when no
+    remote was named (the unwired posture).
     """
     line_id = line_id_from_ref(line_ref) if line_ref else None
     if line_id is None:
         return None
-    line = rev_parse(repo, line_ref)
-    target = rev_parse(repo, target_ref)
-    if line is None or target is None:
-        if not remote_url:
-            return None
-        line_remote = resolve_remote_ref_head(repo, remote_url, line_ref)
-        target_remote = resolve_remote_ref_head(repo, remote_url, target_ref)
-        if line_remote is None or target_remote is None:
-            return None
-        fetch_ref(repo, remote_url, line_ref, f"refs/dd-behind/{line_id}/line")
-        fetch_ref(repo, remote_url, target_ref, f"refs/dd-behind/{line_id}/target")
-        line = rev_parse(repo, f"refs/dd-behind/{line_id}/line")
-        target = rev_parse(repo, f"refs/dd-behind/{line_id}/target")
+    if remote_url:
+        line = resolve_remote_ref_head(repo, remote_url, line_ref)
+        target = resolve_remote_ref_head(repo, remote_url, target_ref)
         if line is None or target is None:
             return None
+        try:
+            fetch_ref(repo, remote_url, line_ref, f"refs/dd-behind/{line_id}/line")
+            fetch_ref(repo, remote_url, target_ref, f"refs/dd-behind/{line_id}/target")
+        except LineBranchError:
+            return None
+        line = rev_parse(repo, f"refs/dd-behind/{line_id}/line")
+        target = rev_parse(repo, f"refs/dd-behind/{line_id}/target")
+    else:
+        line = rev_parse(repo, line_ref)
+        target = rev_parse(repo, target_ref)
+    if line is None or target is None:
+        return None
     out, _err, code = _git(repo, "rev-list", "--count", f"{line}..{target}")
     if code != 0:
         return None
