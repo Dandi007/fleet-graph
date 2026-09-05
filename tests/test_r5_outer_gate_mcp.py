@@ -397,6 +397,7 @@ class TestNegativeBNoAuth:
 
         write_line_state(tmp_path / "runs", "wf-1")
         server = build(tmp_path, revive=fake_revive, set_seat=fake_set_seat)
+        roster = tmp_path / "ronin-lines.json"
         payload = asyncio.run(
             call_json(
                 server,
@@ -413,8 +414,13 @@ class TestNegativeBNoAuth:
             )
         )
         assert calls[0]["who"] == SUPERVISOR
-        # maintenance_set/clear 真件落盘（scratch root）。
-        gate = tmp_path / "runs" / "maintenance-stop"
+        # maintenance_set/clear 真件落盘：gate 路径与调度器认知面（
+        # SchedulerConfig.from_json 对同一名册的 maintenance_stop_path）
+        # 交叉验证——同源同文件，不是 <run_root>/maintenance-stop 诱饵闸。
+        from fleet_graph.scheduler.daemon import SchedulerConfig
+
+        scheduler_cfg = SchedulerConfig.from_json(roster)
+        gate = scheduler_cfg.maintenance_stop_path
         asyncio.run(
             call_json(
                 server,
@@ -424,6 +430,7 @@ class TestNegativeBNoAuth:
         )
         flag = json.loads(gate.read_text(encoding="utf-8"))
         assert flag["reason"] == "deploy" and flag["expires_at"]
+        assert flag["held_by"] == SUPERVISOR
         payload_clear = asyncio.run(
             call_json(server, "maintenance_clear", {"principal": SUPERVISOR})
         )
@@ -451,6 +458,99 @@ class TestNegativeBNoAuth:
                 )
             )
         assert CODE_NOT_SUPERVISOR in str(excinfo.value)
+
+
+class TestMaintenanceGateIsTheSchedulerGate:
+    """final rf finding 1（blocker 修复核验）：工具闸 == 调度器闸。
+
+    maintenance_set/clear 落的必须恰好是 ``SchedulerConfig.from_json``（对
+    同一名册）解析出的 ``maintenance_stop_path``——名册 ``maintenance_stop``
+    覆盖键或调度器缺省闸——而不是从未被任何组件读取的
+    ``<run_root>/maintenance-stop`` 诱饵闸。回执 gate_path 与调度器认知面
+    交叉验证，run_root 面恒静。
+    """
+
+    def test_gate_path_equals_scheduler_config_resolution(self, tmp_path: Path) -> None:
+        server = build(tmp_path)
+        payload = asyncio.run(
+            call_json(
+                server,
+                "maintenance_set",
+                {"principal": SUPERVISOR, "reason": "rf1", "ttl_seconds": 60},
+            )
+        )
+        from fleet_graph.scheduler.daemon import SchedulerConfig
+
+        scheduler_cfg = SchedulerConfig.from_json(tmp_path / "ronin-lines.json")
+        assert Path(payload["gate_path"]) == scheduler_cfg.maintenance_stop_path
+        # 调度器此刻真的被按住（同一文件、同一 expiry 语义）。
+        scheduler_gate_held = tmp_path / "runs" / "maintenance-stop"
+        assert not scheduler_gate_held.exists()  # 诱饵面静默
+        # 诱饵路径永不落盘：run_root 面与闸文件无交集。
+        assert Path(payload["gate_path"]) != scheduler_gate_held
+        asyncio.run(call_json(server, "maintenance_clear", {"principal": SUPERVISOR}))
+        assert not Path(payload["gate_path"]).exists()
+
+    def test_roster_override_is_honoured_by_both_sides(self, tmp_path: Path) -> None:
+        """名册 maintenance_stop 覆盖键：工具与调度器解析出同一路径。"""
+        from fleet_graph.scheduler.daemon import SchedulerConfig
+
+        override = tmp_path / "custom-gate"
+        roster = make_state_config(tmp_path)
+        server = build(tmp_path)
+        # build() 内部会重写名册（make_state_config），覆盖键必须在建面之后
+        # 落盘——顺序即判据：服务运行中读到的名册必须带覆盖键。
+        raw = json.loads(roster.read_text(encoding="utf-8"))
+        raw["maintenance_stop"] = str(override)
+        roster.write_text(json.dumps(raw), encoding="utf-8")
+        payload = asyncio.run(
+            call_json(
+                server,
+                "maintenance_set",
+                {"principal": SUPERVISOR, "reason": "override", "ttl_seconds": 60},
+            )
+        )
+        assert Path(payload["gate_path"]) == override
+        assert SchedulerConfig.from_json(roster).maintenance_stop_path == override
+        assert override.exists()
+        asyncio.run(call_json(server, "maintenance_clear", {"principal": SUPERVISOR}))
+        assert not override.exists()
+
+    def test_run_root_decoy_file_is_never_written(self, tmp_path: Path) -> None:
+        """变异核验（finding 1 的病灶）：run_root 诱饵闸永不成为写入面。"""
+        decoy = tmp_path / "runs" / "maintenance-stop"
+        server = build(tmp_path)
+        asyncio.run(
+            call_json(
+                server,
+                "maintenance_set",
+                {"principal": SUPERVISOR, "reason": "decoy-check", "ttl_seconds": 60},
+            )
+        )
+        assert not decoy.exists()
+        asyncio.run(call_json(server, "maintenance_clear", {"principal": SUPERVISOR}))
+
+    def test_unreadable_roster_falls_back_to_scheduler_default(self, tmp_path: Path) -> None:
+        from fleet_graph.outer_gate_mcp import SchedulerMaintenanceGate
+        from fleet_graph.scheduler.daemon import DEFAULT_MAINTENANCE_STOP
+
+        gate = SchedulerMaintenanceGate(lines_config=tmp_path / "gone.json")
+        assert gate.path == DEFAULT_MAINTENANCE_STOP
+
+    def test_resolver_single_source_of_truth(self, tmp_path: Path) -> None:
+        """解析器单源：scheduler 模块常量被导入复用，而非二次声明。"""
+        import inspect
+
+        from fleet_graph import outer_gate_mcp
+        from fleet_graph.scheduler.daemon import (
+            DEFAULT_MAINTENANCE_STOP as scheduler_default,
+        )
+
+        assert outer_gate_mcp.DEFAULT_MAINTENANCE_STOP is scheduler_default
+        source = inspect.getsource(outer_gate_mcp)
+        # 该生产路径字面量只允许出现在 scheduler 模块（daemon 的缺省声明）；
+        # 外门模块内零次出现 = 不可能有人再把它绑错成缺省路径。
+        assert source.count("/data/fleet-graph/maintenance-stop") == 0
 
 
 class TestNegativeCCacheComposition:

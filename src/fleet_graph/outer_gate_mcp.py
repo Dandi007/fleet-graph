@@ -39,6 +39,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.scheduler.daemon import DEFAULT_MAINTENANCE_STOP
 from fleet_graph.state.fleet_state import (
     DEFAULT_RUN_ROOT,
     FleetStateConfig,
@@ -94,9 +95,35 @@ TAKEOVER_KEYS = (
 )
 
 #: ``maintenance_set`` 的 gate 载荷与默认有效期（过期即失活，沿用
-#: ``SchedulerDaemon._gate_expired`` 的 v23 裁决语义）。
+#: ``SchedulerDaemon._gate_expired`` 的 v23 裁决语义）。调度器缺省闸路径从
+#: scheduler 模块单源导入（不在此处二次声明同一常量）。
 MAINTENANCE_STOP_FILE = "maintenance-stop"
 MAINTENANCE_DEFAULT_TTL_S = 3600
+
+
+def resolve_maintenance_stop_path(lines_config: Path | str | None) -> Path | None:
+    """The exact gate path ``SchedulerConfig`` resolves for this roster.
+
+    One resolver, two consumers: the scheduler daemon (``from_json``) and the
+    outer gate's ``SchedulerMaintenanceGate``. Reading the roster's
+    ``maintenance_stop`` override here (default ``DEFAULT_MAINTENANCE_STOP``)
+    is what keeps a tool-held gate the same gate the daemon honours --
+    cross-checked by ``test_r5_outer_gate_mcp.py`` against
+    ``SchedulerConfig.from_json(...).maintenance_stop_path``. ``None`` only
+    when the roster cannot be read at all (the caller then falls back to the
+    scheduler's own default explicitly -- never to a run_root guess).
+    """
+    if lines_config is None:
+        return None
+    try:
+        raw = json.loads(Path(lines_config).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    from fleet_graph.scheduler.daemon import DEFAULT_MAINTENANCE_STOP
+
+    return Path(raw.get("maintenance_stop", str(DEFAULT_MAINTENANCE_STOP)))
 
 
 def supervisor_principal(environ: dict[str, str] | None = None) -> str:
@@ -469,13 +496,13 @@ def build_outer_gate_mcp_server(
     ) -> dict[str, Any]:
         """Hold the fleet-wide maintenance gate (supervisor-only).
 
-        写维护闸（``maintenance-stop``，带 ``reason`` 与 ``expires_at``；
-        过期即失活，v23 裁决语义）。监督者专属+留痕。``maintenance_gate``
-        为测试注入点；生产默认绑定调度器 ``maintenance_stop()`` 读取的同一
-        面（roster ``maintenance_stop`` 覆盖键 →
-        ``SchedulerConfig.maintenance_stop_path``，缺省
-        ``/data/fleet-graph/maintenance-stop``）——工具持有闸与调度器认知
-        闸是同一文件。
+        写维护闸（带 ``reason`` 与 ``expires_at``；过期即失活，v23 裁决语
+        义）。监督者专属+留痕。``maintenance_gate`` 为测试注入点；生产默认
+        绑定调度器 ``maintenance_stop()`` 读取的同一面：与名册同源的
+        ``SchedulerConfig.maintenance_stop_path``（名册 ``maintenance_stop``
+        覆盖键 → 调度器缺省闸，单源导入自 scheduler 模块）——工具持有闸
+        与调度器认知闸是同一文件，绝不落 ``<run_root>/maintenance-stop``
+        诱饵面（调度器从未读它）。
         """
         require_supervisor("maintenance_set", principal)
         if not str(reason).strip():
@@ -496,7 +523,7 @@ def build_outer_gate_mcp_server(
         try:
             gate = maintenance_gate
             if gate is None:
-                gate = SchedulerMaintenanceGate(run_root=Path(state_config.run_root))
+                gate = SchedulerMaintenanceGate(lines_config=Path(state_config.lines_config))
             gate.set(reason=str(reason), ttl_seconds=ttl, by=principal, clock=clock)
         except Exception as exc:
             refuse("MAINTENANCE_WRITE_FAILED", str(exc), tool="maintenance_set")
@@ -521,7 +548,7 @@ def build_outer_gate_mcp_server(
         try:
             gate = maintenance_gate
             if gate is None:
-                gate = SchedulerMaintenanceGate(run_root=Path(state_config.run_root))
+                gate = SchedulerMaintenanceGate(lines_config=Path(state_config.lines_config))
             expired = gate.expired()
             gate.clear()
         except Exception as exc:
@@ -713,29 +740,41 @@ def _default_note_publisher(
 class SchedulerMaintenanceGate:
     """The fleet-wide maintenance gate as an injectable seam.
 
-    Production binds the file the scheduler's ``maintenance_stop()`` reads:
-    the daemon's ``DEFAULT_MAINTENANCE_STOP`` (``/data/fleet-graph/
-    maintenance-stop``) or the roster's ``maintenance_stop`` override -- the
-    exact path ``SchedulerConfig`` resolves, so a tool-held gate is the same
-    gate the daemon honours. Tests bind a scratch root. ``set`` writes
+    Production binds the exact file the scheduler's ``maintenance_stop()``
+    reads -- the path ``SchedulerConfig`` resolves from the same roster the
+    surface serves (roster ``maintenance_stop`` override, default the
+    scheduler's own ``DEFAULT_MAINTENANCE_STOP``, imported single-source).
+    ``run_root`` is deliberately NOT consulted here: the daemon has never read
+    a gate under its run root, so a file there is a decoy -- a receipt that
+    says "held" while the fleet keeps running (宪法第九条: 静默空转禁止).
+    When no roster can be read, the gate degrades to the scheduler's own
+    default -- the honest answer for "what would the daemon honour". Tests
+    bind a scratch path directly. ``set`` writes
     ``{reason, expires_at, held_by}``; the gate is inert once ``expires_at``
     passes (the v23 ruling the daemon honours), and an unparseable flag keeps
     holding (the daemon's deliberate divergence).
     """
 
+    #: The scheduler's own default emergency-stop path (one source of truth:
+    #: imported from the scheduler module, never re-declared here).
+    DEFAULT_MAINTENANCE_STOP = DEFAULT_MAINTENANCE_STOP
+
     def __init__(
-        self, run_root: Path | str | None = None, *, path: Path | str | None = None
+        self,
+        run_root: Path | str | None = None,
+        *,
+        path: Path | str | None = None,
+        lines_config: Path | str | None = None,
     ) -> None:
         if path is not None:
             self._path = Path(path)
-        else:
-            from fleet_graph.scheduler.daemon import DEFAULT_MAINTENANCE_STOP
-
-            self._path = (
-                Path(run_root) / MAINTENANCE_STOP_FILE
-                if run_root is not None
-                else DEFAULT_MAINTENANCE_STOP
-            )
+            return
+        if lines_config is not None:
+            resolved = resolve_maintenance_stop_path(Path(lines_config))
+            if resolved is not None:
+                self._path = resolved
+                return
+        self._path = DEFAULT_MAINTENANCE_STOP
 
     @property
     def path(self) -> Path:
@@ -820,6 +859,7 @@ __all__ = [
     "OuterGateUnavailable",
     "SchedulerMaintenanceGate",
     "build_outer_gate_mcp_server",
+    "resolve_maintenance_stop_path",
     "serve",
     "supervisor_principal",
     "takeover_item_complete",
