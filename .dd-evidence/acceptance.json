@@ -1,0 +1,37 @@
+{
+ "development_id": "dev-fg-84f3b2aace9a",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "bash",
+    "-lc",
+    "uv sync --frozen && uv run pytest -q tests/test_x4_fault_classification.py tests/test_supervise_audit.py"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "........................................................................ [ 98%]\n.                                                                        [100%]\n",
+   "stderr_tail": "Checked 100 packages in 1ms\n"
+  },
+  {
+   "command": [
+    "bash",
+    "-lc",
+    "env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy make verify"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-debater-opponent\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-debater-judge\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/debater-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-arbiter\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/arbiter-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-code-local\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-code-remote\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-content\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-feishu\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-web\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}, {\"errors\": [], \"ok\": true, \"role\": \"dr-worker-wiki\", \"schema\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles/schemas/worker-input.v1.json\"}], \"roles_root\": \"/data/code/self/agent-runtime-releases/c9339183091f208c83f597d13776e924556a34a6/profiles/roles\", \"run_ok\": true}\nresearch-role-contracts self_check: pass\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "bash",
+    "-lc",
+    "env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy bash -c 'R=/tmp/x4-accept-testenv; rm -rf \"$R\"; bash scripts/testenv.sh up --root \"$R\" >/tmp/x4-te-up.out 2>&1; uprc=$?; V=\"env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy\"; CHK(){ bash -c \"$V bash scripts/verify-rebuild.sh --env test --root $R --check $1\" | grep -cE \"^$1 [a-z0-9-]+ PASS — \"; }; c11=$( [ \"$uprc\" -eq 0 ] && CHK 11 ); c13=$( [ \"$uprc\" -eq 0 ] && CHK 13 ); c14=$( [ \"$uprc\" -eq 0 ] && CHK 14 ); c17=$( [ \"$uprc\" -eq 0 ] && CHK 17 ); c18=$( [ \"$uprc\" -eq 0 ] && CHK 18 ); c19=$( [ \"$uprc\" -eq 0 ] && CHK 19 ); lines=$( [ \"$uprc\" -eq 0 ] && bash -c \"$V bash scripts/verify-rebuild.sh --env test --root $R\" | grep -cE \"^[0-9]{2} [a-z0-9-]+ (PASS|FAIL) — \" ); bash scripts/testenv.sh down --root \"$R\" >/tmp/x4-te-down.out 2>&1; drc=$?; refs=$(grep -oE \"prod_references=[0-9]+\" /tmp/x4-te-down.out | head -1); echo \"up=$uprc lines=$lines c11=$c11 c13=$c13 c14=$c14 c17=$c17 c18=$c18 c19=$c19 down=$drc $refs\"; test \"$uprc\" -eq 0 -a \"$lines\" -eq 21 -a \"$c11\" -eq 1 -a \"$c13\" -eq 1 -a \"$c14\" -eq 1 -a \"$c17\" -eq 1 -a \"$c18\" -eq 1 -a \"$c19\" -eq 1 -a \"$drc\" -eq 0 -a \"$refs\" = \"prod_references=0\"'"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "up=0 lines=21 c11=1 c13=1 c14=1 c17=1 c18=1 c19=1 down=0 prod_references=0\n",
+   "stderr_tail": ""
+  }
+ ]
+}
