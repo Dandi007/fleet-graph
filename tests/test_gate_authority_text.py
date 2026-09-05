@@ -17,7 +17,19 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCSTRING_PATH = REPO_ROOT / "src" / "fleet_graph" / "dd" / "self_gate.py"
-SCAN_EXCLUDED_DIRS = {".git", ".dev-dispatch", ".dd-evidence", ".venv", "__pycache__"}
+# Tool cache directories (gitignored build artifacts): their raw bytes are
+# compressed/serialized tool state, not source text -- a byte-blob there
+# can carry any two characters as a literal and is meaningless to the
+# shadow sweep.
+SCAN_EXCLUDED_DIRS = {
+    ".git",
+    ".dev-dispatch",
+    ".dd-evidence",
+    ".venv",
+    "__pycache__",
+    ".ruff_cache",
+    ".pytest_cache",
+}
 D5_ANCHORS = ("D5", "decided_by", "dispatched_by")
 SHADOW = "S" + "8"
 

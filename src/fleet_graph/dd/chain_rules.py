@@ -28,6 +28,16 @@ from fleet_graph.dd.upstream_constants import compute_json_digest
 #: so a link whose predecessor ended REJECT is a rework link by construction.
 REJECT = "REJECT"
 
+#: The two walker events a chain record's `verdict` can carry for the retry
+#: edge: a failed signing (the run ended in the walker's failure event) and
+#: the spine event a completed run seals. Local mirrors of
+#: `graphs.dd_pipeline.FAILURE_EVENT` / `SPINE_EVENT` -- the same mirroring
+#: discipline as REJECT above, so this rule module stays free of graph-layer
+#: imports. The X-4 measured path (dev-fg-d9370430e0ce rev4 -> rev5) sealed
+#: exactly these two words onto one receipt.
+FAILED = "failed"
+SUCCESS = "success"
+
 #: Local mirror of `dd_replay.MAX_WALK_ATTEMPTS`. The attempt identity a review
 #: entry carries is uuid5 (one-way), so recognising which generation a committed
 #: entry was sealed for is a bounded forward search, not a reverse of the
@@ -44,6 +54,27 @@ def rework_link_parent(rejecting_receipt: dict[str, Any]) -> str:
     """The parent digest a rework implement names: the rejecting review's
     canonical-JSON digest, computed over the receipt object itself."""
     return compute_json_digest(dict(rejecting_receipt))
+
+
+def is_retry_link(previous_verdict: str) -> bool:
+    """Whether the link after a receipt with this verdict may be a retry edge.
+
+    A failed signing is not a chain break by itself: the engine re-prepares
+    the handoff and re-runs the *same* attempt (same attempt_id, same receipt
+    identity), so the next record can be the second signing of one receipt
+    rather than a new link. The rework edge models a REJECT's re-entry into
+    implement; this models a failed attempt's re-run -- the X-4 path the
+    audit went red on before it was modelled (dev-fg-d9370430e0ce
+    rev4 -> rev5, "parent … != expected …" on a chain that never broke).
+    """
+    return previous_verdict == FAILED
+
+
+def retry_link_parent(previous: dict[str, Any]) -> str:
+    """The parent digest the retry signing names: the re-prepare handoff
+    digest the failed signing already named -- its own parent, unchanged.
+    The retry re-enters the same handoff; it does not advance the chain."""
+    return str(previous.get("parent_handoff_receipt_digest") or "")
 
 
 def entry_generation(entry: dict[str, Any], development_id: str, generation: int) -> bool:
@@ -129,10 +160,14 @@ def new_attempt_is_legal(
 
 
 __all__ = [
+    "FAILED",
     "REJECT",
+    "SUCCESS",
     "entry_generation",
+    "is_retry_link",
     "is_rework_link",
     "new_attempt_is_legal",
+    "retry_link_parent",
     "rework_link_parent",
     "split_entries",
 ]
