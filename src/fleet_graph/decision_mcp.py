@@ -666,6 +666,25 @@ def build_decision_mcp_server(
         }
 
     @mcp.tool()
+    def decision_get(message_id: str) -> dict[str, Any]:
+        """Read-only: one decision ledger row by its source message id.
+
+        R5 外门补只读工具（五面 tools/list 各含只读工具）：与
+        ``decision_list`` 同一裁决台账（bridge receipts + bus published，
+        :7494 ``/v1/decisions`` 同源），按 ``source_message_id`` 取单行。
+        未命中是显式 ``DECISION_NOT_FOUND`` 拒绝，绝不静默空行。
+        """
+        for row in decision_list_all_rows():
+            if str(row.get("source_message_id") or "") == str(message_id):
+                return row
+        raise ToolError(
+            json.dumps(
+                {"code": "DECISION_NOT_FOUND", "message": f"no decision row for {message_id!r}"},
+                sort_keys=True,
+            )
+        )
+
+    @mcp.tool()
     def decision_deliver(
         decision: str,
         reason: str,
@@ -700,6 +719,45 @@ def build_decision_mcp_server(
             refuse(f"invalid payload: {exc}")
         ledger.record(result)
         return result.as_dict()
+
+    def decision_list_all_rows() -> list[dict[str, Any]]:
+        """The same ledger ``decision_list`` derives from, as one row list.
+
+        Bridge receipts first (with the dd document-side reconciliation), then
+        the best-effort bus-published rows without a receipt -- the exact
+        composition of the :7494 ``/v1/decisions`` read model (no second
+        reader). The bridge db binds ``run_root``-adjacent defaults in test
+        contexts; a missing/unreadable db degrades to receipts-less rows
+        (``_read_receipts`` fail-soft), never a crash.
+        """
+        from fleet_graph.state.fleet_state import (
+            FleetStateConfig as _FleetStateConfig,
+        )
+        from fleet_graph.state.fleet_state import (
+            _read_published as _view_read_published,
+        )
+        from fleet_graph.state.fleet_state import (
+            _read_receipts as _view_read_receipts,
+        )
+        from fleet_graph.state.fleet_state import (
+            _receipt_to_decision as _view_receipt_to_decision,
+        )
+
+        dd_root = Path(os.environ.get("FLEET_GRAPH_DD_ROOT", "/data/fleet-graph/dd"))
+        lines_config = Path(os.environ.get("FLEET_GRAPH_LINES_CONFIG", "config/ronin-lines.json"))
+        config = _FleetStateConfig(
+            run_root=run_root,
+            dd_root=dd_root,
+            lines_config=lines_config,
+            bus_url=os.environ.get("FLEET_GRAPH_BUS_URL"),
+        )
+        rows = [
+            _view_receipt_to_decision(receipt, dd_root=config.dd_root)
+            for receipt in _view_read_receipts(config)
+        ]
+        seen = {str(row.get("source_message_id") or "") for row in rows}
+        rows.extend(_view_read_published(config, seen))
+        return rows
 
     return mcp
 

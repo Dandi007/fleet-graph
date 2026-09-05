@@ -58,7 +58,8 @@
 # FGT_AGENT_BUS_ROOT（agent-bus 代码源，默认 /data/code/self/agent-bus）。生产一律不设。
 #
 # 固定端口映射（可用 FGT_PORT_<面> 覆盖）：bus HTTP 27490、bus MCP 25608、
-# dd MCP 25610、goal MCP 25611、decision MCP 25614、state HTTP 27494、workfolder 25618。
+# dd MCP 25610、goal MCP 25611、decision MCP 25614、state MCP 25612、
+# state HTTP 27494、workfolder 25618。
 #
 # 代理卫生（S6）：开头 unset 全部代理变量；回环 curl 一律 --noproxy '*'。
 set -u
@@ -78,10 +79,11 @@ P_BUS_MCP="${FGT_PORT_BUS_MCP:-25608}"
 P_DD_MCP="${FGT_PORT_DD_MCP:-25610}"
 P_GOAL_MCP="${FGT_PORT_GOAL_MCP:-25611}"
 P_DECISION_MCP="${FGT_PORT_DECISION_MCP:-25614}"
+P_STATE_MCP="${FGT_PORT_STATE_MCP:-25612}"
 P_STATE_HTTP="${FGT_PORT_STATE_HTTP:-27494}"
 P_WORKFOLDER="${FGT_PORT_WORKFOLDER:-25618}"
 
-FACE_PORTS="bus-http:$P_BUS_HTTP bus-mcp:$P_BUS_MCP dd-mcp:$P_DD_MCP goal-mcp:$P_GOAL_MCP decision-mcp:$P_DECISION_MCP state-http:$P_STATE_HTTP workfolder:$P_WORKFOLDER"
+FACE_PORTS="bus-http:$P_BUS_HTTP bus-mcp:$P_BUS_MCP dd-mcp:$P_DD_MCP goal-mcp:$P_GOAL_MCP decision-mcp:$P_DECISION_MCP state-mcp:$P_STATE_MCP state-http:$P_STATE_HTTP workfolder:$P_WORKFOLDER"
 
 # agent-bus 代码源（只读复用，绝不写入）。
 AGENT_BUS_ROOT="${FGT_AGENT_BUS_ROOT:-/data/code/self/agent-bus}"
@@ -267,6 +269,14 @@ te_spawn_faces() {
             --run-root "$TEST_ROOT/runs" \
             --lines-config "$TEST_ROOT/config/ronin-lines.json" \
             --state-dir "$TEST_ROOT/decision-mcp"
+        te_launch state-mcp "$TEST_ROOT/logs/state-mcp.log" \
+            env FLEET_GRAPH_SUPERVISION_TOKEN_ROOT="$TEST_ROOT/secrets" \
+            FLEET_GRAPH_DEPLOY_CURRENT="$TEST_ROOT/current" \
+            uv run --frozen --project "$REPO_ROOT" fleet-graph outer-gate serve \
+            --host 127.0.0.1 --port "$P_STATE_MCP" \
+            --run-root "$TEST_ROOT/runs" \
+            --lines-config "$TEST_ROOT/config/ronin-lines.json" \
+            --dd-root "$TEST_ROOT/dd"
         te_launch state-http "$TEST_ROOT/logs/state-http.log" \
             env FLEET_GRAPH_BUS_TOKEN_FILE="$TEST_ROOT/secrets/fleet-graph.token" \
             uv run --frozen --project "$REPO_ROOT" fleet-graph state serve \
@@ -298,6 +308,14 @@ te_spawn_faces() {
             --run-root "$TEST_ROOT/runs" \
             --lines-config "$TEST_ROOT/config/ronin-lines.json" \
             --state-dir "$TEST_ROOT/decision-mcp"
+        te_launch state-mcp "$TEST_ROOT/logs/state-mcp.log" \
+            env FLEET_GRAPH_SUPERVISION_TOKEN_ROOT="$TEST_ROOT/secrets" \
+            FLEET_GRAPH_DEPLOY_CURRENT="$TEST_ROOT/current" \
+            "$fg" outer-gate serve \
+            --host 127.0.0.1 --port "$P_STATE_MCP" \
+            --run-root "$TEST_ROOT/runs" \
+            --lines-config "$TEST_ROOT/config/ronin-lines.json" \
+            --dd-root "$TEST_ROOT/dd"
         te_launch state-http "$TEST_ROOT/logs/state-http.log" \
             env FLEET_GRAPH_BUS_TOKEN_FILE="$TEST_ROOT/secrets/fleet-graph.token" \
             "$fg" state serve \
@@ -346,13 +364,14 @@ face_ready() {
         dd-mcp)        mcp_probe "$P_DD_MCP" ;;
         goal-mcp)      mcp_probe "$P_GOAL_MCP" ;;
         decision-mcp)  mcp_probe "$P_DECISION_MCP" ;;
+        state-mcp)     mcp_probe "$P_STATE_MCP" ;;
         state-http)    [ "$(http_code "http://127.0.0.1:$P_STATE_HTTP/v1/lines")" = "200" ] ;;
         engine)        pid_alive "$(cat "$TEST_ROOT/pids/engine.pid" 2>/dev/null)" ;;
         *)             return 1 ;;
     esac
 }
 
-KILL_ALL_FACES="bus-mcp bus-server state-http decision-mcp goal-mcp dd-mcp engine"
+KILL_ALL_FACES="bus-mcp bus-server state-mcp state-http decision-mcp goal-mcp dd-mcp engine"
 
 kill_all() {
     # SIGTERM → 宽限 5s → SIGKILL → 等到全灭（击杀回收必须确定完成）。
@@ -402,7 +421,7 @@ await_ready() {
     # 就绪上限 §一·4 默认 60s；FGT_READY_TIMEOUT 仅供测试缩短（同 FGT_DENY_* 的
     # 测试后门定位，生产不设）。
     local deadline=$(( $(date +%s) + ${FGT_READY_TIMEOUT:-60} )) pending faces f
-    faces="bus-http bus-mcp dd-mcp goal-mcp decision-mcp state-http engine"
+    faces="bus-http bus-mcp dd-mcp goal-mcp decision-mcp state-mcp state-http engine"
     while :; do
         pending=""
         for f in $faces; do
@@ -626,6 +645,7 @@ VRB_PERSONA_FILES=$TEST_ROOT/personas/wf-testenv-sample.md
 VRB_SUPERVISOR_ROOT=$TEST_ROOT/supervisor
 VRB_SECRETS_DIR=$TEST_ROOT/secrets
 VRB_LLM_LEDGER=http://127.0.0.1:$P_STATE_HTTP/v1/llm-ledger
+VRB_MCP_STATE=$P_STATE_MCP
 EOF
 }
 

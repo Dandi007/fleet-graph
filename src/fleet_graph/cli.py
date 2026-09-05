@@ -846,6 +846,26 @@ def _decision_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _outer_gate_serve(args: argparse.Namespace) -> int:
+    """Serve the outer-gate MCP surface on loopback (R5 外门收敛).
+
+    The nine runtime tools (state read x4 / supervisor-only write x4 /
+    note_publish) on one MCP face: the supervisory plane's and the lines'
+    public interface to the engine. ``:7494`` and the CLI demote to
+    implementation details behind this gate.
+    """
+    from fleet_graph.outer_gate_mcp import serve
+
+    serve(
+        host=args.host,
+        port=args.port,
+        run_root=args.run_root,
+        lines_config=args.lines_config,
+        dd_root=args.dd_root,
+    )
+    return 0
+
+
 def _line_state_serve(args: argparse.Namespace) -> int:
     """Serve the read-only line-state MCP surface on loopback.
 
@@ -1961,6 +1981,36 @@ def build_parser() -> argparse.ArgumentParser:
         "line-state MCP) covers; defaults to config/ronin-lines.json",
     )
     line_state_serve.set_defaults(func=_line_state_serve)
+
+    outer_gate = subparsers.add_parser(
+        "outer-gate",
+        help="the outer-gate MCP surface (R5: state read x4 / supervisor write x4 / note_publish)",
+    )
+    outer_gate_sub = outer_gate.add_subparsers()
+    outer_gate_serve = outer_gate_sub.add_parser(
+        "serve",
+        help="serve the outer-gate MCP surface (the nine runtime tools on one face)",
+    )
+    outer_gate_serve.add_argument("--host", default="127.0.0.1")
+    outer_gate_serve.add_argument("--port", type=int, default=5616)
+    outer_gate_serve.add_argument(
+        "--run-root",
+        default=None,
+        help="where the lines' heartbeat/terminal artifacts live; defaults to "
+        "/data/fleet-graph/runs (the same root the :7494 read model serves)",
+    )
+    outer_gate_serve.add_argument(
+        "--lines-config",
+        default=None,
+        help="the roster SSoT that decides which lines the state tools cover; "
+        "defaults to config/ronin-lines.json",
+    )
+    outer_gate_serve.add_argument(
+        "--dd-root",
+        default=None,
+        help="where dd development records live; defaults to /data/fleet-graph/dd",
+    )
+    outer_gate_serve.set_defaults(func=_outer_gate_serve)
 
     state = subparsers.add_parser(
         "state", help="the M1 fleet-state read-model (read-only /v1 views)"
