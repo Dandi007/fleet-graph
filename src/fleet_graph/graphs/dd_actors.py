@@ -22,6 +22,7 @@ board is not a decision, and the gate's answer to that is to wait.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,7 @@ from fleet_graph.bus.board import Board, GateTicket, normalize_decision
 from fleet_graph.cost_obs import CostDataPlane
 from fleet_graph.cost_obs.classify import LAUNCH, REVIEW
 from fleet_graph.dd.dispatch import derive_attempt_id
-from fleet_graph.dd.egress import PROVIDER_UNAVAILABLE
+from fleet_graph.dd.egress import PROVIDER_UNAVAILABLE, root_cause_for
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.executors.agent_run import (
@@ -101,6 +102,128 @@ GATE_APPROVE = "APPROVE"
 # bounded retry it never earned. PROVIDER_UNAVAILABLE is the egress layer's
 # flat code -- the legacy alias whose root cause reads `transport`.
 INVALID_HANDOFF_SCHEMA = "INVALID_HANDOFF_SCHEMA"
+
+# The execution-family name for a run whose *agent* failed (`agent_error:
+# true`, no transport evidence): the process ran to its failed end and the
+# failure belongs to the agent side, never to the wire. The sealed lifecycle
+# contract's taxonomy (development-lifecycle.json, byte-digest-pinned by the
+# capability manifest) names no agent-failure code, and editing that pinned
+# file is outside this fix's boundary; an unlisted code reads as
+# non-retryable by `Lifecycle.is_retryable`'s fail-closed lookup, which is
+# exactly the disposition this failure earns (R1-c reconfigure, not a
+# transport backoff).
+AGENT_RUN_FAILED = "AGENT_RUN_FAILED"
+
+
+@dataclass(frozen=True)
+class AgentRunFailure:
+    """The classification of one failed agent run, from its own evidence.
+
+    `failure_code` and `detail` build the `StageOutcome`; `detail` carries
+    the raw evidence fields verbatim (contract_error / agent_error_subtype /
+    the route attempts' transport fields) so the failure shows its face.
+    `unattributed` separates the two spend stories: a run whose end leaves
+    its lifecycle uncompleted -- transport evidence, a lost run, a missing
+    result, or no evidence either way -- keeps its spend in `unknown`; a run
+    that failed at its own end (contract violation, agent failure) ran to
+    completion and its spend belongs to the lifecycle the stage served.
+    """
+
+    failure_code: str
+    detail: str
+    unattributed: bool
+    contract_error: str = ""
+    agent_error_subtype: str = ""
+
+
+# The route-attempt fields whose non-empty presence is transport evidence:
+# an HTTP status, a signal, or an error class is the wire speaking.
+ROUTE_TRANSPORT_FIELDS = ("http_status", "signal", "error_class")
+
+
+def _route_attempts_with_transport_evidence(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """The route attempts that carry positive transport evidence.
+
+    A run whose every attempt finished clean (no status, no signal, no error
+    class, exit 0) has *zero* transport evidence -- calling its failure a
+    provider outage is the misclassification X-4 exists to stop.
+    """
+    evidence: list[dict[str, Any]] = []
+    for attempt in result.get("route_attempts") or []:
+        if not isinstance(attempt, dict):
+            continue
+        spoke_transport = any(
+            attempt.get(name) not in (None, "") for name in ROUTE_TRANSPORT_FIELDS
+        ) or attempt.get("exit_code") not in (None, 0)
+        if spoke_transport:
+            evidence.append(attempt)
+    return evidence
+
+
+def classify_agent_run_failure(
+    result: dict[str, Any] | None, *, state: str = "", run_id: str = ""
+) -> AgentRunFailure:
+    """Classify one failed agent run from its result.json-shaped evidence.
+
+    The X-4 behaviour contract, as one testable pure function shared by every
+    call site that reads a failed run: transport stays transport on evidence
+    (a lost run, a missing result, or a route attempt that carries an HTTP
+    status / signal / error class / non-zero exit); a contract violation
+    (`contract_error` set, no transport evidence) is a schema failure in the
+    same family as an unreadable envelope; an agent-side failure
+    (`agent_error: true`) keeps its subtype verbatim and never falls back to
+    a provider code. Only *positive* evidence re-classifies: a failed run
+    with no evidence either way keeps the legacy provider code and its
+    unknown spend, exactly as before. Everything the detail carries is the
+    result's own words -- a classified failure must still show its face.
+    """
+    ended = state or "failed"
+    if result is None or state == "lost":
+        return AgentRunFailure(
+            failure_code=PROVIDER_UNAVAILABLE,
+            detail=f"run {run_id} ended {ended} with no result to classify",
+            unattributed=True,
+        )
+    evidence = _route_attempts_with_transport_evidence(result)
+    if evidence:
+        return AgentRunFailure(
+            failure_code=PROVIDER_UNAVAILABLE,
+            detail=(
+                f"run {run_id} ended {ended} with transport evidence: "
+                + json.dumps(evidence, ensure_ascii=False, sort_keys=True)
+            ),
+            unattributed=True,
+        )
+    contract_error = result.get("contract_error")
+    if isinstance(contract_error, str) and contract_error.strip():
+        return AgentRunFailure(
+            failure_code=INVALID_HANDOFF_SCHEMA,
+            detail=(f"run {run_id} ended {ended} in contract violation: {contract_error}"),
+            unattributed=False,
+            contract_error=contract_error,
+        )
+    if result.get("agent_error") is True:
+        subtype = result.get("agent_error_subtype")
+        subtype_text = str(subtype) if subtype not in (None, "") else ""
+        exit_code = result.get("exit_code")
+        return AgentRunFailure(
+            failure_code=AGENT_RUN_FAILED,
+            detail=(
+                f"run {run_id} ended {ended} in agent failure"
+                + (f": {subtype_text}" if subtype_text else "")
+                + (f" (exit_code {exit_code})" if exit_code not in (None, "") else "")
+            ),
+            unattributed=False,
+            agent_error_subtype=subtype_text,
+        )
+    # No evidence either way: the legacy classification stands, and the run's
+    # spend keeps its `unknown` attribution. Only positive evidence moves a
+    # failure out of the provider-outage bucket.
+    return AgentRunFailure(
+        failure_code=PROVIDER_UNAVAILABLE,
+        detail=f"run {run_id} ended {ended}",
+        unattributed=True,
+    )
 
 
 def _usage_tokens(envelope: dict[str, Any] | None) -> float:
@@ -375,11 +498,22 @@ class AgentRunStageActor:
             )
 
         if status.result is None or not status.ok:
-            self._record_unknown_spend(run_id, envelope=status.result)
+            # Classify from the run's own evidence before naming a layer
+            # (X-4): a run that ended cleanly on the wire but violated its
+            # output contract, or failed on the agent side, must not wear a
+            # provider outage's code -- the classification table would grant
+            # it a transport retry it never earned.
+            fault = classify_agent_run_failure(status.result, state=status.state, run_id=run_id)
+            if fault.unattributed:
+                self._record_unknown_spend(run_id, envelope=status.result)
+            else:
+                self._record_failed_run_spend(
+                    stage, dispatch, fault, envelope=status.result, run_id=run_id
+                )
             return StageOutcome(
                 event=FAILURE_EVENT,
-                failure_code=PROVIDER_UNAVAILABLE,
-                detail=f"{stage.id} run {run_id} ended {status.state}",
+                failure_code=fault.failure_code,
+                detail=fault.detail,
             )
 
         try:
@@ -453,14 +587,75 @@ class AgentRunStageActor:
                     attribution=REVIEW, order_id=order_id, tokens=tokens, event_id=run_id
                 )
 
+    def _record_failed_run_spend(
+        self,
+        stage: Stage,
+        dispatch: Dispatch,
+        fault: AgentRunFailure,
+        *,
+        envelope: dict[str, Any] | None,
+        run_id: str,
+    ) -> None:
+        """Attribute a run that failed at its own end to the lifecycle it served.
+
+        X-4's spend rule: a contract-violation or agent-side failure ran to
+        its failed end -- the route attempts carry the durations and the burn
+        -- so its tokens belong to the stage's lifecycle (launch for
+        implement, review for a review), carrying the failure classification
+        as labels, not to `unknown`. `unknown` stays reserved for spends
+        nothing can attribute: a transport interruption or a timeout, where
+        the run never completed the lifecycle it was serving. The identity
+        keys are the data plane's own (launch by order, review by
+        order+phase+attempt, cost by event id + attribution), so a replayed
+        recording is a no-op and a retried attempt cannot double-count.
+        """
+        if self.cost_plane is None:
+            return
+        order_id = self.development_id
+        tokens = _usage_tokens(envelope)
+        reviews = review_stages(self.lifecycle)
+        if stage.id == implement_stage(self.lifecycle):
+            attribution = LAUNCH
+            self.cost_plane.record_launch(
+                order_id=order_id,
+                development_id=order_id,
+                generation=int(dispatch.get("generation", 1)),
+                seat=stage_role(stage, self.roles),
+                model=str(self.models.get(stage.id) or ""),
+            )
+        elif stage.id in reviews:
+            attribution = REVIEW
+            phase = "continuous" if stage.id == reviews[0] else "final"
+            self.cost_plane.record_review(
+                order_id=order_id,
+                phase=phase,
+                verdict="failed",
+                attempt=int(dispatch.get("attempt", 1)),
+            )
+        else:
+            return
+        if tokens > 0:
+            self.cost_plane.record_failure_cost(
+                attribution=attribution,
+                order_id=order_id,
+                tokens=tokens,
+                event_id=run_id,
+                failure_code=fault.failure_code,
+                root_cause=root_cause_for(fault.failure_code, fault.detail),
+            )
+
     def _record_unknown_spend(self, run_id: str, *, envelope: dict[str, Any] | None) -> None:
         """Account a run's spend as `unknown` when nothing attributes it.
 
-        A run that failed, timed out, or answered in a shape we will not guess
-        at still spent tokens on a lifecycle that never completed, so those
-        tokens genuinely lack a lifecycle attribution. They are kept observable
-        under `unknown` -- spec requirement 3 -- rather than dropped or
-        silently relabelled as a known class. Unmeasured spend is left absent,
+        A run that timed out, was lost, died on the wire, or answered in a
+        shape we will not guess at still spent tokens on a lifecycle that
+        never completed, so those tokens genuinely lack a lifecycle
+        attribution. They are kept observable under `unknown` -- spec
+        requirement 3 -- rather than dropped or silently relabelled as a
+        known class. A run that failed at its own end with positive evidence
+        (a contract violation or an agent-side failure, X-4's spend rule) is
+        attributed by `_record_failed_run_spend` instead: it completed the
+        run, only the verdict went wrong. Unmeasured spend is left absent,
         never minted as a synthetic zero.
         """
         if self.cost_plane is None:
@@ -631,12 +826,15 @@ class BoardGate:
 
 
 __all__ = [
+    "AGENT_RUN_FAILED",
     "DEFAULT_ROLES",
     "GATE_APPROVE",
     "PRODUCT_ARTIFACT",
     "ROLE_STAGE",
+    "AgentRunFailure",
     "AgentRunStageActor",
     "BoardGate",
+    "classify_agent_run_failure",
     "implement_stage",
     "review_stages",
     "stage_role",

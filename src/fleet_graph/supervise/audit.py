@@ -51,7 +51,13 @@ from fleet_graph.arbiter.a2 import (
 from fleet_graph.bus.board import NOTE_KIND, WORK_NOTES
 from fleet_graph.bus.client import BusClient, PublishResult
 from fleet_graph.dd.bootstrap import DEVELOPMENT_PATH, IdentityChanged, committed_target_base
-from fleet_graph.dd.chain_rules import is_rework_link, rework_link_parent
+from fleet_graph.dd.chain_rules import (
+    SUCCESS,
+    is_retry_link,
+    is_rework_link,
+    retry_link_parent,
+    rework_link_parent,
+)
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.vendor import git_ops
 
@@ -259,6 +265,24 @@ def _check_receipt_chain(report: AuditReport, development_id: str, entry: dict[s
             # dev-fg-369dacf607c1: a legitimate rework chain went red here
             # before this case was modelled.
             acceptable.add(rework_link_parent(previous.get("receipt") or {}))
+        if (
+            previous is not None
+            and is_retry_link(str(previous.get("verdict") or ""))
+            and str(previous.get("stage") or "") == str(record.get("stage") or "")
+            and previous.get("attempt") == record.get("attempt")
+            and str(previous.get("receipt_digest") or "") == str(record.get("receipt_digest") or "")
+            and str(record.get("verdict") or "") == SUCCESS
+        ):
+            # The retry edge (dd/chain_rules.py): a failed signing whose
+            # re-run sealed the *same* receipt -- same stage, same attempt,
+            # same receipt digest, failed -> success -- is one receipt signed
+            # twice across a re-prepared handoff, so the second signing names
+            # the parent the failed one already named (X-4 measured on
+            # dev-fg-d9370430e0ce rev4 -> rev5). Every one of the four
+            # conditions must hold; dropping any of them reopens the door to
+            # "any failed record forgives the next parent", which is the
+            # loosening this edge must never be.
+            acceptable.add(retry_link_parent(previous))
         if parent not in acceptable:
             breaks.append(
                 f"rev{record.get('revision')} {record.get('stage')}: parent "
