@@ -363,6 +363,8 @@ class RunArtifacts:
         self.release_id = release_id
 
         self._rounds_path = self.run_root / "rounds.jsonl"
+        #: R3: the Stop-Response actions ledger, under the coordinator face.
+        self._coord_rounds_path = self.run_root / "coord" / "rounds.jsonl"
         self._heartbeat_path = self.run_root / "heartbeat.json"
         self._terminal_path = self.run_root / "terminal.json"
         self._acks_path = self.run_root / LINE_MESSAGE_ACKS_FILE
@@ -444,6 +446,25 @@ class RunArtifacts:
             if raw.strip():
                 rounds.append(json.loads(raw))
         return rounds
+
+    def record_stop_response_actions(self, record: dict[str, Any]) -> bool:
+        """Append one Stop-Response actions record; never rewrites history.
+
+        R3: the coordinator's actions verbatim and the per-action consumption
+        receipts land in the Stop-Response rounds ledger under ``coord/`` --
+        beside the coordinator round inputs, because this is the coordinator's
+        output face. Append-only and flushed like ``rounds.jsonl``; a lost
+        append degrades observability only and must never block the loop.
+        """
+        try:
+            self._coord_rounds_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._coord_rounds_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                handle.flush()
+            return True
+        except OSError as exc:
+            log.warning("coord actions record append failed (not blocking the loop): %s", exc)
+            return False
 
     # --- line-message acks (M4) ------------------------------------------
 

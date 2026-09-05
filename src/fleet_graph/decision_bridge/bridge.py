@@ -19,6 +19,12 @@ cursor costs observation (zero resume), a refuse or transport failure seals a
 terminal ``refused`` receipt, and a durability fault (an unreadable, unwritable,
 locked or corrupt database) fails closed -- the bridge refuses to resume rather
 than continuing on an in-memory cursor.
+
+R3 (wf-4601c8, S11): the bridge recovers **parked goal lines only**. Its dd
+consumption leg is deleted -- a dd gate is released solely by the dispatching
+line's own graph gate node consuming its own ``dd.gate_release.v1`` action, so
+a board decision that references a dd single resolves to a structured noop
+here instead of resuming anything.
 """
 
 from __future__ import annotations
@@ -33,7 +39,6 @@ from typing import Any
 
 from fleet_graph.bus.board import DECISION_KIND, NOTE_KIND, WORK_NOTES
 from fleet_graph.decision_bridge.owners import (
-    OWNER_KIND_DD,
     RESUME_ALREADY_RESUMED,
     RESUME_REFUSED,
     RESUME_RESUMED,
@@ -75,11 +80,10 @@ class DecisionBridgeConfig:
     poll_interval_seconds: float = 1.0
     board_page_limit: int = DEFAULT_BOARD_PAGE_LIMIT
     owner_url: str | None = None
-    dd_root: Path = Path("/data/fleet-graph/dd")
-    #: The line roster the production bridge may recover parked goal lines
-    #: from. Empty (the default) means the bridge recovers dd developments
-    #: only; populated, the bridge also discovers/resumes parked lines through
-    #: their registered control entry (the scheduler's stall-state files).
+    #: The line roster the production bridge recovers parked goal lines from.
+    #: R3 (S11): the bridge recovers parked lines only -- there is no dd owner
+    #: any more, because a dd gate is released solely by the dispatching
+    #: line's own graph gate node consuming its own ``dd.gate_release.v1``.
     line_owners: list[Any] = field(default_factory=list)
     line_run_root: Path = Path("/data/fleet-graph/runs")
     #: Test seam for the crash-window drill: write a sentinel at this path and
@@ -141,44 +145,13 @@ class DecisionBridge:
 
             self.owner_source = HttpOwnerSource(self.config.owner_url)
             return self.owner_source
-        from fleet_graph.decision_bridge.owners import DdOwnerSource
+        from fleet_graph.decision_bridge.owners import LineOwnerSource
 
-        dd_source = DdOwnerSource(self.config.dd_root)
-        if not self.config.line_owners:
-            self.owner_source = dd_source
-            return self.owner_source
-        from fleet_graph.decision_bridge.owners import CompositeOwnerSource, LineOwnerSource
-
-        line_source = LineOwnerSource(self.config.line_run_root, self.config.line_owners)
-        self.owner_source = CompositeOwnerSource(
-            [dd_source, line_source], kinds={"dd": dd_source, "line": line_source}
-        )
+        # R3 (S11): the line owner is the only production owner. A decision
+        # that resolves to no parked line is a structured noop -- a dd gate is
+        # never recovered from the board by this bridge.
+        self.owner_source = LineOwnerSource(self.config.line_run_root, self.config.line_owners)
         return self.owner_source
-
-    def _record_dispatched_decision_consumed(self, target: OwnerTarget) -> None:
-        """Wake fact 4: a consumed dd decision must wake the parked line that
-        dispatched the development (``dispatched_by == line folder``).
-
-        The line is woken by the scheduler, not here: the fact is written into
-        the line's stall-state file and the scheduler's next tick reads it as a
-        wake fact and clears the parked fields through its own ``_wake``. The
-        dispatch provenance comes from the resolved target when it is present
-        (fresh path) or from the owner source's admission record on the replay
-        path, where the reconstructed target carries none. Best-effort and
-        never raising: a wake-fact write must never fail the terminal seal.
-        """
-        if target.kind != OWNER_KIND_DD:
-            return
-        dispatched_by = target.dispatched_by
-        if not dispatched_by:
-            try:
-                dispatched_by = self._ensure_owner_source().dispatched_by(target.id)
-            except Exception:
-                dispatched_by = ""
-        if not dispatched_by:
-            return
-        with contextlib.suppress(Exception):  # best-effort, never fails the seal
-            self._ensure_owner_source().record_decision_consumed(dispatched_by, self.clock())
 
     def _ensure_store(self) -> BridgeStore:
         if self.store is None:
@@ -470,16 +443,6 @@ class DecisionBridge:
         )
         if origin and not reason:
             reason = origin
-
-        if status == STATUS_RESUMED:
-            # Wake fact 4 (the decision-bridge wake): a dd development left
-            # `awaiting_gate` because this decision consumed its gate, and the
-            # development was dispatched by a parked line. Record the fact on
-            # that line so the scheduler wakes it on its next tick (it reads
-            # `dispatched_decision_consumed_at`; the wake goes through the
-            # scheduler's own `_wake`, never a direct ignition). Best-effort:
-            # a wake-fact write must never fail the receipt.
-            self._record_dispatched_decision_consumed(target)
 
         if self.config.kill_window_file is not None:
             self._hold_kill_window(source_message_id)

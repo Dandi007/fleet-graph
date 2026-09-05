@@ -1,77 +1,134 @@
-"""M2 dd-gate delivery: ``decision_deliver`` accepts a dd single target.
+"""dd.gate_release.v1 consumption: the gate node is the sole release path.
 
-The spec (wf-8d9737 M2) extends the decision MCP surface so the *same* tool
-that wakes a parked line can also deliver ``APPROVE``/``REJECT`` to a dd single
-sitting at ``awaiting_gate`` -- resuming the single through its existing gate
-path and waking the dispatching line synchronously. One authority check, one
+The spec (wf-4601c8 R3) deletes the second delivery path: ``decision_deliver``
+no longer accepts a dd target and the decision-bridge no longer recovers dd
+singles. Every test that was bound to that old path is deleted; this module now
+holds the *equivalents bound to the new path* -- the dispatching line's own
+graph gate node consuming its own ``dd.gate_release.v1`` action
+(:class:`fleet_graph.graphs.dd_gate.GraphGateNode`). One authority check, one
 unchanged vocabulary:
 
-- **positive** -- an ``awaiting_gate`` single delivered by its dispatching
-  principal resumes, and the dispatching line's ``parked_*`` snapshot is cleared
-  while the ``dispatched_decision_consumed_at`` wake fact lands (the scheduler
-  wakes it next tick); the new path never produces a "swallowed" entry.
-- **principal == dispatched_by** -- any other principal is refused with
-  ``NOT_DISPATCHING_LINE`` and BOTH the single and the dispatching line stay
-  untouched.
-- **MAYBE stays negative** -- a decision outside {APPROVE, REJECT} is still a
-  call-point :class:`DecisionPayloadError`, exactly as before.
+删/补对照表（旧路用例 → 新路等价用例；覆盖净数不减，另见
+tests/test_r3_stop_response.py 的信封与 nodes 级用例）:
 
-The resume is driven against a fake dd control plane (the same duck-type the
-dd MCP surface and its tests use), but the *line wake* is the real stall-state
-file write the scheduler reads -- no mock there.
+==============================  ==============================================
+旧路（已删除，decision_deliver dd 目标路径）        新路等价（本文件，dd.gate_release.v1 消费）
+==============================  ==============================================
+test_approve_resumes_the_       test_approve_release_consumes_and_receipts
+single_and_wakes_the_
+dispatching_line
+test_reject_is_also_a_          test_reject_release_with_board_binding_consumes
+delivered_verdict_with_a_
+distinct_action_key
+test_the_new_path_is_zero_      test_consumption_is_never_a_third_state
+swallowed
+test_a_non_dispatching_         test_foreign_decider_is_refused_and_single_
+principal_is_refused_and_       untouched
+nothing_moves
+test_an_empty_principal_is_     test_empty_decider_is_a_schema_refusal
+not_the_dispatching_line
+test_the_principal_must_equal_  test_decider_must_equal_record_dispatched_by
+the_record_dispatched_by
+test_a_single_not_awaiting_     test_single_not_awaiting_gate_is_a_failed_
+gate_is_an_explicit_refusal     receipt
+test_maybe_is_still_a_call_     test_invalid_verdict_is_a_failed_receipt
+point_error_for_a_dd_target
+test_a_non_dd_target_still_     （parked-line 外部裁决投递路保留——等价断言在
+routes_to_the_parked_line_path  tests/test_decision_mcp.py 既有 line-path 用例，
+                                本单不删不改其语义）
+==============================  ==============================================
+
+The plane is the duck-typed control plane the gate node holds; the decision
+seal is a real git commit in a real throwaway workspace -- no mock there.
 """
 
 from __future__ import annotations
 
-import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from fleet_graph.decision_bridge.owners import OWNER_KIND_DD
-from fleet_graph.decision_mcp import (
-    CODE_DD_NOT_AWAITING_GATE,
-    CODE_NOT_DISPATCHING_LINE,
-    DECISION_APPROVE,
-    DECISION_REJECT,
-    OUTCOME_DELIVERED,
-    OUTCOME_REFUSED,
-    DecisionPayloadError,
-    DeliveryResult,
-    deliver_decision,
+from fleet_graph.dd.self_gate import EvidenceItem
+from fleet_graph.graphs.dd_gate import (
+    CODE_NOT_AWAITING_GATE,
+    CODE_NOT_DISPATCHER,
+    CODE_OBLIGATIONS_FAILED,
+    CODE_REJECT_CONTRACT_INCOMPLETE,
+    GraphGateNode,
+)
+from fleet_graph.graphs.stop_response import (
+    KIND_GATE_RELEASE,
+    REASON_PAYLOAD_SCHEMA,
+    STATUS_CONSUMED,
+    STATUS_FAILED,
 )
 
-DD_ID = "dev-fg-abc"
+DEV_ID = "dev-fg-abc"
 DISPATCHER = "wf-1"
+GATE_PATH_PARTS = (".dev-dispatch", "gate", "decision-g2.json")
 
-ROSTER: list[Any] = [{"folder_id": "wf-1", "seat": "s", "generation": 2}]
+
+def _passing_evidence() -> list[EvidenceItem]:
+    return [
+        EvidenceItem(obligation, obligation, True, "grounded by fixture")
+        for obligation in (
+            "acceptance_frozen",
+            "diff_within_scope",
+            "zero_test_deletion",
+            "personally_rerun",
+            "mutation_receipt",
+            "regression",
+        )
+    ]
 
 
-class FakeDdPlane:
-    """A duck-typed dd control plane: ``get`` + ``gate`` + publish.
+_WORKSPACE_SEQ = 0
 
-    The resume consumes the verdict per its semantics (M3.1 defect 1): an
-    APPROVE moves the single off the gate (``running``); a REJECT
-    terminalises it as ``refused`` -- which is what the delivery's read-back
-    must observe to report ``delivered/consumed``.
-    """
+
+def _workspace(tmp_path: Path) -> Path:
+    global _WORKSPACE_SEQ
+    _WORKSPACE_SEQ += 1
+    workspace = tmp_path / f"subject-{_WORKSPACE_SEQ}"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    (workspace / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(workspace), "add", "-A"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ],
+        check=True,
+    )
+    return workspace
+
+
+class FakeGatePlane:
+    """The duck-typed control plane the gate node holds: get / publish / resume."""
 
     def __init__(
         self,
         *,
+        workspace: Path,
         state: str = "awaiting_gate",
         dispatched_by: str = DISPATCHER,
         generation: int = 2,
-        awaiting: dict[str, str] | None = None,
     ) -> None:
+        self.workspace = workspace
         self.state = state
         self.dispatched_by = dispatched_by
         self.generation = generation
-        self.awaiting = awaiting or {
-            "question_note_id": "q-dd-1",
-            "card_entity_id": "card-dd-1",
-        }
         self.resumed: list[tuple[str, str]] = []
         self.published: list[dict[str, Any]] = []
 
@@ -81,7 +138,8 @@ class FakeDdPlane:
             "state": self.state,
             "dispatched_by": self.dispatched_by,
             "generation": self.generation,
-            "awaiting": self.awaiting,
+            "repo_path": str(self.workspace),
+            "worktree_path": str(self.workspace),
         }
 
     def publish_gate_decision(
@@ -102,235 +160,249 @@ class FakeDdPlane:
                 "action_key": action_key,
             }
         )
-        return {"development_id": development_id, "decision": decision}
+        return {"development_id": development_id, "decision": decision, "message_id": "m-1"}
 
     def gate(
         self, development_id: str, resume: bool = False, action_key: str | None = None
     ) -> dict[str, Any]:
         assert resume is True
         self.resumed.append((development_id, action_key or ""))
-        # The resumed graph re-reads the board and consumes the verdict per
-        # its semantics: APPROVE leaves the gate, REJECT ends refused.
-        if self.state == "awaiting_gate":
-            self.state = "refused" if action_key and action_key.endswith(":REJECT") else "running"
+        self.state = "refused" if (action_key or "").endswith(":REJECT") else "running"
         return {
-            "state": self.state,
             "development_id": development_id,
-            "resume": {"development_id": development_id, "generation": self.generation},
+            "resume": {
+                "development_id": development_id,
+                "generation": self.generation,
+                "unit": f"fleet-graph-dd-{development_id}-r1",
+                "mode": "resume",
+            },
         }
 
 
-def _stall(run_root: Path, folder_id: str = DISPATCHER) -> Path:
-    path = run_root / ".scheduler" / f"{folder_id}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "generation": 2,
-                "park_considered_run_id": "run-1",
-                "parked_run_id": "run-1",
-                "parked_at": 1_700_000_000.0,
-                "parked_goal_revision": "sha256:consumed",
-                "parked_inbox_available": True,
-                "parked_dd_development_id": DD_ID,
-            }
-        ),
-        encoding="utf-8",
-    )
-    return path
-
-
-def _read_stall(run_root: Path, folder_id: str = DISPATCHER) -> dict[str, Any]:
-    return json.loads((run_root / ".scheduler" / f"{folder_id}.json").read_text(encoding="utf-8"))
-
-
-def _call(
-    run_root: Path,
-    plane: FakeDdPlane,
+def _action(
     *,
-    line: str = DD_ID,
-    decision: str = DECISION_APPROVE,
-    principal: str = DISPATCHER,
-) -> DeliveryResult:
-    return deliver_decision(
-        line=line,
-        decision=decision,
-        reason="live drill",
-        principal=principal,
-        run_root=run_root,
-        lines=ROSTER,
-        dd=plane,
-        clock=lambda: 1_700_000_123.0,
+    verdict: str = "APPROVE",
+    decided_by: str = DISPATCHER,
+    key: str = "k1",
+    payload_extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "development_id": DEV_ID,
+        "verdict": verdict,
+        "decided_by": decided_by,
+    }
+    payload.update(payload_extra or {})
+    return {"kind": KIND_GATE_RELEASE, "payload": payload, "idempotency_key": key}
+
+
+def _node(plane: FakeGatePlane, evidence: Any = None) -> GraphGateNode:
+    return GraphGateNode(plane, evidence=evidence)
+
+
+def _consume(tmp_path: Path, plane: FakeGatePlane, action: dict[str, Any], **kwargs: Any):
+    node = _node(plane, evidence=kwargs.pop("evidence", _passing_evidence()))
+    return node.consume(action, folder_id=DISPATCHER, round_no=3)
+
+
+def test_approve_release_consumes_and_receipts(tmp_path: Path) -> None:
+    """The APPROVE release is consumed end to end: the verdict is sealed into
+    the subject workspace by the node itself (decided_by recorded there), the
+    read model gets the publish, and the suspended pipeline is resumed. S10:
+    the receipt itself is the consumption evidence."""
+    workspace = _workspace(tmp_path)
+    plane = FakeGatePlane(workspace=workspace)
+
+    receipt = _consume(tmp_path, plane, _action())
+
+    assert receipt["status"] == STATUS_CONSUMED
+    assert receipt["development_id"] == DEV_ID
+    assert receipt["decision"] == "APPROVE"
+    assert receipt["decided_by"] == DISPATCHER
+    assert receipt["decided_by_source"] == "graph-gate-node"
+    assert receipt["decision_message_id"] == "m-1"
+    assert receipt["launches"]["unit"] == f"fleet-graph-dd-{DEV_ID}-r1"
+    assert receipt["launches"]["generation"] == 2
+
+    decision_file = workspace.joinpath(*GATE_PATH_PARTS)
+    assert decision_file.is_file()
+    import json
+
+    sealed = json.loads(decision_file.read_text(encoding="utf-8"))
+    assert sealed["decision"] == "APPROVE"
+    assert sealed["decided_by"] == DISPATCHER
+    assert sealed["development_id"] == DEV_ID
+
+    assert plane.published == [
+        {
+            "development_id": DEV_ID,
+            "decision": "APPROVE",
+            "decided_by": DISPATCHER,
+            "reason": plane.published[0]["reason"],
+            "action_key": plane.resumed[0][1],
+        }
+    ]
+    assert "acceptance_frozen=PASS" in plane.published[0]["reason"]
+    assert plane.resumed == [(DEV_ID, plane.published[0]["action_key"])]
+
+
+def test_reject_release_with_board_binding_consumes(tmp_path: Path) -> None:
+    """A REJECT bound to the board adjudication's three non-empty fields (⑮)
+    is consumed and its action key stays distinct."""
+    workspace = _workspace(tmp_path)
+    plane = FakeGatePlane(workspace=workspace)
+    action = _action(
+        verdict="REJECT",
+        key="k-reject",
+        payload_extra={
+            "board_decision": {
+                "problem": "the acceptance surface is wrong",
+                "suggested_answer": "rework with the frozen argv extended",
+                "cost_of_no_answer": "the single hangs at the gate unjudged",
+            }
+        },
     )
 
+    receipt = _consume(tmp_path, plane, action)
 
-class TestPositiveDdDelivery:
-    def test_approve_resumes_the_single_and_wakes_the_dispatching_line(
-        self, tmp_path: Path
-    ) -> None:
-        plane = FakeDdPlane()
-        _stall(tmp_path)
-
-        result = _call(tmp_path, plane, decision=DECISION_APPROVE)
-
-        assert result.status == OUTCOME_DELIVERED
-        assert result.as_dict()["outcome"] == "consumed"
-        assert result.target is not None
-        assert result.target["kind"] == OWNER_KIND_DD
-        assert result.target["id"] == DD_ID
-        assert result.target["generation"] == 2
-        assert result.target["question_note_id"] == "q-dd-1"
-        assert result.target["card_entity_id"] == "card-dd-1"
-        assert result.action_key == f"mcp:dd:{DD_ID}:g2:APPROVE"
-
-        # The single was resumed through its gate, once, with the durable key.
-        assert plane.resumed == [(DD_ID, f"mcp:dd:{DD_ID}:g2:APPROVE")]
-
-        # M3.1: the verdict itself reached the single's decision read model,
-        # decided by the authorized principal, carrying the delivery reason.
-        assert plane.published == [
-            {
-                "development_id": DD_ID,
-                "decision": DECISION_APPROVE,
-                "decided_by": DISPATCHER,
-                "reason": "live drill",
-                "action_key": f"mcp:dd:{DD_ID}:g2:APPROVE",
-            }
-        ]
-
-        # The dispatching line is woken: parked_* cleared, anti-swallow marker
-        # preserved, and the wake fact written.
-        after = _read_stall(tmp_path)
-        assert after["parked_run_id"] is None
-        assert after["parked_at"] is None
-        assert after["parked_goal_revision"] is None
-        assert after["parked_dd_development_id"] is None
-        assert after["park_considered_run_id"] == "run-1"
-        assert after["dispatched_decision_consumed_at"] == 1_700_000_123.0
-
-    def test_reject_is_also_a_delivered_verdict_with_a_distinct_action_key(
-        self, tmp_path: Path
-    ) -> None:
-        plane = FakeDdPlane()
-        _stall(tmp_path)
-
-        result = _call(tmp_path, plane, decision=DECISION_REJECT)
-
-        assert result.status == OUTCOME_DELIVERED
-        assert result.decision == DECISION_REJECT
-        assert result.action_key == f"mcp:dd:{DD_ID}:g2:REJECT"
-        assert plane.resumed == [(DD_ID, f"mcp:dd:{DD_ID}:g2:REJECT")]
-        # A consumed REJECT leaves the single terminal ``refused`` -- the
-        # semantic transfer the delivery's read-back must observe (M3.1).
-        assert plane.state == "refused"
-        assert plane.published[0]["decision"] == DECISION_REJECT
-
-    def test_the_new_path_is_zero_swallowed(self, tmp_path: Path) -> None:
-        """A dd delivery is never a third 'swallowed' state: it is delivered or
-        refused, both of which name their consumption/refusal."""
-        plane = FakeDdPlane()
-        _stall(tmp_path)
-
-        delivered = _call(tmp_path, plane)
-        refused = _call(tmp_path, plane, principal="wf-other")
-
-        assert delivered.status == OUTCOME_DELIVERED
-        assert refused.status == OUTCOME_REFUSED
-        assert refused.code == CODE_NOT_DISPATCHING_LINE
-        for result in (delivered, refused):
-            assert result.status in {OUTCOME_DELIVERED, OUTCOME_REFUSED}
+    assert receipt["status"] == STATUS_CONSUMED
+    assert receipt["decision"] == "REJECT"
+    assert plane.published[0]["decision"] == "REJECT"
+    assert plane.resumed == [(DEV_ID, plane.published[0]["action_key"])]
 
 
-class TestPrincipalIsDispatchingLine:
-    def test_a_non_dispatching_principal_is_refused_and_nothing_moves(self, tmp_path: Path) -> None:
-        plane = FakeDdPlane()
-        stall = _stall(tmp_path)
-        before = json.loads(stall.read_text(encoding="utf-8"))
+def test_a_reject_missing_any_board_field_is_refused_and_traced(tmp_path: Path) -> None:
+    """⑮: a REJECT without all three non-empty adjudication fields is refused
+    by the gate and traced; the single stays at awaiting_gate untouched."""
+    workspace = _workspace(tmp_path)
+    plane = FakeGatePlane(workspace=workspace)
+    action = _action(
+        verdict="REJECT",
+        payload_extra={"board_decision": {"problem": "only the problem"}},
+    )
 
-        result = _call(tmp_path, plane, principal="wf-other")
+    receipt = _consume(tmp_path, plane, action)
 
-        assert result.status == OUTCOME_REFUSED
-        assert result.code == CODE_NOT_DISPATCHING_LINE
-        assert "wf-other" in result.message
-        assert "wf-1" in result.message
-
-        # The single was NOT resumed and the dispatching line is untouched.
-        assert plane.resumed == []
-        assert _read_stall(tmp_path) == before
-
-    def test_an_empty_principal_is_not_the_dispatching_line(self, tmp_path: Path) -> None:
-        plane = FakeDdPlane()
-        _stall(tmp_path)
-
-        result = _call(tmp_path, plane, principal="")
-
-        assert result.status == OUTCOME_REFUSED
-        assert result.code == CODE_NOT_DISPATCHING_LINE
-        assert plane.resumed == []
-
-    def test_the_principal_must_equal_the_record_dispatched_by(self, tmp_path: Path) -> None:
-        plane = FakeDdPlane()
-        _stall(tmp_path)
-        assert _call(tmp_path, plane, principal=DISPATCHER).status == OUTCOME_DELIVERED
-        assert _call(tmp_path, plane, principal="wf-1-extra").code == CODE_NOT_DISPATCHING_LINE
+    assert receipt["status"] == STATUS_FAILED
+    assert receipt["reason"] == CODE_REJECT_CONTRACT_INCOMPLETE
+    assert plane.published == []
+    assert plane.resumed == []
+    assert plane.state == "awaiting_gate"
 
 
-class TestDdNotAtGate:
-    def test_a_single_not_awaiting_gate_is_an_explicit_refusal(self, tmp_path: Path) -> None:
-        plane = FakeDdPlane(state="running")
-        stall = _stall(tmp_path)
-        before = json.loads(stall.read_text(encoding="utf-8"))
+def test_consumption_is_never_a_third_state(tmp_path: Path) -> None:
+    """A gate release is consumed or failed with its reason -- never a silent
+    third state."""
+    workspace = _workspace(tmp_path)
+    plane = FakeGatePlane(workspace=workspace)
 
-        result = _call(tmp_path, plane)
+    consumed = _consume(tmp_path, plane, _action(key="ok"))
+    failed = _consume(tmp_path, plane, _action(key="bad", decided_by="wf-other"))
 
-        assert result.status == OUTCOME_REFUSED
-        assert result.code == CODE_DD_NOT_AWAITING_GATE
-        assert result.retryable is True
-        assert "running" in result.message
-        assert plane.resumed == []
-        assert _read_stall(tmp_path) == before
-
-
-class TestMayBeStaysNegative:
-    def test_maybe_is_still_a_call_point_error_for_a_dd_target(self, tmp_path: Path) -> None:
-        plane = FakeDdPlane()
-        _stall(tmp_path)
-
-        with pytest.raises(DecisionPayloadError, match="APPROVE or REJECT"):
-            _call(tmp_path, plane, decision="MAYBE")
-
-        assert plane.resumed == []
+    assert consumed["status"] == STATUS_CONSUMED
+    assert failed["status"] == STATUS_FAILED
+    for receipt in (consumed, failed):
+        assert receipt["status"] in {STATUS_CONSUMED, STATUS_FAILED}
 
 
-class TestLinePathUnaffected:
-    def test_a_non_dd_target_still_routes_to_the_parked_line_path(self, tmp_path: Path) -> None:
-        """The human/supervisor path to lines is unchanged: a ``wf-*`` target
-        ignores ``principal`` and the dd plane entirely."""
-        plane = FakeDdPlane()
-        stall = _stall(tmp_path)
-        stall.write_text(
-            json.dumps(
-                {
-                    "generation": 2,
-                    "board_question_note_id": "q-1",
-                    "board_card_entity_id": "card-1",
-                    "parked_run_id": "run-1",
-                    "parked_at": 1_700_000_000.0,
-                    "parked_goal_revision": "sha256:consumed",
-                    "parked_inbox_available": True,
-                }
-            ),
-            encoding="utf-8",
-        )
+def test_foreign_decider_is_refused_and_single_untouched(tmp_path: Path) -> None:
+    """The M2 identity invariant on the new path: decided_by != dispatched_by
+    is refused before anything moves (REJECT + 留痕)."""
+    workspace = _workspace(tmp_path)
+    plane = FakeGatePlane(workspace=workspace)
 
-        result = _call(tmp_path, plane, line="wf-1", principal="wf-other")
+    receipt = _consume(tmp_path, plane, _action(decided_by="wf-1-extra"))
 
-        assert result.status == OUTCOME_DELIVERED
-        assert result.target["kind"] == "line"
-        assert plane.resumed == []
-        after = _read_stall(tmp_path)
-        assert after["parked_run_id"] is None
-        assert (
-            "dispatched_decision_consumed_at" not in after
-            or after["dispatched_decision_consumed_at"] is None
-        )
+    assert receipt["status"] == STATUS_FAILED
+    assert receipt["reason"] == CODE_NOT_DISPATCHER
+    assert plane.published == []
+    assert plane.resumed == []
+    assert plane.state == "awaiting_gate"
+
+
+def test_empty_decider_is_a_schema_refusal(tmp_path: Path) -> None:
+    """An empty decided_by never reaches the identity check: it is a payload
+    schema refusal at the node boundary."""
+    plane = FakeGatePlane(workspace=_workspace(tmp_path))
+
+    receipt = _consume(tmp_path, plane, _action(decided_by=""))
+
+    assert receipt["status"] == STATUS_FAILED
+    assert receipt["reason"] == REASON_PAYLOAD_SCHEMA
+    assert plane.resumed == []
+
+
+def test_decider_must_equal_record_dispatched_by(tmp_path: Path) -> None:
+    """Exactly the dispatcher passes; any other identity -- however close --
+    fails the identity invariant."""
+    ok = _consume(tmp_path, FakeGatePlane(workspace=_workspace(tmp_path)), _action(key="ok"))
+    near_miss = _consume(
+        tmp_path,
+        FakeGatePlane(workspace=_workspace(tmp_path)),
+        _action(key="near", decided_by="wf-1x"),
+    )
+
+    assert ok["status"] == STATUS_CONSUMED
+    assert near_miss["reason"] == CODE_NOT_DISPATCHER
+
+
+def test_single_not_awaiting_gate_is_a_failed_receipt(tmp_path: Path) -> None:
+    """A single anywhere other than awaiting_gate is an explicit failed
+    receipt; nothing is published or resumed."""
+    plane = FakeGatePlane(workspace=_workspace(tmp_path), state="running")
+
+    receipt = _consume(tmp_path, plane, _action())
+
+    assert receipt["status"] == STATUS_FAILED
+    assert receipt["reason"] == CODE_NOT_AWAITING_GATE
+    assert "running" in receipt["detail"]
+    assert plane.resumed == []
+
+
+def test_invalid_verdict_is_a_failed_receipt(tmp_path: Path) -> None:
+    """The verdict vocabulary is closed on the new path too: MAYBE is a
+    payload schema refusal, never an interpretation."""
+    plane = FakeGatePlane(workspace=_workspace(tmp_path))
+
+    receipt = _consume(tmp_path, plane, _action(verdict="MAYBE"))
+
+    assert receipt["status"] == STATUS_FAILED
+    assert receipt["reason"] == REASON_PAYLOAD_SCHEMA
+    assert plane.resumed == []
+
+
+def test_a_failed_obligation_refuses_the_release(tmp_path: Path) -> None:
+    """Any of the six obligations failing refuses the release with the
+    per-item rationale in the receipt; the single stays untouched."""
+    workspace = _workspace(tmp_path)
+    plane = FakeGatePlane(workspace=workspace)
+    evidence = _passing_evidence()
+    evidence[3] = EvidenceItem("personally_rerun", "personally reran acceptance", False, "exit=1")
+
+    receipt = _consume(tmp_path, plane, _action(), evidence=evidence)
+
+    assert receipt["status"] == STATUS_FAILED
+    assert receipt["reason"] == CODE_OBLIGATIONS_FAILED
+    assert any(
+        item["id"] == "personally_rerun" and not item["passed"] for item in receipt["evidence"]
+    )
+    assert plane.published == []
+    assert plane.resumed == []
+
+
+def test_unknown_development_is_a_failed_receipt(tmp_path: Path) -> None:
+    """A single the control plane cannot resolve is refused, never guessed."""
+
+    class Missing(FakeGatePlane):
+        def get(self, development_id: str) -> dict[str, Any]:
+            raise RuntimeError("DEVELOPMENT_NOT_FOUND")
+
+    plane = Missing(workspace=_workspace(tmp_path))
+
+    receipt = _consume(tmp_path, plane, _action())
+
+    assert receipt["status"] == STATUS_FAILED
+    assert plane.resumed == []
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

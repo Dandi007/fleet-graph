@@ -1,22 +1,22 @@
-"""The line self-gate decision (M3): six evidence obligations -> one verdict.
+"""The gate's six evidence obligations -> one verdict (mechanics only).
 
-After M1 (``dd_awaiting_gate`` wake) and M2 (``decision_deliver`` for a dd
-single with a principal check), the gate authority is the dispatching line's
-own judgment (golden-order D5): on a ``dd_awaiting_gate`` wake the line
-mechanically discharges **six evidence obligations** and then delivers
-``APPROVE``/``REJECT`` through the exact dd delivery path the decision surface
-already checks. ``decided_by`` *must equal* that single's
-``record.json.dispatched_by`` -- the delivery path refuses any principal that
-is not the single's ``dispatched_by`` -- so a self-gate verdict can never be
+R3 (wf-4601c8): the *delivery* half of this module is gone. The old
+``deliver_self_gate_decision`` discharged the obligations and handed the
+verdict to the decision surface's dd path -- the second delivery path the R3
+spec deletes. What remains (and what the graph gate node,
+:mod:`fleet_graph.graphs.dd_gate`, consumes) is the pure mechanical substrate:
+the six required obligation ids, the per-obligation evidence builders, the
+mutation-target enumeration, and the fail-closed completeness gate. ``decided_by
+*must equal*`` the single's ``record.json.dispatched_by`` is asserted by the
+gate node itself before anything is touched, so a gate verdict can never be
 cast by anyone but the dispatching line. Under D5 the human/supervision
 surface appears at exactly three points -- enrollment release, goal-level
 acceptance, and the answer escalation report -- and never inside this gate.
 
 The six obligations are the gate's non-negotiable required fields (golden-order
 D5; design.md §6.2/§6.3; goal.md §二 M3 + S9/S10/S11/S12). Missing any one of
-them leaves
-the delivery **refused** -- the negative criterion a test must be able to turn
-red:
+them leaves the release **refused** -- the negative criterion a test must be
+able to turn red:
 
 1. **acceptance-argv frozen and verbatim** (three-way machine equality: spec
    freeze == ``record.json.acceptance_commands`` == stage receipt command).
@@ -37,25 +37,16 @@ red:
    is admissible only with an isolated rerun attribution on the clean base.
 
 The functions here are pure over plain data so the whole gate decision is
-testable without a live dd root, a live git repo, or a live pytest run. The
-production runners (``graphs/runner.py``) import :func:`deliver_self_gate_decision`
-and supply the evidence it consumes.
+testable without a live dd root, a live git repo, or a live pytest run.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
-
-from fleet_graph.decision_mcp import (
-    DECISION_APPROVE,
-    DECISION_REJECT,
-    OUTCOME_REFUSED,
-    DeliveryResult,
-    deliver_decision,
-)
 
 #: Evidence ids, in the six-obligation order the spec pins. Each is a required
 #: field of the gate decision; a decision may not be delivered with any missing.
@@ -114,6 +105,19 @@ class MutationTarget:
 _CALL_RE = re.compile(r"(?<![.\w])([A-Za-z_]\w*)\s*\(")
 
 
+def command_digest(argv: Any) -> str:
+    """The normalized digest of one acceptance argv (R3 三方归一哈希比对).
+
+    ``[["bash", "-lc", "uv run pytest"]]`` and any trivially equivalent shape
+    normalise to the same sha256 over the canonical JSON of the string parts,
+    so the three-way comparison is a digest equality -- the same freeze always
+    hashes the same, and a diverged command is a different digest, never a
+    prose judgement.
+    """
+    canonical = [[str(part) for part in entry] for entry in _canonical_commands(argv)]
+    return hashlib.sha256(json.dumps(canonical, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
 def _argv_equal(left: Any, right: Any) -> bool:
     """Machine-compare two acceptance argv lists (list of argv lists)."""
     return _canonical_commands(left) == _canonical_commands(right)
@@ -140,15 +144,24 @@ def evidence_acceptance_frozen(
     receipt_command: list[list[str]],
 ) -> EvidenceItem:
     """Obligation 1: the three assertions of the frozen acceptance argv are
-    byte-equal (spec freeze == record.json == stage receipt)."""
-    equal = _argv_equal(spec_argv, record_acceptance_commands) and _argv_equal(
-        record_acceptance_commands, receipt_command
-    )
+    byte-equal (spec freeze == record.json == stage receipt).
+
+    R3 口径: the comparison is a normalized digest equality per source --
+    three digests, one verdict.
+    """
+    spec_digest = command_digest(spec_argv)
+    record_digest = command_digest(record_acceptance_commands)
+    receipt_digest_value = command_digest(receipt_command)
+    equal = spec_digest == record_digest == receipt_digest_value
     detail = (
-        "spec/record/receipt acceptance argv identical"
+        f"acceptance argv digests identical ({spec_digest[:16]})"
         if equal
-        else f"acceptance argv diverge: spec={spec_argv!r} "
-        f"record={record_acceptance_commands!r} receipt={receipt_command!r}"
+        else (
+            f"acceptance argv digests diverge: spec={spec_digest[:16]} "
+            f"record={record_digest[:16]} receipt={receipt_digest_value[:16]} "
+            f"(spec={spec_argv!r} record={record_acceptance_commands!r} "
+            f"receipt={receipt_command!r})"
+        )
     )
     return EvidenceItem(EVIDENCE_ACCEPTANCE_FROZEN, "acceptance frozen and verbatim", equal, detail)
 
@@ -380,7 +393,7 @@ def _is_product_source(path: str) -> bool:
 
 
 def render_rationale(evidence: list[EvidenceItem]) -> str:
-    """The rationale payload the delivery carries (machine-readable per-item)."""
+    """The rationale payload the release carries (machine-readable per-item)."""
     parts = [f"{item.id}={'PASS' if item.passed else 'FAIL'}:{item.detail}" for item in evidence]
     return "; ".join(parts)
 
@@ -403,46 +416,6 @@ def collect_evidence(items: list[EvidenceItem]) -> EvidenceItem | None:
     return None
 
 
-def deliver_self_gate_decision(
-    *,
-    development_id: str,
-    principal: str,
-    evidence: list[EvidenceItem],
-    run_root: Path,
-    dd: Any | None = None,
-) -> DeliveryResult:
-    """Discharge the six obligations, then deliver APPROVE/REJECT as the line.
-
-    Missing any obligated field refuses delivery *without* touching the single;
-    otherwise the verdict is derived mechanically (all six passed -> APPROVE,
-    any failed -> REJECT) and delivered through :func:`deliver_decision`, whose
-    dd path validates ``principal == dispatched_by`` -- so ``decided_by`` is the
-    line and only the line. The rationale payload is the delivery ``reason``.
-    """
-    incomplete = collect_evidence(evidence)
-    if incomplete is not None:
-        return DeliveryResult(
-            status=OUTCOME_REFUSED,
-            code=CODE_SELF_GATE_EVIDENCE_INCOMPLETE,
-            message=incomplete.detail,
-            line=development_id,
-            decision="",
-        )
-
-    passed = all(item.passed for item in evidence)
-    decision = DECISION_APPROVE if passed else DECISION_REJECT
-    reason = render_rationale(evidence)
-    return deliver_decision(
-        line=development_id,
-        decision=decision,
-        reason=reason,
-        run_root=run_root,
-        lines=[],
-        principal=principal,
-        dd=dd,
-    )
-
-
 __all__ = [
     "CODE_SELF_GATE_EVIDENCE_INCOMPLETE",
     "EVIDENCE_ACCEPTANCE_FROZEN",
@@ -456,7 +429,7 @@ __all__ = [
     "MutationTarget",
     "RegressionBaseline",
     "collect_evidence",
-    "deliver_self_gate_decision",
+    "command_digest",
     "enumerate_mutation_targets",
     "evidence_acceptance_frozen",
     "evidence_diff_within_scope",

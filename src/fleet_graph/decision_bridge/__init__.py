@@ -1,15 +1,17 @@
 """The E1 decision event bridge: read published verdicts, map each to exactly
 one waiting owner, and recover it through an existing controlled entry.
 
-This is the *resume side* of the human gate. Where the supervisor observer (E1
+This is the *resume side* of the human gate for **parked goal lines** (R3/S11:
+the dd consumption leg is deleted -- a dd gate is released solely by the
+dispatching line's own graph gate node). Where the supervisor observer (E1
 `board_question`) and the preauth-released decision publisher sit on the
 "someone should look at this" and "reinstate a gate" faces, this bridge sits on
 the "a human already cast ``work.decision.v1`` -- now make the waiting owner
 advance" face. It is deliberately read-only against the bus: it pulls decision
 messages off `board:work-notes`, resolves them strictly, and then calls the
-*owner's own* controlled recovery entry (the dd `gate(resume=True)` adapter, or
-a registered line entry) -- it never publishes a decision, never consumes an
-inbox, and never writes into a supervised line's state.
+*owner's own* controlled recovery entry (a registered line entry) -- it never
+publishes a decision, never consumes an inbox, and never writes into a
+supervised line's state.
 
 Four properties make the bridge trustworthy, and each is pinned by tests:
 
@@ -33,10 +35,9 @@ Four properties make the bridge trustworthy, and each is pinned by tests:
   ``e1:<source_message_id>:<target_kind>:<target_id>:<generation>``. The
   bridge's store enforces a unique index on it, and the *owner* also enforces
   the same ``(action_key, generation)`` uniqueness on its own durable surface:
-  the dd gate claims each action key before launching a resume, and the line
-  entry claims it before waking a parked run. The adapter passes the action key
-  through untouched, so a duplicate transport call returns the same logical
-  success instead of accepting or recovering twice.
+  the line entry claims it before waking a parked run. The adapter passes the
+  action key through untouched, so a duplicate transport call returns the same
+  logical success instead of accepting or recovering twice.
 
 The bridge process is a standalone user unit
 (`fleet-graph-decision-bridge.service`), independent of `fleet-graphd.service`
@@ -53,7 +54,6 @@ from fleet_graph.decision_bridge.bridge import (
 )
 from fleet_graph.decision_bridge.owners import (
     CompositeOwnerSource,
-    DdOwnerSource,
     HttpOwnerSource,
     LineOwnerSource,
     OwnerResult,
@@ -82,7 +82,6 @@ __all__ = [
     "BridgeStore",
     "BridgeStoreError",
     "CompositeOwnerSource",
-    "DdOwnerSource",
     "DecisionBridge",
     "DecisionBridgeConfig",
     "HttpOwnerSource",

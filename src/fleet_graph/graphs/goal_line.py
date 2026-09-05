@@ -46,8 +46,22 @@ from fleet_graph.goal_interrupt.contract import (
     prior_terminal_digest,
     resume_key_for,
 )
+from fleet_graph.graphs.dd_gate import DdGatePort
 from fleet_graph.graphs.dd_subgraph import DdSubgraphPort, merge_dd_results
 from fleet_graph.graphs.guards import LineGuards, PromptVerdict
+from fleet_graph.graphs.stop_response import (
+    ACTIONS_FIELD,
+    KIND_DISPATCH,
+    KIND_GATE_RELEASE,
+    REASON_CONSUMER_UNWIRED,
+    REASON_GATE_REFUSED,
+    STATUS_CONSUMED,
+    consumed_record,
+    declared_record,
+    failed_receipt,
+    validate_actions,
+    validate_dispatch_payload,
+)
 from fleet_graph.state.run_artifacts import WAITING_ON_DEFAULT, normalize_waiting_on
 from fleet_graph.work_report import (
     OUTCOME_BLOCKED,
@@ -429,11 +443,14 @@ class LineState(TypedDict, total=False):
     #: parks on the line-consumed revision instead of the one current at
     #: registration time. Absent when no reader is wired or the read fails.
     goal_revision: str
-    #: R2 图合一: the coordinator's declared dispatch intents, not yet
-    #: instantiated. Each one becomes exactly one subgraph call via a graph
-    #: edge (Send); the fan-out node clears the list so the routing cannot
-    #: re-instantiate.
-    pending_dispatches: list[dict[str, Any]]
+    #: R3 Stop Response: the coordinator's declared actions, not yet consumed.
+    #: Each entry is one well-formed ``{kind, payload, idempotency_key}``; the
+    #: fan-out turns every ``dd.dispatch.v1`` into exactly one dispatch-node
+    #: call and every ``dd.gate_release.v1`` into exactly one gate-node call
+    #: via a graph edge (Send). Malformed actions never get this far -- they
+    #: are fail-closed receipts recorded at parse time. The reducer lets
+    #: parallel fan-out tasks each remove their own action by idempotency_key.
+    pending_actions: Annotated[list[dict[str, Any]], merge_pending_actions]
     #: R2 图合一: the dd subgraph's return values, merged per development by
     #: the reducer. This is the ONLY dd-terminal channel into the line state:
     #: no disk file is read as a dd terminal/wake event any more.
@@ -442,6 +459,10 @@ class LineState(TypedDict, total=False):
     #: ``dd_dispatch`` task is instantiating. Present only inside that task's
     #: isolated state view, never persisted anywhere durable.
     dd_intent: dict[str, Any]
+    #: R3 Stop Response: the Send-carried payload channel -- the one action a
+    #: ``dd_gate_release`` task is consuming. Present only inside that task's
+    #: isolated state view, never persisted anywhere durable.
+    gate_action: dict[str, Any]
 
 
 class Coordinator(Protocol):
@@ -477,6 +498,7 @@ class AcceptancePort(Protocol):
 class ArtifactsPort(Protocol):
     def heartbeat(self, round_no: int, phase: str, *, force: bool = False) -> bool: ...
     def append_round(self, line: dict[str, Any]) -> bool: ...
+    def record_stop_response_actions(self, record: dict[str, Any]) -> bool: ...
     def write_worker_report(self, round_no: int, report: dict[str, Any]) -> Any: ...
     def write_terminal(
         self,
@@ -565,6 +587,17 @@ class LineDeps:
     #: dispatch intents then stay unfulfilled rather than half-wired, and the
     #: scheduler's waiting_dd parking (M1) remains that line's dd channel.
     dd: DdSubgraphPort | None = None
+    #: R3 Stop Response: the gate node port -- one consume = one
+    #: ``dd.gate_release.v1`` action (the sole awaiting_gate release path,
+    #: S11). None means gate-release actions fail closed with an unwired-
+    #: consumer receipt rather than half-running.
+    gate: DdGatePort | None = None
+    #: R3: the development id a ``dd_awaiting_gate`` wake names, injected into
+    #: every coordinator input so the line can weigh the release in its Stop
+    #: Response actions. Empty means an ordinary run with no wake anchor. The
+    #: release itself still travels only through the gate node -- the wake
+    #: never carries a verdict.
+    dd_awaiting_gate_development_id: str = ""
 
     def now(self) -> float | None:
         return self.clock() if self.clock is not None else None
@@ -611,34 +644,163 @@ def _coordinator_input(
     if decision is not None:
         coord_input["decision"] = decision.as_dict()
         coord_input["resume_key"] = decision.resume_key
+    if deps.dd_awaiting_gate_development_id:
+        # R3: the dd wake anchor is an input fact, never a verdict. The line
+        # weighs the release and declares it in its Stop Response actions; the
+        # gate node -- not this envelope -- is the only release path (S11).
+        coord_input["dd_awaiting_gate_development_id"] = deps.dd_awaiting_gate_development_id
     return coord_input
 
 
-def dispatch_intents(result: dict[str, Any]) -> list[dict[str, Any]]:
-    """The well-formed dispatch intents a coordinator result declares (R2).
+def declared_actions(
+    result: dict[str, Any], *, round_no: int, folder_id: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """(dispatch actions, gate actions, parse-failed receipts, all actions).
 
-    ``dispatches`` is the graph-edge channel the coordinator's structured
-    result uses to hand the line one or more development intents. Only
-    well-formed intents (a dict naming both ``repo_path`` and a spec source)
-    survive -- anything else is dropped verbatim, never guessed into a
-    development. The intents are *not* executed here; the graph edge
-    (``Send``) instantiates them, one subgraph call each.
+    The R3 reading of a Stop Response: every well-formed action is routed by
+    kind -- ``dd.dispatch.v1`` to the dispatch fan-out, ``dd.gate_release.v1``
+    to the gate node -- and every malformed one becomes a fail-closed receipt.
+    A dispatch action whose payload fails the schema (including the hard
+    ``dispatched_by`` requirement) is a failed receipt too: zero graph edges,
+    the internal create function is never called.
     """
-    raw = result.get("dispatches")
-    if not isinstance(raw, list):
-        return []
-    intents: list[dict[str, Any]] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        if not str(entry.get("repo_path") or "").strip():
-            continue
-        if not (
-            str(entry.get("spec_text") or "").strip() or str(entry.get("spec_path") or "").strip()
-        ):
-            continue
-        intents.append(dict(entry))
-    return intents
+    consumable, receipts = validate_actions(result, round_no=round_no)
+    dispatches: list[dict[str, Any]] = []
+    releases: list[dict[str, Any]] = []
+    for action in consumable:
+        if action["kind"] == KIND_DISPATCH:
+            schema_error = validate_dispatch_payload(action["payload"])
+            if schema_error:
+                receipts.append(
+                    failed_receipt(
+                        action,
+                        reason="dispatched_by_required"
+                        if "dispatched_by" in schema_error
+                        else "payload_schema",
+                        detail=schema_error,
+                        round_no=round_no,
+                    )["action_receipts"][0]
+                )
+                continue
+            if str(action["payload"].get("dispatched_by")).strip() != folder_id:
+                receipts.append(
+                    failed_receipt(
+                        action,
+                        reason="dispatched_by_required",
+                        detail=(
+                            "dispatched_by must be the dispatching line itself "
+                            f"({folder_id!r}), got "
+                            f"{str(action['payload'].get('dispatched_by')).strip()!r}"
+                        ),
+                        round_no=round_no,
+                    )["action_receipts"][0]
+                )
+                continue
+            dispatches.append(action)
+        elif action["kind"] == KIND_GATE_RELEASE:
+            releases.append(action)
+    return dispatches, releases, receipts, consumable
+
+
+def merge_pending_actions(
+    left: list[dict[str, Any]] | None, right: list[dict[str, Any]] | None
+) -> list[dict[str, Any]]:
+    """The fan-out-safe channel reducer for ``pending_actions``.
+
+    A coordinator turn *replaces* the channel with the full well-formed action
+    list. A consumption task removes exactly its own action by returning the
+    bare removal marker ``{"idempotency_key": ...}`` -- parallel tasks remove
+    different keys, so the merge is order-independent and the channel is empty
+    the moment every fan-out task has consumed its action.
+    """
+    actions = list(left or [])
+    removals = {
+        str(entry.get("idempotency_key"))
+        for entry in (right or [])
+        if isinstance(entry, dict) and set(entry.keys()) == {"idempotency_key"}
+    }
+    additions = [
+        entry
+        for entry in (right or [])
+        if isinstance(entry, dict) and set(entry.keys()) != {"idempotency_key"}
+    ]
+    if removals:
+        actions = [entry for entry in actions if str(entry.get("idempotency_key")) not in removals]
+    if additions:
+        actions = additions
+    return actions
+
+
+def _apply_stop_response(
+    deps: LineDeps, state: LineState, round_no: int, result: dict[str, Any]
+) -> LineState:
+    """Read one Stop Response's ``actions[]`` and return the state update.
+
+    The declared round lands in the Stop-Response ledger with the actions
+    verbatim plus the parse-time fail-closed receipts; every routable action
+    whose consumer port is unwired is failed closed right here (never half-
+    routed, never silently dropped); the rest ride ``pending_actions`` for the
+    graph edge (Send) to instantiate, one node call each.
+    """
+    update: LineState = {}
+    raw = result.get(ACTIONS_FIELD)
+    verbatim = raw if isinstance(raw, list) else []
+    dispatches, releases, receipts, consumable = declared_actions(
+        result, round_no=round_no, folder_id=deps.folder_id
+    )
+
+    routable: list[dict[str, Any]] = []
+    for action in dispatches:
+        if deps.dd is None:
+            receipts.append(
+                failed_receipt(
+                    action,
+                    reason=REASON_CONSUMER_UNWIRED,
+                    detail="no dd dispatch port is wired to this line; the action "
+                    "is refused rather than half-run",
+                    round_no=round_no,
+                )["action_receipts"][0]
+            )
+        else:
+            routable.append(action)
+    for action in releases:
+        if deps.gate is None:
+            receipts.append(
+                failed_receipt(
+                    action,
+                    reason=REASON_CONSUMER_UNWIRED,
+                    detail="no gate node port is wired to this line; the release is "
+                    "refused rather than half-run",
+                    round_no=round_no,
+                )["action_receipts"][0]
+            )
+        else:
+            routable.append(action)
+
+    if verbatim or receipts:
+        deps.artifacts.record_stop_response_actions(
+            declared_record(
+                round_no=round_no,
+                at=_iso_now(deps),
+                verdict=str(result.get("verdict", "")),
+                actions=verbatim,
+                receipts=receipts,
+            )
+        )
+    if consumable and not receipts and not routable:
+        # Declared actions exist but none are routable and none failed at
+        # parse: every one was failed closed above, receipts already recorded.
+        pass
+    if routable:
+        update["pending_actions"] = routable
+    return update
+
+
+def _iso_now(deps: LineDeps) -> str:
+    from fleet_graph.state.run_artifacts import iso
+
+    clock = deps.clock
+    return iso(clock() if clock is not None else time.time())
 
 
 def _verdict_update(
@@ -687,13 +849,6 @@ def _verdict_update(
         if str(result.get("dd_development_id") or "").strip():
             # M1: the dispatch anchor the scheduler's dd wake facts key on.
             update["dd_development_id"] = str(result["dd_development_id"])
-        intents = dispatch_intents(result)
-        if intents:
-            # R2 图合一: a dispatch declared alongside the park is still
-            # instantiated by the graph edge first -- the fan-out runs before
-            # finalise, so the subgraph return value rides in the same state
-            # the terminal is written from.
-            update["pending_dispatches"] = intents
         return update
 
     if verdict != "continue":
@@ -736,9 +891,6 @@ def _verdict_update(
 
     deps.guards.accept_prompt(check, prompt, round_no)
     update: LineState = {"pending_prompt": prompt, "pending_sha": check.sha256}
-    intents = dispatch_intents(result)
-    if intents:
-        update["pending_dispatches"] = intents
     return update
 
 
@@ -874,6 +1026,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         result = deps.coordinator.turn(round_no, coord_input)
         _apply_ack_obligation(deps, drain, result, round_no)
         update = _verdict_update(deps, state, round_no, result)
+        update = {**_apply_stop_response(deps, state, round_no, result), **update}
         if consumed_revision:
             update["goal_revision"] = consumed_revision
         return update
@@ -1002,7 +1155,11 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
                     "round_no": round_no + 1,
                     "rounds_recorded": state.get("rounds_recorded", 0) + 1,
                 }
-        return {**cleared, **_verdict_update(deps, state, round_no, result)}
+        return {
+            **cleared,
+            **_apply_stop_response(deps, state, round_no, result),
+            **_verdict_update(deps, state, round_no, result),
+        }
 
     def worker_turn(state: LineState) -> LineState:
         round_no = state.get("round_no", 1)
@@ -1266,15 +1423,25 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         return "finalise" if state.get("terminal") else "coordinator_turn"
 
     def after_coordinator(state: LineState) -> str | list[Send]:
-        # R2 图合一: dispatch intents are instantiated by the graph's edge --
-        # one Send per development, each an isolated subgraph execution. This
-        # routing runs before the terminal routes so a dispatch declared
-        # alongside a park still gets its return value into the state the
-        # terminal is written from.
-        if state.get("pending_dispatches") and deps.dd is not None:
-            return [
-                Send("dd_dispatch", {"dd_intent": intent}) for intent in state["pending_dispatches"]
+        # R3 Stop Response: declared actions are instantiated by the graph's
+        # edge -- one Send per action, each an isolated node execution. This
+        # routing runs before the terminal routes so an action declared
+        # alongside a park still runs before the terminal is written from the
+        # same state.
+        actions = state.get("pending_actions") or []
+        if actions:
+            sends: list[Send] = [
+                Send("dd_dispatch", {"dd_intent": action})
+                for action in actions
+                if action.get("kind") == KIND_DISPATCH
             ]
+            sends.extend(
+                Send("dd_gate_release", {"gate_action": action})
+                for action in actions
+                if action.get("kind") == KIND_GATE_RELEASE
+            )
+            if sends:
+                return sends
         if state.get("terminal"):
             if (
                 deps.interrupt is not None
@@ -1292,54 +1459,141 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         return "check_bounds"
 
     def dd_dispatch(state: LineState) -> LineState:
-        """R2 图合一的子图实例化节点：一次执行 = 一单一次子图调用。
+        """R3 的派单消费节点：一次执行 = 一条 dd.dispatch.v1 action。
 
-        The Send payload carries exactly one development's intent
-        (``dd_intent``) -- the fan-out tasks' state views are isolated, and
-        each task merges only its own development into the ``dd_results``
-        reducer channel from the subgraph's RETURN VALUE. No disk file is
-        consulted as a dd terminal/wake event on this path. The cleared
-        ``pending_dispatches`` stops the routing from re-instantiating the
-        same intents after the fan-out joins.
+        The Send payload carries exactly one action (``dd_intent``) -- the
+        fan-out tasks' state views are isolated. The node drives the R2
+        subgraph (the internal development_create function -- never an MCP
+        round trip), receipts the consumption into the Stop-Response ledger
+        with the development id and the launches reference, and removes its
+        own action from the pending channel so the join cannot re-instantiate
+        it.
         """
-        intent = state.get("dd_intent") or {}
-        answer: dict[str, Any] = {}
+        action = state.get("dd_intent") or {}
+        round_no = state.get("round_no", 1)
+        payload = action.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        update: LineState = {}
+
+        if deps.dd is None:
+            deps.artifacts.record_stop_response_actions(
+                consumed_record(
+                    round_no=round_no,
+                    at=_iso_now(deps),
+                    receipt=failed_receipt(
+                        action,
+                        reason=REASON_CONSUMER_UNWIRED,
+                        detail="no dd dispatch port is wired to this line",
+                        round_no=round_no,
+                    )["action_receipts"][0],
+                )
+            )
+            removal = {"idempotency_key": str(action.get("idempotency_key") or "")}
+            return {"pending_actions": [removal]}
+
         fault: str | None = None
-        if deps.dd is not None:
-            try:
-                answer = deps.dd.invoke({"line_folder": deps.folder_id, "intent": intent})
-            except Exception as exc:
-                # A broken gateway is a fact for the next coordinator turn,
-                # never a silent drop and never a fabricated terminal.
-                fault = f"{type(exc).__name__}: {exc}"[:300]
-        result = answer.get("dd_result") if isinstance(answer, dict) else None
-        update: LineState = {"pending_dispatches": []}
-        if fault is not None:
+        answer: dict[str, Any] = {}
+        try:
+            answer = deps.dd.invoke({"line_folder": deps.folder_id, "intent": payload})
+        except Exception as exc:
+            # A broken gateway is a fact for the next coordinator turn,
+            # never a silent drop and never a fabricated terminal.
+            fault = f"{type(exc).__name__}: {exc}"[:300]
+
+        receipt: dict[str, Any]
+        if fault is None:
+            result = answer.get("dd_result") if isinstance(answer, dict) else None
+            record = answer.get("record") if isinstance(answer, dict) else None
+            if isinstance(result, dict) and result.get("development_id"):
+                development_id = str(result["development_id"])
+                update["dd_results"] = {development_id: result}
+                launch = record.get("launch") if isinstance(record, dict) else None
+                launch = launch if isinstance(launch, dict) else {}
+                receipt = {
+                    "kind": KIND_DISPATCH,
+                    "idempotency_key": str(action.get("idempotency_key") or ""),
+                    "status": STATUS_CONSUMED,
+                    "reason": "",
+                    "detail": "dispatch consumed through the graph edge",
+                    "development_id": development_id,
+                    "state": str(result.get("state") or ""),
+                    "output_commit": str(result.get("output_commit") or ""),
+                    "launches": {
+                        "unit": str(launch.get("unit") or ""),
+                        "generation": launch.get("generation", result.get("generation", 1)),
+                        "thread_id": str(launch.get("thread_id") or ""),
+                    },
+                }
+                deps.artifacts.append_round(
+                    {
+                        "round": round_no,
+                        "verdict": "dispatch",
+                        "development_id": development_id,
+                        "dd_state": str(result.get("state") or ""),
+                        "output_commit": str(result.get("output_commit") or ""),
+                        "injected": True,
+                    }
+                )
+            else:
+                receipt = failed_receipt(
+                    action,
+                    reason="dispatch_fault",
+                    detail="the dispatch subgraph returned no development",
+                    round_no=round_no,
+                )["action_receipts"][0]
+        else:
+            receipt = failed_receipt(
+                action,
+                reason="dispatch_fault",
+                detail=fault,
+                round_no=round_no,
+            )["action_receipts"][0]
             deps.artifacts.append_round(
                 {
-                    "round": state.get("round_no", 1),
+                    "round": round_no,
                     "verdict": "dispatch",
-                    "development_id": str(intent.get("development_id") or ""),
                     "dd_state": "dispatch_fault",
                     "detail": fault,
                     "injected": True,
                 }
             )
-            return update
-        if isinstance(result, dict) and result.get("development_id"):
-            development_id = str(result["development_id"])
-            update["dd_results"] = {development_id: result}
-            deps.artifacts.append_round(
-                {
-                    "round": state.get("round_no", 1),
-                    "verdict": "dispatch",
-                    "development_id": development_id,
-                    "dd_state": str(result.get("state") or ""),
-                    "output_commit": str(result.get("output_commit") or ""),
-                    "injected": True,
-                }
-            )
-        return update
+        deps.artifacts.record_stop_response_actions(
+            consumed_record(round_no=round_no, at=_iso_now(deps), receipt=receipt)
+        )
+        removal = {"idempotency_key": str(action.get("idempotency_key") or "")}
+        return {**update, "pending_actions": [removal]}
+
+    def dd_gate_release(state: LineState) -> LineState:
+        """R3 的 gate 消费节点：一次执行 = 一条 dd.gate_release.v1 action。
+
+        The gate node port consumes the action -- the sole awaiting_gate
+        release path (S11) -- and the consumption receipt lands in the
+        Stop-Response ledger. The node never raises into the line: a fault is
+        a failed receipt with its reason.
+        """
+        action = state.get("gate_action") or {}
+        round_no = state.get("round_no", 1)
+        if deps.gate is None:
+            receipt = failed_receipt(
+                action,
+                reason=REASON_CONSUMER_UNWIRED,
+                detail="no gate node port is wired to this line",
+                round_no=round_no,
+            )["action_receipts"][0]
+        else:
+            try:
+                receipt = deps.gate.consume(action, folder_id=deps.folder_id, round_no=round_no)
+            except Exception as exc:
+                receipt = failed_receipt(
+                    action,
+                    reason=REASON_GATE_REFUSED,
+                    detail=f"{type(exc).__name__}: {exc}"[:400],
+                    round_no=round_no,
+                )["action_receipts"][0]
+        deps.artifacts.record_stop_response_actions(
+            consumed_record(round_no=round_no, at=_iso_now(deps), receipt=receipt)
+        )
+        return {"pending_actions": [{"idempotency_key": str(action.get("idempotency_key") or "")}]}
 
     graph: StateGraph = StateGraph(LineState)
     graph.add_node("check_bounds", check_bounds)
@@ -1349,6 +1603,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     graph.add_node("finalise", finalise)
     graph.add_node("decision_interrupt", decision_interrupt)
     graph.add_node("dd_dispatch", dd_dispatch)
+    graph.add_node("dd_gate_release", dd_gate_release)
 
     graph.add_edge(START, "check_bounds")
     graph.add_conditional_edges("check_bounds", after_bounds)
@@ -1356,9 +1611,9 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     # The interrupt node resumes into the same round's coordinator result, so it
     # routes exactly like a coordinator turn.
     graph.add_conditional_edges("decision_interrupt", after_coordinator)
-    # R2 图合一: the fan-out join routes like a coordinator turn -- with the
-    # intents consumed, the line proceeds into its (possibly parked) terminal
-    # or its worker turn with the subgraph return values in state.
+    # R3 Stop Response: the fan-out join routes like a coordinator turn -- with
+    # each action consumed (its removal marker merged), the line proceeds into
+    # its (possibly parked) terminal or its worker turn.
     graph.add_conditional_edges("dd_dispatch", after_coordinator)
     # Unconditional: the facts are gathered even after a worker timeout --
     # they are cheap, and the coordinator judging a timeout deserves them too.
@@ -1386,6 +1641,7 @@ __all__ = [
     "WORKER_REPORT_RETRY_LIMIT",
     "WORKER_TURN_TIMEOUT_REASON",
     "AcceptancePort",
+    "DdGatePort",
     "DdSubgraphPort",
     "DecisionInterruptPort",
     "LineDeps",
@@ -1395,7 +1651,8 @@ __all__ = [
     "build_goal_line_graph",
     "claims_resume_verification_broken",
     "classify_turn_timeout",
-    "dispatch_intents",
+    "declared_actions",
+    "merge_pending_actions",
     "n7_rejects_blocked",
     "n7_rejects_round_zero_repark",
     "timeout_matrix_missing",
