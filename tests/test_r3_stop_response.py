@@ -1,6 +1,6 @@
-"""R3 Stop Response 派单与批 gate：actions[] 信封、gate 节点六项取证、第二投递路删除。
+"""R3 Stop Response 派单与批 gate: actions[] 信封、gate 节点六项取证、第二投递路删除。
 
-判据锚：specs/r3-stop-response-dispatch.md 行为契约 §1–§3 与阴性用例 1–9；
+判据锚：specs/r3-stop-response-dispatch.md 行为契约 §1-§3 与阴性用例 1-9；
 findings【六项取证的盲区】（S9/S10/S11 三条都要成为 gate 节点断言）、
 【⑮ 返工契约】（gate REJECT 绑 board 裁决三非空）。
 
@@ -422,7 +422,7 @@ def test_dispatch_requires_dispatched_by() -> None:
             }
         ]
     }
-    _, receipts = validate_actions(result, round_no=1)
+    _, _receipts = validate_actions(result, round_no=1)
     dispatches, _, parse_receipts, _routable = declared_actions(result, round_no=1, folder_id=LINE)
     assert dispatches == []
     assert parse_receipts and "dispatched_by" in parse_receipts[0]["detail"]
