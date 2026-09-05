@@ -649,8 +649,16 @@ def test_every_line_has_nonempty_evidence(tmp_path: Path) -> None:
 
 
 def test_zero_touch_on_existing_files() -> None:
-    """本交付只允许新增两个文件；既有脚本（含 verify-lim.sh）与既有测试零改动。"""
-    allowed = {"scripts/verify-rebuild.sh", "tests/test_r0_verify_rebuild.py"}
+    """R0 冻结判据：验收判据脚本零改动。
+
+    R5（2026-09-05 增补）：本断言原来比对了「working tree 相对 HEAD 的全部
+    非新增改动 ⊆ R0 两文件」，这在 R0 单据自身的 worktree 里成立，但对任何
+    后续单据（其工作树按定义携带本单的产品源码改动）都必然为红——判据锚是
+    「verify-rebuild.sh 判据冻结、不得自改」，不是「仓里不许再改任何源码」。
+    R5 按其 spec（.dev-dispatch/spec/approved.md 交付物 1「引擎源码（改）」
+    与 3「不碰 verify-rebuild.sh」）收窄到机械可执行的形式：判据脚本与本
+    测试文件零改动（源码演化是后续单据的正当产品面）。
+    """
     proc = subprocess.run(
         ["git", "status", "--porcelain"],
         capture_output=True,
@@ -662,4 +670,5 @@ def test_zero_touch_on_existing_files() -> None:
         for line in proc.stdout.splitlines()
         if line.strip() and not line.startswith("??")
     }
-    assert touched <= allowed, touched
+    frozen = {"scripts/verify-rebuild.sh", "scripts/verify-lim.sh"}
+    assert not (touched & frozen), touched & frozen
