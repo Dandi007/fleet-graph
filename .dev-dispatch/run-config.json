@@ -1,0 +1,23 @@
+{
+ "development_id": "dev-fg-874632b9f8e6",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "bash",
+   "-lc",
+   "uv sync --frozen && uv run pytest -q tests/test_r6_legacy_removal.py"
+  ],
+  [
+   "bash",
+   "-lc",
+   "env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy make verify"
+  ],
+  [
+   "bash",
+   "-lc",
+   "env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy bash -c 'R=/tmp/r6-accept-testenv; rm -rf \"$R\"; bash scripts/testenv.sh up --root \"$R\" >/tmp/r6-te-up.out 2>&1; uprc=$?; V=\"env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy\"; CHK(){ bash -c \"$V bash scripts/verify-rebuild.sh --env test --root $R --check $1\" | grep -cE \"^$1 [a-z0-9-]+ PASS — \"; }; c01=$( [ \"$uprc\" -eq 0 ] && CHK 01 ); c02=$( [ \"$uprc\" -eq 0 ] && CHK 02 ); c21=$( [ \"$uprc\" -eq 0 ] && CHK 21 ); c18=$( [ \"$uprc\" -eq 0 ] && CHK 18 ); c19=$( [ \"$uprc\" -eq 0 ] && CHK 19 ); lines=$( [ \"$uprc\" -eq 0 ] && bash -c \"$V bash scripts/verify-rebuild.sh --env test --root $R\" | grep -cE \"^[0-9]{2} [a-z0-9-]+ (PASS|FAIL) — \" ); bash scripts/testenv.sh down --root \"$R\" >/tmp/r6-te-down.out 2>&1; drc=$?; refs=$(grep -oE \"prod_references=[0-9]+\" /tmp/r6-te-down.out | head -1); echo \"up=$uprc lines=$lines c01=$c01 c02=$c02 c21=$c21 c18=$c18 c19=$c19 down=$drc $refs\"; test \"$uprc\" -eq 0 -a \"$lines\" -eq 21 -a \"$c01\" -eq 1 -a \"$c02\" -eq 1 -a \"$c21\" -eq 1 -a \"$c18\" -eq 1 -a \"$c19\" -eq 1 -a \"$drc\" -eq 0 -a \"$refs\" = \"prod_references=0\"'"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}
