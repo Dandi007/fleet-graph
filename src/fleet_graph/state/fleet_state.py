@@ -41,6 +41,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 from fleet_graph.state.run_artifacts import (
     line_message_acks_path,
@@ -143,6 +144,12 @@ class FleetStateConfig:
     has_harvest_receipt: Callable[[str], bool] | None = None
     #: E5 首跑基线水位文件路径；None 用 ``<run_root>/.scheduler/e5-baseline.json``。
     harvest_baseline_path: Path | None = None
+    #: R2（wf-4601c8 图合一）: the M1 waiting-zero-consumption ledger file the
+    #: ``/v1/llm-ledger`` query face serves. It is the in-fleet projection of
+    #: the 灵智账本 consumption face (request_events), served over HTTP because
+    #: the 05 probe is a curl probe and a ``file://`` URL can never answer
+    #: HTTP 200. ``None`` keeps the route honestly 404 (face not configured).
+    llm_ledger_path: Path | None = None
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -715,6 +722,48 @@ class FleetStateView:
             self._write_e5_baseline(baseline)
         return {"schema_version": SCHEMA_VERSION, "developments": developments}
 
+    def llm_ledger(self, window_seconds: int) -> dict[str, Any]:
+        """The M1 waiting-zero-consumption ledger query face (R2).
+
+        Serves the configured ledger file's ``request_events`` projection over
+        HTTP. This is a plain query-face synthesis -- a read-model pass-through
+        of the 灵智账本 consumption face's local projection, the same class of
+        read as every other /v1 view (pure persistence read, never a wake or
+        terminal-state event source). ``LedgerUnavailable`` states why the
+        face has nothing honest to serve; the handler turns it into the
+        matching non-200 so a probe can tell "configured, empty" from "gone".
+        """
+        if self.config.llm_ledger_path is None:
+            raise LedgerFaceUnavailable(404, "llm ledger query face is not configured")
+        try:
+            raw = json.loads(self.config.llm_ledger_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise LedgerFaceUnavailable(503, f"llm ledger unreadable: {exc}") from exc
+        events = raw.get("request_events") if isinstance(raw, dict) else None
+        if not isinstance(events, list):
+            raise LedgerFaceUnavailable(503, "llm ledger carries no request_events array")
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "window_seconds": window_seconds,
+            "request_events": events,
+            "total": len(events),
+        }
+
+
+class LedgerFaceUnavailable(Exception):
+    """The /v1/llm-ledger face cannot serve an honest answer.
+
+    ``status`` is the HTTP status the handler answers with (404 unconfigured,
+    503 configured but unreadable) and ``detail`` the machine-readable reason.
+    Never fabricated zeros: a probe must be able to distinguish "the ledger
+    says zero" from "there is no ledger".
+    """
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+
 
 class FleetStateHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -728,7 +777,8 @@ class FleetStateHandler(BaseHTTPRequestHandler):
     server: FleetStateHTTPServer
 
     def do_GET(self) -> None:
-        path = self.path.split("?", 1)[0].rstrip("/")
+        path, _, query = self.path.partition("?")
+        path = path.rstrip("/")
         if path == "/v1/lines":
             payload = self.server.view.lines()
         elif path == "/v1/decisions":
@@ -737,8 +787,36 @@ class FleetStateHandler(BaseHTTPRequestHandler):
             payload = self.server.view.harvestable()
         elif path == "/v1/enrollments":
             payload = self.server.view.enrollments()
+        elif path == "/v1/llm-ledger":
+            self._serve_llm_ledger(query)
+            return
         else:
             self.send_error(404)
+            return
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_llm_ledger(self, query: str) -> None:
+        """The M1 zero-consumption ledger face: 200 + request_events, or the
+        honest non-200 (unconfigured / unreadable) -- never fabricated zeros."""
+        try:
+            params = parse_qs(query)
+            window = int((params.get("window_seconds") or ["3600"])[0])
+        except ValueError:
+            window = 3600
+        try:
+            payload = self.server.view.llm_ledger(window)
+        except LedgerFaceUnavailable as exc:
+            body = json.dumps({"error": exc.detail}, ensure_ascii=False).encode("utf-8")
+            self.send_response(exc.status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
@@ -775,5 +853,6 @@ __all__ = [
     "FleetStateConfig",
     "FleetStateHTTPServer",
     "FleetStateView",
+    "LedgerFaceUnavailable",
     "serve",
 ]

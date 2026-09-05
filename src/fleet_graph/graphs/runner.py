@@ -33,6 +33,7 @@ from fleet_graph.goal_interrupt.contract import DecisionInput
 from fleet_graph.goal_interrupt.runtime import LineInterruptPort, resume_line
 from fleet_graph.goal_interrupt.store import GoalInterruptStore
 from fleet_graph.graphs.adapters import AgentRunCoordinator, AgentSessionWorker
+from fleet_graph.graphs.dd_subgraph import DdSubgraph, DevelopmentGateway
 from fleet_graph.graphs.goal_line import LineDeps, build_goal_line_graph
 from fleet_graph.graphs.guards import LineBounds, LineGuards
 from fleet_graph.state.line_metrics import LineMetrics, line_metrics_exposition_dir
@@ -41,6 +42,20 @@ from fleet_graph.state.run_artifacts import (
     capture_release_id,
     iso,
     write_json_durable,
+)
+
+#: R2 图合一: the line's declared MCP toolset. Lines are wired to the goal,
+#: work-folder, decision and agent-bus surfaces only -- the dev-dispatch MCP
+#: (``fleet-graph-dd-mcp``) is NOT part of the line's toolset any more: the
+#: line dispatches through the graph edge (DdSubgraph over the internal
+#: ``development_create`` function), never through an MCP round trip. A roster
+#: may override the set per line via ``LineConfig.mcp_servers``; the dd-mcp
+#: exclusion is structural (it is absent here and asserted by test).
+LINE_MCP_SERVERS: tuple[str, ...] = (
+    "fleet-graph-goal-mcp",
+    "fleet-graph-work-folder-mcp",
+    "fleet-graph-decision-mcp",
+    "agent-bus-mcp",
 )
 
 
@@ -81,10 +96,11 @@ class LineConfig:
     #: by the orchestration layer, injected into every coordinator input. None
     #: means none were captured (the field is then absent from the envelope).
     resume_verification: dict[str, Any] | None = None
-    #: The prior generation's terminal.json content, injected into the round-1
-    #: coordinator input when present. None lets build_line read the terminal
-    #: left on disk under run_root, which at generation start is the previous
-    #: generation's.
+    #: The prior generation's terminal content, injected into the round-1
+    #: coordinator input when present. None means round 1 carries no
+    #: prior_terminal: since R2 (wf-4601c8 图合一) the line never re-derives it
+    #: from terminal.json on disk -- the orchestration layer that has the fact
+    #: injects it, and disk stays pure persistence.
     prior_terminal: dict[str, Any] | None = None
     #: M5: the revival envelope (who/basis/generation/reason) for a line whose
     #: `done` terminal a valid revoke overturned. Injected into the round-1
@@ -113,6 +129,17 @@ class LineConfig:
     #: :func:`run_self_gate` self-deliver the gate decision (D5: "DD gate needs
     #: no human"); empty means an ordinary run and the hook is a no-op.
     dd_awaiting_gate_development_id: str = ""
+    #: R2 图合一: the dd gateway the line's graph edge dispatches through.
+    #: None keeps the line off the graph-edge dispatch path (the coordinator's
+    #: declared intents stay unfulfilled; scheduler-side waiting_dd parking
+    #: remains the channel). Wired by the launcher/CLI when the deployment
+    #: turns graph-edge dispatch on.
+    dd_gateway: DevelopmentGateway | None = None
+    #: R2 图合一: the line's explicit MCP toolset (--mcp-allow entries). None
+    #: keeps the seat's built-in behaviour unchanged; a declared set makes the
+    #: allowlist explicit -- and the dev-dispatch MCP is structurally absent
+    #: from :data:`LINE_MCP_SERVERS`, the in-repo default.
+    mcp_servers: tuple[str, ...] | None = None
 
     @property
     def inbox_alias(self) -> str | None:
@@ -130,17 +157,6 @@ class LineConfig:
     @property
     def resolved_checkpoint_path(self) -> str:
         return self.checkpoint_path or str(self.run_root / "checkpoint.sqlite3")
-
-
-def _read_prior_terminal(run_root: Path) -> dict[str, Any] | None:
-    """Read the terminal.json already on disk, which at generation start is the
-    previous generation's. Absent or unparseable -> None, so round 1 simply
-    carries no prior_terminal rather than guessing."""
-    try:
-        data = json.loads((run_root / "terminal.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
 
 
 def mint_launch_id(folder_id: str, generation: int, start_ts: int) -> str:
@@ -202,6 +218,9 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         seat_spec=SeatSpec(
             agent=config.seat,
             labels=seat_labels,
+            # R2 图合一: the roster-declared toolset (default absent = unchanged
+            # argv). The dd-mcp exclusion lives in LINE_MCP_SERVERS itself.
+            mcp_allow=config.mcp_servers or (),
         ),
         seat_key=derive_seat_key(thread_id, "worker"),
         turn_timeout_seconds=config.turn_timeout_seconds,
@@ -229,9 +248,11 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         # `not_declared` fact instead of a silently absent step.
         acceptance=AcceptanceRunner(config.acceptance),
         resume_verification=config.resume_verification,
-        prior_terminal=config.prior_terminal
-        if config.prior_terminal is not None
-        else _read_prior_terminal(config.run_root),
+        # R2 (wf-4601c8 图合一): the prior generation's terminal reaches the line
+        # only by explicit injection -- the orchestration layer carries it, the
+        # line process never re-reads terminal.json as a state/wake signal
+        # (disk is pure persistence: write allowed, read-as-event is not).
+        prior_terminal=config.prior_terminal,
         # M5: the revival envelope is passed through verbatim -- it is never
         # guessed or re-read from disk. A revoke carries its own audit fields,
         # and a revived line must read exactly who/basis/generation the revoke
@@ -256,6 +277,10 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         # last activity); the graph reads them off it when a worker turn
         # times out, so the round record attributes the hang.
         turn_variables=worker.turn_variables,
+        # R2 图合一: the dd subgraph port -- one invoke = one development's
+        # subgraph execution over the graph edge. None (default) keeps the
+        # line off the graph-edge dispatch path entirely.
+        dd=DdSubgraph(config.dd_gateway) if config.dd_gateway is not None else None,
     )
     return build_goal_line_graph(deps), deps
 
@@ -593,6 +618,7 @@ def resume_goal_line(config: LineConfig, decision: DecisionInput) -> tuple[dict[
 
 
 __all__ = [
+    "LINE_MCP_SERVERS",
     "LineConfig",
     "build_line",
     "resume_goal_line",

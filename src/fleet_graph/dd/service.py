@@ -39,6 +39,7 @@ import logging
 import os
 import socket
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,7 @@ from fleet_graph.dd.control_plane import (
 )
 from fleet_graph.dd.reconcile import ReconcileError, ReconcileSource, WorkFolderReconciler
 from fleet_graph.dd.work_folder_store import governed_work_folder_store
+from fleet_graph.state.run_artifacts import iso
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +247,57 @@ SUPPORTED_TOOLS: frozenset[str] = frozenset(
 #: not the in-process development control plane.
 WORK_FOLDER_TOOLS: frozenset[str] = frozenset({"wf_reconcile"})
 
+#: R2 图合一 外门：``development_create`` 在 MCP 面上只留给监督者。线内派单已
+#: 降为图边直调内部函数（graphs/dd_subgraph.ControlPlaneGateway），任何经 MCP
+#: 到达的派单请求都必须自报 principal，且只有监督者 principal 通过；其余稳定
+#: 拒绝（结构化拒绝码 + 拒绝留痕）。环境变量仅供部署绑定监督面身份，测试可替换。
+SUPERVISOR_PRINCIPAL_ENV = "FLEET_GRAPH_SUPERVISOR_PRINCIPAL"
+SUPERVISOR_PRINCIPAL_DEFAULT = "fleet-supervisor"
+OUTER_GATE_REFUSAL_CODE = "OUTER_GATE_NON_SUPERVISOR"
+#: The durable refusal trace file (留痕), relative to the control plane root.
+OUTER_GATE_REFUSALS_FILE = "outer-gate-refusals.jsonl"
+
+
+def supervisor_principal(environ: dict[str, str] | None = None) -> str:
+    """The one principal the outer gate admits (env-bindable, default fixed)."""
+    return (environ if environ is not None else os.environ).get(
+        SUPERVISOR_PRINCIPAL_ENV
+    ) or SUPERVISOR_PRINCIPAL_DEFAULT
+
+
+def trace_outer_gate_refusal(
+    control: Any,
+    *,
+    principal: str,
+    supervisor: str,
+    tool: str = "development_create",
+) -> None:
+    """Append one durable refusal row (留痕) beside the control plane's records.
+
+    Best effort by contract: a trace that cannot land never changes the
+    refusal -- the structured ToolError is the gate, this is its audit line.
+    """
+    root = getattr(control, "root", None)
+    if root is None:
+        return
+    row = json.dumps(
+        {
+            "code": OUTER_GATE_REFUSAL_CODE,
+            "tool": tool,
+            "principal": principal,
+            "supervisor": supervisor,
+            "at": iso(time.time()),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    try:
+        path = Path(root) / OUTER_GATE_REFUSALS_FILE
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(row + "\n")
+    except OSError:
+        pass
+
 
 def port_is_available(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> bool:
     """Bind-test the selected loopback port before FastMCP tries to serve it."""
@@ -354,6 +407,7 @@ def build_mcp_server(
 
     @mcp.tool()
     def development_create(
+        principal: str,
         repo_path: str,
         target_base: str | None = None,
         spec_text: str | None = None,
@@ -362,32 +416,43 @@ def build_mcp_server(
         timeouts: dict[str, int] | None = None,
         stage_models: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Admit one development. Everything else is derived server-side.
+        """Admit one development. OUTER GATE: supervisor principal only.
 
-        Takes a dedicated git worktree (or clone) path, an optional target
-        base (defaults to the repo's HEAD), the approved spec as text or
-        as a path, and the bounded principal that dispatched the development
-        (a line folder or a human subject) as `dispatched_by`. The server
-        derives the development id, freezes the spec and target base into the
-        bootstrap commit, computes the H0 handoff and its chain-root digest,
-        derives the durable ref and the acceptance argv (from the spec's
-        ```dd-acceptance block), and publishes the work board card. Idempotent
-        for the same (repo, spec, base).
+        R2 图合一: the line's own dispatch path is the graph edge calling the
+        internal ``development_create`` function in-process, so anything that
+        arrives on THIS MCP tool must be the supervisor (the outer gate). The
+        caller declares itself with `principal`; any other principal is
+        refused with a stable structured code and the refusal is traced
+        durably beside the control plane's records.
 
-        `timeouts` optionally overrides the per-stage run fence
-        (`{stage_id: positive seconds}`, e.g. `{"implement": 7200}`); an
-        unknown stage id is refused. Not passing it keeps the 3600s default
-        for every stage -- existing behavior unchanged.
-
-        `stage_models` (M4) is the seat parameter channel: `{llm_stage ->
-        seat}` (e.g. `{"implement": "glm-5.3-flash"}`), validated against the
-        registry's allowed seat set -- an unknown stage or a disallowed seat
-        refuses with a structured code and no unit is created. Every llm
-        stage is frozen into record.json as `seats` (with per-stage source:
-        `line-explicit` / `registry-default`); every launch of this
-        development runs exactly those seats. There is no server-wide
-        stage-model override any more -- the record is the single source.
+        Admission is unchanged for the admitted caller: server-side
+        derivation from a repo path, an optional target base, the approved
+        spec (text or path), the bounded dispatching principal
+        (`dispatched_by`), optional per-stage `timeouts` and the M4
+        `stage_models` seat channel. Idempotent for the same (repo, spec,
+        base).
         """
+        supervisor = supervisor_principal()
+        if (principal or "").strip() != supervisor:
+            trace_outer_gate_refusal(
+                control, principal=(principal or "").strip(), supervisor=supervisor
+            )
+            raise ToolError(
+                json.dumps(
+                    {
+                        "code": OUTER_GATE_REFUSAL_CODE,
+                        "tool": "development_create",
+                        "principal": (principal or "").strip(),
+                        "reason": (
+                            "development_create is the outer gate: only the "
+                            "supervisor principal may dispatch over MCP; lines "
+                            "dispatch through the graph edge (internal function)"
+                        ),
+                        "supervisor": supervisor,
+                    },
+                    sort_keys=True,
+                )
+            )
         return call(
             "create",
             repo_path=repo_path,
@@ -626,6 +691,10 @@ __all__ = [
     "DEFAULT_PORT",
     "NOT_SUPPORTED_RULING",
     "NOT_SUPPORTED_TOOLS",
+    "OUTER_GATE_REFUSALS_FILE",
+    "OUTER_GATE_REFUSAL_CODE",
+    "SUPERVISOR_PRINCIPAL_DEFAULT",
+    "SUPERVISOR_PRINCIPAL_ENV",
     "SUPPORTED_TOOLS",
     "WORK_FOLDER_ROOT_ENV",
     "WORK_FOLDER_TOOLS",
@@ -635,4 +704,6 @@ __all__ = [
     "build_mcp_server",
     "port_is_available",
     "serve",
+    "supervisor_principal",
+    "trace_outer_gate_refusal",
 ]

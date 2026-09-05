@@ -882,6 +882,7 @@ def _state_serve(args: argparse.Namespace) -> int:
             enroll_queue_path=(
                 pathlib.Path(args.enroll_queue) if args.enroll_queue else DEFAULT_ENROLL_QUEUE
             ),
+            llm_ledger_path=(pathlib.Path(args.llm_ledger_file) if args.llm_ledger_file else None),
         )
     )
     return 0
@@ -1988,6 +1989,13 @@ def build_parser() -> argparse.ArgumentParser:
         "/v1/enrollments view re-reads per request; defaults to the goal "
         "service's own queue home /data/fleet-graph/goal/enroll-queue.jsonl "
         "(the same home goal serve writes by default)",
+    )
+    state_serve.add_argument(
+        "--llm-ledger-file",
+        default=None,
+        help="the request_events ledger projection the /v1/llm-ledger query "
+        "face serves (R2 waiting-zero-consumption 判据面); unset keeps the "
+        "route honestly 404",
     )
     state_serve.set_defaults(func=_state_serve)
 

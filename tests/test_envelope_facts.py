@@ -251,11 +251,24 @@ class TestResumeVerificationFrom:
 
 
 class TestBuildLinePriorTerminal:
-    def test_build_line_reads_prior_terminal_from_disk(self, tmp_path: Any) -> None:
+    def test_build_line_carries_prior_terminal_only_by_injection(self, tmp_path: Any) -> None:
+        """R2（wf-4601c8 图合一）改写指向新信道：prior_terminal 只经注入进入线，
+        线进程不再从盘面 terminal.json 重读（盘面纯持久化，读作事件即违宪）。
+        盘面上留着的旧 terminal.json 不再成为事实源。"""
         from fleet_graph.graphs.runner import LineConfig, build_line
 
         (tmp_path / "terminal.json").write_text(
             json.dumps({"terminal": "blocked", "rounds": 3}), encoding="utf-8"
         )
-        _graph, deps = build_line(LineConfig(folder_id="wf-x", seat="s", run_root=tmp_path))
-        assert deps.prior_terminal == {"terminal": "blocked", "rounds": 3}
+        _graph, deps = build_line(
+            LineConfig(
+                folder_id="wf-x",
+                seat="s",
+                run_root=tmp_path,
+                prior_terminal={"terminal": "done", "rounds": 7},
+            )
+        )
+        assert deps.prior_terminal == {"terminal": "done", "rounds": 7}
+
+        _graph, bare = build_line(LineConfig(folder_id="wf-x", seat="s", run_root=tmp_path))
+        assert bare.prior_terminal is None

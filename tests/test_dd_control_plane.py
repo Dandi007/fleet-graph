@@ -1037,8 +1037,10 @@ class TestListDoesNotServeStaleLiveness:
         self, scratch: Path, tmp_path: Path
     ) -> None:
         """Measured on the real machine: a run that failed after the cache was
-        written kept listing as running. Terminal cache rows are immutable and
-        trusted; non-terminal rows are recomputed on every list."""
+        written kept listing as running. Since R2 (wf-4601c8 图合一) the list
+        derives every row from the authorities -- the on-disk cache is written
+        persistence, never a state signal -- so no cache content, terminal or
+        not, can surface as a status any more."""
         plane = make_plane(tmp_path)
         dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
         dev_root = plane.root / dev
