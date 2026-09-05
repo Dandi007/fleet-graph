@@ -97,7 +97,14 @@ def _loopback_needs_no_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def make_state_config(tmp_path: Path, *, lines: list[dict[str, Any]] | None = None) -> Path:
-    """A scratch roster config + run root; returns the roster path."""
+    """A scratch roster config + run root; returns the roster path.
+
+    rc finding 1（blocker，密闭性）：名册自带 ``maintenance_stop`` 覆盖键指向
+    scratch 树——``SchedulerMaintenanceGate`` 与 ``SchedulerConfig.from_json``
+    因此永远解析不到生产缺省闸 ``/data/fleet-graph/maintenance-stop``。测试里的
+    maintenance_set/clear 只落 tmp_path，绝不写真删全舰队紧急停机闸，也不依赖
+    「宿主恰好能创建 /data/fleet-graph」。
+    """
     lines = (
         lines
         if lines is not None
@@ -108,7 +115,12 @@ def make_state_config(tmp_path: Path, *, lines: list[dict[str, Any]] | None = No
     roster = tmp_path / "ronin-lines.json"
     roster.write_text(
         json.dumps(
-            {"run_root": str(tmp_path / "runs"), "dd_root": str(tmp_path / "dd"), "lines": lines}
+            {
+                "run_root": str(tmp_path / "runs"),
+                "dd_root": str(tmp_path / "dd"),
+                "maintenance_stop": str(tmp_path / "maintenance-gate"),
+                "lines": lines,
+            }
         ),
         encoding="utf-8",
     )
@@ -295,9 +307,17 @@ class TestNegativeAAlwaysPresent:
 
     def test_unavailable_source_is_marked_not_omitted(self, tmp_path: Path) -> None:
         # roster 指向死路径 → 该项 unavailable（键在、标注在），其余项仍现算。
+        # 名册写面也带 maintenance_stop 覆盖键（rc finding 1 密闭性：任何
+        # 名册都不会把闸解析到生产缺省路径）。
         roster = tmp_path / "ronin-lines.json"
         roster.write_text(
-            json.dumps({"run_root": str(tmp_path / "runs"), "lines": []}),
+            json.dumps(
+                {
+                    "run_root": str(tmp_path / "runs"),
+                    "maintenance_stop": str(tmp_path / "maintenance-gate"),
+                    "lines": [],
+                }
+            ),
             encoding="utf-8",
         )
         missing_roster = tmp_path / "gone.json"
@@ -414,13 +434,16 @@ class TestNegativeBNoAuth:
             )
         )
         assert calls[0]["who"] == SUPERVISOR
-        # maintenance_set/clear 真件落盘：gate 路径与调度器认知面（
-        # SchedulerConfig.from_json 对同一名册的 maintenance_stop_path）
-        # 交叉验证——同源同文件，不是 <run_root>/maintenance-stop 诱饵闸。
+        # maintenance_set/clear 真件落盘（落在 scratch 闸——名册覆盖键保证
+        # 永远不是 /data/fleet-graph/maintenance-stop）：gate 路径与调度器
+        # 认知面（SchedulerConfig.from_json 对同一名册的
+        # maintenance_stop_path）交叉验证——同源同文件，不是
+        # <run_root>/maintenance-stop 诱饵闸。
         from fleet_graph.scheduler.daemon import SchedulerConfig
 
         scheduler_cfg = SchedulerConfig.from_json(roster)
         gate = scheduler_cfg.maintenance_stop_path
+        assert str(gate).startswith(str(tmp_path))
         asyncio.run(
             call_json(
                 server,
@@ -531,11 +554,18 @@ class TestMaintenanceGateIsTheSchedulerGate:
         asyncio.run(call_json(server, "maintenance_clear", {"principal": SUPERVISOR}))
 
     def test_unreadable_roster_falls_back_to_scheduler_default(self, tmp_path: Path) -> None:
+        """名册不可读时解析器回落调度器缺省常量——对象是常量本身，不落盘。
+
+        rc finding 1 密闭性：不实例化服务、不调用 set/clear——这条用例只断言
+        解析回落的对象身份，任何磁盘写入都不发生（调度器缺省闸是生产面，
+        测试进程对它零触碰）。
+        """
         from fleet_graph.outer_gate_mcp import SchedulerMaintenanceGate
         from fleet_graph.scheduler.daemon import DEFAULT_MAINTENANCE_STOP
 
         gate = SchedulerMaintenanceGate(lines_config=tmp_path / "gone.json")
         assert gate.path == DEFAULT_MAINTENANCE_STOP
+        assert not gate.path.exists()
 
     def test_resolver_single_source_of_truth(self, tmp_path: Path) -> None:
         """解析器单源：scheduler 模块常量被导入复用，而非二次声明。"""
