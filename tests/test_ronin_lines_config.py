@@ -206,6 +206,12 @@ ENROLLED = {
     # 入编时 scripts/verify-rebuild.sh 尚不存在（liveness 诚实红），R0 补齐。
     # 座位 opencode-glm53；implement glm-5.3-flash、两道 review glm-5.3。
     "wf-4601c8",
+    # 2026-09-05 第十六波（用户令「给 goal-agent 去端到端实现吧，等他实现完了你来验收」）：
+    # ADHD 多模型化线。改的是一个 fork 来的第三方仓（Dandi007/adhd），把它唯一的 LLM 出口从
+    # Claude Agent SDK 换成 agent-run——名册里第二条题目对象不是本机基建的线（第一条是
+    # wf-fdd6ac 的 calendar-agent）。四批验收命令 S1-S4 在入编前已真机空跑：S2 现红于
+    # "No default chain for qwen3.8-max@opencode"，那正是它要补的东西，红得其所。
+    "wf-194310",
 }
 
 # 2026-08-29 复活：曾在 MIGRATED 里 enabled=false 停摆的线被用户令重新点亮。
