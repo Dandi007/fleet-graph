@@ -15,9 +15,11 @@ explicit choice rather than a default.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import random
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -122,6 +124,13 @@ class WorkspaceSealer:
             "input_commit": dispatch.get("input_commit", ""),
             "output_commit": commit,
         }
+        # R4: the stage's own structured facts (configure's rebase record --
+        # `{requested_head, actual_head, rebased}` -- and any future machine
+        # fact a script stage seals) ride on the receipt verbatim. The actor's
+        # account never overwrites the sealer's chain fields.
+        for key, value in (outcome.receipt or {}).items():
+            if key not in receipt and key != "verdict":
+                receipt[key] = value
         declared = (outcome.receipt or {}).get("verdict")
         if declared:
             receipt["verdict"] = declared
@@ -170,12 +179,38 @@ class WorkspaceSealer:
 
 @dataclass
 class ConfigureStage:
-    """Writes the run config the later stages read."""
+    """Writes the run config the later stages read.
+
+    R4（一线一分支）adds the dispatch's mandatory first step: after fetch, the
+    bootstrap/spec material is rebased onto the dispatch-time head of the
+    line's release branch (`refs/heads/release/<line-id>`). A dispatch whose
+    requested head the branch has since advanced gets its `target_base_commit`
+    frozen at the NEW head, and the configure receipt records
+    `{requested_head, actual_head, rebased}` -- the machine fact check 14's
+    probe greps the event trail for. A rebase conflict is the structured
+    refusal `REBASE_SPEC_INCOMPATIBLE` (spec incompatible with the branch
+    advance -- never an environment error, never a silent force-push or a
+    skipped rebase), carrying the conflicting file list.
+
+    Unwired (`line_ref` empty) the step records `skipped` and changes nothing:
+    the pre-R4 behavior, kept for dispatches that carry no line identity.
+    """
 
     repo: Path
     run_config: dict[str, Any] = field(default_factory=dict)
+    # The line branch this dispatch is durable on (`refs/heads/release/<id>`,
+    # the admission record's remote_ref). Empty = unwired = skip the rebase.
+    line_ref: str = ""
+    # The head the dispatch requested (the admission-frozen base, i.e. the
+    # old head). Recorded verbatim in the receipt as `requested_head`.
+    requested_base: str = ""
+    # The admission record file; a rebased dispatch freezes the new head into
+    # its `target_base_commit` so every later stage, launch and probe reads
+    # the frozen base. Empty leaves records alone.
+    record_path: str = ""
 
     def act(self, stage: Any, dispatch: Dispatch) -> StageOutcome:
+        rebase = self._rebase_to_line_head()
         write_json(
             self.repo,
             RUN_CONFIG_PATH,
@@ -197,7 +232,147 @@ class ConfigureStage:
             generation=int(dispatch.get("generation", 1)),
             development_id=str(dispatch.get("development_id", "")),
         )
-        return StageOutcome(produced=tuple(stage.produced_artifacts))
+        return StageOutcome(receipt={"rebase": rebase}, produced=tuple(stage.produced_artifacts))
+
+    # -- R4 first-step rebase -------------------------------------------------
+
+    def _git(self, *args: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return run_git(self.repo, *args, **kwargs)
+
+    def _rebase_to_line_head(self) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "event": "rebase",
+            "ref": self.line_ref,
+            "requested_head": self.requested_base,
+            "actual_head": "",
+            "rebased": False,
+        }
+        if not self.line_ref:
+            record["status"] = "skipped"
+            record["reason"] = "line_ref_unwired"
+            return record
+
+        tracking = f"refs/remotes/origin/{self.line_ref.removeprefix('refs/heads/')}"
+        fetched = self._git("fetch", "--quiet", "origin")
+        if fetched.returncode != 0:
+            # Transport/environment: the fetch -- not the spec/branch pair --
+            # is what failed. A fault, honestly labelled.
+            raise PipelineFault(
+                f"configure fetch failed for {self.line_ref}: "
+                f"{(fetched.stderr or fetched.stdout).strip()[:300]}"
+            )
+        resolved = self._git("rev-parse", "--verify", "--quiet", f"{tracking}^{{commit}}")
+        actual_head = resolved.stdout.strip() if resolved.returncode == 0 else ""
+        record["actual_head"] = actual_head
+        if not actual_head:
+            # No line branch yet: nothing to advance, head unchanged -- the
+            # merger creates the branch at first push.
+            record["status"] = "line_branch_absent"
+            return record
+        if actual_head == self.requested_base or self._is_ancestor(actual_head, self._head()):
+            # Branch did not advance past what the dispatch already sits on.
+            record["status"] = "up_to_date"
+            self._sync_local_branch(actual_head, record)
+            return record
+
+        rebased = self._rebase(actual_head, record)
+        record["rebased"] = rebased
+        if rebased:
+            record["status"] = "rebased"
+            record["rebase_head"] = self._head()
+            self._freeze_base(actual_head)
+            self._sync_local_branch(actual_head, record)
+        return record
+
+    def _head(self) -> str:
+        return self._git("rev-parse", "HEAD", check=True).stdout.strip()
+
+    def _is_ancestor(self, older: str, newer: str) -> bool:
+        return self._git("merge-base", "--is-ancestor", older, newer).returncode == 0
+
+    def _rebase(self, actual_head: str, record: dict[str, Any]) -> bool:
+        """Replay the workspace's own commits onto the advanced branch head.
+
+        True when the rebase landed; the structured spec-conflict refusal when
+        git cannot reconcile the material with the branch's advance (the
+        conflicting file list travels in the refusal, and the event record
+        keeps it too -- never a silent force-push, never a skipped rebase).
+        The committer identity is explicit because the guarded git
+        environment blanks the global config a rebase would otherwise need.
+        """
+        proc = self._git(
+            "-c",
+            f"user.name={AUTHOR_NAME}",
+            "-c",
+            f"user.email={AUTHOR_EMAIL}",
+            "rebase",
+            "--quiet",
+            actual_head,
+        )
+        if proc.returncode == 0:
+            return True
+        conflicts = self._git("diff", "--name-only", "--diff-filter=U").stdout.split("\n")
+        files = [name.strip() for name in conflicts if name.strip()]
+        record["status"] = "conflict"
+        record["conflict_files"] = files
+        self._git("rebase", "--abort")
+        raise StageRefused(
+            f"configure rebase onto {self.line_ref} @ {actual_head[:12]} conflicts with "
+            f"the spec material; spec incompatible with branch advance "
+            f"(conflicting files: {', '.join(files) or 'unlisted'})",
+            code="REBASE_SPEC_INCOMPATIBLE",
+        )
+
+    def _freeze_base(self, actual_head: str) -> None:
+        """Freeze the post-rebase head as the order's `target_base_commit`."""
+        if not self.record_path:
+            return
+        path = Path(self.record_path)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        data["target_base_commit"] = actual_head
+        # The receipt still records the freeze; a lost record write is an
+        # observability gap, not a chain break.
+        with contextlib.suppress(OSError):
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+
+    def _sync_local_branch(self, actual_head: str, record: dict[str, Any]) -> None:
+        """Point the local line branch at the dispatch-time origin head.
+
+        The dispatch-side view of the branch (what the state face reads
+        `release_behind` against) stays exactly the head configure froze --
+        fast-forward only, so a locally diverged branch is reported, never
+        clobbered.
+        """
+        short = self.line_ref.removeprefix("refs/heads/")
+        local = self._git("rev-parse", "--verify", "--quiet", f"refs/heads/{short}^{{commit}}")
+        if local.returncode == 0:
+            current = local.stdout.strip()
+            if current == actual_head or self._is_ancestor(current, actual_head):
+                moved = self._git(
+                    "update-ref",
+                    "-m",
+                    "configure: sync line branch",
+                    f"refs/heads/{short}",
+                    actual_head,
+                )
+                record["branch_synced"] = moved.returncode == 0
+            else:
+                record["branch_synced"] = False
+                record["branch_diverged"] = current
+        else:
+            moved = self._git(
+                "update-ref",
+                "-m",
+                "configure: create line branch",
+                f"refs/heads/{short}",
+                actual_head,
+            )
+            record["branch_synced"] = moved.returncode == 0
 
 
 @dataclass
@@ -333,7 +508,19 @@ class MergeStage:
     the work is sealed and ready and the publish is a separate decision. The
     default stays there because pushing to a durable ref is the one thing on
     this path that is not undoable, and it should be opted into.
+
+    R4（一线一分支）: publishing targets the line's release branch
+    (`refs/heads/release/<line-id>`), and the pushed commit is the **stripped**
+    merge result -- `.dev-dispatch/` and `.dd-evidence/` machine parts are
+    removed from the tree before anything lands on the line branch. Before the
+    push the remote head is re-checked against the frozen base (the local line
+    branch head configure synced): a branch advanced by someone else is the
+    structured refusal `RELEASE_HEAD_ADVANCED` -- traced, never overwritten --
+    and the line re-runs configure from the new head.
     """
+
+    #: The machine parts that never enter a line branch (R4 机器件剥离).
+    STRIPPED_PATHS = (".dev-dispatch", ".dd-evidence")
 
     repo: Path
     remote_url: str
@@ -408,6 +595,113 @@ class MergeStage:
             return RemoteResult(1, str(exc))
         return RemoteResult(0, "", merged)
 
+    def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return run_git(self.repo, *args)
+
+    def _local_line_head(self) -> str:
+        short = self.target_ref.removeprefix("refs/heads/")
+        proc = self._git("rev-parse", "--verify", "--quiet", f"refs/heads/{short}^{{commit}}")
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+
+    def _stripped_commit(self, subject: str, parent: str) -> tuple[str, list[str]]:
+        """The line-branch commit for `subject`: same tree minus machine parts.
+
+        Built entirely with plumbing against a temporary index, so the
+        workspace (and the audit chain it carries) is never touched. The
+        parent is the frozen base, so the pushed history is line-branch
+        native: base -> stripped work.
+        """
+        env = git_ops.safe_git_environment()
+        _fd, index_name = tempfile.mkstemp(prefix="dd-stripped-index-")
+        Path(index_name).unlink(missing_ok=True)
+        index = Path(index_name)
+        env["GIT_INDEX_FILE"] = str(index)
+        try:
+            run_git(self.repo, "read-tree", subject, env=env, check=True)
+            for path in self.STRIPPED_PATHS:
+                run_git(
+                    self.repo,
+                    "rm",
+                    "-r",
+                    "--cached",
+                    "--ignore-unmatch",
+                    "--quiet",
+                    path,
+                    env=env,
+                )
+            tree = run_git(self.repo, "write-tree", env=env, check=True).stdout.strip()
+            argv = [
+                "-c",
+                f"user.name={AUTHOR_NAME}",
+                "-c",
+                f"user.email={AUTHOR_EMAIL}",
+                "commit-tree",
+                tree,
+                "-m",
+                "merge: release line-branch commit (machine parts stripped)",
+            ]
+            if parent:
+                argv += ["-p", parent]
+            commit = run_git(self.repo, *argv, env=env, check=True).stdout.strip()
+            return commit, list(self.STRIPPED_PATHS)
+        finally:
+            index.unlink(missing_ok=True)
+
+    def _publish_release(self, subject: str) -> dict[str, Any]:
+        """CAS push of the stripped merge result onto the line branch (R4).
+
+        The frozen base is the local line branch head configure synced; a
+        remote head that is neither absent nor equal to it means someone
+        advanced the branch under this order -- the structured
+        `RELEASE_HEAD_ADVANCED` refusal, the line's cue to re-run configure.
+        The push itself is compare-and-swap (`--force-with-lease=<ref>:<head>`),
+        so even a race between probe and push cannot overwrite another
+        line's commit.
+        """
+        frozen = self._local_line_head()
+        probe = self._git("ls-remote", "--exit-code", "--refs", self.remote_url, self.target_ref)
+        observed = ""
+        if probe.returncode == 0:
+            for line in probe.stdout.splitlines():
+                if line.strip():
+                    observed = line.split("\t", 1)[0].strip()
+                    break
+        elif probe.returncode != 2:
+            # A transport/remote failure is not "branch absent": refuse honestly.
+            raise StageRefused(
+                f"merge refused: cannot probe {self.target_ref}: "
+                f"{(probe.stderr or probe.stdout).strip()[:300]}",
+                code="MERGE_REFUSED",
+            )
+        if observed and frozen and observed != frozen:
+            raise StageRefused(
+                f"merge refused: {self.target_ref} advanced past the frozen base "
+                f"(remote {observed[:12]} != frozen {frozen[:12]}); the line re-runs "
+                "configure from the new head before this order can land",
+                code="RELEASE_HEAD_ADVANCED",
+            )
+        commit, stripped = self._stripped_commit(subject, frozen)
+        push_argv = ["push", "--quiet"]
+        if observed:
+            push_argv += [f"--force-with-lease={self.target_ref}:{observed}"]
+        push_argv += [self.remote_url, f"{commit}:{self.target_ref}"]
+        pushed = self._git(*push_argv)
+        if pushed.returncode != 0:
+            raise StageRefused(
+                f"merge refused: push to {self.target_ref} failed: "
+                f"{(pushed.stderr or pushed.stdout).strip()[:400]}",
+                code="MERGE_REFUSED",
+            )
+        # Sync the dispatch-side view: the local line branch takes the pushed
+        # commit (fast-forward -- the parent is the previous head).
+        short = self.target_ref.removeprefix("refs/heads/")
+        self._git("update-ref", "-m", "merger: release", f"refs/heads/{short}", commit)
+        return {
+            "released_commit": commit,
+            "stripped_paths": stripped,
+            "previous_target_head": observed,
+        }
+
     def _fast_forward(self, dispatch: Dispatch) -> dict[str, Any]:
         """The CAS publish, with egress backoff on both remote operations.
 
@@ -415,8 +709,14 @@ class MergeStage:
         transport-class failures under the stage fence. A repo-layer verdict
         -- target moved, ref missing, remote rejected -- keeps the existing
         `MERGE_REFUSED` semantics; only the network's own failures retry.
+
+        R4: a target ref under `refs/heads/release/` publishes through the
+        line-branch path (strip machine parts, CAS against the frozen base).
+        Every other ref keeps the exact pre-R4 publish semantics.
         """
         subject = str(dispatch.get("input_commit", ""))
+        if self.target_ref.startswith("refs/heads/release/"):
+            return self._publish_release(subject)
         try:
             observed = retry_remote(
                 self._probe_target_head, op_name="ls-remote", **self._retry_kwargs()

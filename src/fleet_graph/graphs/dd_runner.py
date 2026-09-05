@@ -178,6 +178,13 @@ class DevelopmentConfig:
     #: generation is not a gate rework: no anchor is ever injected and the
     #: receipt replay path behaves exactly as before.
     gate_reject: dict[str, Any] = field(default_factory=dict)
+    #: R4: the order-private audit branch (refs/heads/dd/<dev>) the stage
+    #: sealers publish to -- remote_ref is the merger's release branch. Empty
+    #: falls back to remote_ref (the pre-R4 single-durable-ref layout).
+    audit_ref: str = ""
+    #: R4: the admission record file, so configure's first-step rebase can
+    #: freeze the post-rebase head into it. Empty leaves records alone.
+    record_path: str = ""
 
     @property
     def thread_id(self) -> str:
@@ -322,12 +329,18 @@ def build_pipeline(
         reprepare_worktree=config.reprepare_worktree,
         observe=observe,
     )
+    # R4: the ref each surface publishes to. The receipt chain's continuity
+    # lives on the order-private audit branch (stage sealers); the merger's
+    # CAS push lands on remote_ref -- the line's release branch. An empty
+    # audit_ref means the legacy layout where both are remote_ref.
+    publish_ref = config.audit_ref or config.remote_ref
+
     sealer = PluginMaterializer(
         builder=builder,
         binding=config.plugin_binding,
         target=MaterializationTarget(
             remote_url=config.remote_url,
-            remote_ref=config.remote_ref,
+            remote_ref=publish_ref,
             worktree=str(config.workspace_path),
             state_root=str(config.state_root),
         ),
@@ -337,9 +350,19 @@ def build_pipeline(
     # Defaults that make an assembled pipeline runnable. A caller-supplied
     # entry always wins; nothing here is mandatory.
     merge_stage = stage_producing(lifecycle, MERGE_RESULT)
+    configure_stage = stage_producing(lifecycle, RUN_CONFIG)
+    # R4 first-step rebase wiring: only a release-branch dispatch carries a
+    # line branch to rebase onto; legacy durable refs leave the step unwired.
+    line_ref = config.remote_ref if config.remote_ref.startswith("refs/heads/release/") else ""
     registered: dict[str, Actor] = {
-        stage_producing(lifecycle, RUN_CONFIG): ConfigureStage(
-            repo=config.workspace_path, run_config=config.run_config
+        configure_stage: ConfigureStage(
+            repo=config.workspace_path,
+            run_config=config.run_config,
+            # R4 first-step rebase: onto the line's release branch head, with
+            # the post-rebase base frozen into the admission record.
+            line_ref=line_ref,
+            requested_base=config.target_base_commit,
+            record_path=config.record_path if line_ref else "",
         ),
         stage_producing(lifecycle, ACCEPTANCE_RESULT): AcceptanceStage(
             repo=config.workspace_path,

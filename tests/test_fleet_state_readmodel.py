@@ -51,6 +51,12 @@ LINE_OBJ_FIELDS = {
     "run_id",
     "wake_facts_stale",
     "release_id",
+    # R4（一线一分支）branch-position readings, first-class on the state face.
+    "release_ref",
+    "release_behind",
+    "deploy_behind",
+    "release_behind_basis",
+    "deploy_behind_basis",
 }
 
 

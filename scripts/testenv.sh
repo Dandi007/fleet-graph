@@ -450,7 +450,7 @@ write_roster() {
   "dd_root": "$TEST_ROOT/dd",
   "probe_via_runtime": false,
   "supervisor_events": false,
-  "lines": [
+    "lines": [
     {
       "folder_id": "wf-testenv-sample",
       "seat": "testenv-sample",
@@ -458,6 +458,22 @@ write_roster() {
       "max_rounds": 1,
       "enabled": false,
       "_provenance": "testenv 安全样例线：enabled=false 等价不参与调度（§一·2）"
+    },
+    {
+      "folder_id": "wf-r3-sample",
+      "seat": "r3-sample",
+      "alias": "r3-sample",
+      "max_rounds": 1,
+      "enabled": false,
+      "_provenance": "R3 引擎级 fixture 样本线：enabled=false 不参与调度；state 面 release_behind 读数的样本线之一"
+    },
+    {
+      "folder_id": "wf-r4-sample",
+      "seat": "r4-sample",
+      "alias": "r4-sample",
+      "max_rounds": 1,
+      "enabled": false,
+      "_provenance": "R4 一线一分支样本线：enabled=false 不参与调度；验收 14 项 state 面 release_behind==0 读数的样本线"
     }
   ]
 }
@@ -672,6 +688,11 @@ EOF
     # 即失败——缺样本的环境不得变绿。
     r3_sample_driver "$REPO_ROOT" "$TEST_ROOT" "$P_BUS_HTTP"
 
+    # R4 验收样本（specs/r4-release-branch-model.md 开放点 2 的实现方作答）：
+    # 引擎级 fixture 驱动真实 configure(rebase)→merger(剥离+推线分支) 路径产出
+    # 13/14 所需的单记录与 release_behind 读数（零外部网关、幂等、fail-closed）。
+    r4_sample_driver "$REPO_ROOT" "$TEST_ROOT" "$P_BUS_HTTP"
+
     read -r n_alive n_total <<EOF
 $(alive_of_pids)
 EOF
@@ -693,6 +714,27 @@ r3_sample_driver() {
     fi
     if ! $py "$driver" --root "$test_root" --bus-port "$bus_port"; then
         printf 'testenv: R3 样本驱动失败（判据样本不可缺，fail-closed）\n' >&2
+        kill_all
+        reclaim_after_kill || true
+        exit 5
+    fi
+}
+
+r4_sample_driver() {
+    local repo_root="$1" test_root="$2" bus_port="$3"
+    local driver="$repo_root/scripts/testenv_r4_sample.py"
+    if [ ! -f "$driver" ]; then
+        printf 'testenv: R4 样本驱动缺失: %s\n' "$driver" >&2
+        exit 5
+    fi
+    local py=""
+    if [ -x "$repo_root/.venv/bin/python" ]; then
+        py="$repo_root/.venv/bin/python"
+    else
+        py="uv run --frozen --project $repo_root python"
+    fi
+    if ! $py "$driver" --root "$test_root" --bus-port "$bus_port"; then
+        printf 'testenv: R4 样本驱动失败（判据样本不可缺，fail-closed）\n' >&2
         kill_all
         reclaim_after_kill || true
         exit 5

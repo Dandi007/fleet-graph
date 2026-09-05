@@ -62,6 +62,9 @@ REASON_GATE_REFUSED = "gate_refused"
 #:   dispatched_by  -> create(dispatched_by=...)      the dispatching line, verbatim
 #:   timeouts       -> create(timeouts=...)           per-stage run fences
 #:   stage_models   -> create(stage_models=...)       the M4 seat channel
+#:   target_ref     -> create(target_ref=...)         R4: explicit target branch;
+#:                    anything but the dispatching line's own
+#:                    refs/heads/release/<line-id> is refused by admission
 #: The idempotency_key is the caller's exactly-once handle for the *action*; dd
 #: admission stays idempotent on its own (repo, spec, base) key, so a replayed
 #: action re-enters admission and gets the same development back unchanged --
@@ -74,6 +77,7 @@ DISPATCH_PAYLOAD_FIELDS = (
     "dispatched_by",
     "timeouts",
     "stage_models",
+    "target_ref",
 )
 
 #: The dd.gate_release.v1 payload: which single, the verdict, who decided, the

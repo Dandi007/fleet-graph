@@ -509,10 +509,14 @@ def run_pipeline_to_gate(
     run_root = root / "dd" / development_id
     lifecycle = Lifecycle.load()
     remote_url = str(record["remote_url"])
-    remote_ref = str(record["remote_ref"])
+    # R4：record.remote_ref 是线分支（refs/heads/release/<line>），单私有审计
+    # 分支在 audit_ref；链条连续性（sealer 发布）挂在审计分支上，合并在合并段
+    # 指向线分支。旧 record（无 audit_ref）回退 remote_ref——同一语义。
+    audit_ref = str(record.get("audit_ref") or record["remote_ref"])
+    line_ref = str(record["remote_ref"])
 
     def sealer_for(stage_id: str) -> Any:
-        base_sealer = WorkspaceSealer(repo=workspace, remote_url=remote_url, remote_ref=remote_ref)
+        base_sealer = WorkspaceSealer(repo=workspace, remote_url=remote_url, remote_ref=audit_ref)
         name = RECEIPT_NAMES.get(stage_id)
         if name is None:
             return base_sealer
@@ -537,6 +541,11 @@ def run_pipeline_to_gate(
                 "setup_commands": [],
                 "acceptance_env": {},
             },
+            # R4 首步 rebase 三件套：线分支、派单请求头（准入冻结 base）、
+            # 准入记录（rebase 后新头冻结回写）。
+            line_ref=line_ref,
+            requested_base=str(record["target_base_commit"]),
+            record_path=str(root / "dd" / development_id / "record.json"),
         ),
         stage_producing(lifecycle, ACCEPTANCE_RESULT): AcceptanceStage(
             repo=workspace,
@@ -552,7 +561,7 @@ def run_pipeline_to_gate(
             repo=workspace,
         ),
         stage_producing(lifecycle, MERGE_RESULT): MergeStage(
-            repo=workspace, remote_url=remote_url, target_ref=remote_ref, publish=False
+            repo=workspace, remote_url=remote_url, target_ref=line_ref, publish=False
         ),
     }
     deps = PipelineDeps(
