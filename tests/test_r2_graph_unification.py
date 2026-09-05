@@ -102,6 +102,7 @@ class FakeInbox:
 class FakeArtifacts:
     def __init__(self) -> None:
         self.rounds: list[dict[str, Any]] = []
+        self.actions_records: list[dict[str, Any]] = []
         self.terminal: dict[str, Any] | None = None
 
     def heartbeat(self, round_no: int, phase: str, *, force: bool = False) -> bool:
@@ -109,6 +110,10 @@ class FakeArtifacts:
 
     def append_round(self, line: dict[str, Any]) -> bool:
         self.rounds.append(line)
+        return True
+
+    def record_stop_response_actions(self, record: dict[str, Any]) -> bool:
+        self.actions_records.append(record)
         return True
 
     def write_worker_report(self, round_no: int, report: dict[str, Any]) -> str:
@@ -199,8 +204,8 @@ def test_no_disk_channel_in_wakeup_path_mutation(tmp_path: Path) -> None:
 
 
 def test_terminal_state_via_subgraph_return_only(tmp_path: Path) -> None:
-    """dd 终态只经子图返回值进线状态：coordinator 声明 dispatches → Send 扇出
-    → 返回值汇进 dd_results；盘面上伪造的 terminal.json 不被消费。
+    """dd 终态只经子图返回值进线状态：coordinator 声明 actions（R3 信封）
+    → Send 扇出 → 返回值汇进 dd_results；盘面上伪造的 terminal.json 不被消费。
     """
     authority_answer = {
         "development_id": "dev-r2-1",
@@ -219,11 +224,16 @@ def test_terminal_state_via_subgraph_return_only(tmp_path: Path) -> None:
                 "reason": "dispatched via the graph edge",
                 "waiting_on": "dd",
                 "dd_development_id": "dev-r2-1",
-                "dispatches": [
+                "actions": [
                     {
-                        "repo_path": "/tmp/repo",
-                        "spec_text": "# spec",
-                        "_development_id": "dev-r2-1",
+                        "kind": "dd.dispatch.v1",
+                        "idempotency_key": "r2-envelope-k1",
+                        "payload": {
+                            "repo_path": "/tmp/repo",
+                            "spec_text": "# spec",
+                            "dispatched_by": "wf-3f30cd",
+                            "_development_id": "dev-r2-1",
+                        },
                     }
                 ],
             },
@@ -239,8 +249,8 @@ def test_terminal_state_via_subgraph_return_only(tmp_path: Path) -> None:
     assert len(dd.payloads) == 1
     assert dd.payloads[0]["line_folder"] == "wf-3f30cd"
     assert dd.payloads[0]["intent"]["repo_path"] == "/tmp/repo"
-    # 派单意图已消费：不会重复实例化。
-    assert state["pending_dispatches"] == []
+    # 派单 action 已消费：不会重复实例化。
+    assert state["pending_actions"] == []
     # 线停在 blocked+dd（M1 驻停不变），但终态写自含返回值的状态。
     assert state["terminal"] == "blocked"
 
@@ -330,7 +340,11 @@ def test_checkpoint_rebuild_no_dup_dispatch_no_loss(tmp_path: Path) -> None:
     # 不重复派发（准入幂等键）：同一意图二次 admit，start 不再点火。
     plane = _FakePlane()
     gateway = ControlPlaneGateway(plane, sleeper=lambda _s: None)
-    intent = {"repo_path": "/tmp/repo", "spec_text": "# spec"}
+    intent = {
+        "repo_path": "/tmp/repo",
+        "spec_text": "# spec",
+        "dispatched_by": "wf-3f30cd",
+    }
     gateway.admit(intent, line_folder="wf-3f30cd")
     record = gateway.admit(intent, line_folder="wf-3f30cd")
     assert record["already_admitted"] is True
@@ -383,7 +397,8 @@ def test_control_plane_gateway_projects_the_authority_answer() -> None:
     plane = _FakePlane()
     gateway = ControlPlaneGateway(plane, sleeper=lambda _s: None)
     result = gateway.dispatch(
-        {"repo_path": "/tmp/repo", "spec_text": "# spec"}, line_folder="wf-3f30cd"
+        {"repo_path": "/tmp/repo", "spec_text": "# spec", "dispatched_by": "wf-3f30cd"},
+        line_folder="wf-3f30cd",
     )
     assert result["development_id"] == "dev-1"
     assert result["state"] == "complete"
@@ -407,7 +422,8 @@ def test_gateway_honest_in_flight_when_never_terminal() -> None:
 
     gateway = ControlPlaneGateway(NeverTerminal(), max_observations=2, sleeper=lambda _s: None)
     result = gateway.dispatch(
-        {"repo_path": "/tmp/repo", "spec_text": "# spec"}, line_folder="wf-3f30cd"
+        {"repo_path": "/tmp/repo", "spec_text": "# spec", "dispatched_by": "wf-3f30cd"},
+        line_folder="wf-3f30cd",
     )
     assert result["state"] == "in_flight"
     assert result["terminal"] == ""

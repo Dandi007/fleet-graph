@@ -43,16 +43,10 @@ from fleet_graph.dd.control_plane import (
 from fleet_graph.dd.lifecycle import Lifecycle
 from fleet_graph.dd.upstream_constants import compute_json_digest
 from fleet_graph.decision_mcp import (
-    CODE_DD_NOT_AWAITING_GATE,
-    CODE_GATE_NOT_CONSUMED,
-    CODE_GATE_VERDICT_UNDELIVERED,
     CODE_LINE_NOT_PARKED,
     DECISION_APPROVE,
     DECISION_REJECT,
-    OUTCOME_DELIVERED,
     OUTCOME_REFUSED,
-    DeliveryLedger,
-    build_decision_mcp_server,
     deliver_decision,
 )
 from fleet_graph.graphs.dd_pipeline import (
@@ -305,15 +299,53 @@ def claim_files(plane: DdControlPlane, development_id: str) -> list[Path]:
     return sorted(claim_dir.rglob("*.json")) if claim_dir.is_dir() else []
 
 
-# --- 红靶①：裁决送达必须落地（缺陷 1） --------------------------------------
+# --- 红靶①：裁决送达必须落地（缺陷 1，R3 后经图内 gate 节点） ----------------
+
+
+def _gate_node(plane: DdControlPlane) -> Any:
+    from fleet_graph.dd.self_gate import EvidenceItem
+    from fleet_graph.graphs.dd_gate import GraphGateNode
+
+    return GraphGateNode(
+        plane,
+        evidence=[
+            EvidenceItem(name, name, True, "grounded by the red-target harness")
+            for name in (
+                "acceptance_frozen",
+                "diff_within_scope",
+                "zero_test_deletion",
+                "personally_rerun",
+                "mutation_receipt",
+                "regression",
+            )
+        ],
+    )
+
+
+def _gate_action(dev: str, verdict: str, key: str = "red-target-k1") -> dict[str, Any]:
+    from fleet_graph.graphs.stop_response import KIND_GATE_RELEASE
+
+    payload: dict[str, Any] = {
+        "development_id": dev,
+        "verdict": verdict,
+        "decided_by": PRINCIPAL,
+    }
+    if verdict == "REJECT":
+        payload["board_decision"] = {
+            "problem": "验收取证不齐",
+            "suggested_answer": "补齐冻结验收后重跑",
+            "cost_of_no_answer": "单据在闸口无人能裁",
+        }
+    return {"kind": KIND_GATE_RELEASE, "payload": payload, "idempotency_key": key}
 
 
 class TestRedTargetVerdictMustLand:
-    """A real awaiting_gate single, the registered decision_deliver MCP tool,
-    a REJECT: the board's decision read model resolves the verdict, and the
-    single terminalises refused."""
+    """A real awaiting_gate single, the line's own graph gate node consuming
+    its ``dd.gate_release.v1`` (R3: the only release path), a REJECT: the
+    board's decision read model resolves the verdict, and the single
+    terminalises refused."""
 
-    def test_reject_via_the_mcp_tool_publishes_the_verdict_and_refuses_the_single(
+    def test_reject_via_the_gate_node_publishes_the_verdict_and_refuses_the_single(
         self, tmp_path: Path
     ) -> None:
         board = memory_board()
@@ -321,33 +353,20 @@ class TestRedTargetVerdictMustLand:
         plane, dev, repo = admit(tmp_path, board, launcher)
         suspend_at_gate(plane, repo, dev)
 
-        server = build_decision_mcp_server(
-            tmp_path / "runs",
-            [],
-            dd=plane,
-            ledger=DeliveryLedger(state_dir=tmp_path / "decision-state"),
-        )
-        payload = call_tool(
-            server,
-            {
-                "decision": DECISION_REJECT,
-                "reason": "验收取证不齐，驳回",
-                "line": dev,
-                "principal": PRINCIPAL,
-            },
+        receipt = _gate_node(plane).consume(
+            _gate_action(dev, "REJECT"), folder_id=PRINCIPAL, round_no=1
         )
 
-        assert payload["status"] == OUTCOME_DELIVERED, payload
-        assert payload["outcome"] == "consumed"
-        assert payload["line"] == dev
-        assert payload["decision"] == DECISION_REJECT
+        assert receipt["status"] == "consumed", receipt
+        assert receipt["development_id"] == dev
+        assert receipt["decision"] == DECISION_REJECT
 
         # board.decision_for（决议读模型）可解析出该裁决——ref 到问题 note。
         ticket = GateTicket(question_note_id="msg_question_1", card_entity_id="ent-dd-card")
         decision = board.decision_for(ticket)
-        assert decision is not None, "the delivered verdict must be resolvable on the board"
+        assert decision is not None, "the released verdict must be resolvable on the board"
         assert decision.decision == DECISION_REJECT
-        assert decision.rationale == "验收取证不齐，驳回"
+        assert decision.rationale.startswith("acceptance_frozen=PASS")
         assert decision.decided_by == PRINCIPAL
 
         # 单据 terminal=refused（非仅 resume）。
@@ -355,7 +374,7 @@ class TestRedTargetVerdictMustLand:
         assert status["terminal"] == "refused"
         assert status["state"] == "refused"
 
-    def test_approve_via_the_tool_consumes_the_verdict_and_leaves_the_gate(
+    def test_approve_via_the_gate_node_consumes_the_verdict_and_leaves_the_gate(
         self, tmp_path: Path
     ) -> None:
         board = memory_board()
@@ -363,13 +382,11 @@ class TestRedTargetVerdictMustLand:
         plane, dev, repo = admit(tmp_path, board, launcher)
         suspend_at_gate(plane, repo, dev)
 
-        server = build_decision_mcp_server(tmp_path / "runs", [], dd=plane)
-        payload = call_tool(
-            server,
-            {"decision": DECISION_APPROVE, "reason": "放行", "line": dev, "principal": PRINCIPAL},
+        receipt = _gate_node(plane).consume(
+            _gate_action(dev, "APPROVE"), folder_id=PRINCIPAL, round_no=1
         )
 
-        assert payload["status"] == OUTCOME_DELIVERED, payload
+        assert receipt["status"] == "consumed", receipt
         ticket = GateTicket(question_note_id="msg_question_1", card_entity_id="ent-dd-card")
         assert board.decision_for(ticket) is not None
         status = plane.get(dev)
@@ -379,23 +396,17 @@ class TestRedTargetVerdictMustLand:
         self, tmp_path: Path
     ) -> None:
         # No board at all: publishing the verdict is impossible, so the
-        # delivery refuses instead of running a valueless resume (S10).
+        # release fails closed instead of running a valueless resume (S10).
         launcher = GateUnitLauncher(memory_board())
         plane, dev, repo = admit(tmp_path, None, launcher)
         suspend_at_gate(plane, repo, dev)
 
-        result = deliver_decision(
-            line=dev,
-            decision=DECISION_REJECT,
-            reason="board down",
-            principal=PRINCIPAL,
-            run_root=tmp_path / "runs",
-            lines=[],
-            dd=plane,
+        receipt = _gate_node(plane).consume(
+            _gate_action(dev, "REJECT"), folder_id=PRINCIPAL, round_no=1
         )
 
-        assert result.status == OUTCOME_REFUSED
-        assert result.code == CODE_GATE_VERDICT_UNDELIVERED
+        assert receipt["status"] == "failed"
+        assert receipt["reason"] == "release_refused"
         assert launcher.launched == [], "no unit may start when the verdict cannot land"
 
 
@@ -414,27 +425,23 @@ class TestRedTargetFailedResumeReturnsTheClaim:
         launcher = GateUnitLauncher(board, consume=False)
         plane, dev, repo = admit(tmp_path, board, launcher)
         suspend_at_gate(plane, repo, dev)
+        node = _gate_node(plane)
+        action = _gate_action(dev, "REJECT")
 
-        server = build_decision_mcp_server(tmp_path / "runs", [], dd=plane)
-        arguments = {
-            "decision": DECISION_REJECT,
-            "reason": "驳回",
-            "line": dev,
-            "principal": PRINCIPAL,
-        }
-
-        first = call_tool(server, dict(arguments))
-        assert first["status"] == OUTCOME_REFUSED
-        assert first["code"] == CODE_GATE_NOT_CONSUMED
+        first = node.consume(action, folder_id=PRINCIPAL, round_no=1)
+        assert first["status"] == "consumed"
+        assert first["post_release_state"] == "awaiting_gate", (
+            "the receipt must record honestly that the single stayed parked"
+        )
         assert len(resume_launches(plane, dev)) == 1, "the first resume did launch"
         assert len(claim_files(plane, dev)) == 1, "the failed attempt held the claim"
 
         # The unit comes back and this time the graph consumes the verdict.
         launcher.consume = True
-        second = call_tool(server, dict(arguments))
+        second = node.consume(action, folder_id=PRINCIPAL, round_no=1)
 
-        assert second["status"] == OUTCOME_DELIVERED, second
-        assert second["action_key"].startswith("mcp:dd:")
+        assert second["status"] == "consumed", second
+        assert second["post_release_state"] == "refused"
         assert len(resume_launches(plane, dev)) == 2, (
             "the redelivery must be accepted and re-attempt the resume, "
             "not be refused as already_resumed"
@@ -448,20 +455,14 @@ class TestRedTargetFailedResumeReturnsTheClaim:
         launcher = GateUnitLauncher(board)
         plane, dev, repo = admit(tmp_path, board, launcher)
         suspend_at_gate(plane, repo, dev)
+        node = _gate_node(plane)
+        action = _gate_action(dev, "REJECT")
+        assert node.consume(action, folder_id=PRINCIPAL, round_no=1)["status"] == "consumed"
 
-        server = build_decision_mcp_server(tmp_path / "runs", [], dd=plane)
-        arguments = {
-            "decision": DECISION_REJECT,
-            "reason": "驳回",
-            "line": dev,
-            "principal": PRINCIPAL,
-        }
-        assert call_tool(server, dict(arguments))["status"] == OUTCOME_DELIVERED
+        third = node.consume(action, folder_id=PRINCIPAL, round_no=1)
 
-        third = call_tool(server, dict(arguments))
-
-        assert third["status"] == OUTCOME_REFUSED
-        assert third["code"] == CODE_DD_NOT_AWAITING_GATE
+        assert third["status"] == "failed"
+        assert third["reason"] == "not_awaiting_gate"
         assert len(resume_launches(plane, dev)) == 1, "no second consumption"
 
     def test_the_control_plane_releases_the_claim_and_records_it(self, tmp_path: Path) -> None:

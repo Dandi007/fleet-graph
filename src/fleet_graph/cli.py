@@ -1183,9 +1183,10 @@ def _decision_bridge_run(args: argparse.Namespace) -> int:
     """The resident decision bridge: read verdicts, resolve, recover, seal.
 
     Read-only against the bus (``GET .../messages`` only); the recovery call
-    goes through the owner's controlled entry (dd gate resume, a registered
-    line entry, or an HTTP owner for the isolated drill). One JSON line per
-    cycle on stdout.
+    goes through the owner's controlled entry (a registered line entry, or an
+    HTTP owner for the isolated drill). One JSON line per cycle on stdout.
+    R3 (S11): there is no dd owner -- a dd gate is released only by the
+    dispatching line's own graph gate node.
     """
     from fleet_graph.decision_bridge.bridge import DecisionBridge, DecisionBridgeConfig
     from fleet_graph.decision_bridge.owners import HttpOwnerSource
@@ -1202,7 +1203,6 @@ def _decision_bridge_run(args: argparse.Namespace) -> int:
             poll_interval_seconds=args.poll_interval,
             board_page_limit=args.page_limit,
             owner_url=args.owner_url,
-            dd_root=pathlib.Path(args.dd_root),
             line_owners=line_owners,
             line_run_root=line_run_root,
             kill_window_file=pathlib.Path(args.kill_window_file) if args.kill_window_file else None,
@@ -2069,7 +2069,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="recover through this HTTP owner instead of the dd control plane "
         "(the isolated drill's fake owner)",
     )
-    bridge_run.add_argument("--dd-root", default="/data/fleet-graph/dd")
     bridge_run.add_argument(
         "--lines-config",
         default=None,

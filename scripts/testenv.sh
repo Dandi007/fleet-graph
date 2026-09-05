@@ -666,10 +666,37 @@ EOF
     write_knobs
     prod_baseline_snapshot
 
+    # R3 验收样本（specs/r3-stop-response-dispatch.md 开放点 1 的实现方作答）：
+    # 引擎级 fixture 在 testenv 内驱动真实图路径产出 11/17 所需的派单+gate
+    # 样本（零外部网关、零真实模型调用、幂等、fail-closed）。样本失败的 up
+    # 即失败——缺样本的环境不得变绿。
+    r3_sample_driver "$REPO_ROOT" "$TEST_ROOT" "$P_BUS_HTTP"
+
     read -r n_alive n_total <<EOF
 $(alive_of_pids)
 EOF
     printf 'up=1 surfaces=%s/%s root=%s\n' "$n_alive" "$n_total" "$TEST_ROOT"
+}
+
+r3_sample_driver() {
+    local repo_root="$1" test_root="$2" bus_port="$3"
+    local driver="$repo_root/scripts/testenv_r3_sample.py"
+    if [ ! -f "$driver" ]; then
+        printf 'testenv: R3 样本驱动缺失: %s\n' "$driver" >&2
+        exit 5
+    fi
+    local py=""
+    if [ -x "$repo_root/.venv/bin/python" ]; then
+        py="$repo_root/.venv/bin/python"
+    else
+        py="uv run --frozen --project $repo_root python"
+    fi
+    if ! $py "$driver" --root "$test_root" --bus-port "$bus_port"; then
+        printf 'testenv: R3 样本驱动失败（判据样本不可缺，fail-closed）\n' >&2
+        kill_all
+        reclaim_after_kill || true
+        exit 5
+    fi
 }
 
 # ---------------- status ----------------

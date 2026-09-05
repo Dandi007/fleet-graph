@@ -47,6 +47,9 @@ class DdDispatchIntent(TypedDict, total=False):
     target_base: str
     spec_text: str
     spec_path: str
+    #: R3: the dispatching line's id (v2 增补, required). Passed through to
+    #: ``create`` verbatim; the entry point refuses an empty one.
+    dispatched_by: str
     timeouts: dict[str, int]
     stage_models: dict[str, str]
 
@@ -135,11 +138,29 @@ class ControlPlaneGateway:
         )
 
     def admit(self, intent: DdDispatchIntent, *, line_folder: str) -> dict[str, Any]:
-        """development_create 内部函数化：``dispatched_by`` 恒为派单线本身。"""
-        payload = {**intent, "dispatched_by": line_folder}
+        """development_create 内部函数化：``dispatched_by`` 逐字透传（R3）。
+
+        The dispatch action's payload carries ``dispatched_by`` -- the value
+        the dispatch node already validated against this line's identity --
+        and it reaches ``create`` verbatim: the admission record's frozen
+        surface must name exactly the line the action named, so the gate
+        node's ``decided_by == dispatched_by`` invariant can never be met by
+        an identity the dispatcher did not declare. A payload without one is
+        refused here as a second lock (the dispatch node refuses first).
+        """
+        dispatched_by = str(intent.get("dispatched_by") or "").strip()
+        if not dispatched_by:
+            raise ValueError(
+                "dispatch intent carries no dispatched_by; refusing to admit an "
+                "unattributable development"
+            )
+        payload = {key: value for key, value in intent.items() if not key.startswith("_")}
         record = dict(self.plane.create(**payload))
         if not record.get("already_admitted"):
-            self.plane.start(str(record["development_id"]))
+            start = dict(self.plane.start(str(record["development_id"])))
+            # The launches reference rides on the admit record so the dispatch
+            # node's consumption receipt can name what the admission started.
+            record["launch"] = start
         return record
 
     def observe(self, record: dict[str, Any], *, line_folder: str) -> DdDevelopmentResult:

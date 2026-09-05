@@ -1,14 +1,14 @@
-"""Mechanical production of the six self-gate evidence obligations (M3).
+"""Mechanical production of the six gate evidence obligations (R3 gate node).
 
 The rework review (rc-aa907dfb, finding 2) caught the defect this module
-closes: the six evidence builders in ``dd/self_gate.py`` were exported but had
+closed: the six evidence builders in ``dd/self_gate.py`` were exported but had
 no production caller, so a self-gate wake delivered an *empty* evidence list
 and the delivery refused on missing obligations rather than gathering real
 ones. This module is the production caller: from the single's frozen admission
 record, the sealed stage receipts, the subject workspace's git diff, the
 line's own acceptance rerun, and the recorded regression baseline it assembles
-the six grounded :class:`EvidenceItem` answers :func:`deliver_self_gate_decision`
-consumes.
+the six grounded :class:`EvidenceItem` answers the graph gate node consumes
+(``graphs.dd_gate`` -- the sole ``awaiting_gate`` release path, S11).
 
 Sources, obligation by obligation:
 

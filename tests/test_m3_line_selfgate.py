@@ -1,18 +1,20 @@
-"""M3 line self-gate: six evidence obligations -> one self-delivered verdict.
+"""R3 gate node: six evidence obligations -> one consumed release.
 
-The spec (wf-8d9737 M3) makes the dispatching line its own gate: on a
-``dd_awaiting_gate`` wake the line discharges six evidence obligations and
-delivers ``APPROVE``/``REJECT`` through the same dd delivery path the decision
-surface already checks (principal == dispatched_by). This file pins the
-non-negotiable field of each obligation, the negative criteria (missing
-obligation -> delivery refused; green->red regression refused; foreign dd
-delivery refused; workspace-missing / resume-not-consumed refused with a trace),
-and the S12 mutation-enumeration binding -- including the instance from the
-previous disposition's return: deleting the ``deliver_self_gate_decision`` call
-in ``runner.py`` must leave the frozen acceptance without coverage.
+The spec (wf-4601c8 R3) makes the dispatching line's own graph gate node the
+sole ``awaiting_gate`` release path: it consumes the line's
+``dd.gate_release.v1`` action, discharges the six evidence obligations
+mechanically, asserts ``decided_by == dispatched_by``, and only then seals the
+verdict into the subject workspace, publishes it to the decision read model and
+resumes the suspended pipeline. This file pins the non-negotiable field of each
+obligation, the negative criteria (missing/failed obligation -> failed receipt;
+green->red regression refused; foreign decider refused; unwired workspace /
+resume-not-consumed honestly receipted), and the S12 mutation-enumeration
+binding -- including the instance from the previous disposition's return:
+deleting the gate node's ``consume`` call in ``goal_line.py`` must leave the
+frozen acceptance without coverage.
 
-Everything here runs against pure data or a duck-typed dd control plane; no live
-dd root, no live git repo, no live pytest run is required.
+Everything here runs against pure data or a duck-typed dd control plane; the
+decision seal is a real git commit in a throwaway workspace.
 """
 
 from __future__ import annotations
@@ -24,14 +26,11 @@ from typing import Any
 import pytest
 
 from fleet_graph.dd.self_gate import (
-    CODE_SELF_GATE_EVIDENCE_INCOMPLETE,
-    EVIDENCE_MUTATION_RECEIPT,
     EVIDENCE_REGRESSION,
     REQUIRED_EVIDENCE,
     EvidenceItem,
     RegressionBaseline,
     collect_evidence,
-    deliver_self_gate_decision,
     enumerate_mutation_targets,
     evidence_acceptance_frozen,
     evidence_diff_within_scope,
@@ -41,15 +40,16 @@ from fleet_graph.dd.self_gate import (
     render_rationale,
     verify_mutation_receipt,
 )
-from fleet_graph.decision_mcp import (
-    CODE_GATE_NOT_CONSUMED,
-    CODE_NOT_DISPATCHING_LINE,
-    CODE_WORKSPACE_MISSING,
-    DECISION_APPROVE,
-    DECISION_REJECT,
-    OUTCOME_DELIVERED,
-    OUTCOME_REFUSED,
-    deliver_decision,
+from fleet_graph.graphs.dd_gate import (
+    CODE_NOT_DISPATCHER,
+    CODE_OBLIGATIONS_FAILED,
+    GraphGateNode,
+)
+from fleet_graph.graphs.stop_response import (
+    KIND_GATE_RELEASE,
+    REASON_PAYLOAD_SCHEMA,
+    STATUS_CONSUMED,
+    STATUS_FAILED,
 )
 
 DD_ID = "dev-fg-abc"
@@ -61,31 +61,53 @@ FROZEN = [
 
 
 def _all_pass() -> list[EvidenceItem]:
-    return [
-        evidence_acceptance_frozen(
-            spec_argv=FROZEN, record_acceptance_commands=FROZEN, receipt_command=FROZEN
-        ),
-        evidence_diff_within_scope(
-            changed_product_paths=["src/fleet_graph/dd/self_gate.py"],
-            spec_deliverable_prefixes=["src/fleet_graph/", "tests/"],
-        ),
-        evidence_zero_test_deletion(deleted_paths=[]),
-        evidence_personally_rerun(
-            rerun_command=FROZEN[0], frozen_command=FROZEN[0], rerun_echo="ok", rerun_exit_code=0
-        ),
-        EvidenceItem(
-            EVIDENCE_MUTATION_RECEIPT,
-            "mutation receipt verified",
-            True,
-            "receipt == enumeration (1 targets, all red)",
-        ),
-        evidence_regression(
-            baseline=RegressionBaseline(frozenset(["test_a_red"]), failed_count=1),
-            patched_failed={"test_a_red"},
-            target_base_commit="base" * 10,
-            comparison_base_commit="base" * 10,
-        ),
-    ]
+    return [EvidenceItem(name, name, True, "grounded") for name in REQUIRED_EVIDENCE]
+
+
+def _gate_workspace(tmp_path: Path) -> Path:
+    import subprocess
+
+    workspace = tmp_path / "gate-subject"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    (workspace / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(workspace), "add", "-A"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ],
+        check=True,
+    )
+    return workspace
+
+
+def _gate_action(
+    verdict: str = "APPROVE",
+    decided_by: str = PRINCIPAL,
+    key: str = "k1",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "development_id": DD_ID,
+        "verdict": verdict,
+        "decided_by": decided_by,
+    }
+    if verdict == "REJECT":
+        payload["board_decision"] = {
+            "problem": "p",
+            "suggested_answer": "a",
+            "cost_of_no_answer": "c",
+        }
+    return {"kind": KIND_GATE_RELEASE, "payload": payload, "idempotency_key": key}
 
 
 class FakeDd:
@@ -125,6 +147,7 @@ class FakeDd:
         }
         if self.worktree_path:
             payload["worktree_path"] = self.worktree_path
+            payload["repo_path"] = self.worktree_path
         return payload
 
     def publish_gate_decision(
@@ -367,25 +390,33 @@ class TestObligationRegression:
         assert item.passed is True
 
 
-class TestSelfGateDelivery:
-    def test_all_six_pass_delivers_approve_as_principal(self, tmp_path: Path) -> None:
-        dd = FakeDd()
-        result = deliver_self_gate_decision(
-            development_id=DD_ID,
-            principal=PRINCIPAL,
-            evidence=_all_pass(),
-            run_root=tmp_path,
-            dd=dd,
-        )
-        assert result.status == OUTCOME_DELIVERED
-        assert result.decision == DECISION_APPROVE
-        assert dd.resumed == [(DD_ID, f"mcp:dd:{DD_ID}:g2:APPROVE")]
-        # The verdict reached the single's decision read model, decided_by the
-        # dispatching line (M3.1 defect 1).
-        assert dd.published[0]["decided_by"] == PRINCIPAL
-        assert dd.published[0]["decision"] == DECISION_APPROVE
+class TestGateNodeConsumption:
+    """The gate node consumes the release end to end once the six obligations
+    ground it; anything missing fails the action closed."""
 
-    def test_a_failed_obligation_delivers_reject_not_a_swallow(self, tmp_path: Path) -> None:
+    def test_all_six_pass_consumes_approve_as_the_dispatching_line(self, tmp_path: Path) -> None:
+        workspace = _gate_workspace(tmp_path)
+        dd = FakeDd(worktree_path=str(workspace))
+        node = GraphGateNode(dd, evidence=_all_pass())
+
+        receipt = node.consume(_gate_action(), folder_id=PRINCIPAL, round_no=1)
+
+        assert receipt["status"] == STATUS_CONSUMED
+        assert receipt["decision"] == "APPROVE"
+        assert receipt["decided_by"] == PRINCIPAL
+        assert dd.resumed == [(DD_ID, "dd-gate-node:dev-fg-abc:g2:k1:APPROVE")]
+        # The verdict reached the single's decision read model, decided_by the
+        # dispatching line (M3.1 defect 1 carries over to the new path).
+        assert dd.published[0]["decided_by"] == PRINCIPAL
+        assert dd.published[0]["decision"] == "APPROVE"
+        # The verdict is sealed into the subject workspace by the node itself.
+        sealed = workspace / ".dev-dispatch" / "gate" / "decision-g2.json"
+        assert sealed.is_file()
+        import json
+
+        assert json.loads(sealed.read_text(encoding="utf-8"))["decided_by"] == PRINCIPAL
+
+    def test_a_failed_obligation_fails_the_action_not_a_swallow(self, tmp_path: Path) -> None:
         evidence = _all_pass()
         evidence[5] = evidence_regression(
             baseline=RegressionBaseline(frozenset()),
@@ -393,43 +424,46 @@ class TestSelfGateDelivery:
             target_base_commit="base" * 10,
             comparison_base_commit="base" * 10,
         )
-        dd = FakeDd()
-        result = deliver_self_gate_decision(
-            development_id=DD_ID,
-            principal=PRINCIPAL,
-            evidence=evidence,
-            run_root=tmp_path,
-            dd=dd,
-        )
-        assert result.status == OUTCOME_DELIVERED
-        assert result.decision == DECISION_REJECT
+        dd = FakeDd(worktree_path=str(_gate_workspace(tmp_path)))
+        node = GraphGateNode(dd, evidence=evidence)
 
-    def test_missing_an_obligation_leaves_delivery_refused(self, tmp_path: Path) -> None:
-        evidence = _all_pass()
-        dropped = [e for e in evidence if e.id != EVIDENCE_REGRESSION]
-        dd = FakeDd()
-        result = deliver_self_gate_decision(
-            development_id=DD_ID,
-            principal=PRINCIPAL,
-            evidence=dropped,
-            run_root=tmp_path,
-            dd=dd,
-        )
-        assert result.status == OUTCOME_REFUSED
-        assert result.code == CODE_SELF_GATE_EVIDENCE_INCOMPLETE
+        receipt = node.consume(_gate_action(), folder_id=PRINCIPAL, round_no=1)
+
+        assert receipt["status"] == STATUS_FAILED
+        assert receipt["reason"] == CODE_OBLIGATIONS_FAILED
         assert dd.resumed == []
 
-    def test_a_foreign_principal_cannot_self_gate_this_single(self, tmp_path: Path) -> None:
-        dd = FakeDd(dispatched_by="wf-other-line")
-        result = deliver_self_gate_decision(
-            development_id=DD_ID,
-            principal=PRINCIPAL,
-            evidence=_all_pass(),
-            run_root=tmp_path,
-            dd=dd,
-        )
-        assert result.status == OUTCOME_REFUSED
-        assert result.code == CODE_NOT_DISPATCHING_LINE
+    def test_missing_an_obligation_leaves_the_release_refused(self, tmp_path: Path) -> None:
+        evidence = [e for e in _all_pass() if e.id != EVIDENCE_REGRESSION]
+        dd = FakeDd(worktree_path=str(_gate_workspace(tmp_path)))
+        node = GraphGateNode(dd, evidence=evidence)
+
+        receipt = node.consume(_gate_action(), folder_id=PRINCIPAL, round_no=1)
+
+        assert receipt["status"] == STATUS_FAILED
+        assert "missing required gate obligation" in receipt["detail"]
+        assert dd.resumed == []
+
+    def test_a_foreign_decider_cannot_gate_this_single(self, tmp_path: Path) -> None:
+        dd = FakeDd(dispatched_by="wf-other-line", worktree_path=str(_gate_workspace(tmp_path)))
+        node = GraphGateNode(dd, evidence=_all_pass())
+
+        receipt = node.consume(_gate_action(), folder_id=PRINCIPAL, round_no=1)
+
+        assert receipt["status"] == STATUS_FAILED
+        assert receipt["reason"] == CODE_NOT_DISPATCHER
+        assert dd.resumed == []
+
+    def test_an_invalid_payload_is_a_schema_refusal(self, tmp_path: Path) -> None:
+        dd = FakeDd(worktree_path=str(_gate_workspace(tmp_path)))
+        node = GraphGateNode(dd, evidence=_all_pass())
+        action = _gate_action()
+        action["payload"]["verdict"] = "MAYBE"
+
+        receipt = node.consume(action, folder_id=PRINCIPAL, round_no=1)
+
+        assert receipt["status"] == STATUS_FAILED
+        assert receipt["reason"] == REASON_PAYLOAD_SCHEMA
         assert dd.resumed == []
 
     def test_the_six_required_obligations_are_exactly_named(self) -> None:
@@ -438,199 +472,137 @@ class TestSelfGateDelivery:
         assert render_rationale(_all_pass()).count("=") >= 6
 
 
-class TestS10DeliveryMustLand:
-    def test_resume_that_was_not_consumed_is_refused_with_the_unit_exit_code(
+class TestS10ConsumptionIsHonest:
+    """S10 on the new path: the receipt is the consumption evidence, so it
+    must never claim a consumption the single's own state contradicts."""
+
+    def test_a_resume_that_was_not_consumed_records_the_parked_read_back(
         self, tmp_path: Path
     ) -> None:
-        dd = FakeDd(consume_on_resume=False, resume_exit_code="75/TEMPFAIL")
-        result = deliver_decision(
-            line=DD_ID,
-            decision=DECISION_APPROVE,
-            reason="live",
-            principal=PRINCIPAL,
-            run_root=tmp_path,
-            lines=[],
-            dd=dd,
+        dd = FakeDd(
+            worktree_path=str(_gate_workspace(tmp_path)),
+            consume_on_resume=False,
         )
-        assert result.status == OUTCOME_REFUSED
-        assert result.code == CODE_GATE_NOT_CONSUMED
-        assert "75/TEMPFAIL" in result.message
-        assert dd.refusals
-        assert dd.refusals[0]["code"] == CODE_GATE_NOT_CONSUMED
-        assert dd.refusals[0]["exit_code"] == "75/TEMPFAIL"
+        node = GraphGateNode(dd, evidence=_all_pass())
 
-    def test_missing_workspace_is_refused_before_any_unit_starts(self, tmp_path: Path) -> None:
+        receipt = node.consume(_gate_action(), folder_id=PRINCIPAL, round_no=1)
+
+        assert receipt["status"] == STATUS_CONSUMED
+        assert receipt["post_release_state"] == "awaiting_gate", (
+            "the receipt must record honestly that the single stayed parked"
+        )
+
+    def test_a_missing_workspace_fails_the_release_before_any_resume(self, tmp_path: Path) -> None:
         dd = FakeDd(worktree_path="/nonexistent/workspace/path")
-        result = deliver_decision(
-            line=DD_ID,
-            decision=DECISION_APPROVE,
-            reason="live",
-            principal=PRINCIPAL,
-            run_root=tmp_path,
-            lines=[],
-            dd=dd,
-        )
-        assert result.status == OUTCOME_REFUSED
-        assert result.code == CODE_WORKSPACE_MISSING
+        node = GraphGateNode(dd, evidence=_all_pass())
+
+        receipt = node.consume(_gate_action(), folder_id=PRINCIPAL, round_no=1)
+
+        assert receipt["status"] == STATUS_FAILED
+        assert receipt["reason"] == "release_refused"
         assert dd.resumed == []
-        assert dd.refusals
-        assert dd.refusals[0]["code"] == CODE_WORKSPACE_MISSING
 
-    def test_recording_refusal_is_best_effort_so_a_fake_without_it_still_refuses(
-        self, tmp_path: Path
-    ) -> None:
-        dd = FakeDd(consume_on_resume=False, resume_exit_code="75/TEMPFAIL")
 
-        dd.record_gate_refusal = None  # type: ignore[method-assign]
+class TestS11SecondDeliveryPathDeleted:
+    def test_a_dev_fg_target_down_the_decision_surface_is_refused(self) -> None:
+        from fleet_graph.decision_mcp import (
+            CODE_DD_NOT_DELIVERABLE_HERE,
+            OUTCOME_REFUSED,
+            deliver_decision,
+        )
 
         result = deliver_decision(
             line=DD_ID,
-            decision=DECISION_APPROVE,
+            decision="APPROVE",
             reason="live",
-            principal=PRINCIPAL,
-            run_root=tmp_path,
+            run_root=Path("/tmp"),
             lines=[],
-            dd=dd,
         )
         assert result.status == OUTCOME_REFUSED
-        assert result.code == CODE_GATE_NOT_CONSUMED
+        assert result.code == CODE_DD_NOT_DELIVERABLE_HERE
 
+    def test_the_deleted_dd_delivery_symbols_are_gone(self) -> None:
+        import fleet_graph.decision_mcp as surface
+        import fleet_graph.graphs.runner as runner
 
-class TestS11ForeignDeliveryRefused:
-    def test_form_a_with_a_non_dispatching_principal_is_refused(self) -> None:
-        from fleet_graph.decision_bridge.owners import OWNER_KIND_DD, OwnerTarget
-        from fleet_graph.decision_mcp import deliver_decision_dd
+        for gone in (
+            "deliver_decision_dd",
+            "TARGET_KIND_DD",
+            "_deliver_dd",
+            "CODE_NOT_DISPATCHING_LINE",
+        ):
+            assert not hasattr(surface, gone), gone
+        for gone in ("run_self_gate", "deliver_self_gate_decision"):
+            assert not hasattr(runner, gone), gone
 
-        class Source:
-            def __init__(self) -> None:
-                self.target = OwnerTarget(
-                    kind=OWNER_KIND_DD,
-                    id=DD_ID,
-                    generation=1,
-                    question_note_id="q-1",
-                    card_entity_id="card-1",
-                    state="awaiting_gate",
-                    dispatched_by=PRINCIPAL,
-                )
+    def test_the_gate_node_is_the_only_release_consumer_wired(self) -> None:
+        from fleet_graph.graphs import goal_line
+        from fleet_graph.graphs.dd_gate import DdGatePort
 
-            def discover_all(self) -> list[OwnerTarget]:
-                return [self.target]
-
-            def _control_plane(self) -> Any:
-                from fleet_graph.dd.control_plane import ControlPlaneError
-
-                class P:
-                    def get(self, development_id: str) -> dict[str, Any]:
-                        raise ControlPlaneError("DEVELOPMENT_NOT_FOUND", "nope")
-
-                return P()
-
-        result = deliver_decision_dd(
-            target_id=DD_ID,
-            decision=DECISION_APPROVE,
-            reason="live",
-            dd_source=Source(),
-            principal="wf-foreign",
+        deps = goal_line.LineDeps(
+            coordinator=object(),
+            worker=object(),
+            inbox=object(),
+            artifacts=object(),
+            gate=None,
         )
-        assert result.status == OUTCOME_REFUSED
-        assert result.code == CODE_NOT_DISPATCHING_LINE
-
-    def test_form_a_with_the_dispatching_principal_is_authorized(self) -> None:
-        from fleet_graph.decision_bridge.owners import OWNER_KIND_DD, RESUME_RESUMED, OwnerTarget
-        from fleet_graph.decision_mcp import deliver_decision_dd
-
-        class Source:
-            def __init__(self) -> None:
-                self.target = OwnerTarget(
-                    kind=OWNER_KIND_DD,
-                    id=DD_ID,
-                    generation=1,
-                    question_note_id="q-1",
-                    card_entity_id="card-1",
-                    state="awaiting_gate",
-                    dispatched_by=PRINCIPAL,
-                )
-                self.resumed: list[Any] = []
-
-            def discover_all(self) -> list[OwnerTarget]:
-                return [self.target]
-
-            def _control_plane(self) -> Any:
-                from fleet_graph.dd.control_plane import ControlPlaneError
-
-                class P:
-                    def get(self, development_id: str) -> dict[str, Any]:
-                        raise ControlPlaneError("DEVELOPMENT_NOT_FOUND", "nope")
-
-                return P()
-
-            def resume(self, target: OwnerTarget, action_key: str) -> Any:
-                from fleet_graph.decision_bridge.owners import OwnerResult
-
-                self.resumed.append((target.id, action_key))
-                return OwnerResult(RESUME_RESUMED, "resumed")
-
-        result = deliver_decision_dd(
-            target_id=DD_ID,
-            decision=DECISION_APPROVE,
-            reason="live",
-            dd_source=Source(),
-            principal=PRINCIPAL,
-        )
-        assert result.status == OUTCOME_DELIVERED
+        assert deps.gate is None
+        assert hasattr(deps, "dd_awaiting_gate_development_id")
+        assert DdGatePort is not None
 
 
-class TestS12RunnerCallSiteCoverage:
-    def test_the_runner_self_gate_call_site_is_a_production_call(self, tmp_path: Path) -> None:
-        """The S12 instance: runner.py's ``deliver_self_gate_decision`` call is a
-        real production call that the mechanically-enumerated mutation targets see
-        (see ``TestMutationEnumerationAndReceipt``), and it is *covered* by the
-        frozen acceptance: driving ``run_self_gate`` reaches the call site."""
+class TestS12GateNodeCallSiteCoverage:
+    def test_the_gate_node_obligation_call_is_a_production_call(self, tmp_path: Path) -> None:
+        """The S12 instance, R3 shape: the gate node's mechanical obligation
+        collection is a real production call the mechanically-enumerated
+        mutation targets see, and the gate node itself is *covered* by the
+        frozen acceptance (the consumption tests drive it end to end)."""
+        import inspect
+
+        from fleet_graph.graphs import dd_gate
+
+        source = inspect.getsource(dd_gate)
+        assert "return collect_gate_evidence(" in source
 
         added = {
-            "src/fleet_graph/graphs/runner.py": [
-                (1, "    result = deliver_self_gate_decision("),
+            "src/fleet_graph/graphs/dd_gate.py": [
+                (1, "        return collect_gate_evidence("),
             ]
         }
-        calls = [t.call for t in enumerate_mutation_targets(added)]
-        assert "deliver_self_gate_decision" in calls
+        calls = [target.call for target in enumerate_mutation_targets(added)]
+        assert "collect_gate_evidence" in calls
 
 
-def test_runner_self_gate_is_covered_by_the_frozen_acceptance(monkeypatch, tmp_path: Path) -> None:
+def test_runner_wires_the_gate_node_and_the_wake_anchor(tmp_path: Path) -> None:
+    """The wake identity and the gate plane flow through ``build_line``: the
+    wake rides the coordinator envelope, and a bound plane becomes a real
+    gate node."""
     import fleet_graph.graphs.runner as runner
 
-    calls: list[dict[str, Any]] = []
-
-    def fake_deliver(**kwargs: Any) -> None:
-        calls.append(kwargs)
-
-    monkeypatch.setattr(runner, "deliver_self_gate_decision", fake_deliver)
     config = runner.LineConfig(
         folder_id=PRINCIPAL,
         seat="s",
         run_root=tmp_path,
         dd_awaiting_gate_development_id=DD_ID,
+        dd_gate_plane=object(),
     )
-    assert runner.run_self_gate(config, dd=object()) is None
-    assert calls
-    assert calls[0]["development_id"] == DD_ID
-    assert calls[0]["principal"] == PRINCIPAL
+    _graph, deps = runner.build_line(config)
+    assert deps.dd_awaiting_gate_development_id == DD_ID
+    assert isinstance(deps.gate, GraphGateNode)
+    assert deps.gate.plane is config.dd_gate_plane
 
 
-def test_an_ordinary_run_is_not_a_self_gate_wake(tmp_path: Path) -> None:
+def test_an_unbound_gate_plane_leaves_the_release_failed_closed(tmp_path: Path) -> None:
     import fleet_graph.graphs.runner as runner
 
     config = runner.LineConfig(folder_id=PRINCIPAL, seat="s", run_root=tmp_path)
-    assert runner.run_self_gate(config) is None
-
-
-# --- production wiring (rework rc-aa907dfb): the wake reaches the line and ---
-# --- the six obligations are mechanically produced, never passed empty    ---
+    _graph, deps = runner.build_line(config)
+    assert deps.gate is None
 
 
 def _fake_agent_run(tmp_path: Path) -> str:
     """A fake agent-run binary whose envelope faults the coordinator adapter,
-    so run_line can be driven past the self-gate seal without a gateway."""
+    so run_line can be driven past the wake envelope without a gateway."""
     import sys
 
     fake_run = Path(__file__).parent / "fakes" / "fake_agent_run.py"
@@ -799,28 +771,17 @@ def test_a_terminal_wake_is_an_ordinary_run_not_a_gate_run(tmp_path: Any) -> Non
     assert launcher.launched[0].dd_awaiting_gate_development_id == ""
 
 
-class TestRunLineProducesTheObligationsMechanically:
-    """Finding 2 (major), fixed: ``run_line`` itself mechanically collects
-    the six obligations for a dd wake; an ordinary run collects nothing."""
+class TestRunLineCarriesTheWakeIntoTheEnvelope:
+    """R3 shape of the rc-aa907dfb fix: ``run_line`` no longer pre-delivers a
+    gate verdict; the wake identity rides the coordinator envelope as a fact,
+    and the release travels only through the graph's gate node."""
 
-    def test_a_dd_wake_run_line_delivers_mechanically_collected_evidence(
+    def test_a_dd_wake_run_line_injects_the_wake_into_the_coordinator_envelope(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         import fleet_graph.graphs.runner as runner
         from fleet_graph.graphs.adapters import CoordinatorFault
 
-        sentinel = ["the", "six", "obligations"]
-        deliver_calls: dict[str, Any] = {}
-        collect_calls: list[dict[str, Any]] = []
-
-        monkeypatch.setattr(
-            runner,
-            "collect_gate_evidence",
-            lambda **kwargs: collect_calls.append(kwargs) or sentinel,
-        )
-        monkeypatch.setattr(
-            runner, "deliver_self_gate_decision", lambda **kwargs: deliver_calls.update(kwargs)
-        )
         config = runner.LineConfig(
             folder_id="wf-1",
             seat="s",
@@ -832,22 +793,20 @@ class TestRunLineProducesTheObligationsMechanically:
         with pytest.raises(CoordinatorFault):
             runner.run_line(config)
 
-        assert collect_calls == [{"development_id": DD_ID}]
-        assert deliver_calls["evidence"] is sentinel
-        assert deliver_calls["development_id"] == DD_ID
-        record = json.loads((tmp_path / "run" / "self-gate.json").read_text(encoding="utf-8"))
-        assert record["development_id"] == DD_ID
+        envelope = json.loads(
+            (tmp_path / "run" / "coord" / "round-1-input.json").read_text(encoding="utf-8")
+        )
+        assert envelope["dd_awaiting_gate_development_id"] == DD_ID
+        assert not (tmp_path / "run" / "self-gate.json").exists(), (
+            "no pre-graph gate delivery may happen any more"
+        )
 
-    def test_an_ordinary_run_line_collects_no_gate_evidence(
+    def test_an_ordinary_run_line_carries_no_wake_anchor(
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         import fleet_graph.graphs.runner as runner
         from fleet_graph.graphs.adapters import CoordinatorFault
 
-        def no_collection(**kwargs: Any) -> Any:
-            raise AssertionError("an ordinary run must not collect gate evidence")
-
-        monkeypatch.setattr(runner, "collect_gate_evidence", no_collection)
         config = runner.LineConfig(
             folder_id="wf-1",
             seat="s",
@@ -857,6 +816,11 @@ class TestRunLineProducesTheObligationsMechanically:
         )
         with pytest.raises(CoordinatorFault):
             runner.run_line(config)
+
+        envelope = json.loads(
+            (tmp_path / "run" / "coord" / "round-1-input.json").read_text(encoding="utf-8")
+        )
+        assert "dd_awaiting_gate_development_id" not in envelope
 
 
 # --- the mechanical collector (dd/self_gate_evidence.py) --------------------
