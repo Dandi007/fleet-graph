@@ -1,0 +1,12 @@
+{
+ "development_id": "dev-fg-d9370430e0ce",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "wf-4601c8",
+ "decision_message_id": "msg_01M1R8216FCWNA54A9VEAN4C3G",
+ "rationale": "本线按 goal §四·一 A-2 自判（D5：decided_by=dispatched_by=wf-4601c8；发布者为该线 coordinator 座位的 mcp-gateway，本线 alias token 迁移属 R6）。六项取证全绿：①三方验收逐字一致——implement attempt2 回执、acceptance rev8、supervisor 审计一次性 worktree 复跑三方均为 pytest 28 passed/0 failed、make verify 3028 passed/0 failed exit 0、testenv echo 'up=0 lines=21 c13=1 c14=1 c18=1 c19=1 down=0 prod_references=0'；②改动未越界——scope 边界 PASS，diff manifest 26 文件（产品 15+dispatch 元数据 11），identity_unedited_since_bootstrap PASS；③零测试删除——test_r4 24→28、make verify 3024→3028 只增未删，acceptance_no_skips PASS；④亲跑验收——审计在一次性 worktree 复跑 3 条冻结 argv 全绿（acceptance_rerun PASS），dd acceptance e11 同绿；⑤全量回归对基线——make verify 0 failed，verify-rebuild 21/21 PASS、prod_references=0；⑥变异回执——final_review rf-9efa5741 APPROVE（e9），continuous rc APPROVE（e8），gate 只核回执。审计唯一红项 receipt_chain_linked（rev5.parent=e07fa440≠rev4.receipt=0970a521）经本线核链为误报：rev4/rev5 为同一 attempt-2 回执的 failed/success 双重落款（receipt_digest 同为 0970a521，parent 同为 re-prepare handoff e07fa440，成因即 goal §七 X-4 的 e5 误分类重跑路径），且 rev6.parent=0970a521=rev5.receipt_digest，链在下一修订即复联；git 级 provenance（bootstrap 祖先、identity 绑定、frozen acceptance digest、祖先链）由审计独立验证全绿。X-4 类账本落款缺陷由本线另立改动单修复，不阻塞本单放行。",
+ "question_note_id": "msg_01M1R543ENXDGD8N8ZXGDM30JX",
+ "card_entity_id": "msg_01M1QYYSEPF5REPQ3ZVPJNZXRA",
+ "output_commit": "f5d900d0bd8f90f6c2e6031453008949f395b2d5"
+}
