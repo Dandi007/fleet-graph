@@ -242,6 +242,14 @@
       "alias": "ronin-rebuild",
       "enabled": true,
       "_provenance": "2026-09-05 第十五波入编（用户 2026-09-04 23:5x 令「开新的 Workboard，核心是端到端地把旧引擎全部替换成新的开发方式，最终以新的形态落地」）：浪人舰队引擎重建线，wf-8d9737 的后继。正本 = 宪法页 v2（L0 十三条 + L1 七条）与目标架构页（D1–D20），本线只实现不改判据；里程碑 R0–R7 在 wf-4601c8/goal.md，验收标准 v2 二十一项在其 design.md §4。改动单目标分支 release/wf-4601c8（自 release/wf-8d9737 @29f2130 切出）。入编时 scripts/verify-rebuild.sh 尚不存在（liveness 诚实红），R0 补成逐项报、exit=失败项数。座位 opencode-glm53（probe.py 已注册探针）；implement glm-5.3-flash，两道 review glm-5.3，经 development_create.stage_models 传入。"
+    },
+    {
+      "folder_id": "wf-194310",
+      "seat": "opencode-gpt-sol",
+      "max_rounds": 9999,
+      "alias": "ronin-adhd",
+      "enabled": true,
+      "_provenance": "2026-09-05 第十六波入编（用户令「给 goal-agent 去端到端实现吧，等他实现完了你来验收」）：ADHD 多模型化线。把上游 UditAkhourii/adhd（并行发散 ideation，tree-of-thought with pruning）的唯一 LLM 出口从 @anthropic-ai/claude-agent-sdk 换成本机 agent-run，使发散真正跑在多厂模型上（分歧长在权重里，而非同一份权重扮演不同角色）；再加 MCP 异步工单门面，结果经 work folder 交接。改动仓 /data/code/self/adhd（self，Dandi007/adhd private fork），分支 feat/agent-runtime-adapter 自 upstream/main@16dc239 切出；S2 另需改 agent-runtime 的 profiles/routes.yaml 补两条 chain，该改动走 PR 不自行 merge。goal/spec/design/findings/golden-order SSoT 全在 wf-194310，验收命令四批 S1–S4 已按铁律 1 真机空跑（S2 现红于 No default chain，正是待办本身；S3 的 work-folder MCP 断言路径实测 PASS）。座位 opencode-gpt-sol：避 dsv4pro 集中度（18/30），terra 留给需 katana-memory-mcp 的线，glm53 刚给 wf-4601c8；本线是 TypeScript 实现 + 接口设计密集，gpt-5.6-sol 经 agent-run 实测 6.41s 正常。"
     }
   ],
   "line_environment": {
