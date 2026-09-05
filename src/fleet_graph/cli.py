@@ -639,6 +639,10 @@ def _dd_run(args: argparse.Namespace) -> int:
         run_root=run_root,
         remote_url=args.remote_url,
         remote_ref=args.remote_ref,
+        # R4: the order-private audit branch stage sealers publish to; empty
+        # keeps the pre-R4 layout where remote_ref itself carries the seals.
+        audit_ref=args.audit_ref,
+        record_path=args.record_file,
         # The identity the development committed wins over HEAD: by now HEAD
         # has moved past the base the spec was approved against.
         target_base_commit=target_base,
@@ -1706,6 +1710,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dd_run.add_argument("--remote-url", required=True)
     dd_run.add_argument("--remote-ref", required=True, help="refs/heads/... durable ref")
+    dd_run.add_argument(
+        "--audit-ref",
+        default="",
+        help="R4: refs/heads/dd/<dev> audit branch stage sealers publish to "
+        "(empty = remote_ref carries the seals, pre-R4 layout)",
+    )
+    dd_run.add_argument(
+        "--record-file",
+        default="",
+        help="R4: admission record.json path; configure's rebase freezes the "
+        "post-rebase base into it (empty = records untouched)",
+    )
     dd_run.add_argument("--root-digest", required=True, help="sha256: of the initial handoff")
     dd_run.add_argument("--spec-commit", default=None, help="defaults to the workspace HEAD")
     dd_run.add_argument(

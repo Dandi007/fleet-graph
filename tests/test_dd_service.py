@@ -529,6 +529,7 @@ def test_the_fake_control_plane_mirrors_the_real_surface() -> None:
         "dispatched_by",
         "timeouts",
         "stage_models",
+        "target_ref",
     }
     gate = {
         name

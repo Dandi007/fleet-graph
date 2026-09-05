@@ -190,7 +190,29 @@ STATE_COMPLETE = "complete"
 # Terminal states are the pipeline's own vocabulary, passed through:
 # complete / failed / refused / bounds / fault.
 
-_HEX40 = re.compile(r"^[0-9a-f]{40}$")
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+
+#: R4（一线一分支）: the durable ref of a dispatched development is the
+#: dispatching line's own release branch -- one line, one repo, one branch.
+#: The order-private audit branch (`refs/heads/dd/<development_id>`) stays as
+#: the seal-publishing ref, recorded separately as `audit_ref`.
+RELEASE_REF_PREFIX = "refs/heads/release/"
+AUDIT_REF_PREFIX = "refs/heads/dd/"
+
+#: Structured refusal: the dispatch intent named a target branch other than
+#: the dispatching line's own release branch (another line's release, main,
+#: any other repo branch). The refusal names the conflicting ref (拒绝留痕).
+CODE_TARGET_REF_CROSS_LINE = "TARGET_REF_CROSS_LINE"
+
+
+def release_line_ref(line_id: str) -> str:
+    """The line branch for one line id: `refs/heads/release/<line-id>`."""
+    return f"{RELEASE_REF_PREFIX}{line_id}"
+
+
+def audit_branch_ref(development_id: str) -> str:
+    """The order-private audit branch: `refs/heads/dd/<development_id>`."""
+    return f"{AUDIT_REF_PREFIX}{development_id}"
 
 
 class ControlPlaneError(RuntimeError):
@@ -239,6 +261,13 @@ CLASS_ENVIRONMENT_CONTRACT = "environment_contract"
 CLASS_IMPLEMENTATION = "implementation"
 CLASS_FABRICATION = "fabrication"
 CLASS_REJECTED = "rejected"
+#: R4（一线一分支）: the branch advanced under the order -- configure could not
+#: rebase the bootstrap/spec material onto the line branch head (rebase
+#: conflict), or the merger found the remote release branch no longer at the
+#: frozen base. The spec explicitly rules this NOT an environment error: the
+#: remedy is a fresh dispatch from the new head (the reconfigure exit), and it
+#: is never read as a fault signal.
+CLASS_SPEC_CONFLICT = "spec_conflict"
 
 EXIT_RECONFIGURE = "reconfigure"
 EXIT_REWORK = "rework"
@@ -280,8 +309,22 @@ REJECTION_CODES = frozenset(
     }
 )
 
+#: R4 branch-advance conflicts (configure rebase incompatible / merger remote
+#: head no longer at the frozen base). Classified as `CLASS_SPEC_CONFLICT` --
+#: explicitly not environment, not implementation, not a fault -- with the
+#: reconfigure exit: the line re-runs configure from the advanced head (a new
+#: dispatch freezes the new base).
+SPEC_CONFLICT_CODES = frozenset(
+    {
+        "REBASE_SPEC_INCOMPATIBLE",
+        "RELEASE_HEAD_ADVANCED",
+    }
+)
+
 #: The classes a downstream supervision plane reads as a *fault*. `rejected`
-#: is deliberately absent: human_gate REJECT is a verdict, not a fault.
+#: is deliberately absent: human_gate REJECT is a verdict, not a fault. R4's
+#: `spec_conflict` (branch advanced under the order) is absent too: it is the
+#: spec's own "not an environment error" class, remedied by re-dispatch.
 FAULT_CLASSES = frozenset({CLASS_ENVIRONMENT_CONTRACT, CLASS_IMPLEMENTATION, CLASS_FABRICATION})
 
 #: Legacy results carry the code only inside the synthesized reason text
@@ -322,6 +365,11 @@ def classify_failure(
         # signal; the exit stays the fresh-generation rework, so a rejection
         # still exits deterministically on a new generation.
         cls, exit_, retryable = CLASS_REJECTED, EXIT_REWORK, True
+    elif code in SPEC_CONFLICT_CODES:
+        # R4 branch-advance conflict: the spec/branch pair moved under the
+        # order. Explicitly NOT an environment error (the spec's own ruling);
+        # the exit is reconfigure -- a fresh dispatch from the advanced head.
+        cls, exit_, retryable = CLASS_SPEC_CONFLICT, EXIT_RECONFIGURE, True
     elif code in IMPLEMENTATION_CODES:
         cls, exit_, retryable = CLASS_IMPLEMENTATION, EXIT_REWORK, True
     else:
@@ -693,6 +741,15 @@ class DdLaunchSpec:
     #: generation's run root. Empty means the launch is not a gate rework and
     #: carries no `--gate-reject-file` -- byte-identical to before.
     gate_reject_file: str = ""
+    #: R4: the order-private audit branch (refs/heads/dd/<dev>) the stage
+    #: sealers publish to, keeping the receipt chain a chain. Empty means the
+    #: legacy layout where remote_ref itself is the seal-publishing ref.
+    audit_ref: str = ""
+    #: R4: the admission record file. Configure's first-step rebase freezes a
+    #: post-rebase base into it, so every later launch carries the frozen
+    #: base. Empty (never passed) leaves the record untouched -- byte-for-byte
+    #: the pre-R4 launch shape.
+    record_file: str = ""
     working_directory: str = DEFAULT_WORKING_DIRECTORY
     executable: str = DEFAULT_EXECUTABLE
     environment: dict[str, str] = field(default_factory=dict)
@@ -735,6 +792,12 @@ class DdLaunchSpec:
             self.remote_url,
             "--remote-ref",
             self.remote_ref,
+        ]
+        if self.audit_ref and self.audit_ref != self.remote_ref:
+            argv += ["--audit-ref", self.audit_ref]
+        if self.record_file:
+            argv += ["--record-file", self.record_file]
+        argv += [
             "--root-digest",
             self.root_digest,
             # The admitted, persisted target base is forwarded verbatim so the
@@ -832,6 +895,7 @@ class DdControlPlane:
         dispatched_by: str = "",
         timeouts: dict[str, int] | None = None,
         stage_models: dict[str, str] | None = None,
+        target_ref: str = "",
     ) -> dict[str, Any]:
         """Admit one development: derive everything, bootstrap, record.
 
@@ -842,6 +906,20 @@ class DdControlPlane:
         subject) that dispatched this development; it is recorded and forwarded
         to the runner as the `dispatched_by` worker-run label. Empty means no
         finer provenance was recorded.
+
+        R4（一线一分支）: a dispatch from a line is durable on that line's own
+        release branch -- `remote_ref` derives as
+        `refs/heads/release/<dispatched_by>`, and the order-private audit
+        branch (`refs/heads/dd/<development_id>`) is kept in the separate
+        `audit_ref` field for seal publishing and chain verification. An
+        admission that carries no `dispatched_by` has no line branch and keeps
+        the legacy durable ref (`remote_ref == audit_ref == refs/heads/dd/…`).
+
+        `target_ref` (R4) is an explicitly requested target branch. A request
+        naming any branch other than the dispatching line's own release branch
+        -- another line's release, main, any other repo branch -- is refused
+        with `TARGET_REF_CROSS_LINE`, naming the conflicting ref (b1-scope
+        family; the refusal is the admission's trace).
 
         `timeouts` optionally overrides the per-stage run fence (stage_id ->
         positive seconds); it is validated against the contract's stage ids and
@@ -874,7 +952,6 @@ class DdControlPlane:
         spec_digest = digest_of(spec)
         development_id = derive_development_id(repo, spec_digest, base)
         dev_root = self.root / development_id
-        dispatched_by = (dispatched_by or "").strip()
         validated_timeouts = validate_timeouts(timeouts)
 
         existing = self._read_record_if_any(development_id)
@@ -898,7 +975,28 @@ class DdControlPlane:
 
         self._refuse_foreign_binding(repo, development_id)
         remote_url = self._origin_url(repo)
-        remote_ref = f"refs/heads/dd/{development_id}"
+        # R4: the durable ref is the dispatching line's release branch; the
+        # order-private audit branch moves to its own field. An admission
+        # without provenance has no line branch -- the legacy durable ref
+        # stands, unchanged, and audit_ref stays empty (same ref).
+        dispatched_by = (dispatched_by or "").strip()
+        if dispatched_by:
+            remote_ref = release_line_ref(dispatched_by)
+        else:
+            remote_ref = audit_branch_ref(development_id)
+        audit_ref = (
+            audit_branch_ref(development_id)
+            if remote_ref != audit_branch_ref(development_id)
+            else ""
+        )
+        requested_ref = (target_ref or "").strip()
+        if requested_ref and requested_ref != remote_ref:
+            raise ControlPlaneError(
+                CODE_TARGET_REF_CROSS_LINE,
+                f"dispatch names target branch {requested_ref!r}; line "
+                f"{dispatched_by or '(unattributed)'!r} admits only its own "
+                f"{remote_ref!r} (one line, one branch)",
+            )
         acceptance_commands = derive_acceptance_commands(spec)
 
         bootstrap_commit = self._bootstrap(repo, development_id, spec, base)
@@ -923,6 +1021,10 @@ class DdControlPlane:
             "repo_path": str(repo),
             "remote_url": remote_url,
             "remote_ref": remote_ref,
+            # R4: the order-private audit branch (refs/heads/dd/<dev>) -- the
+            # ref stage sealers publish to so the chain stays a chain. Empty
+            # when it coincides with remote_ref (legacy unattributed records).
+            "audit_ref": audit_ref,
             "target_base_commit": base,
             "spec_digest": spec_digest,
             "spec_size_bytes": len(spec),
@@ -964,7 +1066,11 @@ class DdControlPlane:
                 "target_base_commit": record["target_base_commit"],
                 "root_handoff_digest": record["root_handoff_digest"],
             },
-            "remote": {"url": record["remote_url"], "ref": record["remote_ref"]},
+            "remote": {
+                "url": record["remote_url"],
+                "ref": record["remote_ref"],
+                "audit_ref": str(record.get("audit_ref") or ""),
+            },
             "acceptance_commands": record["acceptance_commands"],
             "seats": dict(record.get("seats") or {}),
             "seats_source": dict(record.get("seats_source") or {}),
@@ -1081,7 +1187,7 @@ class DdControlPlane:
                 f"cannot resolve {ref!r} in {repo}: {resolved.stderr.strip()[:200]}",
             )
         commit = resolved.stdout.strip()
-        if not _HEX40.fullmatch(commit):
+        if not HEX40.fullmatch(commit):
             raise ControlPlaneError("TARGET_BASE_UNRESOLVED", f"{ref!r} resolved to {commit!r}")
         return commit
 
@@ -1505,6 +1611,8 @@ class DdControlPlane:
             plugin_binding=Path(str(record["plugin_binding_path"])),
             remote_url=str(record["remote_url"]),
             remote_ref=str(record["remote_ref"]),
+            audit_ref=str(record.get("audit_ref") or ""),
+            record_file=str(dev_root / RECORD_FILE),
             root_digest=str(record["root_handoff_digest"]),
             target_base_commit=str(record["target_base_commit"]),
             acceptance_commands=[list(c) for c in record.get("acceptance_commands") or []],
@@ -2109,6 +2217,7 @@ class DdControlPlane:
             "worktree_path": record["repo_path"],
             "remote_url": record["remote_url"],
             "remote_ref": record["remote_ref"],
+            "audit_ref": record.get("audit_ref", ""),
             "target_base_commit": record["target_base_commit"],
             "spec_digest": record["spec_digest"],
             "bootstrap_commit": record["bootstrap_commit"],
@@ -2378,6 +2487,10 @@ class DdControlPlane:
     def _remote_ref_matches(self, record: dict[str, Any], head_commit: str) -> bool:
         if not head_commit:
             return False
+        # R4: chain continuity lives on the order-private audit branch (the
+        # ref stage sealers publish); remote_ref is the merger's release
+        # branch. Legacy records without audit_ref verify against remote_ref.
+        ref = str(record.get("audit_ref") or record["remote_ref"])
         try:
             # The remote probe is exactly where egress jitter lands, so it
             # retries transport-class failures under the bounded backoff; a
@@ -2388,7 +2501,7 @@ class DdControlPlane:
                     Path(str(record["repo_path"])),
                     "ls-remote",
                     str(record["remote_url"]),
-                    str(record["remote_ref"]),
+                    ref,
                 ),
                 op_name="ls-remote",
             )
@@ -2900,11 +3013,14 @@ class DdControlPlane:
 
 __all__ = [
     "ACCEPTANCE_FENCE",
+    "AUDIT_REF_PREFIX",
     "CHECKPOINT_FILE",
     "CLASS_ENVIRONMENT_CONTRACT",
     "CLASS_FABRICATION",
     "CLASS_IMPLEMENTATION",
     "CLASS_REJECTED",
+    "CLASS_SPEC_CONFLICT",
+    "CODE_TARGET_REF_CROSS_LINE",
     "DEFAULT_DD_ROOT",
     "DEFAULT_EXECUTABLE",
     "DEFAULT_PLUGIN_BINDING",
@@ -2921,16 +3037,20 @@ __all__ = [
     "LAUNCHES_FILE",
     "RECORD_FILE",
     "REJECTION_CODES",
+    "RELEASE_REF_PREFIX",
     "RESULT_FILE",
+    "SPEC_CONFLICT_CODES",
     "STATUS_FILE",
     "UNIT_PREFIX",
     "ControlPlaneError",
     "DdControlPlane",
     "DdLaunchSpec",
+    "audit_branch_ref",
     "build_h0_handoff",
     "classify_failure",
     "derive_acceptance_commands",
     "derive_development_id",
     "gate_decision_path",
     "merge_result_path",
+    "release_line_ref",
 ]

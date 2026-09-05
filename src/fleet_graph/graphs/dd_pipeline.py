@@ -683,6 +683,15 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             if outcome.event == FAILURE_EVENT
             else {}
         )
+        # R4: a script stage's named machine fact rides on the event trail
+        # (check 14's probe greps events.jsonl for configure's rebase record).
+        # Echoed verbatim from the sealed receipt -- the walker invents
+        # nothing, it observes.
+        rebase_record = (
+            outcome.receipt.get("rebase")
+            if isinstance(outcome.receipt, dict) and "rebase" in outcome.receipt
+            else None
+        )
         return {
             "steps": steps,
             "artifacts": artifacts,
@@ -710,6 +719,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     "event": outcome.event,
                     "attempt": dispatch["attempt"],
                     "output_commit": head_commit,
+                    **({"rebase": rebase_record} if rebase_record is not None else {}),
                     **(
                         {
                             "failure_code": outcome.failure_code,

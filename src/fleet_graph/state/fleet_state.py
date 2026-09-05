@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
 
+from fleet_graph.state.release_position import release_position
 from fleet_graph.state.run_artifacts import (
     line_message_acks_path,
     normalize_waiting_on,
@@ -594,6 +595,14 @@ class FleetStateView:
             # park (``waiting_on`` alone used to report a park the scheduler
             # had retracted, and vice versa).
             park = parked_decision_state(run_root, folder_id)
+            # R4（一线一分支）: the line's branch-position readings -- how far
+            # the line branch trails its origin counterpart (release_behind,
+            # the dispatch-side view check 14's probe reads) and how far the
+            # execution position trails the branch head (deploy_behind, the
+            # D8 frozen-cost view). First-class fields: present even when
+            # unavailable, where they carry an explicit basis instead of a
+            # fabricated 0.
+            position = release_position(self.config.dd_root, folder_id)
             line_objs.append(
                 {
                     "folder_id": folder_id,
@@ -612,6 +621,11 @@ class FleetStateView:
                     # deploy `current` symlink (that would report what the
                     # symlink points at *now*, not what the process exec'd).
                     "release_id": heartbeat.get("release_id") if heartbeat else None,
+                    "release_ref": position["release_ref"],
+                    "release_behind": position["release_behind"],
+                    "deploy_behind": position["deploy_behind"],
+                    "release_behind_basis": position["release_behind_basis"],
+                    "deploy_behind_basis": position["deploy_behind_basis"],
                 }
             )
         return {"schema_version": SCHEMA_VERSION, "lines": line_objs}
