@@ -36,7 +36,9 @@ from fleet_graph.dd.control_plane import (
     release_line_ref,
 )
 from fleet_graph.dd.lifecycle import Lifecycle
+from fleet_graph.graphs.dd_materializer import PluginMaterializer
 from fleet_graph.graphs.dd_pipeline import StageRefused
+from fleet_graph.graphs.dd_runner import DevelopmentConfig, build_pipeline
 from fleet_graph.graphs.dd_scripts import (
     MERGE_PATH,
     MERGED,
@@ -644,6 +646,82 @@ class TestMergerReleasesTheLineBranch:
         released = written["released_commit"]
         assert _remote_head(repo, LINE_REF) == released
         assert "feature.py" in git(repo, "ls-tree", "--name-only", "-r", released)
+
+
+# ----------------------- 密封发布面：build_pipeline 自身的 sealer 接线
+
+
+class TestBuildPipelineSealsOnTheAuditBranch:
+    """Review rc-05e0d170 findings: build_pipeline's own wiring targets the
+    order-private audit branch (publish_ref), never the line's release
+    branch. A seal landing on the release branch stacks machine parts
+    (.dev-dispatch/, .dd-evidence/) onto it and advances it past the frozen
+    base, refusing every merger CAS push with RELEASE_HEAD_ADVANCED."""
+
+    DEV = "dev-r4wire"
+
+    def _config(self, repo: Path, tmp_path: Path, **overrides: Any) -> DevelopmentConfig:
+        defaults: dict[str, Any] = dict(
+            development_id=self.DEV,
+            workspace_path=repo,
+            state_root=tmp_path / "dd" / self.DEV / "state",
+            run_root=tmp_path / "dd" / self.DEV,
+            remote_url=str(_bare(tmp_path)),
+            remote_ref=LINE_REF,
+            target_base_commit="b" * 40,
+            root_handoff_digest="sha256:" + "c" * 64,
+            plugin_binding=object(),
+            head_commit=head(repo),
+            audit_ref=audit_branch_ref(self.DEV),
+        )
+        defaults.update(overrides)
+        return DevelopmentConfig(**defaults)
+
+    def test_every_script_stage_sealer_publishes_to_the_audit_branch(
+        self, tmp_path: Path, line_repo: tuple[Path, Path, str, str]
+    ) -> None:
+        repo, _origin, _base, _advanced = line_repo
+        _graph, deps = build_pipeline(self._config(repo, tmp_path))
+        plugin = PluginMaterializer(
+            builder=object(), binding=object(), target=object()
+        ).sealed_stages
+        script_stages = [s.id for s in LIFECYCLE.stages.values() if s.id not in plugin]
+        assert script_stages, "the lifecycle must leave script stages to seal"
+        for stage_id in script_stages:
+            sealer = deps.materializer.by_stage[stage_id]
+            assert isinstance(sealer, WorkspaceSealer), stage_id
+            assert sealer.remote_ref == audit_branch_ref(self.DEV), stage_id
+            assert sealer.remote_ref != LINE_REF, stage_id
+
+    def test_the_plugin_sealed_stages_publish_to_the_audit_branch_too(
+        self, tmp_path: Path, line_repo: tuple[Path, Path, str, str]
+    ) -> None:
+        repo, _origin, _base, _advanced = line_repo
+        _graph, deps = build_pipeline(self._config(repo, tmp_path))
+        for stage_id in PluginMaterializer(
+            builder=object(), binding=object(), target=object()
+        ).sealed_stages:
+            sealer = deps.materializer.by_stage[stage_id]
+            assert sealer.target.remote_ref == audit_branch_ref(self.DEV)
+
+    def test_a_generation_restart_replays_and_republishes_on_the_audit_branch(
+        self, tmp_path: Path, line_repo: tuple[Path, Path, str, str]
+    ) -> None:
+        repo, _origin, _base, _advanced = line_repo
+        run_root = tmp_path / "dd" / self.DEV / "g2"
+        _graph, deps = build_pipeline(self._config(repo, tmp_path, run_root=run_root, generation=2))
+        assert deps.replayer is not None
+        assert deps.replayer.remote_ref == audit_branch_ref(self.DEV)
+        assert deps.replayer.remote_ref != LINE_REF
+
+    def test_without_an_audit_branch_the_legacy_ref_stays_the_publish_ref(
+        self, tmp_path: Path, line_repo: tuple[Path, Path, str, str]
+    ) -> None:
+        repo, _origin, _base, _advanced = line_repo
+        _graph, deps = build_pipeline(self._config(repo, tmp_path, audit_ref=""))
+        for stage_id, sealer in deps.materializer.by_stage.items():
+            if isinstance(sealer, WorkspaceSealer):
+                assert sealer.remote_ref == LINE_REF, stage_id
 
 
 # ------------------------------------------------------------ 元判据

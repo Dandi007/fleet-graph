@@ -241,6 +241,12 @@ def build_pipeline(
             "dispatching a new implementer",
             missing=["new-implement-prompt", "new-agent-run"],
         )
+    # R4: the ref each surface publishes to. The receipt chain's continuity
+    # lives on the order-private audit branch (stage sealers); the merger's
+    # CAS push lands on remote_ref -- the line's release branch. An empty
+    # audit_ref means the legacy layout where both are remote_ref.
+    publish_ref = config.audit_ref or config.remote_ref
+
     if replayer is None and config.generation > 1 and not gate_rework:
         # ...and a generation whose own tree seals a rejecting gate verdict
         # for the previous generation but whose launch carries no rework
@@ -278,7 +284,12 @@ def build_pipeline(
                 development_id=config.development_id,
                 generation=config.generation,
                 remote_url=config.remote_url,
-                remote_ref=config.remote_ref,
+                # The seals being replayed live on the audit branch
+                # (publish_ref); verifying and re-publishing the chain must
+                # target the same ref or a line dispatch's replay would land
+                # receipts on the release branch and advance it past the
+                # frozen base.
+                remote_ref=publish_ref,
                 lifecycle=lifecycle,
                 run_config=dict(config.run_config or {}),
             )
@@ -329,11 +340,7 @@ def build_pipeline(
         reprepare_worktree=config.reprepare_worktree,
         observe=observe,
     )
-    # R4: the ref each surface publishes to. The receipt chain's continuity
-    # lives on the order-private audit branch (stage sealers); the merger's
-    # CAS push lands on remote_ref -- the line's release branch. An empty
-    # audit_ref means the legacy layout where both are remote_ref.
-    publish_ref = config.audit_ref or config.remote_ref
+    # publish_ref, decided above, is what the plugin's sealers publish to.
 
     sealer = PluginMaterializer(
         builder=builder,
@@ -415,11 +422,17 @@ def build_pipeline(
         materializer=StageMaterializers(
             by_stage={
                 # Everything the plugin does not seal commits its own output.
+                # R4: those seals publish to the audit branch (publish_ref) --
+                # a line dispatch's remote_ref is the release branch, and a
+                # seal landing there would stack machine parts
+                # (.dev-dispatch/, .dd-evidence/) onto the line branch and
+                # advance it past the frozen base, refusing every merger CAS
+                # push with RELEASE_HEAD_ADVANCED.
                 **{
                     name: WorkspaceSealer(
                         repo=config.workspace_path,
                         remote_url=config.remote_url,
-                        remote_ref=config.remote_ref,
+                        remote_ref=publish_ref,
                         # Egress: the durable-ref publish retries
                         # transport-class failures inside the stage's run
                         # fence; every attempt lands one evidence line.
