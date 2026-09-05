@@ -34,6 +34,7 @@ from fleet_graph.dd.service import (
     WORK_FOLDER_TOOLS,
     build_mcp_server,
     port_is_available,
+    supervisor_principal,
 )
 
 ALL_TOOLS = {
@@ -239,7 +240,9 @@ def test_the_create_tool_admits_only_the_derivation_inputs() -> None:
     """Admission is server-side derivation: no handoff, digest, receipt,
     idempotency or policy parameter exists to guess at.
 
-    Two tuned inputs exist. The per-stage run-fence override `timeouts`
+    R2 图合一 added the outer-gate `principal` (required): the declaring
+    caller identity the gate checks before anything else. Two tuned inputs
+    remain. The per-stage run-fence override `timeouts`
     ({stage_id: positive seconds}) tunes *how* a stage's run is fenced.
     The M4 seat channel `stage_models` ({llm_stage: seat}) freezes which
     seat each agent stage runs under -- validated against the registry and
@@ -249,6 +252,7 @@ def test_the_create_tool_admits_only_the_derivation_inputs() -> None:
     tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
     schema = tools["development_create"].parameters
     assert set(schema["properties"]) == {
+        "principal",
         "repo_path",
         "target_base",
         "spec_text",
@@ -257,7 +261,7 @@ def test_the_create_tool_admits_only_the_derivation_inputs() -> None:
         "timeouts",
         "stage_models",
     }
-    assert schema["required"] == ["repo_path"]
+    assert schema["required"] == ["principal", "repo_path"]
 
 
 def test_the_gate_tool_carries_no_decision() -> None:
@@ -313,6 +317,7 @@ def test_every_supported_tool_drives_the_control_plane_over_the_running_endpoint
         (
             "development_create",
             {
+                "principal": supervisor_principal(),
                 "repo_path": "/data/worktrees/dev-1",
                 "target_base": "refs/remotes/origin/main",
                 "spec_text": "# spec",

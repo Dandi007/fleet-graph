@@ -2148,29 +2148,13 @@ class DdControlPlane:
         rows: list[dict[str, Any]] = []
         next_cursor = None
         for name in ids:
-            status_path = self._dev_root(name) / STATUS_FILE
-            status: dict[str, Any] | None = None
-            if status_path.is_file():
-                try:
-                    status = json.loads(status_path.read_text(encoding="utf-8"))
-                except ValueError:
-                    status = None
-            # A terminal state is immutable, so its cache is trustworthy; a
-            # cached "running"/"created" row can be stale the moment the unit
-            # exits (measured: a failed run listed as running), so anything
-            # non-terminal is recomputed rather than served from the file.
-            if status is None or not status.get("terminal"):
-                status = self.rebuild_status(name)
-            elif "dispatched_by" not in status:
-                # A terminal cache written before `dispatched_by` entered the
-                # read model carries no provenance; backfill it from the
-                # authoritative record (never from worker-run labels) so the
-                # row still attributes the development to its dispatching line.
-                status = {
-                    **status,
-                    "dispatched_by": str(self._record(name).get("dispatched_by") or ""),
-                }
-                write_json_durable(status_path, status)
+            # R2 (wf-4601c8 图合一) single state source: every listed row is
+            # derived from the authorities (record.json + this generation's
+            # result.json, plus the liveness probe) via ``rebuild_status``.
+            # The on-disk status cache is written persistence, never a state
+            # signal -- nothing consumes its content any more, so a stale or
+            # hand-edited cache cannot surface as a status however it drifts.
+            status = self.rebuild_status(name)
             if state and status.get("state") != state:
                 continue
             rows.append(status)

@@ -29,10 +29,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Protocol, TypedDict
+from typing import Annotated, Any, Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import interrupt
+from langgraph.types import Send, interrupt
 
 from fleet_graph.acceptance import STATUS_ERROR, STATUS_NOT_DECLARED
 from fleet_graph.goal.line_message import (
@@ -46,6 +46,7 @@ from fleet_graph.goal_interrupt.contract import (
     prior_terminal_digest,
     resume_key_for,
 )
+from fleet_graph.graphs.dd_subgraph import DdSubgraphPort, merge_dd_results
 from fleet_graph.graphs.guards import LineGuards, PromptVerdict
 from fleet_graph.state.run_artifacts import WAITING_ON_DEFAULT, normalize_waiting_on
 from fleet_graph.work_report import (
@@ -428,6 +429,19 @@ class LineState(TypedDict, total=False):
     #: parks on the line-consumed revision instead of the one current at
     #: registration time. Absent when no reader is wired or the read fails.
     goal_revision: str
+    #: R2 图合一: the coordinator's declared dispatch intents, not yet
+    #: instantiated. Each one becomes exactly one subgraph call via a graph
+    #: edge (Send); the fan-out node clears the list so the routing cannot
+    #: re-instantiate.
+    pending_dispatches: list[dict[str, Any]]
+    #: R2 图合一: the dd subgraph's return values, merged per development by
+    #: the reducer. This is the ONLY dd-terminal channel into the line state:
+    #: no disk file is read as a dd terminal/wake event any more.
+    dd_results: Annotated[dict[str, Any], merge_dd_results]
+    #: R2 图合一: the Send-carried payload channel -- the one development a
+    #: ``dd_dispatch`` task is instantiating. Present only inside that task's
+    #: isolated state view, never persisted anywhere durable.
+    dd_intent: dict[str, Any]
 
 
 class Coordinator(Protocol):
@@ -544,6 +558,13 @@ class LineDeps:
     #: records the matrix fields with honest None values rather than dropping
     #: them -- the field set is the contract, never the guess.
     turn_variables: Any = None
+    #: R2 图合一: the dd subgraph port -- one invoke = one development's
+    #: subgraph execution (admit via the internal ``development_create``
+    #: function, observe via the authority projection). None keeps a line off
+    #: the graph-edge dispatch path entirely: the coordinator's declared
+    #: dispatch intents then stay unfulfilled rather than half-wired, and the
+    #: scheduler's waiting_dd parking (M1) remains that line's dd channel.
+    dd: DdSubgraphPort | None = None
 
     def now(self) -> float | None:
         return self.clock() if self.clock is not None else None
@@ -593,6 +614,33 @@ def _coordinator_input(
     return coord_input
 
 
+def dispatch_intents(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """The well-formed dispatch intents a coordinator result declares (R2).
+
+    ``dispatches`` is the graph-edge channel the coordinator's structured
+    result uses to hand the line one or more development intents. Only
+    well-formed intents (a dict naming both ``repo_path`` and a spec source)
+    survive -- anything else is dropped verbatim, never guessed into a
+    development. The intents are *not* executed here; the graph edge
+    (``Send``) instantiates them, one subgraph call each.
+    """
+    raw = result.get("dispatches")
+    if not isinstance(raw, list):
+        return []
+    intents: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        if not str(entry.get("repo_path") or "").strip():
+            continue
+        if not (
+            str(entry.get("spec_text") or "").strip() or str(entry.get("spec_path") or "").strip()
+        ):
+            continue
+        intents.append(dict(entry))
+    return intents
+
+
 def _verdict_update(
     deps: LineDeps, state: LineState, round_no: int, result: dict[str, Any]
 ) -> LineState:
@@ -639,6 +687,13 @@ def _verdict_update(
         if str(result.get("dd_development_id") or "").strip():
             # M1: the dispatch anchor the scheduler's dd wake facts key on.
             update["dd_development_id"] = str(result["dd_development_id"])
+        intents = dispatch_intents(result)
+        if intents:
+            # R2 图合一: a dispatch declared alongside the park is still
+            # instantiated by the graph edge first -- the fan-out runs before
+            # finalise, so the subgraph return value rides in the same state
+            # the terminal is written from.
+            update["pending_dispatches"] = intents
         return update
 
     if verdict != "continue":
@@ -680,7 +735,11 @@ def _verdict_update(
         deps.guards.record_progress()
 
     deps.guards.accept_prompt(check, prompt, round_no)
-    return {"pending_prompt": prompt, "pending_sha": check.sha256}
+    update: LineState = {"pending_prompt": prompt, "pending_sha": check.sha256}
+    intents = dispatch_intents(result)
+    if intents:
+        update["pending_dispatches"] = intents
+    return update
 
 
 def _timeout_matrix(deps: LineDeps) -> dict[str, Any]:
@@ -1206,7 +1265,16 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     def after_bounds(state: LineState) -> str:
         return "finalise" if state.get("terminal") else "coordinator_turn"
 
-    def after_coordinator(state: LineState) -> str:
+    def after_coordinator(state: LineState) -> str | list[Send]:
+        # R2 图合一: dispatch intents are instantiated by the graph's edge --
+        # one Send per development, each an isolated subgraph execution. This
+        # routing runs before the terminal routes so a dispatch declared
+        # alongside a park still gets its return value into the state the
+        # terminal is written from.
+        if state.get("pending_dispatches") and deps.dd is not None:
+            return [
+                Send("dd_dispatch", {"dd_intent": intent}) for intent in state["pending_dispatches"]
+            ]
         if state.get("terminal"):
             if (
                 deps.interrupt is not None
@@ -1223,6 +1291,56 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         # Prompt was refused; go round again without touching the worker.
         return "check_bounds"
 
+    def dd_dispatch(state: LineState) -> LineState:
+        """R2 图合一的子图实例化节点：一次执行 = 一单一次子图调用。
+
+        The Send payload carries exactly one development's intent
+        (``dd_intent``) -- the fan-out tasks' state views are isolated, and
+        each task merges only its own development into the ``dd_results``
+        reducer channel from the subgraph's RETURN VALUE. No disk file is
+        consulted as a dd terminal/wake event on this path. The cleared
+        ``pending_dispatches`` stops the routing from re-instantiating the
+        same intents after the fan-out joins.
+        """
+        intent = state.get("dd_intent") or {}
+        answer: dict[str, Any] = {}
+        fault: str | None = None
+        if deps.dd is not None:
+            try:
+                answer = deps.dd.invoke({"line_folder": deps.folder_id, "intent": intent})
+            except Exception as exc:
+                # A broken gateway is a fact for the next coordinator turn,
+                # never a silent drop and never a fabricated terminal.
+                fault = f"{type(exc).__name__}: {exc}"[:300]
+        result = answer.get("dd_result") if isinstance(answer, dict) else None
+        update: LineState = {"pending_dispatches": []}
+        if fault is not None:
+            deps.artifacts.append_round(
+                {
+                    "round": state.get("round_no", 1),
+                    "verdict": "dispatch",
+                    "development_id": str(intent.get("development_id") or ""),
+                    "dd_state": "dispatch_fault",
+                    "detail": fault,
+                    "injected": True,
+                }
+            )
+            return update
+        if isinstance(result, dict) and result.get("development_id"):
+            development_id = str(result["development_id"])
+            update["dd_results"] = {development_id: result}
+            deps.artifacts.append_round(
+                {
+                    "round": state.get("round_no", 1),
+                    "verdict": "dispatch",
+                    "development_id": development_id,
+                    "dd_state": str(result.get("state") or ""),
+                    "output_commit": str(result.get("output_commit") or ""),
+                    "injected": True,
+                }
+            )
+        return update
+
     graph: StateGraph = StateGraph(LineState)
     graph.add_node("check_bounds", check_bounds)
     graph.add_node("coordinator_turn", coordinator_turn)
@@ -1230,6 +1348,7 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     graph.add_node("acceptance_step", acceptance_step)
     graph.add_node("finalise", finalise)
     graph.add_node("decision_interrupt", decision_interrupt)
+    graph.add_node("dd_dispatch", dd_dispatch)
 
     graph.add_edge(START, "check_bounds")
     graph.add_conditional_edges("check_bounds", after_bounds)
@@ -1237,6 +1356,10 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     # The interrupt node resumes into the same round's coordinator result, so it
     # routes exactly like a coordinator turn.
     graph.add_conditional_edges("decision_interrupt", after_coordinator)
+    # R2 图合一: the fan-out join routes like a coordinator turn -- with the
+    # intents consumed, the line proceeds into its (possibly parked) terminal
+    # or its worker turn with the subgraph return values in state.
+    graph.add_conditional_edges("dd_dispatch", after_coordinator)
     # Unconditional: the facts are gathered even after a worker timeout --
     # they are cheap, and the coordinator judging a timeout deserves them too.
     graph.add_edge("worker_turn", "acceptance_step")
@@ -1263,6 +1386,7 @@ __all__ = [
     "WORKER_REPORT_RETRY_LIMIT",
     "WORKER_TURN_TIMEOUT_REASON",
     "AcceptancePort",
+    "DdSubgraphPort",
     "DecisionInterruptPort",
     "LineDeps",
     "LineMetricsPort",
@@ -1271,6 +1395,7 @@ __all__ = [
     "build_goal_line_graph",
     "claims_resume_verification_broken",
     "classify_turn_timeout",
+    "dispatch_intents",
     "n7_rejects_blocked",
     "n7_rejects_round_zero_repark",
     "timeout_matrix_missing",

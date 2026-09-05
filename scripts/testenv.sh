@@ -15,7 +15,7 @@
 #        `systemctl` 只以本脚本生成的 stub（TEST_ROOT/bin/systemctl-stub）出现，
 #        那是 verify-rebuild 01 项探针的被替换物，不是进程管理器。
 #
-# 用法：scripts/testenv.sh up|down|status|mkrepo <name> [--root PATH]
+# 用法：scripts/testenv.sh up|down|status|mkrepo <name>|rebuild [--root PATH] [--purge]
 #   --root 缺省 $FGT_ROOT，再缺省 /tmp/fleet-graph-testenv（下称 TEST_ROOT）。
 #
 #   up        布局与拒绝清单检查（零副作用）→ 幂等判定 → 逐面拉起 → 就绪等待
@@ -37,6 +37,13 @@
 #             数据默认保留（取证），`--purge` 才删 TEST_ROOT；已 down 时 down → exit 0。
 #   mkrepo    创建 TEST_ROOT/repos/<name>.git（bare）+ TEST_ROOT/repos/<name>
 #             工作克隆（remote=本地 bare），打印两路径；幂等：已存在只打印。
+#   rebuild   R2 图合一 A 方案探针：checkpoint 库（sqlite）退为可删缓存——
+#             枚举并删除 TEST_ROOT/runs/*/checkpoint.sqlite3，再对每张
+#             dd/<dev>/record.json 从权威件（record.json + 当代 result.json）
+#             重建图状态投影（重建输入只有持久权威件，绝不借 checkpoint 或
+#             .scheduler 补状态），并校验同 (repo_path, spec_digest) 无重复
+#             派单目录。末行打印
+#             `rebuild ok deleted=<n> rebuilt=<n> dups=<n> 重建=ok`；rc=0。
 #
 # 拒绝清单（阴性核心；up 与 verify-rebuild --env test 双侧同判，任一命中即拒绝、
 # 退出非零、报错点名冲突项、零副作用）：
@@ -92,7 +99,7 @@ ROOT=""
 PURGE=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        up|down|status|mkrepo)
+        up|down|status|mkrepo|rebuild)
             [ -z "$CMD" ] || die "一个调用只接受一个子命令（先给 $CMD 又给 $1）"
             CMD="$1"; shift ;;
         --root)
@@ -268,7 +275,8 @@ te_spawn_faces() {
             --lines-config "$TEST_ROOT/config/ronin-lines.json" \
             --bridge-state-dir "$TEST_ROOT/bridge" \
             --bus-url "http://127.0.0.1:$P_BUS_HTTP" \
-            --enroll-queue "$TEST_ROOT/scheduler/enroll-queue.jsonl"
+            --enroll-queue "$TEST_ROOT/scheduler/enroll-queue.jsonl" \
+            --llm-ledger-file "$TEST_ROOT/stubs/ledger.json"
     else
         te_launch engine "$TEST_ROOT/logs/engine.log" \
             env FLEET_GRAPH_GATEWAY_BASE_URL="http://127.0.0.1:$P_BUS_HTTP" \
@@ -298,7 +306,8 @@ te_spawn_faces() {
             --lines-config "$TEST_ROOT/config/ronin-lines.json" \
             --bridge-state-dir "$TEST_ROOT/bridge" \
             --bus-url "http://127.0.0.1:$P_BUS_HTTP" \
-            --enroll-queue "$TEST_ROOT/scheduler/enroll-queue.jsonl"
+            --enroll-queue "$TEST_ROOT/scheduler/enroll-queue.jsonl" \
+            --llm-ledger-file "$TEST_ROOT/stubs/ledger.json"
     fi
 
     # 注意：不设 FLEET_GRAPH_BUS_TOKEN/FILE 于引擎与 dd/goal/decision 面——
@@ -483,7 +492,10 @@ write_secrets_and_files() {
     printf '%s\n' "$gateway" > "$TEST_ROOT/secrets/gateway.token"
     chmod 600 "$TEST_ROOT/secrets/gateway.token"
 
-    # 05 号检查的 VRB_LLM_LEDGER stub：静态空 request_events（file://，curl 可指）。
+    # 05 号检查的 VRB_LLM_LEDGER stub：静态空 request_events 投影文件，由
+    # state-http 面的 /v1/llm-ledger 查询面按 --llm-ledger-file 服务（R2）。
+    # 05 号探针是 curl 探针、要求 http 200——file:// 形参 curl 只报 000，
+    # 故账本面必须真经 HTTP（查询面合成，与生产 knob 指向灵智账本消费面同构）。
     printf '%s\n' '{"request_events": [], "events": [], "total": 0}' \
         > "$TEST_ROOT/stubs/ledger.json"
 
@@ -560,6 +572,21 @@ EOF
     chmod +x "$TEST_ROOT/bin/systemctl-stub"
 }
 
+write_waiting_dd_sample() {
+    # R2 交付物（spec 交付物 3②）：waiting_dd 判据样本。M1 状态词表里
+    # waiting_dd = 线停在它派出的 development 上（waiting_on=dd 的机械投影，
+    # run_artifacts.LINE_STATE_WAITING_DD）。样本落 TEST_ROOT/runs/.scheduler 下
+    # 的 wf-*.json，让 verify-rebuild 05 号「等待零消耗」判据有样本可核：
+    # 该线 alias 在账本 request_events 的计数必须为 0（stub 静态空账本）。
+    # 这是测试判据样本，不是引擎状态——enabled=false 的样例线不参与调度。
+    local dir="$TEST_ROOT/runs/.scheduler"
+    mkdir -p "$dir"
+    local stamp
+    stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '%s\n' "{\"folder_id\": \"wf-testenv-sample\", \"line_state\": \"waiting_dd\", \"status\": \"waiting_dd\", \"parked_dd_development_id\": \"dev-testenv-sample\", \"parked_at\": \"$stamp\"}" \
+        > "$dir/wf-testenv-sample.json"
+}
+
 write_knobs() {
     # 纯 VRB_*=值 赋值（无命令替换、无 source 链）；verify-rebuild.sh --env test
     # 的唯一输入。至少覆盖 R0 spec 第 6 条全部 knob。VRB_CURRENT 指 TEST_ROOT 内
@@ -582,7 +609,7 @@ VRB_SKILL_FILE=$TEST_ROOT/config/supervisor-SKILL.md
 VRB_PERSONA_FILES=$TEST_ROOT/personas/wf-testenv-sample.md
 VRB_SUPERVISOR_ROOT=$TEST_ROOT/supervisor
 VRB_SECRETS_DIR=$TEST_ROOT/secrets
-VRB_LLM_LEDGER=file://$TEST_ROOT/stubs/ledger.json
+VRB_LLM_LEDGER=http://127.0.0.1:$P_STATE_HTTP/v1/llm-ledger
 EOF
 }
 
@@ -630,6 +657,7 @@ EOF
     write_bus_config
     write_secrets_and_files
     write_systemctl_stub
+    write_waiting_dd_sample
     snapshot_current
 
     te_spawn_faces
@@ -811,9 +839,66 @@ cmd_mkrepo() {
     printf '%s\n%s\n' "$bare" "$clone"
 }
 
+# ---------------- rebuild（R2 图合一 A 方案探针） ----------------
+cmd_rebuild() {
+    # 判据锚：R2 spec §行为契约 3（checkpoint A 方案）。checkpoint 库是可删缓存：
+    # 删除后图状态仍可从持久权威件（work folder + dd record.json/result.json）
+    # 完全重建——本探针机械核对三件事：
+    #   1) 删 TEST_ROOT/runs/*/checkpoint.sqlite3（缓存库，可删）；
+    #   2) 逐 dd/<dev>/record.json 用 jq 从 record.json + 当代 result.json 重建
+    #      状态投影（state/terminal/head_commit/generation）——重建输入只有
+    #      两权威件，绝不读 checkpoint 或 .scheduler；
+    #   3) 同 (repo_path, spec_digest) 只允许一张单（已派单事实 + 幂等键判重，
+    #      重建绝不产生重复派单目录）。
+    local deleted=0 rebuilt=0 dups=0 db
+    for db in "$TEST_ROOT"/runs/*/checkpoint.sqlite3; do
+        [ -e "$db" ] || continue
+        rm -f "$db" && deleted=$(( deleted + 1 ))
+    done
+    local dev rec gen result_path state terminal head_commit key
+    local -A seen_keys=()
+    if [ -d "$TEST_ROOT/dd" ]; then
+        for dev in "$TEST_ROOT"/dd/*/; do
+            [ -d "$dev" ] || continue
+            rec="$dev/record.json"
+            [ -f "$rec" ] || continue
+            gen="$(jq -r '.generation // 1' "$rec" 2>/dev/null)"
+            case "$gen" in ''|*[!0-9]*) gen=1 ;; esac
+            if [ "$gen" -le 1 ]; then
+                result_path="$dev/result.json"
+            else
+                result_path="$dev/g$gen/result.json"
+            fi
+            terminal="$(jq -r '.terminal // ""' "$result_path" 2>/dev/null)"
+            head_commit="$(jq -r '.head_commit // ""' "$result_path" 2>/dev/null)"
+            awaiting="$(jq -r '(.awaiting // empty) != empty' "$result_path" 2>/dev/null)"
+            if [ "$awaiting" = "true" ]; then
+                state="awaiting_gate"
+            elif [ -n "$terminal" ] && [ "$terminal" != "null" ]; then
+                state="$terminal"
+            else
+                state="created"
+            fi
+            key="$(jq -r '[.repo_path // "", .spec_digest // ""] | @tsv' "$rec" 2>/dev/null)"
+            if [ -n "${seen_keys[$key]:-}" ]; then
+                dups=$(( dups + 1 ))
+            fi
+            seen_keys[$key]=1
+            printf 'rebuilt dev=%s state=%s head=%s gen=%s\n' \
+                "$(basename "$dev")" "$state" "$head_commit" "$gen"
+            rebuilt=$(( rebuilt + 1 ))
+        done
+    fi
+    if [ "$dups" -gt 0 ]; then
+        die "rebuild 校验失败：同 (repo_path, spec_digest) 存在 $dups 个重复派单目录" 1
+    fi
+    printf 'rebuild ok deleted=%d rebuilt=%d dups=%d 重建=ok\n' "$deleted" "$rebuilt" "$dups"
+}
+
 case "$CMD" in
     up)      cmd_up ;;
     status)  cmd_status ;;
     down)    cmd_down ;;
     mkrepo)  cmd_mkrepo ;;
+    rebuild) cmd_rebuild ;;
 esac
