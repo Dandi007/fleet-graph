@@ -1,0 +1,12 @@
+{
+ "development_id": "dev-fg-e9c3f96ba1da",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "wf-4601c8",
+ "decision_message_id": "msg_01M1QY5EE35GZ18SZQJ4WGB7C0",
+ "rationale": "六项取证逐项带数字（ronin-rebuild 以 gate 身份自判，goal §四·一 A-2；decided_by=dispatched_by=wf-4601c8）：①三方验收逐字一致＝引擎机械归一哈希 sha256:f519502ef8a391f5010b615d4b9b78312c6bfbbd02dbc885a77b86aced18f71f，spec 冻结/record.json/implement 回执/acceptance 回执四方 3 条命令逐字相等。②改动未越界＝base 8064722..head 23665bf name-status 32 路径，扣除机器件(.dev-dispatch/×8+/.dd-evidence/×1)=产品路径 23，全部在 src/fleet_graph、tests/、scripts/testenv*；违禁面 verify-rebuild.sh/Makefile/config 名册/deploy 变更数=0。③零测试删除＝diff-filter=D 计数 0（全仓与 tests/ 均 0）；def test_ 基线 2779→head 2788 净+9；test_m2 删/补对照表 8旧↔8新+1语义保留（9→11）。④亲跑验收＝merge-candidate worktree @23665bf 逐字跑 3 条全 exit0：pytest [100%] 15 passed；make verify 3000 passed+1 skipped in 108.23s；testenv 回显逐字 up=0 lines=21 c11=1 c12=1 c17=1 c18=1 c19=1 down=0 prod_references=0。⑤全量回归对基线＝base@8064722 独立 worktree make verify 2992 passed+1 skipped in 114.49s exit0 vs head 3000 passed+1 skipped exit0：+8 passed、两侧 0 failed、无绿转红（与派单前基线 2992/1@d0b980d 及 implement 回执 3000/3001 一致）。⑥变异回执核验（gate 只核回执）＝rc-456ed2c2 与 rf-456ed2c2 双 APPROVE（reviewer 均 glm-5.3，spec_digest 均=1804c031…），feedback index 恰 2 条且 digest 与工件 sha256 逐一相符（68279268…/372af3ca…）；变异红靶由验收套件机械执行并三方回执计数一致（implement counts 15/15 failed=0 = acceptance 回显 = 亲跑 15/15），fail-closed 变异用例在卷（test_gate_missing_mutation_receipt_fail_closed/test_actions_unknown_kind_fails_closed 等）；grep 探针归零（decision_deliver dd 路径 0、OWNER_KIND_DD 0、bridge dd 消费 0、旧调用点豁免模块外 0）。身份不变量：decided_by==record.dispatched_by==wf-4601c8。seat 合规：implement=glm-5.3-flash、两 review=glm-5.3（record.seats 三 stage line-explicit）。",
+ "question_note_id": "msg_01M1QVVY1GWYRY0ZX87TVCQNDP",
+ "card_entity_id": "msg_01M1QM95KRA6Z0KGHF1K1MHBKB",
+ "output_commit": "23665bfa080bba1b95748a5d9fc63eb5060a6368"
+}
