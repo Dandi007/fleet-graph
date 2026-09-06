@@ -2,11 +2,10 @@
 
 The surface is the control plane: every real tool drives the in-process
 `DdControlPlane` -- there is no graph-API forwarding tier any more. Tool-surface
-shape follows the wf-a08949 2026-08-27 use-case-family ruling: the full
-15-name surface stays reachable, only the consumed family
-(list/get/events/evidence/create/start/gate) does work, and every legacy-only
-name refuses with an explicit NOT_SUPPORTED structure and zero control-plane
-calls.
+shape follows the wf-a08949 2026-08-27 use-case-family ruling, closed out by R6
+(wf-4601c8 §7.1.7): the five legacy NOT_SUPPORTED stub names are *removed* --
+the surface is exactly the consumed family plus `wf_reconcile`, and a legacy
+name is simply an unknown tool.
 """
 
 from __future__ import annotations
@@ -29,7 +28,6 @@ from fastmcp.exceptions import ToolError
 from fleet_graph.dd.control_plane import ControlPlaneError
 from fleet_graph.dd.service import (
     DEFAULT_PORT,
-    NOT_SUPPORTED_TOOLS,
     SUPPORTED_TOOLS,
     WORK_FOLDER_TOOLS,
     build_mcp_server,
@@ -38,9 +36,6 @@ from fleet_graph.dd.service import (
 )
 
 ALL_TOOLS = {
-    "deployment_create",
-    "deployment_status",
-    "development_control",
     "development_create",
     "development_list",
     "development_get",
@@ -48,40 +43,23 @@ ALL_TOOLS = {
     "development_evidence",
     "development_gate",
     "development_start",
-    "development_steer",
     "development_reconfigure",
-    "development_relock",
     "development_adopt",
     "development_recover",
     "wf_reconcile",
 }
 
-# Arguments that satisfy each legacy-only tool's schema, so the refusal we
-# observe is the NOT_SUPPORTED structure and not an argument-validation error.
-# `development_reconfigure` is deliberately absent: R1-c moved it into the
-# real surface (the environment/contract failure exit).
-NOT_SUPPORTED_CALLS: dict[str, dict[str, object]] = {
-    "deployment_create": {"request": {"operation": "deploy"}},
-    "deployment_status": {"operation_id": "operation-1"},
-    "development_steer": {
-        "development_id": "dev-1",
-        "instruction": "continue",
-        "idempotency_key": "steer-key",
-        "expected_revision": 8,
-    },
-    "development_control": {
-        "development_id": "dev-1",
-        "action": "pause",
-        "idempotency_key": "control-key",
-        "expected_revision": 11,
-    },
-    "development_relock": {
-        "development_id": "dev-1",
-        "plugin_commit": "abc123",
-        "idempotency_key": "relock-key",
-        "expected_revision": 12,
-    },
-}
+#: R6 (wf-4601c8 §7.1.7): the removed legacy names. The surface must not
+#: register them at all -- an unknown-tool error is the correct answer.
+REMOVED_TOOLS: frozenset[str] = frozenset(
+    {
+        "deployment_create",
+        "deployment_status",
+        "development_control",
+        "development_steer",
+        "development_relock",
+    }
+)
 
 
 @pytest.fixture(autouse=True)
@@ -148,7 +126,7 @@ def test_selected_port_is_free_and_not_a_legacy_port() -> None:
         pytest.skip("port 5610 is already being served on this host")
 
 
-def test_all_sixteen_tools_are_reachable() -> None:
+def test_all_eleven_tools_are_reachable() -> None:
     server = build_mcp_server(FakeControlPlane())
     tools = asyncio.run(server.list_tools())
     assert {tool.name for tool in tools} == ALL_TOOLS
@@ -172,41 +150,22 @@ def test_the_goal_surface_is_not_on_the_dd_face() -> None:
     assert "fleet-graph://goal-open/briefing" not in resources
 
 
-def test_the_surface_split_is_exactly_the_ruling() -> None:
-    """Supported + refused partitions the 15 development names, with no overlap.
+def test_the_surface_is_exactly_the_consumed_family() -> None:
+    """Supported + work-folder partition the surface; the removed legacy names
+    appear nowhere.
 
-    R1-c moved `development_reconfigure` from the refused side to the real
-    side (the environment/contract failure exit); steer / relock / control /
-    deployment_* stay refused. `wf_reconcile` (the B3 work-folder recovery exit)
-    is a separate family on the same surface -- it drives a source seam, not the
-    development control plane. The goal-driven family is no longer on this
-    surface at all (goal serve, :5611).
+    R6 (wf-4601c8 §7.1.7) removed the five NOT_SUPPORTED stub names instead of
+    keeping them registered: steer / relock / control / deployment_* are gone.
+    `wf_reconcile` (the B3 work-folder recovery exit) is a separate family on
+    the same surface -- it drives a source seam, not the development control
+    plane. The goal-driven family is no longer on this surface at all (goal
+    serve, :5611).
     """
-    assert SUPPORTED_TOOLS | set(NOT_SUPPORTED_TOOLS) | WORK_FOLDER_TOOLS == ALL_TOOLS
-    assert not SUPPORTED_TOOLS & set(NOT_SUPPORTED_TOOLS)
+    assert SUPPORTED_TOOLS | WORK_FOLDER_TOOLS == ALL_TOOLS
     assert not WORK_FOLDER_TOOLS & SUPPORTED_TOOLS
-    assert not WORK_FOLDER_TOOLS & set(NOT_SUPPORTED_TOOLS)
     assert {"wf_reconcile"} == WORK_FOLDER_TOOLS
     assert "goal_enroll" not in ALL_TOOLS
-    assert {
-        "development_list",
-        "development_get",
-        "development_events",
-        "development_evidence",
-        "development_create",
-        "development_start",
-        "development_gate",
-        "development_reconfigure",
-        "development_adopt",
-        "development_recover",
-    } == SUPPORTED_TOOLS
-    assert {
-        "development_steer",
-        "development_relock",
-        "development_control",
-        "deployment_create",
-        "deployment_status",
-    } == set(NOT_SUPPORTED_TOOLS)
+    assert not REMOVED_TOOLS & ALL_TOOLS
 
 
 def test_the_reconfigure_tool_admits_only_the_acceptance_context() -> None:
@@ -475,27 +434,28 @@ def test_a_control_plane_refusal_reaches_the_client_machine_readably() -> None:
     }
 
 
-@pytest.mark.parametrize("tool", sorted(NOT_SUPPORTED_TOOLS))
-def test_every_legacy_only_tool_refuses_with_the_explicit_structure(tool: str) -> None:
-    """The refusal carries a machine-readable payload and touches no control plane."""
+@pytest.mark.parametrize("tool", sorted(REMOVED_TOOLS))
+def test_every_removed_legacy_tool_is_unknown_on_the_surface(tool: str) -> None:
+    """R6 (wf-4601c8 §7.1.7): a removed name is not a tool at all.
+
+    A live HTTP round-trip must answer unknown-tool (the fastmcp
+    "Unknown tool" ToolError), not a NOT_SUPPORTED refusal and -- above all --
+    not a successful call. This is the flip side of the tools/list assertion:
+    the name is gone from the surface, not merely renamed."""
     plane = FakeControlPlane()
     server = build_mcp_server(plane)
 
     async def call(url: str) -> str:
         async with Client(url) as client:
             with pytest.raises(ToolError) as excinfo:
-                await client.call_tool(tool, NOT_SUPPORTED_CALLS[tool])
+                await client.call_tool(tool, {})
             return str(excinfo.value)
 
     with running_server(server) as url:
         message = asyncio.run(call(url))
 
-    payload = json.loads(message[message.index("{") : message.rindex("}") + 1])
-    assert payload["code"] == "NOT_SUPPORTED"
-    assert payload["tool"] == tool
-    assert payload["reason"] == NOT_SUPPORTED_TOOLS[tool]
-    assert payload["supported_tools"] == sorted(SUPPORTED_TOOLS)
-    assert plane.calls == [], "a refused tool must never reach the control plane"
+    assert "unknown" in message.lower(), message
+    assert plane.calls == [], "a removed tool must never reach the control plane"
 
 
 def test_the_fake_control_plane_mirrors_the_real_surface() -> None:

@@ -149,33 +149,25 @@ RECEIPT_NAMES = {
 #: starts with an empty registry, so the driver registers these idempotently
 #: (the same upsert semantics the deployment uses).
 BOARD_PROTOCOLS: dict[str, dict[str, Any]] = {
-    "work.card.v1": {
+    # R6 (wf-4601c8 §7.2.3): work.card.v1 retired -- the registry no longer
+    # carries the card protocol. The fixtures' line-card surface is a
+    # dedicated engine-neutral kind (root, refs-free) so a question note can
+    # ref an existing entity without resurrecting the retired card face.
+    "goal.line.card.v1": {
         "payload_schema": {
             "additionalProperties": False,
             "properties": {
-                "assignee": {"type": "string"},
-                "blocked_by": {"items": {"type": "string"}, "type": "array"},
-                "definition_of_done": {"type": "string"},
-                "development_id": {"type": "string"},
-                "intent": {"type": "string"},
-                "links": {"items": {"type": "string"}, "type": "array"},
-                "priority": {"enum": ["p0", "p1", "p2"]},
-                "program": {"type": "string"},
-                "status": {
-                    "enum": ["backlog", "ready", "doing", "blocked", "review", "done", "dropped"]
-                },
-                "title": {"minLength": 1, "type": "string"},
-                "work_folder_id": {"type": "string"},
+                "card_entity_id": {"type": "string"},
+                "note": {"minLength": 1, "type": "string"},
+                "note_type": {"enum": ["progress", "finding", "question", "handoff", "evidence"]},
             },
-            "required": ["title", "status", "intent"],
+            "required": ["card_entity_id", "note"],
             "type": "object",
         },
         "entity_role": "root",
         "refs_required": False,
-        "description": (
-            "Work board card: coordination state for one deliverable unit; "
-            "deep state lives in the referenced work folder"
-        ),
+        "description": "Goal line escalation surface: one entity per line that "
+        "question notes ref (retired card protocol successor, engine-neutral kind)",
     },
     "work.decision.v1": {
         "payload_schema": {
@@ -492,10 +484,38 @@ def run_line_graph(
     )
 
 
+def _goal_line_card_entity_id(bus_client: Any, dispatched_by: str) -> str:
+    """The goal-line card entity the sample's gate question refs.
+
+    R6 (wf-4601c8 §7.2.3) removed the engine-side card publish, so the
+    fixture materialises its own line card through the shared constructor and
+    shared idempotency key (the same face the scheduler's escalation uses),
+    keeping the sample's question note ref valid against a fresh bus.
+    """
+    from fleet_graph.bus.board import (
+        WORK_INDEX,
+        goal_line_card_key,
+        goal_line_card_payload,
+    )
+
+    # R6 (wf-4601c8 §7.2.3): work.card.v1 is retired from the registry, so the
+    # fixture publishes its line card as goal.line.card.v1 -- the engine-neutral
+    # successor kind on board:work-index (root, refs-free). The gate's question
+    # note refs this entity.
+    card = bus_client.publish(
+        WORK_INDEX,
+        "goal.line.card.v1",
+        goal_line_card_payload(folder_id=dispatched_by, title=dispatched_by),
+        goal_line_card_key(dispatched_by),
+    )
+    return str(card.entity_id)
+
+
 def run_pipeline_to_gate(
     root: Path,
     plane: Any,
     board: Any,
+    bus_client: Any,
     development_id: str,
     record: dict[str, Any],
     base: str,
@@ -556,7 +576,7 @@ def run_pipeline_to_gate(
         ),
         lifecycle_gate_stage(lifecycle): BoardGate(
             board=board,
-            card_entity_id=str(record.get("card_entity_id") or ""),
+            card_entity_id=_goal_line_card_entity_id(bus_client, str(record["dispatched_by"])),
             development_id=development_id,
             repo=workspace,
         ),
@@ -766,7 +786,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # -- the micro single's real pipeline run, to the gate --------------------
-    run_pipeline_to_gate(root, plane, board, development_id, record, base, acceptance_commands)
+    run_pipeline_to_gate(
+        root, plane, board, bus_client, development_id, record, base, acceptance_commands
+    )
     status = plane.get(development_id)
     if str(status.get("state") or "") != "awaiting_gate":
         raise RuntimeError(

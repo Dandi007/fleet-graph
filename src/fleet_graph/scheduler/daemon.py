@@ -29,7 +29,7 @@ seen two unrelated problems.
 `LineSpec.enabled` is the roster: which lines this scheduler is allowed to
 start at all. It defaults to *off*, so a line runs only because a reviewed
 config says it runs. That default is the point. The gate it replaces --
-`/data/ronin/maintenance-stop`, an external flag file that held the whole
+the legacy engine-external maintenance-stop flag file that held the whole
 fleet down -- had the opposite shape: every line was live and one file stood
 in the way. That file carries a mandatory `expires_at` and goes inert when it
 passes (babysitter v23, a 2026-08-23 ruling), which makes "the fleet ignites
@@ -329,7 +329,7 @@ class SchedulerConfig:
     #: units). Default off; enabling it is a reviewed config PR, exactly like
     #: probe_via_runtime.
     supervisor_events: bool = False
-    #: M2 E6: the loopback state read-model the E5/E6/E7 observer scans.
+    #: M2 E6: the loopback state read-model the E5/E6 observer scans.
     read_model_base_url: str = "http://127.0.0.1:7494"
     #: M2 E6: a line is stale when its heartbeat_age_s exceeds this.
     heartbeat_stale_threshold_seconds: float = 300.0
@@ -345,9 +345,6 @@ class SchedulerConfig:
     harvest_default_branch: str | None = None
     harvest_deploy: list[str] = field(default_factory=list)
     repo: str | None = None
-    #: M4 E7: 纯配置透传（无业务逻辑）。缺省 None → 不发射 --e7-allowlist，
-    #: E7 goal.md 直写保持 deny-all 默认拒绝语义零放宽。
-    e7_allowlist_path: str | None = None
     #: M4 acceptance-command freeze: the goal-folder root the scheduler reads
     #: each line's goal.md from (the same root the goal MCP face serves).
     #: None disables the freeze check entirely -- a scheduler that cannot read
@@ -394,7 +391,6 @@ class SchedulerConfig:
             harvest_default_branch=raw.get("harvest_default_branch"),
             harvest_deploy=list(raw.get("harvest_deploy") or []),
             repo=raw.get("repo"),
-            e7_allowlist_path=raw.get("e7_allowlist_path"),
             goal_folder_root=(
                 Path(raw["goal_folder_root"]) if raw.get("goal_folder_root") else None
             ),
@@ -826,7 +822,8 @@ class Scheduler:
             # file; the scheduler reads it back here as a wake fact and, past
             # the stall threshold, as a red signal.
             "dispatched_decision_consumed_at": state.get("dispatched_decision_consumed_at"),
-            # The line's board card entity (`work.card.v1` on board:work-index),
+            # The line's board card entity (the goal-line card on
+            # board:goal-line),
             # materialised by the first escalation. Per line, not per parking:
             # it survives new terminals and re-parkings, so later question
             # notes ref the same entity instead of re-publishing the card.
@@ -1414,7 +1411,7 @@ class Scheduler:
         goal line historically had none -- every ask 422'd with
         DERIVATION_ERROR ("ref target entity 'wf-…' not found"). So the first
         escalation *materialises* the line's card: one `work.card.v1` on
-        board:work-index. The kind is entity_role='root' on the bus, which
+        board:goal-line. The kind is entity_role='root' on the bus, which
         rejects a caller-chosen entity_id on the first publish (entity_id
         without supersedes is itself a DERIVATION_ERROR), so the entity id is
         whatever the bus derives -- the card message's own id. That id is
@@ -1436,12 +1433,21 @@ class Scheduler:
         """
         if self.board is None:
             return None
+        # R6 (wf-4601c8 §7.2.3): the engine-side card publish left Board (the
+        # work.card.v1 protocol is retired); the surface kind is the
+        # engine-neutral goal.line.card.v1 successor (root, refs-free).
+        # The question note still needs a card entity to ref; the scheduler
+        # materialises its escalation surface through the bus client directly
+        # (same payload/idempotency key as before -- the shared goal-line card
+        # face) and adopts the derived entity id. Board remains telemetry.
         card_entity_id = state.get("board_card_entity_id")
         if not card_entity_id:
             try:
-                card = self.board.publish_card(
+                card = self.board.client.publish(
+                    self.board.index_channel,
+                    "goal.line.card.v1",
                     goal_line_card_payload(folder_id=line.folder_id, title=line.folder_id),
-                    idempotency_key=goal_line_card_key(line.folder_id),
+                    goal_line_card_key(line.folder_id),
                 )
             except Exception as exc:  # telemetry must not bite
                 return f"card_failed:{type(exc).__name__}:{str(exc)[:160]}"

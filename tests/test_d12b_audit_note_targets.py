@@ -63,7 +63,6 @@ from fleet_graph.supervise.events import (
     blocked_decision_event,
     board_question_event,
     cap_breaker_event,
-    decision_swallowed_event,
     enrollment_pending_event,
     heartbeat_stale_event,
     line_fault_event,
@@ -240,7 +239,6 @@ class TestSupervisorNoteNamedTargets:
         for event in (
             line_fault_event("wf-x", "run-1"),
             cap_breaker_event(7, "TOTAL_CAP_REACHED", ["wf-x"]),
-            decision_swallowed_event("msg-1", "bus loss"),
         ):
             note = render_supervisor_note(event, {}, {}, CLASSIFY_NEEDS_HUMAN, [])
             assert _named_destination(note) == "supervisor_escalation", event.type

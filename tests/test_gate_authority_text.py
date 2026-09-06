@@ -29,6 +29,7 @@ SCAN_EXCLUDED_DIRS = {
     "__pycache__",
     ".ruff_cache",
     ".pytest_cache",
+    ".mypy_cache",
 }
 D5_ANCHORS = ("D5", "decided_by", "dispatched_by")
 SHADOW = "S" + "8"

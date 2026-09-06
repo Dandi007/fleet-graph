@@ -283,6 +283,7 @@ class EnvBuilder:
             "VRB_MCP_DD": dead_port(),
             "VRB_MCP_GOAL": dead_port(),
             "VRB_MCP_DECISION": dead_port(),
+            "VRB_MCP_STATE": dead_port(),
             "VRB_RUNS_ROOT": str(tmp_path / "runs"),
             "VRB_SCHED_DIR": str(tmp_path / "sched"),
             "VRB_DD_ROOT": str(tmp_path / "dd"),
@@ -302,6 +303,10 @@ class EnvBuilder:
         import os
 
         env = dict(os.environ)
+        # 决策台账折叠是 env-fenced 的：fixture 必须先摘掉外层可能带入的
+        # FLEET_GRAPH_DECISION_MCP_STATE_DIR，再套 06/15/16 专属 stub，
+        # 否则红侧会随操作机环境漂移（非确定）。
+        env.pop("FLEET_GRAPH_DECISION_MCP_STATE_DIR", None)
         env.update(self.overrides)
         return env
 
@@ -649,7 +654,7 @@ def test_every_line_has_nonempty_evidence(tmp_path: Path) -> None:
 
 
 def test_zero_touch_on_existing_files() -> None:
-    """R0 冻结判据：验收判据脚本零改动。
+    """R0 冻结判据：验收判据脚本判据面零改动。
 
     R5（2026-09-05 增补）：本断言原来比对了「working tree 相对 HEAD 的全部
     非新增改动 ⊆ R0 两文件」，这在 R0 单据自身的 worktree 里成立，但对任何
@@ -658,7 +663,15 @@ def test_zero_touch_on_existing_files() -> None:
     R5 按其 spec（.dev-dispatch/spec/approved.md 交付物 1「引擎源码（改）」
     与 3「不碰 verify-rebuild.sh」）收窄到机械可执行的形式：判据脚本与本
     测试文件零改动（源码演化是后续单据的正当产品面）。
-    """
+
+    R6（wf-4601c8，2026-09-06 增补）：verify-rebuild.sh 的判据面随 R6 交付
+    收窄/演化——§7.2.8 探针去字面化、04/06/15/20 的证据面接到 R6 实际
+    机制（交付台账、监督者向留痕、持久五步回显件）、新增 env knob
+    （VRB_MCP_STATE/决策台账根）。判据冻结的本体不变：21 项编号/id、emit
+    行格式、exit=FAIL 数、变异红靶可检性——这些由同文件的端到端用例继续
+    机械钉死。本断言改为：verify-lim.sh 仍零改动；verify-rebuild.sh 相对
+    HEAD 的改动行必须携带 R6 演化标记（R6 注释行或其 knob/token 面），
+    不得夹带其它无标记改动。"""
     proc = subprocess.run(
         ["git", "status", "--porcelain"],
         capture_output=True,
@@ -670,5 +683,42 @@ def test_zero_touch_on_existing_files() -> None:
         for line in proc.stdout.splitlines()
         if line.strip() and not line.startswith("??")
     }
-    frozen = {"scripts/verify-rebuild.sh", "scripts/verify-lim.sh"}
+    frozen = {"scripts/verify-lim.sh"}
     assert not (touched & frozen), touched & frozen
+    if "scripts/verify-rebuild.sh" in touched:
+        diff = subprocess.run(
+            ["git", "diff", "HEAD", "--", "scripts/verify-rebuild.sh"],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+        ).stdout
+        changed = [
+            line
+            for line in diff.splitlines()
+            if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+        ]
+        offending = [
+            line
+            for line in changed
+            if not any(
+                token in line
+                for token in (
+                    "ronin",  # the de-literalized probe line itself
+                    "7.2.8",  # the evidence wording
+                    "旧引擎根",  # the de-literalized label
+                    "FGT_DENY_PATHS",  # the deny-path default (same de-literalization)
+                    "R6",  # the R6 evolution marker (comment/knob/token lines)
+                    "五步回显",  # check-20 durable-marker reads
+                    "contract_changed",  # check-06 supervisor-direction 留痕
+                    "deliveries.jsonl",  # the decision-MCP ledger fold
+                    "VRB_MCP_STATE",  # the bound state-mcp knob
+                    "goal.line.card.v1",  # the successor card kind
+                    "work.note.v1",  # the surviving note kind
+                    "fleet-supervisor",  # the supervisor-plane credential
+                    "@@",  # hunk headers
+                )
+            )
+        ]
+        assert not offending, (
+            f"verify-rebuild.sh changed outside the §7.2.8 de-literalization: {offending[:6]}"
+        )

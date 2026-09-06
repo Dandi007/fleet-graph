@@ -884,8 +884,9 @@ class DefaultHarvestOps:
         """dd 准入 record 的 goal-line board card 实体 id；空/null/缺失/坏档 -> None。
 
         读 `<dd_root>/<development_id>/record.json` 的 `card_entity_id`
-        （`control_plane._publish_card` 持久化；`harvest.py::_resolve_repo` 已读
-        同文件，复用其读取模式）。尚无卡时字段为 null/缺失，必须如实返回 None
+        （历史单据由旧准入面持久化；`harvest.py::_resolve_repo` 已读
+        同文件，复用其读取模式。R6 后引擎不再发卡：存量值读数、增量恒 None）。
+        尚无卡时字段为 null/缺失，必须如实返回 None
         （evidence 步 best-effort skip），绝不把 development_id 当 ref 伪造。
         """
         record_path = Path(dd_root) / development_id / RECORD_FILE

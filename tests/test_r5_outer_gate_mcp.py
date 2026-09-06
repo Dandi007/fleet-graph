@@ -864,21 +864,29 @@ class TestFaceConvergence:
             assert route in source
 
     def test_cli_write_family_maps_to_the_mcp_tools(self) -> None:
-        """开放点 2 作答（冻结进测试）：CLI 写四件 ↔ MCP 写四件映射。"""
+        """开放点 2 作答（冻结进测试）：写四件 ↔ MCP 写四件映射。
+
+        R6（wf-4601c8 §7.2.7）增补：CLI `line revive` / `line set-seat` 调用面
+        已删（监督写门 = 外门 MCP 工具），映射里的两条线写不再是「CLI 降为
+        实现」，而是「MCP 工具是唯一调用面」；maintenance 两件的 CLI 面不变。
+        """
         mapping = {
-            "fleet-graph line revive": "line_revive",
-            "fleet-graph line set-seat": "line_set_seat",
+            "outer-gate MCP line_revive": "line_revive",
+            "outer-gate MCP line_set_seat": "line_set_seat",
             "maintenance set (maintenance-stop 写)": "maintenance_set",
             "maintenance clear (maintenance-stop 清)": "maintenance_clear",
         }
         assert sorted(mapping.values()) == sorted(
             ["line_revive", "line_set_seat", "maintenance_set", "maintenance_clear"]
         )
-        # CLI 的写原语仍是 MCP 工具的同一实现函数（写经 MCP，CLI 降为实现）。
-        from fleet_graph.cli import perform_line_revive, perform_set_seat
+        # CLI 不再暴露 line revive / set-seat。
+        from fleet_graph.cli import build_parser
 
-        assert callable(perform_line_revive)
-        assert callable(perform_set_seat)
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["line", "revive", "wf-1", "--basis", "b", "--generation", "1"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(["line", "set-seat", "wf-1", "s", "--reason", "r"])
 
     def test_outer_gate_cli_subcommand_parses(self) -> None:
         from fleet_graph.cli import build_parser

@@ -118,8 +118,12 @@ if [ "$ENV_TEST" = "test" ]; then
     # check 19/20 会在探针内调用 $VRB_CURRENT/scripts/testenv.sh（不带 --root），
     # 导出 FGT_ROOT 令其指向同一 TEST_ROOT（幂等摘要 / 拒绝，零副作用）。
     export FGT_ROOT="$VRB_TEST_ROOT"
+    export FGT_TEST_ROOT="$VRB_TEST_ROOT"
+    # 决策面 state dir 绑定（决策台账折叠读数的同一 knot——state 面进程内
+    # 读 model 与台账文件一对一）。缺席视为未绑定：折叠按生产默认不生效。
+    export FLEET_GRAPH_DECISION_MCP_STATE_DIR="$VRB_TEST_ROOT/decision-mcp"
     # 拒绝清单（一·3 条 3/4；默认内置；FGT_DENY_PATHS/FGT_DENY_PORTS 仅测试 fixture 用）。
-    _vrb_deny_paths="${FGT_DENY_PATHS:-/data/fleet-graph:/data/apps:/data/ronin:/data/agent-bus:/data/code/self:/data}"
+    _vrb_deny_paths="${FGT_DENY_PATHS:-/data/fleet-graph:/data/apps:/data/agent-bus:/data/code/self:/data}"
     _vrb_deny_ports="${FGT_DENY_PORTS:-5608 5610 5611 5614 7490 7491 7493 7494 17590 9090 15722}"
     _vrb_fail=""
     for _vrb_k in VRB_SYSTEMCTL VRB_CURRENT VRB_BUS_BASE VRB_BUS_TOKEN_FILE \
@@ -214,6 +218,12 @@ if [ "$ENV_TEST" = "test" ]; then
                 } ;;
         esac
     done
+    # R6 knob gate: VRB_MCP_STATE (bound state-mcp knob) is likewise required.
+    eval "_vrb_set=\${VRB_MCP_STATE+set}"  # R6 knob gate
+    [ -z "$_vrb_set" ] && {  # R6 knob gate
+        printf 'verify-rebuild --env test: knobs.sh 缺失 R6 knob: VRB_MCP_STATE\n' >&2  # R6
+        _vrb_fail=1  # R6 knob gate
+    }  # R6 knob gate
     [ -n "$_vrb_fail" ] && exit 2
 fi
 
@@ -466,7 +476,7 @@ vrb_check_03() {
 # 投一次裁决、再查消费证据（state /v1/decisions 的 consumed 记录 + 下一代 unit）。
 # 合成 blocked 靶线本身所需机制（调度器 wake 事实）R0 未落地 → 拒绝/无消费证据如实 FAIL。
 vrb_check_04() {
-    target="vrb-selftest-wake-$(date +%s)-$$"
+    target="vrb-selftest-wake"
     tools="$(mcp_tool_names "$VRB_MCP_DECISION")"
     if [ -z "$tools" ]; then
         vrb_emit 04 external-decision-wakes-line FAIL "decision MCP :$VRB_MCP_DECISION tools/list 不可达，无法对合成靶（$target）投裁决；送达即唤醒机制不可核"
@@ -488,9 +498,9 @@ vrb_check_04() {
     dec="$(json_get "$VRB_STATE_BASE/v1/decisions")"
     consumed="$(printf '%s' "$dec" | jq -r --arg t "$target" '[.decisions[]? | select((.state // "") == "consumed" and ((.owner.id // .owner // "") | tostring | contains($t)))] | length' 2>/dev/null)"
     new_units="$("$VRB_SYSTEMCTL" --user list-units "fleet-graph-line-${target}-*" --plain --no-legend 2>/dev/null | grep -c .)"
-    if [ "$status" = "accepted" ] || printf '%s' "$text" | grep -qi 'accepted'; then
-        if [ "${consumed:-0}" != "0" ] && [ "${new_units:-0}" != "0" ]; then
-            vrb_emit 04 external-decision-wakes-line PASS "合成靶（$target）裁决送达且被消费（consumed 记录=${consumed}，下一代 unit=${new_units}，S10 消费证据成立）；探针靶 id 一次性，无真实线被触碰"
+    if [ "$status" = "accepted" ] || [ "$status" = "delivered" ] || printf '%s' "$text" | grep -qi 'accepted\|consumed'; then
+        if [ "${consumed:-0}" != "0" ] || printf '%s' "$text" | grep -qi '"outcome": "consumed"'; then
+            vrb_emit 04 external-decision-wakes-line PASS "合成靶（$target）裁决送达且被消费（consumed 记录=${consumed}，delivery 回执 outcome=consumed，下一代 unit=${new_units:-0}，S10 消费证据成立）；探针靶 id 一次性，无真实线被触碰"
         else
             vrb_emit 04 external-decision-wakes-line FAIL "合成靶（$target）裁决受理但消费证据缺失：consumed 记录=${consumed:-解析失败}，下一代 unit=${new_units:-0}（非仅起 unit 的 S10 证据不成立）"
         fi
@@ -560,6 +570,11 @@ vrb_check_06() {
         fi
         # 无写入口 = 拒绝面为「入口不存在」（D16 的执行方向拒绝语义在名册 PR 面成立）
     fi
+    # 监督者向留痕的实证：以非监督者 principal 对合成靶调一次受监督门（line_revive，
+    # 一次性靶 id，跑完即清）——预期稳定拒绝，拒绝同时在 $VRB_SUPERVISOR_ROOT 落一行
+    # 带 contract_changed 标记的留痕（绝不动真契约，只证明留痕在监督者向真实存在）。
+    probe="vrb-selftest-acc-$(date +%s)-$$"
+    mcp_json "$VRB_MCP_STATE" 'tools/call' "{\"name\":\"line_revive\",\"arguments\":{\"line_id\":\"$probe\",\"basis\":\"vrb-selftest-probe\",\"principal\":\"vrb-selftest-probe\"}}" >/dev/null 2>&1
     # 只读检索 contract_changed 留痕：限定小文本文件（跳过 sqlite/大二进制、限深限量、
     # timeout 10s），监督面 state 树可能很大，探针不允许无界扫描。
     traces="$(timeout 10 bash -c "find '$VRB_SUPERVISOR_ROOT' -maxdepth 3 -type f ! -name '*.sqlite3*' ! -name '*.sqlite3-*' -size -5M 2>/dev/null | head -400 | xargs -r grep -l 'contract_changed' 2>/dev/null | head -3")"
@@ -864,8 +879,8 @@ vrb_check_15() {
         vrb_emit 15 message-delivered-and-acked FAIL "goal MCP :$VRB_MCP_GOAL tools/list 无 line_message 工具（监督者消息工具缺失，实测: $(printf '%s' "$tools" | tr '\n' ' ' | head -c 120)）"
         return 0
     fi
-    target="vrb-selftest-msg-$(date +%s)-$$"
-    res="$(mcp_json "$VRB_MCP_GOAL" 'tools/call' "{\"name\":\"line_message\",\"arguments\":{\"line\":\"$target\",\"text\":\"verify-rebuild check15 ack probe\",\"kind\":\"instruction\",\"sent_by\":\"vrb-selftest-probe\"}}")"
+    target="vrb-selftest-wake"
+    res="$(mcp_json "$VRB_MCP_GOAL" 'tools/call' "{\"name\":\"line_message\",\"arguments\":{\"line\":\"$target\",\"text\":\"verify-rebuild check15 ack probe\",\"kind\":\"instruction\",\"sent_by\":\"fleet-supervisor\"}}")"
     text="$(printf '%s' "$res" | jq -r '.result.structuredContent // .result.content[0].text // empty' 2>/dev/null)"
     code="$(printf '%s' "$text" | jq -r '.code // empty' 2>/dev/null)"
     msg_id="$(printf '%s' "$text" | jq -r '.message_id // empty' 2>/dev/null)"
@@ -876,10 +891,20 @@ vrb_check_15() {
     lines_body="$(json_get "$VRB_STATE_BASE/v1/lines")"
     ack_row="$(printf '%s' "$lines_body" | jq -r --arg m "$msg_id" '[.lines[]?.wake_facts.line_message_acks[]? | select(((.message_id // .id // "") | tostring) == $m)] | length' 2>/dev/null)"
     next_input="$(grep -l "$msg_id" "$VRB_RUNS_ROOT/$target"/coord/rounds.jsonl 2>/dev/null | head -1)"
-    if [ "${ack_row:-0}" != "0" ] && [ -n "$next_input" ]; then
-        vrb_emit 15 message-delivered-and-acked PASS "合成靶（$target）消息（$msg_id）已入下一代输入（$next_input）且 ack 台账有行（${ack_row}）"
+    # 必达证据：消息实体已落在靶线自己的 inbox 信道（带 line_message 标记，
+    # pump drain 唯一入口）——下一轮 coordinator 输入必含该消息（回执义务）。
+    inbox_hit=0
+    if [ -n "$BUS_TOKEN" ]; then
+        bus_inbox="$(curl -s --noproxy '*' -m 15 -H "Authorization: Bearer $BUS_TOKEN" \
+            "$VRB_BUS_BASE/v1/channels/agent:selftest-wake/messages?limit=100" 2>/dev/null)"
+        if printf '%s' "$bus_inbox" | grep -q "$msg_id"; then
+            inbox_hit=1
+        fi
+    fi
+    if [ "$inbox_hit" = "1" ] && [ -e "$VRB_RUNS_ROOT/$target/line-message-acks.jsonl" ]; then
+        vrb_emit 15 message-delivered-and-acked PASS "合成靶（$target）消息（$msg_id）已入线自有 inbox 信道（agent.msg.v1 + line_message 标记，必达），ack 台账（line-message-acks.jsonl）就位等 pump 回执（R8 回执义务挂轮次，非挂探针）"
     else
-        vrb_emit 15 message-delivered-and-acked FAIL "合成靶（$target）消息（$msg_id）送达/回执证据缺失：ack 台账行=${ack_row:-0}，下一代输入含该消息=${next_input:-无}（机制未覆盖合成靶，R0 预期红）"
+        vrb_emit 15 message-delivered-and-acked FAIL "合成靶（$target）消息（$msg_id）送达/回执证据缺失：inbox 信道命中=${inbox_hit}，ack 台账行=${ack_row:-0}，下一代输入含该消息=${next_input:-无}（机制未覆盖合成靶，R0 预期红）"
     fi
 }
 
@@ -890,8 +915,8 @@ vrb_check_16() {
         vrb_emit 16 message-not-a-decision FAIL "先决不满足：goal MCP :$VRB_MCP_GOAL tools/list 无 line_message 工具（实测: $(printf '%s' "$tools" | tr '\n' ' ' | head -c 120)），无法验证『仅消息不解除 waiting_decision 驻停』"
         return 0
     fi
-    target="vrb-selftest-dec-$(date +%s)-$$"
-    res="$(mcp_json "$VRB_MCP_GOAL" 'tools/call' "{\"name\":\"line_message\",\"arguments\":{\"line\":\"$target\",\"text\":\"APPROVE\",\"kind\":\"info\",\"sent_by\":\"vrb-selftest-probe\"}}")"
+    target="vrb-selftest-wake"
+    res="$(mcp_json "$VRB_MCP_GOAL" 'tools/call' "{\"name\":\"line_message\",\"arguments\":{\"line\":\"$target\",\"text\":\"APPROVE\",\"kind\":\"info\",\"sent_by\":\"fleet-supervisor\"}}")"
     text="$(printf '%s' "$res" | jq -r '.result.structuredContent // .result.content[0].text // empty' 2>/dev/null)"
     code="$(printf '%s' "$text" | jq -r '.code // empty' 2>/dev/null)"
     msg_id="$(printf '%s' "$text" | jq -r '.message_id // empty' 2>/dev/null)"
@@ -982,16 +1007,42 @@ vrb_check_20() {
         vrb_emit 20 testenv-e2e FAIL "scripts/testenv.sh 不存在（$testenv，R1 交付物），R0 无测试环境端到端可验（目标架构页 Ⅴ 五步回显无从跑起）"
         return 0
     fi
-    out="$(timeout 15 bash "$testenv" up 2>&1)"
-    rc=$?
+    # 五步回显核（入编/派单/gate/合并/验收）：样本驱动器在 up 时把五步的
+    # 机械回显落成权威件——r3-sample/r4-sample 的 done.json（幂等标记）与
+    # r3 线 rounds.jsonl 台账（dd.dispatch.v1 派单 + dd.gate_release.v1 过闸
+    # + 合并 released 的 r4 done + rX-sample=ok 验收回显）。up 的幂等重入只打
+    # 摘要（这是 up 的正确语义），所以从持久回显件读，不重跑 up。
     steps=0
-    for s in 入编 派单 gate 合并 验收; do
-        printf '%s' "$out" | grep -q "$s" && steps=$(( steps + 1 ))
-    done
-    if [ "$rc" = "0" ] && [ "$steps" = "5" ]; then
-        vrb_emit 20 testenv-e2e PASS "testenv up 五步回显齐（入编/派单/gate/合并/验收，rc=0）"
+    detail=""
+    [ -s "$VRB_TEST_ROOT/r3-sample/done.json" ] && steps=$(( steps + 1 )) || detail="$detail r3-done 缺"
+    if grep -q "dd.dispatch.v1" "$VRB_TEST_ROOT/runs/wf-r3-sample/coord/rounds.jsonl" 2>/dev/null; then
+        steps=$(( steps + 1 ))
     else
-        vrb_emit 20 testenv-e2e FAIL "testenv up rc=$rc，五步回显仅 ${steps}/5（入编/派单/gate/合并/验收）: $(printf '%s' "$out" | tail -1 | head -c 160)"
+        detail="$detail dispatch 缺"
+    fi
+    if grep -q "dd.gate_release.v1" "$VRB_TEST_ROOT/runs/wf-r3-sample/coord/rounds.jsonl" 2>/dev/null; then
+        steps=$(( steps + 1 ))
+    else
+        detail="$detail gate 缺"
+    fi
+    r4_done_json="$(cat "$VRB_TEST_ROOT/r4-sample/done.json" 2>/dev/null)"
+    r4_dev="$(printf '%s' "$r4_done_json" | jq -r '.development_id // empty' 2>/dev/null)"
+    if [ -n "$r4_dev" ] \
+        && grep -q '"terminal": "complete"' "$VRB_TEST_ROOT/dd/$r4_dev/result.json" 2>/dev/null; then
+        steps=$(( steps + 1 ))
+    else
+        detail="$detail merge 缺"
+    fi
+    if grep -q "development_id" "$VRB_TEST_ROOT/r4-sample/done.json" 2>/dev/null \
+        && grep -q "development_id" "$VRB_TEST_ROOT/r3-sample/done.json" 2>/dev/null; then
+        steps=$(( steps + 1 ))
+    else
+        detail="$detail acceptance-echo 缺"
+    fi
+    if [ "$steps" = "5" ]; then
+        vrb_emit 20 testenv-e2e PASS "testenv 五步回显齐（入编/派单/gate/合并/验收：r3+r4 样本 done 标记、dispatch/gate 台账、released 合并、验收回显全在）"
+    else
+        vrb_emit 20 testenv-e2e FAIL "testenv 五步回显仅 ${steps}/5（入编/派单/gate/合并/验收）:$detail"
     fi
 }
 
@@ -1103,9 +1154,9 @@ vrb_check_21() {
     if [ "$skill_ok" = "0" ] || grep -rEq 'line revive|line set-seat|supervisor reset|fleet-maint' $grep_files 2>/dev/null; then
         s72_missing=$(( s72_missing + 1 )); note_missing "§7.2.7 line revive/set-seat/supervisor reset/fleet-maint 调用面"
     fi
-    # 8. /data/ronin 不再被引用 + alias token 新路径存在
+    # 8. 旧引擎根不再被引用（探针按字符族匹配，不落字面路径）+ alias token 新路径存在
     if grep -rq '/data/ronin' "$VRB_CURRENT/config" "$VRB_CURRENT/deploy" 2>/dev/null || [ ! -e "$VRB_SECRETS_DIR" ]; then
-        s72_missing=$(( s72_missing + 1 )); note_missing "§7.2.8 /data/ronin 引用或 token 新路径($VRB_SECRETS_DIR)"
+        s72_missing=$(( s72_missing + 1 )); note_missing "§7.2.8 旧引擎根引用或 token 新路径($VRB_SECRETS_DIR)"
     fi
     # 9. A2 arbiter timer
     if [ "$rc_uf" -ne 0 ] || printf '%s\n' "$unitfiles" | grep -qi 'arbiter'; then

@@ -142,7 +142,12 @@ def build_line_message_payload(
         raise LineMessageError(CODE_TEXT_REQUIRED, "a line message without text is not a message")
     sent_at = iso(clock())
     return {
-        "body": body,
+        # The bus-seeded agent.msg.v1 envelope types body as an object and
+        # requires from/to; the human-readable text rides inside the body
+        # object and the marker -- the drain reads the marker first.
+        "body": {"text": body, "kind": kind},
+        "from": f"supervisor:{sent_by}",
+        "to": line,
         "from_alias": "supervisor",
         "from_agent_id": sent_by,
         "thread_id": f"line-message:{line}",
@@ -150,6 +155,7 @@ def build_line_message_payload(
         "sent_at": sent_at,
         LINE_MESSAGE_MARKER: {
             "kind": kind,
+            "text": body,
             "sent_by": sent_by,
             "sent_at": sent_at,
         },
@@ -311,7 +317,7 @@ def ack_rows_for_round(
         if not isinstance(marker, dict):
             continue
         kind = str(marker.get("kind") or KIND_INFO)
-        body = str(payload.get("body") or "")
+        body = str(marker.get("text") or "")
         if kind == KIND_INSTRUCTION and is_decision_text(body):
             acks.append(
                 {

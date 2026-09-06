@@ -9,10 +9,11 @@ HTTP hop, no second engine. Its state model is the one the user ruled for R1
           + the durable checkpoint (in-flight graph state)
           + the run artifacts (events, results, launches)
 
-There is deliberately **no database**. `status.json` under a development's
-directory is a *rebuildable cache* for list/get fast paths: `rebuild_status`
-recomputes it wholesale from the sources above, and a test proves the rebuilt
-copy equals the cached one, so losing the file loses nothing.
+There is deliberately **no database**. The development status is pure
+derivation: `rebuild_status` recomputes it on demand from the sources above
+(R6, wf-4601c8 §7.2.4: the former on-disk `status.json` cache's write face is
+retired -- R2 had already removed every read consumer, so the file would have
+been write-only).
 
 **Admission is server-side derivation** (R1-b). `create` takes exactly a repo
 path, a target base, and the spec -- everything else (development id, H0
@@ -480,11 +481,12 @@ def validate_timeouts(timeouts: dict[str, Any] | None) -> dict[str, int]:
 
 # --- M4 stage seats: the record is the single source -----------------------
 #
-# S2.3/S3 收尾. A stage's model used to be server-side policy: `dd serve
-# --stage-model` injected a fleet-wide override into every launched run, and
+# S2.3/S3 收尾. A stage's model used to be server-side policy: a serve-time
+# cmdline seat key injected a fleet-wide override into every launched run, and
 # that second source silently shadowed the role registry (fr ran five days on
 # deepseek-v4-pro while its registry seat said claude-opus-5). The override is
-# retired; seats now come from exactly one place -- the admission record. The
+# retired -- and R6 (wf-4601c8 §7.1.8) removed the cmdline key itself; seats
+# now come from exactly one place -- the admission record. The
 # committed ``config/stage-seats.json`` is the local projection of the role
 # registry (the registry itself is agent-runtime's, closed out by wf-9b5931):
 # its factory defaults fill every seat a dispatch did not name explicitly,
@@ -709,7 +711,6 @@ class DdLaunchSpec:
     #: acceptance, and an env overlay for both.
     setup_commands: list[list[str]] = field(default_factory=list)
     acceptance_env: dict[str, str] = field(default_factory=dict)
-    board_card: str = ""
     #: The bounded principal that dispatched this development (a line folder or
     #: a human subject), forwarded to the runner as `--dispatched-by` and
     #: recorded on every dd-worker run as the `dispatched_by` label. Empty means
@@ -729,7 +730,9 @@ class DdLaunchSpec:
     #: The development's frozen seats (stage -> seat), read from the admission
     #: record at launch time -- the single source (M4). There is no second
     #: stage-model source to shadow the role registry any more: the control
-    #: plane holds no seat policy of its own.
+    #: plane holds no seat policy of its own. R6 (§7.1.8): the seats are
+    #: consumed in-process by the stage actor; they never re-appear as a
+    #: cmdline key on the launched run.
     stage_models: dict[str, str] = field(default_factory=dict)
     #: Per-stage run-fence overrides (stage_id -> seconds), forwarded from the
     #: admission record so the launched `dd run` fences each stage with its own
@@ -831,14 +834,13 @@ class DdLaunchSpec:
             argv += ["--setup", shlex.join(command)]
         for key, value in sorted(self.acceptance_env.items()):
             argv += ["--accept-env", f"{key}={value}"]
-        for stage, model in sorted(self.stage_models.items()):
-            argv += ["--stage-model", f"{stage}={model}"]
+        # R6 (wf-4601c8 §7.1.8): seats are NOT re-declared on the cmdline. The
+        # actor resolves each stage's seat from the record-derived mapping in
+        # one place; a cmdline seat key would be a second seat source.
         for stage, seconds in sorted(self.timeouts.items()):
             argv += ["--stage-timeout", f"{stage}={seconds}"]
         if self.gate_reject_file:
             argv += ["--gate-reject-file", self.gate_reject_file]
-        if self.board_card:
-            argv += ["--board-card", self.board_card]
         if self.dispatched_by:
             argv += ["--dispatched-by", self.dispatched_by]
         if self.resume:
@@ -962,15 +964,10 @@ class DdControlPlane:
                     f"{development_id} already admitted with a different spec or repo; "
                     "a changed spec is a new development in a fresh worktree",
                 )
-            if not existing.get("card_entity_id"):
-                # The bus was down (or refused) at first admission; the card
-                # publish is idempotency-keyed, so healing it here cannot fork.
-                card = self._publish_card(
-                    development_id, repo, str(existing.get("remote_ref") or "")
-                )
-                if card:
-                    existing["card_entity_id"] = card
-                    write_json_durable(dev_root / RECORD_FILE, existing)
+            # R6 (wf-4601c8 §7.2.3): the engine-side work.card.v1 publish (and
+            # its heal-up branch) is gone -- a dd development no longer
+            # materialises a board card at admission. The gate still re-reads
+            # the board for the verdict; the card is not an engine product.
             return self._creation_result(existing, already_admitted=True)
 
         self._refuse_foreign_binding(repo, development_id)
@@ -1013,8 +1010,6 @@ class DdControlPlane:
         dev_root.mkdir(parents=True, exist_ok=True)
         (dev_root / H0_FILE).write_bytes(h0_bytes)
 
-        card_entity_id = self._publish_card(development_id, repo, remote_ref)
-
         record = {
             "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
             "development_id": development_id,
@@ -1032,7 +1027,6 @@ class DdControlPlane:
             "bootstrap_commit": bootstrap_commit,
             "root_handoff_digest": root_handoff_digest,
             "acceptance_commands": acceptance_commands,
-            "card_entity_id": card_entity_id,
             "dispatched_by": dispatched_by,
             #: The per-stage run-fence overrides, as validated. Empty (or never
             #: passed) keeps the runner's 3600s default for every stage -- this
@@ -1044,9 +1038,9 @@ class DdControlPlane:
             #: admission. `seats_source` records where each seat came from
             #: (`line-explicit` / `registry-default`). Every launch reads its
             #: seats from THIS mapping -- there is no server-side stage-model
-            #: override any more -- and the launched argv is the record's
-            #: `--stage-model stage=seat` pairs, so launches.jsonl and the
-            #: record can never disagree.
+            #: override any more, and no cmdline seat key either: the actor
+            #: reads this mapping directly, so launches and the record can
+            #: never disagree.
             "seats": seats,
             "seats_source": seat_sources,
             "plugin_binding_path": str(self.plugin_binding),
@@ -1074,8 +1068,6 @@ class DdControlPlane:
             "acceptance_commands": record["acceptance_commands"],
             "seats": dict(record.get("seats") or {}),
             "seats_source": dict(record.get("seats_source") or {}),
-            "card_entity_id": record["card_entity_id"],
-            "gate_enabled": bool(record["card_entity_id"]),
         }
 
     def _admit_repo(self, repo_path: str) -> Path:
@@ -1280,29 +1272,6 @@ class DdControlPlane:
             # disabled and says so, rather than half-wired.
             return None
 
-    def _publish_card(self, development_id: str, repo: Path, remote_ref: str) -> str:
-        board = self._board_factory()
-        if board is None:
-            return ""
-        try:
-            # The exact work.card.v1 schema the board enforces: title/status/
-            # intent required, additionalProperties false (measured 2026-08-27).
-            result = board.publish_card(
-                {
-                    "title": f"dd {development_id}",
-                    "status": "doing",
-                    "intent": f"dev-dispatch development in {repo}",
-                    "development_id": development_id,
-                    "links": [remote_ref],
-                },
-                idempotency_key=f"dd-card:{development_id}",
-            )
-        except Exception:
-            # Best-effort: admission must survive a downed bus. The gate then
-            # stays disabled and the result says so; a later create heals it.
-            return ""
-        return result.entity_id
-
     # --- records and status ----------------------------------------------
 
     def _dev_root(self, development_id: str) -> Path:
@@ -1414,10 +1383,11 @@ class DdControlPlane:
         return dict(values) if isinstance(values, dict) else None
 
     def rebuild_status(self, development_id: str) -> dict[str, Any]:
-        """Recompute the status cache from git + checkpoint + run artifacts.
+        """Derive the status from git + checkpoint + run artifacts.
 
-        This is the proof the cache is a cache: everything in `status.json`
-        comes from here, and nothing reads the file except the list fast path.
+        R6 (wf-4601c8 §7.2.4): this is now pure derivation -- no on-disk
+        status.json is written or read. The name stays for API stability:
+        every caller gets the freshly computed projection of the authorities.
         """
         record = self._record(development_id)  # refuses unknown ids before anything else
         generation = self._generation(record)
@@ -1484,7 +1454,12 @@ class DdControlPlane:
             "active_unit": active_unit or "",
             "launches": len(self._launches(development_id)),
         }
-        write_json_durable(self._dev_root(development_id) / STATUS_FILE, status)
+        # R6 (wf-4601c8 §7.2.4): the status.json write face is retired. R2
+        # already removed every read consumer -- the status is now pure
+        # derivation over the authorities (git + checkpoint + run artifacts),
+        # computed on demand; the only consumers of the *cache* were reads
+        # that no longer exist (list fast path gone, harvest H-B reads
+        # result.json first and refuses closed without it).
         return status
 
     # --- start / gate ----------------------------------------------------
@@ -1618,7 +1593,6 @@ class DdControlPlane:
             acceptance_commands=[list(c) for c in record.get("acceptance_commands") or []],
             setup_commands=[list(c) for c in record.get("setup_commands") or []],
             acceptance_env=dict(record.get("acceptance_env") or {}),
-            board_card=str(record.get("card_entity_id") or ""),
             dispatched_by=str(record.get("dispatched_by") or ""),
             resume=resume,
             launch_seq=seq,
@@ -2067,7 +2041,6 @@ class DdControlPlane:
         status = self.rebuild_status(development_id)
         awaiting = status.get("awaiting") or {}
         question_note_id = str(awaiting.get("question_note_id") or "")
-        card_entity_id = str(awaiting.get("card_entity_id") or "")
         if not question_note_id:
             raise ControlPlaneError(
                 "GATE_TICKET_UNRESOLVED",
@@ -2083,7 +2056,7 @@ class DdControlPlane:
         from fleet_graph.bus.board import DECISION_KIND, WORK_NOTES
 
         payload = {
-            "card_entity_id": card_entity_id,
+            "card_entity_id": "",
             "question": "",
             "decision": decision,
             "decided_by": decided_by,
@@ -2102,7 +2075,6 @@ class DdControlPlane:
         return {
             "development_id": development_id,
             "question_note_id": question_note_id,
-            "card_entity_id": card_entity_id,
             "decision": decision,
             "decided_by": decided_by,
             "message_id": str(getattr(published, "message_id", "") or ""),
@@ -2199,7 +2171,7 @@ class DdControlPlane:
             ticket = GateTicket.from_dict(
                 {
                     "question_note_id": str(awaiting.get("question_note_id") or ""),
-                    "card_entity_id": str(awaiting.get("card_entity_id") or ""),
+                    "card_entity_id": "",
                 }
             )
             return board.decision_for(ticket) is not None
@@ -2227,7 +2199,6 @@ class DdControlPlane:
             "acceptance_env": record.get("acceptance_env", {}),
             "timeouts": record.get("timeouts", {}),
             "reconfigures": record.get("reconfigures", []),
-            "card_entity_id": record.get("card_entity_id", ""),
             "created_at": record.get("created_at", ""),
             "adoptions": [
                 adopted.as_dict()
@@ -2798,7 +2769,7 @@ class DdControlPlane:
         try:
             ticket = GateTicket(
                 question_note_id=question_note_id,
-                card_entity_id=str(record.get("card_entity_id") or ""),
+                card_entity_id="",
             )
             return board.decision_for(ticket)
         except Exception:

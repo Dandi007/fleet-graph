@@ -37,7 +37,8 @@ REPO_ROOT = sys.argv[1]
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from fleet_graph.mcp_availability import (
-    PROBE_NOT_SUPPORTED,
+    PROBE_ERROR,
+    PROBE_SUCCESS,
     STATUS_AVAILABLE,
     STATUS_UNAVAILABLE,
     FastMcpSurface,
@@ -398,42 +399,18 @@ else:
 
 # ---------------- M4 ----------------
 # M4 阳性：把某 MCP 面的上游指向不存在地址 → 必须告警。
-# M4 阴性：面正常时不得开火；显式 NOT_SUPPORTED 的历史工具不得算失败。
+# M4 阴性：面正常时不得开火；已移除的历史工具名不得算失败。
 # 复用 fleet_graph.mcp_availability 判定口（归属可观测线 wf-6475fd；本线只交付
 # 「MCP 面怎么算可用」的判定口 + 结构化结论，不写告警规则、不自造第二份判定口）。
 # 探测：把判定口指向不可达地址 → 必须回 unavailable 且 list_error 非空；指向 live 的
-# dd :5610 → 必须回 available，且 NOT_SUPPORTED 历史工具（development_steer）加入探针时
-# 其拒绝必须被记为 not_supported 而非 error、不得把整体判失败。
+# dd :5610 → 必须回 available。R6（wf-4601c8 §7.1.7）把五个 NOT_SUPPORTED 历史工具
+# 从 dd 面整个移除，development_steer 不再注册：把已移除名加入探针时其 unknown-tool
+# 错误必须被记为 error（unknown tool ≠ 成功），且不得把整体判失败（read-only 主探针
+# development_list 仍成功 → 整体 available）。
 DD_MCP_URL = f"http://127.0.0.1:{DD}/mcp"
 UNREACHABLE_URL = "http://127.0.0.1:1/mcp"
 READ_ONLY_PROBES = ["development_list"]
-NOT_SUPPORTED_TOOL = "development_steer"
-NOT_SUPPORTED_ARGS = {
-    "development_id": "verify-mcp-only-probe",
-    "instruction": "verify-mcp-only-probe",
-    "idempotency_key": "verify-mcp-only-probe",
-    "expected_revision": 0,
-}
-
-
-class DdSteerArgsSurface:
-    """FastMcpSurface adapter that supplies development_steer's required args.
-
-    Without its args fastmcp rejects the call as a missing-argument validation
-    error before the function body runs, so the real NOT_SUPPORTED refusal would
-    never be observed. Supplying them makes the oracle see the actual refusal.
-    """
-
-    def __init__(self, url, timeout):
-        self._inner = FastMcpSurface(url, timeout=timeout)
-
-    def list_tools(self):
-        return self._inner.list_tools()
-
-    def call_tool(self, tool, arguments):
-        if tool == NOT_SUPPORTED_TOOL:
-            arguments = dict(NOT_SUPPORTED_ARGS)
-        return self._inner.call_tool(tool, arguments)
+REMOVED_TOOL = "development_steer"
 
 
 # M4 阳性：把判定口指向不存在地址（connection refused），必须回 unavailable 且 list_error 非空。
@@ -449,29 +426,32 @@ else:
          f"判定口实测：上游指向 {UNREACHABLE_URL} → status={positive.status}，"
          f"list_error={positive.list_error!r}（未把不可达上游判为 unavailable，判定口不能红）")
 
-# M4 阴性：面正常不得开火；显式 NOT_SUPPORTED 的历史工具不得算失败。
+# M4 阴性：面正常不得开火；已移除的历史工具名（unknown tool）不得算成功，也不得
+# 把整体判失败。
 negative = judge_mcp_availability(
-    DdSteerArgsSurface(DD_MCP_URL, 5), READ_ONLY_PROBES + [NOT_SUPPORTED_TOOL]
+    FastMcpSurface(DD_MCP_URL, timeout=5), READ_ONLY_PROBES + [REMOVED_TOOL]
 )
 if negative.status == STATUS_UNAVAILABLE and negative.list_error and not negative.tools_listed:
     emit("M4", "阴性", "不可判定",
-         "面正常时不得开火；显式 NOT_SUPPORTED 的历史工具不得算失败",
+         "面正常时不得开火；已移除的历史工具名不得算成功或算失败",
          f"dd 面 {DD_MCP_URL} 不可达：{negative.list_error}（判定口无法构造「面正常」前提），不可判定")
 else:
-    steer_probe = next((p for p in negative.probes if p.tool == NOT_SUPPORTED_TOOL), None)
-    steer_not_supported = steer_probe is not None and steer_probe.outcome == PROBE_NOT_SUPPORTED
-    if negative.status == STATUS_AVAILABLE and steer_not_supported:
+    removed_probe = next((p for p in negative.probes if p.tool == REMOVED_TOOL), None)
+    list_probe = next((p for p in negative.probes if p.tool == "development_list"), None)
+    removed_is_error = removed_probe is not None and removed_probe.outcome == PROBE_ERROR
+    list_ok = list_probe is not None and list_probe.outcome == PROBE_SUCCESS
+    if negative.status == STATUS_AVAILABLE and list_ok and removed_is_error:
         emit("M4", "阴性", "绿",
-             "面正常时不得开火；显式 NOT_SUPPORTED 的历史工具不得算失败",
+             "面正常时不得开火；已移除的历史工具名不得算成功或算失败",
              f"判定口实测 dd 面 :{DD}：status={negative.status}，development_list 探针成功；"
-             f"{NOT_SUPPORTED_TOOL} 探针 outcome={steer_probe.outcome}（NOT_SUPPORTED 拒绝计 "
-             f"not_supported，不把整体判失败）")
+             f"{REMOVED_TOOL} 探针 outcome={removed_probe.outcome}（R6 已移除，unknown-tool "
+             f"错误如实记 error，不把整体判失败）")
     else:
-        detail = steer_probe.outcome if steer_probe else "无探针"
+        detail = removed_probe.outcome if removed_probe else "无探针"
         emit("M4", "阴性", "红",
-             "面正常时不得开火；显式 NOT_SUPPORTED 的历史工具不得算失败",
-             f"判定口实测 dd 面 :{DD}：status={negative.status}，{NOT_SUPPORTED_TOOL} 探针 "
-             f"outcome={detail}（正常面被误判或 NOT_SUPPORTED 被计失败）")
+             "面正常时不得开火；已移除的历史工具名不得算成功或算失败",
+             f"判定口实测 dd 面 :{DD}：status={negative.status}，{REMOVED_TOOL} 探针 "
+             f"outcome={detail}（正常面被误判、unknown tool 被计成功、或 read-only 主探针失败）")
 
 # ---------------- 汇总 ----------------
 for cid, side, status, desc, evidence in CRITERIA:

@@ -116,8 +116,26 @@ class IdempotentFakeBoard:
         self.card_publishes: list[str] = []
         self.deduplicated_publishes: list[str] = []
         self.questions: dict[str, Any] = {}
+        self.client = IdempotentFakeBoard._Client(self)
 
-    def publish_card(self, payload: dict[str, Any], idempotency_key: str) -> Any:
+    #: R6 (wf-4601c8 §7.2.3): Board.publish_card is gone -- the scheduler and
+    #: the interrupt runtime publish through ``board.client`` with the shared
+    #: goal-line card face. The fake mirrors that call shape.
+    index_channel = "board:work-index"
+
+    class _Client:
+        def __init__(self, outer: IdempotentFakeBoard) -> None:
+            self._outer = outer
+            self.index_channel = "board:work-index"
+
+        def publish(
+            self, channel_id: str, kind: str, payload: dict[str, Any], idempotency_key: str
+        ) -> Any:
+            return self._outer._publish_card(channel_id, kind, payload, idempotency_key)
+
+    def _publish_card(
+        self, channel_id: str, kind: str, payload: dict[str, Any], idempotency_key: str
+    ) -> Any:
         self.card_publishes.append(idempotency_key)
         if idempotency_key in self.cards:
             existing = self.cards[idempotency_key]
@@ -490,30 +508,38 @@ class TestFaithfulIdempotency:
         409, not a dedup. The fake models this so a regression to a divergent
         payload fails loudly instead of quietly passing."""
         board = IdempotentFakeBoard()
-        board.publish_card(
+        board.client.publish(
+            "board:work-index",
+            "work.card.v1",
             goal_line_card_payload(folder_id=FOLDER_ID, title=ALIAS),
-            idempotency_key=goal_line_card_key(FOLDER_ID),
+            goal_line_card_key(FOLDER_ID),
         )
         with pytest.raises(BusConflict):
-            board.publish_card(
+            board.client.publish(
+                "board:work-index",
+                "work.card.v1",
                 {
                     "title": FOLDER_ID,
                     "status": "doing",
                     "intent": "divergent",
                     "work_folder_id": FOLDER_ID,
                 },
-                idempotency_key=goal_line_card_key(FOLDER_ID),
+                goal_line_card_key(FOLDER_ID),
             )
 
     def test_same_key_identical_payload_deduplicates(self) -> None:
         board = IdempotentFakeBoard()
-        first = board.publish_card(
+        first = board.client.publish(
+            "board:work-index",
+            "work.card.v1",
             goal_line_card_payload(folder_id=FOLDER_ID, title=ALIAS),
-            idempotency_key=goal_line_card_key(FOLDER_ID),
+            goal_line_card_key(FOLDER_ID),
         )
-        second = board.publish_card(
+        second = board.client.publish(
+            "board:work-index",
+            "work.card.v1",
             goal_line_card_payload(folder_id=FOLDER_ID, title=ALIAS),
-            idempotency_key=goal_line_card_key(FOLDER_ID),
+            goal_line_card_key(FOLDER_ID),
         )
         assert second.deduplicated is True
         assert second.entity_id == first.entity_id

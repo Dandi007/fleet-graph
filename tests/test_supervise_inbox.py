@@ -73,7 +73,7 @@ def client_for(
             "messages": notes,
             "head_seq": notes[-1]["channel_seq"] if notes else 0,
         },
-        "board:work-index/messages": {
+        "board:goal-line/messages": {
             "messages": cards,
             "head_seq": cards[-1]["channel_seq"] if cards else 0,
         },

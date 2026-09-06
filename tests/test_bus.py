@@ -587,7 +587,8 @@ class TestAgentMayNotDecide:
         for _ in range(6):
             transport.queue(*publish_ok())
 
-        board.publish_card({"title": "t"}, "i1")
+        # R6 (wf-4601c8 §7.2.3): Board.publish_card is removed -- the engine
+        # no longer creates cards at all (asserted explicitly below).
         board.revise_card(entity_id="c", supersedes="s", payload={}, idempotency_key="i2")
         board.note(card_entity_id="c", text="n", note_type="progress", idempotency_key="i3")
         board.evidence(card_entity_id="c", text="e", idempotency_key="i4")

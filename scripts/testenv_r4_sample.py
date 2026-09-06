@@ -296,10 +296,38 @@ def run_line_graph(
     )
 
 
+def _goal_line_card_entity_id(bus_client: Any, dispatched_by: str) -> str:
+    """The goal-line card entity the sample's gate question refs.
+
+    R6 (wf-4601c8 §7.2.3) removed the engine-side card publish, so the
+    fixture materialises its own line card through the shared constructor and
+    shared idempotency key (the same face the scheduler's escalation uses),
+    keeping the sample's question note ref valid against a fresh bus.
+    """
+    from fleet_graph.bus.board import (
+        WORK_INDEX,
+        goal_line_card_key,
+        goal_line_card_payload,
+    )
+
+    # R6 (wf-4601c8 §7.2.3): work.card.v1 is retired from the registry, so the
+    # fixture publishes its line card as goal.line.card.v1 -- the engine-neutral
+    # successor kind on board:work-index (root, refs-free). The gate's question
+    # note refs this entity.
+    card = bus_client.publish(
+        WORK_INDEX,
+        "goal.line.card.v1",
+        goal_line_card_payload(folder_id=dispatched_by, title=dispatched_by),
+        goal_line_card_key(dispatched_by),
+    )
+    return str(card.entity_id)
+
+
 def run_pipeline(
     root: Path,
     plane: Any,
     board: Any,
+    bus_client: Any,
     development_id: str,
     record: dict[str, Any],
     base: str,
@@ -376,7 +404,7 @@ def run_pipeline(
         ),
         lifecycle_gate_stage(lifecycle): BoardGate(
             board=board,
-            card_entity_id=str(record.get("card_entity_id") or ""),
+            card_entity_id=_goal_line_card_entity_id(bus_client, str(record["dispatched_by"])),
             development_id=development_id,
             repo=workspace,
         ),
@@ -561,7 +589,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- the real pipeline run, to the gate -----------------------------------
     graph, state = run_pipeline(
-        root, plane, board, development_id, record, base, advanced, acceptance_commands
+        root, plane, board, bus_client, development_id, record, base, advanced, acceptance_commands
     )
     run_root = root / "dd" / development_id
     # The authority result.json first: the control plane derives the gate
