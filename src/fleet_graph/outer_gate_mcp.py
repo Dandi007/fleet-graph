@@ -436,8 +436,9 @@ def build_outer_gate_mcp_server(
         """Revive one done line (supervisor-only, audited).
 
         监督者 principal 专属：非监督者稳定拒绝+留痕（拒绝码
-        ``OUTER_GATE_NON_SUPERVISOR`` 写进回执）。成功路径即 CLI
-        ``line revive`` 的同一原语：C1 预检+revoke 记录+generation 递增。
+        ``OUTER_GATE_NON_SUPERVISOR`` 写进回执）。成功路径即受监督 revive
+        写原语（R6 §7.2.7 起 CLI 调用面已删，本工具是唯一调用门）：
+        C1 预检+revoke 记录+generation 递增。
         """
         require_supervisor("line_revive", principal)
         fn = revive
@@ -471,9 +472,9 @@ def build_outer_gate_mcp_server(
     ) -> dict[str, Any]:
         """Switch one line's runtime seat (supervisor-only, audited).
 
-        监督者 principal 专属（同族鉴权+留痕）。成功路径即 CLI
-        ``line set-seat`` 的同一原语：C4 探活预检+override 记录+
-        generation 递增。
+        监督者 principal 专属（同族鉴权+留痕）。成功路径即受监督 set-seat
+        写原语（R6 §7.2.7 起 CLI 调用面已删，本工具是唯一调用门）：
+        C4 探活预检+override 记录+generation 递增。
         """
         require_supervisor("line_set_seat", principal)
         fn = set_seat

@@ -189,6 +189,228 @@ def _line_run(args: argparse.Namespace) -> int:
     return 0 if result.get("terminal") in {"done", "blocked", "bounds"} else 1
 
 
+def perform_set_seat(
+    *,
+    folder_id: str,
+    to_seat: str,
+    reason: str,
+    who: str,
+    lines_config: pathlib.Path,
+    run_root: pathlib.Path | None = None,
+    prober: Any = None,
+    probe_enabled: bool = True,
+    clock: Any = time.time,
+) -> dict[str, Any]:
+    """The line set-seat write primitive behind the outer-gate MCP tool.
+
+    R6 (wf-4601c8 §7.2.7): the CLI `line set-seat` call face is gone -- this
+    plain function is what the supervised MCP door (`line_set_seat`) invokes.
+    Step 7's core: probe the target seat (C4 precheck, probe healthy before
+    switching), write a C1-complete override to the scheduler's persistent
+    surface, and bump the persisted generation so the next scheduler launch is
+    a fresh thread cold-starting on the override seat.
+
+    Refusals are operator errors (not in roster, missing reason, no-op switch,
+    probe not healthy) and raise ``SystemExit`` -- the same shape the rest of
+    the CLI uses for a command that cannot do what it was told. A no-op switch
+    (already on that seat) is refused before any probe: there is nothing to
+    switch, and manufacturing an override would only create audit noise.
+    """
+    from fleet_graph.scheduler.daemon import (
+        SchedulerConfig,
+        bump_line_generation,
+    )
+    from fleet_graph.scheduler.seat_override import SeatOverrideStore, validate_override
+    from fleet_graph.state.run_artifacts import iso
+
+    if not folder_id:
+        raise SystemExit("set-seat needs a folder_id")
+    if not reason:
+        raise SystemExit("set-seat needs a reason: a seat switch without a reason is not auditable")
+    if not who:
+        raise SystemExit("set-seat needs a who: a seat switch without an operator is not auditable")
+
+    config = SchedulerConfig.from_json(pathlib.Path(lines_config))
+    line = next((entry for entry in config.lines if entry.folder_id == folder_id), None)
+    if line is None:
+        raise SystemExit(
+            f"set-seat refused: {folder_id} is not in the roster at {lines_config}; "
+            "a seat switch needs a roster line to name the 'from' seat"
+        )
+
+    store = SeatOverrideStore(run_root or config.run_root)
+    current_override = store.get(folder_id)
+    from_seat = current_override.to if current_override is not None else line.seat
+    if from_seat == to_seat:
+        raise SystemExit(
+            f"set-seat refused: {folder_id} already runs on seat {to_seat!r} "
+            "(roster seat when no override is in effect); a no-op switch changes nothing"
+        )
+
+    # C4: probe the face the target seat depends on *before* switching. A seat
+    # that cannot be probed (no credential, unregistered) reads as "we don't
+    # know", and not knowing is a refusal -- the switch may be perfectly fine
+    # and we simply cannot ask, but switching blind is not the spec.
+    if probe_enabled:
+        if prober is None:
+            from fleet_graph.scheduler.probe import CliGatewayProber
+
+            prober = CliGatewayProber()
+        try:
+            healthy = bool(prober.check(to_seat))
+        except Exception as exc:
+            raise SystemExit(
+                f"set-seat refused: gateway probe for seat {to_seat!r} could not be run: {exc}"
+            ) from exc
+        if not healthy:
+            raise SystemExit(
+                f"set-seat refused: gateway probe red for seat {to_seat!r}; "
+                "probe healthy before switching (C4 precheck)"
+            )
+
+    when = iso(clock())
+    record = validate_override(
+        {
+            "folder_id": folder_id,
+            "who": who,
+            "when": when,
+            "from": from_seat,
+            "to": to_seat,
+            "reason": reason,
+        }
+    )
+    store.write(record)
+    next_generation = bump_line_generation(run_root or config.run_root, folder_id, line.generation)
+    return {
+        **record.as_dict(),
+        "generation": next_generation,
+        "run_root": str(run_root or config.run_root),
+    }
+
+
+def perform_line_revive(
+    *,
+    folder_id: str,
+    who: str,
+    basis: str,
+    lines_config: pathlib.Path,
+    run_root: pathlib.Path | None = None,
+    generation: int | None = None,
+    run_id: str | None = None,
+    reason: str | None = None,
+    checkpoints: Any = None,
+    clock: Any = time.time,
+) -> dict[str, Any]:
+    """The line-revive write primitive behind the outer-gate MCP tool.
+
+    R6 (wf-4601c8 §7.2.7): the CLI `line revive` call face is gone -- this
+    plain function is what the supervised MCP door (`line_revive`) invokes.
+    M5's first-class revival entry. Two gates, both mandatory, before anything
+    is written:
+
+    1. **C1 precheck** -- the target line's current checkpoint-authoritative
+       terminal must really be ``done``, and the given ``--generation`` (or
+       ``--run-id``) must match that checkpoint record. Any mismatch is a
+       refusal (`refused: target not terminal_done` / `refused: generation
+       mismatch`) and nothing is written or bumped.
+    2. **C1 write** -- the revoke record must carry who/basis/generation/when;
+       ``validate_revive`` refuses a record missing any of them before it
+       reaches disk.
+
+    Only after both pass is the revoke record written and the persisted
+    generation bumped, so the next scheduler launch cold-starts on a fresh
+    thread (the old `done` thread is spent -- see daemon.py).
+    """
+    from fleet_graph.scheduler.checkpoint_terminal import SqliteCheckpointTerminalReader
+    from fleet_graph.scheduler.daemon import (
+        SchedulerConfig,
+        bump_line_generation,
+        stalled_generation,
+    )
+    from fleet_graph.scheduler.revive import ReviveStore, validate_revive
+    from fleet_graph.state.run_artifacts import iso
+
+    if not folder_id:
+        raise SystemExit("line revive needs a folder_id")
+    if not who:
+        raise SystemExit("line revive needs a who: a revoke without an operator is not auditable")
+    if not basis:
+        raise SystemExit(
+            "line revive needs a basis: a revoke without a mechanical reference "
+            "(goal.md ruling id / board decision id / message reference) is not auditable"
+        )
+    if generation is None and run_id is None:
+        raise SystemExit(
+            "line revive needs a generation or a run id: a revoke must name the "
+            "generation (or run id) of the `done` terminal it overturns"
+        )
+
+    config = SchedulerConfig.from_json(pathlib.Path(lines_config))
+    line = next((entry for entry in config.lines if entry.folder_id == folder_id), None)
+    if line is None:
+        raise SystemExit(
+            f"line revive refused: {folder_id} is not in the roster at {lines_config}; "
+            "a revoke needs a roster line to name the generation base"
+        )
+
+    effective_run_root = pathlib.Path(run_root) if run_root is not None else config.run_root
+    reader = checkpoints or SqliteCheckpointTerminalReader(effective_run_root)
+    current_generation = stalled_generation(effective_run_root, folder_id, line.generation)
+
+    # C1 precheck: the current checkpoint-authoritative terminal must be `done`,
+    # and the recorded generation must match where that `done` lives. Walk the
+    # same (current, previous) pair the daemon reads, so the CLI and the daemon
+    # can never disagree about which terminal a revoke refers to.
+    done_generation: int | None = None
+    done_record: dict[str, Any] | None = None
+    for candidate in (current_generation, current_generation - 1):
+        if candidate < 1:
+            continue
+        reading = reader.read(folder_id, candidate)
+        if reading.fault is not None:
+            break
+        if reading.authoritative:
+            record = reading.record
+            if record is not None and record.get("terminal") == "done":
+                done_generation = candidate
+                done_record = record
+            break
+    if done_generation is None:
+        raise SystemExit(
+            f"line revive refused: target not terminal_done: {folder_id} is not 'done' "
+            "in its current checkpoint (revival is only legal against a done terminal)"
+        )
+    if generation is not None and generation != done_generation:
+        raise SystemExit(
+            f"line revive refused: generation mismatch: generation {generation} does not "
+            f"match the checkpoint's done terminal at generation {done_generation}"
+        )
+    if run_id is not None and done_record is not None and done_record.get("run_id") != run_id:
+        raise SystemExit(
+            f"line revive refused: generation mismatch: run id {run_id!r} does not match "
+            f"the checkpoint's done terminal run_id {done_record.get('run_id')!r}"
+        )
+
+    when = iso(clock())
+    record = validate_revive(
+        {
+            "folder_id": folder_id,
+            "who": who,
+            "basis": basis,
+            "generation": done_generation,
+            "when": when,
+            "reason": reason or "",
+        }
+    )
+    ReviveStore(effective_run_root).write(record)
+    next_generation = bump_line_generation(effective_run_root, folder_id, line.generation)
+    return {
+        **record.as_dict(),
+        "next_generation": next_generation,
+        "run_root": str(effective_run_root),
+    }
+
+
 def _line_overrides(args: argparse.Namespace) -> int:
     """The C3 reconcile/lint surface: fold converged overrides, list the drift.
 

@@ -2,7 +2,8 @@
 
 A goal line's seat is an SSoT fact: it lives in the reviewed roster
 (``config/ronin-lines.json``) and only changes through a git/PR/review/deploy
-cycle. Step 7 adds the *runtime* switch -- ``fleet-graph line set-seat`` -- for
+cycle. Step 7 adds the *runtime* switch (R6 §7.2.7: supervised via the
+outer-gate ``line_set_seat`` MCP tool) for
 the cases that cannot wait for a release (a seat's subscription dies mid-line,
 a family split lands, a bad rollout needs an immediate lane change). That
 switch must not rewrite the roster, so it writes a separate, smaller, audited

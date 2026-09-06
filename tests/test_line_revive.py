@@ -21,8 +21,9 @@ Covers the frozen-scope acceptance:
    other refusal order is unchanged.
 7. **R6 (wf-4601c8 §7.2.7)** -- the CLI `line revive` call face is removed
    (the outer-gate MCP `line_revive` tool is the supervised write door now);
-   the tests that drove `perform_line_revive` went with it. The revoke
-   surface itself (C1..C3, the decide order) is unchanged.
+   the C1 precheck tests re-point at the `perform_line_revive` primitive
+   that door invokes. The revoke surface (C1..C3, the decide order) is
+   unchanged.
 """
 
 from __future__ import annotations
@@ -586,3 +587,126 @@ class TestDecideOrderIsUnchanged:
             unproductive_recent=DEFAULT_TOTAL_CAP,
         )
         assert decision.refusal is Refusal.TOTAL_CAP_REACHED
+
+
+# --- C1 precheck on the write primitive (behind the outer-gate MCP door) ----
+
+
+class TestRevivePrimitivePrecheck:
+    def test_perform_line_revive_requires_who_and_basis(self, tmp_path: Path) -> None:
+        from fleet_graph.cli import perform_line_revive
+
+        roster = tmp_path / "lines.json"
+        roster.write_text(json.dumps({"lines": [{"folder_id": "wf-1", "seat": "s"}]}))
+        with pytest.raises(SystemExit, match="needs a who"):
+            perform_line_revive(
+                folder_id="wf-1",
+                who="",
+                basis="b",
+                lines_config=roster,
+                run_root=tmp_path / "runs",
+            )
+        with pytest.raises(SystemExit, match="needs a basis"):
+            perform_line_revive(
+                folder_id="wf-1",
+                who="alice",
+                basis="",
+                lines_config=roster,
+                run_root=tmp_path / "runs",
+            )
+
+    def test_perform_line_revive_requires_generation_or_run_id(self, tmp_path: Path) -> None:
+        from fleet_graph.cli import perform_line_revive
+
+        roster = tmp_path / "lines.json"
+        roster.write_text(json.dumps({"lines": [{"folder_id": "wf-1", "seat": "s"}]}))
+        with pytest.raises(SystemExit, match="needs a generation or a run id"):
+            perform_line_revive(
+                folder_id="wf-1",
+                who="alice",
+                basis="b",
+                lines_config=roster,
+                run_root=tmp_path / "runs",
+            )
+
+    def test_perform_line_revive_refuses_when_target_is_not_done(self, tmp_path: Path) -> None:
+        from fleet_graph.cli import perform_line_revive
+
+        roster = tmp_path / "lines.json"
+        roster.write_text(json.dumps({"lines": [{"folder_id": "wf-1", "seat": "s"}]}))
+        reader = FakeCheckpointReader(
+            records={("wf-1", 1): {"terminal": "blocked", "rounds": 0, "run_id": "run-b"}}
+        )
+        with pytest.raises(SystemExit, match="target not terminal_done"):
+            perform_line_revive(
+                folder_id="wf-1",
+                who="alice",
+                basis="goal-md-ruling-42",
+                generation=1,
+                lines_config=roster,
+                run_root=tmp_path / "runs",
+                checkpoints=reader,
+            )
+
+    def test_perform_line_revive_refuses_on_generation_mismatch(self, tmp_path: Path) -> None:
+        from fleet_graph.cli import perform_line_revive
+
+        roster = tmp_path / "lines.json"
+        roster.write_text(json.dumps({"lines": [{"folder_id": "wf-1", "seat": "s"}]}))
+        reader = FakeCheckpointReader(records={("wf-1", 1): done_record(run_id="run-done")})
+        with pytest.raises(SystemExit, match="generation mismatch"):
+            perform_line_revive(
+                folder_id="wf-1",
+                who="alice",
+                basis="goal-md-ruling-42",
+                generation=2,
+                lines_config=roster,
+                run_root=tmp_path / "runs",
+                checkpoints=reader,
+            )
+
+    def test_perform_line_revive_refuses_on_run_id_mismatch(self, tmp_path: Path) -> None:
+        from fleet_graph.cli import perform_line_revive
+
+        roster = tmp_path / "lines.json"
+        roster.write_text(json.dumps({"lines": [{"folder_id": "wf-1", "seat": "s"}]}))
+        reader = FakeCheckpointReader(records={("wf-1", 1): done_record(run_id="run-done")})
+        with pytest.raises(SystemExit, match="generation mismatch"):
+            perform_line_revive(
+                folder_id="wf-1",
+                who="alice",
+                basis="goal-md-ruling-42",
+                run_id="run-other",
+                lines_config=roster,
+                run_root=tmp_path / "runs",
+                checkpoints=reader,
+            )
+
+    def test_perform_line_revive_writes_and_bumps_on_match(self, tmp_path: Path) -> None:
+        from fleet_graph.cli import perform_line_revive
+        from fleet_graph.state.run_artifacts import iso
+
+        roster = tmp_path / "lines.json"
+        roster.write_text(json.dumps({"lines": [{"folder_id": "wf-1", "seat": "s"}]}))
+        reader = FakeCheckpointReader(records={("wf-1", 1): done_record(run_id="run-done")})
+        result = perform_line_revive(
+            folder_id="wf-1",
+            who="alice",
+            basis="goal-md-ruling-42",
+            generation=1,
+            reason="goal changed upstream",
+            lines_config=roster,
+            run_root=tmp_path / "runs",
+            checkpoints=reader,
+            clock=lambda: 1_787_000_000.0,
+        )
+        assert result["who"] == "alice"
+        assert result["basis"] == "goal-md-ruling-42"
+        assert result["generation"] == 1
+        assert result["when"] == iso(1_787_000_000.0)
+        assert result["next_generation"] == 2
+        store = ReviveStore(tmp_path / "runs")
+        stored = store.get("wf-1")
+        assert stored is not None
+        assert stored.basis == "goal-md-ruling-42"
+        assert stored.generation == 1

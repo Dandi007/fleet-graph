@@ -289,17 +289,19 @@ journalctl --user -u fleet-graphd -f          # 每 60s 一批，每条线一行
 每行形如 `{"folder_id": ..., "ignited": false, "refusal": "line_disabled", ...}`。
 `refusal` 就是上面七道闸加名册的名字，一一对应。
 
-## 线级换座（step 7：`line set-seat`）
+## 线级换座（step 7：受监督的 `line_set_seat` 写门）
 
 名册座位是 SSoT，只走 PR/review/deploy 改。等不及发布的时候（座位订阅挂了、
 家族分流、坏放量要立刻换道），用**运行时 override** 换座——**绝不动
-`config/ronin-lines.json`**：
+`config/ronin-lines.json`**。R6（wf-4601c8 §7.2.7）删除了 CLI `line set-seat`
+调用面：换座写门 = 外门 MCP 工具 `line_set_seat`（监督者 principal 专属，
+`fleet-graph outer-gate serve`，:5616），实现就是同一个原语（C4 探活预检 +
+override 写入 + generation 递增）：
 
-```bash
-# 用法（从仓库根或部署目录跑；--lines-config 缺省 config/ronin-lines.json）
-fleet-graph line set-seat wf-9b5931 opencode-gpt-terra \
-  --reason "dsv4pro 订阅道故障，先切 terra 保线" \
-  --who "$USER"
+```
+line_set_seat(line_id="wf-9b5931", to_seat="opencode-gpt-terra",
+              reason="dsv4pro 订阅道故障，先切 terra 保线",
+              principal=<监督者>)
 ```
 
 流程：**先探活预检目标座**（C4，probe 不健康直接拒绝并报因）→ 写一条
@@ -371,13 +373,15 @@ kill-restart 照旧**精确 re-adopt 在飞审计 run**，不重派、不重付�
   adopt-baseline**：游标落在当前 head，存量 pending 问题不回放（那是人已有的
   backlog，`fleet-graph inbox list` 看得到）。要回放，把 `board_seq` 改小。
 - 事件审完出 receipt（`/data/fleet-graph/supervisor/reports/<key>.json`），
-  同键永不再拉起。**要重审，用文档化重置命令**（幂等，只动 supervisor 自己的
-  状态面）：
+  同键永不再拉起。**要重审，走受监督重置原语**（幂等，只动 supervisor 自己的
+  状态面）。R6（wf-4601c8 §7.2.7）删除了 CLI `supervisor reset` 调用面——
+  库函数 `reset_supervisor_event`（scheduler/supervisor_events.py）仍是唯一
+  重置实现，重置属监督面操作，经监督面入口执行：
 
-  ```bash
-  fleet-graph supervisor reset e3-<run_id>          # 删 receipt + 清尝试计数
-  fleet-graph supervisor reset e1-<note_id>         # 另外机械回拨 board_seq 到该问题之前
-  fleet-graph supervisor reset e1-<note_id> --board-seq N   # 机械定位不了时显式指定
+  ```
+  reset e3-<run_id>          # 删 receipt + 清尝试计数
+  reset e1-<note_id>         # 另外机械回拨 board_seq 到该问题之前
+  reset e1-<note_id> --board-seq N   # 机械定位不了时显式指定
   ```
 
   三件套一次做完：删 receipt、清 cursor 里该键的 attempts、（仅 E1）回拨

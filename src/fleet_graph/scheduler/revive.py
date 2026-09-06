@@ -3,7 +3,8 @@
 A `done` terminal is the one state the scheduler treats as final
 (`Refusal.TERMINAL_DONE`), and E3 made the durable checkpoint the authority
 for that reading. M5 adds the *dual*: a legitimate, auditable, first-class way
-for a human decision to overturn `done` -- ``fleet-graph line revive`` -- that
+for a human decision to overturn `done` -- supervised (R6 §7.2.7) through the
+outer-gate ``line_revive`` MCP tool -- that
 *never* rewrites ``terminal.json`` and never reaches into the checkpoint to
 hand-edit thread state. Revival is a new-generation cold start (the existing
 ``bump_line_generation`` discipline), and the old ``done`` thread is left in
