@@ -44,8 +44,9 @@ CODE_ACCEPTANCE_DECLARATION_INVALID = "ACCEPTANCE_DECLARATION_INVALID"
 CODE_SPEC_LINT_BAN = "SPEC_LINT_BAN"
 CODE_ACCEPTANCE_ARGV_UNEXECUTABLE = "ACCEPTANCE_ARGV_UNEXECUTABLE"
 
-#: Gate 6: the applicant's alias token (`/data/ronin/secrets/<alias>.token`)
-#: must already exist. An application whose alias has no bus credential would
+#: Gate 6: the applicant's alias token (`<secrets-root>/<alias>.token`,
+#: resolved via bus/tokens.py LINE_TOKEN_PATH_TEMPLATE) must already exist.
+#: An application whose alias has no bus credential would
 #: start a line whose inbox/board face is silently half-broken
 #: (bus/tokens.py:76-87), so the submission refuses closed up front.
 CODE_ALIAS_TOKEN_MISSING = "GOAL_ENROLL_ALIAS_TOKEN_MISSING"

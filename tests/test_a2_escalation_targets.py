@@ -38,7 +38,7 @@ from fleet_graph.arbiter.a2 import (
 )
 
 WORK_NOTES = "board:work-notes"
-WORK_INDEX = "board:work-index"
+WORK_INDEX = "board:goal-line"
 
 
 # --- fixtures ---------------------------------------------------------------

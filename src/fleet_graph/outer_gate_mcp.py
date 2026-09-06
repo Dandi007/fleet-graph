@@ -66,6 +66,10 @@ DEFAULT_LINES_CONFIG = "config/ronin-lines.json"
 #: 环境变量仅供部署绑定监督面身份，测试可替换。
 SUPERVISOR_PRINCIPAL_ENV = "FLEET_GRAPH_SUPERVISOR_PRINCIPAL"
 SUPERVISOR_PRINCIPAL_DEFAULT = "fleet-supervisor"
+#: R6 (wf-4601c8): the refusal 留痕 root is env-bindable so the supervisor
+#: plane's own state tree carries the traces check 06 probes; default keeps
+#: the gate's own data root (byte-identical behavior when unset).
+SUPERVISOR_TRACE_ROOT_ENV = "FLEET_GRAPH_SUPERVISOR_STATE_ROOT"
 
 #: 拒绝码（closed）。一切拒绝带稳定码，无静默成功。
 CODE_NOT_SUPERVISOR = "OUTER_GATE_NON_SUPERVISOR"
@@ -153,6 +157,10 @@ def trace_outer_gate_refusal(
     row = json.dumps(
         {
             "code": CODE_NOT_SUPERVISOR,
+            # Stable 留痕 marker: check 06 (verify-rebuild) searches the
+            # supervisor state root for exactly this token -- the trace of a
+            # refused contract/acceptance-context mutation attempt.
+            "contract_changed": "refused",
             "tool": tool,
             "principal": principal,
             "supervisor": supervisor,
@@ -829,9 +837,14 @@ def serve(
         lines_config=Path(lines_config) if lines_config else Path(DEFAULT_LINES_CONFIG),
         dd_root=Path(dd_root) if dd_root else Path(DEFAULT_DD_ROOT),
     )
+    dd = Path(DEFAULT_DD_ROOT) if not dd_root else Path(dd_root)
+    # R6 (wf-4601c8): supervisor-direction refusal 留痕 rides the supervisor
+    # state root when bound (testenv sets it; production default unchanged).
+    trace_root = os.environ.get(SUPERVISOR_TRACE_ROOT_ENV) or dd
     build_outer_gate_mcp_server(
         config,
-        Path(DEFAULT_DD_ROOT) if not dd_root else Path(dd_root),
+        dd,
+        refusal_root=Path(trace_root),
     ).run(transport="streamable-http", host=host, port=port, path="/mcp")
 
 

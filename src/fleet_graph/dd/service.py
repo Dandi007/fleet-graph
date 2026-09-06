@@ -7,18 +7,15 @@ transient-unit launches, and read-side assembly from git + checkpoint + run
 artifacts all happen right here.
 
 Tool surface (wf-a08949 goal.md 2026-08-27 use-case-family ruling; wf-13ff9e
-plan.md §1 R1-d, extended by R1-c): the consumed use-case family does work --
-``development_list / get / events / evidence / create / start / gate /
-reconfigure``.  ``reconfigure`` is the R1-c environment/contract failure exit:
-on the legacy engine it existed in name but was a permanent 409 once a
-development FAILED; here it is real, scoped by schema to the acceptance
-context alone, and pairs with ``start`` launching a fresh generation.  The
-remaining legacy tool names stay registered so every historical caller gets an
-explicit, machine-readable ``NOT_SUPPORTED`` refusal instead of an unknown-tool
-error, but they perform no work: ``steer`` was a permanent 409 on the legacy
-engine and is not replicated; ``relock`` / ``control`` / ``deployment_*``
-belong to the legacy engine's patch surface and are outside the equivalence
-scope.
+plan.md §1 R1-d, extended by R1-c; R6 removal per wf-4601c8 §7.1.7): the
+consumed use-case family does work -- ``development_list / get / events /
+evidence / create / start / gate / reconfigure``.  ``reconfigure`` is the R1-c
+environment/contract failure exit: on the legacy engine it existed in name but
+was a permanent 409 once a development FAILED; here it is real, scoped by
+schema to the acceptance context alone, and pairs with ``start`` launching a
+fresh generation.  The legacy patch-surface names (``steer`` / ``relock`` /
+``control`` / ``deployment_*``) are gone from the surface entirely -- a name
+that never does work here is simply not a tool.
 
 Two contracts the tools themselves enforce:
 
@@ -209,21 +206,11 @@ class GateAutoResumer:
         self._stop.set()
 
 
-# Legacy tool names that are registered but refuse with an explicit error
-# structure instead of pretending the legacy semantics exist here.
-# name -> reason, quoted in the refusal payload.
-NOT_SUPPORTED_TOOLS: dict[str, str] = {
-    "development_steer": ("steer was a permanent 409 on the legacy engine and is not replicated"),
-    "development_relock": "relock belongs to the legacy engine's patch surface",
-    "development_control": (
-        "control is outside the consumed use-case family "
-        "(create/start/get/list/events/evidence/gate)"
-    ),
-    "deployment_create": "deployment_* belongs to the legacy engine's patch surface",
-    "deployment_status": "deployment_* belongs to the legacy engine's patch surface",
-}
-
-NOT_SUPPORTED_RULING = "wf-a08949 goal.md 2026-08-27 use-case-family ruling"
+# R6 (wf-4601c8 §7.1.7): the five legacy NOT_SUPPORTED stub tools (the steer /
+# relock / control / deployment_* family) are removed from the surface
+# entirely -- an unknown-tool error is now the correct, machine-readable
+# answer for a name that never does work here. The consumed use-case family
+# below is the whole surface.
 
 # The consumed use-case family: the only tools that do real work.
 SUPPORTED_TOOLS: frozenset[str] = frozenset(
@@ -340,31 +327,6 @@ def build_mcp_server(
             return dict(getattr(control, method)(**kwargs))
         except ControlPlaneError as exc:
             raise ToolError(json.dumps(exc.to_dict(), sort_keys=True)) from exc
-
-    def refuse(tool: str) -> dict[str, Any]:
-        """Raise the explicit NOT_SUPPORTED structure for a legacy-only tool."""
-        raise ToolError(
-            json.dumps(
-                {
-                    "code": "NOT_SUPPORTED",
-                    "tool": tool,
-                    "reason": NOT_SUPPORTED_TOOLS[tool],
-                    "ruling": NOT_SUPPORTED_RULING,
-                    "supported_tools": sorted(SUPPORTED_TOOLS),
-                },
-                sort_keys=True,
-            )
-        )
-
-    @mcp.tool()
-    def deployment_create(request: dict[str, Any]) -> dict[str, Any]:
-        """NOT_SUPPORTED: legacy patch-surface tool, refuses explicitly."""
-        return refuse("deployment_create")
-
-    @mcp.tool()
-    def deployment_status(operation_id: str) -> dict[str, Any]:
-        """NOT_SUPPORTED: legacy patch-surface tool, refuses explicitly."""
-        return refuse("deployment_status")
 
     @mcp.tool()
     def development_list(
@@ -561,18 +523,6 @@ def build_mcp_server(
             ) from exc
 
     @mcp.tool()
-    def development_steer(
-        development_id: str,
-        instruction: str,
-        idempotency_key: str,
-        expected_revision: int,
-        reason: str = "",
-        urgency: str = "next_safe_boundary",
-    ) -> dict[str, Any]:
-        """NOT_SUPPORTED: permanent 409 on the legacy engine, refuses explicitly."""
-        return refuse("development_steer")
-
-    @mcp.tool()
     def development_reconfigure(
         development_id: str,
         acceptance_env: dict[str, str] | None = None,
@@ -603,28 +553,6 @@ def build_mcp_server(
             acceptance_argv=acceptance_argv,
             setup=setup,
         )
-
-    @mcp.tool()
-    def development_control(
-        development_id: str,
-        action: str,
-        idempotency_key: str,
-        expected_revision: int,
-        reason: str = "",
-    ) -> dict[str, Any]:
-        """NOT_SUPPORTED: outside the consumed use-case family, refuses explicitly."""
-        return refuse("development_control")
-
-    @mcp.tool()
-    def development_relock(
-        development_id: str,
-        plugin_commit: str,
-        idempotency_key: str,
-        expected_revision: int,
-        reason: str = "",
-    ) -> dict[str, Any]:
-        """NOT_SUPPORTED: legacy patch-surface tool, refuses explicitly."""
-        return refuse("development_relock")
 
     return mcp
 
@@ -689,8 +617,6 @@ __all__ = [
     "DEFAULT_AUTO_RESUME_INTERVAL",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
-    "NOT_SUPPORTED_RULING",
-    "NOT_SUPPORTED_TOOLS",
     "OUTER_GATE_REFUSALS_FILE",
     "OUTER_GATE_REFUSAL_CODE",
     "SUPERVISOR_PRINCIPAL_DEFAULT",

@@ -46,7 +46,6 @@ LINE_OBJ_FIELDS = {
     "phase",
     "heartbeat_age_s",
     "terminal",
-    "parked",
     "wake_facts",
     "run_id",
     "wake_facts_stale",
@@ -269,12 +268,13 @@ class TestLinesView:
         assert by_id["wf-000002"]["heartbeat_age_s"] == pytest.approx(23.0, abs=0.5)
 
     def test_parked_and_wake_facts_from_terminal(self, synthetic: dict[str, Any]) -> None:
+        """R6 (wf-4601c8 §7.2.4): the derived ``parked`` field is gone; the
+        waiting state stays mechanically readable via ``waiting_on``."""
         payload = FleetStateView(make_config(synthetic)).lines()
         by_id = {line["folder_id"]: line for line in payload["lines"]}
-        assert by_id["wf-000001"]["parked"] is True
+        assert "parked" not in by_id["wf-000001"]
         assert by_id["wf-000001"]["wake_facts"]["waiting_on"] == "decision"
         assert by_id["wf-000001"]["wake_facts"]["reason"] == "need human"
-        assert by_id["wf-000002"]["parked"] is False
         assert by_id["wf-000002"]["terminal"] == "done"
         assert by_id["wf-000002"]["wake_facts"]["waiting_on"] == "none"
 
@@ -287,13 +287,14 @@ class TestLinesView:
         self, synthetic: dict[str, Any]
     ) -> None:
         """阳性判据（spec §4.2）：terminal.json.run_id == heartbeat.run_id 时，
-        该行照常 parked=true 且 wake_facts 属活 run，wake_facts_stale=false。"""
+        wake_facts 属活 run，wake_facts_stale=false（R6 起 waiting 状态经
+        ``waiting_on`` 机械可判，不再有派生 ``parked`` 字段）。"""
         payload = FleetStateView(make_config(synthetic)).lines()
         by_id = {line["folder_id"]: line for line in payload["lines"]}
         line = by_id["wf-000001"]
         assert line["run_id"] == "run-wf-000001"
         assert line["wake_facts_stale"] is False
-        assert line["parked"] is True
+        assert line["wake_facts"]["waiting_on"] == "decision"
         assert line["wake_facts"]["run_id"] == "run-wf-000001"
 
     def test_stale_run_declaration_is_flagged_not_presented_as_current(
@@ -339,7 +340,7 @@ class TestLinesView:
 
     def test_no_terminal_has_no_stale_flag(self, synthetic: dict[str, Any]) -> None:
         """没有 terminal 声明就没有「过期声明」可言：wf-000002 heartbeat 在但未声明
-        驻停，wake_facts_stale=false（parked=false 时消费者无歧义）。"""
+        驻停，wake_facts_stale=false（waiting_on=none 时消费者无歧义）。"""
         run_root = synthetic["run_root"]
         (run_root / "wf-000002" / "terminal.json").unlink()
         payload = FleetStateView(make_config(synthetic)).lines()

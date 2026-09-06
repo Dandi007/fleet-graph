@@ -30,9 +30,13 @@ from typing import Literal
 #: `agent:{alias}` channel is private, owner-only readable, and the owner is
 #: the line's pump agent -- so the inbox probe must present the *line's*
 #: token, not the fleet-graph service token (which gets a structural 403).
-#: These files mirror the pump tokens (persona §5c). Overridable via the
-#: FLEET_GRAPH_LINE_TOKEN_PATH env var or an explicit template.
-LINE_TOKEN_PATH_TEMPLATE = "/data/ronin/secrets/{alias}.token"
+#: These files mirror the pump tokens (persona §5c). R6 (wf-4601c8 §7.2.8):
+#: the default root is the governed fleet secrets directory (verify-rebuild 21
+#: §7.2.8 asserts exactly this path's presence); the legacy engine root stays
+#: reachable only via the env override during token migration (B-3).
+#: Overridable via the FLEET_GRAPH_LINE_TOKEN_PATH env var or an explicit
+#: template.
+LINE_TOKEN_PATH_TEMPLATE = "/data/fleet-graph/secrets/{alias}.token"
 LINE_TOKEN_PATH_ENV = "FLEET_GRAPH_LINE_TOKEN_PATH"
 
 #: An alias is a path component of the token file; anything outside this set
@@ -275,10 +279,14 @@ def build_supervisor_identity_check(
     broadens.
     """
 
+    root = supervision_root
+    if root is None:
+        #: Env-bindable for isolated environments (testenv); production runs
+        #: with the env unset and gets the fleet supervision token root.
+        root = os.environ.get("FLEET_GRAPH_SUPERVISION_TOKEN_ROOT") or SUPERVISION_TOKEN_ROOT
+
     def check(identity: str) -> bool:
-        return resolve_supervisor_identity(
-            identity, template=template, supervision_root=supervision_root
-        ).owned
+        return resolve_supervisor_identity(identity, template=template, supervision_root=root).owned
 
     return check
 

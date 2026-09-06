@@ -26,7 +26,6 @@ from fleet_graph.scheduler.supervisor_events import (
     SupervisorLaunchSpec,
     SupervisorObserver,
     observer_environment,
-    reset_supervisor_event,
 )
 from fleet_graph.supervise.events import SupervisorEventError, line_fault_event, validate_event
 
@@ -238,8 +237,11 @@ class TestCapEvents:
 
 
 class TestReadModelEvents:
-    """M2 E5/E6/E7: derived from the synthetic read-model snapshots (:7494),
-    never from heartbeat/terminal/bus/bridge files (spec 交付 C + D)."""
+    """M2 E5/E6/E8: derived from the synthetic read-model snapshots (:7494),
+    never from heartbeat/terminal/bus/bridge files (spec 交付 C + D).
+
+    R6 (wf-4601c8 §7.2.1) removed the E7 decision-swallowed scan and its
+    goal.md direct-write allowlist wiring; the E7 tests went with them."""
 
     def test_e5_harvestable_development_fires(self, tmp_path: Path) -> None:
         observer, launcher = observer_for(
@@ -314,12 +316,14 @@ class TestReadModelEvents:
                             {"folder_id": "wf-fresh", "heartbeat_age_s": 5.0, "terminal": None},
                             # Terminal-ed: not a stalled line.
                             {"folder_id": "wf-term", "heartbeat_age_s": 600.0, "terminal": "done"},
-                            # Parked: waiting on a decision, not stalled.
+                            # Waiting on a decision: not stalled (R6 removed
+                            # the derived ``parked`` field; the wait reads off
+                            # the wake fact).
                             {
                                 "folder_id": "wf-parked",
                                 "heartbeat_age_s": 600.0,
                                 "terminal": None,
-                                "parked": True,
+                                "wake_facts": {"waiting_on": "decision"},
                             },
                             # No heartbeat at all.
                             {"folder_id": "wf-nohb", "heartbeat_age_s": None, "terminal": None},
@@ -330,142 +334,6 @@ class TestReadModelEvents:
         )
         tick(observer, {})
         assert launcher.events() == []
-
-    def test_e7_swallowed_decision_fires(self, tmp_path: Path) -> None:
-        """Reworked to watermark semantics (spec 交付 C.4): first tick adopts
-        the current snapshot as baseline (zero E7 emission), a new swallowed
-        decision on the second tick is the only thing emitted."""
-        snapshot = {
-            "/v1/decisions": {
-                "schema_version": "1",
-                "decisions": [
-                    {"source_message_id": "msg_sw", "state": "swallowed", "reason": "noop"},
-                    {"source_message_id": "msg_pub", "state": "published", "reason": ""},
-                ],
-            }
-        }
-        observer, launcher = observer_for(tmp_path, read_model=read_model_for(snapshot))
-        actions = tick(observer, {})  # baseline adoption
-        assert launcher.events() == []
-        assert any("cursor_adopted:e7_baseline" in a.get("action", "") for a in actions)
-        snapshot["/v1/decisions"]["decisions"].append(
-            {"source_message_id": "msg_new", "state": "swallowed", "reason": "noop"}
-        )
-        tick(observer, {})
-        [event] = launcher.events()
-        assert event["type"] == "decision_swallowed"
-        assert event["key"] == "e7-msg_new"
-        assert event["payload"] == {"source_message_id": "msg_new", "reason": "noop"}
-
-    def test_e7_first_run_adopts_baseline_and_emits_nothing(self, tmp_path: Path) -> None:
-        """交付 C.1: 首轮零发射——快照含历史 swallowed → 第一次 tick
-        launcher.events()==[]，cursor 落盘 e7_baseline 含该 source_message_id，
-        动作注记含 cursor_adopted:e7_baseline。"""
-        observer, launcher = observer_for(
-            tmp_path,
-            read_model=read_model_for(
-                {
-                    "/v1/decisions": {
-                        "schema_version": "1",
-                        "decisions": [
-                            {
-                                "source_message_id": "msg_01M13x",
-                                "state": "swallowed",
-                                "reason": "noop",
-                            },
-                            {
-                                "source_message_id": "msg_01M14x",
-                                "state": "swallowed",
-                                "reason": "noop",
-                            },
-                        ],
-                    }
-                }
-            ),
-        )
-        actions = tick(observer, {})
-        assert launcher.events() == []
-        state = json.loads(
-            (tmp_path / "runs" / ".scheduler" / "supervisor-cursor.json").read_text()
-        )
-        assert state["e7_baseline"] == ["msg_01M13x", "msg_01M14x"]
-        assert any("cursor_adopted:e7_baseline=n=2" in a.get("action", "") for a in actions)
-
-    def test_e7_new_swallowed_fires_after_baseline(self, tmp_path: Path) -> None:
-        """交付 C.2: 第二 tick 快照多一条新增 swallowed（msg_new）→ 仅发射
-        e7-msg_new（type/key/payload 精确），历史 id 不重发；后续多 tick 重复
-        扫描不重复发射（水位推进）。"""
-        snapshot = {
-            "/v1/decisions": {
-                "schema_version": "1",
-                "decisions": [
-                    {"source_message_id": "msg_01M13x", "state": "swallowed", "reason": "noop"},
-                ],
-            }
-        }
-        observer, launcher = observer_for(tmp_path, read_model=read_model_for(snapshot))
-        tick(observer, {})  # baseline adoption
-        assert launcher.events() == []
-        snapshot["/v1/decisions"]["decisions"].append(
-            {"source_message_id": "msg_new", "state": "swallowed", "reason": "blocked"}
-        )
-        tick(observer, {})
-        [event] = launcher.events()
-        assert event["type"] == "decision_swallowed"
-        assert event["key"] == "e7-msg_new"
-        assert event["payload"] == {"source_message_id": "msg_new", "reason": "blocked"}
-        # Repeated rescans of the same snapshot must not re-emit.
-        tick(observer, {})
-        tick(observer, {})
-        assert len(launcher.events()) == 1
-
-    def test_e7_baseline_survives_restart(self, tmp_path: Path) -> None:
-        """交付 C.3: restart 后基线仍生效——新 observer 对象 + 同 state root /
-        cursor → 历史 id 不重发（水位持久化）。"""
-        snapshot = {
-            "/v1/decisions": {
-                "schema_version": "1",
-                "decisions": [
-                    {"source_message_id": "msg_01M13x", "state": "swallowed", "reason": "noop"},
-                ],
-            }
-        }
-        observer, launcher = observer_for(tmp_path, read_model=read_model_for(snapshot))
-        tick(observer, {})  # adopt baseline
-        assert launcher.events() == []
-        observer2, launcher2 = observer_for(tmp_path, read_model=read_model_for(snapshot))
-        tick(observer2, {})
-        assert launcher2.events() == []
-
-    def test_e7_deferred_by_budget_does_not_advance_watermark(self, tmp_path: Path) -> None:
-        """交付 A.4: 被 deferred:tick_budget 未真正处置的新 id 不得推进水位——
-        下一 tick 重扫重派；处置后才推进。"""
-        snapshot = {
-            "/v1/decisions": {
-                "schema_version": "1",
-                "decisions": [
-                    {"source_message_id": "msg_01M13x", "state": "swallowed", "reason": "noop"},
-                ],
-            }
-        }
-        observer, launcher = observer_for(
-            tmp_path, max_per_tick=0, read_model=read_model_for(snapshot)
-        )
-        tick(observer, {})  # baseline adoption
-        snapshot["/v1/decisions"]["decisions"].append(
-            {"source_message_id": "msg_new", "state": "swallowed", "reason": "noop"}
-        )
-        actions = tick(observer, {})  # budget 0: msg_new deferred
-        assert launcher.events() == []
-        assert any("deferred:tick_budget" in a.get("action", "") for a in actions)
-        cursor = tmp_path / "runs" / ".scheduler" / "supervisor-cursor.json"
-        state = json.loads(cursor.read_text())
-        assert "msg_new" not in state["e7_baseline"]
-        # Budget available again: re-dispatched and the watermark advances.
-        observer.config.max_launches_per_tick = 2
-        tick(observer, {})
-        assert len(launcher.events()) == 1
-        assert "msg_new" in json.loads(cursor.read_text())["e7_baseline"]
 
     def test_no_progress_actions_aggregate_and_dedup_across_ticks(self, tmp_path: Path) -> None:
         """交付 B (P3): 同 tick 内同类「无进展」action 聚合为一条计数
@@ -840,8 +708,10 @@ class TestBudgets:
 
     def test_cursor_edits_on_disk_are_honored_next_tick(self, tmp_path: Path) -> None:
         """The observer reloads the cursor file at the start of every tick, so
-        `supervisor reset` needs no daemon restart. Pinned here: an external
-        edit (clearing attempts) between ticks re-arms the same observer."""
+        a cursor edit needs no daemon restart (R6, wf-4601c8 §7.2.7: the
+        `supervisor reset` CLI face is gone; the observer still reloads the
+        cursor every tick). Pinned here: an external edit (clearing attempts)
+        between ticks re-arms the same observer."""
         observer, launcher = observer_for(tmp_path, max_attempts=1)
         folders = {"wf-a": terminal("fault", "run-1")}
         tick(observer, folders)
@@ -1051,113 +921,6 @@ class TestFailOpen:
         actions = tick(observer, folders)
         assert len(launcher.events()) == 1
         assert any(a.get("action") == "launched" for a in actions), actions
-
-
-class TestReset:
-    """`fleet-graph supervisor reset <key>`: the documented replacement for the
-    2026-08-28 four-step surgery. Idempotent, supervisor state surface only."""
-
-    def _paths(self, tmp_path: Path) -> tuple[Path, Path]:
-        state_root = tmp_path / "supervisor"
-        cursor = tmp_path / "runs" / ".scheduler" / "supervisor-cursor.json"
-        return state_root, cursor
-
-    def _seed(self, tmp_path: Path, key: str, *, board_seq: int | None = 9) -> tuple[Path, Path]:
-        state_root, cursor = self._paths(tmp_path)
-        reports = state_root / "reports"
-        reports.mkdir(parents=True, exist_ok=True)
-        (reports / f"{key}.json").write_text("{}")
-        cursor.parent.mkdir(parents=True, exist_ok=True)
-        cursor.write_text(json.dumps({"board_seq": board_seq, "attempts": {key: 2, "other": 1}}))
-        return state_root, cursor
-
-    def test_reset_clears_receipt_and_attempts_and_is_idempotent(self, tmp_path: Path) -> None:
-        key = "e3-run-1"
-        state_root, cursor = self._seed(tmp_path, key)
-        first = reset_supervisor_event(key, state_root=state_root, cursor_path=cursor)
-        assert first["receipt"].startswith("deleted:")
-        # attempts 保留：计数器正是让下次 launch 拿到新 thread（a{n+1}）的东西。
-        # 清零会重派 a{n} 撞旧 thread 的 terminal checkpoint（生产实锤
-        # e1-msg_01M12MRW…：reset 后重跑 resumed:already_complete）。
-        assert first["attempts"] == "kept:2 (next launch is a3)"
-        assert not (state_root / "reports" / f"{key}.json").exists()
-        state = json.loads(cursor.read_text())
-        assert state["attempts"] == {key: 2, "other": 1}  # untouched
-        assert state["board_seq"] == 9  # E3: nothing to rewind
-
-        second = reset_supervisor_event(key, state_root=state_root, cursor_path=cursor)
-        assert second["receipt"] == "absent"
-        assert second["attempts"] == "kept:2 (next launch is a3)"
-        assert json.loads(cursor.read_text()) == state
-
-    def test_the_observer_refires_a_reset_terminal_event(self, tmp_path: Path) -> None:
-        """End to end against the real observer: exhaust the key, reset it,
-        and the very next tick launches again -- same observer object, no
-        restart, because the cursor is reloaded every tick."""
-        observer, launcher = observer_for(tmp_path, max_attempts=2)
-        folders = {"wf-a": terminal("fault", "run-1")}
-        tick(observer, folders)
-        reports = tmp_path / "supervisor" / "reports"
-        reports.mkdir(parents=True, exist_ok=True)
-        (reports / "e3-run-1.json").write_text("{}")  # the finished receipt
-        actions = tick(observer, folders)
-        assert any(a.get("action") == "skipped:receipt_exists" for a in actions)
-
-        state_root, cursor = self._paths(tmp_path)
-        reset_supervisor_event("e3-run-1", state_root=state_root, cursor_path=cursor)
-        tick(observer, folders)
-        assert len(launcher.events()) == 2
-        # attempts 保留下的重跑是 a2——新 thread，绝不撞 a1 的 terminal checkpoint
-        assert launcher.events()[-1]["attempt"] == 2
-
-    def test_e1_board_seq_rewinds_mechanically_and_never_forwards(self, tmp_path: Path) -> None:
-        key = "e1-msg_q1"
-        state_root, cursor = self._seed(tmp_path, key, board_seq=9)
-        bus = FakeBus()
-        bus.add_question("msg_q1", "card-1", seq=6)
-        first = reset_supervisor_event(key, state_root=state_root, cursor_path=cursor, bus=bus)
-        assert first["board_seq"] == "rewound:9->5"
-        assert json.loads(cursor.read_text())["board_seq"] == 5
-        second = reset_supervisor_event(key, state_root=state_root, cursor_path=cursor, bus=bus)
-        assert second["board_seq"].startswith("already_at_or_before")
-        assert json.loads(cursor.read_text())["board_seq"] == 5
-
-    def test_e1_without_a_locatable_note_says_so_and_takes_the_explicit_seq(
-        self, tmp_path: Path
-    ) -> None:
-        key = "e1-msg_gone"
-        state_root, cursor = self._seed(tmp_path, key, board_seq=9)
-        no_bus = reset_supervisor_event(key, state_root=state_root, cursor_path=cursor, bus=None)
-        assert no_bus["board_seq"].startswith("not_rewound:no bus client")
-        missing = reset_supervisor_event(
-            key, state_root=state_root, cursor_path=cursor, bus=FakeBus()
-        )
-        assert missing["board_seq"].startswith("not_rewound:note")
-        assert json.loads(cursor.read_text())["board_seq"] == 9  # untouched, not guessed
-        explicit = reset_supervisor_event(
-            key, state_root=state_root, cursor_path=cursor, board_seq=4
-        )
-        assert explicit["board_seq"] == "set:4"
-        assert json.loads(cursor.read_text())["board_seq"] == 4
-
-    def test_explicit_board_seq_never_moves_the_cursor_forward(self, tmp_path: Path) -> None:
-        """The explicit --board-seq path obeys the same discipline as the
-        mechanical one: never move the cursor forward past unprocessed
-        questions, even when the operator names a higher value."""
-        key = "e1-msg_q1"
-        state_root, cursor = self._seed(tmp_path, key, board_seq=9)
-        summary = reset_supervisor_event(
-            key, state_root=state_root, cursor_path=cursor, board_seq=12
-        )
-        assert summary["board_seq"].startswith("not_moved_forward:9")
-        assert json.loads(cursor.read_text())["board_seq"] == 9  # unchanged
-
-    def test_reset_survives_a_missing_cursor_file(self, tmp_path: Path) -> None:
-        state_root, cursor = self._paths(tmp_path)
-        summary = reset_supervisor_event("e3-run-x", state_root=state_root, cursor_path=cursor)
-        assert summary["receipt"] == "absent"
-        assert summary["attempts"] == "absent"
-        assert json.loads(cursor.read_text())["attempts"] == {}
 
 
 class TestLaunchSpec:
@@ -1408,79 +1171,6 @@ class TestHarvestWiring:
         assert config.harvest_default_branch is None
         assert config.harvest_deploy == []
         assert config.repo is None
-        assert config.e7_allowlist_path is None
-
-
-class TestE7AllowlistWiring:
-    """M4 E7 goal.md 直写 allowlist argv 透传：observer 侧把 --e7-allowlist 补传
-    进 `supervisor run` argv（spec 契约：带 e7_allowlist_path 的 ObserverConfig +
-    SupervisorObserver → spec.argv() 含 --e7-allowlist <path>；未配置时该旗标不
-    出现——E7 直写保持 deny-all 默认拒绝零放宽）。"""
-
-    def _observer(self, tmp_path: Path, **e7: Any) -> tuple[SupervisorObserver, RecordingLauncher]:
-        launcher = RecordingLauncher()
-        observer = SupervisorObserver(
-            ObserverConfig(
-                run_root=tmp_path / "runs",
-                supervisor_state_root=tmp_path / "supervisor",
-                **e7,
-            ),
-            launcher=launcher,  # type: ignore[arg-type]
-            read_model=read_model_for(EMPTY_READ_MODEL),
-        )
-        return observer, launcher
-
-    def test_argv_carries_e7_allowlist_flag_when_configured(self, tmp_path: Path) -> None:
-        observer, launcher = self._observer(
-            tmp_path,
-            e7_allowlist_path="/data/fleet-graph/supervisor/e7-write-allowlist.json",
-            harvest_allowlist_path="/data/fleet-graph/supervisor/harvest-allowlist.json",
-        )
-        tick(observer, {"wf-a": terminal("fault", "run-1")})
-        [spec] = launcher.specs
-        argv = spec.argv()
-        assert "--e7-allowlist" in argv
-        assert (
-            argv[argv.index("--e7-allowlist") + 1]
-            == "/data/fleet-graph/supervisor/e7-write-allowlist.json"
-        )
-        # --harvest-allowlist 同存量行为不变。
-        assert "--harvest-allowlist" in argv
-        assert (
-            argv[argv.index("--harvest-allowlist") + 1]
-            == "/data/fleet-graph/supervisor/harvest-allowlist.json"
-        )
-
-    def test_unconfigured_observer_emits_no_e7_allowlist_flag(self, tmp_path: Path) -> None:
-        observer, launcher = self._observer(tmp_path)
-        tick(observer, {"wf-a": terminal("fault", "run-1")})
-        [spec] = launcher.specs
-        argv = spec.argv()
-        assert "--e7-allowlist" not in argv
-
-    def test_launch_spec_without_e7_allowlist_field_emits_no_flag(self, tmp_path: Path) -> None:
-        # 阴性（默认拒绝零放宽）：SupervisorLaunchSpec 不带 e7_allowlist_path 时
-        # argv() 无 --e7-allowlist。
-        spec = SupervisorLaunchSpec(
-            event=line_fault_event("wf-a", "run-1"),
-            run_root=tmp_path / "runs",
-            state_root=tmp_path / "supervisor",
-        )
-        argv = spec.argv()
-        assert "--e7-allowlist" not in argv
-
-    def test_config_from_json_reads_e7_allowlist_field(self, tmp_path: Path) -> None:
-        path = tmp_path / "config.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "lines": [],
-                    "e7_allowlist_path": "/data/fleet-graph/supervisor/e7-write-allowlist.json",
-                }
-            )
-        )
-        config = SchedulerConfig.from_json(path)
-        assert config.e7_allowlist_path == "/data/fleet-graph/supervisor/e7-write-allowlist.json"
 
 
 class TestWikiFlagWiring:

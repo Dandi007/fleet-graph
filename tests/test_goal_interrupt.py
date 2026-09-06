@@ -336,18 +336,31 @@ class FakeBoard:
     Idempotency keys resolve to stable entities, mirroring the real bus: asking
     twice under the same key returns the same card / question note."""
 
+    #: R6 (wf-4601c8 §7.2.3): Board.publish_card is gone -- the interrupt
+    #: runtime publishes through ``board.client``. The fake mirrors the shape.
+    index_channel = "board:work-index"
+
+    class _Client:
+        def __init__(self, outer: FakeBoard) -> None:
+            self._outer = outer
+            self.index_channel = "board:work-index"
+
+        def publish(
+            self, channel_id: str, kind: str, payload: dict[str, Any], idempotency_key: str
+        ) -> Any:
+            outer = self._outer
+            if idempotency_key not in outer.cards:
+                outer.cards[idempotency_key] = SimpleNamespace(
+                    entity_id=f"card-{idempotency_key}", payload=payload
+                )
+            outer.publishes.append("card")
+            return outer.cards[idempotency_key]
+
     def __init__(self) -> None:
         self.cards: dict[str, Any] = {}
         self.questions: dict[str, Any] = {}
         self.publishes: list[str] = []
-
-    def publish_card(self, payload: dict[str, Any], idempotency_key: str) -> Any:
-        if idempotency_key not in self.cards:
-            self.cards[idempotency_key] = SimpleNamespace(
-                entity_id=f"card-{idempotency_key}", payload=payload
-            )
-        self.publishes.append("card")
-        return self.cards[idempotency_key]
+        self.client = FakeBoard._Client(self)
 
     def ask(self, *, card_entity_id: str, question: str, idempotency_key: str) -> Any:
         if idempotency_key not in self.questions:

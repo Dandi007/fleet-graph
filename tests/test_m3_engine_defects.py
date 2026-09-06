@@ -66,7 +66,6 @@ from fleet_graph.state.fleet_state import (
     FleetStateConfig,
     FleetStateView,
 )
-from fleet_graph.state.run_artifacts import parked_decision_state
 
 PRINCIPAL = "wf-8d9737"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -777,19 +776,18 @@ class TestDefectFiveSingleParkedAuthority:
         parked_stall(run_root, "wf-1", "run-1")
         blocked_terminal(run_root, "wf-1", "run-1")
 
-        assert parked_decision_state(run_root, "wf-1").parked is True
         line = read_model(run_root, tmp_path).lines()["lines"][0]
-        assert line["parked"] is True
+        # R6 (wf-4601c8 §7.2.4): the derived ``parked`` field is gone; the
+        # waiting state stays mechanically readable via ``waiting_on``.
+        assert line["wake_facts"]["waiting_on"] == "decision"
 
     def test_a_superseded_park_snapshot_loses_against_the_newer_run(self, tmp_path: Path) -> None:
         run_root = tmp_path / "runs"
         parked_stall(run_root, "wf-1", "run-1")
         blocked_terminal(run_root, "wf-1", "run-2")
 
-        park = parked_decision_state(run_root, "wf-1")
-        assert park.parked is False
-        assert "superseded" in park.state_word
-        assert read_model(run_root, tmp_path).lines()["lines"][0]["parked"] is False
+        line = read_model(run_root, tmp_path).lines()["lines"][0]
+        assert line["wake_facts_stale"] is True, "superseded declaration is flagged"
 
         result = deliver_decision(
             line="wf-1",
@@ -813,15 +811,22 @@ class TestDefectFiveSingleParkedAuthority:
         )
         blocked_terminal(run_root, "wf-1", "run-1")
 
-        assert parked_decision_state(run_root, "wf-1").parked is False
-        assert read_model(run_root, tmp_path).lines()["lines"][0]["parked"] is False
+        line = read_model(run_root, tmp_path).lines()["lines"][0]
+        assert line["wake_facts_stale"] is True, "retracted snapshot flags the declaration"
 
     def test_without_scheduler_state_the_terminal_declaration_stands(self, tmp_path: Path) -> None:
         run_root = tmp_path / "runs"
         blocked_terminal(run_root, "wf-1", "run-1")
-
-        assert parked_decision_state(run_root, "wf-1").parked is True
-        assert read_model(run_root, tmp_path).lines()["lines"][0]["parked"] is True
+        # No stall snapshot: the terminal declaration is the only claim, and
+        # the read model exposes the declared wake facts as-is. The declared
+        # run is carried with the declaration (wake_facts.run_id); with no
+        # live heartbeat the top-level run_id is absent and the declaration
+        # is honestly flagged stale rather than presented as a live park.
+        line = read_model(run_root, tmp_path).lines()["lines"][0]
+        assert line["wake_facts"]["waiting_on"] == "decision"
+        assert line["wake_facts"]["waiting_on_declared"] == "decision"
+        assert line["run_id"] is None
+        assert line["wake_facts_stale"] is True
 
     def test_a_dd_dispatch_park_is_not_a_decision_park(self, tmp_path: Path) -> None:
         run_root = tmp_path / "runs"
@@ -831,7 +836,11 @@ class TestDefectFiveSingleParkedAuthority:
         stall["parked_dd_development_id"] = "dev-fg-abc"
         stall_path.write_text(json.dumps(stall), encoding="utf-8")
 
-        assert parked_decision_state(run_root, "wf-1").parked is False
+        # The dd dispatch park is not a decision park: the terminal (absent
+        # here) declares no waiting_on=decision, so the read model reports no
+        # decision wait (R6: the waiting state reads from wake facts).
+        line = read_model(run_root, tmp_path).lines()["lines"][0]
+        assert (line["wake_facts"] or {}).get("waiting_on") != "decision"
 
 
 # --- 缺陷 6：status.json 不再作为可消费缓存被读 ------------------------------

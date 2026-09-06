@@ -257,8 +257,14 @@ class TestLineMessageCore:
             kind=KIND_INSTRUCTION,
             sent_by="supervisor",
         )
+        # R6: the bus-seeded agent.msg.v1 envelope requires from/to; the
+        # field set grows by those three, still with no decision field.
+        # R6: the bus-seeded agent.msg.v1 envelope requires from/to and types
+        # body as an object; the marker carries the flat text verbatim.
         assert set(payload) == {
             "body",
+            "from",
+            "to",
             "from_alias",
             "from_agent_id",
             "thread_id",
@@ -268,7 +274,7 @@ class TestLineMessageCore:
         }
         assert "decision" not in payload
         assert "APPROVE" not in payload[LINE_MESSAGE_MARKER]
-        assert payload["body"] == "APPROVE", "the text travels as data, not semantics"
+        assert payload["body"]["text"] == "APPROVE", "the text travels as data, not semantics"
 
     def test_delivery_lands_in_the_lines_own_inbox(self) -> None:
         sink = FakeSink()
@@ -308,7 +314,8 @@ class TestMessageDeliveryIntoTheRound:
         _, deps = run_line([{"verdict": "done"}], inbox=inbox)
         carried = deps.coordinator.calls[0]["inbox_messages"]
         assert [m["message_id"] for m in carried] == ["msg-9"]
-        assert carried[0]["payload"]["body"] == "switch the implement seat"
+        # R6: body is the envelope object; the flat text lives in body.text.
+        assert carried[0]["payload"]["body"]["text"] == "switch the implement seat"
 
     def test_a_verdict_ack_is_recorded_in_progress_and_the_ledger(self) -> None:
         inbox = FakeInbox(
@@ -464,6 +471,10 @@ def make_plane(tmp_path: Path, launcher: RecordingLauncher) -> DdControlPlane:
 
 
 def seat_pairs_from_argv(argv: list[str]) -> dict[str, str]:
+    """R6 (wf-4601c8 §7.1.8): the launched argv carries NO seat key any more --
+    the seat mapping is read from the record in-process, so a measured argv's
+    seat pairs are always empty. Kept as the shared detector for the
+    zero-residue assertions below."""
     pairs: dict[str, str] = {}
     for index, part in enumerate(argv):
         if part == "--stage-model":
@@ -508,9 +519,10 @@ class TestStageSeatSingleSource:
         }
         assert set(result["seats_source"].values()) == {"line-explicit"}
 
-    def test_launches_jsonl_measured_argv_matches_record_seats(self, tmp_path: Path) -> None:
-        """阳性「座位单一来源」: a unit dispatched with stage_models has
-        launches.jsonl 实测座位 == record.seats, uncovered by any global."""
+    def test_launches_jsonl_measured_argv_carries_no_seat_key(self, tmp_path: Path) -> None:
+        """座位单一来源（R6 收口）：a unit dispatched with stage_models has
+        launches.jsonl 实测 argv 零座位键——座位只在 record.seats 一处，
+        runner 进程内读取，cmdline 上不存在第二份（§7.1.8 判据的机械形态）。"""
         launcher = RecordingLauncher()
         plane = make_plane(tmp_path, launcher)
         dev = plane.create(
@@ -521,10 +533,12 @@ class TestStageSeatSingleSource:
         plane.start(dev)
 
         record = json.loads((plane.root / dev / RECORD_FILE).read_text(encoding="utf-8"))
+        assert record["seats"]["implement"] == "glm-5.3-flash"
         launches = (plane.root / dev / "launches.jsonl").read_text(encoding="utf-8")
         measured_argv = json.loads(launches.strip().splitlines()[-1])["argv"]
-        assert seat_pairs_from_argv(measured_argv) == record["seats"]
-        assert seat_pairs_from_argv(launcher.specs[0].argv()) == record["seats"]
+        assert "--stage-model" not in measured_argv
+        assert seat_pairs_from_argv(measured_argv) == {}
+        assert seat_pairs_from_argv(launcher.specs[0].argv()) == {}
 
     def test_a_seat_outside_the_registry_refuses_and_no_unit_is_created(
         self, tmp_path: Path
@@ -569,16 +583,17 @@ class TestStageSeatSingleSource:
             load(tmp_path / "absent.json")
         assert excinfo.value.code == "STAGE_SEAT_REGISTRY_UNREADABLE"
 
-    def test_the_dd_serve_cli_refuses_the_retired_override(self) -> None:
-        """CLI --stage-model 去功能化: keep parsing, refuse with a structured
-        exit -- the server never starts with a seat policy attached."""
-        from fleet_graph.cli import _dd_serve, build_parser
+    def test_the_dd_serve_cli_removed_the_override_key(self) -> None:
+        """R6 (wf-4601c8 §7.1.8): the `--stage-model` key is gone from the
+        serve path too -- argparse rejects it as an unknown argument, the
+        same way the run path does. There is no seat policy on the server,
+        not even a refusing one."""
+        from fleet_graph.cli import build_parser
 
-        args = build_parser().parse_args(
-            ["dd", "serve", "--port", "0", "--stage-model", "continuous_review=glm-5.3"]
-        )
-        assert _dd_serve(args) == 2
-        assert args.stage_model == ["continuous_review=glm-5.3"]
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(
+                ["dd", "serve", "--port", "0", "--stage-model", "continuous_review=glm-5.3"]
+            )
 
     def test_the_dd_serve_service_signature_has_no_seat_policy(self) -> None:
         import inspect

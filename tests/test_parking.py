@@ -141,12 +141,31 @@ class FakeBoard:
         self.cards: list[dict[str, Any]] = []
         self.publishes: list[str] = []
 
-    def publish_card(self, payload: dict[str, Any], idempotency_key: str) -> FakePublishResult:
-        self.publishes.append("card")
-        self.cards.append({"payload": payload, "idempotency_key": idempotency_key})
-        if self.card_error is not None:
-            raise self.card_error
-        return FakePublishResult(f"msg-card-{len(self.cards)}")
+    #: R6 (wf-4601c8 §7.2.3): the daemon no longer goes through
+    #: Board.publish_card -- it publishes via board.client with the shared
+    #: goal-line card face. The fake mirrors that call shape.
+    index_channel = "board:work-index"
+
+    class _Client:
+        def __init__(self, outer: FakeBoard) -> None:
+            self._outer = outer
+            self.index_channel = "board:work-index"
+
+        def publish(
+            self, channel_id: str, kind: str, payload: dict[str, Any], idempotency_key: str
+        ) -> FakePublishResult:
+            outer = self._outer
+            outer.publishes.append("card")
+            outer.cards.append({"payload": payload, "idempotency_key": idempotency_key})
+            if outer.card_error is not None:
+                raise outer.card_error
+            return FakePublishResult(f"msg-card-{len(outer.cards)}")
+
+    @property
+    def client(self) -> FakeBoard._Client:
+        if not hasattr(self, "_client"):
+            self._client = FakeBoard._Client(self)
+        return self._client
 
     def ask(self, *, card_entity_id: str, question: str, idempotency_key: str) -> FakeTicket:
         self.publishes.append("question")
@@ -708,10 +727,10 @@ class TestCardMaterialisation:
         assert board.publishes == ["card", "question"]
         assert board.cards[0]["idempotency_key"] == "goal-line-card:wf-1"
         payload = board.cards[0]["payload"]
-        assert payload["title"] == "wf-1"
-        assert payload["status"] == "doing"
-        assert "wf-1" in payload["intent"]
-        assert payload["work_folder_id"] == "wf-1"
+        # R6 (wf-4601c8 §7.2.3): the line card rides the surviving work.note.v1
+        # schema -- the card protocol is retired, the surface kind changed.
+        assert payload["note_type"] == "progress"
+        assert "wf-1" in payload["note"]
         assert result.board_question == "question_sent:note-123"
 
     def test_the_question_refs_the_materialised_entity_not_the_folder_id(

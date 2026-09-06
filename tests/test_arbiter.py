@@ -42,7 +42,7 @@ REPO_ROOT = Path(__file__).parent.parent
 ARBITER_PKG = REPO_ROOT / "src" / "fleet_graph" / "arbiter"
 
 WORK_NOTES = "board:work-notes"
-WORK_INDEX = "board:work-index"
+WORK_INDEX = "board:goal-line"
 
 
 # --- fixtures ---------------------------------------------------------------

@@ -189,270 +189,6 @@ def _line_run(args: argparse.Namespace) -> int:
     return 0 if result.get("terminal") in {"done", "blocked", "bounds"} else 1
 
 
-def perform_set_seat(
-    *,
-    folder_id: str,
-    to_seat: str,
-    reason: str,
-    who: str,
-    lines_config: pathlib.Path,
-    run_root: pathlib.Path | None = None,
-    prober: Any = None,
-    probe_enabled: bool = True,
-    clock: Any = time.time,
-) -> dict[str, Any]:
-    """The set-seat operation, as a plain function so tests can drive it.
-
-    Step 7's core: probe the target seat (C4 precheck, probe healthy before
-    switching), write a C1-complete override to the scheduler's persistent
-    surface, and bump the persisted generation so the next scheduler launch is
-    a fresh thread cold-starting on the override seat.
-
-    Refusals are operator errors (not in roster, missing reason, no-op switch,
-    probe not healthy) and raise ``SystemExit`` -- the same shape the rest of
-    the CLI uses for a command that cannot do what it was told. A no-op switch
-    (already on that seat) is refused before any probe: there is nothing to
-    switch, and manufacturing an override would only create audit noise.
-    """
-    from fleet_graph.scheduler.daemon import (
-        SchedulerConfig,
-        bump_line_generation,
-    )
-    from fleet_graph.scheduler.seat_override import SeatOverrideStore, validate_override
-    from fleet_graph.state.run_artifacts import iso
-
-    if not folder_id:
-        raise SystemExit("set-seat needs a folder_id")
-    if not reason:
-        raise SystemExit("set-seat needs --reason: a seat switch without a reason is not auditable")
-    if not who:
-        raise SystemExit("set-seat needs --who: a seat switch without an operator is not auditable")
-
-    config = SchedulerConfig.from_json(pathlib.Path(lines_config))
-    line = next((entry for entry in config.lines if entry.folder_id == folder_id), None)
-    if line is None:
-        raise SystemExit(
-            f"set-seat refused: {folder_id} is not in the roster at {lines_config}; "
-            "a seat switch needs a roster line to name the 'from' seat"
-        )
-
-    store = SeatOverrideStore(run_root or config.run_root)
-    current_override = store.get(folder_id)
-    from_seat = current_override.to if current_override is not None else line.seat
-    if from_seat == to_seat:
-        raise SystemExit(
-            f"set-seat refused: {folder_id} already runs on seat {to_seat!r} "
-            "(roster seat when no override is in effect); a no-op switch changes nothing"
-        )
-
-    # C4: probe the face the target seat depends on *before* switching. A seat
-    # that cannot be probed (no credential, unregistered) reads as "we don't
-    # know", and not knowing is a refusal -- the switch may be perfectly fine
-    # and we simply cannot ask, but switching blind is not the spec.
-    if probe_enabled:
-        if prober is None:
-            from fleet_graph.scheduler.probe import CliGatewayProber
-
-            prober = CliGatewayProber()
-        try:
-            healthy = bool(prober.check(to_seat))
-        except Exception as exc:
-            raise SystemExit(
-                f"set-seat refused: gateway probe for seat {to_seat!r} could not be run: {exc}"
-            ) from exc
-        if not healthy:
-            raise SystemExit(
-                f"set-seat refused: gateway probe red for seat {to_seat!r}; "
-                "probe healthy before switching (C4 precheck)"
-            )
-
-    when = iso(clock())
-    record = validate_override(
-        {
-            "folder_id": folder_id,
-            "who": who,
-            "when": when,
-            "from": from_seat,
-            "to": to_seat,
-            "reason": reason,
-        }
-    )
-    store.write(record)
-    next_generation = bump_line_generation(run_root or config.run_root, folder_id, line.generation)
-    return {
-        **record.as_dict(),
-        "generation": next_generation,
-        "run_root": str(run_root or config.run_root),
-    }
-
-
-def _line_set_seat(args: argparse.Namespace) -> int:
-    """Switch one goal line's runtime seat, audited, via the override surface."""
-    who = args.who or os.environ.get("USER") or "operator"
-    result = perform_set_seat(
-        folder_id=args.folder,
-        to_seat=args.seat,
-        reason=args.reason,
-        who=who,
-        lines_config=pathlib.Path(args.lines_config),
-        run_root=pathlib.Path(args.run_root) if args.run_root else None,
-        prober=None,
-        probe_enabled=not args.no_probe,
-    )
-    json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
-    sys.stdout.write("\n")
-    print(
-        f"set-seat: {result['folder_id']} {result['from']} -> {result['to']} "
-        f"(next launch as generation {result['generation']})",
-        file=sys.stderr,
-    )
-    return 0
-
-
-def perform_line_revive(
-    *,
-    folder_id: str,
-    who: str,
-    basis: str,
-    lines_config: pathlib.Path,
-    run_root: pathlib.Path | None = None,
-    generation: int | None = None,
-    run_id: str | None = None,
-    reason: str | None = None,
-    checkpoints: Any = None,
-    clock: Any = time.time,
-) -> dict[str, Any]:
-    """The line-revive operation, as a plain function so tests can drive it.
-
-    M5's first-class revival entry. Two gates, both mandatory, before anything
-    is written:
-
-    1. **C1 precheck** -- the target line's current checkpoint-authoritative
-       terminal must really be ``done``, and the given ``--generation`` (or
-       ``--run-id``) must match that checkpoint record. Any mismatch is a
-       refusal (`refused: target not terminal_done` / `refused: generation
-       mismatch`) and nothing is written or bumped.
-    2. **C1 write** -- the revoke record must carry who/basis/generation/when;
-       ``validate_revive`` refuses a record missing any of them before it
-       reaches disk.
-
-    Only after both pass is the revoke record written and the persisted
-    generation bumped, so the next scheduler launch cold-starts on a fresh
-    thread (the old `done` thread is spent -- see daemon.py).
-    """
-    from fleet_graph.scheduler.checkpoint_terminal import SqliteCheckpointTerminalReader
-    from fleet_graph.scheduler.daemon import (
-        SchedulerConfig,
-        bump_line_generation,
-        stalled_generation,
-    )
-    from fleet_graph.scheduler.revive import ReviveStore, validate_revive
-    from fleet_graph.state.run_artifacts import iso
-
-    if not folder_id:
-        raise SystemExit("line revive needs a folder_id")
-    if not who:
-        raise SystemExit("line revive needs --who: a revoke without an operator is not auditable")
-    if not basis:
-        raise SystemExit(
-            "line revive needs --basis: a revoke without a mechanical reference "
-            "(goal.md ruling id / board decision id / message reference) is not auditable"
-        )
-    if generation is None and run_id is None:
-        raise SystemExit(
-            "line revive needs --generation or --run-id: a revoke must name the "
-            "generation (or run id) of the `done` terminal it overturns"
-        )
-
-    config = SchedulerConfig.from_json(pathlib.Path(lines_config))
-    line = next((entry for entry in config.lines if entry.folder_id == folder_id), None)
-    if line is None:
-        raise SystemExit(
-            f"line revive refused: {folder_id} is not in the roster at {lines_config}; "
-            "a revoke needs a roster line to name the generation base"
-        )
-
-    effective_run_root = pathlib.Path(run_root) if run_root is not None else config.run_root
-    reader = checkpoints or SqliteCheckpointTerminalReader(effective_run_root)
-    current_generation = stalled_generation(effective_run_root, folder_id, line.generation)
-
-    # C1 precheck: the current checkpoint-authoritative terminal must be `done`,
-    # and the recorded generation must match where that `done` lives. Walk the
-    # same (current, previous) pair the daemon reads, so the CLI and the daemon
-    # can never disagree about which terminal a revoke refers to.
-    done_generation: int | None = None
-    done_record: dict[str, Any] | None = None
-    for candidate in (current_generation, current_generation - 1):
-        if candidate < 1:
-            continue
-        reading = reader.read(folder_id, candidate)
-        if reading.fault is not None:
-            break
-        if reading.authoritative:
-            record = reading.record
-            if record is not None and record.get("terminal") == "done":
-                done_generation = candidate
-                done_record = record
-            break
-    if done_generation is None:
-        raise SystemExit(
-            f"line revive refused: target not terminal_done: {folder_id} is not 'done' "
-            "in its current checkpoint (revival is only legal against a done terminal)"
-        )
-    if generation is not None and generation != done_generation:
-        raise SystemExit(
-            f"line revive refused: generation mismatch: --generation {generation} does not "
-            f"match the checkpoint's done terminal at generation {done_generation}"
-        )
-    if run_id is not None and done_record is not None and done_record.get("run_id") != run_id:
-        raise SystemExit(
-            f"line revive refused: generation mismatch: --run-id {run_id!r} does not match "
-            f"the checkpoint's done terminal run_id {done_record.get('run_id')!r}"
-        )
-
-    when = iso(clock())
-    record = validate_revive(
-        {
-            "folder_id": folder_id,
-            "who": who,
-            "basis": basis,
-            "generation": done_generation,
-            "when": when,
-            "reason": reason or "",
-        }
-    )
-    ReviveStore(effective_run_root).write(record)
-    next_generation = bump_line_generation(effective_run_root, folder_id, line.generation)
-    return {
-        **record.as_dict(),
-        "next_generation": next_generation,
-        "run_root": str(effective_run_root),
-    }
-
-
-def _line_revive(args: argparse.Namespace) -> int:
-    """Revive one done goal line, audited, via the revoke surface."""
-    who = args.who or os.environ.get("USER") or "operator"
-    result = perform_line_revive(
-        folder_id=args.folder,
-        who=who,
-        basis=args.basis,
-        generation=args.generation,
-        run_id=args.run_id,
-        reason=args.reason,
-        lines_config=pathlib.Path(args.lines_config),
-        run_root=pathlib.Path(args.run_root) if args.run_root else None,
-    )
-    json.dump(result, sys.stdout, ensure_ascii=False, indent=1)
-    sys.stdout.write("\n")
-    print(
-        f"line revive: {result['folder_id']} revived by {result['who']} on basis "
-        f"{result['basis']!r} (next launch as generation {result['next_generation']})",
-        file=sys.stderr,
-    )
-    return 0
-
-
 def _line_overrides(args: argparse.Namespace) -> int:
     """The C3 reconcile/lint surface: fold converged overrides, list the drift.
 
@@ -658,11 +394,11 @@ def _dd_run(args: argparse.Namespace) -> int:
             "setup_commands": [shlex.split(c) for c in args.setup],
             "acceptance_env": _env_pairs(args.accept_env),
         },
-        models=dict(pair.split("=", 1) for pair in args.stage_model),
-        # The per-stage run fence, forwarded verbatim from the admission record
-        # (`--stage-timeout implement=7200`). Values are whole seconds; the
-        # control plane validated them at create time, so a malformed one here
-        # is an operator error worth stopping on.
+        # R6 (wf-4601c8 §7.1.8): the cmdline stage-seat override key is
+        # gone from every launch path. A launched run's seats ride the admission
+        # record (`record.seats`, frozen from role registry defaults plus any
+        # line-explicit `development_create stage_models`) -- and the runner
+        # reads exactly that: there is no cmdline seat source left to shadow it.
         timeouts=_stage_timeouts(args.stage_timeout),
         publish_merge=args.publish_merge,
         cost_obs_dir=args.cost_obs_dir or "",
@@ -771,22 +507,6 @@ def _dd_serve(args: argparse.Namespace) -> int:
     """Serve the dev-dispatch MCP surface on loopback. It is the control plane."""
     from fleet_graph.dd.service import serve
 
-    if args.stage_model:
-        # M4 (S2.3/S3 收尾): the server-wide stage-model override is retired.
-        # It was the second seat source that silently shadowed the role
-        # registry; seats are now frozen per development in record.json at
-        # admission (`development_create` stage_models). Keep the flag
-        # parseable so a stale unit template fails visibly here instead of
-        # crashing in argparse -- but never start with a seat policy attached.
-        print(
-            "fleet-graph dd serve: --stage-model is retired "
-            "(STAGE_MODEL_OVERRIDE_RETIRED). Seats are per-development, frozen "
-            "in record.json at admission via development_create stage_models; "
-            "there is no server-wide override. Remove the flag from the unit "
-            "template (see deploy/systemd/fleet-graph-dd-mcp.service).",
-            file=sys.stderr,
-        )
-        return 2
     serve(
         host=args.host,
         port=args.port,
@@ -993,8 +713,6 @@ def _scheduler_run(args: argparse.Namespace) -> int:
                 harvest_default_branch=config.harvest_default_branch,
                 harvest_deploy=config.harvest_deploy,
                 repo=config.repo,
-                # M4 E7: 纯配置透传，无业务逻辑。
-                e7_allowlist_path=config.e7_allowlist_path,
             ),
             launcher=TransientLauncher(dry_run=args.dry_run),
             bus=board.client if board is not None else None,
@@ -1115,8 +833,8 @@ def _supervisor_run(args: argparse.Namespace) -> int:
             bus = None
 
     # M4 wiki 人话账 (交付 B)：`--wiki` 可选 enable 开关。off（默认）-> wiki=None
-    # 零回归（E5/E6/E7 的 deps.wiki 保持 None）；on -> 构造 DefaultWikiClient()
-    # （katana-wiki-mcp :8113）注入 E5/E6/E7 三路 config.wiki。
+    # 零回归（E5/E6 的 deps.wiki 保持 None）；on -> 构造 DefaultWikiClient()
+    # （katana-wiki-mcp :8113）注入 E5/E6 两路 config.wiki。
     wiki = None
     if args.wiki:
         from fleet_graph.supervise.wiki_report import DefaultWikiClient
@@ -1146,8 +864,6 @@ def _supervisor_run(args: argparse.Namespace) -> int:
         harvest_deploy_command=args.harvest_deploy,
         harvest_verify_argv=args.harvest_verify,
         harvest_verify_real_argv=args.harvest_verify_real,
-        # M4 E7: goal.md 直写目标线白名单（deny-all 默认）。
-        e7_allowlist_path=args.e7_allowlist,
         # M4 wiki 人话账 (交付 B)：None 或 DefaultWikiClient()。
         wiki=wiki,
     )
@@ -1157,50 +873,6 @@ def _supervisor_run(args: argparse.Namespace) -> int:
     # Reaching a receipt is this process doing its job; the classification is
     # the report's content, not this process's exit status.
     return 0 if result.get("receipt_path") else 1
-
-
-def _supervisor_reset(args: argparse.Namespace) -> int:
-    """Reset one event key's supervisor state so the observer re-fires it.
-
-    Idempotent; touches only the supervisor's own state surface (receipt +
-    cursor). The checkpoint db is untouched on purpose: re-runs are new
-    attempts and therefore fresh threads."""
-    import pathlib
-
-    from fleet_graph.scheduler.supervisor_events import reset_supervisor_event
-
-    cursor_path = (
-        pathlib.Path(args.cursor)
-        if args.cursor
-        else pathlib.Path(args.run_root) / ".scheduler" / "supervisor-cursor.json"
-    )
-
-    bus = None
-    if args.board_seq is None and args.key.startswith("e1-"):
-        try:
-            from fleet_graph.bus.client import BusClient
-
-            bus = BusClient(base_url=args.bus_url)
-        except Exception:
-            # No credential -> the summary records the degradation and points
-            # at --board-seq; resetting receipt + attempts still proceeds.
-            bus = None
-
-    summary = reset_supervisor_event(
-        args.key,
-        state_root=pathlib.Path(args.state_root),
-        cursor_path=cursor_path,
-        board_seq=args.board_seq,
-        bus=bus,
-    )
-    summary["daemon"] = (
-        "fleet-graphd reloads the cursor file at the start of every tick -- no "
-        "restart required; only a reset racing an in-flight tick can be "
-        "overwritten once (re-run this command, or restart to be certain)"
-    )
-    json.dump(summary, sys.stdout, ensure_ascii=False, indent=1)
-    sys.stdout.write("\n")
-    return 0
 
 
 def _decision_bridge_run(args: argparse.Namespace) -> int:
@@ -1534,93 +1206,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.set_defaults(func=_line_run)
 
-    set_seat = line_sub.add_parser(
-        "set-seat",
-        help="switch one line's runtime seat: probe (C4), write an audited "
-        "override (C1), bump the generation so the next launch cold-starts on "
-        "the new seat. Never rewrites the roster.",
-    )
-    set_seat.add_argument("folder", help="the goal line's work folder id (wf-...)")
-    set_seat.add_argument("seat", help="the seat to switch this line TO")
-    set_seat.add_argument("--reason", required=True, help="why (C1: a switch must be explainable)")
-    set_seat.add_argument(
-        "--who",
-        default=None,
-        help="who is doing this (C1; defaults to $USER)",
-    )
-    set_seat.add_argument(
-        "--lines-config",
-        default="config/ronin-lines.json",
-        help="the roster SSoT the 'from' seat is read from",
-    )
-    set_seat.add_argument(
-        "--run-root",
-        default=None,
-        help="override where the override surface and stall-state live "
-        "(default the roster's run_root)",
-    )
-    set_seat.add_argument(
-        "--no-probe",
-        action="store_true",
-        help="skip the C4 gateway precheck of the target seat (drills only: "
-        "a production switch without the precheck is not the spec)",
-    )
-    set_seat.set_defaults(func=_line_set_seat)
-
-    revive = line_sub.add_parser(
-        "revive",
-        help="M5: revive one done goal line -- write a C1-complete revoke "
-        "record (who/basis/generation/when) to the scheduler's persistent "
-        "surface and bump the generation so the next launch cold-starts on a "
-        "fresh thread. Never rewrites terminal.json, never touches the "
-        "checkpoint. Refused unless the line's current checkpoint terminal is "
-        "really `done` at the recorded generation.",
-    )
-    revive.add_argument("folder", help="the goal line's work folder id (wf-...)")
-    revive.add_argument(
-        "--basis",
-        required=True,
-        help="the mechanical reference for the revoke -- a goal.md ruling "
-        "block id, a board decision id, or a message reference, never free "
-        "prose (C1)",
-    )
-    revive.add_argument(
-        "--who",
-        default=None,
-        help="who is overturning the terminal (C1; defaults to $USER)",
-    )
-    revive.add_argument(
-        "--generation",
-        type=int,
-        default=None,
-        help="the generation of the `done` terminal being overturned; must "
-        "match the checkpoint record (or use --run-id instead)",
-    )
-    revive.add_argument(
-        "--run-id",
-        default=None,
-        help="the run id of the `done` terminal being overturned; must match "
-        "the checkpoint record (or use --generation instead)",
-    )
-    revive.add_argument(
-        "--reason",
-        default=None,
-        help="optional prose; never sufficient on its own (C1 -- `basis` is "
-        "the auditable reference)",
-    )
-    revive.add_argument(
-        "--lines-config",
-        default="config/ronin-lines.json",
-        help="the roster SSoT the generation base is read from",
-    )
-    revive.add_argument(
-        "--run-root",
-        default=None,
-        help="override where the revoke surface and stall-state live "
-        "(default the roster's run_root)",
-    )
-    revive.set_defaults(func=_line_revive)
-
     overrides = line_sub.add_parser(
         "overrides",
         help="the C3 reconcile/lint face: fold overrides that converged with "
@@ -1787,15 +1372,6 @@ def build_parser() -> argparse.ArgumentParser:
         "Carries no verdict: the gate re-reads the board itself. Needs the same --checkpoint",
     )
     dd_run.add_argument(
-        "--stage-model",
-        action="append",
-        default=[],
-        metavar="STAGE=MODEL",
-        help="the stage seat this development runs under, e.g. "
-        "continuous_review=glm-5.3. Forwarded from the admission record's "
-        "`seats` -- the single source (M4); not an operator override",
-    )
-    dd_run.add_argument(
         "--stage-timeout",
         action="append",
         default=[],
@@ -1865,16 +1441,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--executable",
         default=None,
         help="fleet-graph executable for launched dd runs (default the deployed release)",
-    )
-    dd_serve.add_argument(
-        "--stage-model",
-        action="append",
-        default=[],
-        metavar="STAGE=MODEL",
-        help="RETIRED (STAGE_MODEL_OVERRIDE_RETIRED): parsing is kept so a "
-        "stale unit template fails visibly, but the server refuses to start "
-        "with any value. Seats are per-development, frozen in record.json at "
-        "admission (development_create stage_models)",
     )
     dd_serve.add_argument(
         "--auto-resume",
@@ -2281,58 +1847,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="M3 harvest (E5): real-machine verify argv after deploy (defaults to 'make verify')",
     )
     supervisor_run.add_argument(
-        "--e7-allowlist",
-        default=None,
-        help="M4 E7 (decision_swallowed): E7 goal.md 直写目标线白名单 config file. "
-        "Deny-all when unset -- E7 then refuses every goal.md direct write and "
-        "records the refusal",
-    )
-    supervisor_run.add_argument(
         "--wiki",
         action="store_true",
         help="M4 wiki 人话账 (交付 B): enable the katana-wiki-mcp client "
-        "(DEFAULT_WIKI_MCP_URL) so E5/E6/E7 append achievement sections on "
+        "(DEFAULT_WIKI_MCP_URL) so E5/E6 append achievement sections on "
         "successful closure. Off by default: deps.wiki stays None (零回归)",
     )
     supervisor_run.set_defaults(func=_supervisor_run)
-
-    supervisor_reset = supervisor_sub.add_parser(
-        "reset",
-        help="reset one event key so the observer re-fires it: delete the "
-        "receipt, clear the cursor's attempts counter, and (E1 only) rewind "
-        "board_seq to just before the question. Idempotent; never touches the "
-        "checkpoint db -- a re-run is a new attempt and thus a fresh thread. "
-        "No daemon restart needed: the cursor is reloaded every tick",
-    )
-    supervisor_reset.add_argument("key", help="the event key, e.g. e3-<run_id> or e1-<note_id>")
-    supervisor_reset.add_argument(
-        "--state-root",
-        default="/data/fleet-graph/supervisor",
-        help="the supervisor's own root (holds reports/<key>.json)",
-    )
-    supervisor_reset.add_argument(
-        "--run-root",
-        default="/data/fleet-graph/runs",
-        help="the scheduler run root; the cursor lives at "
-        "<run-root>/.scheduler/supervisor-cursor.json unless --cursor is given",
-    )
-    supervisor_reset.add_argument(
-        "--cursor", default=None, help="explicit cursor file path (overrides --run-root derivation)"
-    )
-    supervisor_reset.add_argument(
-        "--board-seq",
-        type=int,
-        default=None,
-        help="explicit board_seq to set (clamped: never moves the cursor "
-        "forward). Without it an e1-<note_id> key is "
-        "located mechanically on the bus and the cursor moves to just before "
-        "that message (never forwards); when the note cannot be located "
-        "(no credential, bus down, id not in the channel window) the summary "
-        "says so and this flag is the fallback. E2/E3/E4 need no rewind: "
-        "they re-derive from terminals/tick results every tick",
-    )
-    supervisor_reset.add_argument("--bus-url", default=DEFAULT_BUS_URL)
-    supervisor_reset.set_defaults(func=_supervisor_reset)
 
     supervise = subparsers.add_parser(
         "supervise", help="the supervision face (audits, no verdicts)"

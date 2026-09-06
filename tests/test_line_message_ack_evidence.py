@@ -471,7 +471,9 @@ class ParkEvidence:
             "terminal": terminal.get("terminal"),
             "waiting_on": terminal.get("waiting_on"),
             "line_state": stall.get("line_state"),
-            "parked": face.get("parked"),
+            # R6 (wf-4601c8 §7.2.4): the face no longer derives a ``parked``
+            # field; the waiting state reads from the wake facts.
+            "parked": (face.get("wake_facts") or {}).get("waiting_on") == "decision",
             "face_terminal": face.get("terminal"),
             "face_waiting_on": (face.get("wake_facts") or {}).get("waiting_on"),
             "decision_consumed_at": stall.get("dispatched_decision_consumed_at"),

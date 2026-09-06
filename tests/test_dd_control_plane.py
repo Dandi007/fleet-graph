@@ -157,10 +157,14 @@ class TestAdmissionDerivation:
             ["sh", "-c", "echo 'quoted argument'"],
         ]
 
-        # The durable ref is derived, and the board card was published.
+        # The durable ref is derived. R6 (wf-4601c8 §7.2.3): admission no
+        # longer publishes a work.card.v1 board card -- no card fact in the
+        # result and none in the record.
         assert created["remote"]["ref"] == f"refs/heads/dd/{dev}"
-        assert created["card_entity_id"] == "ent-dd-card"
-        assert created["gate_enabled"] is True
+        assert "card_entity_id" not in created
+        assert "gate_enabled" not in created
+        record = json.loads((plane.root / dev / RECORD_FILE).read_text())
+        assert "card_entity_id" not in record
 
     def test_create_is_idempotent_for_the_same_admission(
         self, scratch: Path, tmp_path: Path
@@ -492,24 +496,25 @@ class TestDispatchedByForwarding:
 
 
 class TestDispatchedByReadModel:
-    """The `dispatched_by` provenance reaches the read model: `status.json`
-    carries it, `development_list`/`development_get` rows carry it, absent
-    provenance is an empty string, pre-existing orders backfill it from the
-    authoritative record, and the negative consistency holds -- status.json
-    never drifts from record.json."""
+    """The `dispatched_by` provenance reaches the read model: derived rows
+    carry it, absent provenance is an empty string, and the negative
+    consistency holds -- a rebuilt status always equals the authoritative
+    record. R6 (wf-4601c8 §7.2.4): the status.json write face is gone, so the
+    file-based cache assertions became derivation-based ones."""
 
-    def test_status_json_carries_dispatched_by(self, scratch: Path, tmp_path: Path) -> None:
+    def test_derived_status_carries_dispatched_by(self, scratch: Path, tmp_path: Path) -> None:
         plane = make_plane(tmp_path)
         dev = plane.create(str(scratch), spec_text=SPEC, dispatched_by="wf-goal-line")[
             "development_id"
         ]
-        status = json.loads((plane.root / dev / STATUS_FILE).read_text())
+        status = plane.rebuild_status(dev)
+        assert not (plane.root / dev / STATUS_FILE).exists()
         assert status["dispatched_by"] == "wf-goal-line"
 
-    def test_status_json_defaults_to_empty_string(self, scratch: Path, tmp_path: Path) -> None:
+    def test_derived_status_defaults_to_empty_string(self, scratch: Path, tmp_path: Path) -> None:
         plane = make_plane(tmp_path)
         dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
-        status = json.loads((plane.root / dev / STATUS_FILE).read_text())
+        status = plane.rebuild_status(dev)
         assert status["dispatched_by"] == ""
 
     def test_get_carries_dispatched_by(self, scratch: Path, tmp_path: Path) -> None:
@@ -530,12 +535,13 @@ class TestDispatchedByReadModel:
         assert all("dispatched_by" in row for row in rows)
         assert rows[0]["dispatched_by"] == "wf-goal-line"
 
-    def test_list_backfills_a_terminal_cache_missing_dispatched_by(
+    def test_a_legacy_cache_file_left_behind_cannot_surface(
         self, scratch: Path, tmp_path: Path
     ) -> None:
-        """A terminal `status.json` written before `dispatched_by` entered the
-        read model carries no provenance; the list fast-path backfills it from
-        the authoritative record so the row still attributes the development."""
+        """R6 (wf-4601c8 §7.2.4): a `status.json` from before the write face
+        was retired (or one a pre-R6 reader wrote) carries no authority: the
+        list rows are rebuilt from record.json + result.json and attribute the
+        development from the record regardless of what the stale file said."""
         plane = make_plane(tmp_path)
         dev = plane.create(str(scratch), spec_text=SPEC, dispatched_by="wf-goal-line")[
             "development_id"
@@ -555,31 +561,23 @@ class TestDispatchedByReadModel:
             ),
             encoding="utf-8",
         )
-        before = plane.rebuild_status(dev)
-        assert before["state"] == "complete"
-        legacy = {k: v for k, v in before.items() if k != "dispatched_by"}
-        assert "dispatched_by" not in legacy
-        (dev_root / STATUS_FILE).write_text(json.dumps(legacy), encoding="utf-8")
         rows = plane.list()["developments"]
         assert rows[0]["state"] == "complete"
         assert rows[0]["dispatched_by"] == "wf-goal-line"
-        assert json.loads((dev_root / STATUS_FILE).read_text())["dispatched_by"] == "wf-goal-line"
 
-    def test_status_never_drifts_from_the_record(self, scratch: Path, tmp_path: Path) -> None:
-        """Negative consistency: `status.json`'s `dispatched_by` always equals
-        `record.json`'s same-named field. A hand-edited status that drifts is
-        corrected by the next rebuild from the authoritative record."""
+    def test_derived_status_never_drifts_from_the_record(
+        self, scratch: Path, tmp_path: Path
+    ) -> None:
+        """Negative consistency: the derived status's `dispatched_by` always
+        equals `record.json`'s same-named field -- derivation reads the
+        record, so a stale file cannot drift it."""
         plane = make_plane(tmp_path)
         dev = plane.create(str(scratch), spec_text=SPEC, dispatched_by="wf-goal-line")[
             "development_id"
         ]
         dev_root = plane.root / dev
-        drifted = json.loads((dev_root / STATUS_FILE).read_text())
-        drifted["dispatched_by"] = "some-other-line"
-        (dev_root / STATUS_FILE).write_text(json.dumps(drifted), encoding="utf-8")
         rebuilt = plane.rebuild_status(dev)
         assert rebuilt["dispatched_by"] == "wf-goal-line"
-        assert json.loads((dev_root / STATUS_FILE).read_text())["dispatched_by"] == "wf-goal-line"
         record = json.loads((dev_root / RECORD_FILE).read_text())
         assert rebuilt["dispatched_by"] == record["dispatched_by"]
 
@@ -641,10 +639,13 @@ class TestGate:
         assert refused.value.code == "CHECKPOINT_MISSING"
 
 
-class TestStatusCacheIsACache:
-    def test_rebuild_reproduces_the_cache_from_the_authoritative_sources(
+class TestStatusIsPureDerivation:
+    def test_rebuild_is_deterministic_over_the_authoritative_sources(
         self, scratch: Path, tmp_path: Path
     ) -> None:
+        """R6 (wf-4601c8 §7.2.4): the status.json write face is retired. The
+        status is pure derivation -- two rebuilds over unchanged authorities
+        agree, and no cache file is materialised."""
         plane = make_plane(tmp_path)
         dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
         plane.start(dev)
@@ -663,15 +664,14 @@ class TestStatusCacheIsACache:
             ),
             encoding="utf-8",
         )
-        before = plane.rebuild_status(dev)
-        (dev_root / STATUS_FILE).unlink()
-        assert plane.rebuild_status(dev) == before
-        assert json.loads((dev_root / STATUS_FILE).read_text()) == before
-        assert before["state"] == "complete"
+        first = plane.rebuild_status(dev)
+        assert not (dev_root / STATUS_FILE).exists(), "no status cache is written"
+        assert plane.rebuild_status(dev) == first
+        assert first["state"] == "complete"
 
-    def test_list_survives_a_corrupted_cache_by_rebuilding(
-        self, scratch: Path, tmp_path: Path
-    ) -> None:
+    def test_list_is_unaffected_by_stale_cache_files(self, scratch: Path, tmp_path: Path) -> None:
+        """A leftover or hand-edited status.json can never surface: nothing
+        reads it -- every listed row is rebuilt from the authorities."""
         plane = make_plane(tmp_path)
         dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
         (plane.root / dev / STATUS_FILE).write_text("not json", encoding="utf-8")
@@ -874,6 +874,9 @@ class TestStageModelPolicy:
 
     @staticmethod
     def _argv_seat_pairs(argv: list[str]) -> dict[str, str]:
+        """R6 (wf-4601c8 §7.1.8): the launched argv carries NO seat key at
+        all -- the stage actor resolves seats from the record in-process, so
+        the measured argv's seat pairs are always the empty mapping."""
         pairs: dict[str, str] = {}
         for index, part in enumerate(argv):
             if part == "--stage-model":
@@ -900,9 +903,10 @@ class TestStageModelPolicy:
         assert record["seats"]["continuous_review"] == "glm-5.3"
         assert record["seats"]["final_review"] == "claude-opus-5"
 
-    def test_the_launched_argv_is_exactly_the_record_seats(
-        self, scratch: Path, tmp_path: Path
-    ) -> None:
+    def test_the_launched_argv_carries_no_seat_key(self, scratch: Path, tmp_path: Path) -> None:
+        """R6 (wf-4601c8 §7.1.8): no `--stage-model` on the launched argv --
+        the seat mapping is read from the record by the runner, never
+        re-declared on a cmdline (a cmdline key would be a second source)."""
         launcher = RecordingLauncher()
         plane = self._plane(tmp_path, launcher)
         dev = plane.create(
@@ -912,11 +916,9 @@ class TestStageModelPolicy:
         )["development_id"]
         plane.start(dev)
 
-        record = json.loads((plane.root / dev / RECORD_FILE).read_text(encoding="utf-8"))
         argv = launcher.specs[0].argv()
-        assert self._argv_seat_pairs(argv) == record["seats"], (
-            "the measured launch argv and record.seats must agree pair for pair"
-        )
+        assert "--stage-model" not in argv
+        assert self._argv_seat_pairs(argv) == {}
 
     def test_seats_default_to_the_registry_factory_values(
         self, scratch: Path, tmp_path: Path
@@ -929,20 +931,24 @@ class TestStageModelPolicy:
         record = json.loads((plane.root / dev / RECORD_FILE).read_text(encoding="utf-8"))
         assert set(record["seats"]) == {"implement", "continuous_review", "final_review"}
         assert set(record["seats_source"].values()) == {"registry-default"}
-        assert self._argv_seat_pairs(launcher.specs[0].argv()) == record["seats"]
+        assert "--stage-model" not in launcher.specs[0].argv()
 
     def test_a_server_wide_stage_model_override_no_longer_exists(
         self, scratch: Path, tmp_path: Path
     ) -> None:
         """The second seat source is gone, not shadowed: the control plane has
-        no seat policy of its own, and a launch reads the record only."""
+        no seat policy of its own, the launch argv carries no seat key, and
+        the only seat mapping that exists anywhere is record.seats."""
         assert "stage_models" not in inspect.signature(DdControlPlane.__init__).parameters
         launcher = RecordingLauncher()
         plane = self._plane(tmp_path, launcher)
         dev = plane.create(str(scratch), spec_text=SPEC)["development_id"]
         plane.start(dev)
         record = json.loads((plane.root / dev / RECORD_FILE).read_text(encoding="utf-8"))
-        assert self._argv_seat_pairs(launcher.specs[0].argv()) == record["seats"]
+        assert record["seats"], "the record still freezes the seat mapping"
+        argv = launcher.specs[0].argv()
+        assert "--stage-model" not in argv
+        assert self._argv_seat_pairs(argv) == {}
 
     def test_a_seat_outside_the_registry_refuses_and_creates_nothing(
         self, scratch: Path, tmp_path: Path

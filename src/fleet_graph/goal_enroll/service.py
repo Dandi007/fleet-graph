@@ -214,28 +214,13 @@ class GoalEnrollService:
         """
         if self._board is None:
             return "failed:no_board_bound"
-        try:
-            card = self._board.publish_card(
-                {
-                    "title": folder_id,
-                    "status": "doing",
-                    "intent": f"goal enrollment application for {folder_id} (alias {alias})",
-                    "work_folder_id": folder_id,
-                },
-                idempotency_key=f"enroll-card:{folder_id}",
-            )
-            ticket = self._board.ask(
-                card_entity_id=card.entity_id,
-                question=(
-                    f"goal enrollment application {folder_id} (alias {alias}, "
-                    f"submitted by {applicant}): needs a human decision; "
-                    f"roster `enabled` flips only via roster PR. {note or ''}".strip()
-                ),
-                idempotency_key=f"enroll-question:{folder_id}",
-            )
-            return f"sent:{ticket.question_note_id}"
-        except Exception as exc:  # telemetry must not bite
-            return f"failed:{type(exc).__name__}:{str(exc)[:200]}"
+        # R6 (wf-4601c8 §7.2.3): the enrollment notifier no longer publishes a
+        # work.card.v1 application card. A work.note.v1 is refs_required and a
+        # question needs an existing board entity to ref; with card creation
+        # out of the engine, the E8 enrollment-pending audit (read-model /
+        # enrollments) is the structural visibility for a pending application,
+        # and the bus degrade path below records the delivery outcome.
+        return "failed:card_face_removed"
 
     # --- unified views ----------------------------------------------------
 

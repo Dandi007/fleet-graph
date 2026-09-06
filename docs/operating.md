@@ -86,7 +86,8 @@ code（带失败条款）拒绝——绝无半条、绝无 warning-as-admission�
    落 `enroll-queue.jsonl`（`pending`）。若 bus 可用，同时向
    `board:work-notes` 发一条 `question` note（申请即挂板）；bus 降级（token
    缺失等）不阻断入队，entry 记 `board_notify: failed`。
-2. **挂板/E8**：state read-model（:7494）`GET /v1/enrollments` 重读
+2. **挂板/E8**：state read-model HTTP 面（R5 后实现层；supervise 一律走 MCP
+   外门）`GET /v1/enrollments` 重读
    enroll-queue（与 `_read_roster` 同法，坏行降级不 5xx 全链）；supervisor
    observer 消费 `/v1/enrollments` 发 E8 `enrollment_pending`（dedup key
    `enroll:{folder_id}`；pending 超龄 24h 未裁追加提醒 attempt
@@ -546,8 +547,9 @@ systemctl --user disable --now fleet-graph-arbiter.timer fleet-graph-arbiter.ser
 - **gate 不收裁决**：`development_gate` 只报挂起的 question note，`resume=true`
   无值重入，图自己重读板。裁决只经 board `work.decision.v1`
   （带 `refs=[{"target_entity": <question_note_id>}]`）。
-- **模型策略**：`dd serve --stage-model continuous_review=deepseek-v4-pro`
-  是部署侧 flag，不进 client 词表。
+- **模型策略（R6 更新）**：`--stage-model` 键已从全部 launch 路径删除；座位唯一
+  来源 = admission record 的 `seats`（role registry 出厂 + `development_create`
+  的 `stage_models` 覆盖），不在 client 或部署 flag 词表里。
 - **审计**：`fleet-graph supervise audit <dev-id> --repo <clone>`——`--dd-root`
   下有 record 的 development 自动走进程内 `GraphEngineSource`，其余走老引擎。
 

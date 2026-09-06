@@ -151,7 +151,7 @@ def build_goal_mcp_server(
     application still queues and the entry records ``board_notify: failed``,
     with E8 as the fallback visibility. ``alias_token_check`` is the gate-6
     seam ``(alias) -> bool``; when None the validator uses the production
-    default (``/data/ronin/secrets/<alias>.token`` ownership, realpath-
+    default (governed secrets root ``<alias>.token`` ownership, realpath-
     canonicalized over the secrets boundary, honouring
     ``FLEET_GRAPH_LINE_TOKEN_PATH``). ``supervisor_identity_check`` is the
     U4 admission seam ``(identity) -> bool``; when None the service uses the

@@ -23,7 +23,6 @@ from typing import Any
 
 import pytest
 
-from fleet_graph.cli import perform_set_seat
 from fleet_graph.scheduler.daemon import (
     LineSpec,
     Scheduler,
@@ -32,7 +31,6 @@ from fleet_graph.scheduler.daemon import (
 )
 from fleet_graph.scheduler.ignition import Refusal
 from fleet_graph.scheduler.launcher import LaunchResult
-from fleet_graph.scheduler.probe import UnknownSeat
 from fleet_graph.scheduler.seat_override import (
     SeatOverride,
     SeatOverrideStore,
@@ -353,114 +351,31 @@ class TestC4TripleObservability:
         assert launcher.launched[0].seat == "opencode-gpt-terra"
 
 
-# --- set-seat operation ----------------------------------------------------
+# --- R6: the CLI set-seat call face is removed (wf-4601c8 §7.2.7/§7.2.11) ----
 
 
-class TestSetSeatOperation:
-    def test_set_seat_writes_the_override_and_bumps_the_generation(self, tmp_path: Path) -> None:
-        roster = write_roster(tmp_path)
-        result = perform_set_seat(
-            folder_id="wf-9b5931",
-            to_seat="opencode-gpt-terra",
-            reason="lane died",
-            who="alice",
-            lines_config=roster,
-            prober=FakeProber(healthy=True),
-            clock=lambda: 1724_921_664.0,
-        )
-        assert result["who"] == "alice"
-        assert result["when"] == iso(1724_921_664.0)
-        assert result["from"] == "opencode-dsv4pro"
-        assert result["to"] == "opencode-gpt-terra"
-        assert result["reason"] == "lane died"
-        assert result["generation"] == 2
-        store = SeatOverrideStore(tmp_path / "runs")
-        assert store.get("wf-9b5931").to == "opencode-gpt-terra"
+class TestR6RemovesTheCliSetSeatFace:
+    def test_the_cli_no_longer_exposes_line_set_seat(self) -> None:
+        """The seat-write face is the outer-gate MCP tool now (R5). The CLI
+        `line set-seat` parser -- the §7.2.7/§7.2.11 call face -- is gone;
+        the C1..C4 override surface itself stays (covered above)."""
+        from fleet_graph.cli import build_parser
 
-    def test_set_seat_from_an_existing_override_records_that_seat_as_from(
-        self, tmp_path: Path
-    ) -> None:
-        store = make_store(tmp_path)
-        store.write(make_override())
-        result = perform_set_seat(
-            folder_id="wf-9b5931",
-            to_seat="opencode-glm53",
-            reason="rebalance",
-            who="alice",
-            lines_config=write_roster(tmp_path),
-            prober=FakeProber(healthy=True),
-        )
-        assert result["from"] == "opencode-gpt-terra"
-
-    def test_a_red_probe_refuses_the_switch_and_writes_nothing(self, tmp_path: Path) -> None:
-        with pytest.raises(SystemExit, match="probe red"):
-            perform_set_seat(
-                folder_id="wf-9b5931",
-                to_seat="opencode-gpt-terra",
-                reason="lane died",
-                who="alice",
-                lines_config=write_roster(tmp_path),
-                prober=FakeProber(healthy=False),
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(
+                [
+                    "line",
+                    "set-seat",
+                    "wf-9b5931",
+                    "opencode-gpt-terra",
+                    "--reason",
+                    "lane died",
+                ]
             )
-        assert make_store(tmp_path).load() == {}
-
-    def test_an_unanswerable_probe_refuses_the_switch(self, tmp_path: Path) -> None:
-        with pytest.raises(SystemExit, match="could not be run"):
-            perform_set_seat(
-                folder_id="wf-9b5931",
-                to_seat="opencode-gpt-terra",
-                reason="lane died",
-                who="alice",
-                lines_config=write_roster(tmp_path),
-                prober=FakeProber(healthy=UnknownSeat("no probe for 'wat'")),
-            )
-
-    def test_a_no_op_switch_is_refused_before_any_probe(self, tmp_path: Path) -> None:
-        prober = FakeProber(healthy=True)
-        with pytest.raises(SystemExit, match="already runs on seat"):
-            perform_set_seat(
-                folder_id="wf-9b5931",
-                to_seat="opencode-dsv4pro",
-                reason="no change",
-                who="alice",
-                lines_config=write_roster(tmp_path),
-                prober=prober,
-            )
-        assert prober.asked == []
-
-    def test_a_folder_outside_the_roster_is_refused(self, tmp_path: Path) -> None:
-        with pytest.raises(SystemExit, match="not in the roster"):
-            perform_set_seat(
-                folder_id="wf-unknown",
-                to_seat="opencode-gpt-terra",
-                reason="lane died",
-                who="alice",
-                lines_config=write_roster(tmp_path),
-                prober=FakeProber(healthy=True),
-            )
-
-    def test_a_missing_reason_is_refused(self, tmp_path: Path) -> None:
-        with pytest.raises(SystemExit, match="--reason"):
-            perform_set_seat(
-                folder_id="wf-9b5931",
-                to_seat="opencode-gpt-terra",
-                reason="",
-                who="alice",
-                lines_config=write_roster(tmp_path),
-                prober=FakeProber(healthy=True),
-            )
-
-    def test_probe_can_be_disabled_for_drills(self, tmp_path: Path) -> None:
-        result = perform_set_seat(
-            folder_id="wf-9b5931",
-            to_seat="opencode-gpt-terra",
-            reason="drill",
-            who="alice",
-            lines_config=write_roster(tmp_path),
-            prober=FakeProber(healthy=False),
-            probe_enabled=False,
-        )
-        assert result["to"] == "opencode-gpt-terra"
+        # The other line subcommands are untouched.
+        args = parser.parse_args(["line", "overrides", "--json"])
+        assert args.json is True
 
 
 # --- end to end: new generation cold-start on the override seat ------------
@@ -471,21 +386,30 @@ class TestNewGenerationColdStart:
         self, tmp_path: Path
     ) -> None:
         store = make_store(tmp_path)
-        roster = write_roster(tmp_path)
+        write_roster(tmp_path)
         launcher = FakeLauncher()
         scheduler = make_scheduler(tmp_path, store=store)
         scheduler.launcher = launcher
         line = scheduler.config.lines[0]
 
         assert scheduler.generation_of(line) == 1
-        perform_set_seat(
-            folder_id="wf-9b5931",
-            to_seat="opencode-gpt-terra",
-            reason="lane died",
-            who="alice",
-            lines_config=roster,
-            prober=FakeProber(healthy=True),
+        # R6 (wf-4601c8 §7.2.7/§7.2.11): the CLI set-seat call face is gone;
+        # drive the same C1-write + generation-bump through the store/bump
+        # primitives the outer-gate tool still uses.
+        store = make_store(tmp_path)
+        store.write(
+            validate_override(
+                {
+                    "folder_id": "wf-9b5931",
+                    "who": "alice",
+                    "when": iso(1700_000_000.0),
+                    "from": "opencode-dsv4pro",
+                    "to": "opencode-gpt-terra",
+                    "reason": "lane died",
+                }
+            )
         )
+        bump_line_generation(tmp_path / "runs", "wf-9b5931", base_generation=1)
         scheduler.tick()
         launched = launcher.launched[0]
         assert launched.seat == "opencode-gpt-terra"

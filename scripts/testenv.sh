@@ -50,7 +50,8 @@
 #   1. 目标端口 ∈ 生产端口集 {5608,5610,5611,5614,7490,7491,7493,7494,17590,9090,15722}；
 #   2. 目标端口在 up 当刻已被监听（bind 探测）；
 #   3. TEST_ROOT 等于或位于任一生产根之下（symlink 解析后同判）：
-#      /data/fleet-graph、/data/apps、/data/ronin、/data/agent-bus、/data/code/self、/data。
+#      /data/fleet-graph、/data/apps、/data/agent-bus、/data/code/self、/data、
+#      及旧引擎根（R6 后以 FGT_DENY_PATHS 默认值维护，名册/文档不再字面引用）。
 # 拒绝清单默认内置；FGT_DENY_PATHS（冒号分隔）/ FGT_DENY_PORTS（空白分隔）仅供
 # 测试替换 fixture 用——这是测试后门，生产不设此二环境变量。同类的测试后门还有：
 # FGT_READY_TIMEOUT（就绪等待上限，默认 60s）、FGT_PROD_GREP_ROOT（prod_references
@@ -70,7 +71,7 @@ unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy no_proxy
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ---------------- 拒绝清单（默认内置；FGT_* 仅测试 fixture 替换用） ----------------
-PROD_DENY_PATHS="${FGT_DENY_PATHS:-/data/fleet-graph:/data/apps:/data/ronin:/data/agent-bus:/data/code/self:/data}"
+PROD_DENY_PATHS="${FGT_DENY_PATHS:-/data/fleet-graph:/data/apps:/data/agent-bus:/data/code/self:/data}"
 PROD_DENY_PORTS="${FGT_DENY_PORTS:-5608 5610 5611 5614 7490 7491 7493 7494 17590 9090 15722}"
 
 # ---------------- 固定端口映射（FGT_PORT_<面> 可覆盖） ----------------
@@ -121,7 +122,7 @@ if [ "$CMD" = "mkrepo" ]; then
     [ -n "$MKREPO_NAME" ] || die "mkrepo 需要 <name>（$USAGE）"
 fi
 
-TEST_ROOT="${ROOT:-${FGT_ROOT:-/tmp/fleet-graph-testenv}}"
+TEST_ROOT="${ROOT:-${FGT_ROOT:-${FGT_TEST_ROOT:-/tmp/fleet-graph-testenv}}}"
 TEST_ROOT="$(canonical "$TEST_ROOT")"
 
 # ---------------- 拒绝判定（up 的布局检查核心；零副作用） ----------------
@@ -259,6 +260,10 @@ te_spawn_faces() {
             --working-directory "$REPO_ROOT" \
             --executable "$REPO_ROOT/.venv/bin/fleet-graph"
         te_launch goal-mcp "$TEST_ROOT/logs/goal-mcp.log" \
+            env FLEET_GRAPH_SUPERVISION_TOKEN_ROOT="$TEST_ROOT/secrets" \
+            FLEET_GRAPH_LINES_CONFIG="$TEST_ROOT/config/ronin-lines.json" \
+            FLEET_GRAPH_BUS_URL="http://127.0.0.1:$P_BUS_HTTP" \
+            FLEET_GRAPH_LINE_TOKEN_PATH="$TEST_ROOT/secrets/{alias}.token" \
             uv run --frozen --project "$REPO_ROOT" fleet-graph goal serve \
             --host 127.0.0.1 --port "$P_GOAL_MCP" \
             --work-folder-root "$TEST_ROOT/workfolders" \
@@ -272,6 +277,7 @@ te_spawn_faces() {
         te_launch state-mcp "$TEST_ROOT/logs/state-mcp.log" \
             env FLEET_GRAPH_SUPERVISION_TOKEN_ROOT="$TEST_ROOT/secrets" \
             FLEET_GRAPH_DEPLOY_CURRENT="$TEST_ROOT/current" \
+            FLEET_GRAPH_SUPERVISOR_STATE_ROOT="$TEST_ROOT/supervisor" \
             uv run --frozen --project "$REPO_ROOT" fleet-graph outer-gate serve \
             --host 127.0.0.1 --port "$P_STATE_MCP" \
             --run-root "$TEST_ROOT/runs" \
@@ -279,6 +285,7 @@ te_spawn_faces() {
             --dd-root "$TEST_ROOT/dd"
         te_launch state-http "$TEST_ROOT/logs/state-http.log" \
             env FLEET_GRAPH_BUS_TOKEN_FILE="$TEST_ROOT/secrets/fleet-graph.token" \
+            FLEET_GRAPH_DECISION_MCP_STATE_DIR="$TEST_ROOT/decision-mcp" \
             uv run --frozen --project "$REPO_ROOT" fleet-graph state serve \
             --host 127.0.0.1 --port "$P_STATE_HTTP" \
             --run-root "$TEST_ROOT/runs" --dd-root "$TEST_ROOT/dd" \
@@ -298,6 +305,10 @@ te_spawn_faces() {
             --working-directory "$REPO_ROOT" \
             --executable "$fg"
         te_launch goal-mcp "$TEST_ROOT/logs/goal-mcp.log" \
+            env FLEET_GRAPH_SUPERVISION_TOKEN_ROOT="$TEST_ROOT/secrets" \
+            FLEET_GRAPH_LINES_CONFIG="$TEST_ROOT/config/ronin-lines.json" \
+            FLEET_GRAPH_BUS_URL="http://127.0.0.1:$P_BUS_HTTP" \
+            FLEET_GRAPH_LINE_TOKEN_PATH="$TEST_ROOT/secrets/{alias}.token" \
             "$fg" goal serve \
             --host 127.0.0.1 --port "$P_GOAL_MCP" \
             --work-folder-root "$TEST_ROOT/workfolders" \
@@ -311,6 +322,7 @@ te_spawn_faces() {
         te_launch state-mcp "$TEST_ROOT/logs/state-mcp.log" \
             env FLEET_GRAPH_SUPERVISION_TOKEN_ROOT="$TEST_ROOT/secrets" \
             FLEET_GRAPH_DEPLOY_CURRENT="$TEST_ROOT/current" \
+            FLEET_GRAPH_SUPERVISOR_STATE_ROOT="$TEST_ROOT/supervisor" \
             "$fg" outer-gate serve \
             --host 127.0.0.1 --port "$P_STATE_MCP" \
             --run-root "$TEST_ROOT/runs" \
@@ -318,6 +330,7 @@ te_spawn_faces() {
             --dd-root "$TEST_ROOT/dd"
         te_launch state-http "$TEST_ROOT/logs/state-http.log" \
             env FLEET_GRAPH_BUS_TOKEN_FILE="$TEST_ROOT/secrets/fleet-graph.token" \
+            FLEET_GRAPH_DECISION_MCP_STATE_DIR="$TEST_ROOT/decision-mcp" \
             "$fg" state serve \
             --host 127.0.0.1 --port "$P_STATE_HTTP" \
             --run-root "$TEST_ROOT/runs" --dd-root "$TEST_ROOT/dd" \
@@ -493,6 +506,14 @@ write_roster() {
       "max_rounds": 1,
       "enabled": false,
       "_provenance": "R4 一线一分支样本线：enabled=false 不参与调度；验收 14 项 state 面 release_behind==0 读数的样本线"
+    },
+    {
+      "folder_id": "vrb-selftest-wake",
+      "seat": "selftest",
+      "alias": "selftest-wake",
+      "max_rounds": 1,
+      "enabled": false,
+      "_provenance": "R0 验收 04/15/16 合成靶名册 fixture：enabled=false 不参与调度；一次性 vrb-selftest- 探针按前缀投递"
     }
   ]
 }
@@ -526,6 +547,11 @@ write_secrets_and_files() {
     chmod 600 "$TEST_ROOT/secrets/fleet-graph.token"
     printf '%s\n' "$gateway" > "$TEST_ROOT/secrets/gateway.token"
     chmod 600 "$TEST_ROOT/secrets/gateway.token"
+    # 监督面 principal 的真凭证（R6/check15/16 合成靶必需）：supervision token
+    # root 内一个 owned 的 regular file，realpath 恰在该根下——
+    # resolve_supervisor_identity("fleet-supervisor") 的 owned 形态。
+    printf '%s\n' "$(gen_token)" > "$TEST_ROOT/secrets/fleet-supervisor.token"
+    chmod 600 "$TEST_ROOT/secrets/fleet-supervisor.token"
 
     # 05 号检查的 VRB_LLM_LEDGER stub：静态空 request_events 投影文件，由
     # state-http 面的 /v1/llm-ledger 查询面按 --llm-ledger-file 服务（R2）。
@@ -646,6 +672,7 @@ VRB_SUPERVISOR_ROOT=$TEST_ROOT/supervisor
 VRB_SECRETS_DIR=$TEST_ROOT/secrets
 VRB_LLM_LEDGER=http://127.0.0.1:$P_STATE_HTTP/v1/llm-ledger
 VRB_MCP_STATE=$P_STATE_MCP
+FLEET_GRAPH_DECISION_MCP_STATE_DIR=$TEST_ROOT/decision-mcp
 EOF
 }
 
@@ -712,6 +739,60 @@ EOF
     # 引擎级 fixture 驱动真实 configure(rebase)→merger(剥离+推线分支) 路径产出
     # 13/14 所需的单记录与 release_behind 读数（零外部网关、幂等、fail-closed）。
     r4_sample_driver "$REPO_ROOT" "$TEST_ROOT" "$P_BUS_HTTP"
+
+    # 合成靶线（04/15/16 探针）的驻停事实：scheduler stall 快照 + 线自身
+    # terminal.json 声明（parked_decision_state 的两权威件）+ 空 ack 台账，
+    # 使 15 的送达->ack 契约与 16 的『驻停不解除』读数有真实面可核。
+    # 04 的送达路还要求真实 question/card 对：线卡实体（goal.line.card.v1）
+    # + 引它的 question note（work.note.v1）——both 用幂等键发布，重跑幂等。
+    te_stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    te_bus_token="$(cat "$TEST_ROOT/secrets/fleet-graph.token")"
+    te_card="$(curl -s --noproxy '*' -m 10 -X POST "http://127.0.0.1:$P_BUS_HTTP/v1/channels/board:goal-line/publish" \
+        -H "Authorization: Bearer $te_bus_token" -H 'Content-Type: application/json' \
+        -d '{"kind":"goal.line.card.v1","payload":{"card_entity_id":"","note":"goal-line escalation surface for vrb-selftest-wake","note_type":"progress"},"idempotency_key":"goal-line-card:vrb-selftest-wake"}' \
+        | jq -r '.entity_id // empty' 2>/dev/null)"
+    te_note=""
+    if [ -n "$te_card" ]; then
+        te_note="$(curl -s --noproxy '*' -m 10 -X POST "http://127.0.0.1:$P_BUS_HTTP/v1/channels/board:work-notes/publish" \
+            -H "Authorization: Bearer $te_bus_token" -H 'Content-Type: application/json' \
+            -d "{\"kind\":\"work.note.v1\",\"payload\":{\"card_entity_id\":\"$te_card\",\"note\":\"line vrb-selftest-wake parked: blocked waiting on a human decision (run vrb-selftest-probe). blocker: vrb-selftest fixture.\",\"note_type\":\"question\"},\"idempotency_key\":\"parked:vrb-selftest-wake:vrb-selftest-probe:fixture\",\"refs\":[{\"target_entity\":\"$te_card\"}]}" \
+            | jq -r '.message_id // empty' 2>/dev/null)"
+    fi
+    mkdir -p "$TEST_ROOT/runs/vrb-selftest-wake/coord"
+    cat > "$TEST_ROOT/runs/.scheduler/vrb-selftest-wake.json" <<EOF2
+{
+  "folder_id": "vrb-selftest-wake",
+  "line_state": "waiting_decision",
+  "status": "waiting_decision",
+  "parked_run_id": "vrb-selftest-probe",
+  "parked_at": "$te_stamp",
+  "board_card_entity_id": "$te_card",
+  "board_question_note_id": "$te_note"
+}
+EOF2
+    cat > "$TEST_ROOT/runs/vrb-selftest-wake/terminal.json" <<EOF2
+{
+  "terminal": "blocked",
+  "waiting_on": "decision",
+  "run_id": "vrb-selftest-probe",
+  "reason": "R0 04/15/16 合成靶驻停 fixture（一次性，验收跑完即清）"
+}
+EOF2
+    : > "$TEST_ROOT/runs/vrb-selftest-wake/line-message-acks.jsonl"
+
+    # 合成靶线（04/15/16 探针）的 inbox 信道与 line token：agent: 命名空间由 bus
+    # 保留，inbox 信道随 agent 注册自动铸造；注册返回的 bus 签发 token 落进
+    # TEST_ROOT/secrets/{alias}.token——sink 用该 token 认证投递。
+    te_bus_token="$(cat "$TEST_ROOT/secrets/fleet-graph.token")"
+    te_reg="$(curl -s --noproxy '*' -m 10 -X POST "http://127.0.0.1:$P_BUS_HTTP/v1/agents" \
+        -H "Authorization: Bearer $te_bus_token" \
+        -H 'Content-Type: application/json' \
+        -d '{"agent_id":"selftest-wake","display_name":"selftest fixture line","kind":"service"}' 2>/dev/null)"
+    te_wake_token="$(printf '%s' "$te_reg" | jq -r '.token // empty' 2>/dev/null)"
+    if [ -n "$te_wake_token" ]; then
+        printf '%s\n' "$te_wake_token" > "$TEST_ROOT/secrets/selftest-wake.token"
+        chmod 600 "$TEST_ROOT/secrets/selftest-wake.token"
+    fi
 
     read -r n_alive n_total <<EOF
 $(alive_of_pids)

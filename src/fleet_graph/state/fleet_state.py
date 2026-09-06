@@ -17,7 +17,8 @@ dd status / decision-bridge 的 bridge.sqlite3，以及可选的 agent-bus
 - **读失败降级不 5xx 全链**：单个工件缺失/解析失败只对该条目标记
   absent/unknown，绝不让整表挂掉。
 - 机械事实只读：``heartbeat_age_s`` = 现在 - heartbeat.json 的 ``updated_at``；
-  ``parked`` = ``waiting_on == "decision"``（见 ``normalize_waiting_on``）；
+  ``waiting_on`` 等 wake facts 取自 terminal 声明（R6 起不再派生 ``parked``
+  字段——waiting 状态由 ``waiting_on == "decision"`` 机械可判）。
   ``wake_facts`` 至少含 ``waiting_on`` 等机械事实。
 - 驻停声明按 run 一致性门控：``terminal.json.run_id == heartbeat.json.run_id``
   时该声明才属活 run；否则 ``wake_facts_stale=true`` 且顶层 ``run_id`` 暴露
@@ -49,7 +50,6 @@ from fleet_graph.state.release_position import release_position
 from fleet_graph.state.run_artifacts import (
     line_message_acks_path,
     normalize_waiting_on,
-    parked_decision_state,
 )
 
 log = logging.getLogger(__name__)
@@ -431,8 +431,42 @@ def _read_published(config: FleetStateConfig, seen: set[str]) -> list[dict[str, 
     credential, or any read failure degrades to "no published" -- the bus is an
     optional enrichment, never a hard dependency of the view.
     """
+    published: list[dict[str, Any]] = []
+    # R6: the decision-MCP delivery ledger is the durable consume record for
+    # the synchronous line-delivery path -- a ``delivered`` row carries the
+    # owner line in its action_key and was written only after a successful
+    # resume through the registered control entry. Fold it in first so the
+    # owner attribution does not depend on the bridge db being present. The
+    # fold is env-fenced: it only runs where the decision face's state dir is
+    # actually bound (isolated environments / the bound production face).
+    ledger_env = os.environ.get("FLEET_GRAPH_DECISION_MCP_STATE_DIR")
+    if ledger_env:
+        try:
+            ledger = Path(ledger_env) / "deliveries.jsonl"
+            if ledger.is_file():
+                for raw in ledger.read_text(encoding="utf-8").splitlines():
+                    try:
+                        entry = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if not isinstance(entry, dict) or entry.get("status") != "delivered":
+                        continue
+                    action_key = str(entry.get("action_key") or "")
+                    owner_id = action_key.split(":")[1] if action_key.count(":") >= 2 else ""
+                    row = {
+                        "source_message_id": f"delivery:{action_key}",
+                        "state": STATE_CONSUMED,
+                        "owner": {
+                            "kind": "line",
+                            "id": owner_id,
+                            "generation": entry.get("generation"),
+                        },
+                    }
+                    published.append(row)
+        except (OSError, AttributeError):
+            pass
     if not config.bus_url:
-        return []
+        return published
     try:
         from fleet_graph.bus.board import DECISION_KINDS, WORK_NOTES
         from fleet_graph.bus.client import BusClient, load_token
@@ -441,8 +475,7 @@ def _read_published(config: FleetStateConfig, seen: set[str]) -> list[dict[str, 
         messages, _head = client.messages(WORK_NOTES, limit=200)
     except Exception as exc:
         log.debug("state read-model: bus published read skipped: %s", exc)
-        return []
-    published: list[dict[str, Any]] = []
+        return published
     for message in messages:
         message_id = str(message.get("message_id") or "")
         if not message_id or message_id in seen:
@@ -589,14 +622,6 @@ class FleetStateView:
                 wake_facts["line_message_acks"] = list(reversed(acks))[:ACK_TAIL_LIMIT]
 
             generation = self._generation_for(run_root, folder_id, roster_generation)
-            # M3.1 defect 5: ``parked`` derives from the single parked-state
-            # authority (the scheduler's stall snapshot, run-consistent with
-            # the line's own terminal declaration) -- the same derivation the
-            # decision MCP's delivery path answers to, so the read model and
-            # the delivery surface can no longer disagree about a forked
-            # park (``waiting_on`` alone used to report a park the scheduler
-            # had retracted, and vice versa).
-            park = parked_decision_state(run_root, folder_id)
             # R4（一线一分支）: the line's branch-position readings -- how far
             # the line branch trails its origin counterpart (release_behind,
             # the dispatch-side view check 14's probe reads) and how far the
@@ -613,7 +638,6 @@ class FleetStateView:
                     "phase": heartbeat.get("phase") if heartbeat else None,
                     "heartbeat_age_s": heartbeat_age_s,
                     "terminal": terminal.get("terminal") if terminal else None,
-                    "parked": park.parked,
                     "wake_facts": wake_facts,
                     "run_id": live_run_id,
                     "wake_facts_stale": wake_facts_stale,
@@ -765,14 +789,16 @@ class FleetStateView:
         }
 
     def awaiting_decisions(self) -> list[dict[str, Any]]:
-        """Lines parked waiting on a decision (state_takeover item 3).
+        """Lines waiting on a decision (state_takeover item 3).
 
-        Same parked-state authority ``lines()`` and the decision MCP delivery
-        path use -- no second reader.
+        R6 (wf-4601c8 §7.2.4) removed the derived ``parked`` field from the
+        /v1/lines projection; this view derives the same answer from the
+        still-emitted wake facts (``waiting_on == "decision"``) -- no second
+        reader, no reintroduced field.
         """
         awaiting = []
         for line in self.lines().get("lines") or []:
-            if line.get("parked"):
+            if (line.get("wake_facts") or {}).get("waiting_on") == "decision":
                 awaiting.append(
                     {
                         "folder_id": line.get("folder_id"),

@@ -123,7 +123,23 @@ class FakePublishResult:
 class FakeBoard:
     """Publishes the card and answers the park question, like the real board."""
 
-    def publish_card(self, payload: dict[str, Any], idempotency_key: str) -> FakePublishResult:
+    #: R6 (wf-4601c8 §7.2.3): the card publish goes through ``board.client``.
+    index_channel = "board:work-index"
+
+    class _Client:
+        def __init__(self, outer: FakeBoard) -> None:
+            self._outer = outer
+            self.index_channel = "board:work-index"
+
+        def publish(
+            self, channel_id: str, kind: str, payload: dict[str, Any], idempotency_key: str
+        ) -> FakePublishResult:
+            return self._outer._publish_card(payload, idempotency_key)
+
+    def __init__(self) -> None:
+        self.client = FakeBoard._Client(self)
+
+    def _publish_card(self, payload: dict[str, Any], idempotency_key: str) -> FakePublishResult:
         return FakePublishResult("msg-card-1")
 
     def ask(self, *, card_entity_id: str, question: str, idempotency_key: str) -> FakeTicket:

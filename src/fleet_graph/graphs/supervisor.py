@@ -74,7 +74,6 @@ from fleet_graph.supervise.events import (
     EVENT_BLOCKED_DECISION,
     EVENT_BOARD_QUESTION,
     EVENT_CAP_BREAKER,
-    EVENT_DECISION_SWALLOWED,
     EVENT_ENROLLMENT_PENDING,
     EVENT_HEARTBEAT_STALE,
     EVENT_LINE_FAULT,
@@ -359,7 +358,6 @@ _ESCALATION_TARGET_BY_SUBJECT = {
     EVENT_BOARD_QUESTION: ESCALATION_SUPERVISOR_ESCALATION,
     EVENT_LINE_FAULT: ESCALATION_SUPERVISOR_ESCALATION,
     EVENT_CAP_BREAKER: ESCALATION_SUPERVISOR_ESCALATION,
-    EVENT_DECISION_SWALLOWED: ESCALATION_SUPERVISOR_ESCALATION,
     EVENT_HEARTBEAT_STALE: ESCALATION_NEEDS_EVIDENCE,
     EVENT_ENROLLMENT_PENDING: ESCALATION_NEEDS_EVIDENCE,
 }
@@ -915,16 +913,8 @@ class SupervisorRunConfig:
     # --- M4 E6 stop (heartbeat_stale) ---
     #: Test seam: injected E6Ops; None -> DefaultE6Ops.
     e6_ops: Any | None = None
-    # --- M4 E7 goal.md direct-write (decision_swallowed) ---
-    #: E7 goal.md 直写目标线白名单。默认 deny-all：白名单未合入前 E7 直写无任何
-    #: 权限（铁律）。
-    e7_allowlist: Any | None = None
-    #: Explicit E7 allowlist config file; overrides e7_allowlist when set.
-    e7_allowlist_path: str | None = None
-    #: Test seam: injected E7Ops; None -> DefaultE7Ops.
-    e7_ops: Any | None = None
     # --- M4 wiki 人话账 (交付 C) ---
-    #: katana-wiki-mcp 客户端。E6/E7 成功收口时向「舰队开发阶段性成果报告」页追加
+    #: katana-wiki-mcp 客户端。E5/E6 成功收口时向「舰队开发阶段性成果报告」页追加
     #: 缺陷闭环分节；None -> 不汇报（默认）。wiki 是 telemetry，失败不咬反应器。
     wiki: Any | None = None
 
@@ -961,11 +951,12 @@ def run_supervisor(config: SupervisorRunConfig) -> dict[str, Any]:
 
     E5 `approved_unharvested` is dispatched to the M3 harvest ReAct subgraph
     (`supervise/harvest.py`); E6 `heartbeat_stale` to the M4 stop reactor
-    (`supervise/e6_stop.py`); E7 `decision_swallowed` to the M4 goal.md
-    direct-write reactor (`supervise/e7_write.py`). These three are the event
-    types whose job is to *write* (squash merge + deploy / stop a line unit /
-    append to the line's own goal.md), and each write is gated by its own
-    allowlist (deny-all default). Every other event runs the audit graph below.
+    (`supervise/e6_stop.py`). These two are the event types whose job is to
+    *write* (squash merge + deploy / stop a line unit), and each write is
+    gated by its own allowlist (deny-all default). R6 (wf-4601c8 §7.2.1/
+    §7.2.11) removed the E7 goal.md direct-write reactor: a swallowed decision
+    is now audit-visible only -- the goal.md 捎话 channel no longer exists.
+    Every other event runs the audit graph below.
 
     Resume semantics mirror graphs/runner.resume_start, with one addition: a
     thread whose checkpoint already carries a receipt is *finished* -- invoke
@@ -1018,30 +1009,6 @@ def run_supervisor(config: SupervisorRunConfig) -> dict[str, Any]:
                 run_root=config.run_root,
                 checkpoint_path=config.checkpoint_path,
                 ops=config.e6_ops,
-                bus=config.bus,
-                publish_notes=config.publish_notes,
-                wiki=config.wiki,
-            )
-        )
-
-    if event.type == EVENT_DECISION_SWALLOWED:
-        from fleet_graph.supervise.e7_allowlist import (
-            E7WriteAllowlist,
-            load_e7_write_allowlist,
-        )
-        from fleet_graph.supervise.e7_write import E7WriteRunConfig, run_e7_write
-
-        allowlist = config.e7_allowlist or E7WriteAllowlist.default()
-        if config.e7_allowlist_path:
-            allowlist = load_e7_write_allowlist(config.e7_allowlist_path)
-        return run_e7_write(
-            E7WriteRunConfig(
-                event=event.as_dict(),
-                state_root=config.state_root,
-                run_root=config.run_root,
-                checkpoint_path=config.checkpoint_path,
-                allowlist=allowlist,
-                ops=config.e7_ops,
                 bus=config.bus,
                 publish_notes=config.publish_notes,
                 wiki=config.wiki,

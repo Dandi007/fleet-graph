@@ -2,7 +2,7 @@
 
 > 判据锚：goal.md §二 R6 与 §四·一 B-3（仓外删除：本线出清单与验证脚本，批准后由监督面或 wf-3ffd90 执行）；wf-8d9737 design.md §7.1/§7.2；specs/r6-legacy-removal.md 交付物 3 与行为契约 3。
 > **本清单只备不执行**。每项含：对象、类别、验证命令（只读，= decommission-outer-verify.sh 同判据）、执行命令（供监督面复核后执行，本线不跑）、风险注记。执行前必须先跑 `scripts/decommission-outer-verify.sh` 留底稿，执行后复跑对账（exit 由残留数归零）。
-> 仓内对应物（dd-mcp 五 NOT_SUPPORTED 工具、--stage-model 键、/v1/lines.parked、status.json、skill/persona 引用面）走 R6 仓内单（specs/r6-legacy-removal.md），不在本清单。
+> 仓内对应物（dd-mcp 五 NOT_SUPPORTED 工具、--stage-model 键、/v1/lines.parked、status.json 写出面、skill/persona 引用面、goal.md 直写信道 e7_*、CLI line revive/set-seat/supervisor reset 残余、/data/ronin 字面引用、engine 侧 work.card.v1 建卡路）已随 R6 仓内单（specs/r6-legacy-removal.md，2026-09-06 交付）删除；本清单仅存仓外面。注意：板上**存量**历史卡实体仍在 bus 运行时（属 B3 执行后消失），R6 删的是引擎侧创建/写出路径。
 
 ## A. systemd user 单元与 unit 文件（~/.config/systemd/user）
 

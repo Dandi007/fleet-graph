@@ -115,6 +115,7 @@ def safe_vrb_env() -> tuple[dict[str, str], Path]:
     env["VRB_SUPERVISOR_ROOT"] = str(dead / "supervisor")
     env["VRB_SECRETS_DIR"] = str(dead / "secrets")
     env["VRB_LLM_LEDGER"] = "http://127.0.0.1:1/api/request_events"
+    env["VRB_MCP_STATE"] = "1"  # R6: bound state-mcp knob (check 06 probe)
     return env, dead
 
 

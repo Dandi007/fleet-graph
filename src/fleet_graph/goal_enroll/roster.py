@@ -33,7 +33,16 @@ class RealRosterReader:
     """
 
     def __init__(self, path: str | Path | None = None) -> None:
-        self._path = Path(path) if path is not None else DEFAULT_LINES_CONFIG
+        if path is not None:
+            self._path = Path(path)
+        else:
+            # Env-bindable for isolated environments (testenv, the decision
+            # face shares the knob); production runs with the env unset and
+            # reads the repository-default roster.
+            import os
+
+            env = os.environ.get("FLEET_GRAPH_LINES_CONFIG")
+            self._path = Path(env) if env else DEFAULT_LINES_CONFIG
 
     def _lines_raw(self) -> list[Any]:
         try:

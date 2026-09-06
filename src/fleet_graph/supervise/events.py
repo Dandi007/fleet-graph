@@ -31,8 +31,6 @@ EVENT_CAP_BREAKER = "cap_breaker"
 EVENT_APPROVED_UNHARVESTED = "approved_unharvested"
 #: E6 -- a line's heartbeat is stale past the threshold (read-model /v1/lines).
 EVENT_HEARTBEAT_STALE = "heartbeat_stale"
-#: E7 -- a decision was swallowed (read-model /v1/decisions).
-EVENT_DECISION_SWALLOWED = "decision_swallowed"
 #: E8 -- a goal enrollment application is pending (read-model /v1/enrollments).
 #: dedup key = ``enroll:{folder_id}``; a pending application older than the
 #: staleness threshold gets an additional reminder attempt keyed
@@ -48,7 +46,6 @@ EVENT_TYPES = frozenset(
         EVENT_CAP_BREAKER,
         EVENT_APPROVED_UNHARVESTED,
         EVENT_HEARTBEAT_STALE,
-        EVENT_DECISION_SWALLOWED,
         EVENT_ENROLLMENT_PENDING,
     }
 )
@@ -196,14 +193,6 @@ def heartbeat_stale_event(
     )
 
 
-def decision_swallowed_event(source_message_id: str, reason: str) -> SupervisorEvent:
-    return SupervisorEvent(
-        type=EVENT_DECISION_SWALLOWED,
-        key=sanitize_key(f"e7-{source_message_id}"),
-        payload={"source_message_id": source_message_id, "reason": reason},
-    )
-
-
 def enrollment_pending_event(
     folder_id: str,
     *,
@@ -240,7 +229,6 @@ __all__ = [
     "EVENT_BLOCKED_DECISION",
     "EVENT_BOARD_QUESTION",
     "EVENT_CAP_BREAKER",
-    "EVENT_DECISION_SWALLOWED",
     "EVENT_ENROLLMENT_PENDING",
     "EVENT_HEARTBEAT_STALE",
     "EVENT_LINE_FAULT",
@@ -251,7 +239,6 @@ __all__ = [
     "blocked_decision_event",
     "board_question_event",
     "cap_breaker_event",
-    "decision_swallowed_event",
     "enrollment_pending_event",
     "heartbeat_stale_event",
     "line_fault_event",
