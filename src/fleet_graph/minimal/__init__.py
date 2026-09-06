@@ -1,7 +1,10 @@
 """fleet_graph.minimal — the LoopX minimal-system protocol layer.
 
 Holds the Stop schema table and envelope validator the rebuilt engine's nodes
-reuse to grade every agent output as exactly one valid JSON object.
+reuse to grade every agent output as exactly one valid JSON object, plus the
+mechanically-checked git gates for agent handoffs (``gitgate``). Each DD adds
+its own module here; modules from different DDs are intentionally not
+imported by one another.
 """
 
 from fleet_graph.minimal.protocol import (

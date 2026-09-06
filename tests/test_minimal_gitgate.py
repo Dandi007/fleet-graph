@@ -1,0 +1,342 @@
+"""Tests for the minimal git gate (GO-28 handoff / GO-36 DD readiness).
+
+All gate logic runs against a fake GitRunner that answers by argv pattern, so
+no real git, no network, and the assertions double as the contract that every
+call is a plain argv list executed in an explicit cwd (never a shell string).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from fleet_graph.minimal.gitgate import (
+    CompletedResult,
+    DDRepoRef,
+    FailureCode,
+    RepoRef,
+    check_dd_ready,
+    check_handoff,
+    file_exists_at,
+)
+
+# Deterministic 40-char shas so remote tips and local HEADs can diverge on cue.
+SHA_A1 = "a" * 40
+SHA_B1 = "b" * 40
+SHA_OLD = "c" * 40
+SHA_NEW = "d" * 40
+
+# argv fragments that identify which git query a call is.
+_FRAGMENTS = {
+    "branch": ["rev-parse", "--abbrev-ref", "HEAD"],
+    "head": ["rev-parse", "HEAD"],
+    "status": ["status", "--porcelain"],
+    "fetch": ["fetch"],
+    "tip": ["rev-parse", "--verify"],
+    "cat_file": ["cat-file", "-e"],
+    "merge_base": ["merge-base", "--is-ancestor"],
+}
+
+
+def _matches(args: list[str], fragment: list[str]) -> bool:
+    return all(part in args for part in fragment)
+
+
+class FakeGitRunner:
+    """Answers each recognized git query from a per-repo script.
+
+    A repo's script maps a query kind to its canned result: ``branch`` is the
+    ref name stdout (``"HEAD"`` meaning detached), ``head`` the HEAD sha,
+    ``status`` the porcelain output, ``tip`` the remote tip sha (``None``
+    meaning the ref does not resolve), ``spec`` the ``cat-file -e`` exit code,
+    ``merge_base`` the ``merge-base --is-ancestor`` exit code. Unscripted
+    queries get the green defaults; unrecognized argv fails loudly so tests
+    cannot pass on accidental gaps.
+    """
+
+    def __init__(self, repos: dict[str, dict[str, Any]]) -> None:
+        self._repos = repos
+        self.calls: list[tuple[list[str], str]] = []
+
+    def run(self, args: list[str], *, cwd: str) -> CompletedResult:
+        self.calls.append((list(args), cwd))
+        script = self._repos.get(cwd)
+        if script is None:
+            raise AssertionError(f"unexpected cwd {cwd!r}; scripted: {sorted(self._repos)}")
+        if _matches(args, _FRAGMENTS["fetch"]):
+            return CompletedResult(0, "", "")
+        if _matches(args, _FRAGMENTS["branch"]):
+            return CompletedResult(0, script.get("branch", "feature-x") + "\n", "")
+        if _matches(args, _FRAGMENTS["head"]):
+            return CompletedResult(0, script.get("head", SHA_A1) + "\n", "")
+        if _matches(args, _FRAGMENTS["status"]):
+            return CompletedResult(0, script.get("status", ""), "")
+        if _matches(args, _FRAGMENTS["tip"]):
+            tip = script.get("tip", SHA_A1)
+            if tip is None:
+                return CompletedResult(128, "", "refs/remotes/origin/feature-x not found")
+            return CompletedResult(0, tip + "\n", "")
+        if _matches(args, _FRAGMENTS["cat_file"]):
+            return CompletedResult(script.get("spec", 0), "", "")
+        if _matches(args, _FRAGMENTS["merge_base"]):
+            return CompletedResult(script.get("merge_base", 1), "", "")
+        raise AssertionError(f"unrecognized git argv: {args!r}")
+
+
+def _repo(worktree: str, **script: Any) -> RepoRef:
+    return RepoRef(worktree=worktree, remote="origin", branch="feature-x", label=f"repo-{worktree}")
+
+
+def _runner(*repo_scripts: tuple[str, dict[str, Any]]) -> FakeGitRunner:
+    return FakeGitRunner(dict(repo_scripts))
+
+
+# ---------------------------------------------------------------------------
+# check_handoff
+# ---------------------------------------------------------------------------
+
+
+class TestCheckHandoff:
+    def test_two_green_repos_pass(self) -> None:
+        result = check_handoff(
+            [_repo("/wt/one"), _repo("/wt/two")],
+            runner=_runner(("/wt/one", {}), ("/wt/two", {})),
+        )
+        assert result.ok is True
+        assert result.failures == []
+
+    def test_dirty_worktree_fails(self) -> None:
+        result = check_handoff(
+            [_repo("/wt/dirty")],
+            runner=_runner(("/wt/dirty", {"status": " M src/foo.py\n"})),
+        )
+        assert result.ok is False
+        assert [f.code for f in result.failures] == [FailureCode.DIRTY_WORKTREE]
+        assert result.failures[0].repo == "repo-/wt/dirty"
+
+    def test_untracked_files_also_count_as_dirty(self) -> None:
+        result = check_handoff(
+            [_repo("/wt/untracked")],
+            runner=_runner(("/wt/untracked", {"status": "?? notes.txt\n"})),
+        )
+        assert result.ok is False
+        assert [f.code for f in result.failures] == [FailureCode.DIRTY_WORKTREE]
+
+    def test_local_ahead_of_remote_is_not_pushed(self) -> None:
+        result = check_handoff(
+            [_repo("/wt/ahead")],
+            runner=_runner(
+                (
+                    "/wt/ahead",
+                    {"head": SHA_NEW, "tip": SHA_OLD, "merge_base": 1},
+                )
+            ),
+        )
+        assert result.ok is False
+        assert [f.code for f in result.failures] == [FailureCode.NOT_PUSHED]
+
+    def test_local_behind_remote_is_head_behind_remote(self) -> None:
+        result = check_handoff(
+            [_repo("/wt/behind")],
+            runner=_runner(
+                (
+                    "/wt/behind",
+                    {"head": SHA_OLD, "tip": SHA_NEW, "merge_base": 0},
+                )
+            ),
+        )
+        assert result.ok is False
+        assert [f.code for f in result.failures] == [FailureCode.HEAD_BEHIND_REMOTE]
+
+    def test_branch_missing_on_remote(self) -> None:
+        result = check_handoff(
+            [_repo("/wt/no-branch")],
+            runner=_runner(("/wt/no-branch", {"tip": None})),
+        )
+        assert result.ok is False
+        assert [f.code for f in result.failures] == [FailureCode.BRANCH_MISSING_ON_REMOTE]
+
+    def test_detached_head(self) -> None:
+        result = check_handoff(
+            [_repo("/wt/detached")],
+            runner=_runner(("/wt/detached", {"branch": "HEAD"})),
+        )
+        assert result.ok is False
+        assert [f.code for f in result.failures] == [FailureCode.DETACHED_HEAD]
+
+    def test_one_bad_repo_out_of_two_is_reported_once(self) -> None:
+        result = check_handoff(
+            [_repo("/wt/good"), _repo("/wt/bad")],
+            runner=_runner(
+                ("/wt/good", {}),
+                ("/wt/bad", {"status": " M src/foo.py\n"}),
+            ),
+        )
+        assert result.ok is False
+        assert len(result.failures) == 1
+        assert result.failures[0].repo == "repo-/wt/bad"
+        assert result.failures[0].code == FailureCode.DIRTY_WORKTREE
+
+    def test_failures_are_data_not_exceptions(self) -> None:
+        result = check_handoff(
+            [_repo("/wt/multi")],
+            runner=_runner(
+                (
+                    "/wt/multi",
+                    {
+                        "status": " M a.py\n?? b.txt\n",
+                        "head": SHA_NEW,
+                        "tip": SHA_OLD,
+                        "merge_base": 1,
+                    },
+                )
+            ),
+        )
+        assert result.ok is False
+        assert [f.code for f in result.failures] == [
+            FailureCode.NOT_PUSHED,
+            FailureCode.DIRTY_WORKTREE,
+        ]
+        for failure in result.failures:
+            assert failure.detail
+
+
+# ---------------------------------------------------------------------------
+# check_dd_ready
+# ---------------------------------------------------------------------------
+
+
+def _dd_repo(worktree: str, spec_path: str = "docs/specs/101-foo.md") -> DDRepoRef:
+    return DDRepoRef(
+        worktree=worktree,
+        remote="origin",
+        branch="feature-x",
+        label=f"repo-{worktree}",
+        spec_path=spec_path,
+    )
+
+
+class TestCheckDDReady:
+    def test_all_five_checks_pass(self) -> None:
+        result = check_dd_ready([_dd_repo("/wt/dd-ok")], runner=_runner(("/wt/dd-ok", {})))
+        assert result.ok is True
+        assert result.failures == []
+
+    def test_spec_missing_in_head_commit(self) -> None:
+        result = check_dd_ready(
+            [_dd_repo("/wt/dd-nospec")],
+            runner=_runner(("/wt/dd-nospec", {"spec": 1})),
+        )
+        assert result.ok is False
+        assert [f.code for f in result.failures] == [FailureCode.SPEC_MISSING]
+
+    def test_handoff_failure_short_circuits_spec_check(self) -> None:
+        result = check_dd_ready(
+            [_dd_repo("/wt/dd-dirty")],
+            runner=_runner(("/wt/dd-dirty", {"status": " M x.py\n", "spec": 1})),
+        )
+        assert result.ok is False
+        assert [f.code for f in result.failures] == [FailureCode.DIRTY_WORKTREE]
+
+    def test_branch_missing_on_remote_fails_before_spec(self) -> None:
+        result = check_dd_ready(
+            [_dd_repo("/wt/dd-nobranch")],
+            runner=_runner(("/wt/dd-nobranch", {"tip": None, "spec": 1})),
+        )
+        assert result.ok is False
+        assert [f.code for f in result.failures] == [FailureCode.BRANCH_MISSING_ON_REMOTE]
+
+    def test_two_repos_only_one_missing_spec(self) -> None:
+        result = check_dd_ready(
+            [_dd_repo("/wt/dd-a"), _dd_repo("/wt/dd-b")],
+            runner=_runner(("/wt/dd-a", {}), ("/wt/dd-b", {"spec": 128})),
+        )
+        assert result.ok is False
+        assert len(result.failures) == 1
+        assert result.failures[0].repo == "repo-/wt/dd-b"
+        assert result.failures[0].code == FailureCode.SPEC_MISSING
+
+
+# ---------------------------------------------------------------------------
+# file_exists_at
+# ---------------------------------------------------------------------------
+
+
+class TestFileExistsAt:
+    def test_nonzero_cat_file_exit_is_false_not_an_exception(self) -> None:
+        runner = _runner(("/wt/x", {"spec": 128}))
+        assert file_exists_at("/wt/x", SHA_A1, "docs/specs/nope.md", runner=runner) is False
+
+    def test_zero_cat_file_exit_is_true(self) -> None:
+        runner = _runner(("/wt/x", {"spec": 0}))
+        assert file_exists_at("/wt/x", SHA_A1, "docs/specs/101-foo.md", runner=runner) is True
+
+
+# ---------------------------------------------------------------------------
+# runner contract: argv lists + explicit cwd, never shell strings
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerContract:
+    def _exercised_runner(self) -> FakeGitRunner:
+        runner = _runner(("/wt/contract", {}))
+        check_dd_ready([_dd_repo("/wt/contract")], runner=runner)
+        return runner
+
+    def test_every_call_passes_an_argv_list(self) -> None:
+        runner = self._exercised_runner()
+        assert runner.calls, "the gate made no git calls at all"
+        for args, _cwd in runner.calls:
+            assert isinstance(args, list)
+            assert all(isinstance(part, str) for part in args)
+            assert args[0] == "git"
+            for sep in (";", "|", "&&", "$(", "`"):
+                assert not any(sep in part for part in args), f"shell-ish {sep!r} in {args!r}"
+
+    def test_every_call_carries_the_config_guards(self) -> None:
+        """Agent-written worktrees can carry a hostile repo-local config; every
+        argv must include the three guards that neutralize it (mirrored from
+        tests/test_dd_git.py's exploit regression)."""
+        runner = self._exercised_runner()
+        assert runner.calls
+        for args, _cwd in runner.calls:
+            assert args[1:2] == ["-c"] and args[2] == "core.fsmonitor=false"
+            assert "core.hooksPath=/dev/null" in args
+            assert "protocol.ext.allow=never" in args
+
+    def test_every_call_carries_the_worktree_cwd(self) -> None:
+        runner = self._exercised_runner()
+        for _args, cwd in runner.calls:
+            assert cwd == "/wt/contract"
+
+    def test_worktree_pinned_via_dash_c_argv(self) -> None:
+        """The fake sees the argv the real runner would exec verbatim; the cwd
+        is pinned with a list-form ``-C <worktree>``, never a shell string."""
+        runner = self._exercised_runner()
+        for args, _cwd in runner.calls:
+            at_c = args.index("-C")
+            assert args[at_c + 1] == "/wt/contract"
+
+    def test_fetch_happens_before_tip_resolution(self) -> None:
+        runner = self._exercised_runner()
+        fetch_at = next(
+            i for i, (args, _cwd) in enumerate(runner.calls) if _matches(args, _FRAGMENTS["fetch"])
+        )
+        tip_at = next(
+            i for i, (args, _cwd) in enumerate(runner.calls) if _matches(args, _FRAGMENTS["tip"])
+        )
+        assert fetch_at < tip_at
+
+
+# ---------------------------------------------------------------------------
+# failure codes are exported constants
+# ---------------------------------------------------------------------------
+
+
+class TestFailureCodes:
+    def test_codes_are_stable_strings(self) -> None:
+        assert FailureCode.NOT_PUSHED == "not_pushed"
+        assert FailureCode.HEAD_BEHIND_REMOTE == "head_behind_remote"
+        assert FailureCode.DIRTY_WORKTREE == "dirty_worktree"
+        assert FailureCode.BRANCH_MISSING_ON_REMOTE == "branch_missing_on_remote"
+        assert FailureCode.DETACHED_HEAD == "detached_head"
+        assert FailureCode.SPEC_MISSING == "spec_missing"
