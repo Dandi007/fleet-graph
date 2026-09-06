@@ -472,11 +472,87 @@ vrb_check_03() {
 }
 
 # ---------------- 04 external-decision-wakes-line 外部裁决送达即唤醒（合成靶） ----------------
-# 现场合成的只是 vrb-selftest- 命名空间的一次性靶 id（不落任何盘面文件）：对 decision MCP
-# 投一次裁决、再查消费证据（state /v1/decisions 的 consumed 记录 + 下一代 unit）。
-# 合成 blocked 靶线本身所需机制（调度器 wake 事实）R0 未落地 → 拒绝/无消费证据如实 FAIL。
+# 对 decision MCP 投一次裁决、再查消费证据（state /v1/decisions 的 consumed 记录 + 下一代 unit）。
+# 合成 blocked 靶的驻停事实由 testenv up 一次性写就（stall 快照 parked_run_id/parked_at +
+# terminal.json waiting_on=decision）；投递唤醒即按设计清除该驻停权威——同一 testenv 第二次
+# 全量跑（或单查后再跑）check04 必拒 LINE_NOT_PARKED（缺口在 fixture 一次性，不在判据）。
+# R7a 自足复位：--env test 面投递前若合成靶未被驻停，按 testenv up 同一写法复位 fixture
+# （stall 快照 + terminal.json blocked/waiting_on=decision；board card/question note 缺失时
+# 以同一 idempotency_key 补发）再投递，使双腿全量跑可重复；非 test 面保持现状、绝不造生产状态。
+#
+# R7a：check04 投递前 fixture 复位（仅 --env test 面，幂等）。合成靶硬编码 vrb-selftest-wake，
+# 复位只写 $VRB_TEST_ROOT/runs/ 下 stall 快照与 terminal.json（testenv up 同一写法），
+# 从不写生产路径；任何其它 line id 不会出现在此复位路径。
+vrb_check04_park_synthetic() {
+    local target="vrb-selftest-wake"
+    local stall term_dir term parked_run_id parked_at wait card note stamp parked=1
+    stall="$VRB_SCHED_DIR/$target.json"
+    term_dir="$VRB_RUNS_ROOT/$target"
+    term="$term_dir/terminal.json"
+    # 已驻停判定：stall 快照 parked_run_id 与 parked_at 均非空（唤醒按设计清二者）。
+    if [ -r "$stall" ]; then
+        parked_run_id="$(jq -r '.parked_run_id // empty' "$stall" 2>/dev/null)"
+        parked_at="$(jq -r '.parked_at // empty' "$stall" 2>/dev/null)"
+        if [ -n "$parked_run_id" ] && [ -n "$parked_at" ] && [ "$parked_at" != "null" ]; then
+            if [ -r "$term" ]; then
+                wait="$(jq -r '.waiting_on // empty' "$term" 2>/dev/null)"
+                [ -n "$wait" ] && [ "$wait" != "decision" ] && parked=0
+            fi
+        else
+            parked=0
+        fi
+    else
+        parked=0
+    fi
+    [ "$parked" = "1" ] && return 0
+    # 沿用已有 card/note 实体（唤醒不清除 board_card_entity_id/board_question_note_id）；
+    # 缺失时按 testenv up 同一写法与同一 idempotency_key 补发（重发幂等）。
+    card="$(jq -r '.board_card_entity_id // empty' "$stall" 2>/dev/null)"
+    note="$(jq -r '.board_question_note_id // empty' "$stall" 2>/dev/null)"
+    if [ -z "$card" ] && [ -n "$BUS_TOKEN" ]; then
+        card="$(curl -s --noproxy '*' -m 10 -X POST "$VRB_BUS_BASE/v1/channels/board:goal-line/publish" \
+            -H "Authorization: Bearer $BUS_TOKEN" -H 'Content-Type: application/json' \
+            -d '{"kind":"goal.line.card.v1","payload":{"card_entity_id":"","note":"goal-line escalation surface for vrb-selftest-wake","note_type":"progress"},"idempotency_key":"goal-line-card:vrb-selftest-wake"}' \
+            | jq -r '.entity_id // empty' 2>/dev/null)"
+    fi
+    if [ -z "$note" ] && [ -n "$card" ]; then
+        note="$(curl -s --noproxy '*' -m 10 -X POST "$VRB_BUS_BASE/v1/channels/board:work-notes/publish" \
+            -H "Authorization: Bearer $BUS_TOKEN" -H 'Content-Type: application/json' \
+            -d "{\"kind\":\"work.note.v1\",\"payload\":{\"card_entity_id\":\"$card\",\"note\":\"line vrb-selftest-wake parked: blocked waiting on a human decision (run vrb-selftest-probe). blocker: vrb-selftest fixture.\",\"note_type\":\"question\"},\"idempotency_key\":\"parked:vrb-selftest-wake:vrb-selftest-probe:fixture\",\"refs\":[{\"target_entity\":\"$card\"}]}" \
+            | jq -r '.message_id // empty' 2>/dev/null)"
+    fi
+    stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    mkdir -p "$term_dir/coord"
+    cat > "$stall" <<EOF2
+{
+  "folder_id": "$target",
+  "line_state": "waiting_decision",
+  "status": "waiting_decision",
+  "parked_run_id": "vrb-selftest-probe",
+  "parked_at": "$stamp",
+  "board_card_entity_id": "$card",
+  "board_question_note_id": "$note"
+}
+EOF2
+    cat > "$term" <<EOF2
+{
+  "terminal": "blocked",
+  "waiting_on": "decision",
+  "run_id": "vrb-selftest-probe",
+  "reason": "R0 04/15/16 合成靶驻停 fixture（check04 投递前自足复位）"
+}
+EOF2
+    : > "$term_dir/line-message-acks.jsonl"
+    printf 'verify-rebuild check04: fixture reset 合成靶 %s（stall=%s card=%s note=%s parked_at=%s）\n' \
+        "$target" "$stall" "${card:-<无>}" "${note:-<无>}" "$stamp" >&2
+}
+
 vrb_check_04() {
     target="vrb-selftest-wake"
+    # 仅 --env test 面复位（复位动作只落 $VRB_TEST_ROOT/runs/，幂等，见 helper）。
+    if [ -n "${VRB_TEST_ROOT:-}" ]; then
+        vrb_check04_park_synthetic
+    fi
     tools="$(mcp_tool_names "$VRB_MCP_DECISION")"
     if [ -z "$tools" ]; then
         vrb_emit 04 external-decision-wakes-line FAIL "decision MCP :$VRB_MCP_DECISION tools/list 不可达，无法对合成靶（$target）投裁决；送达即唤醒机制不可核"
