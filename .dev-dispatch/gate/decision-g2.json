@@ -1,0 +1,12 @@
+{
+ "development_id": "dev-fg-874632b9f8e6",
+ "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
+ "decided_by": "wf-4601c8",
+ "decision_message_id": "msg_01M1TV5NN9914MWPWZ0HQWSDBS",
+ "rationale": "ronin-rebuild 以 gate 身份自判（goal §四·一 A-2，D5；decided_by=dispatched_by=wf-4601c8；常量本轮 development_get/record.json 现值重 derive：base=fff7590、head=8cb9934、spec_digest=sha256:9ca03678…、三条 argv=record.json 冻结值）。六项取证全绿：①三方（实取四方：record.json/.dd-evidence acceptance.json/spec approved.md/run-config.json）验收命令逐字相等，归一 sha256=69359fe9…。②改动未越界：base..head 67 路径扣机器件 9（.dev-dispatch×8+.dd-evidence×1）＝产品 58（A=tests/test_r6_legacy_removal.py，D=恰 e7_* 5 件，M=52），全部落 spec 交付物 1–4；verify-rebuild.sh 判据块仅两行文案（§7.2.8 报错字面改写，探针 grep -rq '/data/ronin' 原样），check21 gone=9/9、13/13 判据未动。③零测试删除：tests/ D 恰 test_e7_allowlist.py+test_e7_write.py（design §2 点名 e7 直写信道整删，test_r6::test_tests_bound_to_removed_objects 机械断言恰允许此二者）。④亲跑验收（独立 --detach worktree @8cb9934）三条冻结 argv 全 EXIT=0：pytest 15/15 [100%]；make verify 3074 passed+1 skipped in 116.79s；testenv 回显逐字 up=0 lines=21 c01=1 c02=1 c21=1 c18=1 c19=1 down=0 prod_references=0。⑤全量回归对基线（base@fff7590 同法独立 worktree）：base make verify 3109 passed+1 skipped exit0 vs head 3074 passed+1 skipped exit0，两侧 0 failed、skip 同为 1；Δ=-35 逐 nodeid 可解释（−79 全为被删对象绑定用例、+44 改写替换含 15 条 test_r6 与 is_removed 负向断言族，无一悬空）。⑥变异回执核验：test_r6 15 函数机械枚举全卷（清单 SSoT 计数、注入 import 必红、顺序护栏两向、只读边界、删/改对照），implement 15/15=acceptance=亲跑三方计数一致；rc/rf-89a65bf8 双 APPROVE（reviewer glm-5.3）。附加：record.seats implement=glm-5.3-flash、两 review=glm-5.3（三 stage line-explicit）；g2 阶段链 7 条无缺号。放行 merge_only（合 release/wf-4601c8），不含部署。",
+ "question_note_id": "msg_01M1TMD7G2D5BTAG8R9KAQN3W4",
+ "card_entity_id": "msg_01M1SAEABK8JFRYFABR7KKZ3NB",
+ "output_commit": "8cb9934c3a20c574de49e8ec316555f106938851"
+}
