@@ -74,7 +74,7 @@ def scrubbed_environment(env: dict[str, str] | None = None) -> dict[str, str]:
 # lines (`ronin-model-switch`) has agent-runtime as its subject. Executing the
 # fleet's executor out of a tree that the fleet itself edits is a loop nobody
 # wants to debug at 3am.
-DEFAULT_AGENT_RUN_BIN = "/data/code/self/agent-runtime-current/bin/agent-run"
+DEFAULT_AGENT_RUN_BIN = "/data/code/fleet-comparison/driver/agent-runtime/bin/compare-agent-run"
 DEFAULT_STATE_ROOT = "/data/fleet-graph/runs"
 
 RunState = Literal["running", "succeeded", "failed", "lost"]

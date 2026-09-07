@@ -119,7 +119,7 @@ DEFAULT_WORKING_DIRECTORY = "/data/apps/fleet-graph/current"
 DEFAULT_EXECUTABLE = "/data/apps/fleet-graph/current/.venv/bin/fleet-graph"
 #: Fail-closed admission whitelist: a repo outside these roots is refused.
 #: /tmp is admitted for throwaway acceptance repos (the §24 precedent).
-DEFAULT_WORKTREE_ROOTS: tuple[str, ...] = ("/data/worktrees", "/tmp")
+DEFAULT_WORKTREE_ROOTS: tuple[str, ...] = ("/data/code/fleet-comparison/self", "/data/worktrees", "/tmp")
 
 RECORD_FILE = "record.json"
 STATUS_FILE = "status.json"
