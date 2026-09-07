@@ -101,9 +101,9 @@ class TestNoUnguardedGitIsLeftInTheSource:
         # The minimal package has no old-module imports to lean on, so it
         # duplicates the guards in its own argv builders; those builds are
         # guarded calls and are checked behaviorally (guards directly follow
-        # the git token) in tests/test_minimal_gitgate.py and
-        # tests/test_minimal_enroll.py.
-        whitelisted = {"minimal/gitgate.py", "minimal/enroll.py"}
+        # the git token) in tests/test_minimal_gitgate.py,
+        # tests/test_minimal_enroll.py, and tests/test_minimal_runroot.py.
+        whitelisted = {"minimal/gitgate.py", "minimal/enroll.py", "minimal/runroot.py"}
         offenders = []
         for path in sorted(root.rglob("*.py")):
             if "vendor" in path.parts or path.name == "git.py":
