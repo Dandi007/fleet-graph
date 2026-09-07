@@ -1,0 +1,67 @@
+{
+  "agent_run": "/data/code/fleet-comparison/codex/agent-runtime/bin/agent-run",
+  "agent_session": "/data/code/fleet-comparison/codex/agent-runtime/bin/agent-session",
+  "work_folder_mcp": "http://127.0.0.1:5602/mcp",
+  "dd_capacity": 8,
+  "warning_turns": 20,
+  "acceptance_timeout": 900,
+  "poll_interval": 0.2,
+  "scribe_interval": 60,
+  "roles": {
+    "goal": {
+      "runtime": "opencode",
+      "model": "deepseek-v4-pro@opencode",
+      "harness": "fleet-goal",
+      "write": true,
+      "timeout": 1800,
+      "hooks": "isolate",
+      "session_policy": "resume",
+      "compact_after": 0,
+      "system_prompt_file": "/data/code/fleet-comparison/codex/fleet-graph/config/prompts/goal.md"
+    },
+    "impl": {
+      "runtime": "opencode",
+      "model": "deepseek-v4-pro@opencode",
+      "harness": "fleet-developer",
+      "write": true,
+      "timeout": 1800,
+      "hooks": "isolate",
+      "session_policy": "resume",
+      "compact_after": 0,
+      "system_prompt_file": "/data/code/fleet-comparison/codex/fleet-graph/config/prompts/impl.md"
+    },
+    "cr": {
+      "runtime": "opencode",
+      "model": "deepseek-v4-pro@opencode",
+      "harness": "fleet-reviewer",
+      "write": true,
+      "timeout": 1800,
+      "hooks": "isolate",
+      "session_policy": "resume",
+      "compact_after": 0,
+      "system_prompt_file": "/data/code/fleet-comparison/codex/fleet-graph/config/prompts/cr.md"
+    },
+    "fr": {
+      "runtime": "opencode",
+      "model": "deepseek-v4-pro@opencode",
+      "harness": "fleet-reviewer",
+      "write": true,
+      "timeout": 1800,
+      "hooks": "isolate",
+      "session_policy": "resume",
+      "compact_after": 0,
+      "system_prompt_file": "/data/code/fleet-comparison/codex/fleet-graph/config/prompts/fr.md"
+    },
+    "scribe": {
+      "runtime": "opencode",
+      "model": "deepseek-v4-pro@opencode",
+      "harness": "fleet-scribe",
+      "write": false,
+      "timeout": 1800,
+      "hooks": "isolate",
+      "session_policy": "resume",
+      "compact_after": 0,
+      "system_prompt_file": "/data/code/fleet-comparison/codex/fleet-graph/config/prompts/scribe.md"
+    }
+  }
+}
