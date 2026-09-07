@@ -23,6 +23,9 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v5
+        with:
+          # 历史保护测试需要读取基准 blob 与替代实现的提交先后关系。
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true

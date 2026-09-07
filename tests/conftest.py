@@ -74,3 +74,9 @@ def write_index(
 
 def head(repo: Path) -> str:
     return git(repo, "rev-parse", "HEAD")
+
+
+@pytest.fixture(autouse=True)
+def isolated_runtime_roster(tmp_path: Path, monkeypatch):
+    """每项检查隔离服务名册，禁止读写宿主开线数据。"""
+    monkeypatch.setenv("FLEET_GRAPH_RUNTIME_ROSTER", str(tmp_path / "runtime-roster.json"))

@@ -184,7 +184,25 @@ def classify_agent_run_failure(
             detail=f"run {run_id} ended {ended} with no result to classify",
             unattributed=True,
         )
+    if result.get("exit_reason") in {"launcher_failure", "config_error"}:
+        return AgentRunFailure(
+            failure_code=AGENT_RUN_FAILED,
+            detail=f"run {run_id} local execution failure: {result.get('stderr_tail') or ''}",
+            unattributed=True,
+        )
     evidence = _route_attempts_with_transport_evidence(result)
+    contract_error = result.get("contract_error")
+    if result.get("exit_reason") == "contract_violation" or (
+        isinstance(contract_error, str)
+        and contract_error.strip()
+        and result.get("error_class") == "task_fault"
+    ):
+        return AgentRunFailure(
+            failure_code=INVALID_HANDOFF_SCHEMA,
+            detail=f"run {run_id} contract_violation: {contract_error or ''}",
+            unattributed=False,
+            contract_error=str(contract_error or ""),
+        )
     if evidence:
         return AgentRunFailure(
             failure_code=PROVIDER_UNAVAILABLE,
@@ -359,6 +377,18 @@ class AgentRunStageActor:
             # The precondition already holds; nothing to restore.
             return
         cleared_head = current
+        recovery_ref = (
+            f"refs/fleet-recovery/{self.development_id}/"
+            f"g{int(dispatch.get('generation', 1))}-{stage.id}-"
+            f"a{int(dispatch.get('attempt', 1))}-{current[:12]}"
+        )
+        run_git(workspace, "update-ref", recovery_ref, current, check=True)
+        if dirty.stdout.strip():
+            run_git(
+                workspace, "stash", "push", "--include-untracked", "-m", recovery_ref, check=True
+            )
+            snapshot = run_git(workspace, "rev-parse", "refs/stash", check=True).stdout.strip()
+            run_git(workspace, "update-ref", recovery_ref + "-worktree", snapshot, check=True)
         reset = run_git(workspace, "reset", "--hard", "--quiet", input_commit)
         if reset.returncode != 0:
             return
@@ -373,6 +403,10 @@ class AgentRunStageActor:
                     "development_id": self.development_id,
                     "input_commit": input_commit,
                     "cleaned_head": cleared_head,
+                    "recovery_ref": recovery_ref,
+                    "worktree_recovery_ref": recovery_ref + "-worktree"
+                    if dirty.stdout.strip()
+                    else "",
                 }
             )
 
@@ -457,6 +491,8 @@ class AgentRunStageActor:
         model = self.models.get(stage.id)
         spec = AgentRunSpec(
             prompt="",
+            cwd=str(self.worktree_path),
+            sandbox_workspace=str(self.worktree_path),
             role=stage_role(stage, self.roles),
             # agent-run resolves `--model` through a chain and wants the
             # runtime named alongside it.

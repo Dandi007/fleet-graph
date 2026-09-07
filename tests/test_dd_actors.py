@@ -500,6 +500,7 @@ class TestAutoRePrepareClearsARemnantBeforeAFreshAttempt:
         re_prepares = [e for e in events if e.get("event") == "re_prepare"]
         assert len(re_prepares) == 1
         assert re_prepares[0]["cleaned_head"] == remnant
+        assert git(repo, "rev-parse", re_prepares[0]["recovery_ref"]).strip() == remnant
         assert re_prepares[0]["input_commit"] == input_commit
         assert re_prepares[0]["stage"] == "implement"
 

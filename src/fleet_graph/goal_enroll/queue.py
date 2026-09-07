@@ -32,10 +32,17 @@ and idempotently.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import threading
 import time
+from contextlib import contextmanager, nullcontext
+from copy import deepcopy
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.dd.operation_lock import operation_lock
 from fleet_graph.goal_enroll.contract import (
     CODE_NOT_PENDING,
     QUEUE_STATUS_ADMITTED,
@@ -51,6 +58,33 @@ REJECTIONS_FILE = "enroll-rejections.jsonl"
 
 #: Terminal states a decision leaves behind; only ``pending`` is actionable.
 _TERMINAL = (QUEUE_STATUS_ADMITTED, QUEUE_STATUS_REJECTED, QUEUE_STATUS_WITHDRAWN)
+
+
+def _synchronized(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self._access():
+            return deepcopy(method(self, *args, **kwargs))
+
+    return guarded
+
+
+def _write_lines(path: Path, body: str) -> None:
+    descriptor, temporary = tempfile.mkstemp(prefix=".enroll-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def migrate_queue_home(legacy_root: str | Path | None, queue_home: str | Path) -> tuple[str, ...]:
@@ -90,6 +124,7 @@ class EnrollQueue:
 
     def __init__(self, root: str | Path | None = None, *, clock: Any = time.time) -> None:
         self._clock = clock
+        self._thread_lock = threading.RLock()
         self._by_folder: dict[str, dict[str, Any]] = {}
         self._rejections: dict[str, list[dict[str, Any]]] = {}
         self._queue_path: Path | None = None
@@ -103,31 +138,49 @@ class EnrollQueue:
 
     # --- persistence ------------------------------------------------------
 
+    @contextmanager
+    def _access(self):
+        lock = (
+            operation_lock(self._queue_path.with_suffix(".lock"))
+            if self._queue_path is not None
+            else nullcontext()
+        )
+        with self._thread_lock, lock:
+            if self._queue_path is not None:
+                self._load()
+            before = deepcopy((self._by_folder, self._rejections))
+            try:
+                yield
+            except Exception:
+                self._by_folder, self._rejections = before
+                raise
+
     def _load(self) -> None:
+        by_folder: dict[str, dict[str, Any]] = {}
+        rejections: dict[str, list[dict[str, Any]]] = {}
         if self._queue_path is not None and self._queue_path.is_file():
             for line in self._queue_path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if not line:
                     continue
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict) or not isinstance(record.get("folder_id"), str):
+                    raise ValueError("入编队列记录损坏")
                 folder_id = record.get("folder_id")
                 if folder_id:
-                    self._by_folder[folder_id] = record
+                    by_folder[folder_id] = record
         if self._rejections_path is not None and self._rejections_path.is_file():
             for line in self._rejections_path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if not line:
                     continue
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict) or not isinstance(record.get("folder_id"), str):
+                    raise ValueError("入编拒绝记录损坏")
                 folder_id = record.get("folder_id")
                 if folder_id:
-                    self._rejections.setdefault(folder_id, []).append(record)
+                    rejections.setdefault(folder_id, []).append(record)
+        self._by_folder, self._rejections = by_folder, rejections
 
     def _persist_queue(self) -> None:
         if self._queue_path is None:
@@ -136,7 +189,7 @@ class EnrollQueue:
             json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
             for record in self._by_folder.values()
         )
-        self._queue_path.write_text(body, encoding="utf-8")
+        _write_lines(self._queue_path, body)
 
     def _persist_rejections(self) -> None:
         if self._rejections_path is None:
@@ -144,15 +197,16 @@ class EnrollQueue:
         lines: list[dict[str, Any]] = []
         for folder_id in sorted(self._rejections):
             lines.extend(self._rejections[folder_id])
-        self._rejections_path.write_text(
+        _write_lines(
+            self._rejections_path,
             "".join(
                 json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in lines
             ),
-            encoding="utf-8",
         )
 
     # --- the state machine ------------------------------------------------
 
+    @_synchronized
     def submit(self, entry: dict[str, Any]) -> dict[str, Any]:
         """Land one validated application as a ``pending`` entry.
 
@@ -177,6 +231,7 @@ class EnrollQueue:
         self._persist_queue()
         return {**record, "already_pending": False}
 
+    @_synchronized
     def record_board_notify(self, folder_id: str, value: str) -> dict[str, Any] | None:
         """Attach the best-effort board question-note result to the entry."""
         existing = self._by_folder.get(folder_id)
@@ -196,6 +251,7 @@ class EnrollQueue:
             )
         return existing
 
+    @_synchronized
     def _transition(self, folder_id: str, status: str, **extra: Any) -> dict[str, Any]:
         existing = self._require_pending(folder_id)
         now = iso_timestamp(self._clock())
@@ -236,6 +292,7 @@ class EnrollQueue:
             decision_ref=decision_ref,
         )
 
+    @_synchronized
     def record_rejection(
         self, folder_id: str, *, code: str, detail: str, alias: str | None = None
     ) -> None:
@@ -253,18 +310,23 @@ class EnrollQueue:
 
     # --- reads ------------------------------------------------------------
 
+    @_synchronized
     def get(self, folder_id: str) -> dict[str, Any] | None:
         return self._by_folder.get(folder_id)
 
+    @_synchronized
     def entries(self) -> tuple[dict[str, Any], ...]:
         return tuple(self._by_folder.values())
 
+    @_synchronized
     def pending(self) -> tuple[dict[str, Any], ...]:
         return tuple(e for e in self._by_folder.values() if e.get("status") == QUEUE_STATUS_PENDING)
 
+    @_synchronized
     def rejections(self, folder_id: str) -> tuple[dict[str, Any], ...]:
         return tuple(self._rejections.get(folder_id, ()))
 
+    @_synchronized
     def __len__(self) -> int:
         return len(self._by_folder)
 

@@ -317,7 +317,9 @@ def deliver_decision(
     if line.startswith(DD_DEV_PREFIX):
         return _dd_not_deliverable(line, decision)
 
-    if line not in _roster_ids(lines):
+    from fleet_graph.goal_enroll.runtime_roster import runtime_entries
+
+    if line not in _roster_ids([*lines, *runtime_entries()]):
         return DeliveryResult(
             status=OUTCOME_REFUSED,
             code=CODE_NO_WAITING_PARTY,

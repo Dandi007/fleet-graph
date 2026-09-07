@@ -945,9 +945,9 @@ class TestLiveWakeSignals:
         assert signals.goal_revision("wf-1") is None
 
     def test_timestamps_parse_at_both_precisions(self) -> None:
-        assert parse_bus_timestamp("2026-08-27T10:00:00Z") == parse_bus_timestamp(
-            "2026-08-27T10:00:00.999Z"
-        )
+        whole = parse_bus_timestamp("2026-08-27T10:00:00Z")
+        fractional = parse_bus_timestamp("2026-08-27T10:00:00.999Z")
+        assert 0.998 < fractional - whole < 1
 
 
 class TestSourceDegradation:
@@ -985,24 +985,20 @@ class TestSourceDegradation:
         assert state["parked_inbox_available"] is False
         assert state["parked_goal_revision"] == "sha256:rev-1"
 
-    def test_a_degraded_park_never_probes_the_inbox_again(self, tmp_path: Path) -> None:
-        """Availability is assessed once, at establishment. A 403 is an ACL
-        gap that no per-tick probe will fix; the next parked terminal
-        re-assesses at its own establishment. So an inbox recovering mid-park
-        is deliberately not detected."""
+    def test_a_degraded_park_recovers_when_inbox_acl_is_fixed(self, tmp_path: Path) -> None:
+        """外部修好消息权限后，驻停线无需人工重启即可发现新消息。"""
         from fleet_graph.bus.client import BusError
 
         wake = FakeWake(inbox_error=BusError(403, "Cannot read this channel"))
-        scheduler, clock, _ = blocked_line(tmp_path, wake=wake)
+        scheduler, clock, launcher = blocked_line(tmp_path, wake=wake)
         scheduler.tick()
         establish_probes = len(wake.inbox_calls)
-
-        wake.inbox_error = None  # the ACL gets fixed mid-park
+        wake.inbox_error = None
         wake.inbox = True
-        for _ in range(3):
-            clock.now += 60.0
-            assert scheduler.tick()[0].decision.refusal is Refusal.PARKED_AWAITING_DECISION
-        assert len(wake.inbox_calls) == establish_probes
+        clock.now += 60.0
+        assert scheduler.tick()[0].decision.ignite
+        assert len(wake.inbox_calls) > establish_probes
+        assert len(launcher.launched) == 1
 
     def test_a_degraded_park_still_wakes_on_a_goal_edit(self, tmp_path: Path) -> None:
         from fleet_graph.bus.client import BusError

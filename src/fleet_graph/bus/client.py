@@ -122,6 +122,26 @@ class BusClient:
         #: whoami 解析缓存：None=未解析，str=身份，False=解析失败/无身份。
         self._whoami_cache: str | bool | None = None
 
+    def inbox_channel(self, alias: str) -> str:
+        """解析 alias 的真实 inbox；兼容旧服务的同名独立 channel。"""
+        from urllib.parse import quote
+
+        try:
+            resolved = self.post(f"/v1/aliases/{quote(alias, safe='')}/resolve", {})
+        except BusError as exc:
+            if exc.status != 404:
+                raise
+            return f"agent:{alias}"
+        if not isinstance(resolved, dict):
+            raise BusError(502, "alias resolve 响应不是对象")
+        channel = resolved.get("inbox_channel_id")
+        if isinstance(channel, str) and channel.startswith("agent:") and channel[6:].strip():
+            return channel
+        owner = resolved.get("current_agent_id")
+        if isinstance(owner, str) and owner.strip():
+            return f"agent:{owner}"
+        raise BusError(502, "alias resolve 响应缺少有效 inbox_channel_id/current_agent_id")
+
     def _headers(self) -> dict[str, str]:
         headers = {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
         delegate_to = self._delegate_target()

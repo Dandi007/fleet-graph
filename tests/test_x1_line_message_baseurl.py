@@ -126,6 +126,9 @@ def test_end_to_end_delivery_via_temp_bus(
             length = int(self.headers.get("Content-Length", "0"))
             self.rfile.read(length)
             hits.append({"method": "POST", "path": self.path})
+            if self.path.endswith("/resolve"):
+                self._reply(200, {"inbox_channel_id": "agent:temp-owner"})
+                return
             self._reply(
                 200,
                 {
@@ -192,7 +195,8 @@ def test_end_to_end_delivery_via_temp_bus(
         assert str(result["message_id"]) == "msg_x1_e2e_001"
         assert len(result["message_id"]) > 0
         assert len(post_hits) >= 1
-        assert post_hits[0]["path"] == f"/v1/channels/agent:{ALIAS}/publish"
+        assert post_hits[0]["path"] == f"/v1/aliases/{ALIAS}/resolve"
+        assert post_hits[1]["path"] == "/v1/channels/agent:temp-owner/publish"
         assert recorded, "transport 未观察到任何请求"
         assert all(url.startswith(temp_base) for url in recorded)
         assert not any("127.0.0.1:7490" in url for url in recorded)

@@ -49,6 +49,7 @@ from fleet_graph.goal_interrupt.contract import (
 from fleet_graph.graphs.dd_gate import DdGatePort
 from fleet_graph.graphs.dd_subgraph import DdSubgraphPort, merge_dd_results
 from fleet_graph.graphs.guards import LineGuards, PromptVerdict
+from fleet_graph.graphs.phase_heartbeat import phase_heartbeat
 from fleet_graph.graphs.stop_response import (
     ACTIONS_FIELD,
     KIND_DISPATCH,
@@ -455,6 +456,10 @@ class LineState(TypedDict, total=False):
     #: the reducer. This is the ONLY dd-terminal channel into the line state:
     #: no disk file is read as a dd terminal/wake event any more.
     dd_results: Annotated[dict[str, Any], merge_dd_results]
+    # 消费回执进入 checkpoint；只向下一次 coordinator 交接未读取的结果。
+    action_results: Annotated[dict[str, Any], merge_dd_results]
+    action_results_seen: dict[str, Any]
+    action_round_no: int
     #: R2 图合一: the Send-carried payload channel -- the one development a
     #: ``dd_dispatch`` task is instantiating. Present only inside that task's
     #: isolated state view, never persisted anywhere durable.
@@ -629,6 +634,20 @@ def _coordinator_input(
         "inbox_messages": [],
         "inbox_framing": INBOX_FRAMING,
     }
+    seen = state.get("action_results_seen") or {}
+    pending_results = [
+        value
+        for key, value in (state.get("action_results") or {}).items()
+        if seen.get(key) != value
+    ]
+    if pending_results:
+        coord_input["action_results"] = pending_results
+    if getattr(deps.inbox, "reason", None):
+        coord_input["inbox_degraded"] = {
+            "alias": getattr(deps.inbox, "alias", ""),
+            "reason": deps.inbox.reason,
+            "available": False,
+        }
     if state.get("last_turn_status"):
         coord_input["last_turn_status"] = state["last_turn_status"]
     if state.get("last_turn_report"):
@@ -649,6 +668,13 @@ def _coordinator_input(
         # weighs the release and declares it in its Stop Response actions; the
         # gate node -- not this envelope -- is the only release path (S11).
         coord_input["dd_awaiting_gate_development_id"] = deps.dd_awaiting_gate_development_id
+        coord_input["dd_gate_contract"] = (
+            "先用 development_get 读取该 DD 当前 awaiting.question_note_id。"
+            "审单 Stop Response 的 dd.gate_release.v1 payload 必须原样带 question_note_id，"
+            "同时携带 development_id、verdict、decided_by；decided_by 必须为当前 folder_id。"
+            "REJECT 的 board_decision 须含 problem、suggested_answer、cost_of_no_answer。"
+            "同一请求重试复用 idempotency_key；历史请求不可用于当前代。"
+        )
     return coord_input
 
 
@@ -742,7 +768,10 @@ def _apply_stop_response(
     routed, never silently dropped); the rest ride ``pending_actions`` for the
     graph edge (Send) to instantiate, one node call each.
     """
-    update: LineState = {}
+    update: LineState = {
+        "action_results_seen": dict(state.get("action_results") or {}),
+        "action_round_no": round_no,
+    }
     raw = result.get(ACTIONS_FIELD)
     verbatim = raw if isinstance(raw, list) else []
     dispatches, releases, receipts, consumable = declared_actions(
@@ -791,6 +820,11 @@ def _apply_stop_response(
         # Declared actions exist but none are routable and none failed at
         # parse: every one was failed closed above, receipts already recorded.
         pass
+    if receipts:
+        update["action_results"] = {
+            f"{round_no}:parse:{index}": {"round": round_no, "receipt": receipt}
+            for index, receipt in enumerate(receipts)
+        }
     if routable:
         update["pending_actions"] = routable
     return update
@@ -1023,7 +1057,8 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             except Exception:
                 consumed_revision = None
 
-        result = deps.coordinator.turn(round_no, coord_input)
+        with phase_heartbeat(deps.artifacts, round_no, "coordinator"):
+            result = deps.coordinator.turn(round_no, coord_input)
         _apply_ack_obligation(deps, drain, result, round_no)
         update = _verdict_update(deps, state, round_no, result)
         update = {**_apply_stop_response(deps, state, round_no, result), **update}
@@ -1182,7 +1217,8 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         turn_prompt = prompt
         for attempt in range(retry_limit + 1):
             try:
-                output = deps.worker.turn(turn_prompt, round_no)
+                with phase_heartbeat(deps.artifacts, round_no, "worker"):
+                    output = deps.worker.turn(turn_prompt, round_no)
                 report = decode_report(output)
                 break
             except TimeoutError as exc:
@@ -1391,7 +1427,8 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             # confusable is the NOT-RUN failure this step exists to end.
             return {"last_acceptance": {"status": STATUS_NOT_DECLARED}}
         try:
-            facts = deps.acceptance.run()
+            with phase_heartbeat(deps.artifacts, round_no, "acceptance"):
+                facts = deps.acceptance.run()
         except Exception as exc:  # the step must not fault the line
             facts = {
                 "status": STATUS_ERROR,
@@ -1431,12 +1468,18 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         actions = state.get("pending_actions") or []
         if actions:
             sends: list[Send] = [
-                Send("dd_dispatch", {"dd_intent": action})
+                Send(
+                    "dd_dispatch",
+                    {"dd_intent": action, "round_no": state.get("action_round_no", 1)},
+                )
                 for action in actions
                 if action.get("kind") == KIND_DISPATCH
             ]
             sends.extend(
-                Send("dd_gate_release", {"gate_action": action})
+                Send(
+                    "dd_gate_release",
+                    {"gate_action": action, "round_no": state.get("action_round_no", 1)},
+                )
                 for action in actions
                 if action.get("kind") == KIND_GATE_RELEASE
             )
@@ -1561,7 +1604,17 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             consumed_record(round_no=round_no, at=_iso_now(deps), receipt=receipt)
         )
         removal = {"idempotency_key": str(action.get("idempotency_key") or "")}
-        return {**update, "pending_actions": [removal]}
+        return {
+            **update,
+            "pending_actions": [removal],
+            "action_results": {
+                f"{round_no}:{removal['idempotency_key']}": {
+                    "round": round_no,
+                    "receipt": receipt,
+                    **({"dd_result": result} if fault is None and update.get("dd_results") else {}),
+                }
+            },
+        }
 
     def dd_gate_release(state: LineState) -> LineState:
         """R3 的 gate 消费节点：一次执行 = 一条 dd.gate_release.v1 action。
@@ -1593,7 +1646,11 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         deps.artifacts.record_stop_response_actions(
             consumed_record(round_no=round_no, at=_iso_now(deps), receipt=receipt)
         )
-        return {"pending_actions": [{"idempotency_key": str(action.get("idempotency_key") or "")}]}
+        key = str(action.get("idempotency_key") or "")
+        return {
+            "pending_actions": [{"idempotency_key": key}],
+            "action_results": {f"{round_no}:{key}": {"round": round_no, "receipt": receipt}},
+        }
 
     graph: StateGraph = StateGraph(LineState)
     graph.add_node("check_bounds", check_bounds)
@@ -1604,6 +1661,8 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     graph.add_node("decision_interrupt", decision_interrupt)
     graph.add_node("dd_dispatch", dd_dispatch)
     graph.add_node("dd_gate_release", dd_gate_release)
+    # 所有 Send 的 reducer 写入合并后才路由，避免任务间互相重派剩余 action。
+    graph.add_node("action_join", lambda state: {})
 
     graph.add_edge(START, "check_bounds")
     graph.add_conditional_edges("check_bounds", after_bounds)
@@ -1614,7 +1673,9 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     # R3 Stop Response: the fan-out join routes like a coordinator turn -- with
     # each action consumed (its removal marker merged), the line proceeds into
     # its (possibly parked) terminal or its worker turn.
-    graph.add_conditional_edges("dd_dispatch", after_coordinator)
+    graph.add_edge("dd_dispatch", "action_join")
+    graph.add_edge("dd_gate_release", "action_join")
+    graph.add_conditional_edges("action_join", after_coordinator)
     # Unconditional: the facts are gathered even after a worker timeout --
     # they are cheap, and the coordinator judging a timeout deserves them too.
     graph.add_edge("worker_turn", "acceptance_step")

@@ -252,7 +252,9 @@ class TestMerge:
 class TestWorkspaceSealer:
     def test_it_commits_what_the_stage_left_behind(self, repo: Path) -> None:
         before = head(repo)
-        (repo / "note.txt").write_text("written by a stage\n", encoding="utf-8")
+        (repo / ".dd-evidence").mkdir(exist_ok=True)
+        (repo / ".dd-evidence/note.txt").write_text("written by a stage\n", encoding="utf-8")
+        (repo / "cache.tmp").write_text("验收缓存")
 
         sealed = WorkspaceSealer(repo=repo).materialize(
             CONFIGURE, dispatch(input_commit=before), _outcome()
@@ -261,7 +263,9 @@ class TestWorkspaceSealer:
         assert sealed.commit == head(repo) != before
         assert sealed.receipt is not None
         assert sealed.receipt["output_commit"] == sealed.commit
-        assert git(repo, "show", "--name-only", "--format=", "HEAD").strip() == "note.txt"
+        assert (
+            git(repo, "show", "--name-only", "--format=", "HEAD").strip() == ".dd-evidence/note.txt"
+        )
 
     def test_it_uses_the_frozen_attempt_time(self, repo: Path) -> None:
         WorkspaceSealer(repo=repo).materialize(CONFIGURE, dispatch(), _outcome())

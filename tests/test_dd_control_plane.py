@@ -249,19 +249,14 @@ class TestStartAndReAdopt:
         assert started["thread_id"] == f"{dev}:g1"
         argv = launcher.specs[0].argv()
         assert argv[0] == "systemd-run"
+        assert "--expand-environment=no" in argv
         assert "--resume" not in argv
         checkpoint = argv[argv.index("--checkpoint") + 1]
         assert checkpoint == str(plane.root / dev / CHECKPOINT_FILE)
-        # The acceptance argv survives the systemd boundary with quoting:
-        # shlex.join here, shlex.split on the dd-run side.
-        import shlex
-
-        accepted = [argv[i + 1] for i, a in enumerate(argv) if a == "--accept"]
-        assert accepted == [
-            shlex.join(["python3", "-m", "pytest", "-q"]),
-            shlex.join(["sh", "-c", "echo 'quoted argument'"]),
-        ]
-        assert [shlex.split(a) for a in accepted] == [
+        # 正式派发只传入单文件路径，脚本文本不进入父进程 argv。
+        assert "--accept" not in argv
+        record = json.loads(Path(argv[argv.index("--record-file") + 1]).read_text())
+        assert record["acceptance_commands"] == [
             ["python3", "-m", "pytest", "-q"],
             ["sh", "-c", "echo 'quoted argument'"],
         ]
@@ -615,7 +610,8 @@ class TestGate:
         assert report["pending"] is True
         assert report["awaiting"]["question_note_id"] == "msg_question_1"
         assert report["state"] == "awaiting_gate"
-        assert "work.decision.v1" in report["ruling"]
+        assert "graph gate node" in report["ruling"]
+        assert "this tool carries none" in report["ruling"]
 
     def test_resume_relaunches_the_thread_and_carries_no_verdict(
         self, scratch: Path, tmp_path: Path
@@ -1444,16 +1440,12 @@ class TestGenerationRestart:
             acceptance_env={"CI": "1"},
         )
         plane.start(dev)
-        import shlex
-
         argv = launcher.specs[-1].argv()
-        assert [argv[i + 1] for i, a in enumerate(argv) if a == "--accept"] == [
-            shlex.join(["pytest", "-q"])
-        ]
-        assert [argv[i + 1] for i, a in enumerate(argv) if a == "--setup"] == [
-            shlex.join(["npm", "ci"])
-        ]
-        assert [argv[i + 1] for i, a in enumerate(argv) if a == "--accept-env"] == ["CI=1"]
+        assert not {"--accept", "--setup", "--accept-env"}.intersection(argv)
+        record = json.loads(Path(argv[argv.index("--record-file") + 1]).read_text())
+        assert record["acceptance_commands"] == [["pytest", "-q"]]
+        assert record["setup_commands"] == [["npm", "ci"]]
+        assert record["acceptance_env"] == {"CI": "1"}
         assert argv[argv.index("--generation") + 1] == "2"
 
     def test_a_killed_second_generation_resumes_itself(self, scratch: Path, tmp_path: Path) -> None:

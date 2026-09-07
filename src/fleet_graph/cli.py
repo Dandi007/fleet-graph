@@ -590,6 +590,47 @@ def _dd_run(args: argparse.Namespace) -> int:
         if not isinstance(loaded, dict):
             raise SystemExit("--gate-reject-file must carry a JSON object")
         gate_reject = loaded
+    models: dict[str, str] = {}
+    run_config = {
+        "acceptance_commands": [shlex.split(c) for c in args.accept],
+        "setup_commands": [shlex.split(c) for c in args.setup],
+        "acceptance_env": _env_pairs(args.accept_env),
+    }
+    if args.record_file:
+        try:
+            record = json.loads(pathlib.Path(args.record_file).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"--record-file is unreadable: {exc}") from exc
+        if not isinstance(record, dict) or record.get("development_id") != args.development:
+            raise SystemExit("--record-file development_id does not match --development")
+        seats = record.get("seats", {})
+        if not isinstance(seats, dict) or any(
+            not isinstance(stage, str)
+            or not stage.strip()
+            or not isinstance(model, str)
+            or not model.strip()
+            for stage, model in seats.items()
+        ):
+            raise SystemExit("--record-file seats must map stage names to non-empty model names")
+        models = dict(seats)
+        for key in ("acceptance_commands", "setup_commands", "acceptance_env"):
+            if key not in record:
+                continue
+            value = record[key]
+            if key == "acceptance_env":
+                valid = isinstance(value, dict) and all(
+                    isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+                )
+            else:
+                valid = isinstance(value, list) and all(
+                    isinstance(command, list)
+                    and command
+                    and all(isinstance(arg, str) for arg in command)
+                    for command in value
+                )
+            if not valid:
+                raise SystemExit(f"--record-file {key} has invalid shape")
+            run_config[key] = value
     config = DevelopmentConfig(
         development_id=args.development,
         workspace_path=workspace,
@@ -611,16 +652,13 @@ def _dd_run(args: argparse.Namespace) -> int:
         checkpoint_path=args.checkpoint or ":memory:",
         # shlex, not str.split: a quoted argument in an acceptance command
         # must survive the round-trip through the launcher's shlex.join.
-        run_config={
-            "acceptance_commands": [shlex.split(c) for c in args.accept],
-            "setup_commands": [shlex.split(c) for c in args.setup],
-            "acceptance_env": _env_pairs(args.accept_env),
-        },
+        run_config=run_config,
         # R6 (wf-4601c8 §7.1.8): the cmdline stage-seat override key is
         # gone from every launch path. A launched run's seats ride the admission
         # record (`record.seats`, frozen from role registry defaults plus any
         # line-explicit `development_create stage_models`) -- and the runner
         # reads exactly that: there is no cmdline seat source left to shadow it.
+        models=models,
         timeouts=_stage_timeouts(args.stage_timeout),
         publish_merge=args.publish_merge,
         cost_obs_dir=args.cost_obs_dir or "",
@@ -1228,6 +1266,16 @@ def _goal_interrupt_run(args: argparse.Namespace) -> int:
     from fleet_graph.graphs.runner import LineConfig, resume_goal_line
 
     lines, line_run_root = _load_line_roster(args.lines_config)
+    dd_settings: dict[str, Any] = {}
+    if lines and args.lines_config:
+        with open(args.lines_config, encoding="utf-8") as handle:
+            dd_settings = json.load(handle)
+    dd_root = pathlib.Path(dd_settings.get("dd_root", "/data/fleet-graph/dd"))
+    dd_plugin_binding = pathlib.Path(
+        dd_settings.get("line_environment", {}).get(
+            "FLEET_GRAPH_DD_PLUGIN_BINDING", str(dd_root / "plugin-binding.json")
+        )
+    )
     if args.run_root:
         line_run_root = pathlib.Path(args.run_root)
 
@@ -1246,6 +1294,8 @@ def _goal_interrupt_run(args: argparse.Namespace) -> int:
                 folder_id=folder_id,
                 seat=seat,
                 run_root=line_run_root / folder_id,
+                dd_root=dd_root,
+                dd_plugin_binding=dd_plugin_binding,
                 generation=generation,
                 alias=alias,
             )

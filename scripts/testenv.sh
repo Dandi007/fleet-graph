@@ -248,6 +248,7 @@ te_spawn_faces() {
         abmcp+=(uv run --project "$AGENT_BUS_ROOT" agent-bus-mcp)
     fi
 
+    export FLEET_GRAPH_RUNTIME_ROSTER="$TEST_ROOT/goal/roster.json"
     if [ "$fg" = "__uv__" ]; then
         te_launch engine "$TEST_ROOT/logs/engine.log" \
             env FLEET_GRAPH_GATEWAY_BASE_URL="http://127.0.0.1:$P_BUS_HTTP" \
@@ -480,6 +481,7 @@ write_roster() {
   "_comment": "testenv 独立名册：只落 TEST_ROOT，与生产名册零共享（§一·2）。",
   "run_root": "$TEST_ROOT/runs",
   "dd_root": "$TEST_ROOT/dd",
+  "line_environment": {"FLEET_GRAPH_DD_PLUGIN_BINDING": "$TEST_ROOT/config/plugin-binding.json"},
   "probe_via_runtime": false,
   "supervisor_events": false,
     "lines": [

@@ -420,6 +420,7 @@ class Scheduler:
         dd: DdWakeFacts | None = None,
     ) -> None:
         self.config = config
+        self._seed_lines = list(config.lines)
         self.prober = prober
         self.launcher = launcher or TransientLauncher()
         self.units = units or SystemdUnitProbe()
@@ -972,7 +973,12 @@ class Scheduler:
 
         advanced = int(record.get("rounds") or 0) > 0
         finished = record.get("terminal") == "done"
-        streak = 0 if (advanced or finished) else int(state["streak"]) + 1
+        waiting_dd = (
+            record.get("terminal") == "blocked"
+            and record.get("waiting_on") == "dd"
+            and bool(record.get("dd_development_id"))
+        )
+        streak = 0 if (advanced or finished or waiting_dd) else int(state["streak"]) + 1
         try:
             current_generation = max(int(state["generation"]), base_generation)
         except (TypeError, ValueError):
@@ -1229,25 +1235,18 @@ class Scheduler:
             except Exception as exc:  # fail open, by design
                 return self._wake(line, state, f"woken:probe_failed:{probe_error_tag(exc)}")
 
-        # The inbox source is consulted only if the establishment probe found
-        # it usable (`parked_inbox_available`), and its availability is *not*
-        # re-assessed during the park: a source that was down when parking
-        # began (a 403 is an ACL gap, not a blip) coming back mid-park is a
-        # case not worth a per-tick probe against a known-broken endpoint --
-        # the next parked terminal re-assesses it at establishment. A probe
-        # that was available and errors mid-park skips this tick's inbox
-        # check rather than waking: waking on a transient inbox error would
-        # re-ignite a line whose goal.md anchor is still perfectly checkable.
-        # Only the goal.md anchor failing -- the one fact parking stands on --
-        # wakes conservatively.
-        if line.alias and state["parked_inbox_available"] is not False:
+        # 每轮重探消息来源：ACL 或服务恢复后，新消息应能唤醒驻停线。
+        # 来源仍不可用只跳过本轮，不把连接失败当成新工作。
+        if line.alias:
             try:
                 if self.wake is not None and self.wake.inbox_message_after(
                     line.alias, self._terminal_epoch(record)
                 ):
                     return self._wake(line, state, "woken:inbox")
-            except Exception:  # skip this source, the goal.md anchor still holds
-                pass
+                if self.wake is not None:
+                    state["parked_inbox_available"] = True
+            except Exception:  # 降级仍可观测；下轮继续探测，凭证修复后无需外部再点火。
+                state["parked_inbox_available"] = False
 
         # X-6 M1: the goal.md probe's failure direction changed. It used to
         # wake the line (the wake-direction fail-open shared with the other
@@ -1670,6 +1669,7 @@ class Scheduler:
         """
         env = {"PATH": os.environ.get("PATH", "")}
         env.update(self.config.extra_line_environment)
+        env["FLEET_GRAPH_DD_ROOT"] = str(self.config.dd_root)
         return {k: v for k, v in env.items() if v}
 
     def unproductive_recent(self, now: float) -> int:
@@ -1697,6 +1697,15 @@ class Scheduler:
         # names the next launch a self-gate run.
         self._pending_dd_gate = {}
 
+        from dataclasses import asdict, fields
+
+        from fleet_graph.goal_enroll.runtime_roster import merge_lines
+
+        keys = {f.name for f in fields(LineSpec)}
+        self.config.lines = [
+            LineSpec(**{k: v for k, v in e.items() if k in keys})
+            for e in merge_lines([asdict(e) for e in self._seed_lines])
+        ]
         for line in self.config.lines:
             # Accounting runs first: a terminal observed this tick must bump
             # the generation before status_of probes and spec_for launches.

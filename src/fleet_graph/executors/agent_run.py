@@ -58,7 +58,12 @@ DECISION_ENV_PREFIX = "FLEET_GRAPH_DECISION_"
 def scrubbed_environment(env: dict[str, str] | None = None) -> dict[str, str]:
     """agent 子进程实际继承的 env：宿主 env 减去决策凭证命名空间。"""
     source = os.environ if env is None else env
-    return {k: v for k, v in source.items() if not k.startswith(DECISION_ENV_PREFIX)}
+    host_session_keys = {"OPENCODE_DB", "OPENCODE_HOST", "OPENCODE_PORT", "OPENCODE_SKIP_START"}
+    return {
+        k: v
+        for k, v in source.items()
+        if not k.startswith(DECISION_ENV_PREFIX) and k not in host_session_keys
+    }
 
 
 # `-current` is a symlink the deploy flow points at an immutable release
@@ -132,6 +137,7 @@ class AgentRunSpec:
     prompt_file: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     mcp_allow: tuple[str, ...] = ()
+    sandbox_workspace: str | None = None
 
     def argv(self, *, bin_path: str, run_id: str, session_root: str) -> list[str]:
         argv = [bin_path]
@@ -312,6 +318,15 @@ class AgentRunLauncher:
 
         session_root.mkdir(parents=True, exist_ok=True)
         argv = spec.argv(bin_path=self.bin_path, run_id=run_id, session_root=str(session_root))
+        if spec.sandbox_workspace:
+            from fleet_graph.executors.sandbox import git_write_paths, sandbox_argv
+
+            writable = [session_root]
+            if spec.write:
+                writable.extend(git_write_paths(Path(spec.sandbox_workspace)))
+            readable = git_write_paths(Path(spec.sandbox_workspace))
+            readable.extend(Path(p) for p in (spec.input_path, spec.prompt_file) if p)
+            argv = sandbox_argv(argv, writable=writable, readable=readable)
         (session_root / "argv.json").write_text(json.dumps(argv, ensure_ascii=False, indent=1))
 
         stdout_path = session_root / "launcher.stdout"
@@ -354,8 +369,22 @@ class AgentRunLauncher:
         if result is not None:
             return _classify(result)
 
-        # Genuinely died without writing a result. Surface it rather than
-        # hanging, and let the caller retry with a bumped attempt.
+        # 启动器 stderr 是明确的本地失败证据，不能误报 provider outage。
+        error_path = Path(ticket.session_root) / "launcher.stderr"
+        try:
+            error = error_path.read_text(errors="replace")[-4000:].strip()
+        except OSError:
+            error = ""
+        if error:
+            return RunStatus(
+                "failed",
+                {
+                    "state": "failed",
+                    "exit_reason": "launcher_failure",
+                    "stderr_tail": error,
+                    "run_id": ticket.run_id,
+                },
+            )
         return RunStatus("lost")
 
     def wait(

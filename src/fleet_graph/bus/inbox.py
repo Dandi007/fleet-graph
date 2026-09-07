@@ -181,19 +181,22 @@ class Inbox:
 
     @property
     def channel_id(self) -> str:
-        return f"agent:{self.alias}"
+        resolve = getattr(self.client, "inbox_channel", None)
+        return resolve(self.alias) if resolve else f"agent:{self.alias}"
 
     def consume(self) -> Drain:
         """Take a lease on up to `max_messages`. Does not ack -- that is the point."""
+        channel_id = f"alias:{self.alias}"
         try:
+            channel_id = self.channel_id
             result = self.client.post(
-                f"/v1/channels/{self.channel_id}/consume",
+                f"/v1/channels/{channel_id}/consume",
                 {"max_messages": self.max_messages, "lease_ms": self.lease_ms},
             )
         except BusError as exc:
             if exc.status == 403:
                 raise InboxForbidden(
-                    f"consume 403 on {self.channel_id}: the alias was rebound, "
+                    f"consume 403 on {channel_id}: the alias was rebound, "
                     "this process no longer owns the inbox"
                 ) from exc
             raise

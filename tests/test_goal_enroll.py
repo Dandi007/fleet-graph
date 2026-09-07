@@ -565,7 +565,7 @@ class TestServiceAndMCP:
         assert submitted["already_pending"] is False
         assert submitted["briefing_version"] == BRIEFING_VERSION
         assert submitted["mechanism"] == GOAL_ENROLL_MECHANISM
-        assert submitted["board_notify"].startswith("failed:")  # no board bound
+        assert submitted["board_notify"] == "engine:enrollment-pending"
         assert queue.get("wf-1")["status"] == QUEUE_STATUS_PENDING
 
     def test_a_repeated_pending_submit_answers_already_pending(self, tmp_path: Path) -> None:
@@ -756,7 +756,8 @@ class TestServiceAndMCP:
         params = set(admit.parameters["properties"])
         assert {"folder_id", "decision_ref", "decided_by"} <= params
         required = set(admit.parameters.get("required") or params)
-        assert {"folder_id", "decision_ref", "decided_by"} <= required
+        assert {"folder_id", "decided_by"} <= required
+        assert "decision_ref" not in required
 
     def test_the_goal_reject_tool_lists_its_required_arguments(self) -> None:
         """U2: tools/list exposes the reject capability with its required args."""
@@ -880,6 +881,7 @@ class TestServiceAndMCP:
         from fastmcp import Client
         from fastmcp.exceptions import ToolError
 
+        from fleet_graph.bus.tokens import build_line_token_ownership_check
         from fleet_graph.goal.service import build_goal_mcp_server
         from test_dd_service import running_server
 
@@ -889,6 +891,11 @@ class TestServiceAndMCP:
             goal_folders=source,
             goal_queue=EnrollQueue(str(tmp_path / "queue")),
             real_roster=RealRosterReader(tmp_path / "absent.json"),
+            alias_token_check=build_line_token_ownership_check(
+                template=str(tmp_path / "secrets" / "{alias}.token"),
+                secrets_root=tmp_path / "secrets",
+                supervision_roots=(tmp_path / "supervision",),
+            ),
         )
 
         async def call(url: str) -> str:
@@ -1010,13 +1017,15 @@ class TestGoalAdmitSupervisorSurface:
         ]
         assert len(persisted["history"]) == 2
 
-    def test_admission_requires_a_decision_reference(self, tmp_path: Path) -> None:
+    def test_admission_seals_an_engine_reference_without_retired_board(
+        self, tmp_path: Path
+    ) -> None:
         service, queue, _ = self._service(tmp_path)
         service.submit("wf-1", "ronin-fresh")
-        with pytest.raises(GoalEnrollError) as refused:
-            service.admit("wf-1", "", decided_by="supervisor")
-        assert refused.value.code == CODE_DECISION_REF_REQUIRED
-        assert queue.get("wf-1")["status"] == QUEUE_STATUS_PENDING
+        admitted = service.admit("wf-1", "", decided_by="supervisor")
+        assert admitted["decision_ref"].startswith("engine:admission:")
+        assert queue.get("wf-1")["status"] == QUEUE_STATUS_ADMITTED
+        assert service.admit("wf-1", "", decided_by="supervisor")["already_admitted"]
 
     def test_an_already_admitted_enrollment_with_a_different_decision_refuses(
         self, tmp_path: Path

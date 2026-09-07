@@ -243,7 +243,11 @@ def admit(
     git(repo, "init", "-q", "--bare", str(bare))
     git(repo, "remote", "add", "origin", str(bare))
     plane = make_plane(tmp_path, board=board, launcher=launcher)
-    created = plane.create(str(repo), spec_text=SPEC, dispatched_by=PRINCIPAL)
+    created = plane.create(
+        str(repo),
+        spec_text=SPEC + "\n```dd-gate-policy\nlegacy-six-v1\n```\n",
+        dispatched_by=PRINCIPAL,
+    )
     return plane, str(created["development_id"]), repo
 
 

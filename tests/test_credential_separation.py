@@ -74,6 +74,8 @@ class TestLauncherSubprocessEnv:
         fake.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{probe}" "$@"\n')
         fake.chmod(0o755)
         monkeypatch.setenv(DECISION_TOKEN_ENV, str(tmp_path / "decision.token"))
+        monkeypatch.setenv("OPENCODE_DB", str(tmp_path / "host.db"))
+        monkeypatch.setenv("OPENCODE_HOST", "host-session")
 
         launcher = AgentRunLauncher(bin_path=str(fake), state_root=str(tmp_path / "runs"))
         ticket = launcher.launch(AgentRunSpec(prompt="hi"), "run-env-probe")
@@ -87,6 +89,8 @@ class TestLauncherSubprocessEnv:
             time.sleep(0.05)
         child_env = json.loads(env_path.read_text())
         assert DECISION_TOKEN_ENV not in child_env
+        assert "OPENCODE_DB" not in child_env
+        assert "OPENCODE_HOST" not in child_env
         assert "PATH" in child_env
 
 

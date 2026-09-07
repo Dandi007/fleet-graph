@@ -19,6 +19,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from fleet_graph.goal_enroll.runtime_roster import merge_lines
+
 #: The default roster path, relative to the fleet-graph checkout (the same
 #: default the state read-model and the scheduler use).
 DEFAULT_LINES_CONFIG = Path("config/ronin-lines.json")
@@ -47,12 +49,14 @@ class RealRosterReader:
     def _lines_raw(self) -> list[Any]:
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return merge_lines([])
         except (OSError, ValueError):
             return []
         if not isinstance(raw, dict):
             return []
         entries = raw.get("lines") or []
-        return entries if isinstance(entries, list) else []
+        return merge_lines(entries if isinstance(entries, list) else [])
 
     def entries(self) -> tuple[dict[str, Any], ...]:
         out: list[dict[str, Any]] = []
