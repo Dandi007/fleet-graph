@@ -153,6 +153,12 @@ LOG_ROOT = Path("/data/fleet-graph/logs")
 #: symlink happens to point at later.
 RELEASE_CURRENT_PATH = Path("/data/apps/fleet-graph/current")
 
+# 导入时冻结真实代码路径，避免 current 在进程存活期间切换后误报新版本。
+try:
+    _LOADED_CODE_PATH: Path | None = Path(__file__).resolve(strict=True)
+except (OSError, RuntimeError):
+    _LOADED_CODE_PATH = None
+
 #: The fault terminal keeps a traceback summary for a human, not forever: a
 #: single badly-behaved agent can produce a multi-megabyte exception. The first
 #: frames and the message are the useful part.
@@ -316,23 +322,28 @@ def iso(ts: float) -> str:
     return time.strftime(ISO_FORMAT, time.gmtime(ts))
 
 
-def capture_release_id(path: str | Path = RELEASE_CURRENT_PATH) -> str | None:
-    """The release_id this generation actually runs, frozen at startup.
+def capture_release_id(path: str | Path | None = None) -> str | None:
+    """记录本进程实际加载的发布根；显式 path 保留既有路径解析接口。
 
-    The line unit execs through ``/data/apps/fleet-graph/current/.venv/bin/
-    fleet-graph``, and the process resolves that symlink exactly once at exec.
-    This mirrors that freeze: read the symlink target's basename once and
-    return it as the release_id. Missing/unreadable/unresolvable -> ``None``
-    (fail-soft: a line that cannot name its release still runs; only the
-    observable field goes null). The read model must never call this -- it
-    only consumes the persisted value.
+    默认从导入时冻结的模块真实路径识别 source checkout 或 release snapshot。
+    不读取 current，也不把无法识别的安装路径误称为发布版本；识别失败返回 None。
+    调用方将此值写入本代 heartbeat，读模型只消费持久化事实。
     """
     try:
-        resolved = Path(path).resolve(strict=True)
-    except (OSError, RuntimeError):
+        if path is not None:
+            return Path(path).resolve(strict=True).name or None
+        if _LOADED_CODE_PATH is None:
+            return None
+        for parent in _LOADED_CODE_PATH.parents:
+            if (parent / ".release-sha").is_file():
+                return parent.name or None
+            if parent.name == "src" and _LOADED_CODE_PATH.relative_to(parent) == Path(
+                "fleet_graph/state/run_artifacts.py"
+            ):
+                return parent.parent.name or None
+    except (OSError, RuntimeError, ValueError):
         return None
-    basename = resolved.name
-    return basename or None
+    return None
 
 
 class RunArtifacts:

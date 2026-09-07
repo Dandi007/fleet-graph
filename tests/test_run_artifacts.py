@@ -420,6 +420,46 @@ class TestReleaseId:
 class TestCaptureReleaseId:
     """The one-shot startup resolution behind the frozen heartbeat field."""
 
+    def test_default_reports_loaded_source_not_current(self, tmp_path, monkeypatch):
+        from fleet_graph.state import run_artifacts
+
+        loaded = tmp_path / "candidate-release" / "src/fleet_graph/state/run_artifacts.py"
+        loaded.parent.mkdir(parents=True)
+        loaded.touch()
+        old = tmp_path / "old-release"
+        old.mkdir()
+        current = tmp_path / "current"
+        current.symlink_to(old)
+        monkeypatch.setattr(run_artifacts, "_LOADED_CODE_PATH", loaded)
+        monkeypatch.setattr(run_artifacts, "RELEASE_CURRENT_PATH", current)
+        assert capture_release_id() == "candidate-release"
+        assert capture_release_id(current) == "old-release"
+        current.unlink()
+        current.symlink_to(tmp_path / "another-release")
+        assert capture_release_id() == "candidate-release"
+
+    def test_wheel_install_finds_own_snapshot_marker(self, tmp_path, monkeypatch):
+        from fleet_graph.state import run_artifacts
+
+        release = tmp_path / "wheel-release"
+        loaded = release / ".venv/lib/python3.11/site-packages/fleet_graph/state/run_artifacts.py"
+        loaded.parent.mkdir(parents=True)
+        loaded.touch()
+        (release / ".release-sha").write_text("a" * 40)
+        monkeypatch.setattr(run_artifacts, "_LOADED_CODE_PATH", loaded)
+        assert capture_release_id() == "wheel-release"
+
+    def test_unknown_install_does_not_invent_release(self, tmp_path, monkeypatch):
+        from fleet_graph.state import run_artifacts
+
+        loaded = tmp_path / "site-packages/fleet_graph/state/run_artifacts.py"
+        loaded.parent.mkdir(parents=True)
+        loaded.touch()
+        monkeypatch.setattr(run_artifacts, "_LOADED_CODE_PATH", loaded)
+        assert capture_release_id() is None
+        monkeypatch.setattr(run_artifacts, "_LOADED_CODE_PATH", None)
+        assert capture_release_id() is None
+
     def test_resolves_the_current_symlink_basename(self, tmp_path: Path) -> None:
         (tmp_path / "releases" / "rel-1").mkdir(parents=True)
         current = tmp_path / "current"
