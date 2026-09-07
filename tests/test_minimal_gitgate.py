@@ -163,6 +163,28 @@ class TestCheckHandoff:
         assert result.ok is False
         assert [f.code for f in result.failures] == [FailureCode.DETACHED_HEAD]
 
+    def test_wrong_branch_is_reported_even_when_head_differs_from_tip(self) -> None:
+        # A worktree parked on another branch whose sha happens to differ from
+        # the target branch's remote tip: the verdict must be wrong_branch, not
+        # not_pushed -- the fix is to switch back, not to push.
+        result = check_handoff(
+            [_repo("/wt/wrong")],
+            runner=_runner(
+                (
+                    "/wt/wrong",
+                    {
+                        "branch": "release/loopx-minimal",
+                        "head": SHA_NEW,
+                        "tip": SHA_OLD,
+                        "merge_base": 1,
+                    },
+                )
+            ),
+        )
+        assert result.ok is False
+        assert [f.code for f in result.failures] == [FailureCode.WRONG_BRANCH]
+        assert result.failures[0].repo == "repo-/wt/wrong"
+
     def test_one_bad_repo_out_of_two_is_reported_once(self) -> None:
         result = check_handoff(
             [_repo("/wt/good"), _repo("/wt/bad")],
@@ -220,6 +242,26 @@ class TestCheckDDReady:
         result = check_dd_ready([_dd_repo("/wt/dd-ok")], runner=_runner(("/wt/dd-ok", {})))
         assert result.ok is True
         assert result.failures == []
+
+    def test_wrong_branch_with_matching_tip_still_fails(self) -> None:
+        # The silent slip-through: the worktree sits on the release branch while
+        # the dd branch was just cut from the same commit and pushed, so HEAD
+        # equals the remote tip and the tree is clean. Anything short of
+        # wrong_branch here would send the engine opening a PR off the wrong
+        # branch.
+        result = check_dd_ready(
+            [_dd_repo("/wt/dd-wrongbranch")],
+            runner=_runner(
+                (
+                    "/wt/dd-wrongbranch",
+                    {"branch": "release/loopx-minimal", "head": SHA_A1, "tip": SHA_A1},
+                )
+            ),
+        )
+        assert result.ok is False
+        assert [f.code for f in result.failures] == [FailureCode.WRONG_BRANCH]
+        assert "release/loopx-minimal" in result.failures[0].detail
+        assert "feature-x" in result.failures[0].detail
 
     def test_spec_missing_in_head_commit(self) -> None:
         result = check_dd_ready(
@@ -339,4 +381,5 @@ class TestFailureCodes:
         assert FailureCode.DIRTY_WORKTREE == "dirty_worktree"
         assert FailureCode.BRANCH_MISSING_ON_REMOTE == "branch_missing_on_remote"
         assert FailureCode.DETACHED_HEAD == "detached_head"
+        assert FailureCode.WRONG_BRANCH == "wrong_branch"
         assert FailureCode.SPEC_MISSING == "spec_missing"

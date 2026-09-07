@@ -33,7 +33,6 @@ import subprocess
 from dataclasses import dataclass
 from typing import Protocol
 
-_REMOTE_REF_PREFIX = "refs/remotes/"
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _TIMEOUT_SECONDS = 60.0
 
@@ -68,6 +67,7 @@ class FailureCode:
     DIRTY_WORKTREE = "dirty_worktree"
     BRANCH_MISSING_ON_REMOTE = "branch_missing_on_remote"
     DETACHED_HEAD = "detached_head"
+    WRONG_BRANCH = "wrong_branch"
     SPEC_MISSING = "spec_missing"
 
 
@@ -333,6 +333,23 @@ def _handoff_failures(
                 repo=repo.repo_id,
                 code=FailureCode.DETACHED_HEAD,
                 detail=f"worktree {repo.worktree} is on a detached HEAD",
+            )
+        ]
+
+    # GO-36 ②: the worktree must be on the expected branch at all, checked
+    # before any head/tip comparison so a switched worktree is never
+    # misreported as not_pushed / head_behind_remote (which would point the
+    # agent at the wrong fix). A green-looking coincidence -- HEAD equal to
+    # the remote tip because the dd branch was just cut from it -- is still a
+    # wrong_branch failure.
+    if status.branch != repo.branch:
+        return [
+            GateFailure(
+                repo=repo.repo_id,
+                code=FailureCode.WRONG_BRANCH,
+                detail=(
+                    f"worktree {repo.worktree} is on branch {status.branch}, expected {repo.branch}"
+                ),
             )
         ]
 
