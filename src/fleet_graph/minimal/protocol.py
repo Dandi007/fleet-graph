@@ -76,8 +76,12 @@ def _check_goal_turn(obj: dict[str, Any], schema: str) -> list[str]:
     if not _nonempty_str(obj.get("summary")):
         errors.append(f"{schema}: 'summary' must be a non-empty string")
     stop = obj.get("stop")
-    if stop == "dispatch" and not isinstance(obj.get("dispatch"), dict):
-        errors.append(f"{schema}: 'dispatch' must be an object")
+    if stop == "dispatch":
+        dispatch = obj.get("dispatch")
+        if not isinstance(dispatch, dict):
+            errors.append(f"{schema}: 'dispatch' must be an object")
+        else:
+            errors.extend(_check_dispatch(dispatch, schema))
     if stop == "blocked":
         blocked = obj.get("blocked")
         if not isinstance(blocked, dict):
@@ -88,6 +92,117 @@ def _check_goal_turn(obj: dict[str, Any], schema: str) -> list[str]:
                 errors.append(f"{schema}: blocked.kind={kind!r} not in {_render(BLOCKED_KINDS)}")
             if not _nonempty_str(blocked.get("detail")):
                 errors.append(f"{schema}: 'blocked.detail' must be a non-empty string")
+    return errors
+
+
+def _is_valid_branch_name(name: str) -> bool:
+    """The GO-36 sub-rules for a dispatch repo branch (mirrors the git-ref shape
+    enforced by ``enroll.is_valid_git_branch_name`` without importing enroll)."""
+
+    if name.startswith("-"):
+        return False
+    if ".." in name:
+        return False
+    if name.endswith("/"):
+        return False
+    return not any(ch.isspace() for ch in name)
+
+
+def _is_repo_relative_path(path: str) -> bool:
+    """Whether ``path`` is a repo-relative spec path: not absolute, no ``..``
+    segment (protocol.md:11 -- file paths are always relative to workspace root)."""
+
+    if not path or path.startswith("/"):
+        return False
+    return ".." not in path.split("/")
+
+
+def _check_dispatch(dispatch: dict[str, Any], schema: str) -> list[str]:
+    """Field-level checks for a goal.turn/1 ``dispatch`` object (GO-36).
+
+    The dispatch object is the DD launch protocol: ``spec_text`` plus one or
+    more ``repos`` whose branch / worktree path / spec path the engine later
+    verifies mechanically. Only the keys named here are inspected; unlisted
+    keys are ignored (protocol.md:14 §0.6).
+    """
+
+    errors: list[str] = []
+    if not _nonempty_str(dispatch.get("spec_text")):
+        errors.append(f"{schema}: dispatch.spec_text must be a non-empty string")
+
+    repos = dispatch.get("repos")
+    if not isinstance(repos, list) or not repos:
+        errors.append(f"{schema}: dispatch.repos must be a non-empty list")
+    else:
+        seen_paths: dict[str, int] = {}
+        seen_pairs: dict[tuple[str, str], int] = {}
+        for index, repo in enumerate(repos):
+            if not isinstance(repo, dict):
+                errors.append(f"{schema}: dispatch.repos[{index}] must be an object")
+                continue
+
+            path = repo.get("path")
+            if not _nonempty_str(path):
+                errors.append(f"{schema}: dispatch.repos[{index}].path must be a non-empty string")
+            elif not path.startswith("/"):
+                errors.append(f"{schema}: dispatch.repos[{index}].path must be an absolute path")
+
+            if not _nonempty_str(repo.get("remote")):
+                errors.append(
+                    f"{schema}: dispatch.repos[{index}].remote must be a non-empty string"
+                )
+
+            branch = repo.get("branch")
+            if not _nonempty_str(branch):
+                errors.append(
+                    f"{schema}: dispatch.repos[{index}].branch must be a non-empty string"
+                )
+            elif not _is_valid_branch_name(branch):
+                errors.append(
+                    f"{schema}: dispatch.repos[{index}].branch={branch!r} "
+                    "is not a valid git branch name"
+                )
+
+            spec_path = repo.get("spec_path")
+            if not _nonempty_str(spec_path):
+                errors.append(
+                    f"{schema}: dispatch.repos[{index}].spec_path must be a non-empty string"
+                )
+            elif not _is_repo_relative_path(spec_path):
+                errors.append(
+                    f"{schema}: dispatch.repos[{index}].spec_path "
+                    "must be a repo-relative path (no leading '/', no '..')"
+                )
+
+            if _nonempty_str(path):
+                if path in seen_paths:
+                    errors.append(
+                        f"{schema}: dispatch.repos[{index}].path is duplicated by "
+                        f"repos[{seen_paths[path]}]"
+                    )
+                else:
+                    seen_paths[path] = index
+                if _nonempty_str(branch):
+                    pair = (path, branch)
+                    if pair in seen_pairs:
+                        errors.append(
+                            f"{schema}: dispatch.repos[{index}] "
+                            f"duplicates repos[{seen_pairs[pair]}]"
+                        )
+                    else:
+                        seen_pairs[pair] = index
+
+    acceptance_extra = dispatch.get("acceptance_extra")
+    if acceptance_extra is not None:
+        if not isinstance(acceptance_extra, list):
+            errors.append(f"{schema}: dispatch.acceptance_extra must be a list")
+        else:
+            for index, command in enumerate(acceptance_extra):
+                if not _nonempty_str(command):
+                    errors.append(
+                        f"{schema}: dispatch.acceptance_extra[{index}] must be a non-empty string"
+                    )
+
     return errors
 
 

@@ -27,7 +27,17 @@ class TestHappyPaths:
             "schema": SCHEMA_GOAL_TURN,
             "stop": "dispatch",
             "summary": "派一张单",
-            "dispatch": {"spec_text": "做这个"},
+            "dispatch": {
+                "spec_text": "做这个",
+                "repos": [
+                    {
+                        "path": "/data/code/foo",
+                        "remote": "origin",
+                        "branch": "dd/g-000000/dd-01",
+                        "spec_path": "docs/specs/101-foo.md",
+                    }
+                ],
+            },
         }
         assert validate(obj, SCHEMA_GOAL_TURN).ok
 
