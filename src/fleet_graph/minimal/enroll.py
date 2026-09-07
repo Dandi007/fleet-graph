@@ -8,11 +8,10 @@ created here — GO-34: state belongs to the engine.
 
 from __future__ import annotations
 
+import re
 import secrets
 from dataclasses import dataclass, field
 from typing import Any, Protocol
-
-from fleet_graph.dd.git import git_argv
 
 SCHEMA = "goal.enroll/2"
 
@@ -33,8 +32,33 @@ TOP_LEVEL_KEYS = frozenset(
 REPO_KEYS = frozenset({"path", "remote", "target_branch", "acceptance"})
 
 _WORK_FOLDER_PREFIX = "wf-"
+# GO-19 work-folder ids are "wf-" + a lowercase alphanumerical token, as in
+# the protocol examples wf-ab12cd / wf-cce72d; the remainder must be non-empty
+# and restricted to that alphabet.
+_WORK_FOLDER_SUFFIX_RE = re.compile(r"[0-9a-z]+")
 _GOAL_ID_PREFIX = "g-"
 _GOAL_ID_HEX_LEN = 6
+
+# The three git repo-config guards, duplicated locally (same reason as
+# gitgate._GUARDS: GO-32-era hardening against agent-written repo-local
+# .git/config -- core.fsmonitor runs on index refresh, core.hooksPath runs
+# hooks, protocol.ext.allow=never blocks ext:: shell transports). This
+# package must not import the old fleet_graph.dd modules, so the shape is
+# mirrored here rather than shared.
+_GIT_GUARDS: tuple[str, ...] = (
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "protocol.ext.allow=never",
+)
+
+
+def _git_argv(path: str, *args: str) -> list[str]:
+    """Guarded git argv against an untrusted worktree (see _GIT_GUARDS)."""
+
+    return ["git", *_GIT_GUARDS, "-C", path, *args]
 
 
 def _is_nonempty_str(value: Any) -> bool:
@@ -101,10 +125,10 @@ class GitProbe(Protocol):
 
 class SubprocessProbe:
     """Default probe: real `git` / `bash -n` via subprocess. Every call carries a
-    timeout and never uses shell=True with user-controlled input. The git calls
-    reuse fleet_graph.dd.git's hardened argv (repo-local fsmonitor/hooks and
-    ext:: transports disabled): the probed worktrees come from enroll requests,
-    and .git/config there is untrusted input."""
+    timeout and never uses shell=True with user-controlled input. Every git
+    argv carries the three repo-config guards (repo-local fsmonitor/hooks and
+    ext:: transports disabled): the probed worktrees come from enroll
+    requests, and .git/config there is untrusted input."""
 
     timeout_seconds: float = 30.0
 
@@ -123,16 +147,19 @@ class SubprocessProbe:
         return proc.returncode == 0
 
     def is_worktree(self, path: str) -> bool:
-        return self._run(git_argv(path, "rev-parse", "--is-inside-work-tree"))
+        return self._run(_git_argv(path, "rev-parse", "--is-inside-work-tree"))
 
     def branch_exists(self, path: str, branch: str) -> bool:
-        return self._run(git_argv(path, "rev-parse", "--verify", f"refs/heads/{branch}"))
+        return self._run(_git_argv(path, "rev-parse", "--verify", f"refs/heads/{branch}"))
 
     def bash_parses(self, command: str) -> bool:
         return self._run(["bash", "-n", "-c", command])
 
 
-def _default_probe() -> GitProbe:
+def default_probe() -> GitProbe:
+    """The production probe (subprocess git / bash -n); public for callers
+    and tests that need the real thing instead of injecting a fake."""
+
     return SubprocessProbe()
 
 
@@ -141,7 +168,7 @@ def validate_enroll(payload: dict, *, git_probe: GitProbe | None = None) -> Enro
     errors naming the exact location (e.g. ``repos[1].remote: missing``)."""
 
     errors: list[str] = []
-    probe = git_probe if git_probe is not None else _default_probe()
+    probe = git_probe if git_probe is not None else default_probe()
 
     def fail(location: str, message: str) -> None:
         errors.append(f"{location}: {message}")
@@ -168,10 +195,11 @@ def validate_enroll(payload: dict, *, git_probe: GitProbe | None = None) -> Enro
         work_folder = payload["work_folder"]
         if work_folder is not None and not _is_nonempty_str(work_folder):
             fail("work_folder", "must be null (to be created) or a non-empty string")
-        elif _is_nonempty_str(work_folder) and not work_folder.startswith(_WORK_FOLDER_PREFIX):
+        elif _is_nonempty_str(work_folder) and not _is_valid_work_folder_id(work_folder):
             fail(
                 "work_folder",
-                f"must start with {_WORK_FOLDER_PREFIX!r} (GO-19 work-folder id)",
+                f"must look like {_WORK_FOLDER_PREFIX!r} followed by lowercase alphanumeric "
+                f"characters, e.g. 'wf-ab12cd' (GO-19 work-folder id)",
             )
 
     for key in ("title", "goal_text"):
@@ -268,6 +296,16 @@ def validate_enroll(payload: dict, *, git_probe: GitProbe | None = None) -> Enro
                             )
 
     return EnrollValidation(ok=not errors, errors=errors)
+
+
+def _is_valid_work_folder_id(value: str) -> bool:
+    """GO-19 id shape: ``wf-`` plus a non-empty lowercase alphanumeric token
+    (the protocol examples are wf-ab12cd / wf-cce72d)."""
+
+    if not value.startswith(_WORK_FOLDER_PREFIX):
+        return False
+    suffix = value[len(_WORK_FOLDER_PREFIX) :]
+    return _WORK_FOLDER_SUFFIX_RE.fullmatch(suffix) is not None
 
 
 def _generate_goal_id() -> str:
