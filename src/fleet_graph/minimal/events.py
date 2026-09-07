@@ -47,6 +47,7 @@ AGENT_KINDS: frozenset[str] = frozenset(
         "agent.spawned",
         "agent.exited",
         "agent.failed",
+        "agent.invalid_output",
         "agent.compacted",
     }
 )

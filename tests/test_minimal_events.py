@@ -100,6 +100,7 @@ def test_kinds_match_protocol_section_8() -> None:
                 "agent.spawned",
                 "agent.exited",
                 "agent.failed",
+                "agent.invalid_output",
                 "agent.compacted",
                 "engine.started",
                 "engine.resumed",
