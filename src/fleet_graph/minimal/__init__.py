@@ -3,7 +3,7 @@
 Holds the Stop schema table and envelope validator the rebuilt engine's nodes
 reuse to grade every agent output as exactly one valid JSON object. Later DDs
 add their own modules here (``gitgate``, ``enroll``, ``events``, ``dispatch``,
-``prompts``, ``steer``, ``prlifecycle``, ``scribe``, ``stagerunner``, ...);
+``prompts``, ``steer``, ``prlifecycle``, ``scribe``, ``stagerunner``, ``mcptools``, ...);
 modules from different DDs are intentionally not imported by one another.
 """
 
