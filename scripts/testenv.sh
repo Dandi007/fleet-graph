@@ -248,6 +248,7 @@ te_spawn_faces() {
         abmcp+=(uv run --project "$AGENT_BUS_ROOT" agent-bus-mcp)
     fi
 
+    export FLEET_GRAPH_RUNTIME_ROSTER="$TEST_ROOT/goal/roster.json"
     if [ "$fg" = "__uv__" ]; then
         te_launch engine "$TEST_ROOT/logs/engine.log" \
             env FLEET_GRAPH_GATEWAY_BASE_URL="http://127.0.0.1:$P_BUS_HTTP" \
