@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from fleet_graph.minimal.gitgate import (
     CompletedResult,
     DDRepoRef,
@@ -235,6 +237,14 @@ def _dd_repo(worktree: str, spec_path: str = "docs/specs/101-foo.md") -> DDRepoR
         label=f"repo-{worktree}",
         spec_path=spec_path,
     )
+
+
+class TestDDRepoRefValidation:
+    def test_empty_spec_path_is_rejected(self) -> None:
+        # ``git cat-file -e '<sha>:'`` exits 0, so an empty spec_path would
+        # silently skip GO-36 check 5; it must be refused at construction.
+        with pytest.raises(ValueError, match="spec_path"):
+            _dd_repo("/wt/dd-empty", spec_path="")
 
 
 class TestCheckDDReady:

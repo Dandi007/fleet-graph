@@ -17,6 +17,7 @@ import pytest
 from fleet_graph.minimal.gitgate import (
     DDRepoRef,
     FailureCode,
+    RepoRef,
     SubprocessGitRunner,
     check_dd_ready,
     check_handoff,
@@ -79,7 +80,7 @@ class TestRealGitIntegration:
         work = pair["work"]
         _git(work, "push", "-q", "-u", "origin", "feature-x")
         result = check_handoff(
-            [DDRepoRef(worktree=str(work), remote="origin", branch="feature-x")],
+            [RepoRef(worktree=str(work), remote="origin", branch="feature-x")],
             runner=SubprocessGitRunner(),
         )
         assert result.ok is True
@@ -92,7 +93,7 @@ class TestRealGitIntegration:
         _git(work, "add", "-A")
         _git(work, "commit", "-q", "-m", "local only")
         result = check_handoff(
-            [DDRepoRef(worktree=str(work), remote="origin", branch="feature-x")],
+            [RepoRef(worktree=str(work), remote="origin", branch="feature-x")],
             runner=SubprocessGitRunner(),
         )
         assert result.ok is False
@@ -101,7 +102,7 @@ class TestRealGitIntegration:
     def test_never_pushed_branch_is_missing_on_remote(self, pair: dict[str, Path]) -> None:
         work = pair["work"]
         result = check_handoff(
-            [DDRepoRef(worktree=str(work), remote="origin", branch="feature-x")],
+            [RepoRef(worktree=str(work), remote="origin", branch="feature-x")],
             runner=SubprocessGitRunner(),
         )
         assert result.ok is False
@@ -112,7 +113,7 @@ class TestRealGitIntegration:
         _git(work, "push", "-q", "-u", "origin", "feature-x")
         (work / "new.txt").write_text("x\n", encoding="utf-8")
         result = check_handoff(
-            [DDRepoRef(worktree=str(work), remote="origin", branch="feature-x")],
+            [RepoRef(worktree=str(work), remote="origin", branch="feature-x")],
             runner=SubprocessGitRunner(),
         )
         assert result.ok is False

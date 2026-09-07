@@ -167,9 +167,22 @@ class RepoRef:
 
 @dataclass(frozen=True)
 class DDRepoRef(RepoRef):
-    """A ``RepoRef`` carrying the spec path required by the DD gate."""
+    """A ``RepoRef`` carrying the spec path required by the DD gate.
+
+    ``spec_path`` must be a non-empty repo-relative path: an empty one would
+    silently pass the GO-36 spec check because ``git cat-file -e '<sha>:'``
+    exits 0 for the empty path, so emptiness is rejected at construction
+    instead of being discovered at the git layer.
+    """
 
     spec_path: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.spec_path:
+            raise ValueError(
+                "DDRepoRef.spec_path must be a non-empty repo-relative path "
+                "(GO-36 check 5 would otherwise be silently skipped)"
+            )
 
 
 @dataclass(frozen=True)
