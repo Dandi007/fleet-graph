@@ -708,6 +708,12 @@ class TestDdOwnerSideDedup:
         plane, _ = self._plane(tmp_path)
         self._suspended(plane, "dev-abc", tmp_path)
         source = DdOwnerSource(tmp_path / "dd")
+        # Drive the owner adapter against the same *recording* control plane the
+        # sibling tests use. A bare `DdOwnerSource` builds its own plane with the
+        # production defaults (real `systemd-run` launcher + real `systemctl`
+        # probe), whose fixed unit name `fleet-graph-dd-dev-abc-r2` collides with
+        # the leftover unit from a previous suite run and flakes LAUNCH_FAILED.
+        source._control_plane = lambda: plane  # type: ignore[method-assign]
         target = OwnerTarget("dd", "dev-abc", 1, "q-1", "card-1", "awaiting_gate")
         action_key = "e1:d-1:dd:dev-abc:1"
 
