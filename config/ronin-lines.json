@@ -250,6 +250,14 @@
       "alias": "ronin-adhd",
       "enabled": true,
       "_provenance": "2026-09-05 第十六波入编（用户令「给 goal-agent 去端到端实现吧，等他实现完了你来验收」）：ADHD 多模型化线。把上游 UditAkhourii/adhd（并行发散 ideation，tree-of-thought with pruning）的唯一 LLM 出口从 @anthropic-ai/claude-agent-sdk 换成本机 agent-run，使发散真正跑在多厂模型上（分歧长在权重里，而非同一份权重扮演不同角色）；再加 MCP 异步工单门面，结果经 work folder 交接。改动仓 /data/code/self/adhd（self，Dandi007/adhd private fork），分支 feat/agent-runtime-adapter 自 upstream/main@16dc239 切出；S2 另需改 agent-runtime 的 profiles/routes.yaml 补两条 chain，该改动走 PR 不自行 merge。goal/spec/design/findings/golden-order SSoT 全在 wf-194310，验收命令四批 S1–S4 已按铁律 1 真机空跑（S2 现红于 No default chain，正是待办本身；S3 的 work-folder MCP 断言路径实测 PASS）。座位 opencode-gpt-sol：避 dsv4pro 集中度（18/30），terra 留给需 katana-memory-mcp 的线，glm53 刚给 wf-4601c8；本线是 TypeScript 实现 + 接口设计密集，gpt-5.6-sol 经 agent-run 实测 6.41s 正常。"
+    },
+    {
+      "folder_id": "wf-610189",
+      "seat": "opencode-glm53",
+      "max_rounds": 9999,
+      "alias": "ronin-sched-timeout",
+      "enabled": true,
+      "_provenance": "2026-09-07 第十七波入编（用户令「确认修 X-6，开线」；背景令「我们就可以先选一个让他去修呀」）：以新引擎修自身基建缺陷作为 wf-4601c8 重建的目标级验收。目标 = wf-4601c8 goal §七 X-6：fleet-graphd 对 work-folder MCP 调用无超时致整机假死（两次复发 py-spy 栈同点）；加有界超时 + fail-open + 回归用例。改动单目标分支 release/wf-610189（自 main c53769e 切出）。座位 opencode-glm53；implement deepseek-v4-pro（避 X-9），双 review glm-5.3，经 development_create.stage_models 传入。入编时 tests/test_x6_work_folder_timeout.py 尚不存在（liveness 诚实红），是本线要交付的东西。"
     }
   ],
   "line_environment": {
