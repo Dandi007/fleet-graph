@@ -515,8 +515,15 @@ class TestDecisionConsumedWake:
 
 
 class TestFailOpen:
-    def test_a_probe_error_while_parked_falls_back_to_backoff(self, tmp_path: Path) -> None:
-        """Parking saves money; a broken probe must never lock a line shut."""
+    def test_a_goal_probe_error_while_parked_holds_the_park(self, tmp_path: Path) -> None:
+        """X-6 M1: the goal.md probe failing is not a goal change.
+
+        A probe error while parked holds the park ("no fact this tick"), and
+        the line is not locked shut: the very next tick the probe recovers,
+        reports the same revision as the baseline, and the park still holds.
+        The other wake sources keep their wake-direction fail-open (see
+        TestWakeFactDecision for the board-decision source).
+        """
         wake = FakeWake()
         scheduler, clock, _ = blocked_line(tmp_path, wake=wake)
         assert scheduler.tick()[0].decision.refusal is Refusal.PARKED_AWAITING_DECISION
@@ -524,8 +531,18 @@ class TestFailOpen:
         wake.error = RuntimeError("bus is down")
         clock.now += 60.0
         result = scheduler.tick()[0]
-        assert result.park_event == "woken:probe_failed:RuntimeError"
-        assert result.decision.ignite
+        assert result.park_event == "parked:no_goal_fact:RuntimeError"
+        assert result.decision.refusal is Refusal.PARKED_AWAITING_DECISION
+        assert result.decision.ignite is False
+
+        clock.now += 60.0
+        wake.error = None
+        result = scheduler.tick()[0]
+        # The probe recovered and the revision still matches the baseline: a
+        # normal hold, proving the probe was retried rather than the line
+        # being locked shut on the stale "no fact" verdict.
+        assert result.park_event is None
+        assert result.decision.refusal is Refusal.PARKED_AWAITING_DECISION
 
     def test_a_probe_error_at_establishment_means_no_parking(self, tmp_path: Path) -> None:
         scheduler, _, _ = blocked_line(tmp_path, wake=FakeWake(error=RuntimeError("mcp down")))
@@ -533,6 +550,17 @@ class TestFailOpen:
         assert result.parked is False
         assert result.park_event == "not_parked:probe_failed:RuntimeError"
         assert result.decision.ignite
+
+    def test_a_no_fact_probe_at_establishment_means_no_parking(self, tmp_path: Path) -> None:
+        """X-6 M1: a probe that returns without a fact (LiveWakeSignals maps
+        timeouts and unreachable MCPs to None) is also no anchor -- parking
+        fails open exactly like a raise, with its own event tag."""
+        scheduler, _, launcher = blocked_line(tmp_path, wake=FakeWake(revision=None))
+        result = scheduler.tick()[0]
+        assert result.parked is False
+        assert result.park_event == "not_parked:no_goal_fact"
+        assert result.decision.ignite
+        assert len(launcher.launched) == 1
 
     def test_no_wake_signals_at_all_disables_parking(self, tmp_path: Path) -> None:
         """A scheduler that cannot observe wake facts must not park: it would
@@ -905,18 +933,16 @@ class TestLiveWakeSignals:
         signals = LiveWakeSignals(wf_caller=FakeCaller())
         assert signals.goal_revision("wf-1") == "sha256:abc"
 
-    def test_a_statless_answer_raises_rather_than_guessing(self) -> None:
+    def test_a_statless_answer_is_no_fact_rather_than_a_guess(self, tmp_path: Path) -> None:
+        """An fs_stat answer with no content_revision is "no fact" (None),
+        never a guessed revision and never an exception into the tick."""
+
         class FakeCaller:
             def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 return {"ok": True}
 
         signals = LiveWakeSignals(wf_caller=FakeCaller())
-        try:
-            signals.goal_revision("wf-1")
-        except RuntimeError as exc:
-            assert "content_revision" in str(exc)
-        else:
-            raise AssertionError("expected a RuntimeError")
+        assert signals.goal_revision("wf-1") is None
 
     def test_timestamps_parse_at_both_precisions(self) -> None:
         assert parse_bus_timestamp("2026-08-27T10:00:00Z") == parse_bus_timestamp(
