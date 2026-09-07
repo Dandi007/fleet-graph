@@ -165,6 +165,7 @@ class ControlPlaneGateway:
 
     def observe(self, record: dict[str, Any], *, line_folder: str) -> DdDevelopmentResult:
         development_id = str(record.get("development_id") or "")
+        status: dict[str, Any] = {"generation": record.get("generation") or 1}
         for attempt in range(self.max_observations):
             # 权威投影：DdControlPlane.get 的 state 从 record.json + 当代
             # result.json 重建——不是盘面缓存，也不是唤醒路径的事件读。
@@ -178,7 +179,7 @@ class ControlPlaneGateway:
         # 不编造终态，也不把在途伪装成失败。
         return self._project(
             development_id,
-            {"state": "in_flight", "generation": record.get("generation") or 1},
+            {**status, "state": "in_flight"},
         )
 
     def dispatch(self, intent: DdDispatchIntent, *, line_folder: str) -> DdDevelopmentResult:

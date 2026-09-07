@@ -456,6 +456,10 @@ class LineState(TypedDict, total=False):
     #: the reducer. This is the ONLY dd-terminal channel into the line state:
     #: no disk file is read as a dd terminal/wake event any more.
     dd_results: Annotated[dict[str, Any], merge_dd_results]
+    # 消费回执进入 checkpoint；只向下一次 coordinator 交接未读取的结果。
+    action_results: Annotated[dict[str, Any], merge_dd_results]
+    action_results_seen: dict[str, Any]
+    action_round_no: int
     #: R2 图合一: the Send-carried payload channel -- the one development a
     #: ``dd_dispatch`` task is instantiating. Present only inside that task's
     #: isolated state view, never persisted anywhere durable.
@@ -630,6 +634,14 @@ def _coordinator_input(
         "inbox_messages": [],
         "inbox_framing": INBOX_FRAMING,
     }
+    seen = state.get("action_results_seen") or {}
+    pending_results = [
+        value
+        for key, value in (state.get("action_results") or {}).items()
+        if seen.get(key) != value
+    ]
+    if pending_results:
+        coord_input["action_results"] = pending_results
     if getattr(deps.inbox, "reason", None):
         coord_input["inbox_degraded"] = {
             "alias": getattr(deps.inbox, "alias", ""),
@@ -756,7 +768,10 @@ def _apply_stop_response(
     routed, never silently dropped); the rest ride ``pending_actions`` for the
     graph edge (Send) to instantiate, one node call each.
     """
-    update: LineState = {}
+    update: LineState = {
+        "action_results_seen": dict(state.get("action_results") or {}),
+        "action_round_no": round_no,
+    }
     raw = result.get(ACTIONS_FIELD)
     verbatim = raw if isinstance(raw, list) else []
     dispatches, releases, receipts, consumable = declared_actions(
@@ -805,6 +820,11 @@ def _apply_stop_response(
         # Declared actions exist but none are routable and none failed at
         # parse: every one was failed closed above, receipts already recorded.
         pass
+    if receipts:
+        update["action_results"] = {
+            f"{round_no}:parse:{index}": {"round": round_no, "receipt": receipt}
+            for index, receipt in enumerate(receipts)
+        }
     if routable:
         update["pending_actions"] = routable
     return update
@@ -1448,12 +1468,18 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         actions = state.get("pending_actions") or []
         if actions:
             sends: list[Send] = [
-                Send("dd_dispatch", {"dd_intent": action})
+                Send(
+                    "dd_dispatch",
+                    {"dd_intent": action, "round_no": state.get("action_round_no", 1)},
+                )
                 for action in actions
                 if action.get("kind") == KIND_DISPATCH
             ]
             sends.extend(
-                Send("dd_gate_release", {"gate_action": action})
+                Send(
+                    "dd_gate_release",
+                    {"gate_action": action, "round_no": state.get("action_round_no", 1)},
+                )
                 for action in actions
                 if action.get("kind") == KIND_GATE_RELEASE
             )
@@ -1578,7 +1604,17 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             consumed_record(round_no=round_no, at=_iso_now(deps), receipt=receipt)
         )
         removal = {"idempotency_key": str(action.get("idempotency_key") or "")}
-        return {**update, "pending_actions": [removal]}
+        return {
+            **update,
+            "pending_actions": [removal],
+            "action_results": {
+                f"{round_no}:{removal['idempotency_key']}": {
+                    "round": round_no,
+                    "receipt": receipt,
+                    **({"dd_result": result} if fault is None and update.get("dd_results") else {}),
+                }
+            },
+        }
 
     def dd_gate_release(state: LineState) -> LineState:
         """R3 的 gate 消费节点：一次执行 = 一条 dd.gate_release.v1 action。
@@ -1610,7 +1646,11 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         deps.artifacts.record_stop_response_actions(
             consumed_record(round_no=round_no, at=_iso_now(deps), receipt=receipt)
         )
-        return {"pending_actions": [{"idempotency_key": str(action.get("idempotency_key") or "")}]}
+        key = str(action.get("idempotency_key") or "")
+        return {
+            "pending_actions": [{"idempotency_key": key}],
+            "action_results": {f"{round_no}:{key}": {"round": round_no, "receipt": receipt}},
+        }
 
     graph: StateGraph = StateGraph(LineState)
     graph.add_node("check_bounds", check_bounds)
@@ -1621,6 +1661,8 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     graph.add_node("decision_interrupt", decision_interrupt)
     graph.add_node("dd_dispatch", dd_dispatch)
     graph.add_node("dd_gate_release", dd_gate_release)
+    # 所有 Send 的 reducer 写入合并后才路由，避免任务间互相重派剩余 action。
+    graph.add_node("action_join", lambda state: {})
 
     graph.add_edge(START, "check_bounds")
     graph.add_conditional_edges("check_bounds", after_bounds)
@@ -1631,7 +1673,9 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
     # R3 Stop Response: the fan-out join routes like a coordinator turn -- with
     # each action consumed (its removal marker merged), the line proceeds into
     # its (possibly parked) terminal or its worker turn.
-    graph.add_conditional_edges("dd_dispatch", after_coordinator)
+    graph.add_edge("dd_dispatch", "action_join")
+    graph.add_edge("dd_gate_release", "action_join")
+    graph.add_conditional_edges("action_join", after_coordinator)
     # Unconditional: the facts are gathered even after a worker timeout --
     # they are cheap, and the coordinator judging a timeout deserves them too.
     graph.add_edge("worker_turn", "acceptance_step")
