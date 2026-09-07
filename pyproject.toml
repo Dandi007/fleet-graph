@@ -1,13 +1,12 @@
 [project]
 name = "fleet-graph"
-version = "0.0.1"
-description = "LangGraph-based orchestration spine for the ronin fleet and dev-dispatch pipeline"
+version = "2.0.0"
+description = "每 Goal 独立 LangGraph 引擎与统一 MCP 控制面"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "langgraph==1.2.11",
-    "langgraph-checkpoint-sqlite==3.1.1",
-    "httpx==0.28.1",
     "fastmcp==3.4.7",
+    "jsonschema==4.26.0",
 ]
 
 [project.scripts]
@@ -15,7 +14,6 @@ fleet-graph = "fleet_graph.cli:main"
 
 [dependency-groups]
 dev = [
-    "jsonschema>=4.26.0",
     "pytest==9.1.1",
     "ruff==0.16.4",
 ]
@@ -31,29 +29,11 @@ packages = ["src/fleet_graph"]
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
-# .dev-dispatch/ is the engine-materialized order-protocol directory that only
-# exists inside dd order worktrees (never on main). Spec markdown there may
-# carry python fenced blocks quoted verbatim from defect reports; ruff must not
-# demand reformatting them — that fails `make verify` at the pristine
-# input_commit and blocks every such order before any product change
-# (production instance: dev-fg-86fff73b84bd, 2026-08-31).
-extend-exclude = [".dev-dispatch"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
-# Docs and comments quote the plan verbatim, and the plan is written in Chinese.
-# CJK punctuation is intended here, not a confusable typo for the ASCII form.
 allowed-confusables = ["，", "：", "；", "（", "）", "、", "「", "」", "％", "－"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --ignore=tests/e2e/contract/fixture"
-
-[tool.ruff.format]
-exclude = ["src/fleet_graph/dd/vendor/*.py"]
-
-[tool.ruff.lint.per-file-ignores]
-# Vendored domain code from loop-engine-development-mcp. Kept byte-identical
-# apart from the import rewrite so a future diff against upstream stays
-# readable; restyling it here would make that diff useless.
-"src/fleet_graph/dd/vendor/*.py" = ["ALL"]

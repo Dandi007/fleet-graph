@@ -1,3 +1,3 @@
-"""fleet-graph — LangGraph orchestration spine for the ronin fleet and dev-dispatch."""
+"""每 Goal 一个 LangGraph 引擎的 Fleet Graph 最小系统。"""
 
-__version__ = "0.0.1"
+__version__ = "2.0.0"

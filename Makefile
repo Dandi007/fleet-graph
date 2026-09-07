@@ -1,35 +1,21 @@
-.PHONY: help sync lint fmt test verify conformance clean
-
-help:
-	@echo "sync    - install deps into .venv (uv)"
-	@echo "lint    - ruff check + format check"
-	@echo "fmt     - ruff format + autofix"
-	@echo "test    - pytest"
-	@echo "verify  - lint + test (the gate CI runs)"
+.PHONY: sync lint fmt test verify
 
 sync:
-	uv sync --frozen || uv sync
+	uv sync --frozen
 
 lint:
-	uv run ruff check .
-	uv run ruff format --check .
+	uv run ruff check src tests scripts
+	uv run ruff format --check src tests scripts
 
 fmt:
-	uv run ruff check --fix .
-	uv run ruff format .
+	uv run ruff check --fix src tests scripts
+	uv run ruff format src tests scripts
 
 test:
 	uv run pytest
 
-conformance:
-	uv run python scripts/check_supervisor_conformance.py
-	uv run python scripts/check_work_report_conformance.py
-	uv run python scripts/check_research_role_contracts.py
-
-verify: lint test conformance
-
-clean:
-	rm -rf .pytest_cache .ruff_cache dist build
+verify: lint test
+	python3 -m compileall -q src
 
 # Docker 测试使用独立 named volumes；只有网关与 GitHub 可以出网。
 CANDIDATE ?= codex
