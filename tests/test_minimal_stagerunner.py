@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 
 import fleet_graph.minimal as minimal_pkg
-from fleet_graph.minimal import agentrun, gitgate, prompts, protocol
+from fleet_graph.minimal import agentrun, events, gitgate, prompts, protocol
 from fleet_graph.minimal.stagerunner import (
     REVIEW_CHANGED_CODE,
     STAGES,
@@ -490,6 +490,40 @@ class TestStageMapping:
     def test_unknown_stage_raises(self) -> None:
         with pytest.raises(ValueError, match="unknown stage"):
             _request(stage="boss")
+
+
+# ---------------------------------------------------------------------------
+# every emitted (kind, payload) pair must be an EventLog-known kind
+# ---------------------------------------------------------------------------
+
+
+class TestEmittedEventKinds:
+    def test_every_emitted_kind_is_known(self) -> None:
+        dirty = FakeGitRunner()
+        dirty.script_for("/wt/one")["status"] = " M src/foo.py\n"
+        outcomes: list[StageOutcome] = [
+            run_stage(_request(), git_runner=dirty, agent_invoker=FakeInvoker(0, "")),
+            run_stage(_request(), git_runner=FakeGitRunner(), agent_invoker=FakeInvoker(3, "")),
+            run_stage(
+                _request(), git_runner=FakeGitRunner(), agent_invoker=FakeInvoker(0, "prose")
+            ),
+            run_stage(
+                _request(),
+                git_runner=FakeGitRunner(),
+                agent_invoker=FakeInvoker(
+                    0,
+                    json.dumps({"schema": protocol.SCHEMA_IMPL, "stop": "failed"}),
+                ),
+            ),
+            run_stage(
+                _request(),
+                git_runner=FakeGitRunner(),
+                agent_invoker=FakeInvoker(0, _committed_stdout()),
+            ),
+        ]
+        for outcome in outcomes:
+            for kind, _payload in outcome.events:
+                assert kind in events.KINDS, f"unknown event kind {kind!r}"
 
 
 # ---------------------------------------------------------------------------
