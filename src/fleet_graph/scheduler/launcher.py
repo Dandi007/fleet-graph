@@ -92,6 +92,7 @@ class LaunchSpec:
         argv = [
             "systemd-run",
             "--user",
+            "--expand-environment=no",
             # --collect: a failed unit is garbage-collected instead of sitting
             # in the failed state and blocking the next launch of the same name.
             "--collect",

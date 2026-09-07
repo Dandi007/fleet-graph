@@ -259,8 +259,10 @@ class BusLineMessageSink:
 
     def publish(self, alias: str, payload: dict[str, Any]) -> str:
         client = self._client(alias)
+        resolve = getattr(client, "inbox_channel", None)
+        channel = resolve(alias) if resolve else f"agent:{alias}"
         result = client.publish(
-            f"agent:{alias}",
+            channel,
             "agent.msg.v1",
             payload,
             idempotency_key=f"line-message:{uuid.uuid4().hex}",

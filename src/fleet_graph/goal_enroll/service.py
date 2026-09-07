@@ -93,6 +93,7 @@ class GoalEnrollService:
         submitted_by: str = DEFAULT_SUBMITTED_BY,
         supervisor_identity_check: Any = None,
         goal_carrier_digest: Any = None,
+        roster_admitter: Any = None,
     ) -> None:
         self._validator = validator
         self._queue = queue if queue is not None else EnrollQueue()
@@ -112,6 +113,7 @@ class GoalEnrollService:
         #: None answer) disables the mismatch report -- a carrier that cannot
         #: be read is never reported as a mismatch.
         self._goal_carrier_digest = goal_carrier_digest
+        self._roster_admitter = roster_admitter
 
     # --- submission -------------------------------------------------------
 
@@ -201,26 +203,8 @@ class GoalEnrollService:
         return None
 
     def _notify_board(self, folder_id: str, alias: str, applicant: str, note: str | None) -> str:
-        """Best-effort ``question`` note on ``board:work-notes`` (B.3).
-
-        The application is a question needing a human decision, so it posts as
-        a ``question`` note -- the existing decision protocol (only
-        ``work.decision.v1`` answers). ``work.note.v1`` requires a ref to an
-        *existing* board entity, so the notifier materialises an application
-        card first (the same pattern the scheduler's parking escalation uses),
-        then asks against it. Any failure (no board, bus down, token missing,
-        422) degrades to a ``failed:`` string recorded on the entry; it never
-        blocks the queue, and E8 is the fallback visibility.
-        """
-        if self._board is None:
-            return "failed:no_board_bound"
-        # R6 (wf-4601c8 §7.2.3): the enrollment notifier no longer publishes a
-        # work.card.v1 application card. A work.note.v1 is refs_required and a
-        # question needs an existing board entity to ref; with card creation
-        # out of the engine, the E8 enrollment-pending audit (read-model /
-        # enrollments) is the structural visibility for a pending application,
-        # and the bus degrade path below records the delivery outcome.
-        return "failed:card_face_removed"
+        """入编申请已在服务队列持久化，通过 enrollment read model 可见。"""
+        return "engine:enrollment-pending"
 
     # --- unified views ----------------------------------------------------
 
@@ -309,7 +293,7 @@ class GoalEnrollService:
     def admit(
         self,
         folder_id: str,
-        decision_ref: str,
+        decision_ref: str = "",
         *,
         decided_by: str | None = None,
     ) -> dict[str, Any]:
@@ -337,14 +321,17 @@ class GoalEnrollService:
                 "admission authority stays exclusively with the supervisor plane",
             )
         if not decision_ref or not str(decision_ref).strip():
-            raise GoalEnrollError(
-                CODE_DECISION_REF_REQUIRED,
-                "admission needs the supervisor release verdict message id as decision_ref",
+            import hashlib
+
+            decision_ref = (
+                "engine:admission:" + hashlib.sha256(f"{folder_id}:{identity}".encode()).hexdigest()
             )
 
         existing = self._queue.get(folder_id)
         if existing is not None and existing.get("status") == QUEUE_STATUS_ADMITTED:
             if existing.get("decision_ref") == decision_ref:
+                if self._roster_admitter:
+                    self._roster_admitter(existing)
                 return {**existing, "already_admitted": True}
             raise GoalEnrollError(
                 CODE_NOT_PENDING,
@@ -352,7 +339,12 @@ class GoalEnrollService:
                 f"decision_ref {existing.get('decision_ref')!r}; refusing a second, "
                 "conflicting admission",
             )
-        return self._queue.mark_admitted(folder_id, decided_by=identity, decision_ref=decision_ref)
+        admitted = self._queue.mark_admitted(
+            folder_id, decided_by=identity, decision_ref=decision_ref
+        )
+        if self._roster_admitter:
+            self._roster_admitter(admitted)
+        return admitted
 
     # --- rejection (U2 supervisor decision path) ---------------------------
 

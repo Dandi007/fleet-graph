@@ -37,10 +37,9 @@ guess: the fail-open policy lives in one place, the scheduler.
 
 from __future__ import annotations
 
-import calendar
 import json
 import os
-import time
+from datetime import UTC
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -106,14 +105,13 @@ def probe_error_tag(exc: BaseException) -> str:
 
 
 def parse_bus_timestamp(value: Any) -> float:
-    """Epoch seconds from an ISO-8601 UTC stamp, fractional part ignored.
+    """保留 bus 毫秒精度，避免同秒晚到的消息被当作终态之前的旧消息。"""
+    from datetime import datetime
 
-    The bus writes millisecond precision ("...T16:28:00.123Z"), terminal.json
-    writes seconds ("...T16:28:00Z"); truncating to 19 characters makes both
-    parse with one format. Raises on anything else -- the caller fails open.
-    """
-    text = str(value)
-    return float(calendar.timegm(time.strptime(text[:19], "%Y-%m-%dT%H:%M:%S")))
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
 
 
 class LiveWakeSignals:
@@ -189,7 +187,8 @@ class LiveWakeSignals:
 
     def inbox_message_after(self, alias: str, after_epoch: float) -> bool:
         client = self._inbox_client(alias)
-        channel = f"agent:{alias}"
+        resolve = getattr(client, "inbox_channel", None)
+        channel = resolve(alias) if resolve else f"agent:{alias}"
         _, head_seq = client.messages(channel, limit=1)
         if head_seq <= 0:
             return False
@@ -339,8 +338,23 @@ class LiveDdWakeFacts:
     RECORD_FILE = "record.json"
     RESULT_FILE = "result.json"
 
-    def __init__(self, dd_root: str | Path) -> None:
+    def __init__(self, dd_root: str | Path, unit_probe: Any = None) -> None:
         self.dd_root = Path(dd_root)
+        self.unit_probe = unit_probe or self._unit_active
+
+    @staticmethod
+    def _unit_active(unit: str) -> bool:
+        import subprocess
+
+        result = subprocess.run(
+            ["systemctl", "--user", "show", "--property=ActiveState", "--value", unit],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"无法查询 DD unit: {unit}")
+        return result.stdout.strip() in {"active", "activating", "reloading", "deactivating"}
 
     def _read_json(self, path: Path) -> dict[str, Any] | None:
         try:
@@ -368,7 +382,22 @@ class LiveDdWakeFacts:
         )
         result = self._read_json(result_path)
         if result is None:
-            raise RuntimeError(f"dd run result for {development_id} unreadable: {result_path}")
+            if result_path.exists():
+                raise RuntimeError(f"dd run result for {development_id} unreadable: {result_path}")
+            # result 只在调用结束落盘；运行中的权威事实来自启动记录与 systemd。
+            launches_path = dev_root / "launches.jsonl"
+            entries = [json.loads(line) for line in launches_path.read_text().splitlines() if line]
+            launches = [
+                entry
+                for entry in entries
+                if int(entry.get("generation") or 1) == generation and entry.get("started")
+            ]
+            if not launches:
+                raise RuntimeError(f"dd {development_id} 当前代没有启动记录")
+            unit = str(launches[-1].get("unit") or "")
+            if not unit:
+                raise RuntimeError(f"dd {development_id} 启动记录缺少 unit")
+            return None if self.unit_probe(unit) else "terminal"
         # The same precedence the control plane's rebuild enforces: a pending
         # question means the single sits at the gate; otherwise any terminal
         # terminalises the wake.

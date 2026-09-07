@@ -289,12 +289,16 @@ def _read_roster(config: FleetStateConfig) -> tuple[list[tuple[str, int]], Path]
     """
     try:
         raw = json.loads(config.lines_config.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raw = {}
     except (OSError, ValueError):
         return [], config.run_root
     if not isinstance(raw, dict):
         return [], config.run_root
     run_root = Path(str(raw.get("run_root") or config.run_root))
-    entries = raw.get("lines") or []
+    from fleet_graph.goal_enroll.runtime_roster import merge_lines
+
+    entries = merge_lines(raw.get("lines") or [])
     lines: list[tuple[str, int]] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -780,7 +784,9 @@ class FleetStateView:
             raise RosterUnavailable(
                 f"roster {str(self.config.lines_config)!r} is not a JSON object"
             )
-        entries = raw.get("lines") or []
+        from fleet_graph.goal_enroll.runtime_roster import merge_lines
+
+        entries = merge_lines(raw.get("lines") or [])
         lines = [entry for entry in entries if isinstance(entry, dict) and entry.get("folder_id")]
         return {
             "lines_config": str(self.config.lines_config),

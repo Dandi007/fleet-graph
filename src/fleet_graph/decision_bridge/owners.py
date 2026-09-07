@@ -195,7 +195,11 @@ class LineOwnerSource:
 
     def discover_all(self) -> list[OwnerTarget]:
         targets: list[OwnerTarget] = []
-        for line in self.lines:
+        from fleet_graph.goal_enroll.runtime_roster import runtime_entries
+
+        declared = {self._folder_id(line): line for line in self.lines}
+        declared.update({line["folder_id"]: line for line in runtime_entries()})
+        for line in declared.values():
             folder_id = self._folder_id(line)
             state = self._read_state(folder_id)
             if not state.get("parked_run_id") or state.get("parked_at") is None:

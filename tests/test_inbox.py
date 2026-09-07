@@ -61,8 +61,10 @@ def transport() -> RecordingTransport:
 
 
 @pytest.fixture
-def inbox(transport: RecordingTransport) -> Inbox:
+def inbox(transport: RecordingTransport, monkeypatch: pytest.MonkeyPatch) -> Inbox:
     client = BusClient(token="tok", transport=transport)
+    # 本文件验证消费/落盘/ack；独立 alias 协议测试覆盖真实解析请求。
+    monkeypatch.setattr(client, "inbox_channel", lambda alias: f"agent:{alias}")
     return Inbox(client, alias="ronin-quotaalert")
 
 
@@ -200,12 +202,16 @@ class TestDurableWrite:
 
     def test_fsyncs_before_returning(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Without the fsync, a power loss after ack loses the message on both sides."""
+        import stat
+
         import fleet_graph.state.run_artifacts as module
 
-        synced: list[int] = []
-        monkeypatch.setattr(module.os, "fsync", lambda fd: synced.append(fd))
+        synced: list[bool] = []
+        monkeypatch.setattr(
+            module.os, "fsync", lambda fd: synced.append(stat.S_ISDIR(module.os.fstat(fd).st_mode))
+        )
         write_json_durable(tmp_path / "x.json", {"a": 1})
-        assert len(synced) == 1
+        assert synced == [False, True]  # 先持久化文件，再持久化替换后的目录项。
 
     def test_non_ascii_is_preserved(self, tmp_path: Path) -> None:
         path = write_json_durable(tmp_path / "x.json", {"reason": "验收通过"})

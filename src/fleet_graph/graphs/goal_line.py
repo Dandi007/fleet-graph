@@ -49,6 +49,7 @@ from fleet_graph.goal_interrupt.contract import (
 from fleet_graph.graphs.dd_gate import DdGatePort
 from fleet_graph.graphs.dd_subgraph import DdSubgraphPort, merge_dd_results
 from fleet_graph.graphs.guards import LineGuards, PromptVerdict
+from fleet_graph.graphs.phase_heartbeat import phase_heartbeat
 from fleet_graph.graphs.stop_response import (
     ACTIONS_FIELD,
     KIND_DISPATCH,
@@ -629,6 +630,12 @@ def _coordinator_input(
         "inbox_messages": [],
         "inbox_framing": INBOX_FRAMING,
     }
+    if getattr(deps.inbox, "reason", None):
+        coord_input["inbox_degraded"] = {
+            "alias": getattr(deps.inbox, "alias", ""),
+            "reason": deps.inbox.reason,
+            "available": False,
+        }
     if state.get("last_turn_status"):
         coord_input["last_turn_status"] = state["last_turn_status"]
     if state.get("last_turn_report"):
@@ -649,6 +656,13 @@ def _coordinator_input(
         # weighs the release and declares it in its Stop Response actions; the
         # gate node -- not this envelope -- is the only release path (S11).
         coord_input["dd_awaiting_gate_development_id"] = deps.dd_awaiting_gate_development_id
+        coord_input["dd_gate_contract"] = (
+            "先用 development_get 读取该 DD 当前 awaiting.question_note_id。"
+            "审单 Stop Response 的 dd.gate_release.v1 payload 必须原样带 question_note_id，"
+            "同时携带 development_id、verdict、decided_by；decided_by 必须为当前 folder_id。"
+            "REJECT 的 board_decision 须含 problem、suggested_answer、cost_of_no_answer。"
+            "同一请求重试复用 idempotency_key；历史请求不可用于当前代。"
+        )
     return coord_input
 
 
@@ -1023,7 +1037,8 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             except Exception:
                 consumed_revision = None
 
-        result = deps.coordinator.turn(round_no, coord_input)
+        with phase_heartbeat(deps.artifacts, round_no, "coordinator"):
+            result = deps.coordinator.turn(round_no, coord_input)
         _apply_ack_obligation(deps, drain, result, round_no)
         update = _verdict_update(deps, state, round_no, result)
         update = {**_apply_stop_response(deps, state, round_no, result), **update}
@@ -1182,7 +1197,8 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         turn_prompt = prompt
         for attempt in range(retry_limit + 1):
             try:
-                output = deps.worker.turn(turn_prompt, round_no)
+                with phase_heartbeat(deps.artifacts, round_no, "worker"):
+                    output = deps.worker.turn(turn_prompt, round_no)
                 report = decode_report(output)
                 break
             except TimeoutError as exc:
@@ -1391,7 +1407,8 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
             # confusable is the NOT-RUN failure this step exists to end.
             return {"last_acceptance": {"status": STATUS_NOT_DECLARED}}
         try:
-            facts = deps.acceptance.run()
+            with phase_heartbeat(deps.artifacts, round_no, "acceptance"):
+                facts = deps.acceptance.run()
         except Exception as exc:  # the step must not fault the line
             facts = {
                 "status": STATUS_ERROR,

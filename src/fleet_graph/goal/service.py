@@ -135,6 +135,7 @@ def build_goal_mcp_server(
     line_alias_resolver: Any | None = None,
     goal_carrier_digest: Any | None = None,
     clock: Any | None = None,
+    roster_admitter: Any | None = None,
 ) -> Any:
     """Build the standalone goal-driven MCP surface.
 
@@ -182,6 +183,7 @@ def build_goal_mcp_server(
         submitted_by=submitted_by or os.environ.get("FLEET_GRAPH_SUBMITTED_BY", "goal-mcp"),
         supervisor_identity_check=supervisor_identity_check,
         goal_carrier_digest=goal_carrier_digest,
+        roster_admitter=roster_admitter,
     )
     if line_alias_resolver is None:
 
@@ -237,6 +239,15 @@ def build_goal_mcp_server(
     def goal_open_briefing() -> str:
         """The versioned briefing text behind the goal-open prompt."""
         return BRIEFING_TEXT
+
+    @mcp.tool()
+    def goal_prepare_line(alias: str, decided_by: str) -> dict[str, Any]:
+        """监督面准备线身份与 inbox；凭证直接安全落位，不返回 token。"""
+        from fleet_graph.bus.line_registration import prepare_line
+
+        if not enroll._supervisor_identity_check(decided_by):
+            raise ToolError("GOAL_ENROLL_NOT_SUPERVISOR: 只有监督面可准备线凭证")
+        return prepare_line(alias)
 
     @mcp.tool()
     def goal_enroll(
@@ -302,8 +313,8 @@ def build_goal_mcp_server(
     @mcp.tool()
     def goal_admit(
         folder_id: str,
-        decision_ref: str,
         decided_by: str,
+        decision_ref: str = "",
     ) -> dict[str, Any]:
         """Admit one *pending* enrollment from a supervisor release verdict.
 
@@ -457,7 +468,10 @@ def serve(
             return None
         return acceptance_block_digest(goal_md)
 
+    from fleet_graph.goal_enroll.runtime_roster import admit_line
+
     build_goal_mcp_server(
+        roster_admitter=admit_line,
         goal_folders=goal_folders,
         goal_queue=goal_queue,
         real_roster=RealRosterReader(),
