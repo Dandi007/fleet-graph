@@ -149,6 +149,7 @@ class LineConfig:
     #: allowlist explicit -- and the dev-dispatch MCP is structurally absent
     #: from :data:`LINE_MCP_SERVERS`, the in-repo default.
     mcp_servers: tuple[str, ...] | None = None
+    dd_plugin_binding: Path | None = None
 
     @property
     def inbox_alias(self) -> str | None:
@@ -529,6 +530,10 @@ def bind_dd_dependencies(config: LineConfig) -> LineConfig:
         release = Path(__file__).resolve().parents[3]
         plane = DdControlPlane(
             root=root,
+            plugin_binding=config.dd_plugin_binding
+            or Path(
+                os.environ.get("FLEET_GRAPH_DD_PLUGIN_BINDING", str(root / "plugin-binding.json"))
+            ),
             working_directory=str(release),
             executable=str(release / ".venv/bin/fleet-graph"),
         )

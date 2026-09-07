@@ -481,6 +481,7 @@ write_roster() {
   "_comment": "testenv 独立名册：只落 TEST_ROOT，与生产名册零共享（§一·2）。",
   "run_root": "$TEST_ROOT/runs",
   "dd_root": "$TEST_ROOT/dd",
+  "line_environment": {"FLEET_GRAPH_DD_PLUGIN_BINDING": "$TEST_ROOT/config/plugin-binding.json"},
   "probe_via_runtime": false,
   "supervisor_events": false,
     "lines": [

@@ -1266,6 +1266,16 @@ def _goal_interrupt_run(args: argparse.Namespace) -> int:
     from fleet_graph.graphs.runner import LineConfig, resume_goal_line
 
     lines, line_run_root = _load_line_roster(args.lines_config)
+    dd_settings: dict[str, Any] = {}
+    if lines and args.lines_config:
+        with open(args.lines_config, encoding="utf-8") as handle:
+            dd_settings = json.load(handle)
+    dd_root = pathlib.Path(dd_settings.get("dd_root", "/data/fleet-graph/dd"))
+    dd_plugin_binding = pathlib.Path(
+        dd_settings.get("line_environment", {}).get(
+            "FLEET_GRAPH_DD_PLUGIN_BINDING", str(dd_root / "plugin-binding.json")
+        )
+    )
     if args.run_root:
         line_run_root = pathlib.Path(args.run_root)
 
@@ -1284,6 +1294,8 @@ def _goal_interrupt_run(args: argparse.Namespace) -> int:
                 folder_id=folder_id,
                 seat=seat,
                 run_root=line_run_root / folder_id,
+                dd_root=dd_root,
+                dd_plugin_binding=dd_plugin_binding,
                 generation=generation,
                 alias=alias,
             )
