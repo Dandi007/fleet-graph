@@ -20,10 +20,13 @@ from typing import Any
 
 from fleet_graph.bus.client import BusClient, BusConflict, PublishResult
 
-WORK_INDEX = "board:work-index"
+#: R6 (wf-4601c8 §7.2.3): the retired index channel family is renamed to its
+#: engine-neutral successor; B-3 (decommission list batch B3) retires the old
+#: runtime channel itself.
+WORK_INDEX = "board:goal-line"
 WORK_NOTES = "board:work-notes"
 
-CARD_KIND = "work.card.v1"
+CARD_KIND = "work.card.v1"  #: retired: read path only, never published
 NOTE_KIND = "work.note.v1"
 DECISION_KIND = "work.decision.v1"
 DECISION_KIND_V2 = "work.decision.v2"
@@ -251,20 +254,19 @@ def goal_line_card_key(folder_id: str) -> str:
 
 
 def goal_line_card_payload(*, folder_id: str, title: str) -> dict[str, Any]:
-    """The shared ``work.card.v1`` payload of one goal line's board card.
+    """The shared line-card payload of one goal line's board entity.
 
-    ``title`` must be identical across both producers for the same ``folder_id``
-    so the payload is byte-identical and the bus deduplicates rather than
-    conflict-ing. Both the scheduler's parking escalation and the interrupt
-    runtime collapse to ``folder_id`` as the title (the design's sanctioned
-    alternative to threading the roster alias into the line process, which the
-    production launch chain does not deliver), so the two payloads always agree.
+    R6 (wf-4601c8 §7.2.3): the work.card.v1 protocol is retired, so the line
+    card rides the surviving work.note.v1 schema (``card_entity_id`` /
+    ``note`` / ``note_type``) on board:goal-line -- the scheduler's parking
+    escalation, the E2 interrupt runtime and the testenv fixtures all publish
+    this same shape. The body is identical across all producers for the same
+    ``folder_id`` so the bus deduplicates rather than conflict-ing.
     """
     return {
-        "title": title,
-        "status": "doing",
-        "intent": f"goal-line escalation surface for {folder_id}",
-        "work_folder_id": folder_id,
+        "card_entity_id": "",
+        "note": f"goal-line escalation surface for {folder_id} ({title})",
+        "note_type": "progress",
     }
 
 
@@ -312,9 +314,6 @@ class Board:
         self.observability_channel = observability_channel
 
     # --- cards -----------------------------------------------------------
-
-    def publish_card(self, payload: dict[str, Any], idempotency_key: str) -> PublishResult:
-        return self.client.publish(self.index_channel, CARD_KIND, payload, idempotency_key)
 
     def revise_card(
         self,

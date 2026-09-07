@@ -18,7 +18,7 @@ Eight scans, one per event (r4-design §1; E5-E8 consume the read-model):
 - **E4** `TickResult.refusal == TOTAL_CAP_REACHED` -- in-process, straight
   from the tick's own results; deduped per cap window so a breaker that
   holds for an hour is one audit, not sixty.
-- **E5/E6/E7/E8** read-model scans -- a stdlib HTTP client pulls the loopback
+- **E5/E6/E8** read-model scans -- a stdlib HTTP client pulls the loopback
   state read-model (`127.0.0.1:7494`) `/v1/harvestable`, `/v1/lines`,
   `/v1/decisions`, `/v1/enrollments` and derives the events from the *synthetic
   snapshots*, never from heartbeat/terminal/bus/bridge files. The M1 read-model
@@ -63,7 +63,6 @@ from fleet_graph.supervise.events import (
     blocked_decision_event,
     board_question_event,
     cap_breaker_event,
-    decision_swallowed_event,
     enrollment_pending_event,
     heartbeat_stale_event,
     line_fault_event,
@@ -72,7 +71,7 @@ from fleet_graph.supervise.events import (
 DEFAULT_SUPERVISOR_STATE_ROOT = Path("/data/fleet-graph/supervisor")
 DEFAULT_UNIT_PREFIX = "fleet-graph-supervisor"
 
-#: The M1 state read-model the E5/E6/E7 scans consume (loopback).
+#: The M1 state read-model the E5/E6/E8 scans consume (loopback).
 DEFAULT_READ_MODEL_BASE_URL = "http://127.0.0.1:7494"
 
 #: E6 staleness threshold: heartbeat_age_s strictly greater than this.
@@ -154,10 +153,6 @@ class SupervisorLaunchSpec:
     harvest_default_branch: str | None = None
     harvest_deploy: tuple[str, ...] = ()
     repo: str | None = None
-    #: M4 E7: observer-side passthrough of the `supervisor run` E7 goal.md
-    #: direct-write allowlist flag. Default None -- an unconfigured observer
-    #: emits no --e7-allowlist, so the run keeps its deny-all default (零放宽).
-    e7_allowlist_path: str | None = None
     #: M4 wiki 人话账 (交付 B): observer-side passthrough of the `supervisor run`
     #: --wiki enable flag. Default False -- an unconfigured observer emits no
     #: --wiki, so the run keeps deps.wiki=None (零回归).
@@ -203,11 +198,6 @@ class SupervisorLaunchSpec:
         # deny-all 默认拒绝语义零放宽。
         if self.harvest_allowlist_path is not None:
             argv += ["--harvest-allowlist", self.harvest_allowlist_path]
-        # M4 E7: 在 --state-root 之后、与 --harvest-allowlist 并列按需追加
-        # （词法顺序稳定，测试按 `in argv` 断言）。缺省 None → 不发射，E7 直写
-        # 保持 deny-all 默认拒绝语义零放宽（E7WriteAllowlist.default()）。
-        if self.e7_allowlist_path is not None:
-            argv += ["--e7-allowlist", self.e7_allowlist_path]
         if self.harvest_default_branch is not None:
             argv += ["--harvest-default-branch", self.harvest_default_branch]
         for word in self.harvest_deploy:
@@ -232,7 +222,7 @@ class ObserverConfig:
     max_launches_per_tick: int = 2
     max_attempts_per_key: int = 3
     cap_window_seconds: float = DEFAULT_CAP_WINDOW_SECONDS
-    #: The M1 read-model base URL the E5/E6/E7 scans consume. Loopback only;
+    #: The M1 read-model base URL the E5/E6/E8 scans consume. Loopback only;
     #: the fetch explicitly bypasses HTTP(S)_PROXY (see _http_get_json).
     read_model_base_url: str = DEFAULT_READ_MODEL_BASE_URL
     #: E6 threshold: a line is stale when its heartbeat_age_s is strictly
@@ -251,9 +241,6 @@ class ObserverConfig:
     harvest_default_branch: str | None = None
     harvest_deploy: list[str] = field(default_factory=list)
     repo: str | None = None
-    #: M4 E7: 透传给 SupervisorLaunchSpec（argv）。缺省 None → 不发射
-    #: --e7-allowlist，E7 直写保持 deny-all 默认拒绝语义零放宽。
-    e7_allowlist_path: str | None = None
     #: M4 wiki 人话账 (交付 B): 透传给 SupervisorLaunchSpec（argv）。缺省 False
     #: → 不发射 --wiki，supervisor run 保持 deps.wiki=None 零回归。
     wiki: bool = False
@@ -283,7 +270,7 @@ class SupervisorObserver:
         self.units = units
         self.observe = observe
         self.clock = clock
-        #: Synthetic-snapshot fetcher for the E5/E6/E7 read-model scans. Takes
+        #: Synthetic-snapshot fetcher for the E5/E6/E8 read-model scans. Takes
         #: a view path ("/v1/lines") and returns the parsed JSON body or None
         #: on any failure (fail-open). Defaults to the stdlib HTTP client
         #: against config.read_model_base_url; tests inject a fake snapshot.
@@ -315,11 +302,6 @@ class SupervisorObserver:
             "board_seq": raw.get("board_seq"),
             "attempts": dict(attempts) if isinstance(attempts, dict) else {},
         }
-        baseline = raw.get("e7_baseline")
-        if isinstance(baseline, list):
-            # E7 水位（spec 交付 A.1）：已观测（已审计）的 swallowed
-            # source_message_id 有序列表。只认合法列表；键缺失/损坏 = 首跑语义。
-            state["e7_baseline"] = [str(x) for x in baseline]
         return state
 
     def _write_state(self, state: dict[str, Any]) -> None:
@@ -353,7 +335,6 @@ class SupervisorObserver:
             # so deferring them to the next tick is free, whereas the board
             # cursor should only advance past questions we actually handled.
             events: list[SupervisorEvent] = []
-            new_e7: dict[str, str] = {}
             try:
                 events.extend(self._terminal_events(folder_ids, terminal_reader))
             except Exception as exc:  # fail open
@@ -363,12 +344,10 @@ class SupervisorObserver:
             except Exception as exc:  # fail open
                 actions.append({"source": "cap", "error": repr(exc)[:200]})
             try:
-                # E5-E8 read-model scans share the same budget + attempt
-                # counters as E2/E3/E4; an unreachable :7494 is a skipped
-                # scan (an action note), never a dead tick. The decisions
-                # branch also returns which E7 ids are new this tick so the
-                # watermark only advances past ids we actually handled.
-                read_events, new_e7, read_notes = self._read_model_events(state, now=now)
+                # E5/E6/E8 read-model scans share the same budget + attempt
+                # counters as E2/E3/E4; an unreachable read model is a skipped
+                # scan (an action note), never a dead tick.
+                read_events, _new_e7_unused, read_notes = self._read_model_events(state, now=now)
                 events.extend(read_events)
                 actions.extend(read_notes)
             except Exception as exc:  # fail open
@@ -382,14 +361,6 @@ class SupervisorObserver:
                 actions.append(action)
                 if action["action"].startswith("launched"):
                     launched += 1
-                # E7 水位推进纪律（spec 交付 A.4，与 E1 游标同）：只有真正处置
-                # 的新 id（launched / skipped:receipt_exists /
-                # skipped:attempts_exhausted）才推进水位；deferred:tick_budget
-                # 或 skipped:audit_in_flight 未处置，下一 tick 重扫重派。
-                source_id = new_e7.get(event.key)
-                if source_id is not None:
-                    self._advance_e7_baseline(state, source_id, action)
-
             # E1 last, with whatever budget remains. The cursor advances only
             # past messages that were handled (launched, skipped, or not an
             # event); a question deferred by the budget is re-read next tick.
@@ -447,18 +418,18 @@ class SupervisorObserver:
     def _read_model_events(
         self, state: dict[str, Any], *, now: float
     ) -> tuple[list[SupervisorEvent], dict[str, str], list[dict[str, Any]]]:
-        """E5/E6/E7/E8 from the read-model's synthetic snapshots (:7494).
+        """E5/E6/E8 from the read-model's synthetic snapshots (:7494).
 
         The M1 read-model is the only data face these events have: no direct
         heartbeat/terminal/bus/bridge file is re-read here (spec: 「这三事件
         禁止重扫 heartbeat/terminal/bus/bridge 文件（一律经 :7494）」).
-        Every view fetch fails open -- an unreachable :7494 skips that scan,
-        never the tick.
+        Every view fetch fails open -- an unreachable read model skips that
+        scan, never the tick. R6 (wf-4601c8 §7.2.1): the E7 decision-swallowed
+        scan is gone with the goal.md direct-write reactor.
 
-        Returns ``(events, new_e7, notes)``: the derived events, a mapping of
-        each new E7 event key -> its ``source_message_id`` (so ``after_tick``
-        can advance the watermark only past ids actually handled), and any
-        action notes (e.g. ``cursor_adopted:e7_baseline``).
+        Returns ``(events, new_e7, notes)``; ``new_e7`` is retained as an
+        always-empty mapping only for shape compatibility -- no E7 events are
+        minted any more.
         """
         events: list[SupervisorEvent] = []
         new_e7: dict[str, str] = {}
@@ -480,13 +451,16 @@ class SupervisorObserver:
                 except (TypeError, ValueError):
                     continue
                 # E6: stale heartbeat on a line that has not terminal-ed and
-                # is not parked (a parked line waiting on a decision is not a
-                # stalled line; the heartbeat restores when it wakes).
+                # is not waiting on a decision (a decision wait is not a
+                # stalled line; the heartbeat restores when it wakes). R6
+                # (wf-4601c8 §7.2.4) removed the derived ``parked`` field from
+                # the /v1/lines projection, so the wait reads off the wake
+                # fact the projection still carries.
                 if age <= self.config.heartbeat_stale_threshold_seconds:
                     continue
                 if line.get("terminal") is not None:
                     continue
-                if line.get("parked") is True:
+                if (line.get("wake_facts") or {}).get("waiting_on") == "decision":
                     continue
                 events.append(
                     heartbeat_stale_event(
@@ -496,42 +470,6 @@ class SupervisorObserver:
                         str(line.get("phase") or ""),
                     )
                 )
-
-        decisions = self.read_model("/v1/decisions")
-        if isinstance(decisions, dict):
-            swallowed = [
-                decision
-                for decision in decisions.get("decisions") or []
-                if isinstance(decision, dict)
-                and decision.get("state") == "swallowed"
-                and str(decision.get("source_message_id") or "")
-            ]
-            baseline = state.get("e7_baseline")
-            if baseline is None:
-                # First run adopts the current head as its baseline, the same
-                # honest reading as _board_scan (E1 board_question): swallowed
-                # decisions from before we were watching are the human's
-                # existing backlog, not events we observed. This tick emits no
-                # E7 at all (spec 交付 A.2).
-                adopted = [str(decision["source_message_id"]) for decision in swallowed]
-                state["e7_baseline"] = adopted
-                notes.append(
-                    {
-                        "source": "read_model",
-                        "action": f"cursor_adopted:e7_baseline=n={len(adopted)}",
-                    }
-                )
-            else:
-                known = set(baseline)
-                for decision in swallowed:
-                    source_message_id = str(decision["source_message_id"])
-                    if source_message_id in known:
-                        continue
-                    event = decision_swallowed_event(
-                        source_message_id, str(decision.get("reason") or "")
-                    )
-                    events.append(event)
-                    new_e7[event.key] = source_message_id
 
         harvestable = self.read_model("/v1/harvestable")
         if isinstance(harvestable, dict):
@@ -604,26 +542,6 @@ class SupervisorObserver:
         except (ValueError, TypeError):
             return None
         return max(0.0, now - submitted_epoch)
-
-    def _advance_e7_baseline(
-        self, state: dict[str, Any], source_id: str, action: dict[str, Any]
-    ) -> None:
-        """Advance the E7 watermark past a *handled* new id only (spec 交付 A.4).
-
-        Only launched / skipped:receipt_exists / skipped:attempts_exhausted
-        count as handled; deferred:tick_budget and skipped:audit_in_flight do
-        not, so the id is re-scanned and re-dispatched next tick.
-        """
-        outcome = action.get("action", "")
-        if not (
-            outcome.startswith("launched")
-            or outcome.startswith("skipped:receipt_exists")
-            or outcome.startswith("skipped:attempts_exhausted")
-        ):
-            return
-        baseline = state.get("e7_baseline")
-        if isinstance(baseline, list) and source_id not in baseline:
-            baseline.append(source_id)
 
     def _board_scan(self, state: dict[str, Any], *, remaining: int) -> list[dict[str, Any]]:
         if self.bus is None:
@@ -740,7 +658,6 @@ class SupervisorObserver:
             harvest_default_branch=self.config.harvest_default_branch,
             harvest_deploy=tuple(self.config.harvest_deploy),
             repo=self.config.repo,
-            e7_allowlist_path=self.config.e7_allowlist_path,
             wiki=self.config.wiki,
         )
 
@@ -834,10 +751,6 @@ def reset_supervisor_event(
     No daemon restart is required: the observer reloads the cursor file at the
     start of every tick (`after_tick` -> `_load_state`).
 
-    E7 (spec 交付 A.5): 需重审某历史 E7 key 时，删除 cursor 中的
-    `e7_baseline`（整体删 cursor 文件仍为文档化 reset）——水位重建即重扫当前
-    快照全部 swallowed。本命令不代删该键：E7 历史 key 重审是显式水位重建，
-    与 receipt/attempt 的机械语义不同。
     """
     summary: dict[str, Any] = {"key": key}
 

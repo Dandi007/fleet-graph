@@ -7,18 +7,15 @@ transient-unit launches, and read-side assembly from git + checkpoint + run
 artifacts all happen right here.
 
 Tool surface (wf-a08949 goal.md 2026-08-27 use-case-family ruling; wf-13ff9e
-plan.md §1 R1-d, extended by R1-c): the consumed use-case family does work --
-``development_list / get / events / evidence / create / start / gate /
-reconfigure``.  ``reconfigure`` is the R1-c environment/contract failure exit:
-on the legacy engine it existed in name but was a permanent 409 once a
-development FAILED; here it is real, scoped by schema to the acceptance
-context alone, and pairs with ``start`` launching a fresh generation.  The
-remaining legacy tool names stay registered so every historical caller gets an
-explicit, machine-readable ``NOT_SUPPORTED`` refusal instead of an unknown-tool
-error, but they perform no work: ``steer`` was a permanent 409 on the legacy
-engine and is not replicated; ``relock`` / ``control`` / ``deployment_*``
-belong to the legacy engine's patch surface and are outside the equivalence
-scope.
+plan.md §1 R1-d, extended by R1-c; R6 removal per wf-4601c8 §7.1.7): the
+consumed use-case family does work -- ``development_list / get / events /
+evidence / create / start / gate / reconfigure``.  ``reconfigure`` is the R1-c
+environment/contract failure exit: on the legacy engine it existed in name but
+was a permanent 409 once a development FAILED; here it is real, scoped by
+schema to the acceptance context alone, and pairs with ``start`` launching a
+fresh generation.  The legacy patch-surface names (``steer`` / ``relock`` /
+``control`` / ``deployment_*``) are gone from the surface entirely -- a name
+that never does work here is simply not a tool.
 
 Two contracts the tools themselves enforce:
 
@@ -39,6 +36,7 @@ import logging
 import os
 import socket
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +47,7 @@ from fleet_graph.dd.control_plane import (
 )
 from fleet_graph.dd.reconcile import ReconcileError, ReconcileSource, WorkFolderReconciler
 from fleet_graph.dd.work_folder_store import governed_work_folder_store
+from fleet_graph.state.run_artifacts import iso
 
 logger = logging.getLogger(__name__)
 
@@ -207,21 +206,11 @@ class GateAutoResumer:
         self._stop.set()
 
 
-# Legacy tool names that are registered but refuse with an explicit error
-# structure instead of pretending the legacy semantics exist here.
-# name -> reason, quoted in the refusal payload.
-NOT_SUPPORTED_TOOLS: dict[str, str] = {
-    "development_steer": ("steer was a permanent 409 on the legacy engine and is not replicated"),
-    "development_relock": "relock belongs to the legacy engine's patch surface",
-    "development_control": (
-        "control is outside the consumed use-case family "
-        "(create/start/get/list/events/evidence/gate)"
-    ),
-    "deployment_create": "deployment_* belongs to the legacy engine's patch surface",
-    "deployment_status": "deployment_* belongs to the legacy engine's patch surface",
-}
-
-NOT_SUPPORTED_RULING = "wf-a08949 goal.md 2026-08-27 use-case-family ruling"
+# R6 (wf-4601c8 §7.1.7): the five legacy NOT_SUPPORTED stub tools (the steer /
+# relock / control / deployment_* family) are removed from the surface
+# entirely -- an unknown-tool error is now the correct, machine-readable
+# answer for a name that never does work here. The consumed use-case family
+# below is the whole surface.
 
 # The consumed use-case family: the only tools that do real work.
 SUPPORTED_TOOLS: frozenset[str] = frozenset(
@@ -244,6 +233,57 @@ SUPPORTED_TOOLS: frozenset[str] = frozenset(
 #: part of the development use-case family -- it drives a work-folder source seam,
 #: not the in-process development control plane.
 WORK_FOLDER_TOOLS: frozenset[str] = frozenset({"wf_reconcile"})
+
+#: R2 图合一 外门：``development_create`` 在 MCP 面上只留给监督者。线内派单已
+#: 降为图边直调内部函数（graphs/dd_subgraph.ControlPlaneGateway），任何经 MCP
+#: 到达的派单请求都必须自报 principal，且只有监督者 principal 通过；其余稳定
+#: 拒绝（结构化拒绝码 + 拒绝留痕）。环境变量仅供部署绑定监督面身份，测试可替换。
+SUPERVISOR_PRINCIPAL_ENV = "FLEET_GRAPH_SUPERVISOR_PRINCIPAL"
+SUPERVISOR_PRINCIPAL_DEFAULT = "fleet-supervisor"
+OUTER_GATE_REFUSAL_CODE = "OUTER_GATE_NON_SUPERVISOR"
+#: The durable refusal trace file (留痕), relative to the control plane root.
+OUTER_GATE_REFUSALS_FILE = "outer-gate-refusals.jsonl"
+
+
+def supervisor_principal(environ: dict[str, str] | None = None) -> str:
+    """The one principal the outer gate admits (env-bindable, default fixed)."""
+    return (environ if environ is not None else os.environ).get(
+        SUPERVISOR_PRINCIPAL_ENV
+    ) or SUPERVISOR_PRINCIPAL_DEFAULT
+
+
+def trace_outer_gate_refusal(
+    control: Any,
+    *,
+    principal: str,
+    supervisor: str,
+    tool: str = "development_create",
+) -> None:
+    """Append one durable refusal row (留痕) beside the control plane's records.
+
+    Best effort by contract: a trace that cannot land never changes the
+    refusal -- the structured ToolError is the gate, this is its audit line.
+    """
+    root = getattr(control, "root", None)
+    if root is None:
+        return
+    row = json.dumps(
+        {
+            "code": OUTER_GATE_REFUSAL_CODE,
+            "tool": tool,
+            "principal": principal,
+            "supervisor": supervisor,
+            "at": iso(time.time()),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    try:
+        path = Path(root) / OUTER_GATE_REFUSALS_FILE
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(row + "\n")
+    except OSError:
+        pass
 
 
 def port_is_available(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> bool:
@@ -288,31 +328,6 @@ def build_mcp_server(
         except ControlPlaneError as exc:
             raise ToolError(json.dumps(exc.to_dict(), sort_keys=True)) from exc
 
-    def refuse(tool: str) -> dict[str, Any]:
-        """Raise the explicit NOT_SUPPORTED structure for a legacy-only tool."""
-        raise ToolError(
-            json.dumps(
-                {
-                    "code": "NOT_SUPPORTED",
-                    "tool": tool,
-                    "reason": NOT_SUPPORTED_TOOLS[tool],
-                    "ruling": NOT_SUPPORTED_RULING,
-                    "supported_tools": sorted(SUPPORTED_TOOLS),
-                },
-                sort_keys=True,
-            )
-        )
-
-    @mcp.tool()
-    def deployment_create(request: dict[str, Any]) -> dict[str, Any]:
-        """NOT_SUPPORTED: legacy patch-surface tool, refuses explicitly."""
-        return refuse("deployment_create")
-
-    @mcp.tool()
-    def deployment_status(operation_id: str) -> dict[str, Any]:
-        """NOT_SUPPORTED: legacy patch-surface tool, refuses explicitly."""
-        return refuse("deployment_status")
-
     @mcp.tool()
     def development_list(
         state: str | None = None,
@@ -354,30 +369,52 @@ def build_mcp_server(
 
     @mcp.tool()
     def development_create(
+        principal: str,
         repo_path: str,
         target_base: str | None = None,
         spec_text: str | None = None,
         spec_path: str | None = None,
         dispatched_by: str = "",
         timeouts: dict[str, int] | None = None,
+        stage_models: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Admit one development. Everything else is derived server-side.
+        """Admit one development. OUTER GATE: supervisor principal only.
 
-        Takes a dedicated git worktree (or clone) path, an optional target
-        base (defaults to the repo's HEAD), the approved spec as text or
-        as a path, and the bounded principal that dispatched the development
-        (a line folder or a human subject) as `dispatched_by`. The server
-        derives the development id, freezes the spec and target base into the
-        bootstrap commit, computes the H0 handoff and its chain-root digest,
-        derives the durable ref and the acceptance argv (from the spec's
-        ```dd-acceptance block), and publishes the work board card. Idempotent
-        for the same (repo, spec, base).
+        R2 图合一: the line's own dispatch path is the graph edge calling the
+        internal ``development_create`` function in-process, so anything that
+        arrives on THIS MCP tool must be the supervisor (the outer gate). The
+        caller declares itself with `principal`; any other principal is
+        refused with a stable structured code and the refusal is traced
+        durably beside the control plane's records.
 
-        `timeouts` optionally overrides the per-stage run fence
-        (`{stage_id: positive seconds}`, e.g. `{"implement": 7200}`); an
-        unknown stage id is refused. Not passing it keeps the 3600s default
-        for every stage -- existing behavior unchanged.
+        Admission is unchanged for the admitted caller: server-side
+        derivation from a repo path, an optional target base, the approved
+        spec (text or path), the bounded dispatching principal
+        (`dispatched_by`), optional per-stage `timeouts` and the M4
+        `stage_models` seat channel. Idempotent for the same (repo, spec,
+        base).
         """
+        supervisor = supervisor_principal()
+        if (principal or "").strip() != supervisor:
+            trace_outer_gate_refusal(
+                control, principal=(principal or "").strip(), supervisor=supervisor
+            )
+            raise ToolError(
+                json.dumps(
+                    {
+                        "code": OUTER_GATE_REFUSAL_CODE,
+                        "tool": "development_create",
+                        "principal": (principal or "").strip(),
+                        "reason": (
+                            "development_create is the outer gate: only the "
+                            "supervisor principal may dispatch over MCP; lines "
+                            "dispatch through the graph edge (internal function)"
+                        ),
+                        "supervisor": supervisor,
+                    },
+                    sort_keys=True,
+                )
+            )
         return call(
             "create",
             repo_path=repo_path,
@@ -386,6 +423,7 @@ def build_mcp_server(
             spec_path=spec_path,
             dispatched_by=dispatched_by,
             timeouts=timeouts,
+            stage_models=stage_models,
         )
 
     @mcp.tool()
@@ -485,18 +523,6 @@ def build_mcp_server(
             ) from exc
 
     @mcp.tool()
-    def development_steer(
-        development_id: str,
-        instruction: str,
-        idempotency_key: str,
-        expected_revision: int,
-        reason: str = "",
-        urgency: str = "next_safe_boundary",
-    ) -> dict[str, Any]:
-        """NOT_SUPPORTED: permanent 409 on the legacy engine, refuses explicitly."""
-        return refuse("development_steer")
-
-    @mcp.tool()
     def development_reconfigure(
         development_id: str,
         acceptance_env: dict[str, str] | None = None,
@@ -528,28 +554,6 @@ def build_mcp_server(
             setup=setup,
         )
 
-    @mcp.tool()
-    def development_control(
-        development_id: str,
-        action: str,
-        idempotency_key: str,
-        expected_revision: int,
-        reason: str = "",
-    ) -> dict[str, Any]:
-        """NOT_SUPPORTED: outside the consumed use-case family, refuses explicitly."""
-        return refuse("development_control")
-
-    @mcp.tool()
-    def development_relock(
-        development_id: str,
-        plugin_commit: str,
-        idempotency_key: str,
-        expected_revision: int,
-        reason: str = "",
-    ) -> dict[str, Any]:
-        """NOT_SUPPORTED: legacy patch-surface tool, refuses explicitly."""
-        return refuse("development_relock")
-
     return mcp
 
 
@@ -561,7 +565,6 @@ def serve(
     plugin_binding: str | None = None,
     working_directory: str | None = None,
     executable: str | None = None,
-    stage_models: dict[str, str] | None = None,
     auto_resume: bool | None = None,
     auto_resume_interval: float | None = None,
     work_folder_root: str | None = None,
@@ -577,8 +580,6 @@ def serve(
         overrides["working_directory"] = working_directory
     if executable:
         overrides["executable"] = executable
-    if stage_models:
-        overrides["stage_models"] = stage_models
     control = DdControlPlane(**overrides)
     # B3 binding: the concrete wf_reconcile source is bound here, not left
     # unbound (RECONCILE_SOURCE_UNBOUND). The root comes from the flag or the
@@ -616,8 +617,10 @@ __all__ = [
     "DEFAULT_AUTO_RESUME_INTERVAL",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
-    "NOT_SUPPORTED_RULING",
-    "NOT_SUPPORTED_TOOLS",
+    "OUTER_GATE_REFUSALS_FILE",
+    "OUTER_GATE_REFUSAL_CODE",
+    "SUPERVISOR_PRINCIPAL_DEFAULT",
+    "SUPERVISOR_PRINCIPAL_ENV",
     "SUPPORTED_TOOLS",
     "WORK_FOLDER_ROOT_ENV",
     "WORK_FOLDER_TOOLS",
@@ -627,4 +630,6 @@ __all__ = [
     "build_mcp_server",
     "port_is_available",
     "serve",
+    "supervisor_principal",
+    "trace_outer_gate_refusal",
 ]

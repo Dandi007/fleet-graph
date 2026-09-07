@@ -2,14 +2,16 @@
 
 The resolver maps a decision to *zero or more* waiting owners; it never talks
 to an owner directly. Owner access is behind one seam so the same bridge runs
-against the real dd control plane in production and against an isolated fake
-owner in the process drill (`scripts/e1_decision_bridge_acceptance.py`), with
-the same contract on both sides:
+against the real roster in production and against an isolated fake owner in
+the process drill (`scripts/e1_decision_bridge_acceptance.py`), with the same
+contract on both sides. R3 (S11): there is no dd owner any more -- a dd gate
+is released only by the dispatching line's own graph gate node, so the bridge
+recovers parked goal lines only.
 
 - :meth:`OwnerSource.discover` answers "which owners are waiting on this
   question note right now?", re-reading the owner's card / question /
-  generation / current state from its own authoritative source (the dd
-  admission record for a development, the parked line state for a line).
+  generation / current state from its own authoritative source (the parked
+  line state for a line).
 - :meth:`OwnerSource.discover_all` lists every currently-waiting owner, which
   is what the resolver needs: the real bus refs endpoint is reverse-only, so
   a decision's question is found by checking each waiting question in reverse.
@@ -33,11 +35,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-#: Owner kinds. ``dd`` recovers through the dd gate's valueless resume; ``http``
-#: is the isolated-drill owner the acceptance script hosts; ``line`` names the
-#: registered line entry (recovery through a controlled entry, never a raw
-#: launch).
-OWNER_KIND_DD = "dd"
+#: Owner kinds. ``http`` is the isolated-drill owner the acceptance script
+#: hosts; ``line`` names the registered line entry (recovery through a
+#: controlled entry, never a raw launch). R3: there is no dd owner -- a dd
+#: gate is released only by the dispatching line's own graph gate node (S11).
 OWNER_KIND_LINE = "line"
 OWNER_KIND_HTTP = "http"
 
@@ -58,11 +59,6 @@ class OwnerTarget:
     question_note_id: str
     card_entity_id: str
     state: str
-    #: The bounded principal (a line folder or a human subject) that dispatched
-    #: this owner. Carried on dd targets so a consumed dd decision can wake the
-    #: parked line that dispatched it (the 4th wake fact); empty means no
-    #: dispatch provenance was recorded.
-    dispatched_by: str = ""
 
 
 @dataclass(frozen=True)
@@ -85,103 +81,6 @@ class OwnerSource(Protocol):
     def discover_all(self) -> list[OwnerTarget]: ...
 
     def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult: ...
-
-
-class DdOwnerSource:
-    """Recovery through the dd gate's valueless resume.
-
-    ``discover`` lists ``awaiting_gate`` developments whose pending question
-    note matches, re-reading the admission record for card/generation/state --
-    the same facts the gate itself holds. ``resume`` calls
-    ``DdControlPlane.gate(development_id, resume=True)``, which re-reads the
-    board itself and carries no verdict.
-    """
-
-    def __init__(self, dd_root: str | Path = "/data/fleet-graph/dd") -> None:
-        self.dd_root = Path(dd_root)
-
-    def _control_plane(self) -> Any:
-        from fleet_graph.dd.control_plane import DdControlPlane
-
-        return DdControlPlane(root=self.dd_root)
-
-    def discover(self, question_note_id: str) -> list[OwnerTarget]:
-        return [
-            target for target in self.discover_all() if target.question_note_id == question_note_id
-        ]
-
-    def discover_all(self) -> list[OwnerTarget]:
-        # A control-plane read failure *raises* rather than reading as "no
-        # owner": the resolver turns that into a structured discovery-failure
-        # no-op, so a control-plane outage is distinguishable from a genuine
-        # zero-owner decision instead of silently sealing a no-waiting-owner
-        # receipt and advancing the cursor.
-        rows = self._control_plane().list(state="awaiting_gate", limit=1000).get("developments", [])
-        targets: list[OwnerTarget] = []
-        for row in rows:
-            awaiting = row.get("awaiting") or {}
-            question_note_id = str(awaiting.get("question_note_id") or "")
-            if not question_note_id:
-                continue
-            card_entity_id = str(awaiting.get("card_entity_id") or "")
-            if not card_entity_id:
-                record = self._control_plane().get(str(row["development_id"]))
-                card_entity_id = str(record.get("card_entity_id") or "")
-            targets.append(
-                OwnerTarget(
-                    kind=OWNER_KIND_DD,
-                    id=str(row["development_id"]),
-                    generation=int(row.get("generation") or 1),
-                    question_note_id=question_note_id,
-                    card_entity_id=card_entity_id,
-                    state=str(row.get("state") or ""),
-                    #: The bounded principal that dispatched this development
-                    #: (a line folder or a human subject), from the authoritative
-                    #: status row -- the same fact the gate holds. Carried so a
-                    #: consumed decision can wake the parked line that dispatched
-                    #: this dd single (the 4th wake fact).
-                    dispatched_by=str(row.get("dispatched_by") or ""),
-                )
-            )
-        return targets
-
-    def dispatched_by(self, development_id: str) -> str:
-        """The development's `dispatched_by` provenance, straight from the
-        admission record. Empty when absent. A cheap read (one file), so the
-        bridge can attribute a consumed decision to the line that dispatched it
-        even on the replay path, where the reconstructed target carries no
-        provenance.
-        """
-        record_path = self.dd_root / development_id / "record.json"
-        try:
-            record = json.loads(record_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return ""
-        return str(record.get("dispatched_by") or "")
-
-    def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
-        from fleet_graph.dd.control_plane import ControlPlaneError
-
-        try:
-            result = self._control_plane().gate(target.id, resume=True, action_key=action_key)
-        except ControlPlaneError as exc:
-            if exc.code == "ALREADY_RUNNING":
-                # The gate is already advancing; the decision is in effect.
-                return OwnerResult(RESUME_ALREADY_RESUMED, f"{exc.code}: {exc.detail}")
-            return OwnerResult(RESUME_REFUSED, f"{exc.code}: {exc.detail}")
-        if result.get("already_resumed"):
-            # The owner's durable (action_key, generation) unique constraint
-            # already fired: this recovery is already in effect for this
-            # generation, so it is the same logical success, not a second one.
-            return OwnerResult(
-                RESUME_ALREADY_RESUMED,
-                "durable action-key dedup: recovery already in effect for this generation",
-            )
-        if not result.get("resume"):
-            return OwnerResult(
-                RESUME_ALREADY_RESUMED, json.dumps(result, ensure_ascii=False, sort_keys=True)
-            )
-        return OwnerResult(RESUME_RESUMED, json.dumps(result, ensure_ascii=False, sort_keys=True))
 
 
 class HttpOwnerSource:
@@ -389,25 +288,6 @@ class LineOwnerSource:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(cleared, sort_keys=True), encoding="utf-8")
 
-    def record_decision_consumed(self, folder_id: str, at: float) -> bool:
-        """Wake fact 4: mark that a ``work.decision.v1`` for a dd development
-        this line dispatched has been consumed.
-
-        Best-effort and never raises: this is a mechanical fact the scheduler
-        reads on its next tick to wake the parked line (``_check_wake``). The
-        bridge must never fail a decision's terminal seal because a wake-fact
-        write could not land. Returns whether the fact was recorded.
-        """
-        state = self._read_state(folder_id)
-        state["dispatched_decision_consumed_at"] = at
-        try:
-            path = self._stall_path(folder_id)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
-        except OSError:
-            return False
-        return True
-
 
 class CompositeOwnerSource:
     """Fan a discovery out to several owners and dispatch a resume by kind.
@@ -437,54 +317,20 @@ class CompositeOwnerSource:
             targets.extend(source.discover_all())
         return targets
 
-    def dispatched_by(self, development_id: str) -> str:
-        """The dd admission record's `dispatched_by`, routed to the dd owner.
-
-        Exists so the bridge can attribute a consumed decision to the line that
-        dispatched it even on the replay path, where the reconstructed target
-        carries no provenance (see ``DdOwnerSource.dispatched_by``). The line
-        owner has nothing to say about dd provenance, so only the dd source is
-        asked; a missing dd source reads as no provenance.
-        """
-        source = self.kinds.get(OWNER_KIND_DD)
-        read = getattr(source, "dispatched_by", None)
-        if read is None:
-            return ""
-        try:
-            return str(read(development_id) or "")
-        except Exception:  # a provenance read must never break a resume
-            return ""
-
     def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
         source = self.kinds.get(target.kind)
         if source is None:
             return OwnerResult(RESUME_REFUSED, f"no owner source for kind {target.kind!r}")
         return source.resume(target, action_key)
 
-    def record_decision_consumed(self, folder_id: str, at: float) -> bool:
-        """Wake fact 4, routed to the line owner: record that a decision for a
-        dd development this line dispatched was consumed. The scheduler reads
-        the fact on its next tick and wakes the parked line. A missing line
-        owner reads as nothing recorded (best-effort)."""
-        source = self.kinds.get(OWNER_KIND_LINE)
-        write = getattr(source, "record_decision_consumed", None)
-        if write is None:
-            return False
-        try:
-            return bool(write(folder_id, at))
-        except Exception:  # a wake-fact write must never break a resume
-            return False
-
 
 __all__ = [
-    "OWNER_KIND_DD",
     "OWNER_KIND_HTTP",
     "OWNER_KIND_LINE",
     "RESUME_ALREADY_RESUMED",
     "RESUME_REFUSED",
     "RESUME_RESUMED",
     "CompositeOwnerSource",
-    "DdOwnerSource",
     "HttpOwnerSource",
     "LineOwnerSource",
     "OwnerResult",

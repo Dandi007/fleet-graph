@@ -69,13 +69,14 @@ from fleet_graph.goal_enroll.contract import (
     GoalEnrollError,
     iso_timestamp,
 )
+from fleet_graph.goal_enroll.freeze import acceptance_block_digest
 
 GOAL_MD = "goal.md"
 GOLDEN_ORDER_MD = "golden-order.md"
 
 #: Gate 6's token path template -- must agree with bus/tokens.py's
 #: LINE_TOKEN_PATH_TEMPLATE (the fleet's own credential layout).
-_ALIAS_TOKEN_TEMPLATE = "/data/ronin/secrets/{alias}.token"
+_ALIAS_TOKEN_TEMPLATE = "/data/fleet-graph/secrets/{alias}.token"
 
 #: A short liveness probe budget. The probe only proves a command can start,
 #: so a long-running declared command is timed out and still counted as
@@ -223,7 +224,7 @@ class GoalEnrollValidator:
 
     Gates 6 and 7 are the application-face gates the spec adds. They take
     injectable seams so the validator stays deterministic and self-contained:
-    the alias-token ownership check (the ``/data/ronin/secrets/<alias>.token``
+    the alias-token ownership check (the ``<secrets-root>/<alias>.token``
     ownership, realpath-canonicalized) and the alias-uniqueness check (against
     the real roster and the pending queue) are both supplied by the caller --
     the service wires them to the real token store and the queue/roster
@@ -355,6 +356,10 @@ class GoalEnrollValidator:
             "max_rounds": max_rounds,
             "briefing_version": self._briefing_version,
             "acceptance_argv": tuple(tuple(argv) for argv in acceptance_argv),
+            # M4 acceptance-command freeze: pin the carrier's dd-acceptance
+            # block digest at enlistment. The goal.md is already in hand from
+            # gate 2, so the pin is exact -- not recomputed from a re-read.
+            "acceptance_digest": acceptance_block_digest(goal_md),
             "liveness": tuple(liveness),
             "lint_warnings": tuple(lint_warnings),
             "mechanism": GOAL_ENROLL_MECHANISM,
@@ -366,7 +371,7 @@ def _default_alias_token_check() -> Any:
     """Gate 6's production default: the alias's token is *owned* by the line.
 
     Reuses the exact template bus/tokens.py resolves (``LINE_TOKEN_PATH_TEMPLATE``
-    = ``/data/ronin/secrets/{alias}.token``) so the validator and the line's
+    = ``<secrets-root>/{alias}.token``) so the validator and the line's
     inbox/board credential agree on the same path -- and honours the
     ``FLEET_GRAPH_LINE_TOKEN_PATH`` env override (drills use it to point at a
     scratch secrets dir). The check is **ownership**, not presence: the token

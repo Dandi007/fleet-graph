@@ -27,10 +27,16 @@ WorkingDirectory=/data/apps/fleet-graph/current
 # 2026-09-03 用户拍板 impl=glm-5.3-flash / cr=glm-5.3 / fr=claude-opus-5，并要求
 # 「用想用的模型跑起来」。三档一律落在 agent-runtime 的 role registry
 # (profiles/roles/{implementer,continuous_reviewer,final_reviewer}.yaml)，本 unit
-# 不再带 --stage-model —— 那是第二个模型来源，会静默盖掉 role registry：8/29 起
-# fr 的出厂座位写着 claude-opus-5 却整整五天跑 deepseek-v4-pro，就是被这两行盖的。
+# 从不带任何 stage-model 键 —— 那是第二个模型来源，会静默盖掉 role registry：8/29 起
+# fr 的出厂座位写着 claude-opus-5 却整整五天跑 deepseek-v4-pro，就是被它盖的。
 # 判据 scripts/verify-lim.sh 07 seat-single-source 直接读本进程 cmdline，出现
-# --stage-model 即判 FAIL。要换档位改 role registry，不要在这里加回来。
+# stage-model 即判 FAIL。要换档位改 role registry，不要在这里加回来。
+# M4（wf-8d9737）收尾：座位是每单的，不归服务。development_create 的 stage_models
+# 形参把座位冻进 record.json（seats/seats_source），launch 只读 record——服务级
+# 覆盖键就此退役。
+# R6（wf-4601c8 §7.1.8）：`--stage-model` 键已从 dd serve/dd run 全部 launch 路径
+# 删除——argparse 不再认识它，传入即 unknown-argument 退出非零。座位唯一来源 =
+# record.seats（role registry 派生 + line-explicit development_create 覆盖）。
 ExecStart=/data/apps/fleet-graph/current/.venv/bin/fleet-graph dd serve \
     --host 127.0.0.1 --port 5610
 Restart=always

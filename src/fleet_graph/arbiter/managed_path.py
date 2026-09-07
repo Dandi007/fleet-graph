@@ -221,7 +221,7 @@ class _ManagedFakeReasoner:
                 ),
                 "evidence_refs": ["e1"],
                 "consequence": "reversible; nothing is merged",
-                "needs_human": True,
+                "escalation_target": "needs_evidence",
             },
             {"recommendation": "blocked diagnosis", "decision": "approve", "verdict": "release"},
         ]

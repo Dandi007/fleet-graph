@@ -225,33 +225,32 @@ class TestTheDdSubcommand:
         assert _dd_run(args) == 0
         assert seen["config"].target_base_commit == base
 
-    def test_stage_model_overrides_accumulate(self) -> None:
-        args = build_parser().parse_args(
-            [
-                "dd",
-                "run",
-                "--development",
-                "d",
-                "--workspace",
-                "/tmp/w",
-                "--plugin-binding",
-                "/tmp/b.json",
-                "--remote-url",
-                "u",
-                "--remote-ref",
-                "refs/heads/main",
-                "--root-digest",
-                "sha256:" + "a" * 64,
-                "--stage-model",
-                "continuous_review=deepseek-v4-pro",
-                "--stage-model",
-                "final_review=claude-opus-5",
-            ]
-        )
-        assert dict(p.split("=", 1) for p in args.stage_model) == {
-            "continuous_review": "deepseek-v4-pro",
-            "final_review": "claude-opus-5",
-        }
+    def test_stage_model_key_is_removed(self) -> None:
+        """R6 (wf-4601c8 §7.1.8): the `--stage-model` cmdline override key is
+        gone from every launch path. argparse rejects it as an unknown
+        argument -- a stale unit template or launch script fails loudly,
+        never silently injects a second seat source."""
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(
+                [
+                    "dd",
+                    "run",
+                    "--development",
+                    "d",
+                    "--workspace",
+                    "/tmp/w",
+                    "--plugin-binding",
+                    "/tmp/b.json",
+                    "--remote-url",
+                    "u",
+                    "--remote-ref",
+                    "refs/heads/main",
+                    "--root-digest",
+                    "sha256:" + "a" * 64,
+                    "--stage-model",
+                    "continuous_review=deepseek-v4-pro",
+                ]
+            )
 
     def test_stage_timeouts_accumulate_as_whole_seconds(self) -> None:
         args = build_parser().parse_args(
@@ -446,21 +445,13 @@ class TestTheOtherSubcommandsStillParse:
         )
         assert args.generation == 2
 
-    def test_line_revive_parses(self) -> None:
-        args = build_parser().parse_args(
-            ["line", "revive", "wf-1", "--basis", "goal-md-ruling-42", "--generation", "2"]
-        )
-        assert args.folder == "wf-1"
-        assert args.basis == "goal-md-ruling-42"
-        assert args.generation == 2
-        assert args.run_id is None
-
-    def test_line_revive_parses_a_run_id(self) -> None:
-        args = build_parser().parse_args(
-            ["line", "revive", "wf-1", "--basis", "b", "--run-id", "run-done"]
-        )
-        assert args.run_id == "run-done"
-        assert args.generation is None
+    def test_line_revive_call_face_is_removed(self) -> None:
+        """R6 (wf-4601c8 §7.2.7): the CLI `line revive` parser is gone -- the
+        supervised revive write door is the outer-gate MCP tool."""
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(
+                ["line", "revive", "wf-1", "--basis", "goal-md-ruling-42", "--generation", "2"]
+            )
 
     def test_line_run_revival_is_parsed(self) -> None:
         args = build_parser().parse_args(
@@ -482,64 +473,16 @@ class TestTheOtherSubcommandsStillParse:
         assert build_parser().parse_args(["hello"]).topic
 
 
-class TestSupervisorReset:
-    def test_it_parses_with_the_documented_defaults(self) -> None:
-        args = build_parser().parse_args(["supervisor", "reset", "e3-run-1"])
-        assert args.key == "e3-run-1"
-        assert args.board_seq is None
-        assert args.cursor is None
-        assert args.state_root == "/data/fleet-graph/supervisor"
+class TestSupervisorResetCallFaceRemoved:
+    def test_supervisor_reset_call_face_is_removed(self) -> None:
+        """R6 (wf-4601c8 §7.2.7): the CLI `supervisor reset` call face is
+        gone -- the receipt/attempt reset mechanics stay in
+        scheduler/supervisor_events.py (covered by its own tests), but the
+        CLI parser must no longer expose them."""
+        from fleet_graph.cli import build_parser
 
-    def test_it_resets_the_three_pieces_and_is_idempotent(self, tmp_path: Path) -> None:
-        """CLI end to end on an E3 key: receipt gone, attempts kept, exit 0
-        both times. board_seq is untouched -- terminal events re-derive."""
-        from fleet_graph.cli import main
-
-        state_root = tmp_path / "supervisor"
-        (state_root / "reports").mkdir(parents=True)
-        (state_root / "reports" / "e3-run-1.json").write_text("{}")
-        cursor = tmp_path / "runs" / ".scheduler" / "supervisor-cursor.json"
-        cursor.parent.mkdir(parents=True)
-        cursor.write_text(json.dumps({"board_seq": 7, "attempts": {"e3-run-1": 3}}))
-
-        argv = [
-            "supervisor",
-            "reset",
-            "e3-run-1",
-            "--state-root",
-            str(state_root),
-            "--run-root",
-            str(tmp_path / "runs"),
-        ]
-        assert main(argv) == 0
-        assert not (state_root / "reports" / "e3-run-1.json").exists()
-        state = json.loads(cursor.read_text())
-        assert state["attempts"] == {"e3-run-1": 3}  # kept -- next launch is a4
-        assert state["board_seq"] == 7
-        assert main(argv) == 0  # idempotent
-
-    def test_an_explicit_board_seq_is_taken_verbatim(self, tmp_path: Path) -> None:
-        from fleet_graph.cli import main
-
-        cursor = tmp_path / "cursor.json"
-        cursor.write_text(json.dumps({"board_seq": 9, "attempts": {}}))
-        assert (
-            main(
-                [
-                    "supervisor",
-                    "reset",
-                    "e1-msg_q1",
-                    "--state-root",
-                    str(tmp_path / "supervisor"),
-                    "--cursor",
-                    str(cursor),
-                    "--board-seq",
-                    "4",
-                ]
-            )
-            == 0
-        )
-        assert json.loads(cursor.read_text())["board_seq"] == 4
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["supervisor", "reset", "e3-run-1"])
 
 
 class TestLineRunAcceptance:

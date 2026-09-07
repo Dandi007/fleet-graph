@@ -29,7 +29,7 @@ seen two unrelated problems.
 `LineSpec.enabled` is the roster: which lines this scheduler is allowed to
 start at all. It defaults to *off*, so a line runs only because a reviewed
 config says it runs. That default is the point. The gate it replaces --
-`/data/ronin/maintenance-stop`, an external flag file that held the whole
+the legacy engine-external maintenance-stop flag file that held the whole
 fleet down -- had the opposite shape: every line was live and one file stood
 in the way. That file carries a mandatory `expires_at` and goes inert when it
 passes (babysitter v23, a 2026-08-23 ruling), which makes "the fleet ignites
@@ -162,6 +162,12 @@ class LineSpec:
     #: was never reviewed is never passed down.
     noop_limit: int | None = None
     timeout_limit: int | None = None
+    #: M4 acceptance-command freeze: the goal carrier's ```dd-acceptance block
+    #: digest pinned at enlistment (a roster-PR field). None means the line
+    #: predates the pin -- the freeze fails open for it, never locking a
+    #: pre-M4 line shut. When set and the carrier's current digest differs,
+    #: ignition refuses with ACCEPTANCE_DIGEST_MISMATCH.
+    acceptance_digest: str | None = None
 
 
 @dataclass
@@ -175,7 +181,7 @@ class TickResult:
     parked: bool = False
     #: What the parking machinery did this tick, when anything happened:
     #: "established", "woken:inbox", "woken:goal_revision",
-    #: "woken:decision_consumed", "woken:probe_failed".
+    #: "woken:board_decision", "woken:decision_consumed", "woken:probe_failed".
     park_event: str | None = None
     #: Wake fact 4 observability: the red missed-delivery annotation. Filled
     #: on the wake tick when a decision for a dd development this line
@@ -323,7 +329,7 @@ class SchedulerConfig:
     #: units). Default off; enabling it is a reviewed config PR, exactly like
     #: probe_via_runtime.
     supervisor_events: bool = False
-    #: M2 E6: the loopback state read-model the E5/E6/E7 observer scans.
+    #: M2 E6: the loopback state read-model the E5/E6 observer scans.
     read_model_base_url: str = "http://127.0.0.1:7494"
     #: M2 E6: a line is stale when its heartbeat_age_s exceeds this.
     heartbeat_stale_threshold_seconds: float = 300.0
@@ -339,9 +345,12 @@ class SchedulerConfig:
     harvest_default_branch: str | None = None
     harvest_deploy: list[str] = field(default_factory=list)
     repo: str | None = None
-    #: M4 E7: 纯配置透传（无业务逻辑）。缺省 None → 不发射 --e7-allowlist，
-    #: E7 goal.md 直写保持 deny-all 默认拒绝语义零放宽。
-    e7_allowlist_path: str | None = None
+    #: M4 acceptance-command freeze: the goal-folder root the scheduler reads
+    #: each line's goal.md from (the same root the goal MCP face serves).
+    #: None disables the freeze check entirely -- a scheduler that cannot read
+    #: carriers simply never computes a current digest, and `decide` fails
+    #: open on the missing side.
+    goal_folder_root: Path | None = None
 
     @classmethod
     def from_json(cls, path: Path) -> SchedulerConfig:
@@ -382,7 +391,9 @@ class SchedulerConfig:
             harvest_default_branch=raw.get("harvest_default_branch"),
             harvest_deploy=list(raw.get("harvest_deploy") or []),
             repo=raw.get("repo"),
-            e7_allowlist_path=raw.get("e7_allowlist_path"),
+            goal_folder_root=(
+                Path(raw["goal_folder_root"]) if raw.get("goal_folder_root") else None
+            ),
         )
 
 
@@ -427,6 +438,13 @@ class Scheduler:
         #: the next launch's round-1 coordinator input. Reset at the top of
         #: every tick so a stale revoke can never leak into a later launch.
         self._pending_revival: dict[str, dict[str, Any]] = {}
+        #: M3: the development each line's ``dd_awaiting_gate`` wake names,
+        #: keyed by folder, consumed by `spec_for` on the launch this wake
+        #: produces. The wake used to only clear the park, so the line booted
+        #: as an ordinary run and ``decided_by`` = line principal never
+        #: happened (rework rc-aa907dfb finding 1). Reset at the top of every
+        #: tick so a stale wake can never leak into a later launch.
+        self._pending_dd_gate: dict[str, str] = {}
         #: Wake facts for parking. None disables parking outright -- the same
         #: fail-open reading as a probe failure: no way to observe wake facts
         #: means no parking, and the line stays on plain backoff.
@@ -804,7 +822,8 @@ class Scheduler:
             # file; the scheduler reads it back here as a wake fact and, past
             # the stall threshold, as a red signal.
             "dispatched_decision_consumed_at": state.get("dispatched_decision_consumed_at"),
-            # The line's board card entity (`work.card.v1` on board:work-index),
+            # The line's board card entity (the goal-line card on
+            # board:goal-line),
             # materialised by the first escalation. Per line, not per parking:
             # it survives new terminals and re-parkings, so later question
             # notes ref the same entity instead of re-publishing the card.
@@ -1035,7 +1054,12 @@ class Scheduler:
     #   4. the decision bridge consumed a `work.decision.v1` for a dd
     #      development this line dispatched (`dispatched_by == folder_id`):
     #      `dispatched_decision_consumed_at` lands in the stall-state file and
-    #      the next tick wakes the line (`woken:decision_consumed`).
+    #      the next tick wakes the line (`woken:decision_consumed`);
+    #   5. a `work.decision.v1` landed on `board:work-notes` referencing the
+    #      park's own question note after the parking instant, signed
+    #      (`woken:board_decision`). The wake only brings the line back to
+    #      observe the ruling -- consuming it stays the decision surface's
+    #      (M2 path) job, exactly like the inbox wake.
     #
     # Wake fact 4 also carries the observability half of the spec: a line that
     # *stays* parked with a consumed decision past the stall threshold
@@ -1179,6 +1203,23 @@ class Scheduler:
             stall = self._decision_wake_stall(line, state)
             return self._wake(line, state, "woken:decision_consumed", stall=stall)
 
+        # The board-decision fact (D5): the human gate ruled and the ruling
+        # landed on `board:work-notes` targeting this park's own question note
+        # (persisted as `board_question_note_id` at establishment -- reused,
+        # never re-created) after the parking instant, signed. Wake = ignite
+        # the next generation, nothing more: the ruling's consumption stays
+        # with the decision surface (M2 path), exactly like the inbox wake --
+        # the wake only brings the line back to observe the fact, so nothing
+        # here writes any ruling state. A probe failure fails open like every
+        # other source: a broken probe must never lock the line shut.
+        note_id = str(state.get("board_question_note_id") or "")
+        if note_id and self.wake is not None:
+            try:
+                if self.wake.decision_landed(note_id, float(state["parked_at"])):
+                    return self._wake(line, state, "woken:board_decision")
+            except Exception as exc:  # fail open, by design
+                return self._wake(line, state, f"woken:probe_failed:{probe_error_tag(exc)}")
+
         # The inbox source is consulted only if the establishment probe found
         # it usable (`parked_inbox_available`), and its availability is *not*
         # re-assessed during the park: a source that was down when parking
@@ -1262,6 +1303,11 @@ class Scheduler:
             return ParkOutcome(event=f"not_parked:dd_probe_failed:{probe_error_tag(exc)}")
         if fact in ("awaiting_gate", "terminal"):
             # The wake fact already exists: nothing to wait for, never park.
+            # M3: an already-awaiting_gate fact is a self-gate wake all the
+            # same -- the line must ignite *as the gate*, not as an ordinary
+            # run, so the development id is threaded into the next launch.
+            if fact == "awaiting_gate":
+                self._pending_dd_gate[line.folder_id] = dd_id
             self._write_stall_state(line.folder_id, state)
             return ParkOutcome(event=f"not_parked:dd_{fact}")
         state["parked_run_id"] = run_id
@@ -1283,6 +1329,14 @@ class Scheduler:
         except Exception as exc:  # fail open, by design
             return self._wake(line, state, f"woken:dd_probe_failed:{probe_error_tag(exc)}")
         if fact in ("awaiting_gate", "terminal"):
+            # M3: an ``awaiting_gate`` wake makes the next launch a self-gate
+            # run (the line delivers its own verdict), so the anchored
+            # development id is captured for `spec_for` before the snapshot is
+            # cleared -- `_wake` deliberately drops the parked anchor, and the
+            # launch must not lose the wake identity with it. A ``terminal``
+            # wake stays an ordinary run: there is no gate left to judge.
+            if fact == "awaiting_gate":
+                self._pending_dd_gate[line.folder_id] = dd_id
             return self._wake(line, state, f"woken:dd_{fact}")
         return ParkOutcome(parked=True, kind="dd")
 
@@ -1357,7 +1411,7 @@ class Scheduler:
         goal line historically had none -- every ask 422'd with
         DERIVATION_ERROR ("ref target entity 'wf-…' not found"). So the first
         escalation *materialises* the line's card: one `work.card.v1` on
-        board:work-index. The kind is entity_role='root' on the bus, which
+        board:goal-line. The kind is entity_role='root' on the bus, which
         rejects a caller-chosen entity_id on the first publish (entity_id
         without supersedes is itself a DERIVATION_ERROR), so the entity id is
         whatever the bus derives -- the card message's own id. That id is
@@ -1379,12 +1433,21 @@ class Scheduler:
         """
         if self.board is None:
             return None
+        # R6 (wf-4601c8 §7.2.3): the engine-side card publish left Board (the
+        # work.card.v1 protocol is retired); the surface kind is the
+        # engine-neutral goal.line.card.v1 successor (root, refs-free).
+        # The question note still needs a card entity to ref; the scheduler
+        # materialises its escalation surface through the bus client directly
+        # (same payload/idempotency key as before -- the shared goal-line card
+        # face) and adopts the derived entity id. Board remains telemetry.
         card_entity_id = state.get("board_card_entity_id")
         if not card_entity_id:
             try:
-                card = self.board.publish_card(
+                card = self.board.client.publish(
+                    self.board.index_channel,
+                    "goal.line.card.v1",
                     goal_line_card_payload(folder_id=line.folder_id, title=line.folder_id),
-                    idempotency_key=goal_line_card_key(line.folder_id),
+                    goal_line_card_key(line.folder_id),
                 )
             except Exception as exc:  # telemetry must not bite
                 return f"card_failed:{type(exc).__name__}:{str(exc)[:160]}"
@@ -1513,6 +1576,11 @@ class Scheduler:
             # so a revived line can read who overturned it, on what basis, and
             # which generation was overturned. Absent for a normal launch.
             revival=self._pending_revival.get(line.folder_id),
+            # M3: the development a ``dd_awaiting_gate`` wake this tick named.
+            # This is what makes the self-gate the *default path*: the woken
+            # line process receives ``--dd-awaiting-gate`` and self-delivers
+            # the verdict instead of booting as an ordinary run.
+            dd_awaiting_gate_development_id=self._pending_dd_gate.get(line.folder_id, ""),
         )
 
     def acceptance_json_for(self, line: LineSpec) -> str | None:
@@ -1531,6 +1599,30 @@ class Scheduler:
             cwd=line.acceptance_cwd,
             timeout_seconds=line.acceptance_timeout_seconds,
         ).to_cli_json()
+
+    def _carrier_acceptance_digest(self, line: LineSpec) -> str | None:
+        """The goal carrier's current dd-acceptance block digest, or None.
+
+        M4 acceptance-command freeze. Reads goal.md straight from the
+        configured goal-folder root (the same folders the goal MCP face
+        serves) and hashes its ```dd-acceptance block. Every failure mode --
+        no root configured, unreadable file, no block -- returns None, and
+        `decide` fails open on a missing side: a probe that cannot read must
+        never be able to lock a line shut. The executed commands stay the
+        roster's declared argv regardless; the digest only arms the drift
+        tripwire.
+        """
+        if self.config.goal_folder_root is None:
+            return None
+        from fleet_graph.goal_enroll.freeze import acceptance_block_digest
+
+        try:
+            goal_md = (Path(self.config.goal_folder_root) / line.folder_id / "goal.md").read_text(
+                encoding="utf-8"
+            )
+        except (OSError, ValueError):
+            return None
+        return acceptance_block_digest(goal_md)
 
     def line_environment(self) -> dict[str, str]:
         """A line must be able to run the executables the scheduler can.
@@ -1565,6 +1657,10 @@ class Scheduler:
         self.reconcile_overrides()
         # M5: no revoke applied earlier can leak into this tick's launches.
         self._pending_revival = {}
+        # M3: no dd_awaiting_gate wake observed earlier can leak into this
+        # tick's launches either -- only a wake this tick itself observed
+        # names the next launch a self-gate run.
+        self._pending_dd_gate = {}
 
         for line in self.config.lines:
             # Accounting runs first: a terminal observed this tick must bump
@@ -1598,6 +1694,8 @@ class Scheduler:
                 cap_window_seconds=self.config.cap_window_seconds,
                 backoff_cap_seconds=self.config.backoff_cap_seconds,
                 revived=revived,
+                acceptance_digest_pinned=line.acceptance_digest,
+                acceptance_digest_current=self._carrier_acceptance_digest(line),
             )
             seat_roster, seat_override, seat_effective = self.seat_triple(line)
             # G2 line-completion gate: a `done` line whose product is not

@@ -51,6 +51,12 @@ from langgraph.types import interrupt
 
 from fleet_graph.cost_obs.classify import MANAGEMENT
 from fleet_graph.dd.capability import CapabilityError, CapabilityLock
+from fleet_graph.dd.egress import (
+    PROVIDER_UNAVAILABLE,
+    ROOT_CAUSE_TRANSPORT,
+    TransportExhausted,
+    root_cause_for,
+)
 from fleet_graph.dd.lifecycle import (
     AmbiguousSpine,
     Lifecycle,
@@ -373,6 +379,20 @@ def _act_or_wait(actor: Actor, stage: Stage, dispatch: Dispatch) -> StageOutcome
     )
 
 
+def _transport_exhausted_outcome(stage_id: str, exhausted: TransportExhausted) -> StageOutcome:
+    """The failure a transport-exhausted stage reports: retryable, not a fault.
+
+    The code is the taxonomy's retryable provider-unavailable kind, and the
+    detail carries the last failing attempt's own words (the GnuTLS tail an
+    operator greps for), so the layered root cause reads `transport`.
+    """
+    return StageOutcome(
+        event=FAILURE_EVENT,
+        failure_code=PROVIDER_UNAVAILABLE,
+        detail=f"{stage_id} egress retries exhausted: {exhausted}",
+    )
+
+
 def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
     lifecycle = deps.lifecycle
 
@@ -571,6 +591,13 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     return _refused(state, stage.id, step, refused, steps)
                 except PipelineFault as fault:
                     return _terminal(state, TERMINAL_FAULT, str(fault), fault=True)
+                except TransportExhausted as exhausted:
+                    # A script stage's own remote operation (the merge CAS,
+                    # for one) ran out of egress retries. Transport is never
+                    # a verdict and never a fault: the failure is the
+                    # retryable provider-unavailable kind, and advance()
+                    # owns its bounded retry.
+                    outcome = _transport_exhausted_outcome(stage.id, exhausted)
 
             elif step == STEP_MATERIALIZE:
                 assert outcome is not None  # actor precedes materialize in the contract
@@ -603,6 +630,13 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     # this", which upstream also terminalises rather than
                     # reworking. Nothing broke, so it is not a fault.
                     return _refused(state, stage.id, step, refused, steps)
+                except TransportExhausted as exhausted:
+                    # Egress still dark after the stage's bounded backoff.
+                    # Transport failure never faults the order and never
+                    # mints a verdict: it becomes the retryable provider-
+                    # unavailable failure, and advance() routes it through
+                    # the bounded retry on every stage, sealed or not.
+                    outcome = _transport_exhausted_outcome(stage.id, exhausted)
                 except Exception as exc:  # reported as a fault, never swallowed
                     return _terminal(
                         state,
@@ -617,6 +651,13 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                 assert outcome is not None
                 if lifecycle.failure_transition(stage.id, outcome.event) is not None:
                     continue
+                if outcome.event == FAILURE_EVENT:
+                    # A failed outcome produces nothing by definition; the
+                    # failure routing below owns it. A transport-exhausted
+                    # script stage -- whose contract declares no failure
+                    # edge -- arrives here and must stay on that routing,
+                    # never degrade into a fault.
+                    continue
                 missing = [k for k in stage.produced_artifacts if k not in outcome.produced]
                 if missing:
                     return _terminal(
@@ -628,6 +669,29 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     )
 
         assert outcome is not None
+        # M3.1 defect 3: a failed outcome carries no receipt of its own, and
+        # clobbering the carried receipt here would make the *retry* fall back
+        # to the chain root for its parent digest -- anchoring the new receipt
+        # to a stale chain head (断链/回卷) instead of the latest sealed link
+        # (e.g. the rejecting review a rework implement must name). A failure
+        # keeps the previous stage's sealed receipt so the retry's dispatch
+        # stays anchored on the current chain head.
+        carried_receipt = (
+            outcome.receipt
+            if outcome.receipt is not None
+            else (state.get("last_receipt") or {})
+            if outcome.event == FAILURE_EVENT
+            else {}
+        )
+        # R4: a script stage's named machine fact rides on the event trail
+        # (check 14's probe greps events.jsonl for configure's rebase record).
+        # Echoed verbatim from the sealed receipt -- the walker invents
+        # nothing, it observes.
+        rebase_record = (
+            outcome.receipt.get("rebase")
+            if isinstance(outcome.receipt, dict) and "rebase" in outcome.receipt
+            else None
+        )
         return {
             "steps": steps,
             "artifacts": artifacts,
@@ -641,7 +705,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                 stage.id: outcome.run_in_flight,
             },
             "last_event": outcome.event,
-            "last_receipt": outcome.receipt or {},
+            "last_receipt": carried_receipt,
             "last_failure_code": outcome.failure_code,
             # The raw error text as the failing collaborator reported it. The
             # advance() terminal keeps only the code in its reason; without
@@ -655,8 +719,17 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     "event": outcome.event,
                     "attempt": dispatch["attempt"],
                     "output_commit": head_commit,
+                    **({"rebase": rebase_record} if rebase_record is not None else {}),
                     **(
-                        {"failure_code": outcome.failure_code, "detail": outcome.detail}
+                        {
+                            "failure_code": outcome.failure_code,
+                            "detail": outcome.detail,
+                            # The layered root cause (spec 交付面 3): the
+                            # failure record names which layer owns the
+                            # failure -- transport / execution / business --
+                            # so events.jsonl reads the disposition directly.
+                            "root_cause": root_cause_for(outcome.failure_code, outcome.detail),
+                        }
                         if outcome.event == FAILURE_EVENT
                         else {}
                     ),
@@ -676,7 +749,19 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             return _terminal(state, TERMINAL_COMPLETE, f"{stage_id} is the last declared stage")
 
         exit_ = lifecycle.failure_transition(stage_id, event)
-        if exit_ is not None:
+        # Egress layering (spec 交付面 2/4): a transport-rooted failure keeps
+        # its bounded retry on every stage, including the script stages the
+        # contract declares no failure edge for -- the retry is the transport
+        # disposition, and exhausting it lands as a retryable failure whose
+        # record keeps the resume path open. Business and execution failures
+        # on those stages keep their existing semantics untouched.
+        transport_rooted = (
+            exit_ is None
+            and event == FAILURE_EVENT
+            and root_cause_for(failure_code, str(state.get("last_failure_detail", "")))
+            == ROOT_CAUSE_TRANSPORT
+        )
+        if exit_ is not None or transport_rooted:
             retries = dict(state.get("retries", {}))
             used = retries.get(stage_id, 0)
             if lifecycle.is_retryable(failure_code) and used < deps.bounds.max_retries:

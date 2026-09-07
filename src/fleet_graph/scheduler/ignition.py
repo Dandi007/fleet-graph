@@ -55,6 +55,12 @@ class Refusal(StrEnum):
     #: development and the missing feature lines named, until the supervision
     #: surface confirms the product reached the default branch.
     PENDING_DEFAULT_BRANCH = "pending_default_branch"
+    #: M4 acceptance-command freeze: the goal carrier's ```dd-acceptance block
+    #: no longer hashes to the digest pinned at enlistment. Changing the
+    #: acceptance commands means re-enlisting, so the line must not ignite on
+    #: a carrier that disagrees with its own admission. The value is the spec's
+    #: structured code verbatim.
+    ACCEPTANCE_DIGEST_MISMATCH = "ACCEPTANCE_DIGEST_MISMATCH"
 
 
 def backoff_seconds(
@@ -125,6 +131,16 @@ def decide(
     #: revoke match described in scheduler/revive.py. Without it, `done` stays
     #: final (Refusal.TERMINAL_DONE) -- there is no "silent pass" path.
     revived: bool = False,
+    #: M4 acceptance-command freeze (both None = not pinned / unpinnable):
+    #: the digest pinned at enlistment and the goal carrier's current
+    #: dd-acceptance block digest. Both present and unequal refuses -- a
+    #: carrier whose acceptance block drifted from its admission must not
+    #: ignite (changing acceptance means re-enlisting). Either side missing
+    #: fails open: a missing pin can never mismatch, and an unreadable
+    #: carrier is a probe failure -- probe failures must never lock a line
+    #: shut.
+    acceptance_digest_pinned: str | None = None,
+    acceptance_digest_current: str | None = None,
 ) -> IgnitionDecision:
     """Decide whether to ignite `status`, in the babysitter's order.
 
@@ -195,6 +211,22 @@ def decide(
             f"{status.folder_id} is blocked waiting on a human decision; "
             "parked until a wake fact appears (inbox message, goal.md change, "
             "or the parked fields are cleared from its stall-state file)",
+        )
+
+    if (
+        acceptance_digest_pinned is not None
+        and acceptance_digest_current is not None
+        and acceptance_digest_pinned != acceptance_digest_current
+    ):
+        # Before the backoff branch: the freeze is a cheap, certain refusal.
+        # The executed acceptance stays the roster's declared argv (R0d);
+        # this tripwire says the carrier no longer says what was enlisted.
+        return IgnitionDecision(
+            False,
+            Refusal.ACCEPTANCE_DIGEST_MISMATCH,
+            f"{status.folder_id}'s goal-carrier dd-acceptance block no longer "
+            "matches the digest pinned at enlistment; changing the acceptance "
+            "commands means re-enlisting",
         )
 
     wait = backoff_seconds(cooldown_seconds, zero_progress_streak, backoff_cap_seconds)

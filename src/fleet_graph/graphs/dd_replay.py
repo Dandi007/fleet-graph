@@ -50,7 +50,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -58,6 +61,13 @@ from typing import Any
 from fleet_graph.dd import chain_rules
 from fleet_graph.dd.bootstrap import INDEX_PATH
 from fleet_graph.dd.dispatch import derive_attempt_id
+from fleet_graph.dd.egress import (
+    DEFAULT_EGRESS_POLICY,
+    EgressPolicy,
+    EgressRepoError,
+    TransportExhausted,
+    retry_remote,
+)
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.dd.upstream_constants import compute_json_digest
@@ -190,6 +200,13 @@ class ReceiptReplayer:
     #: means "leave the replayed tree alone" (the pre-reconfigure behaviour).
     run_config: dict[str, Any] | None = None
     lifecycle: Lifecycle = field(default_factory=Lifecycle.load)
+    # Egress resilience: the replay-time remote probe and the trim push retry
+    # transport-class failures under the bounded backoff. A probe or push
+    # that stays dark past the budget leaves the replay disabled -- the
+    # stage re-runs for real, the pre-existing fail-closed path.
+    egress_policy: EgressPolicy = field(default_factory=lambda: DEFAULT_EGRESS_POLICY)
+    sleep: Callable[[float], None] = time.sleep
+    rand: Callable[[], float] = random.random
 
     def __post_init__(self) -> None:
         self._plan: list[_Step] | None = None
@@ -706,15 +723,22 @@ class ReceiptReplayer:
                 observed = self._remote_head()
                 if observed != head:
                     return False
-                push = run_git(
-                    self.workspace,
-                    "push",
-                    "--quiet",
-                    f"--force-with-lease={self.remote_ref}:{observed}",
-                    self.remote_url,
-                    f"{tip}:{self.remote_ref}",
-                )
-                if push.returncode != 0:
+                try:
+                    retry_remote(
+                        lambda: run_git(
+                            self.workspace,
+                            "push",
+                            "--quiet",
+                            f"--force-with-lease={self.remote_ref}:{observed}",
+                            self.remote_url,
+                            f"{tip}:{self.remote_ref}",
+                        ),
+                        op_name="push",
+                        policy=self.egress_policy,
+                        sleep=self.sleep,
+                        rand=self.rand,
+                    )
+                except (TransportExhausted, EgressRepoError):
                     return False
             reset = run_git(self.workspace, "reset", "--hard", "--quiet", tip)
             if reset.returncode != 0:
@@ -876,8 +900,15 @@ class ReceiptReplayer:
         return run_git(self.workspace, "merge-base", "--is-ancestor", commit, head).returncode == 0
 
     def _remote_head(self) -> str:
-        proc = run_git(self.workspace, "ls-remote", self.remote_url, self.remote_ref)
-        if proc.returncode != 0:
+        try:
+            proc = retry_remote(
+                lambda: run_git(self.workspace, "ls-remote", self.remote_url, self.remote_ref),
+                op_name="ls-remote",
+                policy=self.egress_policy,
+                sleep=self.sleep,
+                rand=self.rand,
+            )
+        except (TransportExhausted, EgressRepoError):
             return ""
         heads = [line.split()[0] for line in proc.stdout.splitlines() if line.strip()]
         return heads[0] if heads else ""

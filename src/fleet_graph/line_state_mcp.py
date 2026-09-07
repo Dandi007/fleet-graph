@@ -9,7 +9,9 @@ never a second reader (spec 红线 1).
 
 Field surface (identical to ``:7494 /v1/lines``): ``folder_id / generation /
 round / phase / heartbeat_age_s / terminal / parked / wake_facts / release_id /
-run_id / wake_facts_stale``.
+run_id / wake_facts_stale`` plus the R4 branch-position readings
+(``release_ref / release_behind / deploy_behind / release_behind_basis /
+deploy_behind_basis``).
 
 Tools (spec 交付 2): ``list_line_states`` (every line's state) and
 ``get_line_state(folder_id)`` (one line's state). Narrow and self-explanatory
@@ -79,6 +81,12 @@ LINE_STATE_FIELDS = (
     "release_id",
     "run_id",
     "wake_facts_stale",
+    # R4（一线一分支）branch-position readings, first-class on both faces.
+    "release_ref",
+    "release_behind",
+    "deploy_behind",
+    "release_behind_basis",
+    "deploy_behind_basis",
 )
 
 #: Machine-readable refusal codes (closed).
@@ -207,7 +215,9 @@ def build_line_state_mcp_server(
 
         Returns the same field surface as ``:7494 GET /v1/lines`` (folder_id /
         generation / round / phase / heartbeat_age_s / terminal / parked /
-        wake_facts / release_id / run_id / wake_facts_stale), read through the
+        wake_facts / release_id / run_id / wake_facts_stale, plus the R4
+        branch-position readings release_ref / release_behind / deploy_behind
+        / release_behind_basis / deploy_behind_basis), read through the
         exact same view function the :7494 read model serves -- never a second
         reader. An unreachable source is a machine-readable
         LINE_STATE_UNDECIDABLE refusal with evidence, never a fabricated empty

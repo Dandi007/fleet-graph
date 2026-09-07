@@ -374,23 +374,74 @@ class TestClassifyDdFact:
 
 
 class TestLiveDdWakeFacts:
-    def test_reads_the_dev_status_file_and_classifies(self, tmp_path: Path) -> None:
+    """M3.1 defect 6: the wake fact derives from the authority run artifacts
+    (record.json generation + that generation's result.json) -- never the
+    rebuildable status.json cache, whose stale values used to be cited as
+    machine facts."""
+
+    @staticmethod
+    def _write_dev(
+        tmp_path: Path, dev: str, *, generation: int, result: dict[str, Any], gen_dir: bool
+    ) -> None:
+        root = tmp_path / dev
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "record.json").write_text(
+            json.dumps({"development_id": dev, "generation": generation}), encoding="utf-8"
+        )
+        result_path = root / f"g{generation}" / "result.json" if gen_dir else root / "result.json"
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+
+    def test_reads_the_authority_run_artifacts_and_classifies(self, tmp_path: Path) -> None:
         facts = LiveDdWakeFacts(tmp_path)
-        (tmp_path / "dev-1").mkdir()
-        (tmp_path / "dev-1" / "status.json").write_text(
-            json.dumps({"state": "awaiting_gate", "terminal": "merged"}), encoding="utf-8"
+        self._write_dev(
+            tmp_path,
+            "dev-1",
+            generation=1,
+            result={
+                "development_id": "dev-1",
+                "terminal": None,
+                "awaiting": {"question_note_id": "q1", "card_entity_id": "c1"},
+            },
+            gen_dir=False,
         )
         assert facts.dd_fact("dev-1") == "awaiting_gate"
 
-    def test_a_terminal_status_file_classifies_as_terminal(self, tmp_path: Path) -> None:
+    def test_a_later_generation_result_is_the_one_read(self, tmp_path: Path) -> None:
         facts = LiveDdWakeFacts(tmp_path)
-        (tmp_path / "dev-2").mkdir()
-        (tmp_path / "dev-2" / "status.json").write_text(
-            json.dumps({"state": "running", "terminal": "merged"}), encoding="utf-8"
+        self._write_dev(
+            tmp_path,
+            "dev-1",
+            generation=1,
+            result={"terminal": None, "awaiting": {"question_note_id": "q1"}},
+            gen_dir=False,
+        )
+        self._write_dev(
+            tmp_path,
+            "dev-1",
+            generation=2,
+            result={"terminal": "merged", "awaiting": None},
+            gen_dir=True,
+        )
+        assert facts.dd_fact("dev-1") == "terminal"
+
+    def test_a_terminal_result_classifies_as_terminal(self, tmp_path: Path) -> None:
+        facts = LiveDdWakeFacts(tmp_path)
+        self._write_dev(
+            tmp_path,
+            "dev-2",
+            generation=1,
+            result={"terminal": "merged", "awaiting": None},
+            gen_dir=False,
         )
         assert facts.dd_fact("dev-2") == "terminal"
 
-    def test_a_missing_status_file_raises(self, tmp_path: Path) -> None:
+    def test_a_running_single_projects_to_none(self, tmp_path: Path) -> None:
+        facts = LiveDdWakeFacts(tmp_path)
+        self._write_dev(tmp_path, "dev-3", generation=1, result={"terminal": None}, gen_dir=False)
+        assert facts.dd_fact("dev-3") is None
+
+    def test_a_missing_authority_raises(self, tmp_path: Path) -> None:
         facts = LiveDdWakeFacts(tmp_path)
         with pytest.raises(RuntimeError):
             facts.dd_fact("dev-nope")

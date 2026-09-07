@@ -44,8 +44,9 @@ CODE_ACCEPTANCE_DECLARATION_INVALID = "ACCEPTANCE_DECLARATION_INVALID"
 CODE_SPEC_LINT_BAN = "SPEC_LINT_BAN"
 CODE_ACCEPTANCE_ARGV_UNEXECUTABLE = "ACCEPTANCE_ARGV_UNEXECUTABLE"
 
-#: Gate 6: the applicant's alias token (`/data/ronin/secrets/<alias>.token`)
-#: must already exist. An application whose alias has no bus credential would
+#: Gate 6: the applicant's alias token (`<secrets-root>/<alias>.token`,
+#: resolved via bus/tokens.py LINE_TOKEN_PATH_TEMPLATE) must already exist.
+#: An application whose alias has no bus credential would
 #: start a line whose inbox/board face is silently half-broken
 #: (bus/tokens.py:76-87), so the submission refuses closed up front.
 CODE_ALIAS_TOKEN_MISSING = "GOAL_ENROLL_ALIAS_TOKEN_MISSING"
@@ -143,6 +144,12 @@ class GoalRosterEntry:
     mechanism: str
     admitted_at: str
     engine: str = "fleet-graph"
+    #: M4 acceptance-command freeze: the sha256 digest of the goal carrier's
+    #: ```dd-acceptance block at enlistment. A carrier whose block no longer
+    #: hashes to this has changed its acceptance commands -- which means
+    #: re-enlisting, not quietly running. None on entries admitted before the
+    #: pin existed (the freeze fails open for them).
+    acceptance_digest: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -154,6 +161,7 @@ class GoalRosterEntry:
             "mechanism": self.mechanism,
             "admitted_at": self.admitted_at,
             "engine": self.engine,
+            "acceptance_digest": self.acceptance_digest,
         }
 
 

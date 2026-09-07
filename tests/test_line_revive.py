@@ -19,8 +19,11 @@ Covers the frozen-scope acceptance:
    write and never lands on disk.
 6. **decide order** -- the revoke allowance touches only the done branch; every
    other refusal order is unchanged.
-7. **CLI precheck** -- `perform_line_revive` refuses `refused: target not
-   terminal_done` / `refused: generation mismatch` and writes only on match.
+7. **R6 (wf-4601c8 §7.2.7)** -- the CLI `line revive` call face is removed
+   (the outer-gate MCP `line_revive` tool is the supervised write door now);
+   the C1 precheck tests re-point at the `perform_line_revive` primitive
+   that door invokes. The revoke surface (C1..C3, the decide order) is
+   unchanged.
 """
 
 from __future__ import annotations
@@ -586,16 +589,16 @@ class TestDecideOrderIsUnchanged:
         assert decision.refusal is Refusal.TOTAL_CAP_REACHED
 
 
-# --- CLI precheck ------------------------------------------------------------
+# --- C1 precheck on the write primitive (behind the outer-gate MCP door) ----
 
 
-class TestCliPrecheck:
+class TestRevivePrimitivePrecheck:
     def test_perform_line_revive_requires_who_and_basis(self, tmp_path: Path) -> None:
         from fleet_graph.cli import perform_line_revive
 
         roster = tmp_path / "lines.json"
         roster.write_text(json.dumps({"lines": [{"folder_id": "wf-1", "seat": "s"}]}))
-        with pytest.raises(SystemExit, match="--who"):
+        with pytest.raises(SystemExit, match="needs a who"):
             perform_line_revive(
                 folder_id="wf-1",
                 who="",
@@ -603,7 +606,7 @@ class TestCliPrecheck:
                 lines_config=roster,
                 run_root=tmp_path / "runs",
             )
-        with pytest.raises(SystemExit, match="--basis"):
+        with pytest.raises(SystemExit, match="needs a basis"):
             perform_line_revive(
                 folder_id="wf-1",
                 who="alice",
@@ -617,7 +620,7 @@ class TestCliPrecheck:
 
         roster = tmp_path / "lines.json"
         roster.write_text(json.dumps({"lines": [{"folder_id": "wf-1", "seat": "s"}]}))
-        with pytest.raises(SystemExit, match="--generation or --run-id"):
+        with pytest.raises(SystemExit, match="needs a generation or a run id"):
             perform_line_revive(
                 folder_id="wf-1",
                 who="alice",

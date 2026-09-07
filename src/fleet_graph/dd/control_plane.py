@@ -9,10 +9,11 @@ HTTP hop, no second engine. Its state model is the one the user ruled for R1
           + the durable checkpoint (in-flight graph state)
           + the run artifacts (events, results, launches)
 
-There is deliberately **no database**. `status.json` under a development's
-directory is a *rebuildable cache* for list/get fast paths: `rebuild_status`
-recomputes it wholesale from the sources above, and a test proves the rebuilt
-copy equals the cached one, so losing the file loses nothing.
+There is deliberately **no database**. The development status is pure
+derivation: `rebuild_status` recomputes it on demand from the sources above
+(R6, wf-4601c8 §7.2.4: the former on-disk `status.json` cache's write face is
+retired -- R2 had already removed every read consumer, so the file would have
+been write-only).
 
 **Admission is server-side derivation** (R1-b). `create` takes exactly a repo
 path, a target base, and the spec -- everything else (development id, H0
@@ -56,6 +57,7 @@ on the bus, published by a human; this module has no way to publish one.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -83,6 +85,7 @@ from fleet_graph.dd.bootstrap import (
     committed_target_base,
     digest_of,
 )
+from fleet_graph.dd.egress import EgressRepoError, TransportExhausted, retry_remote, root_cause_for
 from fleet_graph.dd.evidence import (
     KIND_ADOPTION,
     KIND_HUMAN_RECOVERY,
@@ -133,6 +136,34 @@ UNIT_PREFIX = "fleet-graph-dd"
 
 ACCEPTANCE_RECORD_PATH = ".dd-evidence/acceptance.json"
 
+#: Where one generation's sealed gate-reject verdict is frozen for the launch
+#: that carries it into the rework (wf-8d9737 rework contract A). Written by
+#: `start` under the generation's run root, read by `dd run` through
+#: `--gate-reject-file`.
+GATE_REJECT_FILE = "gate-reject.json"
+
+#: Rework contract B (wf-8d9737): a generation the engine cannot assemble a
+#: new implement dispatch for -- a sealed-receipt replay that would open a
+#: "new generation" with no new prompt and no new agent run -- is refused at
+#: start instead of being launched as a fake generation.
+CODE_REWORK_REPLAY_REFUSED = "REWORK_REPLAY_REFUSED"
+
+#: Spec ⑮-b (wf-8d9737): the structured refusal for a gate REJECT whose board
+#: ``work.decision.v1`` binding is unavailable -- the verdict record carries no
+#: ``decision_message_id`` (or no ``decided_by``/``rationale``), or no verdict
+#: record exists at all so only the terminal's one-line facts remain. An
+#: unbound verdict must refuse the rework dispatch instead of silently
+#: dispatching a task book with an empty binding (the g3 defect this kills).
+CODE_REWORK_DECISION_UNBOUND = "REWORK_DECISION_UNBOUND"
+
+#: Spec ⑮-b (wf-8d9737): the append-only trail, under the development's own
+#: root next to ``launches.jsonl``, where a refused gate-rework start is traced
+#: (one ``gate_rework_refused`` record per line). The refusal must be loud AND
+#: durably observable: visible in the development's state after restarts, not
+#: only in the caller's exception and the process journal. The run root's own
+#: ``events.jsonl`` stays untouched -- a refused generation seals nothing.
+GATE_REWORK_REFUSALS_FILE = "gate-rework-refusals.jsonl"
+
 
 def gate_decision_path(generation: int) -> str:
     """Where the gate seals its verdict for one generation (dd_scripts.GATE_PATH)."""
@@ -160,7 +191,29 @@ STATE_COMPLETE = "complete"
 # Terminal states are the pipeline's own vocabulary, passed through:
 # complete / failed / refused / bounds / fault.
 
-_HEX40 = re.compile(r"^[0-9a-f]{40}$")
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+
+#: R4（一线一分支）: the durable ref of a dispatched development is the
+#: dispatching line's own release branch -- one line, one repo, one branch.
+#: The order-private audit branch (`refs/heads/dd/<development_id>`) stays as
+#: the seal-publishing ref, recorded separately as `audit_ref`.
+RELEASE_REF_PREFIX = "refs/heads/release/"
+AUDIT_REF_PREFIX = "refs/heads/dd/"
+
+#: Structured refusal: the dispatch intent named a target branch other than
+#: the dispatching line's own release branch (another line's release, main,
+#: any other repo branch). The refusal names the conflicting ref (拒绝留痕).
+CODE_TARGET_REF_CROSS_LINE = "TARGET_REF_CROSS_LINE"
+
+
+def release_line_ref(line_id: str) -> str:
+    """The line branch for one line id: `refs/heads/release/<line-id>`."""
+    return f"{RELEASE_REF_PREFIX}{line_id}"
+
+
+def audit_branch_ref(development_id: str) -> str:
+    """The order-private audit branch: `refs/heads/dd/<development_id>`."""
+    return f"{AUDIT_REF_PREFIX}{development_id}"
 
 
 class ControlPlaneError(RuntimeError):
@@ -209,6 +262,13 @@ CLASS_ENVIRONMENT_CONTRACT = "environment_contract"
 CLASS_IMPLEMENTATION = "implementation"
 CLASS_FABRICATION = "fabrication"
 CLASS_REJECTED = "rejected"
+#: R4（一线一分支）: the branch advanced under the order -- configure could not
+#: rebase the bootstrap/spec material onto the line branch head (rebase
+#: conflict), or the merger found the remote release branch no longer at the
+#: frozen base. The spec explicitly rules this NOT an environment error: the
+#: remedy is a fresh dispatch from the new head (the reconfigure exit), and it
+#: is never read as a fault signal.
+CLASS_SPEC_CONFLICT = "spec_conflict"
 
 EXIT_RECONFIGURE = "reconfigure"
 EXIT_REWORK = "rework"
@@ -250,8 +310,22 @@ REJECTION_CODES = frozenset(
     }
 )
 
+#: R4 branch-advance conflicts (configure rebase incompatible / merger remote
+#: head no longer at the frozen base). Classified as `CLASS_SPEC_CONFLICT` --
+#: explicitly not environment, not implementation, not a fault -- with the
+#: reconfigure exit: the line re-runs configure from the advanced head (a new
+#: dispatch freezes the new base).
+SPEC_CONFLICT_CODES = frozenset(
+    {
+        "REBASE_SPEC_INCOMPATIBLE",
+        "RELEASE_HEAD_ADVANCED",
+    }
+)
+
 #: The classes a downstream supervision plane reads as a *fault*. `rejected`
-#: is deliberately absent: human_gate REJECT is a verdict, not a fault.
+#: is deliberately absent: human_gate REJECT is a verdict, not a fault. R4's
+#: `spec_conflict` (branch advanced under the order) is absent too: it is the
+#: spec's own "not an environment error" class, remedied by re-dispatch.
 FAULT_CLASSES = frozenset({CLASS_ENVIRONMENT_CONTRACT, CLASS_IMPLEMENTATION, CLASS_FABRICATION})
 
 #: Legacy results carry the code only inside the synthesized reason text
@@ -292,6 +366,11 @@ def classify_failure(
         # signal; the exit stays the fresh-generation rework, so a rejection
         # still exits deterministically on a new generation.
         cls, exit_, retryable = CLASS_REJECTED, EXIT_REWORK, True
+    elif code in SPEC_CONFLICT_CODES:
+        # R4 branch-advance conflict: the spec/branch pair moved under the
+        # order. Explicitly NOT an environment error (the spec's own ruling);
+        # the exit is reconfigure -- a fresh dispatch from the advanced head.
+        cls, exit_, retryable = CLASS_SPEC_CONFLICT, EXIT_RECONFIGURE, True
     elif code in IMPLEMENTATION_CODES:
         cls, exit_, retryable = CLASS_IMPLEMENTATION, EXIT_REWORK, True
     else:
@@ -302,6 +381,11 @@ def classify_failure(
         "raw_error": raw_error,
         "retryable": retryable,
         "exit": exit_,
+        # The layered root cause (spec 交付面 3): transport / execution /
+        # business, with its disposition readable from
+        # ROOT_CAUSE_DISPOSITION. Every failure structure this plane writes
+        # -- status.json and the evidence chain alike -- carries it.
+        "root_cause": root_cause_for(code, raw_error),
     }
 
 
@@ -393,6 +477,145 @@ def validate_timeouts(timeouts: dict[str, Any] | None) -> dict[str, int]:
             )
         validated[stage_id] = seconds
     return validated
+
+
+# --- M4 stage seats: the record is the single source -----------------------
+#
+# S2.3/S3 收尾. A stage's model used to be server-side policy: a serve-time
+# cmdline seat key injected a fleet-wide override into every launched run, and
+# that second source silently shadowed the role registry (fr ran five days on
+# deepseek-v4-pro while its registry seat said claude-opus-5). The override is
+# retired -- and R6 (wf-4601c8 §7.1.8) removed the cmdline key itself; seats
+# now come from exactly one place -- the admission record. The
+# committed ``config/stage-seats.json`` is the local projection of the role
+# registry (the registry itself is agent-runtime's, closed out by wf-9b5931):
+# its factory defaults fill every seat a dispatch did not name explicitly,
+# and its allowed set is what ``development_create`` validates against.
+
+STAGE_SEATS_FILE = (
+    Path(__file__).resolve().parent.parent.parent.parent / "config" / "stage-seats.json"
+)
+
+#: Where a seat value came from, recorded per stage in the admission record.
+SEAT_SOURCE_REGISTRY_DEFAULT = "registry-default"
+SEAT_SOURCE_LINE_EXPLICIT = "line-explicit"
+
+#: Structured seat refusals. Both mean "the unit was not created".
+CODE_STAGE_SEAT_STAGE_UNKNOWN = "STAGE_SEAT_STAGE_UNKNOWN"
+CODE_STAGE_SEAT_NOT_ALLOWED = "STAGE_SEAT_NOT_ALLOWED"
+CODE_STAGE_SEAT_REGISTRY_UNREADABLE = "STAGE_SEAT_REGISTRY_UNREADABLE"
+
+
+def load_stage_seat_registry(path: str | Path | None = None) -> dict[str, Any]:
+    """The committed registry projection: ``{"default_seats", "allowed_seats"}``.
+
+    Fail-closed on purpose: a missing or malformed projection means the
+    factory values are unknowable, and freezing guessed seats into a record
+    is exactly the drift this module exists to kill. The refusal names the
+    file so the operator's next step is obvious.
+    """
+    seat_path = Path(path) if path is not None else STAGE_SEATS_FILE
+    try:
+        raw = json.loads(seat_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlPlaneError(
+            CODE_STAGE_SEAT_REGISTRY_UNREADABLE,
+            f"the stage-seat registry projection {seat_path} is missing or "
+            f"malformed ({exc}); seats cannot be resolved fail-closed",
+        ) from exc
+    defaults = raw.get("default_seats")
+    allowed = raw.get("allowed_seats")
+    if (
+        not isinstance(defaults, dict)
+        or not isinstance(allowed, list)
+        or not all(isinstance(seat, str) and seat for seat in allowed)
+    ):
+        raise ControlPlaneError(
+            CODE_STAGE_SEAT_REGISTRY_UNREADABLE,
+            f"the stage-seat registry projection {seat_path} must carry "
+            '{"default_seats": {...}, "allowed_seats": [str, ...]}',
+        )
+    return {
+        "default_seats": {str(stage): str(seat) for stage, seat in defaults.items() if str(seat)},
+        "allowed_seats": frozenset(allowed),
+    }
+
+
+def _seat_eligible_stages() -> set[str]:
+    """The lifecycle's llm stages -- the only stages a seat can apply to.
+
+    ``configure`` / ``acceptance`` / ``human_gate`` / ``merger`` run
+    in-process; a "seat" for them is a typo that would read as policy.
+    """
+    from fleet_graph.dd.lifecycle import Lifecycle
+
+    return {stage for stage, spec in Lifecycle.load().stages.items() if spec.is_llm}
+
+
+def validate_stage_seats(
+    stage_models: dict[str, Any] | None, registry: dict[str, Any]
+) -> dict[str, str]:
+    """The explicitly dispatched seats, validated against the projection.
+
+    A stage the lifecycle does not dispatch to an agent, or a seat value the
+    registry does not allow, refuses by name -- the unit is not created
+    (单不建立). Values must be non-empty strings.
+    """
+    if not stage_models:
+        return {}
+    if not isinstance(stage_models, dict):
+        raise ControlPlaneError(
+            CODE_STAGE_SEAT_STAGE_UNKNOWN,
+            f"stage_models must be a dict of stage -> seat, got {stage_models!r}",
+        )
+    eligible = _seat_eligible_stages()
+    allowed = registry["allowed_seats"]
+    validated: dict[str, str] = {}
+    for stage, seat in stage_models.items():
+        if not isinstance(stage, str) or stage not in eligible:
+            raise ControlPlaneError(
+                CODE_STAGE_SEAT_STAGE_UNKNOWN,
+                f"{stage!r} is not a stage an agent seat applies to; stage_models "
+                f"may name only {sorted(eligible)}",
+            )
+        if not isinstance(seat, str) or not seat.strip():
+            raise ControlPlaneError(
+                CODE_STAGE_SEAT_NOT_ALLOWED,
+                f"seat for {stage!r} must be a non-empty string, got {seat!r}",
+            )
+        seat = seat.strip()
+        if seat not in allowed:
+            raise ControlPlaneError(
+                CODE_STAGE_SEAT_NOT_ALLOWED,
+                f"seat {seat!r} for stage {stage!r} is not in the registry's "
+                f"allowed set {sorted(allowed)}; fix the seat or extend the "
+                "registry projection (config/stage-seats.json)",
+            )
+        validated[stage] = seat
+    return validated
+
+
+def resolve_stage_seats(
+    stage_models: dict[str, Any] | None, registry: dict[str, Any]
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Every seat the development will run under, plus where each came from.
+
+    Registry factory defaults fill the llm stages a dispatch did not name;
+    an explicit ``stage_models`` entry wins and is recorded as
+    ``line-explicit``. Both mappings are frozen into record.json at
+    admission -- the record is the single source the launch reads.
+    """
+    explicit = validate_stage_seats(stage_models, registry)
+    seats: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    for stage in sorted(_seat_eligible_stages()):
+        if stage in explicit:
+            seats[stage] = explicit[stage]
+            sources[stage] = SEAT_SOURCE_LINE_EXPLICIT
+        elif stage in registry["default_seats"]:
+            seats[stage] = registry["default_seats"][stage]
+            sources[stage] = SEAT_SOURCE_REGISTRY_DEFAULT
+    return seats, sources
 
 
 def build_h0_handoff(
@@ -488,7 +711,6 @@ class DdLaunchSpec:
     #: acceptance, and an env overlay for both.
     setup_commands: list[list[str]] = field(default_factory=list)
     acceptance_env: dict[str, str] = field(default_factory=dict)
-    board_card: str = ""
     #: The bounded principal that dispatched this development (a line folder or
     #: a human subject), forwarded to the runner as `--dispatched-by` and
     #: recorded on every dd-worker run as the `dispatched_by` label. Empty means
@@ -505,15 +727,32 @@ class DdLaunchSpec:
     #: development root itself (existing on-disk layout); later generations
     #: get their own subdirectory so a rerun never overwrites history.
     run_root: Path | None = None
-    #: Server-side policy, not client vocabulary: per-stage model overrides
-    #: (the roles' own selectors stay the default). The §24 precedent runs
-    #: review stages on deepseek-v4-pro.
+    #: The development's frozen seats (stage -> seat), read from the admission
+    #: record at launch time -- the single source (M4). There is no second
+    #: stage-model source to shadow the role registry any more: the control
+    #: plane holds no seat policy of its own. R6 (§7.1.8): the seats are
+    #: consumed in-process by the stage actor; they never re-appear as a
+    #: cmdline key on the launched run.
     stage_models: dict[str, str] = field(default_factory=dict)
     #: Per-stage run-fence overrides (stage_id -> seconds), forwarded from the
     #: admission record so the launched `dd run` fences each stage with its own
     #: timeout instead of the 3600s default. Empty means the runner's default
     #: applies to every stage -- existing behavior unchanged.
     timeouts: dict[str, int] = field(default_factory=dict)
+    #: The gate REJECT verdict a rework generation starts from (wf-8d9737
+    #: rework contract A), frozen by `start` at `GATE_REJECT_FILE` under the
+    #: generation's run root. Empty means the launch is not a gate rework and
+    #: carries no `--gate-reject-file` -- byte-identical to before.
+    gate_reject_file: str = ""
+    #: R4: the order-private audit branch (refs/heads/dd/<dev>) the stage
+    #: sealers publish to, keeping the receipt chain a chain. Empty means the
+    #: legacy layout where remote_ref itself is the seal-publishing ref.
+    audit_ref: str = ""
+    #: R4: the admission record file. Configure's first-step rebase freezes a
+    #: post-rebase base into it, so every later launch carries the frozen
+    #: base. Empty (never passed) leaves the record untouched -- byte-for-byte
+    #: the pre-R4 launch shape.
+    record_file: str = ""
     working_directory: str = DEFAULT_WORKING_DIRECTORY
     executable: str = DEFAULT_EXECUTABLE
     environment: dict[str, str] = field(default_factory=dict)
@@ -556,6 +795,12 @@ class DdLaunchSpec:
             self.remote_url,
             "--remote-ref",
             self.remote_ref,
+        ]
+        if self.audit_ref and self.audit_ref != self.remote_ref:
+            argv += ["--audit-ref", self.audit_ref]
+        if self.record_file:
+            argv += ["--record-file", self.record_file]
+        argv += [
             "--root-digest",
             self.root_digest,
             # The admitted, persisted target base is forwarded verbatim so the
@@ -589,12 +834,13 @@ class DdLaunchSpec:
             argv += ["--setup", shlex.join(command)]
         for key, value in sorted(self.acceptance_env.items()):
             argv += ["--accept-env", f"{key}={value}"]
-        for stage, model in sorted(self.stage_models.items()):
-            argv += ["--stage-model", f"{stage}={model}"]
+        # R6 (wf-4601c8 §7.1.8): seats are NOT re-declared on the cmdline. The
+        # actor resolves each stage's seat from the record-derived mapping in
+        # one place; a cmdline seat key would be a second seat source.
         for stage, seconds in sorted(self.timeouts.items()):
             argv += ["--stage-timeout", f"{stage}={seconds}"]
-        if self.board_card:
-            argv += ["--board-card", self.board_card]
+        if self.gate_reject_file:
+            argv += ["--gate-reject-file", self.gate_reject_file]
         if self.dispatched_by:
             argv += ["--dispatched-by", self.dispatched_by]
         if self.resume:
@@ -619,7 +865,6 @@ class DdControlPlane:
         unit_probe: Callable[[str], bool] = _systemd_unit_is_active,
         board_factory: Callable[[], Any] | None = None,
         environment: dict[str, str] | None = None,
-        stage_models: dict[str, str] | None = None,
         scope_boundary: ScopeBoundary | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -636,7 +881,6 @@ class DdControlPlane:
         self.environment = (
             dict(environment) if environment is not None else _inherited_environment()
         )
-        self.stage_models = dict(stage_models or {})
         #: The scope boundary admission refuses against (B1). Data, not a literal
         #: scattered across call sites -- a rescope edits this, not the checks.
         self.scope_boundary = scope_boundary if scope_boundary is not None else default_boundary()
@@ -652,6 +896,8 @@ class DdControlPlane:
         spec_path: str | None = None,
         dispatched_by: str = "",
         timeouts: dict[str, int] | None = None,
+        stage_models: dict[str, str] | None = None,
+        target_ref: str = "",
     ) -> dict[str, Any]:
         """Admit one development: derive everything, bootstrap, record.
 
@@ -663,13 +909,42 @@ class DdControlPlane:
         to the runner as the `dispatched_by` worker-run label. Empty means no
         finer provenance was recorded.
 
+        R4（一线一分支）: a dispatch from a line is durable on that line's own
+        release branch -- `remote_ref` derives as
+        `refs/heads/release/<dispatched_by>`, and the order-private audit
+        branch (`refs/heads/dd/<development_id>`) is kept in the separate
+        `audit_ref` field for seal publishing and chain verification. An
+        admission that carries no `dispatched_by` has no line branch and keeps
+        the legacy durable ref (`remote_ref == audit_ref == refs/heads/dd/…`).
+
+        `target_ref` (R4) is an explicitly requested target branch. A request
+        naming any branch other than the dispatching line's own release branch
+        -- another line's release, main, any other repo branch -- is refused
+        with `TARGET_REF_CROSS_LINE`, naming the conflicting ref (b1-scope
+        family; the refusal is the admission's trace).
+
         `timeouts` optionally overrides the per-stage run fence (stage_id ->
         positive seconds); it is validated against the contract's stage ids and
         recorded for audit. Not passed (or empty) keeps the 3600s default for
         every stage -- existing behavior unchanged.
+
+        `stage_models` (M4) is the seat parameter channel: `{llm_stage ->
+        seat}`, validated against the registry projection before anything is
+        created -- an unknown stage or a disallowed seat refuses with a
+        structured code and the unit is not established. Every llm stage is
+        frozen into record.json as `seats` (explicit entries recorded as
+        `line-explicit`, the rest as the registry's factory defaults), and
+        that record -- not any server-side global -- is what every launch of
+        this development runs under. Seats freeze at first admission: a
+        re-admission of the same (repo, spec, base) returns the existing
+        record unchanged.
         """
         repo = self._admit_repo(repo_path)
         spec = self._read_spec(spec_text, spec_path)
+        # M4: seats are validated before a single byte is written -- a bad
+        # seat must refuse the admission, not poison a bootstrapped worktree.
+        registry = load_stage_seat_registry()
+        seats, seat_sources = resolve_stage_seats(stage_models, registry)
         # B1: admit nothing that actively crosses the declared scope boundary.
         # The refusal names the scope rule, so a crossing is a scope decision
         # rather than whatever downstream failure happened to fire first. The
@@ -679,7 +954,6 @@ class DdControlPlane:
         spec_digest = digest_of(spec)
         development_id = derive_development_id(repo, spec_digest, base)
         dev_root = self.root / development_id
-        dispatched_by = (dispatched_by or "").strip()
         validated_timeouts = validate_timeouts(timeouts)
 
         existing = self._read_record_if_any(development_id)
@@ -690,20 +964,36 @@ class DdControlPlane:
                     f"{development_id} already admitted with a different spec or repo; "
                     "a changed spec is a new development in a fresh worktree",
                 )
-            if not existing.get("card_entity_id"):
-                # The bus was down (or refused) at first admission; the card
-                # publish is idempotency-keyed, so healing it here cannot fork.
-                card = self._publish_card(
-                    development_id, repo, str(existing.get("remote_ref") or "")
-                )
-                if card:
-                    existing["card_entity_id"] = card
-                    write_json_durable(dev_root / RECORD_FILE, existing)
+            # R6 (wf-4601c8 §7.2.3): the engine-side work.card.v1 publish (and
+            # its heal-up branch) is gone -- a dd development no longer
+            # materialises a board card at admission. The gate still re-reads
+            # the board for the verdict; the card is not an engine product.
             return self._creation_result(existing, already_admitted=True)
 
         self._refuse_foreign_binding(repo, development_id)
         remote_url = self._origin_url(repo)
-        remote_ref = f"refs/heads/dd/{development_id}"
+        # R4: the durable ref is the dispatching line's release branch; the
+        # order-private audit branch moves to its own field. An admission
+        # without provenance has no line branch -- the legacy durable ref
+        # stands, unchanged, and audit_ref stays empty (same ref).
+        dispatched_by = (dispatched_by or "").strip()
+        if dispatched_by:
+            remote_ref = release_line_ref(dispatched_by)
+        else:
+            remote_ref = audit_branch_ref(development_id)
+        audit_ref = (
+            audit_branch_ref(development_id)
+            if remote_ref != audit_branch_ref(development_id)
+            else ""
+        )
+        requested_ref = (target_ref or "").strip()
+        if requested_ref and requested_ref != remote_ref:
+            raise ControlPlaneError(
+                CODE_TARGET_REF_CROSS_LINE,
+                f"dispatch names target branch {requested_ref!r}; line "
+                f"{dispatched_by or '(unattributed)'!r} admits only its own "
+                f"{remote_ref!r} (one line, one branch)",
+            )
         acceptance_commands = derive_acceptance_commands(spec)
 
         bootstrap_commit = self._bootstrap(repo, development_id, spec, base)
@@ -720,14 +1010,16 @@ class DdControlPlane:
         dev_root.mkdir(parents=True, exist_ok=True)
         (dev_root / H0_FILE).write_bytes(h0_bytes)
 
-        card_entity_id = self._publish_card(development_id, repo, remote_ref)
-
         record = {
             "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
             "development_id": development_id,
             "repo_path": str(repo),
             "remote_url": remote_url,
             "remote_ref": remote_ref,
+            # R4: the order-private audit branch (refs/heads/dd/<dev>) -- the
+            # ref stage sealers publish to so the chain stays a chain. Empty
+            # when it coincides with remote_ref (legacy unattributed records).
+            "audit_ref": audit_ref,
             "target_base_commit": base,
             "spec_digest": spec_digest,
             "spec_size_bytes": len(spec),
@@ -735,7 +1027,6 @@ class DdControlPlane:
             "bootstrap_commit": bootstrap_commit,
             "root_handoff_digest": root_handoff_digest,
             "acceptance_commands": acceptance_commands,
-            "card_entity_id": card_entity_id,
             "dispatched_by": dispatched_by,
             #: The per-stage run-fence overrides, as validated. Empty (or never
             #: passed) keeps the runner's 3600s default for every stage -- this
@@ -743,6 +1034,15 @@ class DdControlPlane:
             #: byte-identical. Persisted so the audit trail says what fence the
             #: order actually ran under.
             "timeouts": validated_timeouts,
+            #: M4 seat single source: every llm stage's seat, frozen at
+            #: admission. `seats_source` records where each seat came from
+            #: (`line-explicit` / `registry-default`). Every launch reads its
+            #: seats from THIS mapping -- there is no server-side stage-model
+            #: override any more, and no cmdline seat key either: the actor
+            #: reads this mapping directly, so launches and the record can
+            #: never disagree.
+            "seats": seats,
+            "seats_source": seat_sources,
             "plugin_binding_path": str(self.plugin_binding),
             "created_at": iso(self.clock()),
         }
@@ -760,10 +1060,14 @@ class DdControlPlane:
                 "target_base_commit": record["target_base_commit"],
                 "root_handoff_digest": record["root_handoff_digest"],
             },
-            "remote": {"url": record["remote_url"], "ref": record["remote_ref"]},
+            "remote": {
+                "url": record["remote_url"],
+                "ref": record["remote_ref"],
+                "audit_ref": str(record.get("audit_ref") or ""),
+            },
             "acceptance_commands": record["acceptance_commands"],
-            "card_entity_id": record["card_entity_id"],
-            "gate_enabled": bool(record["card_entity_id"]),
+            "seats": dict(record.get("seats") or {}),
+            "seats_source": dict(record.get("seats_source") or {}),
         }
 
     def _admit_repo(self, repo_path: str) -> Path:
@@ -875,7 +1179,7 @@ class DdControlPlane:
                 f"cannot resolve {ref!r} in {repo}: {resolved.stderr.strip()[:200]}",
             )
         commit = resolved.stdout.strip()
-        if not _HEX40.fullmatch(commit):
+        if not HEX40.fullmatch(commit):
             raise ControlPlaneError("TARGET_BASE_UNRESOLVED", f"{ref!r} resolved to {commit!r}")
         return commit
 
@@ -967,29 +1271,6 @@ class DdControlPlane:
             # No credential, no bus: admission still works, the gate is then
             # disabled and says so, rather than half-wired.
             return None
-
-    def _publish_card(self, development_id: str, repo: Path, remote_ref: str) -> str:
-        board = self._board_factory()
-        if board is None:
-            return ""
-        try:
-            # The exact work.card.v1 schema the board enforces: title/status/
-            # intent required, additionalProperties false (measured 2026-08-27).
-            result = board.publish_card(
-                {
-                    "title": f"dd {development_id}",
-                    "status": "doing",
-                    "intent": f"dev-dispatch development in {repo}",
-                    "development_id": development_id,
-                    "links": [remote_ref],
-                },
-                idempotency_key=f"dd-card:{development_id}",
-            )
-        except Exception:
-            # Best-effort: admission must survive a downed bus. The gate then
-            # stays disabled and the result says so; a later create heals it.
-            return ""
-        return result.entity_id
 
     # --- records and status ----------------------------------------------
 
@@ -1102,10 +1383,11 @@ class DdControlPlane:
         return dict(values) if isinstance(values, dict) else None
 
     def rebuild_status(self, development_id: str) -> dict[str, Any]:
-        """Recompute the status cache from git + checkpoint + run artifacts.
+        """Derive the status from git + checkpoint + run artifacts.
 
-        This is the proof the cache is a cache: everything in `status.json`
-        comes from here, and nothing reads the file except the list fast path.
+        R6 (wf-4601c8 §7.2.4): this is now pure derivation -- no on-disk
+        status.json is written or read. The name stays for API stability:
+        every caller gets the freshly computed projection of the authorities.
         """
         record = self._record(development_id)  # refuses unknown ids before anything else
         generation = self._generation(record)
@@ -1172,7 +1454,12 @@ class DdControlPlane:
             "active_unit": active_unit or "",
             "launches": len(self._launches(development_id)),
         }
-        write_json_durable(self._dev_root(development_id) / STATUS_FILE, status)
+        # R6 (wf-4601c8 §7.2.4): the status.json write face is retired. R2
+        # already removed every read consumer -- the status is now pure
+        # derivation over the authorities (git + checkpoint + run artifacts),
+        # computed on demand; the only consumers of the *cache* were reads
+        # that no longer exist (list fast path gone, harvest H-B reads
+        # result.json first and refuses closed without it).
         return status
 
     # --- start / gate ----------------------------------------------------
@@ -1251,6 +1538,45 @@ class DdControlPlane:
                 f"no plugin binding at {self.plugin_binding}; the capability "
                 "check is fail-closed and will not be skipped",
             )
+        # Rework contract A/B (wf-8d9737): a generation whose predecessor was
+        # gate-REJECTed is a rework generation, and its launch must carry the
+        # rejecting verdict so the implement prompt can be assembled with it.
+        # A launch that cannot carry it (record unreadable or contradicting
+        # the terminal) is refused here rather than opened as a fake new
+        # generation.
+        gate_reject_file = ""
+        if generation > 1:
+            try:
+                gate_reject = self._seal_gate_rework(record, generation)
+            except ControlPlaneError as exc:
+                # Spec ⑮-b: the refusal is loud AND durably observable -- the
+                # structured code still raises to the caller, and the trail
+                # keeps the refusal in the development's own state.
+                self._trace_gate_rework_refusal(record, generation, exc)
+                raise
+            if gate_reject is not None:
+                path = run_root / GATE_REJECT_FILE
+                write_json_durable(path, gate_reject)
+                gate_reject_file = str(path)
+                with contextlib.suppress(OSError):
+                    event_path = run_root / EVENTS_FILE
+                    event_path.parent.mkdir(parents=True, exist_ok=True)
+                    with event_path.open("a", encoding="utf-8") as handle:
+                        handle.write(
+                            json.dumps(
+                                {
+                                    "at": iso(self.clock()),
+                                    "event": "gate_rework_dispatch",
+                                    "development_id": development_id,
+                                    "generation": generation,
+                                    "rejected_generation": gate_reject.get("rejected_generation"),
+                                    "decision_message_id": gate_reject.get("decision_message_id"),
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                            + "\n"
+                        )
         run_root.mkdir(parents=True, exist_ok=True)
         seq = len(self._launches(development_id)) + 1
         spec = DdLaunchSpec(
@@ -1260,19 +1586,25 @@ class DdControlPlane:
             plugin_binding=Path(str(record["plugin_binding_path"])),
             remote_url=str(record["remote_url"]),
             remote_ref=str(record["remote_ref"]),
+            audit_ref=str(record.get("audit_ref") or ""),
+            record_file=str(dev_root / RECORD_FILE),
             root_digest=str(record["root_handoff_digest"]),
             target_base_commit=str(record["target_base_commit"]),
             acceptance_commands=[list(c) for c in record.get("acceptance_commands") or []],
             setup_commands=[list(c) for c in record.get("setup_commands") or []],
             acceptance_env=dict(record.get("acceptance_env") or {}),
-            board_card=str(record.get("card_entity_id") or ""),
             dispatched_by=str(record.get("dispatched_by") or ""),
             resume=resume,
             launch_seq=seq,
             generation=generation,
             run_root=run_root,
-            stage_models=dict(self.stage_models),
+            # M4 seat single source: the seats the record froze at admission,
+            # never a server-side global. The launched `dd run` argv carries
+            # exactly these pairs, so launches.jsonl's measured argv and
+            # record.seats agree by construction.
+            stage_models=dict(record.get("seats") or {}),
             timeouts=dict(record.get("timeouts") or {}),
+            gate_reject_file=gate_reject_file,
             working_directory=self.working_directory,
             executable=self.executable,
             environment=dict(self.environment),
@@ -1307,6 +1639,189 @@ class DdControlPlane:
             "thread_id": f"{development_id}:g{generation}",
             "checkpoint": str(dev_root / CHECKPOINT_FILE),
         }
+
+    def _trace_gate_rework_refusal(
+        self, record: dict[str, Any], generation: int, exc: ControlPlaneError
+    ) -> None:
+        """Durably trace a refused gate-rework start (spec ⑮-b, face ③).
+
+        The refusal itself is the raised ``ControlPlaneError`` -- loud by
+        construction. This trail is its durable half: one append-only
+        `gate_rework_refused` line under the development's own root (next to
+        ``launches.jsonl``), so the refused start is observable in the
+        development's state after restarts, not only in the caller's
+        exception and the process journal -- the same bar ``record_gate_refusal``
+        set for delivery-path refusals. The refused generation seals nothing:
+        no launch, no mandate file, no run-root events line. Best-effort: a
+        trace that cannot land never changes the refusal itself.
+        """
+        development_id = str(record["development_id"])
+        entry = {
+            "at": iso(self.clock()),
+            "event": "gate_rework_refused",
+            "code": exc.code,
+            "development_id": development_id,
+            "generation": generation,
+            "rejected_generation": generation - 1,
+            "detail": str(exc),
+        }
+        with (
+            contextlib.suppress(OSError),
+            (self._dev_root(development_id) / GATE_REWORK_REFUSALS_FILE).open(
+                "a", encoding="utf-8"
+            ) as handle,
+        ):
+            handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def _seal_gate_rework(self, record: dict[str, Any], generation: int) -> dict[str, Any] | None:
+        """The gate REJECT verdict generation `generation` must rework from.
+
+        Rework contract A (wf-8d9737): when a development is started into
+        generation N+1 after its generation N ended ``GATE_REJECTED``, the
+        launch carries that rejecting verdict -- decision message id,
+        decided_by, rationale -- so the implement prompt can be assembled with
+        it. The verdict is read from the gate decision record at
+        `gate_decision_path(N)`: committed first, then the worktree copy the
+        gate's own refusal left behind (which is committed here, so the
+        verdict becomes a durable part of the chain).
+
+        Spec ⑮-b (wf-8d9737): the verdict must be *bound* -- the three fields
+        the rework consumes (`decision_message_id`, `decided_by`, `rationale`)
+        all non-empty, sourced from the board ``work.decision.v1`` the gate
+        actually consumed, and carried verbatim. Two shapes cannot serve and
+        refuse the start with ``REWORK_DECISION_UNBOUND`` instead of
+        dispatching an empty-binding task book:
+
+        - a verdict record that says REJECT but is missing any of the three
+          fields (an unbound message id is exactly the g3 live defect), and
+        - a GATE_REJECTED terminal with no sealed verdict record anywhere
+          (a legacy result predating the seal) -- the terminal's one-line
+          facts are no longer a success-path substitute for the board
+          decision; the old ``terminal-facts`` fallback is gone.
+
+        Returns None when generation N was not a gate rejection at all (no
+        record anywhere, no GATE_REJECTED terminal) -- the ordinary reconfigure
+        or retry path, untouched. A record that exists but cannot serve -- not
+        readable, or not a REJECT while the terminal says otherwise -- raises
+        ``REWORK_REPLAY_REFUSED``: starting the generation without its
+        mandated rationale input is exactly the fake-rework defect this
+        contract exists to kill, so the launch is refused instead.
+        """
+        development_id = str(record["development_id"])
+        rejected = generation - 1
+        repo = Path(str(record["repo_path"]))
+        prior_result = self._read_result(development_id, rejected)
+        prior_failure = self._failure_of(prior_result)
+        was_rejected = prior_failure is not None and prior_failure["code"] in REJECTION_CODES
+
+        decision = self._committed_gate_decision(record, rejected)
+        source_record = "committed"
+        if decision is None:
+            path = repo / gate_decision_path(rejected)
+            if path.is_file():
+                source_record = "worktree"
+                try:
+                    decision = dict(json.loads(path.read_text(encoding="utf-8")))
+                except (OSError, ValueError):
+                    decision = {}
+                if str(decision.get("decision") or "").strip().upper() == "REJECT":
+                    # The gate sealed its refusal into the worktree but the
+                    # pipeline refused before any materialize step could
+                    # commit it. Commit the reserved-path record now so the
+                    # verdict is durable and the next read takes the standard
+                    # committed path.
+                    committed = self._commit_gate_record(
+                        repo, gate_decision_path(rejected), rejected
+                    )
+                    if not committed:
+                        raise ControlPlaneError(
+                            CODE_REWORK_REPLAY_REFUSED,
+                            f"{development_id} g{generation} cannot start as a gate rework: "
+                            f"the rejecting verdict at {gate_decision_path(rejected)} could "
+                            "not be committed; no new implement dispatch will be assembled "
+                            "without it (missing: gate-reject-rationale)",
+                            retryable=True,
+                        )
+        if decision is None:
+            if not was_rejected:
+                return None
+            # Spec ⑮-b: a GATE_REJECTED terminal with no sealed verdict record
+            # anywhere (a legacy result predating the seal) has no board
+            # binding to rework from. The terminal's one-line facts were the
+            # old ``terminal-facts`` fallback; that fallback dispatched task
+            # books with an empty binding (the g3 shape) and is now a refusal,
+            # not a success path.
+            raise ControlPlaneError(
+                CODE_REWORK_DECISION_UNBOUND,
+                f"{development_id} g{generation} cannot start as a gate rework: the "
+                f"GATE_REJECTED terminal of g{rejected} has no sealed verdict record at "
+                f"{gate_decision_path(rejected)}, so the board work.decision.v1 binding "
+                "(decision_message_id / decided_by / rationale) is unavailable; no new "
+                "implement dispatch will be assembled from terminal-facts (source: none)",
+            )
+        if str(decision.get("decision") or "").strip().upper() != "REJECT":
+            if not was_rejected:
+                return None
+            raise ControlPlaneError(
+                CODE_REWORK_REPLAY_REFUSED,
+                f"{development_id} g{generation} cannot start as a gate rework: the gate "
+                f"record for g{rejected} says "
+                f"{str(decision.get('decision') or '')!r} while its terminal was "
+                "GATE_REJECTED; no new implement dispatch will be assembled against "
+                "contradicting verdicts (missing: gate-reject-rationale)",
+            )
+        # Spec ⑮-b: the verdict must be bound to the board work.decision.v1
+        # the gate actually consumed. An empty binding field means the
+        # rework's authoritative input is unavailable -- refuse the dispatch
+        # (observably, by code) instead of sealing and dispatching an empty
+        # task book.
+        binding = {
+            "decision_message_id": str(decision.get("decision_message_id") or "").strip(),
+            "decided_by": str(decision.get("decided_by") or "").strip(),
+            "rationale": str(decision.get("rationale") or "").strip(),
+        }
+        unbound = sorted(name for name, value in binding.items() if not value)
+        if unbound:
+            raise ControlPlaneError(
+                CODE_REWORK_DECISION_UNBOUND,
+                f"{development_id} g{generation} cannot start as a gate rework: the "
+                f"rejecting verdict at {gate_decision_path(rejected)} is not bound to "
+                f"its board work.decision.v1 (empty: {', '.join(unbound)}); no new "
+                "implement dispatch will be assembled with an empty binding",
+            )
+        return {
+            "development_id": development_id,
+            "rejected_generation": rejected,
+            "decision": "REJECT",
+            "decision_message_id": str(decision.get("decision_message_id") or ""),
+            "decided_by": str(decision.get("decided_by") or ""),
+            "rationale": str(decision.get("rationale") or ""),
+            "question_note_id": str(decision.get("question_note_id") or ""),
+            # The source of truth is the board work.decision.v1 the gate
+            # consumed; `source_record` names where the sealed copy was read
+            # from (committed chain, or the worktree copy now committed).
+            "source": "board:work.decision.v1",
+            "source_record": source_record,
+        }
+
+    def _commit_gate_record(self, repo: Path, relative: str, rejected: int) -> bool:
+        for args in (
+            ("add", "--", relative),
+            (
+                "-c",
+                "user.name=Dev Dispatch",
+                "-c",
+                "user.email=dev-dispatch@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                f"dev-dispatch: seal gate reject g{rejected}",
+            ),
+        ):
+            proc = run_git(repo, *args)
+            if proc.returncode != 0:
+                return False
+        return True
 
     # --- reconfigure: the environment/contract exit -----------------------
 
@@ -1461,20 +1976,110 @@ class DdControlPlane:
         # that never ran, so carry it out now instead -- the interrupted
         # recovery completes exactly once. (``_claim_resume_action`` runs inside
         # this condition: it must claim before a fresh launch below.)
-        if (
-            action_key
-            and not self._claim_resume_action(development_id, generation, action_key)
-            and self._resume_launched(development_id, generation)
-        ):
-            gate_report["resume"] = {
-                "development_id": development_id,
-                "generation": generation,
-                "already_resumed": True,
-            }
-            gate_report["already_resumed"] = True
-            return gate_report
+        if action_key and not self._claim_resume_action(development_id, generation, action_key):
+            if not self._resume_launched(development_id, generation):
+                # Claim/act window: the interrupted recovery completes now.
+                pass
+            elif status["state"] != STATE_AWAITING_GATE:
+                # The single transferred per its verdict semantics, so the
+                # decision truly was consumed: the same action key dedupes.
+                gate_report["resume"] = {
+                    "development_id": development_id,
+                    "generation": generation,
+                    "already_resumed": True,
+                }
+                gate_report["already_resumed"] = True
+                return gate_report
+            else:
+                # M3.1 defect 2: the earlier resume launched but the single is
+                # still parked at the gate -- the verdict was never consumed
+                # (the unit died, e.g. TEMPFAIL). A one-shot claim burned by a
+                # *failed* resume would refuse the same verdict forever. Return
+                # the claim so the redelivery re-attempts the resume; only a
+                # consumed verdict dedupes (the branch above).
+                self._release_resume_claim(development_id, generation, action_key)
+                if not self._claim_resume_action(development_id, generation, action_key):
+                    raise ControlPlaneError(
+                        "RESUME_CLAIM_CONTESTED",
+                        f"{development_id} g{generation} resume claim for this action key "
+                        "was re-taken concurrently; retry the delivery",
+                        retryable=True,
+                    )
         gate_report["resume"] = self._launch(record, resume=True, generation=generation)
         return gate_report
+
+    def publish_gate_decision(
+        self,
+        development_id: str,
+        *,
+        decision: str,
+        decided_by: str,
+        reason: str = "",
+        action_key: str = "",
+    ) -> dict[str, Any]:
+        """Deliver one verdict to the single's decision read model (the board).
+
+        M3.1 defect 1 (S10 裁决送达必须落地): the gate resume is valueless by
+        design -- the resumed graph re-reads the board -- so a delivery that
+        only resumed never gave the single the verdict. Delivering means
+        publishing the verdict as a ``work.decision.v1`` answering the
+        single's pending question note (a ref to the note is what makes
+        ``Board.decision_for`` resolve it), with ``decided_by`` the already-
+        authorized principal and the delivery's reason as the rationale. The
+        publish is idempotency-keyed on the delivery's action key, so a
+        redelivered verdict republishes nothing. The caller then resumes: the
+        graph consumes the verdict -- REJECT terminalises the single as
+        ``refused``, APPROVE proceeds through merge.
+
+        The Board class itself still publishes no decisions (the structural
+        rule stands): this goes through the board's bus client, the same
+        channel the human Q&A verdicts ride. No board, or no pending question
+        to answer, is a structured refusal -- never a valueless resume that
+        silently drops the verdict.
+        """
+        record = self._record(development_id)
+        status = self.rebuild_status(development_id)
+        awaiting = status.get("awaiting") or {}
+        question_note_id = str(awaiting.get("question_note_id") or "")
+        if not question_note_id:
+            raise ControlPlaneError(
+                "GATE_TICKET_UNRESOLVED",
+                f"{development_id} carries no pending question note; "
+                "there is no question for a verdict to answer",
+            )
+        board = self._board_factory()
+        if board is None:
+            raise ControlPlaneError(
+                "GATE_BOARD_UNAVAILABLE",
+                "no board is configured; the verdict cannot reach the single's decision read model",
+            )
+        from fleet_graph.bus.board import DECISION_KIND, WORK_NOTES
+
+        payload = {
+            "card_entity_id": "",
+            "question": "",
+            "decision": decision,
+            "decided_by": decided_by,
+            "rationale": reason,
+        }
+        idempotency_key = action_key or (
+            f"dd-gate:{development_id}:g{self._generation(record)}:{decision}"
+        )
+        published = board.client.publish(
+            WORK_NOTES,
+            DECISION_KIND,
+            payload,
+            idempotency_key,
+            refs=[{"target_entity": question_note_id}],
+        )
+        return {
+            "development_id": development_id,
+            "question_note_id": question_note_id,
+            "decision": decision,
+            "decided_by": decided_by,
+            "message_id": str(getattr(published, "message_id", "") or ""),
+            "idempotency_key": idempotency_key,
+        }
 
     def _resume_claim_path(self, development_id: str, generation: int, action_key: str) -> Path:
         digest = hashlib.sha256(action_key.encode("utf-8")).hexdigest()
@@ -1509,6 +2114,40 @@ class DdControlPlane:
             )
         return True
 
+    def _release_resume_claim(self, development_id: str, generation: int, action_key: str) -> None:
+        """Return a burned claim after a resume that did not consume (M3.1
+        defect 2).
+
+        The claim exists to make a resume exactly-once against duplicate
+        transport calls -- not to spend the verdict's only delivery on a unit
+        that died unconsumed. Unlinking the claim lets the same action key be
+        claimed again; the release is traced into the generation's
+        ``events.jsonl`` (best-effort) so the return is auditable like every
+        other gate action.
+        """
+        path = self._resume_claim_path(development_id, generation, action_key)
+        with contextlib.suppress(OSError):
+            path.unlink()
+        with contextlib.suppress(OSError):
+            event_path = self._gen_root(development_id, generation) / EVENTS_FILE
+            event_path.parent.mkdir(parents=True, exist_ok=True)
+            with event_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "at": iso(self.clock()),
+                            "event": "resume_claim_released",
+                            "development_id": development_id,
+                            "generation": generation,
+                            "action_key": action_key,
+                            "reason": "previous resume did not consume the verdict",
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+
     def _committed_gate_decision(
         self, record: dict[str, Any], generation: int = 1
     ) -> dict[str, Any] | None:
@@ -1532,7 +2171,7 @@ class DdControlPlane:
             ticket = GateTicket.from_dict(
                 {
                     "question_note_id": str(awaiting.get("question_note_id") or ""),
-                    "card_entity_id": str(awaiting.get("card_entity_id") or ""),
+                    "card_entity_id": "",
                 }
             )
             return board.decision_for(ticket) is not None
@@ -1550,6 +2189,7 @@ class DdControlPlane:
             "worktree_path": record["repo_path"],
             "remote_url": record["remote_url"],
             "remote_ref": record["remote_ref"],
+            "audit_ref": record.get("audit_ref", ""),
             "target_base_commit": record["target_base_commit"],
             "spec_digest": record["spec_digest"],
             "bootstrap_commit": record["bootstrap_commit"],
@@ -1559,7 +2199,6 @@ class DdControlPlane:
             "acceptance_env": record.get("acceptance_env", {}),
             "timeouts": record.get("timeouts", {}),
             "reconfigures": record.get("reconfigures", []),
-            "card_entity_id": record.get("card_entity_id", ""),
             "created_at": record.get("created_at", ""),
             "adoptions": [
                 adopted.as_dict()
@@ -1589,29 +2228,13 @@ class DdControlPlane:
         rows: list[dict[str, Any]] = []
         next_cursor = None
         for name in ids:
-            status_path = self._dev_root(name) / STATUS_FILE
-            status: dict[str, Any] | None = None
-            if status_path.is_file():
-                try:
-                    status = json.loads(status_path.read_text(encoding="utf-8"))
-                except ValueError:
-                    status = None
-            # A terminal state is immutable, so its cache is trustworthy; a
-            # cached "running"/"created" row can be stale the moment the unit
-            # exits (measured: a failed run listed as running), so anything
-            # non-terminal is recomputed rather than served from the file.
-            if status is None or not status.get("terminal"):
-                status = self.rebuild_status(name)
-            elif "dispatched_by" not in status:
-                # A terminal cache written before `dispatched_by` entered the
-                # read model carries no provenance; backfill it from the
-                # authoritative record (never from worker-run labels) so the
-                # row still attributes the development to its dispatching line.
-                status = {
-                    **status,
-                    "dispatched_by": str(self._record(name).get("dispatched_by") or ""),
-                }
-                write_json_durable(status_path, status)
+            # R2 (wf-4601c8 图合一) single state source: every listed row is
+            # derived from the authorities (record.json + this generation's
+            # result.json, plus the liveness probe) via ``rebuild_status``.
+            # The on-disk status cache is written persistence, never a state
+            # signal -- nothing consumes its content any more, so a stale or
+            # hand-edited cache cannot surface as a status however it drifts.
+            status = self.rebuild_status(name)
             if state and status.get("state") != state:
                 continue
             rows.append(status)
@@ -1657,6 +2280,58 @@ class DdControlPlane:
             "events": selected[: max(1, limit)],
             "head_event_id": entries[-1]["event_id"] if entries else None,
         }
+
+    def record_gate_refusal(
+        self,
+        development_id: str,
+        *,
+        code: str,
+        reason: str,
+        exit_code: str = "",
+    ) -> dict[str, Any]:
+        """Durably trace a gate refusal cast on the *delivery* path (M3 S10).
+
+        The decision MCP's dd delivery calls this when a resume's success cannot
+        be read back as consumption (or the frozen workspace vanished before any
+        unit started). It has two observable effects, both read back by the
+        existing read side:
+
+        - an ``events.jsonl`` line carrying ``event: gate_refused`` (so the
+          defiance is visible in the append-only trail, not only in systemd
+          journal);
+        - a ``gate_refused`` fact folded into ``result.json``, which
+          ``rebuild_status`` already surfaces -- so ``get()``/``status.json``
+          report the refusal instead of the previous "unit died, single never
+          changed" hole.
+
+        Best-effort writes: a trace that cannot land never changes the refusal
+        itself.
+        """
+        record = self._record(development_id)
+        generation = self._generation(record)
+        run_root = self._gen_root(development_id, generation)
+        at = iso(self.clock())
+        payload = {"code": code, "reason": reason, "exit_code": exit_code, "at": at}
+
+        event_path = run_root / EVENTS_FILE
+        with contextlib.suppress(OSError):
+            event_path.parent.mkdir(parents=True, exist_ok=True)
+            with event_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {"at": at, "event": "gate_refused", **payload},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+
+        result = self._read_result(development_id, generation) or {}
+        result.setdefault("development_id", development_id)
+        result["gate_refused"] = payload
+        with contextlib.suppress(OSError):
+            write_json_durable(run_root / RESULT_FILE, result)
+        return payload
 
     # --- evidence --------------------------------------------------------
 
@@ -1783,13 +2458,25 @@ class DdControlPlane:
     def _remote_ref_matches(self, record: dict[str, Any], head_commit: str) -> bool:
         if not head_commit:
             return False
-        listed = run_git(
-            Path(str(record["repo_path"])),
-            "ls-remote",
-            str(record["remote_url"]),
-            str(record["remote_ref"]),
-        )
-        if listed.returncode != 0:
+        # R4: chain continuity lives on the order-private audit branch (the
+        # ref stage sealers publish); remote_ref is the merger's release
+        # branch. Legacy records without audit_ref verify against remote_ref.
+        ref = str(record.get("audit_ref") or record["remote_ref"])
+        try:
+            # The remote probe is exactly where egress jitter lands, so it
+            # retries transport-class failures under the bounded backoff; a
+            # probe that is still dark after the budget (or a repo-layer
+            # refusal) reads as unverified -- the pre-existing semantics.
+            listed = retry_remote(
+                lambda: run_git(
+                    Path(str(record["repo_path"])),
+                    "ls-remote",
+                    str(record["remote_url"]),
+                    ref,
+                ),
+                op_name="ls-remote",
+            )
+        except (TransportExhausted, EgressRepoError):
             return False
         heads = [line.split()[0] for line in listed.stdout.splitlines() if line.strip()]
         return bool(heads) and heads[0] == head_commit
@@ -2082,7 +2769,7 @@ class DdControlPlane:
         try:
             ticket = GateTicket(
                 question_note_id=question_note_id,
-                card_entity_id=str(record.get("card_entity_id") or ""),
+                card_entity_id="",
             )
             return board.decision_for(ticket)
         except Exception:
@@ -2297,11 +2984,14 @@ class DdControlPlane:
 
 __all__ = [
     "ACCEPTANCE_FENCE",
+    "AUDIT_REF_PREFIX",
     "CHECKPOINT_FILE",
     "CLASS_ENVIRONMENT_CONTRACT",
     "CLASS_FABRICATION",
     "CLASS_IMPLEMENTATION",
     "CLASS_REJECTED",
+    "CLASS_SPEC_CONFLICT",
+    "CODE_TARGET_REF_CROSS_LINE",
     "DEFAULT_DD_ROOT",
     "DEFAULT_EXECUTABLE",
     "DEFAULT_PLUGIN_BINDING",
@@ -2318,16 +3008,20 @@ __all__ = [
     "LAUNCHES_FILE",
     "RECORD_FILE",
     "REJECTION_CODES",
+    "RELEASE_REF_PREFIX",
     "RESULT_FILE",
+    "SPEC_CONFLICT_CODES",
     "STATUS_FILE",
     "UNIT_PREFIX",
     "ControlPlaneError",
     "DdControlPlane",
     "DdLaunchSpec",
+    "audit_branch_ref",
     "build_h0_handoff",
     "classify_failure",
     "derive_acceptance_commands",
     "derive_development_id",
     "gate_decision_path",
     "merge_result_path",
+    "release_line_ref",
 ]

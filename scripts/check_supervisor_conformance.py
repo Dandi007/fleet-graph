@@ -43,19 +43,17 @@ other side of the gate (it executes only what the gated orchestration asked),
 so it is exempt from Guard D -- the gate is the orchestrator's, and the
 diagnostic is scoped to the orchestration module.
 
-Guard E -- **the E6/E7 dispatch reactors' writes are gated too** (M4). The E6
+Guard E -- **the E6 dispatch reactor's writes are gated too** (M4). The E6
 stop reactor (`supervise/e6_stop.py`) may only stop its own event.folder_id's
-line unit (prefix-exact match, no arbitrary unit), and the E7 goal.md reactor
-(`supervise/e7_write.py`) may only write the folder_id it resolved (圈点, default
-deny-all). Same discipline as Guard D, applied to both modules: every function
-in `supervise/e6_stop.py` that performs a stop write primitive (`stop_unit` /
-`systemctl` / subprocess) must also call the stop gate (`authorize_e6_stop` /
-`authorize`) in the same body; every function in `supervise/e7_write.py` that
-performs a goal.md write primitive (`append_delivery_fail_block` / `fs_write` /
-`fs_edit` / `write` / `edit` / `create`) must also call the write gate
-(`authorize_e7_write` / `authorize`) in the same body. The ops layers
-(`supervise/e6_ops.py`, `supervise/e7_ops.py`) and the allowlist module are
-exempt, exactly like `harvest_ops.py` is under Guard D.
+line unit (prefix-exact match, no arbitrary unit). Same discipline as Guard D,
+applied to that module: every function in `supervise/e6_stop.py` that performs
+a stop write primitive (`stop_unit` / `systemctl` / subprocess) must also call
+the stop gate (`authorize_e6_stop` / `authorize`) in the same body. The ops
+layers (`supervise/e6_ops.py`, `supervise/harvest_ops.py`) and the allowlist
+module are exempt, exactly like `harvest_ops.py` is under Guard D. R6
+(wf-4601c8 §7.2.1/§7.2.11) removed the E7 goal.md direct-write reactor
+entirely -- the goal.md 捎话 channel no longer exists, so the goal.md write
+primitives left the guard with it.
 
 The technique is lifted from the old supervisor's check_no_local_scheduler.py,
 and so is its delivery discipline: tests/test_supervisor_conformance.py feeds
@@ -85,6 +83,18 @@ DECISION_NAMES = frozenset({"DECISION_KIND", "DECISION_KIND_V2"})
 # Guard B exemption: the single sanctioned decision publisher (R4-3).
 DECISION_PUBLISHER_RELPATH = "fleet_graph/supervise/decision_publisher.py"
 
+#: M3.1 (S10 裁决送达必须落地): the dd gate-delivery publish point. The dd
+#: control plane's ``publish_gate_decision`` is the second sanctioned decision
+#: publish path: reachable only behind the S11 ``dispatched_by`` authority
+#: check (the decision MCP's dd delivery and the line self-gate -- the
+#: authorized principal is exactly what the publish records as ``decided_by``),
+#: never from an llm execution path. The exemption is scoped to exactly this
+#: function in exactly this module; any other call anywhere -- including any
+#: other function in the same module -- still trips the guard.
+GUARD_B_PUBLISH_POINTS = {
+    ("fleet_graph/dd/control_plane.py", "publish_gate_decision"),
+}
+
 # Guard C: who may import the publisher. The act script node, and nobody else.
 DECISION_PUBLISHER_MODULE = "fleet_graph.supervise.decision_publisher"
 DECISION_PUBLISHER_IMPORTERS = frozenset({"fleet_graph/graphs/supervisor.py"})
@@ -92,10 +102,10 @@ DECISION_PUBLISHER_IMPORTERS = frozenset({"fleet_graph/graphs/supervisor.py"})
 # Guard D: the harvest orchestration module whose write functions must be gated.
 HARVEST_RELPATH = "fleet_graph/supervise/harvest.py"
 
-# Guard E: the E6/E7 dispatch orchestration modules whose write functions must
-# be gated (M4).
+# Guard E: the E6 dispatch reactor whose write functions must be gated (M4).
+# R6 (wf-4601c8 §7.2.1/§7.2.11): the E7 goal.md direct-write reactor was
+# removed -- the goal.md 捎话 channel is gone, so Guard E covers E6 only.
 E6_STOP_RELPATH = "fleet_graph/supervise/e6_stop.py"
-E7_WRITE_RELPATH = "fleet_graph/supervise/e7_write.py"
 
 #: Write primitives: call names (function or attribute) that can write to the
 #: target repo, the deployed host, or the supervised line's own unit/goal.md.
@@ -151,35 +161,15 @@ E6_STOP_WRITE_PRIMITIVES = frozenset(
     }
 )
 
-#: E7 goal.md write primitives: anything that writes the supervised line's
-#: goal.md (via the ops layer or directly through the work-folder client).
-E7_WRITE_WRITE_PRIMITIVES = frozenset(
-    {
-        "append_delivery_fail_block",
-        "goal_write",
-        "fs_write",
-        "fs_edit",
-        "fs_create",
-        "write",
-        "edit",
-        "create",
-        "WorkFolder",
-        "subprocess",
-        "os.system",
-    }
-)
-
 #: Allowlist/gate names: calling any of these counts as gating the write.
 #: (``authorize`` matches both the pure function and ``allowlist.authorize``.)
 HARVEST_GATE_NAMES = frozenset({"authorize_harvest_write", "authorize"})
 E6_STOP_GATE_NAMES = frozenset({"authorize_e6_stop", "authorize"})
-E7_WRITE_GATE_NAMES = frozenset({"authorize_e7_write", "authorize"})
 
 #: The write-gating specs: relpath -> (write primitives, gate names, label).
 WRITE_GATING_SPECS: tuple[tuple[str, frozenset[str], frozenset[str], str], ...] = (
     (HARVEST_RELPATH, HARVEST_WRITE_PRIMITIVES, HARVEST_GATE_NAMES, "harvest"),
     (E6_STOP_RELPATH, E6_STOP_WRITE_PRIMITIVES, E6_STOP_GATE_NAMES, "E6 stop"),
-    (E7_WRITE_RELPATH, E7_WRITE_WRITE_PRIMITIVES, E7_WRITE_GATE_NAMES, "E7 goal.md write"),
 )
 
 
@@ -228,21 +218,48 @@ def _is_decision_reference(node: ast.expr) -> bool:
     return isinstance(node, ast.Attribute) and node.attr in DECISION_NAMES
 
 
-def check_no_decision_publish(path: Path, tree: ast.AST) -> list[str]:
-    errors: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        arguments = list(node.args) + [kw.value for kw in node.keywords]
-        for argument in arguments:
-            if _is_decision_reference(argument):
-                errors.append(
-                    f"{path}:{node.lineno}: a call carries "
-                    f"{'/'.join(sorted(DECISION_LITERALS | DECISION_NAMES))} "
-                    "as an argument -- the only sanctioned decision publish "
-                    f"path is {DECISION_PUBLISHER_RELPATH}"
-                )
-    return errors
+class _DecisionPublishScan(ast.NodeVisitor):
+    """Guard B's scan: every call carrying a decision kind, except the
+    sanctioned publish points (the R4-3 publisher module and the M3.1
+    S11-gated dd gate-delivery function)."""
+
+    def __init__(self, relpath: str) -> None:
+        self.relpath = relpath
+        self.function_stack: list[str] = []
+        self.errors: list[str] = []
+
+    def _exempt(self) -> bool:
+        return any((self.relpath, name) in GUARD_B_PUBLISH_POINTS for name in self.function_stack)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.function_stack.append(node.name)
+        self.generic_visit(node)
+        self.function_stack.pop()
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.function_stack.append(node.name)
+        self.generic_visit(node)
+        self.function_stack.pop()
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if not self._exempt():
+            arguments = list(node.args) + [kw.value for kw in node.keywords]
+            for argument in arguments:
+                if _is_decision_reference(argument):
+                    self.errors.append(
+                        f"{self.relpath}:{node.lineno}: a call carries "
+                        f"{'/'.join(sorted(DECISION_LITERALS | DECISION_NAMES))} "
+                        "as an argument -- the only sanctioned decision publish "
+                        f"paths are {DECISION_PUBLISHER_RELPATH} and the S11-gated "
+                        "dd gate delivery"
+                    )
+        self.generic_visit(node)
+
+
+def check_no_decision_publish(path: Path, relpath: str, tree: ast.AST) -> list[str]:
+    scan = _DecisionPublishScan(relpath)
+    scan.visit(tree)
+    return scan.errors
 
 
 def check_publisher_import_whitelist(path: Path, relpath: str, tree: ast.AST) -> list[str]:
@@ -316,7 +333,6 @@ def check_write_gating(
             if node.name.startswith("_") and node.name in {
                 "authorize_harvest_write",
                 "authorize_e6_stop",
-                "authorize_e7_write",
             }:
                 continue
             body: ast.AST = node
@@ -370,20 +386,6 @@ def check_e6_stop_gating(path: Path, relpath: str, tree: ast.AST) -> list[str]:
     )
 
 
-def check_e7_write_gating(path: Path, relpath: str, tree: ast.AST) -> list[str]:
-    """Guard E: the E7 reactor may only write its resolved folder's goal.md."""
-    if relpath != E7_WRITE_RELPATH:
-        return []
-    return check_write_gating(
-        path,
-        relpath,
-        tree,
-        write_primitives=E7_WRITE_WRITE_PRIMITIVES,
-        gate_names=E7_WRITE_GATE_NAMES,
-        label="E7 goal.md write",
-    )
-
-
 def run(src_root: Path) -> list[str]:
     if not src_root.is_dir():
         raise SystemExit(f"not a directory: {src_root}")
@@ -397,11 +399,10 @@ def run(src_root: Path) -> list[str]:
         relpath = path.relative_to(src_root).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         if relpath != DECISION_PUBLISHER_RELPATH:
-            errors.extend(check_no_decision_publish(path, tree))
+            errors.extend(check_no_decision_publish(path, relpath, tree))
         errors.extend(check_publisher_import_whitelist(path, relpath, tree))
         errors.extend(check_harvest_write_gating(path, relpath, tree))
         errors.extend(check_e6_stop_gating(path, relpath, tree))
-        errors.extend(check_e7_write_gating(path, relpath, tree))
     return errors
 
 

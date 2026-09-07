@@ -120,9 +120,15 @@ class LineInterruptPort:
 
         card_entity_id = self.card_entity_id
         if not card_entity_id:
-            card = self.board.publish_card(
+            # R6 (wf-4601c8 §7.2.3): the card publish left Board (work.card.v1 is
+            # gone; the interrupt runtime publishes its escalation card the
+            # same way the scheduler does -- through the bus client with the
+            # shared goal-line card face -- and adopts the derived entity id.
+            card = self.board.client.publish(
+                self.board.index_channel,
+                "goal.line.card.v1",
                 goal_line_card_payload(folder_id=self.folder_id, title=self.folder_id),
-                idempotency_key=goal_line_card_key(self.folder_id),
+                goal_line_card_key(self.folder_id),
             )
             card_entity_id = card.entity_id
             self.card_entity_id = card_entity_id

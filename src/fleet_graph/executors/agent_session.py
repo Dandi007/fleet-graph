@@ -55,7 +55,42 @@ class AgentSessionTimeout(AgentSessionError, TimeoutError):
     worker-turn guard (`except TimeoutError`) stops treating a timed-out seat as
     an opaque seat failure. That guard is the graceful path: record the timeout,
     append a `worker_turn_timeout` round, and let the streak breaker decide.
+
+    The `output_evidence` attribute (a dict, attached by `AgentSessionSeat.send`
+    wherever this exception is raised from a real seat call) carries the
+    variable matrix's output signal (defect ⑩): how many stdout lines the turn
+    produced before the deadline, when the last one landed, and the zero-output
+    boolean the attribution report buckets on. A timeout raised without a seat
+    call behind it carries no attribute; the guard then records the honest
+    boundary default -- nothing was received.
     """
+
+
+def _stdout_line_count(stdout: Any) -> int:
+    """Non-empty stdout lines captured so far, bytes or str, None-safe."""
+    if stdout is None:
+        return 0
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", errors="replace")
+    return len([ln for ln in str(stdout).splitlines() if ln.strip()])
+
+
+def _with_output_evidence(
+    exc: AgentSessionTimeout, *, stdout_lines: int, zero_output: bool, source: str
+) -> AgentSessionTimeout:
+    """Attach the defect-⑩ output signal to a typed timeout and return it.
+
+    `last_output_at` stays None until agent-session exposes per-line
+    timestamps; recording the key with an honest None beats inventing a time
+    the seat never reported.
+    """
+    exc.output_evidence = {
+        "stdout_lines": stdout_lines,
+        "last_output_at": None,
+        "zero_output": zero_output,
+        "source": source,
+    }
+    return exc
 
 
 def derive_seat_key(thread_id: str, seat: str) -> str:
@@ -230,10 +265,29 @@ class AgentSessionSeat:
             )
         # subprocess.TimeoutExpired is not a TimeoutError, so the worker-turn
         # guard would never see it as a timeout either; map it onto the same
-        # typed timeout as the in-band TURN_TIMEOUT envelope.
+        # typed timeout as the in-band TURN_TIMEOUT envelope. Whatever stdout
+        # the turn flushed before hanging rides along as output evidence.
         except subprocess.TimeoutExpired as exc:
-            raise AgentSessionTimeout(f"agent-session send timed out after {exc.timeout}s") from exc
-        return _envelope(completed.stdout, context="agent-session send")
+            lines = _stdout_line_count(exc.stdout)
+            raise _with_output_evidence(
+                AgentSessionTimeout(f"agent-session send timed out after {exc.timeout}s"),
+                stdout_lines=lines,
+                zero_output=lines == 0,
+                source="subprocess_timeout",
+            ) from exc
+        try:
+            return _envelope(completed.stdout, context="agent-session send")
+        except AgentSessionTimeout as exc:
+            # In-band TURN_TIMEOUT: the seat's own runtime gave up on the turn
+            # and returned no turn output -- the envelope is protocol, not
+            # product. Evidence records exactly that, so a zero-output 3000s
+            # hang is attributable as such (defect ⑩'s first observation).
+            raise _with_output_evidence(
+                exc,
+                stdout_lines=0,
+                zero_output=True,
+                source="turn_timeout_envelope",
+            ) from exc
 
     def status(self, handle: SeatHandle) -> dict[str, Any]:
         return self._simple(handle, "status")

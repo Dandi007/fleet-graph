@@ -27,6 +27,7 @@ import os
 import time
 import traceback
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -174,6 +175,142 @@ def normalize_waiting_on(raw: Any) -> tuple[str, str | None]:
     return WAITING_ON_DEFAULT, declared
 
 
+#: The scheduler's per-line stall-state directory, relative to the run root.
+#: ``<run_root>/.scheduler/<folder_id>.json`` is the single authority for a
+#: line's parked claim (see :func:`parked_decision_state`).
+SCHEDULER_STALL_SUBDIR = ".scheduler"
+
+#: The line-run artifact names the parked-state authority reads alongside the
+#: stall snapshot. A line's live-run facts live in its own run folder.
+HEARTBEAT_FILE = "heartbeat.json"
+TERMINAL_ARTIFACT = "terminal.json"
+
+#: The M4 line-message ack ledger's file name (spec-m4b 交付面 1). One
+#: append-only JSONL per line, written by the pump's ack obligation and read
+#: by the state face; the constant is the single spelling both sides share so
+#: a probe never has to guess the ledger's name (台账路径发现).
+LINE_MESSAGE_ACKS_FILE = "line-message-acks.jsonl"
+
+
+def line_message_acks_path(run_root: str | Path, folder_id: str) -> Path:
+    """Where one line's ack ledger lives, discovered from the run root.
+
+    ``run_root`` is the fleet run root (the scheduler's ``config.run_root``),
+    not the line folder: the ledger of line ``<line>`` is
+    ``<run_root>/<line>/line-message-acks.jsonl`` -- the exact path the state
+    face folds and the only path ``RunArtifacts`` (constructed with the line
+    folder as its run root) ever writes. A read model or probe resolves the
+    ledger through this helper, never by re-assembling the name.
+    """
+    return Path(run_root) / folder_id / LINE_MESSAGE_ACKS_FILE
+
+
+def scheduler_stall_path(run_root: Path, folder_id: str) -> Path:
+    """Where the scheduler persists one line's stall/park state."""
+    return Path(run_root) / SCHEDULER_STALL_SUBDIR / f"{folder_id}.json"
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    """One JSON object artifact, or {} on missing/unreadable/malformed."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+@dataclass(frozen=True)
+class ParkedDecisionState:
+    """The parked-state authority's answer for one line.
+
+    ``parked`` is the mechanical "parked waiting_on=decision" claim;
+    ``state_word`` carries the line's *actual* current state as dynamically
+    read, so a refusal can name what the line is really doing instead of a
+    hardcoded word (M3.1 defect 4).
+    """
+
+    parked: bool
+    state_word: str
+
+
+def parked_decision_state(run_root: Path, folder_id: str) -> ParkedDecisionState:
+    """The single authority for "this line is parked waiting_on=decision".
+
+    M3.1 defect 5: the parked claim used to live in two places -- the
+    scheduler's stall snapshot (``parked_run_id``/``parked_at``) and the
+    line's own ``terminal.json`` declaration (``blocked`` +
+    ``waiting_on``) -- and the two could disagree. This converges the read:
+    **the stall snapshot is the authority** (it is the control surface the
+    scheduler's park/wake/escape-hatch act on); the terminal declaration
+    supplies the waiting reason and anchors run consistency. The delivery
+    surface (decision MCP) and the fleet-state read model both derive from
+    this one function, so a fork resolves identically on both sides:
+
+    - no stall file at all -> nothing contradicts the terminal declaration,
+      so a ``waiting_on=decision`` terminal stands (single truth, legacy
+      semantics for a line the scheduler has not yet parked);
+    - stall present but the snapshot cleared -> the park was retracted (the
+      operator escape hatch or a wake); the declaration alone no longer
+      reports parked;
+    - snapshot present but for a superseded run (``terminal.json.run_id``
+      names a different run) -> the stale park does not hold;
+    - snapshot present, run-consistent, terminal absent or declaring
+      ``waiting_on=decision`` -> parked. A dd dispatch park
+      (``parked_dd_development_id``) is not a decision park.
+    """
+    run_root = Path(run_root)
+    stall = _read_json_object(scheduler_stall_path(run_root, folder_id))
+    terminal = _read_json_object(run_root / folder_id / TERMINAL_ARTIFACT)
+    heartbeat = _read_json_object(run_root / folder_id / HEARTBEAT_FILE)
+
+    waiting, declared = normalize_waiting_on(terminal.get("waiting_on"))
+    term_word = str(terminal.get("terminal") or "") if terminal else ""
+
+    def state_word_default() -> str:
+        if terminal:
+            word = f"terminal={term_word or 'unknown'}"
+            # The line's own declared waiting reason, verbatim -- an unknown
+            # value normalises to "none" for parking but is the actual state
+            # word a refusal must carry.
+            if declared:
+                word += f", waiting_on={declared}"
+            return word
+        if heartbeat:
+            return f"running (round {heartbeat.get('round')})"
+        return "no park state"
+
+    snapshot_run = str(stall.get("parked_run_id") or "")
+    snapshot_live = bool(snapshot_run) and stall.get("parked_at") is not None
+    if snapshot_live:
+        term_run = str(terminal.get("run_id") or "") if terminal else ""
+        if term_run and term_run != snapshot_run:
+            word = (
+                f"{state_word_default()} (park snapshot {snapshot_run!r} superseded "
+                f"by run {term_run!r})"
+            )
+            return ParkedDecisionState(parked=False, state_word=word)
+        if stall.get("parked_dd_development_id"):
+            word = f"parked on dd development {stall['parked_dd_development_id']!r}"
+            return ParkedDecisionState(parked=False, state_word=word)
+        if terminal and waiting != "decision":
+            return ParkedDecisionState(parked=False, state_word=state_word_default())
+        return ParkedDecisionState(parked=True, state_word="parked waiting_on=decision")
+
+    if not stall:
+        # No scheduler state at all: the terminal declaration is the only
+        # parked claim in existence, so nothing can fork against it.
+        if waiting == "decision":
+            return ParkedDecisionState(
+                parked=True, state_word="parked waiting_on=decision (terminal declaration)"
+            )
+        return ParkedDecisionState(parked=False, state_word=state_word_default())
+
+    # Scheduler state exists but the snapshot is cleared: the park was
+    # retracted on the authority side; a terminal declaration alone no
+    # longer reports a live park.
+    return ParkedDecisionState(parked=False, state_word=state_word_default())
+
+
 def iso(ts: float) -> str:
     """UTC, second precision. Matches pump.py `_iso` exactly."""
     return time.strftime(ISO_FORMAT, time.gmtime(ts))
@@ -226,8 +363,11 @@ class RunArtifacts:
         self.release_id = release_id
 
         self._rounds_path = self.run_root / "rounds.jsonl"
+        #: R3: the Stop-Response actions ledger, under the coordinator face.
+        self._coord_rounds_path = self.run_root / "coord" / "rounds.jsonl"
         self._heartbeat_path = self.run_root / "heartbeat.json"
         self._terminal_path = self.run_root / "terminal.json"
+        self._acks_path = self.run_root / LINE_MESSAGE_ACKS_FILE
 
         self._hb_round: int | None = None
         self._hb_phase: str | None = None
@@ -306,6 +446,58 @@ class RunArtifacts:
             if raw.strip():
                 rounds.append(json.loads(raw))
         return rounds
+
+    def record_stop_response_actions(self, record: dict[str, Any]) -> bool:
+        """Append one Stop-Response actions record; never rewrites history.
+
+        R3: the coordinator's actions verbatim and the per-action consumption
+        receipts land in the Stop-Response rounds ledger under ``coord/`` --
+        beside the coordinator round inputs, because this is the coordinator's
+        output face. Append-only and flushed like ``rounds.jsonl``; a lost
+        append degrades observability only and must never block the loop.
+        """
+        try:
+            self._coord_rounds_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._coord_rounds_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                handle.flush()
+            return True
+        except OSError as exc:
+            log.warning("coord actions record append failed (not blocking the loop): %s", exc)
+            return False
+
+    # --- line-message acks (M4) ------------------------------------------
+
+    def record_line_message_acks(self, round_no: int, acks: list[dict[str, Any]]) -> bool:
+        """Append one round's line-message ack rows; never rewrites history.
+
+        The durable side of the M4 ack obligation: the read model folds this
+        ledger into the line's wake_facts, so an ack is observable on the
+        state face without re-reading rounds.jsonl. A lost append degrades
+        observability only -- it must never block the loop.
+        """
+        if not acks:
+            return True
+        try:
+            with self._acks_path.open("a", encoding="utf-8") as handle:
+                for ack in acks:
+                    row = {"round": round_no, "at": iso(self._clock()), **ack}
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                handle.flush()
+            return True
+        except OSError as exc:
+            log.warning("line-message acks append failed (not blocking the loop): %s", exc)
+            return False
+
+    def read_line_message_acks(self) -> list[dict[str, Any]]:
+        """The line's ack ledger, in arrival order. For tests and the read model."""
+        if not self._acks_path.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        for raw in self._acks_path.read_text(encoding="utf-8").splitlines():
+            if raw.strip():
+                rows.append(json.loads(raw))
+        return rows
 
     # --- worker turn report ----------------------------------------------
 
@@ -463,8 +655,10 @@ def signal_terminal_name(signum: int) -> str:
 
 __all__ = [
     "HEARTBEAT_FIELDS",
+    "HEARTBEAT_FILE",
     "HEARTBEAT_INTERVAL_SECONDS",
     "ISO_FORMAT",
+    "LINE_MESSAGE_ACKS_FILE",
     "LINE_STATE_DONE",
     "LINE_STATE_FAILED",
     "LINE_STATE_VALUES",
@@ -473,14 +667,20 @@ __all__ = [
     "LINE_STATE_WAITING_EXTERNAL",
     "LINE_STATE_WORKING",
     "RELEASE_CURRENT_PATH",
+    "SCHEDULER_STALL_SUBDIR",
+    "TERMINAL_ARTIFACT",
     "TERMINAL_FIELDS",
     "WAITING_ON_DEFAULT",
     "WAITING_ON_VALUES",
+    "ParkedDecisionState",
     "RunArtifacts",
     "capture_release_id",
     "derive_line_state",
     "iso",
+    "line_message_acks_path",
     "normalize_waiting_on",
+    "parked_decision_state",
+    "scheduler_stall_path",
     "signal_terminal_name",
     "write_json_durable",
 ]

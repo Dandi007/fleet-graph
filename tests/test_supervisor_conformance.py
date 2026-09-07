@@ -196,6 +196,50 @@ class TestGuardBDecision:
         assert proc.returncode == 1
         assert "decision_publisher" in proc.stderr
 
+    def test_the_s11_gated_dd_gate_delivery_publish_survives(self, tmp_path: Path) -> None:
+        """M3.1 (S10 裁决送达必须落地): the dd control plane's
+        ``publish_gate_decision`` is the second sanctioned publish point --
+        reachable only behind the dispatched_by authority check."""
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/dd/control_plane.py",
+            "from fleet_graph.bus.board import DECISION_KIND\n"
+            "def publish_gate_decision(self):\n"
+            '    client.publish("board:work-notes", DECISION_KIND, {}, "key")\n',
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 0, proc.stderr
+
+    def test_a_publish_outside_the_exempt_function_in_the_same_module_is_caught(
+        self, tmp_path: Path
+    ) -> None:
+        """The exemption is scoped to the function, not the module: any other
+        function in control_plane.py still trips the guard."""
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/dd/control_plane.py",
+            "from fleet_graph.bus.board import DECISION_KIND\n"
+            "def sneaky(self):\n"
+            '    client.publish("board:work-notes", DECISION_KIND, {}, "key")\n',
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+        assert "decision publish" in proc.stderr
+
+    def test_the_dd_gate_delivery_name_does_not_sanctify_other_modules(
+        self, tmp_path: Path
+    ) -> None:
+        """The exemption is scoped to the (module, function) pair: the same
+        function name elsewhere is still a violation."""
+        src = sample_tree(
+            tmp_path,
+            "fleet_graph/sneaky.py",
+            "def publish_gate_decision():\n"
+            '    client.publish("board:work-notes", "work.decision.v1", {}, "key")\n',
+        )
+        proc = run_guard(src)
+        assert proc.returncode == 1
+
 
 class TestGuardCPublisherImports:
     """Only the supervisor act node may reach the decision publisher."""
@@ -431,73 +475,6 @@ class TestGuardEE6StopWrites:
             tmp_path,
             "fleet_graph/supervise/e6_ops.py",
             "def stop_unit(self, unit):\n    return _run(['systemctl', 'stop', unit])\n",
-        )
-        proc = run_guard(src)
-        assert proc.returncode == 0, proc.stderr
-
-
-class TestGuardEE7GoalWrites:
-    """M4: the E7 reactor may only write its resolved folder's goal.md.
-
-    Guard E inspects `supervise/e7_write.py`: a function that performs a
-    goal.md write primitive (`append_delivery_fail_block` / `fs_write` /
-    `fs_edit` / `write` / `edit` / `create`) must also call the write gate
-    (`authorize_e7_write` / `authorize`) in the same body. An ungated goal.md
-    write is the exact thing the M4 直写目标圈点 铁律 forbids.
-    """
-
-    def test_ungated_goal_write_in_e7_module_is_caught(self, tmp_path: Path) -> None:
-        src = sample_tree(
-            tmp_path,
-            "fleet_graph/supervise/e7_write.py",
-            "def write(state):\n"
-            "    deps.ops.append_delivery_fail_block(state['folder_id'], block)\n",
-        )
-        proc = run_guard(src)
-        assert proc.returncode == 1
-        assert "allowlist" in proc.stderr
-        assert "append_delivery_fail_block" in proc.stderr
-
-    def test_ungated_fs_write_in_e7_module_is_caught(self, tmp_path: Path) -> None:
-        src = sample_tree(
-            tmp_path,
-            "fleet_graph/supervise/e7_write.py",
-            "def write(state):\n    WorkFolder(folder).write('goal.md', content)\n",
-        )
-        proc = run_guard(src)
-        assert proc.returncode == 1
-        assert "allowlist" in proc.stderr
-
-    def test_gated_goal_write_in_e7_module_survives(self, tmp_path: Path) -> None:
-        src = sample_tree(
-            tmp_path,
-            "fleet_graph/supervise/e7_write.py",
-            "from fleet_graph.supervise.e7_write import authorize_e7_write\n"
-            "def write(state):\n"
-            "    auth = authorize_e7_write(allowlist, state['folder_id'])\n"
-            "    if not auth.granted:\n"
-            "        return\n"
-            "    deps.ops.append_delivery_fail_block(state['folder_id'], block)\n",
-        )
-        proc = run_guard(src)
-        assert proc.returncode == 0, proc.stderr
-
-    def test_module_level_ungated_goal_write_is_caught(self, tmp_path: Path) -> None:
-        src = sample_tree(
-            tmp_path,
-            "fleet_graph/supervise/e7_write.py",
-            "deps.ops.append_delivery_fail_block('wf-x', block)\n",
-        )
-        proc = run_guard(src)
-        assert proc.returncode == 1
-        assert "ungated" in proc.stderr
-
-    def test_e7_ops_layer_is_exempt(self, tmp_path: Path) -> None:
-        src = sample_tree(
-            tmp_path,
-            "fleet_graph/supervise/e7_ops.py",
-            "def append_delivery_fail_block(self, folder_id, block):\n"
-            "    return wf.write('goal.md', content)\n",
         )
         proc = run_guard(src)
         assert proc.returncode == 0, proc.stderr

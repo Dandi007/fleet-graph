@@ -17,7 +17,8 @@ dd status / decision-bridge 的 bridge.sqlite3，以及可选的 agent-bus
 - **读失败降级不 5xx 全链**：单个工件缺失/解析失败只对该条目标记
   absent/unknown，绝不让整表挂掉。
 - 机械事实只读：``heartbeat_age_s`` = 现在 - heartbeat.json 的 ``updated_at``；
-  ``parked`` = ``waiting_on == "decision"``（见 ``normalize_waiting_on``）；
+  ``waiting_on`` 等 wake facts 取自 terminal 声明（R6 起不再派生 ``parked``
+  字段——waiting 状态由 ``waiting_on == "decision"`` 机械可判）。
   ``wake_facts`` 至少含 ``waiting_on`` 等机械事实。
 - 驻停声明按 run 一致性门控：``terminal.json.run_id == heartbeat.json.run_id``
   时该声明才属活 run；否则 ``wake_facts_stale=true`` 且顶层 ``run_id`` 暴露
@@ -33,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import time
 from collections.abc import Callable
@@ -41,12 +43,23 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
-from fleet_graph.state.run_artifacts import normalize_waiting_on
+from fleet_graph.bus.tokens import SUPERVISION_TOKEN_ROOT
+from fleet_graph.state.release_position import release_position
+from fleet_graph.state.run_artifacts import (
+    line_message_acks_path,
+    normalize_waiting_on,
+)
 
 log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = "1"
+
+#: M4: how many line-message ack rows the state face folds into wake_facts
+#: (latest first). A ledger cap, not a retention policy -- the run's
+#: line-message-acks.jsonl keeps everything.
+ACK_TAIL_LIMIT = 50
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7494
@@ -92,8 +105,9 @@ _RECEIPT_STATE: dict[str, tuple[str, str | None]] = {
 }
 
 #: dd 单据侧对账的机械事实词汇。human gate 走完（events.jsonl ``human_gate`` +
-#: ``success``）或 status.json 离开 ``awaiting_gate``，都证明该裁决真被消费，
-#: 而不是 bridge receipt 在某个评估瞬间看到的快照。
+#: ``success``）或单据权威 run 工件（该代 result.json）已离开
+#: ``awaiting_gate``，都证明该裁决真被消费，而不是 bridge receipt 在某个评估
+#: 瞬间看到的快照。
 GATE_STAGE = "human_gate"
 GATE_SUCCESS_EVENT = "success"
 DD_AWAITING_GATE = "awaiting_gate"
@@ -133,6 +147,12 @@ class FleetStateConfig:
     has_harvest_receipt: Callable[[str], bool] | None = None
     #: E5 首跑基线水位文件路径；None 用 ``<run_root>/.scheduler/e5-baseline.json``。
     harvest_baseline_path: Path | None = None
+    #: R2（wf-4601c8 图合一）: the M1 waiting-zero-consumption ledger file the
+    #: ``/v1/llm-ledger`` query face serves. It is the in-fleet projection of
+    #: the 灵智账本 consumption face (request_events), served over HTTP because
+    #: the 05 probe is a curl probe and a ``file://`` URL can never answer
+    #: HTTP 200. ``None`` keeps the route honestly 404 (face not configured).
+    llm_ledger_path: Path | None = None
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -172,6 +192,29 @@ def _generation_events_path(dd_root: Path, development_id: str, generation: int)
     return dev_root / f"g{generation}" / "events.jsonl"
 
 
+def _generation_result_path(dd_root: Path, development_id: str, generation: int) -> Path:
+    """Where one generation's ``result.json`` lives (g1 at the dev root).
+
+    The authority artifact for a development's stage/terminal/awaiting facts:
+    the same file the control plane's ``rebuild_status`` derives everything
+    from. The rebuildable status cache file is never consumed here
+    (M3.1 defect 6).
+    """
+    dev_root = dd_root / development_id
+    if generation and generation <= 1:
+        return dev_root / "result.json"
+    return dev_root / f"g{generation}" / "result.json"
+
+
+def _development_generation(dd_root: Path, development_id: str) -> int:
+    """The development's current generation from its admission record; 1 fail-soft."""
+    record = _read_json(dd_root / development_id / "record.json")
+    try:
+        return max(1, int((record or {}).get("generation") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _document_gate_consumed(dd_root: Path, development_id: str, generation: int) -> str:
     """对账单个 dd 单据：该裁决是否真被消费（而非 receipt 瞬时快照）。
 
@@ -179,20 +222,22 @@ def _document_gate_consumed(dd_root: Path, development_id: str, generation: int)
       - ``human_gate_success`` / ``left_awaiting_gate`` → 单据侧证明消费；
       - ``document_awaiting`` → 单据侧可读、仍在等待，真没消费；
       - ``unreconciled`` → 单据侧缺失/不可读，显式标注对不上。
-    顺序：先看 status.json（权威重建态）是否已离开 ``awaiting_gate``，再看
+    顺序：先看单据权威 run 工件（该代 ``result.json``，M3.1 defect 6：不再读
+    无失效逻辑的状态缓存）是否已离开 ``awaiting_gate``，再看
     events.jsonl 是否记了 ``human_gate`` + ``success``。
     """
     dev_root = dd_root / development_id
     if not dev_root.is_dir():
         return BASIS_UNRECONCILED
-    status = _read_json(dev_root / "status.json")
-    state = str(status.get("state") or "") if status else ""
-    if state and state != DD_AWAITING_GATE:
+    result = _read_json(_generation_result_path(dd_root, development_id, generation))
+    if result is not None and not result.get("awaiting"):
+        # A readable authority artifact with no pending question: the single
+        # left the gate (running/terminal), so the verdict was consumed.
         return BASIS_LEFT_AWAITING_GATE
     for entry in _read_jsonl(_generation_events_path(dd_root, development_id, generation)):
         if entry.get("stage") == GATE_STAGE and entry.get("event") == GATE_SUCCESS_EVENT:
             return BASIS_HUMAN_GATE_SUCCESS
-    if status is not None and state == DD_AWAITING_GATE:
+    if result is not None and result.get("awaiting"):
         return BASIS_DOCUMENT_AWAITING
     return BASIS_UNRECONCILED
 
@@ -333,7 +378,7 @@ def _receipt_to_decision(receipt: dict[str, Any], *, dd_root: Path | None = None
     owner_id = str(receipt.get("target_id") or "")
 
     # 终结对账：bridge receipt 定终结态不再单凭快照——有 dd 目标时拿单据侧
-    # （events.jsonl human_gate success / status.json 离开 awaiting_gate）再对
+    # （events.jsonl human_gate success / 权威 result.json 离开 awaiting_gate）再对
     # 一声。单据侧证明被消费 → 提升为 consumed（修正「已送达且被消费却误记
     # swallowed」）；可读但仍 waiting → 维持 swallowed 并标注；对不上 → 显式
     # 标注 unreconciled，不静默归 consumed 或 swallowed。
@@ -386,8 +431,42 @@ def _read_published(config: FleetStateConfig, seen: set[str]) -> list[dict[str, 
     credential, or any read failure degrades to "no published" -- the bus is an
     optional enrichment, never a hard dependency of the view.
     """
+    published: list[dict[str, Any]] = []
+    # R6: the decision-MCP delivery ledger is the durable consume record for
+    # the synchronous line-delivery path -- a ``delivered`` row carries the
+    # owner line in its action_key and was written only after a successful
+    # resume through the registered control entry. Fold it in first so the
+    # owner attribution does not depend on the bridge db being present. The
+    # fold is env-fenced: it only runs where the decision face's state dir is
+    # actually bound (isolated environments / the bound production face).
+    ledger_env = os.environ.get("FLEET_GRAPH_DECISION_MCP_STATE_DIR")
+    if ledger_env:
+        try:
+            ledger = Path(ledger_env) / "deliveries.jsonl"
+            if ledger.is_file():
+                for raw in ledger.read_text(encoding="utf-8").splitlines():
+                    try:
+                        entry = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if not isinstance(entry, dict) or entry.get("status") != "delivered":
+                        continue
+                    action_key = str(entry.get("action_key") or "")
+                    owner_id = action_key.split(":")[1] if action_key.count(":") >= 2 else ""
+                    row = {
+                        "source_message_id": f"delivery:{action_key}",
+                        "state": STATE_CONSUMED,
+                        "owner": {
+                            "kind": "line",
+                            "id": owner_id,
+                            "generation": entry.get("generation"),
+                        },
+                    }
+                    published.append(row)
+        except (OSError, AttributeError):
+            pass
     if not config.bus_url:
-        return []
+        return published
     try:
         from fleet_graph.bus.board import DECISION_KINDS, WORK_NOTES
         from fleet_graph.bus.client import BusClient, load_token
@@ -396,8 +475,7 @@ def _read_published(config: FleetStateConfig, seen: set[str]) -> list[dict[str, 
         messages, _head = client.messages(WORK_NOTES, limit=200)
     except Exception as exc:
         log.debug("state read-model: bus published read skipped: %s", exc)
-        return []
-    published: list[dict[str, Any]] = []
+        return published
     for message in messages:
         message_id = str(message.get("message_id") or "")
         if not message_id or message_id in seen:
@@ -532,7 +610,26 @@ class FleetStateView:
                 live_run_id is None or declared_run_id is None or live_run_id != declared_run_id
             )
 
+            # M4 ack obligation on the state face: the line's line-message ack
+            # ledger, folded into wake_facts (latest first, capped) so an
+            # operator can see an instruction was answered without re-reading
+            # the run's rounds. A missing/failed read degrades to absent --
+            # never a 5xx, never a fabricated ledger. The ledger path comes
+            # from the one discovery seam (spec-m4b 台账路径发现), never a
+            # locally re-assembled name.
+            acks = _read_jsonl(line_message_acks_path(run_root, folder_id))
+            if acks:
+                wake_facts["line_message_acks"] = list(reversed(acks))[:ACK_TAIL_LIMIT]
+
             generation = self._generation_for(run_root, folder_id, roster_generation)
+            # R4（一线一分支）: the line's branch-position readings -- how far
+            # the line branch trails its origin counterpart (release_behind,
+            # the dispatch-side view check 14's probe reads) and how far the
+            # execution position trails the branch head (deploy_behind, the
+            # D8 frozen-cost view). First-class fields: present even when
+            # unavailable, where they carry an explicit basis instead of a
+            # fabricated 0.
+            position = release_position(self.config.dd_root, folder_id)
             line_objs.append(
                 {
                     "folder_id": folder_id,
@@ -541,7 +638,6 @@ class FleetStateView:
                     "phase": heartbeat.get("phase") if heartbeat else None,
                     "heartbeat_age_s": heartbeat_age_s,
                     "terminal": terminal.get("terminal") if terminal else None,
-                    "parked": waiting_on == "decision",
                     "wake_facts": wake_facts,
                     "run_id": live_run_id,
                     "wake_facts_stale": wake_facts_stale,
@@ -551,6 +647,11 @@ class FleetStateView:
                     # deploy `current` symlink (that would report what the
                     # symlink points at *now*, not what the process exec'd).
                     "release_id": heartbeat.get("release_id") if heartbeat else None,
+                    "release_ref": position["release_ref"],
+                    "release_behind": position["release_behind"],
+                    "deploy_behind": position["deploy_behind"],
+                    "release_behind_basis": position["release_behind_basis"],
+                    "deploy_behind_basis": position["deploy_behind_basis"],
                 }
             )
         return {"schema_version": SCHEMA_VERSION, "lines": line_objs}
@@ -622,11 +723,17 @@ class FleetStateView:
                 # nothing mechanical to say, so nothing to report.
                 continue
             development_id = str(record.get("development_id") or entry.name)
-            status = _read_json(entry / "status.json")
-            if status is None:
-                # Unreadable/missing status degrades the entry away.
+            # The terminal verdict comes from the generation's authority run
+            # artifact, not the rebuildable status cache (M3.1 defect 6).
+            result = _read_json(
+                _generation_result_path(
+                    dd_root, development_id, _development_generation(dd_root, development_id)
+                )
+            )
+            if result is None:
+                # Unreadable/missing authority run artifact degrades the entry away.
                 continue
-            terminal = str(status.get("terminal") or "")
+            terminal = str(result.get("terminal") or "")
             # refused / fault / any non-complete terminal / in-flight never
             # listed (目标语义): only `complete` can be approved_unharvested.
             if terminal != "complete":
@@ -645,8 +752,8 @@ class FleetStateView:
             developments.append(
                 {
                     "development_id": development_id,
-                    "head_commit": str(status.get("head_commit") or ""),
-                    "stage": str(status.get("stage") or ""),
+                    "head_commit": str(result.get("head_commit") or ""),
+                    "stage": str(result.get("stage") or ""),
                     "terminal": terminal,
                 }
             )
@@ -654,6 +761,220 @@ class FleetStateView:
         if first_run:
             self._write_e5_baseline(baseline)
         return {"schema_version": SCHEMA_VERSION, "developments": developments}
+
+    # ------------------------------------------------------------------
+    # R5 外门只读投影（specs/r5-outer-gate-mcp.md 行为契约 1：读四件的
+    # 数据源；S7 边界=复用本视图既有投影，不重做读取器）。全部只读、
+    # fail-soft：单个数据源缺失/不可读让对应项显式缺席，绝不让整表挂掉。
+    # ------------------------------------------------------------------
+
+    def roster(self) -> dict[str, Any]:
+        """The roster SSoT the read model covers (state_takeover item 1)."""
+        try:
+            raw = json.loads(self.config.lines_config.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RosterUnavailable(
+                f"roster {str(self.config.lines_config)!r} unreadable: {exc}"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise RosterUnavailable(
+                f"roster {str(self.config.lines_config)!r} is not a JSON object"
+            )
+        entries = raw.get("lines") or []
+        lines = [entry for entry in entries if isinstance(entry, dict) and entry.get("folder_id")]
+        return {
+            "lines_config": str(self.config.lines_config),
+            "lines": lines,
+            "total": len(lines),
+        }
+
+    def awaiting_decisions(self) -> list[dict[str, Any]]:
+        """Lines waiting on a decision (state_takeover item 3).
+
+        R6 (wf-4601c8 §7.2.4) removed the derived ``parked`` field from the
+        /v1/lines projection; this view derives the same answer from the
+        still-emitted wake facts (``waiting_on == "decision"``) -- no second
+        reader, no reintroduced field.
+        """
+        awaiting = []
+        for line in self.lines().get("lines") or []:
+            if (line.get("wake_facts") or {}).get("waiting_on") == "decision":
+                awaiting.append(
+                    {
+                        "folder_id": line.get("folder_id"),
+                        "waiting_on": (line.get("wake_facts") or {}).get("waiting_on"),
+                        "wake_facts_stale": line.get("wake_facts_stale"),
+                    }
+                )
+        return awaiting
+
+    def pending_releases(self) -> list[dict[str, Any]]:
+        """Harvestable developments (state_takeover item 4): complete with no
+        harvest receipt -- the candidates the supervisory plane may release."""
+        return list(self.harvestable().get("developments") or [])
+
+    def auth_mode(self) -> dict[str, Any]:
+        """The authorization mode facts (state_takeover item 5), mechanical only.
+
+        The supervisor principal name (the R2 outer-gate identity) plus the
+        two credential facts that decide "who can act": the line-token
+        template the fleet binds and whether the supervision credential root
+        is present. Read-only, never a policy statement. The supervision
+        root location is overridable via ``FLEET_GRAPH_SUPERVISION_TOKEN_ROOT``
+        (tests bind a scratch root); the default is the fleet's supervision
+        credential root.
+        """
+        from fleet_graph.dd.service import supervisor_principal as dd_supervisor_principal
+        from fleet_graph.outer_gate_mcp import supervisor_principal as gate_principal
+
+        supervision_root = Path(
+            os.environ.get("FLEET_GRAPH_SUPERVISION_TOKEN_ROOT") or str(SUPERVISION_TOKEN_ROOT)
+        )
+        return {
+            "supervisor_principal": gate_principal(),
+            "dd_outer_gate_principal": dd_supervisor_principal(),
+            "line_token_template_respected": True,
+            "supervision_token_root_present": supervision_root.is_dir(),
+        }
+
+    def current_release(self, run_root: Path | None = None) -> dict[str, Any]:
+        """The release the fleet is running (state_takeover item 6).
+
+        Per-line ``release_id`` values as frozen by the line processes at
+        exec (heartbeat), plus the deploy tree's ``current`` symlink target
+        and its ``release.json`` stamp when readable. The symlink read is a
+        mechanical fact about the deploy tree, labelled as such -- the
+        per-line ``release_id`` remains the run-frozen authority. The deploy
+        tree location is overridable via the ``FLEET_GRAPH_DEPLOY_CURRENT``
+        env var (tests bind a scratch tree); an unreadable deploy tree leaves
+        ``deploy_current``/``release_stamp`` honestly None rather than
+        fabricated.
+        """
+        per_line: dict[str, Any] = {}
+        for line in self.lines().get("lines") or []:
+            per_line[str(line.get("folder_id") or "")] = line.get("release_id")
+        deploy_root = Path(
+            os.environ.get("FLEET_GRAPH_DEPLOY_CURRENT") or "/data/apps/fleet-graph/current"
+        )
+        deploy_current: str | None = None
+        release_stamp: dict[str, Any] | None = None
+        try:
+            deploy_current = str(deploy_root.resolve())
+        except OSError:
+            deploy_current = None
+        try:
+            raw = json.loads((deploy_root / "release.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = None
+        if isinstance(raw, dict):
+            release_stamp = {
+                k: raw[k] for k in ("release_id", "created_at", "commit", "head") if k in raw
+            } or None
+        return {
+            "per_line_release_id": per_line,
+            "deploy_current": deploy_current,
+            "release_stamp": release_stamp,
+        }
+
+    def recent_dispatches(self, folder_id: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        """A line's recent dispatch records (state_line's projection).
+
+        Read-only scan of the dd tree for records dispatched by this line
+        (``record.json``'s ``dispatched_by``), newest first by directory
+        mtime, capped at ``limit``. Fail-soft: an unreadable record degrades
+        that entry away.
+        """
+        dd_root = self.config.dd_root
+        if not dd_root.is_dir():
+            return []
+        rows: list[tuple[float, dict[str, Any]]] = []
+        try:
+            entries = sorted(dd_root.iterdir(), key=lambda p: p.name)
+        except OSError:
+            return []
+        for entry in entries:
+            record = _read_json(entry / "record.json")
+            if record is None:
+                continue
+            if str(record.get("dispatched_by") or "") != folder_id:
+                continue
+            try:
+                mtime = entry.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            development_id = str(record.get("development_id") or entry.name)
+            result = _read_json(
+                _generation_result_path(
+                    dd_root,
+                    development_id,
+                    _development_generation(dd_root, development_id),
+                )
+            )
+            rows.append(
+                (
+                    mtime,
+                    {
+                        "development_id": record.get("development_id") or entry.name,
+                        "remote_ref": record.get("remote_ref"),
+                        "state": (result or {}).get("stage"),
+                        "terminal": (result or {}).get("terminal"),
+                    },
+                )
+            )
+        rows.sort(key=lambda pair: pair[0], reverse=True)
+        return [row for _mtime, row in rows[: max(1, limit)]]
+
+    def llm_ledger(self, window_seconds: int) -> dict[str, Any]:
+        """The M1 waiting-zero-consumption ledger query face (R2).
+
+        Serves the configured ledger file's ``request_events`` projection over
+        HTTP. This is a plain query-face synthesis -- a read-model pass-through
+        of the 灵智账本 consumption face's local projection, the same class of
+        read as every other /v1 view (pure persistence read, never a wake or
+        terminal-state event source). ``LedgerUnavailable`` states why the
+        face has nothing honest to serve; the handler turns it into the
+        matching non-200 so a probe can tell "configured, empty" from "gone".
+        """
+        if self.config.llm_ledger_path is None:
+            raise LedgerFaceUnavailable(404, "llm ledger query face is not configured")
+        try:
+            raw = json.loads(self.config.llm_ledger_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise LedgerFaceUnavailable(503, f"llm ledger unreadable: {exc}") from exc
+        events = raw.get("request_events") if isinstance(raw, dict) else None
+        if not isinstance(events, list):
+            raise LedgerFaceUnavailable(503, "llm ledger carries no request_events array")
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "window_seconds": window_seconds,
+            "request_events": events,
+            "total": len(events),
+        }
+
+
+class RosterUnavailable(RuntimeError):
+    """The roster SSoT cannot serve an honest answer (R5 takeover item 1).
+
+    Raised by ``FleetStateView.roster()`` when the roster file is missing,
+    unreadable, or malformed. The outer-gate surface translates it into the
+    item's explicit ``unavailable`` mark -- never a fabricated empty roster,
+    never a silently omitted key.
+    """
+
+
+class LedgerFaceUnavailable(Exception):
+    """The /v1/llm-ledger face cannot serve an honest answer.
+
+    ``status`` is the HTTP status the handler answers with (404 unconfigured,
+    503 configured but unreadable) and ``detail`` the machine-readable reason.
+    Never fabricated zeros: a probe must be able to distinguish "the ledger
+    says zero" from "there is no ledger".
+    """
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
 
 
 class FleetStateHTTPServer(ThreadingHTTPServer):
@@ -668,7 +989,8 @@ class FleetStateHandler(BaseHTTPRequestHandler):
     server: FleetStateHTTPServer
 
     def do_GET(self) -> None:
-        path = self.path.split("?", 1)[0].rstrip("/")
+        path, _, query = self.path.partition("?")
+        path = path.rstrip("/")
         if path == "/v1/lines":
             payload = self.server.view.lines()
         elif path == "/v1/decisions":
@@ -677,8 +999,84 @@ class FleetStateHandler(BaseHTTPRequestHandler):
             payload = self.server.view.harvestable()
         elif path == "/v1/enrollments":
             payload = self.server.view.enrollments()
+        elif path == "/v1/llm-ledger":
+            self._serve_llm_ledger(query)
+            return
+        elif path == "/v1/takeover":
+            # R5 外门收敛：只读 GET 保留（R0 判据 09 的既有读数面），实现
+            # 直接复用 state_takeover 工具的同一六项只读投影——不是第二个
+            # 接管读模型，只是 MCP 门内的读实现经 HTTP 透出。每个数据源的
+            # 失败按项显式标注（unavailable+原因），绝不让整表 5xx 挂掉。
+            self._serve_takeover()
+            return
         else:
             self.send_error(404)
+            return
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_takeover(self) -> None:
+        """The zero-context takeover GET: the six-item projection, item-wise
+        honest (an unavailable source is an explicit unavailable mark, never a
+        missing key and never a 5xx for the whole table)."""
+        from fleet_graph.outer_gate_mcp import (
+            takeover_item_complete,
+            takeover_items,
+            takeover_keys,
+        )
+
+        when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            items = takeover_items(self.server.view, when)
+        except Exception as exc:  # pragma: no cover - defensive
+            body = json.dumps({"error": str(exc)}, ensure_ascii=False).encode("utf-8")
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        missing = [k for k in takeover_keys() if not takeover_item_complete(items.get(k))]
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "items": items,
+            "complete": not missing,
+            "missing": missing,
+            # R0 判据 09 的顶层六键直读形态：六项数据在顶层平铺（各项为该
+            # 数据源本体；不可得项为 unavailable 标注对象），一次调用齐。
+            **{
+                key: (item["data"] if takeover_item_complete(item) else item)
+                for key, item in items.items()
+            },
+        }
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_llm_ledger(self, query: str) -> None:
+        """The M1 zero-consumption ledger face: 200 + request_events, or the
+        honest non-200 (unconfigured / unreadable) -- never fabricated zeros."""
+        try:
+            params = parse_qs(query)
+            window = int((params.get("window_seconds") or ["3600"])[0])
+        except ValueError:
+            window = 3600
+        try:
+            payload = self.server.view.llm_ledger(window)
+        except LedgerFaceUnavailable as exc:
+            body = json.dumps({"error": exc.detail}, ensure_ascii=False).encode("utf-8")
+            self.send_response(exc.status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
@@ -715,5 +1113,7 @@ __all__ = [
     "FleetStateConfig",
     "FleetStateHTTPServer",
     "FleetStateView",
+    "LedgerFaceUnavailable",
+    "RosterUnavailable",
     "serve",
 ]

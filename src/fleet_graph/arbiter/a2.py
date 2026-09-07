@@ -52,6 +52,37 @@ FORBIDDEN_FIELDS = ("decision", "verdict", "approve", "reject", "gate_release")
 #: read-only diagnosis. Terminal states are deliberately absent.
 BLOCKED_STATUSES = frozenset({"blocked", "awaiting_gate"})
 
+#: The closed vocabulary of named escalation targets. It replaces the bare
+#: ``needs_human`` boolean, which could not tell apart three genuinely
+#: different destinations for a suggestion (缺陷⑫, wf-8d9737).
+ESCALATION_TARGETS = frozenset({"dispatching_line", "supervisor_escalation", "needs_evidence"})
+
+#: A dd unit past acceptance / at its gate: the normal course is
+#: dispatching-line self-judgment (D5 -- the dispatching line judges its own
+#: gate), not waiting on a person.
+ESCALATION_DISPATCHING_LINE = "dispatching_line"
+
+#: A class-B escalation: the supervisor must answer (direction / production
+#: action ruling).
+ESCALATION_SUPERVISOR_ESCALATION = "supervisor_escalation"
+
+#: Nobody can judge on the current evidence: go back and gather what is
+#: missing (named in the recommendation text).
+ESCALATION_NEEDS_EVIDENCE = "needs_evidence"
+
+#: Back-compat routing of a legacy ``needs_human: true`` payload: the boolean
+#: cannot name a destination, so the default target is routed by the subject's
+#: form. A blocked/awaiting-gate development card is the dd-unit-at-gate shape
+#: (dispatching line owns it); an addressed consultation is a direction ask
+#: (supervisor answers); an open question note has no addressee -- go back for
+#: evidence. Unknown forms degrade to evidence gathering as well.
+LEGACY_TRUE_TARGET_BY_SUBJECT_KIND = {
+    "blocked": ESCALATION_DISPATCHING_LINE,
+    "consultation": ESCALATION_SUPERVISOR_ESCALATION,
+    "question": ESCALATION_NEEDS_EVIDENCE,
+}
+LEGACY_TRUE_DEFAULT_TARGET = ESCALATION_NEEDS_EVIDENCE
+
 #: Every A2 note is stamped with this prefix, so a suggestion is plainly marked
 #: and replay-idempotency can recognise it by content, not by a private index.
 NOTE_MARKER = "[A2 suggestion — not a decision]"
@@ -82,7 +113,7 @@ class Recommendation:
     recommendation: str
     evidence_refs: tuple[str, ...]
     consequence: str
-    needs_human: bool
+    escalation_target: str
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -90,7 +121,7 @@ class Recommendation:
             "recommendation": self.recommendation,
             "evidence_refs": list(self.evidence_refs),
             "consequence": self.consequence,
-            "needs_human": self.needs_human,
+            "escalation_target": self.escalation_target,
         }
 
 
@@ -98,12 +129,38 @@ class RecommendationInvalid(ValueError):
     """The model answered in a shape the arbiter will not act on."""
 
 
-def coerce_recommendation(raw: Any, *, subject_id: str) -> Recommendation:
+def _coerce_escalation_target(raw: dict[str, Any], *, subject_kind: str) -> str:
+    """Resolve the named escalation target, with legacy-boolean back-compat.
+
+    A named ``escalation_target`` must sit inside the closed vocabulary -- an
+    out-of-vocabulary or empty value is refused outright. A legacy payload
+    carrying only ``needs_human`` stays parseable: ``true`` routes to the
+    default target for the subject's form, ``false`` (or absence) means no
+    escalation (empty target), so old readers and old payloads keep working.
+    """
+    if "escalation_target" in raw:
+        target = raw.get("escalation_target")
+        if not isinstance(target, str) or target not in ESCALATION_TARGETS:
+            raise RecommendationInvalid(
+                f"escalation_target must be one of {sorted(ESCALATION_TARGETS)}, "
+                f"got {target!r} -- refused"
+            )
+        return target
+    if raw.get("needs_human"):
+        return LEGACY_TRUE_TARGET_BY_SUBJECT_KIND.get(subject_kind, LEGACY_TRUE_DEFAULT_TARGET)
+    return ""
+
+
+def coerce_recommendation(raw: Any, *, subject_id: str, subject_kind: str = "") -> Recommendation:
     """Parse a model result into a Recommendation, refusing decision-shaped output.
 
     Only the five allowed keys are read. A payload carrying any forbidden field
     name is refused outright. Free text is preserved as-is: it can never change
     the emitted kind or marker, which the publisher fixes.
+
+    ``subject_kind`` (question / blocked / consultation) only feeds the
+    legacy ``needs_human: true`` back-compat routing; it never overrides a
+    named ``escalation_target``.
     """
     if not isinstance(raw, dict):
         raise RecommendationInvalid(f"recommendation must be an object, got {type(raw).__name__}")
@@ -130,7 +187,7 @@ def coerce_recommendation(raw: Any, *, subject_id: str) -> Recommendation:
         recommendation=recommendation.strip(),
         evidence_refs=evidence_refs,
         consequence=consequence,
-        needs_human=bool(raw.get("needs_human", False)),
+        escalation_target=_coerce_escalation_target(raw, subject_kind=subject_kind),
     )
 
 
@@ -180,7 +237,13 @@ class TextReasoner:
         "exactly one JSON object with these keys only: "
         '"subject_id" (string), "recommendation" (string), '
         '"evidence_refs" (array of strings, may be empty), '
-        '"consequence" (string, a reversibility note), "needs_human" (boolean). '
+        '"consequence" (string, a reversibility note), '
+        '"escalation_target" (one of: '
+        '"dispatching_line" -- a dd unit past acceptance, route to the '
+        "dispatching line: the unit's dispatched_by self-judges the gate; "
+        '"supervisor_escalation" -- a supervisor must answer this escalation; '
+        '"needs_evidence" -- nobody can judge yet, name the missing evidence '
+        'in "recommendation"). '
         "Never emit keys named decision, verdict, approve, reject, or gate_release."
     )
 
@@ -462,13 +525,38 @@ def _subject_refs(
     return tuple(ordered)
 
 
+#: Per-target guidance rendered into the note body. ``dispatching_line`` must
+#: point at the dispatching line's self-judgment (D5) and never at a person
+#: taking the call; ``supervisor_escalation`` keeps the supervisor-must-answer
+#: wording; ``needs_evidence`` composes its line with the missing-evidence
+#: text, so it lives in ``_render_note``.
+_GUIDANCE_LINES = {
+    ESCALATION_DISPATCHING_LINE: (
+        "guidance: route to the dispatching line -- the unit's dispatched_by "
+        "self-judges (D5: the dispatching line owns its own gate)"
+    ),
+    ESCALATION_SUPERVISOR_ESCALATION: (
+        "guidance: supervisor escalation -- the supervisor must answer this "
+        "escalation (direction / production-action ruling)"
+    ),
+}
+
+
 def _render_note(recommendation: Recommendation) -> str:
+    target = recommendation.escalation_target
     lines = [
         NOTE_MARKER,
         f"subject_id: {recommendation.subject_id}",
-        f"needs_human: {'true' if recommendation.needs_human else 'false'}",
+        f"escalation_target: {target or 'none'}",
         f"recommendation: {recommendation.recommendation}",
     ]
+    if target == ESCALATION_NEEDS_EVIDENCE:
+        lines.append(
+            "guidance: needs evidence -- go back for evidence; "
+            f"missing: {recommendation.recommendation}"
+        )
+    elif target in _GUIDANCE_LINES:
+        lines.append(_GUIDANCE_LINES[target])
     if recommendation.consequence:
         lines.append(f"consequence: {recommendation.consequence}")
     if recommendation.evidence_refs:
@@ -511,11 +599,13 @@ def run_arbiter(
         seen.add(subject.subject_id)
         try:
             raw = reasoner.recommend(subject, subject.facts)
-            recommendation = coerce_recommendation(raw, subject_id=subject.subject_id)
+            recommendation = coerce_recommendation(
+                raw, subject_id=subject.subject_id, subject_kind=subject.kind
+            )
         except Exception as exc:  # a refusal, not a crash: one bad subject must not sink the tick
             run.refused.append({"subject_id": subject.subject_id, "reason": str(exc)[:400]})
             continue
-        note_type = "finding" if recommendation.needs_human else "progress"
+        note_type = "finding" if recommendation.escalation_target else "progress"
         text = _render_note(recommendation)
         idempotency_key = f"arbiter-a2:{subject.subject_id}:{subject.source_revision}"
         subject_refs = _subject_refs(subject, recommendation, known_entities)
@@ -551,6 +641,10 @@ __all__ = [
     "ALLOWED_NOTE_TYPES",
     "BLOCKED_STATUSES",
     "DEFAULT_REASONING_MODEL",
+    "ESCALATION_DISPATCHING_LINE",
+    "ESCALATION_NEEDS_EVIDENCE",
+    "ESCALATION_SUPERVISOR_ESCALATION",
+    "ESCALATION_TARGETS",
     "FORBIDDEN_FIELDS",
     "NOTE_MARKER",
     "ArbiterRun",

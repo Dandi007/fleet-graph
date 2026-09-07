@@ -203,6 +203,43 @@ class CostDataPlane:
             attribution=UNKNOWN, order_id=order_id, tokens=tokens, event_id=event_id
         )
 
+    def record_failure_cost(
+        self,
+        *,
+        attribution: str,
+        order_id: str,
+        tokens: float,
+        event_id: str,
+        failure_code: str,
+        root_cause: str,
+    ) -> bool:
+        """Emit a failed run's token spend, attributed to the lifecycle it served.
+
+        The X-4 spend rule: a run that ended in a contract violation or an
+        agent-side failure ran to its failed end -- its route attempts carry
+        the durations and the burn -- so its tokens belong to the launch or
+        review lifecycle the run served, never to `unknown`. The failure
+        classification rides on the fact (`failure_code`, `root_cause`
+        labels) so the attribution stays auditable instead of being a silent
+        relabelling of an unknown bucket. The identity key matches
+        `record_execution_cost`'s family (`cost:<event_id>:<attribution>`),
+        so a replayed emission for the same run is a no-op and a failed run
+        can never double-count against its own success path.
+        """
+        if attribution not in KNOWN_CLASSES and attribution != UNKNOWN:
+            raise ValueError(f"attribution must be a known class or 'unknown', got {attribution!r}")
+        return self._emit(
+            COST_METRIC,
+            {
+                "attribution": attribution,
+                "order_id": order_id,
+                "failure_code": failure_code,
+                "root_cause": root_cause,
+            },
+            float(tokens),
+            key=f"cost:{event_id}:{attribution}",
+        )
+
     def mark_absent(self, *, order_id: str, lifecycle: str) -> None:
         """Explicitly account a lifecycle class whose producer emitted nothing.
 

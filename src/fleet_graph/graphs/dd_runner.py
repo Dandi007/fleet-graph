@@ -25,6 +25,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from fleet_graph.dd.capability import CapabilityLock
 from fleet_graph.dd.cost_obs import build_cost_plane
 from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder
+from fleet_graph.dd.git import run_git
 from fleet_graph.dd.lifecycle import Lifecycle
 from fleet_graph.dd.prompt import PluginPromptSource
 from fleet_graph.executors.agent_run import AgentRunLauncher
@@ -43,6 +44,7 @@ from fleet_graph.graphs.dd_pipeline import (
 )
 from fleet_graph.graphs.dd_replay import ReceiptReplayer, prior_generation_state_roots
 from fleet_graph.graphs.dd_scripts import (
+    GATE_PATH,
     AcceptanceStage,
     ConfigureStage,
     MergeStage,
@@ -58,11 +60,64 @@ SPEC_ARTIFACT = "spec"
 EVENTS_FILE = "events.jsonl"
 RESULT_FILE = "result.json"
 
+# The stage run fence every remote retry budget defers to when the admission
+# record declares no per-stage override -- the runner's own default fence.
+DEFAULT_STAGE_FENCE_SECONDS = 3600
+
 # Artifact kinds used to find the stage that owns each script default.
 RUN_CONFIG = "run_config"
 ACCEPTANCE_RESULT = "acceptance_result"
 MERGE_RESULT = "merge_result"
 GATE_DECISION = "gate_decision"
+
+#: Rework contract B (wf-8d9737). The structured refusal code for a
+#: generation that would open without a new implement dispatch -- a sealed
+#: receipt replay marching a "new generation" straight past the work, as
+#: measured on dev-fg-79d528db4375 g2 (re-seal replay: no implement prompt,
+#: no new agent run, only acceptance.json changed).
+REWORK_REPLAY_REFUSED = "REWORK_REPLAY_REFUSED"
+
+#: Spec ⑮-b (wf-8d9737). The structured refusal code for a gate-rework launch
+#: whose verdict is not bound to the board ``work.decision.v1`` it came from
+#: (empty ``decision_message_id`` / ``decided_by`` / ``rationale``). Dispatch
+#: face defense: even if an unbound mandate file reaches ``dd run``, the run
+#: refuses instead of injecting an empty task book into an implement prompt.
+REWORK_DECISION_UNBOUND = "REWORK_DECISION_UNBOUND"
+
+#: The binding fields a gate-rework verdict must carry non-empty (spec ⑮-b).
+REWORK_BINDING_FIELDS = ("decision_message_id", "decided_by", "rationale")
+
+
+class ReworkDecisionUnbound(RuntimeError):
+    """A gate-rework launch whose verdict has no board binding.
+
+    Raised before the pipeline is built, so a refused generation never
+    launches a stage, seals a receipt, or writes a result. The refusal is the
+    observable failure the spec demands: an empty binding must never silently
+    dispatch a "rework" whose task book says nothing.
+    """
+
+    def __init__(self, message: str, *, unbound: list[str]) -> None:
+        super().__init__(f"{REWORK_DECISION_UNBOUND}: {message}")
+        self.code = REWORK_DECISION_UNBOUND
+        self.detail = message
+        self.unbound = list(unbound)
+
+
+class ReworkReplayRefused(RuntimeError):
+    """A gate-rework generation the engine cannot assemble real work for.
+
+    Raised before the pipeline is built, so a refused generation never
+    launches a stage, seals a receipt, or writes a result. `missing` names
+    what a real rework would have produced (a new implement prompt, a new
+    agent run) and did not.
+    """
+
+    def __init__(self, message: str, *, missing: list[str]) -> None:
+        super().__init__(f"{REWORK_REPLAY_REFUSED}: {message}")
+        self.code = REWORK_REPLAY_REFUSED
+        self.detail = message
+        self.missing = list(missing)
 
 
 @dataclass
@@ -117,6 +172,19 @@ class DevelopmentConfig:
     #: `dispatched_by`. Empty lets the actor fall back to the dispatcher. Never
     #: a run_id/uuid: the label must name a bounded subject, not an identity.
     dispatched_by: str = ""
+    #: The gate REJECT verdict this generation reworks from (wf-8d9737 rework
+    #: contract A), read by `dd run` from `--gate-reject-file` and injected
+    #: into the implement prompt at the engine-side builder. Empty means the
+    #: generation is not a gate rework: no anchor is ever injected and the
+    #: receipt replay path behaves exactly as before.
+    gate_reject: dict[str, Any] = field(default_factory=dict)
+    #: R4: the order-private audit branch (refs/heads/dd/<dev>) the stage
+    #: sealers publish to -- remote_ref is the merger's release branch. Empty
+    #: falls back to remote_ref (the pre-R4 single-durable-ref layout).
+    audit_ref: str = ""
+    #: R4: the admission record file, so configure's first-step rebase can
+    #: freeze the post-rebase head into it. Empty leaves records alone.
+    record_path: str = ""
 
     @property
     def thread_id(self) -> str:
@@ -139,7 +207,70 @@ def build_pipeline(
     """Wire a development. Returns the graph and the deps it holds."""
     lifecycle = Lifecycle.load()
 
-    if replayer is None and config.generation > 1:
+    # Rework contract B (wf-8d9737): a gate-rework generation must open with a
+    # NEW implement dispatch -- a new prompt carrying the rejecting verdict
+    # and a new agent run behind it. A receipt replayer marching the sealed
+    # prefix of the rejected generation straight past implement would produce
+    # a fake new generation (the dev-fg-79d528db4375 g2 shape), so a replayer
+    # alongside a gate rework is refused outright...
+    gate_rework = bool(config.gate_reject)
+    if gate_rework:
+        # Spec ⑮-b: the verdict must be bound to the board work.decision.v1
+        # the gate consumed. An unbound mandate (empty decision_message_id /
+        # decided_by / rationale) is refused at the dispatch face too -- the
+        # control plane refuses at start; this keeps a hand-launched `dd run`
+        # with a stale or hand-written unbound file from silently opening the
+        # generation with an empty task book.
+        unbound = [
+            name
+            for name in REWORK_BINDING_FIELDS
+            if not str(config.gate_reject.get(name) or "").strip()
+        ]
+        if unbound:
+            raise ReworkDecisionUnbound(
+                f"development {config.development_id} g{config.generation} is a gate-rework "
+                "generation whose verdict is not bound to its board work.decision.v1 "
+                f"(empty: {', '.join(sorted(unbound))}); refusing to dispatch a rework "
+                "with an empty binding",
+                unbound=sorted(unbound),
+            )
+    if gate_rework and replayer is not None:
+        raise ReworkReplayRefused(
+            f"development {config.development_id} g{config.generation} is a gate-rework "
+            "generation; a receipt replayer would re-enter the sealed prefix instead of "
+            "dispatching a new implementer",
+            missing=["new-implement-prompt", "new-agent-run"],
+        )
+    # R4: the ref each surface publishes to. The receipt chain's continuity
+    # lives on the order-private audit branch (stage sealers); the merger's
+    # CAS push lands on remote_ref -- the line's release branch. An empty
+    # audit_ref means the legacy layout where both are remote_ref.
+    publish_ref = config.audit_ref or config.remote_ref
+
+    if replayer is None and config.generation > 1 and not gate_rework:
+        # ...and a generation whose own tree seals a rejecting gate verdict
+        # for the previous generation but whose launch carries no rework
+        # mandate is refused too: replaying there would open exactly the fake
+        # generation contract B forbids. The durable rework launch is the
+        # control plane's, with --gate-reject-file set.
+        prior = run_git(
+            config.workspace_path,
+            "show",
+            f"HEAD:{GATE_PATH.format(generation=config.generation - 1)}",
+        )
+        if prior.returncode == 0:
+            try:
+                prior_decision = json.loads(prior.stdout)
+            except ValueError:
+                prior_decision = {}
+            if str(prior_decision.get("decision") or "").strip().upper() == "REJECT":
+                raise ReworkReplayRefused(
+                    f"development {config.development_id} g{config.generation} starts after "
+                    f"a gate REJECT of g{config.generation - 1} but carries no "
+                    "--gate-reject-file; replaying the sealed prefix would open a new "
+                    "generation with no new implement dispatch",
+                    missing=["new-implement-prompt", "new-agent-run"],
+                )
         # A restarted generation replays the receipt-sealed prefix of the
         # previous one instead of re-dispatching agents against work already
         # in the tree (F4). Generation 1 has nothing behind it, and a layout
@@ -153,7 +284,12 @@ def build_pipeline(
                 development_id=config.development_id,
                 generation=config.generation,
                 remote_url=config.remote_url,
-                remote_ref=config.remote_ref,
+                # The seals being replayed live on the audit branch
+                # (publish_ref); verifying and re-publishing the chain must
+                # target the same ref or a line dispatch's replay would land
+                # receipts on the release branch and advance it past the
+                # frozen base.
+                remote_ref=publish_ref,
                 lifecycle=lifecycle,
                 run_config=dict(config.run_config or {}),
             )
@@ -185,13 +321,16 @@ def build_pipeline(
         # data plane is wired in for the stage producing each one.
         cost_plane=cost_plane,
         # The stage's prompt comes from the bundle the capability check
-        # admitted, not from the role's own persona. See dd/prompt.py.
+        # admitted, not from the role's own persona. See dd/prompt.py. A
+        # gate-rework generation's prompt source carries the rejecting verdict
+        # so the implement prompt is assembled with it (wf-8d9737 contract A).
         prompts=PluginPromptSource(
             binding=config.plugin_binding,
             builder=builder,
             worktree_path=str(config.workspace_path),
             acceptance_commands=list(config.run_config.get("acceptance_commands") or []),
             verify_worktree_head=config.verify_worktree_head,
+            gate_reject=dict(config.gate_reject) if gate_rework else None,
         ),
         dispatched_by=config.dispatched_by,
         # Before a fresh dispatch, restore the worktree to the attempt's input
@@ -201,12 +340,14 @@ def build_pipeline(
         reprepare_worktree=config.reprepare_worktree,
         observe=observe,
     )
+    # publish_ref, decided above, is what the plugin's sealers publish to.
+
     sealer = PluginMaterializer(
         builder=builder,
         binding=config.plugin_binding,
         target=MaterializationTarget(
             remote_url=config.remote_url,
-            remote_ref=config.remote_ref,
+            remote_ref=publish_ref,
             worktree=str(config.workspace_path),
             state_root=str(config.state_root),
         ),
@@ -215,9 +356,20 @@ def build_pipeline(
 
     # Defaults that make an assembled pipeline runnable. A caller-supplied
     # entry always wins; nothing here is mandatory.
+    merge_stage = stage_producing(lifecycle, MERGE_RESULT)
+    configure_stage = stage_producing(lifecycle, RUN_CONFIG)
+    # R4 first-step rebase wiring: only a release-branch dispatch carries a
+    # line branch to rebase onto; legacy durable refs leave the step unwired.
+    line_ref = config.remote_ref if config.remote_ref.startswith("refs/heads/release/") else ""
     registered: dict[str, Actor] = {
-        stage_producing(lifecycle, RUN_CONFIG): ConfigureStage(
-            repo=config.workspace_path, run_config=config.run_config
+        configure_stage: ConfigureStage(
+            repo=config.workspace_path,
+            run_config=config.run_config,
+            # R4 first-step rebase: onto the line's release branch head, with
+            # the post-rebase base frozen into the admission record.
+            line_ref=line_ref,
+            requested_base=config.target_base_commit,
+            record_path=config.record_path if line_ref else "",
         ),
         stage_producing(lifecycle, ACCEPTANCE_RESULT): AcceptanceStage(
             repo=config.workspace_path,
@@ -231,13 +383,17 @@ def build_pipeline(
             env=dict(config.run_config.get("acceptance_env") or {}),
             timeout_seconds=config.acceptance_timeout_seconds,
         ),
-        stage_producing(lifecycle, MERGE_RESULT): MergeStage(
+        merge_stage: MergeStage(
             repo=config.workspace_path,
             remote_url=config.remote_url,
             target_ref=config.remote_ref,
             publish=config.publish_merge,
             # The promotion (merge) lifecycle fact is emitted by this stage.
             cost_plane=cost_plane,
+            # Egress: the CAS publish retries transport-class failures under
+            # the stage's run fence, landing one evidence line per attempt.
+            fence_seconds=float(config.timeouts.get(merge_stage, DEFAULT_STAGE_FENCE_SECONDS)),
+            evidence=observe,
         ),
     }
     if board is not None and gate_card_entity_id:
@@ -266,11 +422,22 @@ def build_pipeline(
         materializer=StageMaterializers(
             by_stage={
                 # Everything the plugin does not seal commits its own output.
+                # R4: those seals publish to the audit branch (publish_ref) --
+                # a line dispatch's remote_ref is the release branch, and a
+                # seal landing there would stack machine parts
+                # (.dev-dispatch/, .dd-evidence/) onto the line branch and
+                # advance it past the frozen base, refusing every merger CAS
+                # push with RELEASE_HEAD_ADVANCED.
                 **{
                     name: WorkspaceSealer(
                         repo=config.workspace_path,
                         remote_url=config.remote_url,
-                        remote_ref=config.remote_ref,
+                        remote_ref=publish_ref,
+                        # Egress: the durable-ref publish retries
+                        # transport-class failures inside the stage's run
+                        # fence; every attempt lands one evidence line.
+                        fence_seconds=float(config.timeouts.get(name, DEFAULT_STAGE_FENCE_SECONDS)),
+                        evidence=observe,
                     )
                     for name in lifecycle.stages
                     if name not in sealer.sealed_stages
@@ -460,8 +627,13 @@ def gate_refusal(state: dict[str, Any]) -> dict[str, Any] | None:
 __all__ = [
     "EVENTS_FILE",
     "RESULT_FILE",
+    "REWORK_BINDING_FIELDS",
+    "REWORK_DECISION_UNBOUND",
+    "REWORK_REPLAY_REFUSED",
     "SPEC_ARTIFACT",
     "DevelopmentConfig",
+    "ReworkDecisionUnbound",
+    "ReworkReplayRefused",
     "awaiting_decision",
     "build_pipeline",
     "gate_refusal",

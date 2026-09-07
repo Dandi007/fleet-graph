@@ -902,8 +902,11 @@ class TestKillRestartReAdopt:
         assert ledger_lines() == 1, "restart double-dispatched the audit run"
 
 
-class TestE6E7Dispatch:
-    """M4: run_supervisor 把 E6/E7 分派到各自处置反应器，不进入审计图。"""
+class TestE6Dispatch:
+    """M4: run_supervisor 把 E6 分派到处置反应器，不进入审计图。
+
+    R6 (wf-4601c8 §7.2.1): the E7 goal.md direct-write reactor is removed;
+    its dispatch tests went with it."""
 
     class FakeE6Ops:
         def resolve_line_unit(self, folder_id: str, run_root: Path) -> dict[str, Any]:
@@ -917,25 +920,6 @@ class TestE6E7Dispatch:
 
         def line_heartbeat_age_s(self, folder_id: str) -> float | None:
             return None
-
-    class FakeE7Ops:
-        def resolve_folder_id(self, bus: Any, source_message_id: str) -> str:
-            return "wf-a"
-
-        def goal_revision(self, folder_id: str) -> str:
-            return "rev-before"
-
-        def append_delivery_fail_block(self, folder_id: str, block: str) -> dict[str, Any]:
-            return {
-                "before_revision": "rev-before",
-                "after_revision": "rev-after",
-                "revision_changed": True,
-                "readback_present": True,
-                "marker": "## E7 送达失败（监督面直写）",
-            }
-
-        def read_goal(self, folder_id: str) -> str:
-            return "## E7 送达失败（监督面直写）\n"
 
     def test_e6_dispatches_to_the_stop_reactor(self, tmp_path: Path) -> None:
         from fleet_graph.supervise.e6_stop import OUTCOME_STOPPED
@@ -954,44 +938,6 @@ class TestE6E7Dispatch:
             )
         )
         assert result["outcome"] == OUTCOME_STOPPED
-        assert result["receipt_path"]
-
-    def test_e7_dispatches_to_the_write_reactor(self, tmp_path: Path) -> None:
-        from fleet_graph.supervise.e7_allowlist import E7WriteAllowlist
-        from fleet_graph.supervise.e7_write import OUTCOME_DELIVERED
-        from fleet_graph.supervise.events import decision_swallowed_event
-
-        event = decision_swallowed_event(source_message_id="msg_sw", reason="noop").as_dict()
-        result = run_supervisor(
-            SupervisorRunConfig(
-                event=event,
-                state_root=tmp_path / "supervisor",
-                run_root=tmp_path / "runs",
-                publish_notes=False,
-                e7_ops=self.FakeE7Ops(),
-                e7_allowlist=E7WriteAllowlist(folder_ids=("wf-a",)),
-            )
-        )
-        assert result["outcome"] == OUTCOME_DELIVERED
-        assert result["receipt_path"]
-
-    def test_e7_outside_allowlist_refuses_without_write(self, tmp_path: Path) -> None:
-        from fleet_graph.supervise.e7_allowlist import E7WriteAllowlist
-        from fleet_graph.supervise.e7_write import OUTCOME_REFUSED
-        from fleet_graph.supervise.events import decision_swallowed_event
-
-        event = decision_swallowed_event(source_message_id="msg_sw", reason="noop").as_dict()
-        result = run_supervisor(
-            SupervisorRunConfig(
-                event=event,
-                state_root=tmp_path / "supervisor",
-                run_root=tmp_path / "runs",
-                publish_notes=False,
-                e7_ops=self.FakeE7Ops(),
-                e7_allowlist=E7WriteAllowlist.default(),
-            )
-        )
-        assert result["outcome"] == OUTCOME_REFUSED
         assert result["receipt_path"]
 
     def test_e6_wiki_passthrough_constructs_default_client(self, tmp_path: Path) -> None:
@@ -1017,35 +963,6 @@ class TestE6E7Dispatch:
                 state_root=tmp_path / "supervisor",
                 run_root=tmp_path / "runs",
                 ops=self.FakeE6Ops(),
-                wiki=config.wiki,
-            )
-        )
-        assert isinstance(deps.wiki, DefaultWikiClient)
-
-    def test_e7_wiki_passthrough_constructs_default_client(self, tmp_path: Path) -> None:
-        """交付 B.1：config.wiki 启用 -> E7 三路注入 DefaultWikiClient（非 None）。"""
-        from fleet_graph.supervise.e7_allowlist import E7WriteAllowlist
-        from fleet_graph.supervise.e7_write import E7WriteRunConfig, build_e7_write
-        from fleet_graph.supervise.events import decision_swallowed_event
-        from fleet_graph.supervise.wiki_report import DefaultWikiClient
-
-        event = decision_swallowed_event(source_message_id="msg_sw", reason="noop").as_dict()
-        config = SupervisorRunConfig(
-            event=event,
-            state_root=tmp_path / "supervisor",
-            run_root=tmp_path / "runs",
-            publish_notes=False,
-            e7_ops=self.FakeE7Ops(),
-            e7_allowlist=E7WriteAllowlist(folder_ids=("wf-a",)),
-            wiki=DefaultWikiClient(),
-        )
-        _, deps, _ = build_e7_write(
-            E7WriteRunConfig(
-                event=event,
-                state_root=tmp_path / "supervisor",
-                run_root=tmp_path / "runs",
-                allowlist=E7WriteAllowlist(folder_ids=("wf-a",)),
-                ops=self.FakeE7Ops(),
                 wiki=config.wiki,
             )
         )

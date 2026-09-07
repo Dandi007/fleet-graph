@@ -196,7 +196,6 @@ class TestPositiveSameSource:
                 "phase",
                 "heartbeat_age_s",
                 "terminal",
-                "parked",
                 "wake_facts",
                 "release_id",
                 "run_id",

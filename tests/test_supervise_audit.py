@@ -699,6 +699,159 @@ class TestReceiptChainReworkTopology:
         assert chain[3]["parent_handoff_receipt_digest"] != chain[2]["receipt_digest"]
 
 
+class TestReceiptChainRetryTopology:
+    """The retry edge (dd/chain_rules.py): one receipt signed twice -- a
+    failed signing whose re-run sealed the same receipt (same stage, same
+    attempt, same receipt_digest, failed -> success) re-entered the same
+    re-prepared handoff, so it names the parent the failed signing named.
+    The X-4 measured chain (dev-fg-d9370430e0ce rev4 -> rev5 -> rev6, digests
+    and commits padded to full width) went red before this edge was
+    modelled. Every tampered fixture below is the paired red anchor for one
+    of the four conditions: drop that condition from the audit and its
+    fixture would go green."""
+
+    INPUT_COMMIT = "62cadf3" + "0" * 33
+    OUTPUT_COMMIT = "34795fa" + "0" * 33
+    RECEIPT_DIGEST = "sha256:" + "0970a521" + "0" * 56
+    RETRY_PARENT = "sha256:" + "e07fa440" + "0" * 56
+
+    @staticmethod
+    def _record(
+        revision: int,
+        stage: str,
+        attempt: int,
+        verdict: str,
+        parent: str,
+        digest: str,
+        input_commit: str,
+        output_commit: str,
+    ) -> dict[str, Any]:
+        return {
+            "revision": revision,
+            "stage": stage,
+            "attempt": attempt,
+            "verdict": verdict,
+            "parent_handoff_receipt_digest": parent,
+            "receipt_digest": digest,
+            "input_commit": input_commit,
+            "output_commit": output_commit,
+            "receipt": {},
+        }
+
+    def _x4_chain(self, **rev5_overrides: Any) -> list[dict[str, Any]]:
+        """rev4 (failed signing) -> rev5 (its success re-signing) -> rev6."""
+        rev5 = self._record(
+            5,
+            "implement",
+            2,
+            "success",
+            self.RETRY_PARENT,
+            self.RECEIPT_DIGEST,
+            self.INPUT_COMMIT,
+            self.OUTPUT_COMMIT,
+        )
+        rev5.update(rev5_overrides)
+        return [
+            self._record(
+                4,
+                "implement",
+                2,
+                "failed",
+                self.RETRY_PARENT,
+                self.RECEIPT_DIGEST,
+                self.INPUT_COMMIT,
+                self.INPUT_COMMIT,
+            ),
+            rev5,
+            self._record(
+                6,
+                "continuous_review",
+                2,
+                "APPROVE",
+                self.RECEIPT_DIGEST,
+                "sha256:" + "6" * 64,
+                self.OUTPUT_COMMIT,
+                "c" * 40,
+            ),
+        ]
+
+    def _checked(self, chain: list[dict[str, Any]], bootstrap: str) -> Any:
+        report = AuditReport(target="dev_x", kind="development")
+        audit_module._check_receipt_chain(
+            report, "dev_x", {"bootstrap": {"receipt_digest": bootstrap}, "receipt_chain": chain}
+        )
+        return by_name(report)["receipt_chain_linked"]
+
+    def test_the_x4_double_signing_chain_audits_green(self) -> None:
+        assertion = self._checked(self._x4_chain(), self.RETRY_PARENT)
+        assert assertion.ok, assertion.detail
+
+    def test_a_different_receipt_digest_breaks_the_retry_edge(self) -> None:
+        chain = self._x4_chain(receipt_digest="sha256:" + "d" * 64)
+        assertion = self._checked(chain, self.RETRY_PARENT)
+        assert not assertion.ok
+        assert "rev5 implement" in assertion.detail
+
+    def test_a_different_attempt_breaks_the_retry_edge(self) -> None:
+        chain = self._x4_chain(attempt=3)
+        assertion = self._checked(chain, self.RETRY_PARENT)
+        assert not assertion.ok
+
+    def test_a_non_failed_signing_gets_no_retry_edge(self) -> None:
+        """previous 非 failed: the edge opens only after a failed signing."""
+        chain = self._x4_chain()
+        chain[0]["verdict"] = "interrupted"
+        assertion = self._checked(chain, self.RETRY_PARENT)
+        assert not assertion.ok
+
+    def test_failed_to_failed_is_not_a_retry_edge(self) -> None:
+        """Verdict combination mismatch: two failed signings of one receipt
+        are not the modelled edge."""
+        chain = self._x4_chain(verdict="failed")
+        assertion = self._checked(chain, self.RETRY_PARENT)
+        assert not assertion.ok
+
+    def test_a_different_stage_breaks_the_retry_edge(self) -> None:
+        """The mutation anchor for "any failed edge forgives the next
+        parent": rev5 pointing at a different stage must stay red. Under the
+        mutated rule (drop the four-condition gate, accept any parent after
+        a failed record) this chain would go green."""
+        chain = self._x4_chain(stage="continuous_review")
+        assertion = self._checked(chain, self.RETRY_PARENT)
+        assert not assertion.ok
+        assert "rev5" in assertion.detail
+
+    def test_the_commit_continuity_check_is_unchanged(self) -> None:
+        """rev5.input == rev4.output already holds; break it and the chain
+        goes red even though the retry edge closes the parent link."""
+        chain = self._x4_chain(input_commit="d" * 40)
+        assertion = self._checked(chain, self.RETRY_PARENT)
+        assert not assertion.ok
+        assert "input" in assertion.detail
+
+
+class TestRetryLinkRules:
+    """The chain_rules functions themselves: the closed vocabulary of the
+    retry edge and the parent it names."""
+
+    def test_only_a_failed_signing_is_a_retry_link(self) -> None:
+        from fleet_graph.dd.chain_rules import FAILED, SUCCESS, is_retry_link
+
+        assert is_retry_link(FAILED)
+        for verdict in (SUCCESS, "REJECT", "APPROVE", "PASS", "", "interrupted"):
+            assert not is_retry_link(verdict), verdict
+
+    def test_the_retry_parent_is_the_failed_signings_own_parent(self) -> None:
+        from fleet_graph.dd.chain_rules import retry_link_parent
+
+        previous = {
+            "parent_handoff_receipt_digest": "sha256:" + "e" * 64,
+            "receipt_digest": "sha256:" + "0" * 64,
+        }
+        assert retry_link_parent(previous) == "sha256:" + "e" * 64
+        assert retry_link_parent({}) == ""
+
+
 # --- goal line -------------------------------------------------------------
 
 
