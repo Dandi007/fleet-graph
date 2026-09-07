@@ -183,6 +183,36 @@ class TestSourceBranch:
         assert result.ok is False
         assert errors_mention(result, "not a valid git branch name")
 
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "release/x^",  # caret
+            "a:b",  # colon
+            "x~1",  # tilde
+            "foo*",  # asterisk
+            "x[y",  # open bracket
+            "x\\y",  # backslash
+            "x?y",  # question mark
+        ],
+    )
+    def test_branch_names_with_special_chars_rejected(self, bad):
+        payload = base_payload()
+        payload["source_branch"] = bad
+        result = validate_enroll(payload, git_probe=full_probe())
+        assert result.ok is False
+        assert errors_mention(result, "not a valid git branch name")
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["release/x^", "a:b", "x~1", "foo*", "x[y"],
+    )
+    def test_target_branch_special_chars_rejected(self, bad):
+        payload = base_payload()
+        payload["repos"][0]["target_branch"] = bad
+        result = validate_enroll(payload, git_probe=full_probe())
+        assert result.ok is False
+        assert errors_mention(result, "not a valid git branch name")
+
     def test_missing_source_branch_rejected(self):
         payload = base_payload()
         del payload["source_branch"]
@@ -333,6 +363,20 @@ class TestWorkFolder:
         assert result.ok is False
         assert errors_mention(result, "work_folder")
 
+    @pytest.mark.parametrize("bad", ["ab12cd", "wf", "folder-1", "WF-ab12cd"])
+    def test_wrong_prefix_work_folder_rejected(self, bad):
+        payload = base_payload()
+        payload["work_folder"] = bad
+        result = validate_enroll(payload, git_probe=full_probe())
+        assert result.ok is False
+        assert errors_mention(result, "work_folder: must start with 'wf-'")
+
+    def test_wf_prefix_work_folder_accepted(self):
+        payload = base_payload()
+        payload["work_folder"] = "wf-ab12cd"
+        result = validate_enroll(payload, git_probe=full_probe())
+        assert result.ok is True
+
 
 class TestValidateProbeWiring:
     def test_worktree_probe_called_for_every_repo(self):
@@ -358,6 +402,21 @@ class TestNormalizeEnroll:
         payload = base_payload()
         normalized = normalize_enroll(payload, git_probe=full_probe())
         assert re.fullmatch(r"g-[0-9a-f]{6}", normalized["goal_id"])
+
+    @pytest.mark.parametrize("work_folder", [None, "wf-ab12cd"])
+    def test_validate_ok_payload_never_raises(self, work_folder):
+        payload = base_payload()
+        payload["work_folder"] = work_folder
+        assert validate_enroll(payload, git_probe=full_probe()).ok is True
+        normalized = normalize_enroll(payload, git_probe=full_probe())
+        assert normalized["work_folder"] == work_folder
+
+    def test_missing_work_folder_key_normalize_does_not_raise(self):
+        payload = base_payload()
+        del payload["work_folder"]
+        assert validate_enroll(payload, git_probe=full_probe()).ok is True
+        normalized = normalize_enroll(payload, git_probe=full_probe())
+        assert normalized["work_folder"] is None
 
     def test_given_goal_id_preserved(self):
         normalized = normalize_enroll(base_payload(), goal_id="g-7f3a2c", git_probe=full_probe())

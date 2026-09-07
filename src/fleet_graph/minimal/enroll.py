@@ -58,7 +58,7 @@ def is_valid_git_branch_name(name: str) -> bool:
             return False
         if ord(ch) < 0x20 or ord(ch) == 0x7F:
             return False
-    if "~^:?*[\\" in name:
+    if any(ch in name for ch in "~^:?*[\\"):
         return False
     if name.endswith("."):
         return False
@@ -168,6 +168,11 @@ def validate_enroll(payload: dict, *, git_probe: GitProbe | None = None) -> Enro
         work_folder = payload["work_folder"]
         if work_folder is not None and not _is_nonempty_str(work_folder):
             fail("work_folder", "must be null (to be created) or a non-empty string")
+        elif _is_nonempty_str(work_folder) and not work_folder.startswith(_WORK_FOLDER_PREFIX):
+            fail(
+                "work_folder",
+                f"must start with {_WORK_FOLDER_PREFIX!r} (GO-19 work-folder id)",
+            )
 
     for key in ("title", "goal_text"):
         if key not in payload:
@@ -283,7 +288,7 @@ def normalize_enroll(
     return {
         "schema": SCHEMA,
         "goal_id": goal_id if goal_id is not None else _generate_goal_id(),
-        "work_folder": payload["work_folder"],
+        "work_folder": payload.get("work_folder"),
         "title": payload["title"],
         "goal_text": payload["goal_text"],
         "source_branch": payload["source_branch"],
