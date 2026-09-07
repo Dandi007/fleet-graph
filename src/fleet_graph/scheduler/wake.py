@@ -73,11 +73,17 @@ DECISION_TAIL_WINDOW = 200
 
 
 class WakeSignals(Protocol):
-    """What the scheduler may ask about a parked line. Probes raise on failure."""
+    """What the scheduler may ask about a parked line.
+
+    ``inbox_message_after``/``decision_landed`` raise on probe failure.
+    ``goal_revision`` never does: it returns ``None`` for "no fact this tick"
+    (probe timed out, the MCP was unreachable, or the answer named no
+    revision) so the scheduler can hold the park instead of guessing.
+    """
 
     def inbox_message_after(self, alias: str, after_epoch: float) -> bool: ...
 
-    def goal_revision(self, folder_id: str) -> str: ...
+    def goal_revision(self, folder_id: str) -> str | None: ...
 
     def decision_landed(self, question_note_id: str, after_epoch: float) -> bool: ...
 
@@ -192,15 +198,28 @@ class LiveWakeSignals:
         )
         return any(parse_bus_timestamp(message.get("created_at")) > after_epoch for message in tail)
 
-    def goal_revision(self, folder_id: str) -> str:
+    def goal_revision(self, folder_id: str) -> str | None:
+        """The goal.md revision, or None when this tick has no fact.
+
+        X-6 M1: a probe failure (the caller timing out, the MCP unreachable,
+        or a statless answer) used to raise into the scheduler tick, and the
+        tick's fail-open then *woke* the line -- a broken probe pretending the
+        goal had changed. Now every failure mode here collapses to None:
+        "no fact, hold the park, probe again next tick". The scheduler can
+        still distinguish the two cases mechanically (revision vs None), and
+        the raising contract of the other probes is untouched.
+        """
         from fleet_graph.state.work_folder import FastMCPCaller, WorkFolder
 
         if self._wf_caller is None:
             self._wf_caller = FastMCPCaller(timeout=self.timeout)
-        stat = WorkFolder(folder_id, self._wf_caller).stat("goal.md")
+        try:
+            stat = WorkFolder(folder_id, self._wf_caller).stat("goal.md")
+        except Exception:  # timeout, connection, protocol -- none is a fact
+            return None
         revision = str(stat.get("content_revision") or "")
         if not revision:
-            raise RuntimeError(f"fs_stat goal.md for {folder_id} returned no content_revision")
+            return None
         return revision
 
     @staticmethod
