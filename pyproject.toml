@@ -48,9 +48,9 @@ allowed-confusables = ["，", "：", "；", "（", "）", "、", "「", "」", "
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-# The acceptance gate runs the new module's test file with a bare `pytest`
-# (no `uv run`, so the editable install is not on sys.path). Point pytest at
-# src so `import fleet_graph` resolves without installing the package.
+# Bare `pytest` (e.g. acceptance's `bash -lc pytest tests/...`) resolves to a
+# user-site interpreter without the project installed; point every pytest run
+# at src/ so fleet_graph is importable without an editable install.
 pythonpath = ["src"]
 
 [tool.ruff.format]
