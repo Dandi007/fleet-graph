@@ -18,11 +18,10 @@ The measured reason is in ``fleet_graph/dd/git.py``: a worktree written by an
 agent can carry a hostile repo-local config, and ``git status`` -- which the
 gate runs -- executes ``core.fsmonitor`` on index refresh. The guards are
 duplicated here rather than imported because this package must not depend on
-the old ``fleet_graph.dd`` modules (per-DD isolation). The command name is
-bound to ``_GIT_COMMAND`` so the argv does not *literally* start with the git
-token: the source-wide invariant in ``tests/test_dd_git.py`` flags that shape
-as an unguarded call, and these calls are the guarded kind -- the companion
-behavioral test asserts the guards are present in every argv.
+the old ``fleet_graph.dd`` modules (per-DD isolation). The source-wide
+invariant in ``tests/test_dd_git.py`` whitelists this module's guarded argv
+shape (the guards must directly follow the ``git`` token), so the literal
+command token appears in the argv builder, greppable like any other call.
 """
 
 from __future__ import annotations
@@ -35,6 +34,24 @@ from typing import Protocol
 
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _TIMEOUT_SECONDS = 60.0
+
+
+def _sha_from_ls_remote(stdout: str) -> str | None:
+    """The first full sha in ``ls-remote`` output, or None if it is empty.
+
+    ``git ls-remote <remote> <pattern>`` prints nothing (exit 0) when the
+    remote holds no matching ref, and one ``<sha>\t<ref>`` line per match
+    otherwise; matching lines for ``refs/heads/<branch>`` carry that branch's
+    tip. Reading the sha from stdout -- not the exit code, not stderr -- keeps
+    the branch-absent verdict independent of git's error wording or locale.
+    """
+
+    for line in stdout.splitlines():
+        for token in line.split():
+            if _FULL_SHA_RE.match(token):
+                return token
+    return None
+
 
 # The three repo-config guards, mirrored from fleet_graph/dd/git.py GUARDS:
 # `core.fsmonitor` is a command git runs on index refresh, `core.hooksPath`
@@ -50,9 +67,15 @@ _GUARDS: tuple[str, ...] = (
     "protocol.ext.allow=never",
 )
 
-# Bound rather than inlined so argv construction stays greppable and single;
-# see the module docstring for why the literal does not appear in the argv.
-_GIT_COMMAND = "git"
+
+def _git(worktree: str, *args: str) -> list[str]:
+    """The guarded argv for one git call against ``worktree``.
+
+    Shape-mirrors ``fleet_graph/dd/git.py::git_argv``: the three ``-c`` config
+    guards precede ``-C <worktree>``, so a hostile repo-local config cannot
+    turn a status query into command execution.
+    """
+    return ["git", *_GUARDS, "-C", worktree, *args]
 
 
 class FailureCode:
@@ -213,7 +236,7 @@ def _git(worktree: str, *args: str) -> list[str]:
     guards precede ``-C <worktree>``, so a hostile repo-local config cannot
     turn a status query into command execution.
     """
-    return [_GIT_COMMAND, *_GUARDS, "-C", worktree, *args]
+    return ["git", *_GUARDS, "-C", worktree, *args]
 
 
 def worktree_status(worktree: str, *, runner: GitRunner) -> WorktreeStatus:
@@ -263,25 +286,30 @@ def remote_tip(
 ) -> str | None:
     """Resolve the tip of ``branch`` on ``remote``.
 
-    Fetches ``remote branch`` first unless ``fetch=False`` (tests and callers
-    that have just fetched). Returns the 40-char sha, or ``None`` when the
-    branch does not exist on the remote (the GO-36 ① verdict, not an error).
-    A fetch that fails because the remote ref is absent is that same verdict;
-    any other fetch failure is an environment error and raises ``GitError``.
+    Asks the remote directly via ``git ls-remote <remote> refs/heads/<branch>``
+    when ``fetch=True`` (the default): the answer is what the remote actually
+    holds right now, with no dependence on git's stderr wording, exit codes,
+    or translation of a failed ``git fetch``. ``fetch=False`` (tests, or
+    callers that just fetched) resolves ``<remote>/<branch>`` from the local
+    refs instead. Returns the 40-char sha, or ``None`` when the branch does
+    not exist on the remote (the GO-36 ① verdict, not an error). A fetch
+    failure for any other reason is an environment error and raises
+    ``GitError``.
     """
-    if fetch:
-        fetch_argv = _git(worktree, "fetch", remote, branch)
-        fetch_res = _run(runner, fetch_argv, worktree)
-        if fetch_res.exit_code != 0:
-            if "couldn't find remote ref" in fetch_res.stderr:
-                return None
-            raise GitError(fetch_argv, fetch_res.exit_code, fetch_res.stderr)
 
-    ls_argv = _git(worktree, "rev-parse", "--verify", f"{remote}/{branch}")
-    ls_res = _run(runner, ls_argv, worktree)
-    if ls_res.exit_code != 0:
+    if fetch:
+        argv = _git(worktree, "ls-remote", remote, f"refs/heads/{branch}")
+        res = _run(runner, argv, worktree)
+        if res.exit_code != 0:
+            raise GitError(argv, res.exit_code, res.stderr)
+        tip = _sha_from_ls_remote(res.stdout)
+        return tip
+
+    argv = _git(worktree, "rev-parse", "--verify", f"{remote}/{branch}")
+    res = _run(runner, argv, worktree)
+    if res.exit_code != 0:
         return None
-    tip = ls_res.stdout.strip()
+    tip = res.stdout.strip()
     return tip if _FULL_SHA_RE.match(tip) else None
 
 
@@ -309,10 +337,11 @@ def check_handoff(repos: list[RepoRef], *, runner: GitRunner) -> GateResult:
 def check_dd_ready(repos: list[DDRepoRef], *, runner: GitRunner) -> GateResult:
     """GO-36's open-a-DD gate: handoff checks plus remote branch and spec.
 
-    On top of the three handoff criteria, each repo must have its branch on the
-    remote and the spec file present in the HEAD commit itself. A repo already
-    failing the handoff layer is recorded once, with its earliest precise code;
-    only repos that pass it get the two extra checks.
+    On top of the three handoff criteria, each repo must have its branch on
+    the remote and the spec file present in the HEAD commit itself. A repo
+    already failing the handoff layer is recorded once, with its earliest
+    precise code; only repos that pass it get the extra spec check (a green
+    handoff there implies HEAD resolved to a full 40-char sha).
     """
     failures: list[GateFailure] = []
     for repo in repos:
@@ -321,7 +350,8 @@ def check_dd_ready(repos: list[DDRepoRef], *, runner: GitRunner) -> GateResult:
         if repo_failures:
             failures.extend(repo_failures)
             continue
-        if not file_exists_at(repo.worktree, status.head or "", repo.spec_path, runner=runner):
+        assert status.head is not None  # a green handoff implies HEAD is a full sha
+        if not file_exists_at(repo.worktree, status.head, repo.spec_path, runner=runner):
             failures.append(
                 GateFailure(
                     repo=repo.repo_id,

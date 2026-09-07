@@ -19,6 +19,7 @@ from fleet_graph.minimal.gitgate import (
     check_dd_ready,
     check_handoff,
     file_exists_at,
+    remote_tip,
 )
 
 # Deterministic 40-char shas so remote tips and local HEADs can diverge on cue.
@@ -32,7 +33,7 @@ _FRAGMENTS = {
     "branch": ["rev-parse", "--abbrev-ref", "HEAD"],
     "head": ["rev-parse", "HEAD"],
     "status": ["status", "--porcelain"],
-    "fetch": ["fetch"],
+    "ls_remote": ["ls-remote"],
     "tip": ["rev-parse", "--verify"],
     "cat_file": ["cat-file", "-e"],
     "merge_base": ["merge-base", "--is-ancestor"],
@@ -48,11 +49,13 @@ class FakeGitRunner:
 
     A repo's script maps a query kind to its canned result: ``branch`` is the
     ref name stdout (``"HEAD"`` meaning detached), ``head`` the HEAD sha,
-    ``status`` the porcelain output, ``tip`` the remote tip sha (``None``
-    meaning the ref does not resolve), ``spec`` the ``cat-file -e`` exit code,
-    ``merge_base`` the ``merge-base --is-ancestor`` exit code. Unscripted
-    queries get the green defaults; unrecognized argv fails loudly so tests
-    cannot pass on accidental gaps.
+    ``status`` the porcelain output, ``ls_remote`` the ls-remote stdout
+    (``None`` meaning the remote holds no such ref), ``tip`` the remote tip
+    sha resolved from local refs (``None`` meaning the ref does not resolve),
+    ``spec`` the ``cat-file -e`` exit code, ``merge_base`` the
+    ``merge-base --is-ancestor`` exit code. Unscripted queries get the green
+    defaults; unrecognized argv fails loudly so tests cannot pass on
+    accidental gaps.
     """
 
     def __init__(self, repos: dict[str, dict[str, Any]]) -> None:
@@ -64,8 +67,11 @@ class FakeGitRunner:
         script = self._repos.get(cwd)
         if script is None:
             raise AssertionError(f"unexpected cwd {cwd!r}; scripted: {sorted(self._repos)}")
-        if _matches(args, _FRAGMENTS["fetch"]):
-            return CompletedResult(0, "", "")
+        if _matches(args, _FRAGMENTS["ls_remote"]):
+            listed = script.get("ls_remote", SHA_A1)
+            if listed is None:
+                return CompletedResult(0, "", "")
+            return CompletedResult(0, listed + "\trefs/remotes/origin/feature-x\n", "")
         if _matches(args, _FRAGMENTS["branch"]):
             return CompletedResult(0, script.get("branch", "feature-x") + "\n", "")
         if _matches(args, _FRAGMENTS["head"]):
@@ -152,7 +158,7 @@ class TestCheckHandoff:
     def test_branch_missing_on_remote(self) -> None:
         result = check_handoff(
             [_repo("/wt/no-branch")],
-            runner=_runner(("/wt/no-branch", {"tip": None})),
+            runner=_runner(("/wt/no-branch", {"ls_remote": None})),
         )
         assert result.ok is False
         assert [f.code for f in result.failures] == [FailureCode.BRANCH_MISSING_ON_REMOTE]
@@ -292,7 +298,7 @@ class TestCheckDDReady:
     def test_branch_missing_on_remote_fails_before_spec(self) -> None:
         result = check_dd_ready(
             [_dd_repo("/wt/dd-nobranch")],
-            runner=_runner(("/wt/dd-nobranch", {"tip": None, "spec": 1})),
+            runner=_runner(("/wt/dd-nobranch", {"ls_remote": None, "spec": 1})),
         )
         assert result.ok is False
         assert [f.code for f in result.failures] == [FailureCode.BRANCH_MISSING_ON_REMOTE]
@@ -324,6 +330,43 @@ class TestFileExistsAt:
 
 
 # ---------------------------------------------------------------------------
+# remote_tip: the remote is asked directly, absence is a verdict not an error
+# ---------------------------------------------------------------------------
+
+
+class TestRemoteTip:
+    def test_branch_absent_on_remote_is_none_not_an_exception(self) -> None:
+        # Exit 0 with empty stdout is how ls-remote answers "no such ref";
+        # the absence must not depend on stderr wording or the exit code.
+        runner = _runner(("/wt/tip", {"ls_remote": None}))
+        assert remote_tip("/wt/tip", "origin", "feature-x", runner=runner) is None
+
+    def test_ls_remote_stdout_sha_is_returned(self) -> None:
+        runner = _runner(("/wt/tip", {"ls_remote": SHA_NEW}))
+        assert remote_tip("/wt/tip", "origin", "feature-x", runner=runner) == SHA_NEW
+
+    def test_fetch_false_resolves_local_tracking_ref(self) -> None:
+        runner = _runner(("/wt/tip", {"tip": SHA_B1}))
+        assert remote_tip("/wt/tip", "origin", "feature-x", runner=runner, fetch=False) == SHA_B1
+
+    def test_fetch_false_missing_tracking_ref_is_none(self) -> None:
+        runner = _runner(("/wt/tip", {"tip": None}))
+        assert remote_tip("/wt/tip", "origin", "feature-x", runner=runner, fetch=False) is None
+
+    def test_ls_remote_failure_raises_git_error(self) -> None:
+        from fleet_graph.minimal.gitgate import GitError
+
+        class FailingRunner:
+            def run(self, args: list[str], *, cwd: str) -> CompletedResult:
+                if _matches(args, _FRAGMENTS["ls_remote"]):
+                    return CompletedResult(128, "", "remote origin does not exist")
+                raise AssertionError(f"unexpected argv: {args!r}")
+
+        with pytest.raises(GitError):
+            remote_tip("/wt/tip", "origin", "feature-x", runner=FailingRunner())
+
+
+# ---------------------------------------------------------------------------
 # runner contract: argv lists + explicit cwd, never shell strings
 # ---------------------------------------------------------------------------
 
@@ -340,7 +383,7 @@ class TestRunnerContract:
         for args, _cwd in runner.calls:
             assert isinstance(args, list)
             assert all(isinstance(part, str) for part in args)
-            assert args[0] == "git"
+            assert args[0] == "git", "the argv starts with the literal git command"
             for sep in (";", "|", "&&", "$(", "`"):
                 assert not any(sep in part for part in args), f"shell-ish {sep!r} in {args!r}"
 
@@ -368,15 +411,19 @@ class TestRunnerContract:
             at_c = args.index("-C")
             assert args[at_c + 1] == "/wt/contract"
 
-    def test_fetch_happens_before_tip_resolution(self) -> None:
+    def test_remote_is_queried_before_tip_resolution(self) -> None:
+        """The gate asks the remote directly (ls-remote) rather than trusting
+        stale local refs; the query precedes any local ref resolution."""
         runner = self._exercised_runner()
-        fetch_at = next(
-            i for i, (args, _cwd) in enumerate(runner.calls) if _matches(args, _FRAGMENTS["fetch"])
+        remote_at = next(
+            i
+            for i, (args, _cwd) in enumerate(runner.calls)
+            if _matches(args, _FRAGMENTS["ls_remote"])
         )
-        tip_at = next(
+        local_tips = [
             i for i, (args, _cwd) in enumerate(runner.calls) if _matches(args, _FRAGMENTS["tip"])
-        )
-        assert fetch_at < tip_at
+        ]
+        assert not local_tips or remote_at < min(local_tips)
 
 
 # ---------------------------------------------------------------------------

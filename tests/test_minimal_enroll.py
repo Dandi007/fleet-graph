@@ -12,6 +12,7 @@ import pytest
 
 from fleet_graph.minimal.enroll import (
     EnrollValidation,
+    _git_argv,
     normalize_enroll,
     validate_enroll,
 )
@@ -354,6 +355,22 @@ class TestRepos:
         assert errors_mention(result, "repos[1].path: duplicate path already used by repos[0]")
 
 
+class TestSubprocessProbeGuards:
+    """The probe runs git inside worktrees taken from enroll requests, whose
+    repo-local .git/config is untrusted input; every git argv must carry the
+    three config guards (mirrors tests/test_dd_git.py's exploit regression).
+    """
+
+    def test_every_git_argv_carries_the_config_guards(self):
+        argv = _git_argv("/tmp/x", "status")
+        assert argv[0] == "git"
+        assert argv[:2] == ["git", "-c"], "the guards precede the subcommand"
+        assert "core.fsmonitor=false" in argv
+        assert "core.hooksPath=/dev/null" in argv
+        assert "protocol.ext.allow=never" in argv
+        assert argv[argv.index("-C") + 1] == "/tmp/x"
+
+
 class TestWorkFolder:
     @pytest.mark.parametrize("bad", ["", 42, [], {}])
     def test_bad_work_folder_rejected(self, bad):
@@ -363,13 +380,21 @@ class TestWorkFolder:
         assert result.ok is False
         assert errors_mention(result, "work_folder")
 
-    @pytest.mark.parametrize("bad", ["ab12cd", "wf", "folder-1", "WF-ab12cd"])
+    @pytest.mark.parametrize("bad", ["ab12cd", "wf", "wf-", "folder-1", "WF-ab12cd"])
     def test_wrong_prefix_work_folder_rejected(self, bad):
         payload = base_payload()
         payload["work_folder"] = bad
         result = validate_enroll(payload, git_probe=full_probe())
         assert result.ok is False
-        assert errors_mention(result, "work_folder: must start with 'wf-'")
+        assert errors_mention(result, "work_folder: must look like 'wf-'")
+
+    @pytest.mark.parametrize("bad", ["wf-AB12CD", "wf-ab12!", "wf-ab 12", "wf-ab12cd ", "wf-a.b"])
+    def test_malformed_work_folder_suffix_rejected(self, bad):
+        payload = base_payload()
+        payload["work_folder"] = bad
+        result = validate_enroll(payload, git_probe=full_probe())
+        assert result.ok is False
+        assert errors_mention(result, "work_folder: must look like 'wf-'")
 
     def test_wf_prefix_work_folder_accepted(self):
         payload = base_payload()
@@ -463,6 +488,6 @@ class TestNormalizeEnroll:
             normalize_enroll(payload, git_probe=full_probe())
 
     def test_default_probe_is_subprocess_probe(self):
-        from fleet_graph.minimal.enroll import SubprocessProbe, _default_probe
+        from fleet_graph.minimal.enroll import SubprocessProbe, default_probe
 
-        assert isinstance(_default_probe(), SubprocessProbe)
+        assert isinstance(default_probe(), SubprocessProbe)
