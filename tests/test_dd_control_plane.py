@@ -249,6 +249,7 @@ class TestStartAndReAdopt:
         assert started["thread_id"] == f"{dev}:g1"
         argv = launcher.specs[0].argv()
         assert argv[0] == "systemd-run"
+        assert "--expand-environment=no" in argv
         assert "--resume" not in argv
         checkpoint = argv[argv.index("--checkpoint") + 1]
         assert checkpoint == str(plane.root / dev / CHECKPOINT_FILE)

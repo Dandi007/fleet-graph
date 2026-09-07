@@ -590,6 +590,24 @@ def _dd_run(args: argparse.Namespace) -> int:
         if not isinstance(loaded, dict):
             raise SystemExit("--gate-reject-file must carry a JSON object")
         gate_reject = loaded
+    models: dict[str, str] = {}
+    if args.record_file:
+        try:
+            record = json.loads(pathlib.Path(args.record_file).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"--record-file is unreadable: {exc}") from exc
+        if not isinstance(record, dict) or record.get("development_id") != args.development:
+            raise SystemExit("--record-file development_id does not match --development")
+        seats = record.get("seats", {})
+        if not isinstance(seats, dict) or any(
+            not isinstance(stage, str)
+            or not stage.strip()
+            or not isinstance(model, str)
+            or not model.strip()
+            for stage, model in seats.items()
+        ):
+            raise SystemExit("--record-file seats must map stage names to non-empty model names")
+        models = dict(seats)
     config = DevelopmentConfig(
         development_id=args.development,
         workspace_path=workspace,
@@ -621,6 +639,7 @@ def _dd_run(args: argparse.Namespace) -> int:
         # record (`record.seats`, frozen from role registry defaults plus any
         # line-explicit `development_create stage_models`) -- and the runner
         # reads exactly that: there is no cmdline seat source left to shadow it.
+        models=models,
         timeouts=_stage_timeouts(args.stage_timeout),
         publish_merge=args.publish_merge,
         cost_obs_dir=args.cost_obs_dir or "",

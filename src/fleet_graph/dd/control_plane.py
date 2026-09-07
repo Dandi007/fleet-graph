@@ -772,6 +772,8 @@ class DdLaunchSpec:
         argv = [
             "systemd-run",
             "--user",
+            # 脚本变量交给最终执行的 shell，不能被 systemd 提前展开。
+            "--expand-environment=no",
             "--collect",
             "--unit",
             self.unit_name,
