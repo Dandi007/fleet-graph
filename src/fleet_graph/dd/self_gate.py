@@ -398,14 +398,16 @@ def render_rationale(evidence: list[EvidenceItem]) -> str:
     return "; ".join(parts)
 
 
-def collect_evidence(items: list[EvidenceItem]) -> EvidenceItem | None:
+def collect_evidence(
+    items: list[EvidenceItem], *, required_ids: tuple[str, ...] = REQUIRED_EVIDENCE
+) -> EvidenceItem | None:
     """The completeness gate: all six required ids present, else None.
 
     returns the first missing obligation as the refusal cause, or None when the
     six required obligations are all accounted for.
     """
     present = {item.id for item in items}
-    for required in REQUIRED_EVIDENCE:
+    for required in required_ids:
         if required not in present:
             return EvidenceItem(
                 required,

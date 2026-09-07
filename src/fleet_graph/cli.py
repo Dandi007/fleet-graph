@@ -591,6 +591,11 @@ def _dd_run(args: argparse.Namespace) -> int:
             raise SystemExit("--gate-reject-file must carry a JSON object")
         gate_reject = loaded
     models: dict[str, str] = {}
+    run_config = {
+        "acceptance_commands": [shlex.split(c) for c in args.accept],
+        "setup_commands": [shlex.split(c) for c in args.setup],
+        "acceptance_env": _env_pairs(args.accept_env),
+    }
     if args.record_file:
         try:
             record = json.loads(pathlib.Path(args.record_file).read_text(encoding="utf-8"))
@@ -608,6 +613,24 @@ def _dd_run(args: argparse.Namespace) -> int:
         ):
             raise SystemExit("--record-file seats must map stage names to non-empty model names")
         models = dict(seats)
+        for key in ("acceptance_commands", "setup_commands", "acceptance_env"):
+            if key not in record:
+                continue
+            value = record[key]
+            if key == "acceptance_env":
+                valid = isinstance(value, dict) and all(
+                    isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+                )
+            else:
+                valid = isinstance(value, list) and all(
+                    isinstance(command, list)
+                    and command
+                    and all(isinstance(arg, str) for arg in command)
+                    for command in value
+                )
+            if not valid:
+                raise SystemExit(f"--record-file {key} has invalid shape")
+            run_config[key] = value
     config = DevelopmentConfig(
         development_id=args.development,
         workspace_path=workspace,
@@ -629,11 +652,7 @@ def _dd_run(args: argparse.Namespace) -> int:
         checkpoint_path=args.checkpoint or ":memory:",
         # shlex, not str.split: a quoted argument in an acceptance command
         # must survive the round-trip through the launcher's shlex.join.
-        run_config={
-            "acceptance_commands": [shlex.split(c) for c in args.accept],
-            "setup_commands": [shlex.split(c) for c in args.setup],
-            "acceptance_env": _env_pairs(args.accept_env),
-        },
+        run_config=run_config,
         # R6 (wf-4601c8 §7.1.8): the cmdline stage-seat override key is
         # gone from every launch path. A launched run's seats ride the admission
         # record (`record.seats`, frozen from role registry defaults plus any

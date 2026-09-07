@@ -1,45 +1,14 @@
-"""The gate node: consuming ``dd.gate_release.v1`` (R3, wf-4601c8).
+"""Goal 的审单节点：消费 dd.gate_release.v1，按冻结 policy 校验证据。
 
-This is the sole path on which an ``awaiting_gate`` single is released (S11):
-the dispatching line's own graph consumes its own gate-release action, and
-nothing off this path -- no MCP tool, no HTTP face, no bridge leg, no direct
-record write -- can move a single off the gate. The gate node mechanically
-discharges the six evidence obligations (self_gate_evidence.py's collector,
-reshaped in-process: the old MCP-pre-delivery call sites are gone) and asserts
-the M2 identity invariant ``decided_by == dispatched_by`` before anything is
-touched.
-
-Consumption order, fail-closed at every step:
-
-1. payload schema (development_id / verdict / decided_by non-empty, verdict in
-   the closed set);
-2. the single must resolve and must sit at ``awaiting_gate``;
-3. ``decided_by`` must equal the frozen ``record.json.dispatched_by`` -- a
-   foreign decider is refused with the single untouched (REJECT + 留痕);
-4. the six obligations are computed mechanically -- the first three
-   engine-mechanical (three-way acceptance argv digest equality, diff
-   name-status against the product surface, test-deletion detection), the last
-   three executed or verified by the node (personal acceptance rerun with echo,
-   regression against the frozen baseline, mutation-receipt verification; a
-   missing mutation receipt fails closed);
-5. a REJECT must bind the board adjudication's three non-empty fields (明确
-   的问题 / 建议答案 / 不答的代价, the ⑮ rework contract) -- a REJECT missing any
-   one is refused by the gate and traced;
-6. release: the gate verdict is sealed into the subject workspace at
-   ``.dev-dispatch/gate/decision-g<N>.json`` (the auditable, committed record
-   the read model compares ``decided_by`` against), published to the single's
-   decision read model, and the suspended pipeline is resumed through the
-   control plane's valueless resume.
-
-S10: the consumption evidence is this node's receipt itself -- the receipt
-carries the sealed decision file, the published verdict's message id and the
-launches reference -- never "a unit was started". Every refusal lands as a
-failed receipt with its reason; the single is never silently swallowed past
-the gate.
+调用身份必须与入单 dispatcher 一致。APPROVE 要求全部义务通过；REJECT
+必须携带问题、建议答案和不回答的代价。整次操作持开发单锁，先发布幂等裁决，
+再封存其 ID 与证据，最后恢复 pipeline；未完整封存的裁决不可自动恢复。
 """
 
 from __future__ import annotations
 
+import json
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -129,7 +98,7 @@ class GraphGateNode:
         receipt.update(extra)
         return receipt
 
-    # -- the six obligations ------------------------------------------------
+    # -- policy obligations ------------------------------------------------
 
     def _obligations(self, development_id: str) -> list[EvidenceItem]:
         if self._evidence is not None:
@@ -144,6 +113,14 @@ class GraphGateNode:
             kwargs["rerun"] = self._rerun
         if self._regression_probe is not None:
             kwargs["regression_probe"] = self._regression_probe
+        from fleet_graph.dd.gate_policy import STANDARD
+        from fleet_graph.dd.self_gate_evidence import collect_standard_gate_evidence
+
+        policy = self.plane.get(development_id).get("gate_policy", "legacy-six-v1")
+        if policy == STANDARD:
+            return collect_standard_gate_evidence(
+                development_id=development_id, dd=self.plane, dd_root=self.dd_root
+            )
         return collect_gate_evidence(
             development_id=development_id,
             dd=self.plane,
@@ -162,6 +139,8 @@ class GraphGateNode:
         action_key: str,
         evidence: list[EvidenceItem],
         head_commit: str,
+        rationale: str = "",
+        decision_message_id: str = "",
     ) -> str:
         """Write and commit the gate verdict into the subject workspace.
 
@@ -180,7 +159,8 @@ class GraphGateNode:
                 "decided_by": decided_by,
                 "decided_by_source": "graph-gate-node",
                 "action_key": action_key,
-                "rationale": render_rationale(evidence),
+                "decision_message_id": decision_message_id,
+                "rationale": rationale or render_rationale(evidence),
                 "evidence": [
                     {"id": item.id, "passed": item.passed, "detail": item.detail}
                     for item in evidence
@@ -207,6 +187,26 @@ class GraphGateNode:
     # -- consumption ---------------------------------------------------------
 
     def consume(self, action: dict[str, Any], *, folder_id: str, round_no: int) -> dict[str, Any]:
+        payload = action.get("payload") or {}
+        development_id = payload.get("development_id") if isinstance(payload, dict) else None
+        try:
+            lock = (
+                self.plane.operation_lock(development_id)
+                if development_id and hasattr(self.plane, "operation_lock")
+                else nullcontext()
+            )
+            with lock:
+                return self._consume(action, folder_id=folder_id, round_no=round_no)
+        except Exception as exc:
+            return self._receipt(
+                action,
+                round_no=round_no,
+                status=STATUS_FAILED,
+                code=CODE_RELEASE_REFUSED,
+                detail=str(exc),
+            )
+
+    def _consume(self, action: dict[str, Any], *, folder_id: str, round_no: int) -> dict[str, Any]:
         """Consume one ``dd.gate_release.v1`` action; never raises into the line.
 
         Every refusal is a failed receipt naming its code; the release path is
@@ -267,7 +267,7 @@ class GraphGateNode:
             )
 
         dispatched_by = str(status.get("dispatched_by") or "")
-        if not dispatched_by or decided_by != dispatched_by:
+        if not dispatched_by or decided_by != dispatched_by or folder_id != dispatched_by:
             # The M2 identity invariant: the decider is the dispatcher, or the
             # release is refused with the single untouched (REJECT + 留痕).
             return self._receipt(
@@ -283,10 +283,34 @@ class GraphGateNode:
                 dispatched_by=dispatched_by,
             )
 
+        request_id = str((status.get("awaiting") or {}).get("question_note_id") or "")
+        if request_id.startswith("engine:") and payload.get("question_note_id") != request_id:
+            return self._receipt(
+                action,
+                round_no=round_no,
+                status=STATUS_FAILED,
+                code="gate_request_mismatch",
+                detail="裁决必须绑定当前审单请求 question_note_id",
+                development_id=development_id,
+            )
         evidence = self._obligations(development_id)
-        incomplete = collect_evidence(evidence)
+        from fleet_graph.dd.gate_policy import LEGACY, STANDARD, STANDARD_EVIDENCE
+        from fleet_graph.dd.self_gate import REQUIRED_EVIDENCE
+
+        policy = status.get("gate_policy", LEGACY)
+        if policy not in {STANDARD, LEGACY}:
+            return self._receipt(
+                action,
+                round_no=round_no,
+                status=STATUS_FAILED,
+                code="unknown_gate_policy",
+                detail=f"未知审单协议 {policy!r}",
+            )
+        incomplete = collect_evidence(
+            evidence, required_ids=STANDARD_EVIDENCE if policy == STANDARD else REQUIRED_EVIDENCE
+        )
         failed_items = [item for item in evidence if not item.passed]
-        if incomplete is not None or failed_items:
+        if incomplete is not None or (failed_items and verdict == "APPROVE"):
             detail = render_rationale(evidence)
             if incomplete is not None:
                 detail = f"{incomplete.detail}; {detail}"
@@ -332,7 +356,25 @@ class GraphGateNode:
             head = run_git(workspace, "rev-parse", "HEAD", check=True).stdout.strip()
             idempotency_key = str(action.get("idempotency_key") or "")
             action_key = f"dd-gate-node:{development_id}:g{generation}:{idempotency_key}:{verdict}"
+            rationale = render_rationale(evidence)
+            if verdict == "REJECT":
+                rationale += "\n" + json.dumps(
+                    {
+                        key: payload["board_decision"][key]
+                        for key in ("problem", "suggested_answer", "cost_of_no_answer")
+                    },
+                    ensure_ascii=False,
+                )
 
+            published = dict(
+                self.plane.publish_gate_decision(
+                    development_id,
+                    decision=verdict,
+                    decided_by=decided_by,
+                    reason=rationale,
+                    action_key=action_key,
+                )
+            )
             decision_file = self._seal_decision_file(
                 workspace=workspace,
                 development_id=development_id,
@@ -342,16 +384,8 @@ class GraphGateNode:
                 action_key=action_key,
                 evidence=evidence,
                 head_commit=head,
-            )
-
-            published = dict(
-                self.plane.publish_gate_decision(
-                    development_id,
-                    decision=verdict,
-                    decided_by=decided_by,
-                    reason=render_rationale(evidence),
-                    action_key=action_key,
-                )
+                rationale=str(published.get("rationale") or rationale),
+                decision_message_id=str(published.get("message_id") or ""),
             )
             resume = dict(self.plane.gate(development_id, resume=True, action_key=action_key))
             resume_entry = dict(resume.get("resume") or {})

@@ -94,6 +94,7 @@ from fleet_graph.dd.evidence import (
     EvidenceLink,
 )
 from fleet_graph.dd.git import run_git
+from fleet_graph.dd.operation_lock import operation_lock, serialized
 from fleet_graph.dd.recovery import (
     RECOVERY_MECHANISM,
     HumanRecoveryExit,
@@ -830,12 +831,15 @@ class DdLaunchSpec:
             # after the gate lets it.
             "--publish-merge",
         ]
-        for command in self.acceptance_commands:
-            argv += ["--accept", shlex.join(command)]
-        for command in self.setup_commands:
-            argv += ["--setup", shlex.join(command)]
-        for key, value in sorted(self.acceptance_env.items()):
-            argv += ["--accept-env", f"{key}={value}"]
+        # 正式派发从入单记录读取脚本，避免脚本文本暴露在父进程 argv，
+        # 被验收脚本的 pkill -f 等命令误匹配。独立 CLI 保留显式参数。
+        if not self.record_file:
+            for command in self.acceptance_commands:
+                argv += ["--accept", shlex.join(command)]
+            for command in self.setup_commands:
+                argv += ["--setup", shlex.join(command)]
+            for key, value in sorted(self.acceptance_env.items()):
+                argv += ["--accept-env", f"{key}={value}"]
         # R6 (wf-4601c8 §7.1.8): seats are NOT re-declared on the cmdline. The
         # actor resolves each stage's seat from the record-derived mapping in
         # one place; a cmdline seat key would be a second seat source.
@@ -887,6 +891,70 @@ class DdControlPlane:
         #: scattered across call sites -- a rescope edits this, not the checks.
         self.scope_boundary = scope_boundary if scope_boundary is not None else default_boundary()
         self.clock = clock
+
+    def operation_lock(self, development_id: str):
+        # 先验证身份，避免未知请求创建伪开发单目录。
+        self._record(development_id)
+        return operation_lock(self._dev_root(development_id) / "operation.lock")
+
+    @serialized
+    def cancel(self, development_id: str, generation: int, reason: str) -> dict[str, Any]:
+        """停止指定代的整个 unit，确认退出后封存可查询终态；过期取消不得影响新代。"""
+        record = self._record(development_id)
+        if generation != self._generation(record):
+            raise ControlPlaneError("GENERATION_MISMATCH", "取消请求不属于当前代")
+        if not reason.strip():
+            raise ControlPlaneError("CANCEL_REASON_REQUIRED", "取消必须说明原因")
+        result = self._read_result(development_id, generation) or {}
+        if result.get("terminal") and not result.get("awaiting"):
+            return {
+                "development_id": development_id,
+                "generation": generation,
+                "cancelled": result.get("terminal_code") == "CANCELLED",
+                "already_terminal": True,
+            }
+        unit = self._unit_active(development_id)
+        if unit:
+            try:
+                stopped = subprocess.run(
+                    ["systemctl", "--user", "stop", unit],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise ControlPlaneError("CANCEL_FAILED", str(exc), retryable=True) from exc
+            if stopped.returncode != 0 or self.unit_probe(unit):
+                raise ControlPlaneError("CANCEL_FAILED", stopped.stderr[-1000:], retryable=True)
+        run_root = self._gen_root(development_id, generation)
+        payload = {
+            "event": "cancelled",
+            "development_id": development_id,
+            "generation": generation,
+            "reason": reason,
+            "unit": unit,
+            "at": iso(self.clock()),
+        }
+        run_root.mkdir(parents=True, exist_ok=True)
+        with (run_root / EVENTS_FILE).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        write_json_durable(
+            run_root / RESULT_FILE,
+            {
+                **result,
+                "development_id": development_id,
+                "generation": generation,
+                "terminal": "refused",
+                "terminal_code": "CANCELLED",
+                "terminal_reason": reason,
+                "awaiting": None,
+                "gate_refused": None,
+            },
+        )
+        return {**payload, "cancelled": True, "already_terminal": False}
 
     # --- admission -------------------------------------------------------
 
@@ -943,6 +1011,9 @@ class DdControlPlane:
         """
         repo = self._admit_repo(repo_path)
         spec = self._read_spec(spec_text, spec_path)
+        from fleet_graph.dd.gate_policy import policy_from_spec
+
+        gate_policy = policy_from_spec(spec)
         # M4: seats are validated before a single byte is written -- a bad
         # seat must refuse the admission, not poison a bootstrapped worktree.
         registry = load_stage_seat_registry()
@@ -1013,6 +1084,7 @@ class DdControlPlane:
         (dev_root / H0_FILE).write_bytes(h0_bytes)
 
         record = {
+            "gate_policy": gate_policy,
             "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
             "development_id": development_id,
             "repo_path": str(repo),
@@ -1466,6 +1538,7 @@ class DdControlPlane:
 
     # --- start / gate ----------------------------------------------------
 
+    @serialized
     def start(self, development_id: str) -> dict[str, Any]:
         """Launch the development detached: resume the in-flight generation,
         or -- after a retryable terminal or a reconfigure -- start the next one.
@@ -1827,6 +1900,7 @@ class DdControlPlane:
 
     # --- reconfigure: the environment/contract exit -----------------------
 
+    @serialized
     def reconfigure(
         self,
         development_id: str,
@@ -1916,6 +1990,7 @@ class DdControlPlane:
             "are untouchable by construction",
         }
 
+    @serialized
     def gate(
         self,
         development_id: str,
@@ -1925,8 +2000,8 @@ class DdControlPlane:
         """The gate's state, and -- on request -- a valueless resume.
 
         There is deliberately no decision input anywhere on this path.
-        Verdicts travel only as `work.decision.v1` on the board, published by
-        a human; on resume the graph re-reads the board itself.
+        Verdicts are published by the graph gate node to the durable decision
+        store (or an explicitly configured legacy board); resume re-reads it.
 
         ``action_key`` is the decision bridge's durable exactly-once claim.
         When supplied, the gate persists a ``(action_key, generation)``
@@ -1944,7 +2019,7 @@ class DdControlPlane:
         gate_report: dict[str, Any] = {
             "development_id": development_id,
             "state": status["state"],
-            "pending": bool(awaiting) and decision is None,
+            "pending": bool(awaiting) and status["state"] == STATE_AWAITING_GATE,
             "awaiting": awaiting,
             "decision": decision,
             # A resumable refusal: the gate saw a verdict it could not
@@ -1952,13 +2027,20 @@ class DdControlPlane:
             # the operator knows a malformed verdict, not an absent one, is
             # what is holding the line.
             "gate_refused": gate_refused,
-            "ruling": "decisions travel only as work.decision.v1 on the board; "
-            "this tool carries none",
+            "ruling": "decisions are delivered by the graph gate node; this tool carries none",
         }
-        if awaiting and decision is None:
-            gate_report["decision_on_board"] = self._decision_on_board(awaiting)
+        if awaiting:
+            gate_report["decision_on_board"] = self._decision_on_board(
+                awaiting, development_id=development_id
+            )
         if not resume:
             return gate_report
+        if (
+            awaiting
+            and str(awaiting.get("question_note_id") or "").startswith("engine:")
+            and not gate_report.get("decision_on_board")
+        ):
+            raise ControlPlaneError("DECISION_NOT_READY", "审单裁决及工作区封存尚未完整绑定")
 
         if status["state"] == STATE_RUNNING:
             raise ControlPlaneError(
@@ -2010,6 +2092,7 @@ class DdControlPlane:
         gate_report["resume"] = self._launch(record, resume=True, generation=generation)
         return gate_report
 
+    @serialized
     def publish_gate_decision(
         self,
         development_id: str,
@@ -2049,6 +2132,31 @@ class DdControlPlane:
                 f"{development_id} carries no pending question note; "
                 "there is no question for a verdict to answer",
             )
+        if question_note_id.startswith("engine:"):
+            from fleet_graph.dd.gate_store import GateStore
+
+            expected = f"engine:dd-gate:{development_id}:g{self._generation(record)}"
+            if question_note_id != expected:
+                raise ControlPlaneError("GATE_TICKET_UNRESOLVED", "审单请求与当前代不匹配")
+            try:
+                published = GateStore(self._dev_root(development_id) / "gate-requests").decide(
+                    question_note_id,
+                    decision=decision,
+                    decided_by=decided_by,
+                    reason=reason,
+                    action_key=action_key or f"{expected}:{decision}",
+                )
+            except (OSError, ValueError) as exc:
+                raise ControlPlaneError("GATE_DECISION_REFUSED", str(exc)) from exc
+            return {
+                "development_id": development_id,
+                "question_note_id": question_note_id,
+                "decision": decision,
+                "decided_by": decided_by,
+                "message_id": published["message_id"],
+                "rationale": published["rationale"],
+                "idempotency_key": published["action_key"],
+            }
         board = self._board_factory()
         if board is None:
             raise ControlPlaneError(
@@ -2163,7 +2271,26 @@ class DdControlPlane:
         except ValueError:
             return None
 
-    def _decision_on_board(self, awaiting: dict[str, Any]) -> bool | None:
+    def _decision_on_board(
+        self, awaiting: dict[str, Any], *, development_id: str = ""
+    ) -> bool | None:
+        request_id = str(awaiting.get("question_note_id") or "")
+        if request_id.startswith("engine:"):
+            from fleet_graph.bus.board import GateTicket
+            from fleet_graph.dd.gate_store import GateStore
+
+            store = GateStore(self._dev_root(development_id) / "gate-requests")
+            verdict = store.decision_for(GateTicket(question_note_id=request_id, card_entity_id=""))
+            record = self._record(development_id)
+            seal = self._committed_gate_decision(record, self._generation(record))
+            return bool(
+                verdict is not None
+                and seal
+                and seal.get("decision_message_id") == verdict.message_id
+                and seal.get("decision") == verdict.decision
+                and seal.get("decided_by") == verdict.decided_by
+                and seal.get("action_key") == verdict.raw.get("action_key")
+            )
         board = self._board_factory()
         if board is None:
             return None
@@ -2187,6 +2314,10 @@ class DdControlPlane:
         status = self.rebuild_status(development_id)
         return {
             **status,
+            "gate_policy": record.get("gate_policy", "legacy-six-v1"),
+            "receipt_digests": (
+                self._checkpoint_state(development_id, self._generation(record)) or {}
+            ).get("receipt_digests", {}),
             "repo_path": record["repo_path"],
             "worktree_path": record["repo_path"],
             "remote_url": record["remote_url"],
@@ -2512,6 +2643,10 @@ class DdControlPlane:
         for revision, entry in enumerate(sealed, start=revision_base + 1):
             stage = str(entry.get("stage") or "")
             output_commit = str(entry.get("output_commit") or "")
+            if entry.get("event") == "failed" and output_commit == previous_output:
+                # 未封存的失败保持原 head/parent；它是执行事件，不是新 receipt。
+                # 不能给旧失败套用同 attempt 后来成功时才生成的回执文件。
+                continue
             attempt_id = derive_attempt_id(
                 development_id, generation, int(entry.get("attempt") or 1)
             )
@@ -2522,9 +2657,18 @@ class DdControlPlane:
                 # A script stage with nothing sealed on file reconstructs the
                 # WorkspaceSealer receipt it produced -- the exact shape whose
                 # canonical digest the next plugin dispatch named as parent.
+                input_commit = previous_output
+                rebase = entry.get("rebase") or {}
+                if stage == "configure" and not rebase.get("rebased"):
+                    # 跨代恢复可能在旧代尾之后已有真实提交；不能把旧代尾
+                    # 冒充 configure 的输入。普通 configure seal 是单父提交，
+                    # 以 Git 父还原，并让审计如实观察跨代 input gap。
+                    parent = run_git(repo, "rev-parse", f"{output_commit}^1")
+                    if parent.returncode == 0:
+                        input_commit = parent.stdout.strip()
                 receipt = {
                     "stage": stage,
-                    "input_commit": previous_output,
+                    "input_commit": input_commit,
                     "output_commit": output_commit,
                 }
             # Which digest the *next* link actually names: the sealer re-reads
@@ -2541,7 +2685,7 @@ class DdControlPlane:
                     "stage": stage,
                     "attempt": int(entry.get("attempt") or 1),
                     "verdict": str(entry.get("event") or ""),
-                    "input_commit": previous_output,
+                    "input_commit": str(receipt.get("input_commit") or previous_output),
                     "output_commit": output_commit,
                     "receipt_digest": digest,
                     "parent_handoff_receipt_digest": parent_from_receipt or previous_digest,
@@ -2694,6 +2838,7 @@ class DdControlPlane:
         # governance check -- a human decision on the board -- runs in `recover`.
         return HumanRecoveryExit(records=records)
 
+    @serialized
     def adopt(
         self,
         development_id: str,
@@ -2777,6 +2922,7 @@ class DdControlPlane:
         except Exception:
             return None
 
+    @serialized
     def recover(
         self,
         development_id: str,

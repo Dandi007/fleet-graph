@@ -66,7 +66,7 @@ def write_json(repo: Path, relative: str, payload: Any) -> Path:
 
 @dataclass
 class WorkspaceSealer:
-    """Commits whatever the stage left in the worktree.
+    """只封存程序阶段的机器产物。
 
     Deliberately not a second materialization protocol: the script wrote its
     files, this records them, and the receipt says which commit resulted. The
@@ -100,7 +100,19 @@ class WorkspaceSealer:
             env["GIT_AUTHOR_DATE"] = stamp
             env["GIT_COMMITTER_DATE"] = stamp
 
-        self._git(["add", "-A"], env)
+        # 程序阶段只封存机器产物，不能把验收产生的缓存带入产品提交。
+        machine_roots = (".dev-dispatch", ".dd-evidence")
+        changed = self._git(["diff", "--name-only", "HEAD"], env).splitlines()
+        product_changes = [
+            p for p in changed if not p.startswith(tuple(r + "/" for r in machine_roots))
+        ]
+        if product_changes:
+            raise StageRefused(
+                f"程序阶段修改了产品文件：{product_changes}", code="SCRIPT_PRODUCT_CHANGED"
+            )
+        for root in machine_roots:
+            if (self.repo / root).exists():
+                self._git(["add", "-A", "--", root], env)
         self._git(
             [
                 "-c",
@@ -408,6 +420,7 @@ class AcceptanceStage:
     # only checked against it.
     env: dict[str, str] = field(default_factory=dict)
     timeout_seconds: int = 1800
+    isolated: bool = False
 
     def commands(self) -> list[list[str]]:
         path = self.repo / RUN_CONFIG_PATH
@@ -437,14 +450,42 @@ class AcceptanceStage:
     def _run(self, command: list[str]) -> dict[str, Any]:
         import os
 
-        proc = subprocess.run(
-            command,
-            cwd=str(self.repo),
-            capture_output=True,
-            text=True,
-            timeout=self.timeout_seconds,
-            env={**os.environ, **self.env} if self.env else None,
-        )
+        try:
+            executed = command
+            if self.isolated:
+                from fleet_graph.executors.sandbox import git_write_paths, sandbox_argv
+
+                executed = sandbox_argv(command, writable=git_write_paths(self.repo))
+            proc = subprocess.run(
+                executed,
+                cwd=str(self.repo),
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+                env={**os.environ, **self.env} if self.env else None,
+            )
+        except OSError as exc:
+            return {
+                "command": command,
+                "exit_code": 127,
+                "stdout_tail": "",
+                "stderr_tail": str(exc)[-2000:],
+                "error_type": type(exc).__name__,
+            }
+        except subprocess.TimeoutExpired as exc:
+
+            def tail(value: str | bytes | None) -> str:
+                return (
+                    value.decode(errors="replace") if isinstance(value, bytes) else value or ""
+                )[-2000:]
+
+            return {
+                "command": command,
+                "exit_code": 124,
+                "stdout_tail": tail(exc.stdout),
+                "stderr_tail": tail(exc.stderr),
+                "error_type": "TimeoutExpired",
+            }
         return {
             "command": command,
             "exit_code": proc.returncode,

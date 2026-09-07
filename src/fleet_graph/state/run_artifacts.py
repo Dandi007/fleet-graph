@@ -696,8 +696,21 @@ def write_json_durable(path: str | Path, obj: Any) -> Path:
     """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("w", encoding="utf-8") as handle:
-        json.dump(obj, handle, ensure_ascii=False)
-        handle.flush()
-        os.fsync(handle.fileno())
+    import tempfile
+
+    fd, temporary = tempfile.mkstemp(prefix=".write-", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(obj, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     return target

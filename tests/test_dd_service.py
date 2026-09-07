@@ -43,6 +43,7 @@ ALL_TOOLS = {
     "development_evidence",
     "development_gate",
     "development_start",
+    "development_cancel",
     "development_reconfigure",
     "development_adopt",
     "development_recover",
@@ -91,6 +92,9 @@ class FakeControlPlane:
 
     def start(self, **kwargs: object) -> dict[str, object]:
         return self._record("start", **kwargs)
+
+    def cancel(self, **kwargs: object) -> dict[str, object]:
+        return self._record("cancel", **kwargs)
 
     def get(self, **kwargs: object) -> dict[str, object]:
         return self._record("get", **kwargs)
@@ -285,6 +289,7 @@ def test_every_supported_tool_drives_the_control_plane_over_the_running_endpoint
             },
         ),
         ("development_start", {"development_id": "dev-1"}),
+        ("development_cancel", {"development_id": "dev-1", "generation": 1, "reason": "测试取消"}),
         ("development_gate", {"development_id": "dev-1", "resume": True}),
         (
             "development_reconfigure",
@@ -350,6 +355,7 @@ def test_every_supported_tool_drives_the_control_plane_over_the_running_endpoint
             },
         ),
         ("start", {"development_id": "dev-1"}),
+        ("cancel", {"development_id": "dev-1", "generation": 1, "reason": "测试取消"}),
         ("gate", {"development_id": "dev-1", "resume": True}),
         (
             "reconfigure",

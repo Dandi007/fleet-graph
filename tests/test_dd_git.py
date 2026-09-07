@@ -51,7 +51,8 @@ class TestTheExploitTheGuardsExistFor:
 
         marker = tmp_path / "fired-through-the-sealer"
         arm_fsmonitor(repo, marker)
-        (repo / "written-by-a-stage.txt").write_text("x\n", encoding="utf-8")
+        (repo / ".dev-dispatch").mkdir(exist_ok=True)
+        (repo / ".dev-dispatch/written-by-a-stage.txt").write_text("x\n", encoding="utf-8")
         before = head(repo)
 
         sealed = WorkspaceSealer(repo=repo).materialize(

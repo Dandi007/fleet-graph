@@ -221,6 +221,7 @@ SUPPORTED_TOOLS: frozenset[str] = frozenset(
         "development_evidence",
         "development_create",
         "development_start",
+        "development_cancel",
         "development_gate",
         "development_reconfigure",
         "development_adopt",
@@ -441,6 +442,11 @@ def build_mcp_server(
         so.
         """
         return call("start", development_id=development_id)
+
+    @mcp.tool()
+    def development_cancel(development_id: str, generation: int, reason: str) -> dict[str, Any]:
+        """取消指定代：停止开发单及子进程并封存原因。generation 必须是当前读取的代号。"""
+        return call("cancel", development_id=development_id, generation=generation, reason=reason)
 
     @mcp.tool()
     def development_gate(development_id: str, resume: bool = False) -> dict[str, Any]:

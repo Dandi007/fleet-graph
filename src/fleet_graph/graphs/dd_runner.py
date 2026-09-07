@@ -372,6 +372,7 @@ def build_pipeline(
             record_path=config.record_path if line_ref else "",
         ),
         stage_producing(lifecycle, ACCEPTANCE_RESULT): AcceptanceStage(
+            isolated=True,
             repo=config.workspace_path,
             # The same declaration configure writes down. Acceptance runs this,
             # not whatever the worktree ended up containing.
@@ -396,7 +397,16 @@ def build_pipeline(
             evidence=observe,
         ),
     }
-    if board is not None and gate_card_entity_id:
+    if config.record_path and not (board is not None and gate_card_entity_id):
+        from fleet_graph.dd.gate_store import GateStore
+
+        registered[lifecycle_gate_stage(lifecycle)] = BoardGate(
+            board=GateStore(Path(config.record_path).parent / "gate-requests"),
+            card_entity_id="",
+            development_id=config.development_id,
+            repo=config.workspace_path,
+        )
+    elif board is not None and gate_card_entity_id:
         # The one stage with no default. An assembly that approved on its own
         # would be an agent casting a human's verdict; a caller who wants a
         # different policy registers their own actor, deliberately.

@@ -578,3 +578,129 @@ __all__ = [
     "receipt_on_head",
     "spec_acceptance_argv",
 ]
+
+
+def collect_standard_gate_evidence(
+    *, development_id: str, dd: Any, dd_root: Path
+) -> list[EvidenceItem]:
+    """通用 DD 协议：当代链绑定、冻结验收及真实重跑，不假定项目语言。"""
+    from fleet_graph.dd.gate_policy import STANDARD_EVIDENCE
+    from fleet_graph.graphs.dd_scripts import ACCEPTANCE_PATH, AcceptanceStage
+
+    try:
+        ctx = _resolve_context(
+            development_id=development_id, dd=dd, dd_root=dd_root, workspace=None
+        )
+        generation = int(ctx.record.get("generation") or 1)
+        gen_root = dd_root / development_id
+        if generation > 1:
+            gen_root /= f"g{generation}"
+        state = json.loads((gen_root / "result.json").read_text())
+        history = {entry["stage"]: entry for entry in state.get("history", [])}
+        all_receipts = load_stage_receipts(dd_root, development_id, generation=generation)
+        from fleet_graph.dd.upstream_constants import compute_json_digest
+
+        receipts = {}
+        for stage in ("implement", "continuous_review", "final_review"):
+            output = history.get(stage, {}).get("output_commit")
+            found = [r for r in all_receipts.get(stage, []) if r.get("output_commit") == output]
+            if len(found) != 1 or not output:
+                raise ValueError(f"{stage} 缺少与当前执行链唯一绑定的回执")
+            receipt = found[0]
+            digest = compute_json_digest(receipt)
+            if digest != (ctx.record.get("receipt_digests") or {}).get(stage):
+                raise ValueError(f"{stage} 回执与 checkpoint 冻结的 digest 不一致")
+            receipts[stage] = receipt
+        impl, cr, fr = (receipts[k] for k in ("implement", "continuous_review", "final_review"))
+        approved = (
+            cr.get("verdict") == fr.get("verdict") == "APPROVE"
+            and cr.get("input_commit") == impl.get("output_commit")
+            and fr.get("input_commit") == cr.get("output_commit")
+            and cr.get("implementation_subject_commit")
+            == fr.get("implementation_subject_commit")
+            == impl.get("output_commit")
+            and all(r.get("development_id") == development_id for r in receipts.values())
+            and len({r.get("attempt_id") for r in receipts.values()}) == 1
+            and bool(impl.get("attempt_id"))
+            and impl.get("spec_digest") == ctx.record.get("spec_digest")
+            and _is_ancestor(ctx.workspace, str(fr.get("output_commit") or ""), ctx.head)
+        )
+        changed = diff_changed_paths(ctx.workspace, str(impl["output_commit"]), ctx.head)
+        changed_product = [
+            p for p in changed if not p.startswith((".dev-dispatch/", ".dd-evidence/"))
+        ]
+
+        def dirty_product() -> str:
+            tracked = run_git(
+                ctx.workspace, "diff", "--name-only", "HEAD", check=True
+            ).stdout.strip()
+            untracked = run_git(
+                ctx.workspace, "ls-files", "--others", "--exclude-standard", check=True
+            ).stdout.splitlines()
+            cache_parts = {"__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache"}
+            products = [
+                p
+                for p in untracked
+                if not cache_parts.intersection(Path(p).parts)
+                and not p.startswith((".dev-dispatch/", ".dd-evidence/"))
+            ]
+            return "\n".join([tracked, *products]).strip()
+
+        dirty = dirty_product()
+        approved = approved and not changed_product and not dirty
+        bound = EvidenceItem(
+            "review_chain_approved",
+            "当前代 CR/FR 批准且产品未变化",
+            approved,
+            f"implementation={impl['output_commit']}; "
+            f"changed_product={changed_product}; dirty={dirty}",
+        )
+        committed = run_git(ctx.workspace, "show", f"{ctx.head}:{ACCEPTANCE_PATH}", check=True)
+        accepted = json.loads(committed.stdout)
+        commands = ctx.record.get("acceptance_commands") or []
+        frozen = _obligation_acceptance_frozen(ctx, all_receipts)
+        actual_commands = [r.get("command") for r in accepted.get("results", [])]
+        if not (
+            accepted.get("passed") is True
+            and accepted.get("development_id") == development_id
+            and actual_commands == commands
+            and commands
+            and all(r.get("exit_code") == 0 for r in accepted.get("results", []))
+        ):
+            frozen = EvidenceItem(
+                EVIDENCE_ACCEPTANCE_FROZEN,
+                frozen.label,
+                False,
+                "封存的程序验收没有通过当前入单的全部命令",
+            )
+        runner = AcceptanceStage(
+            ctx.workspace,
+            declared=commands,
+            setup=ctx.record.get("setup_commands") or [],
+            env=ctx.record.get("acceptance_env") or {},
+            isolated=True,
+        )
+        echoes = []
+        ran = bool(commands)
+        for command in [*runner.setup, *commands]:
+            result = runner._run(command)
+            echoes.append(result)
+            if result["exit_code"] != 0:
+                ran = False
+                break
+        stable = _git_head(ctx.workspace) == ctx.head and not dirty_product()
+        rerun = EvidenceItem(
+            EVIDENCE_PERSONALLY_RERUN,
+            "同环境隔离重跑验收",
+            ran and stable,
+            json.dumps({"results": echoes, "subject_unchanged": stable}, ensure_ascii=False),
+        )
+        deletion = evidence_zero_test_deletion(
+            deleted_paths=diff_deleted_paths(ctx.workspace, ctx.base, ctx.head)
+        )
+        return [frozen, bound, rerun, deletion]
+    except Exception as exc:
+        return [
+            EvidenceItem(key, key, False, f"通用审单取证失败：{type(exc).__name__}: {exc}")
+            for key in STANDARD_EVIDENCE
+        ]
