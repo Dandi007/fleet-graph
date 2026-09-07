@@ -283,7 +283,7 @@ class TestNonZeroExit:
         outcome = run_stage(_request(), git_runner=FakeGitRunner(), agent_invoker=invoker)
 
         assert outcome.ok is False
-        assert outcome.invalid_reason == "non_zero_exit"
+        assert outcome.invalid_reason == agentrun.FailureCode.NONZERO_EXIT
         assert len(invoker.calls) == 1
         assert outcome.events == [
             (
@@ -305,7 +305,17 @@ class TestNonZeroExit:
         outcome = run_stage(_request(), git_runner=FakeGitRunner(), agent_invoker=invoker)
 
         assert outcome.ok is False
+        assert outcome.invalid_reason == agentrun.FailureCode.INVALID_OUTPUT
         assert outcome.events[0][1]["detail"] == "boom"
+
+    def test_runtime_timeout_is_classified(self) -> None:
+        stdout = json.dumps({"schema": "runtime.error/1", "stop": "timeout", "detail": "timed out"})
+        invoker = FakeInvoker(1, stdout)
+        outcome = run_stage(_request(), git_runner=FakeGitRunner(), agent_invoker=invoker)
+
+        assert outcome.ok is False
+        assert outcome.invalid_reason == agentrun.FailureCode.TIMEOUT
+        assert outcome.events[0][1]["detail"] == "timed out"
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +329,7 @@ class TestInvalidOutput:
         outcome = run_stage(_request(), git_runner=FakeGitRunner(), agent_invoker=invoker)
 
         assert outcome.ok is False
-        assert outcome.invalid_reason == "no_object"
+        assert outcome.invalid_reason == agentrun.FailureCode.NO_OBJECT
         assert outcome.events[0][0] == "agent.invalid_output"
         assert "impl/1" in outcome.events[0][1]["detail"]
 
@@ -329,7 +339,7 @@ class TestInvalidOutput:
         outcome = run_stage(_request(), git_runner=FakeGitRunner(), agent_invoker=invoker)
 
         assert outcome.ok is False
-        assert outcome.invalid_reason == "invalid_output"
+        assert outcome.invalid_reason == agentrun.FailureCode.INVALID_OUTPUT
         assert outcome.stop == "failed"
         assert "detail" in outcome.events[0][1]["detail"]
 

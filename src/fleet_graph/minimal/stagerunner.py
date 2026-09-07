@@ -139,17 +139,28 @@ def _gate_failure_dict(failure: gitgate.GateFailure) -> dict[str, str]:
     return {"repo": failure.repo, "code": failure.code, "detail": failure.detail}
 
 
-def _runtime_error_detail(stdout: str, exit_code: int) -> str:
-    """The ``agent.failed`` detail: the runtime.error/1 detail if present, else a summary.
+def _runtime_failure(stdout: str, exit_code: int) -> tuple[str, str]:
+    """The non-zero-exit ``(failure_code, detail)``, graded like ``agentrun.parse_stop``.
 
-    The invoker returns only ``(exit_code, stdout)``, so there is no stderr to
-    summarize; the runtime's own structured error object is the primary source
-    (protocol §0.2), and a plain exit-code message is the fallback.
+    Protocol §0.2: no ``runtime.error/1`` object -> ``nonzero_exit``; an object
+    whose ``stop`` is ``"timeout"`` -> ``timeout``; any other runtime error ->
+    ``invalid_output``. The detail is the runtime's own, else a summary.
     """
     err = protocol.extract_protocol_object(stdout, _schema_prefix(protocol.SCHEMA_RUNTIME_ERROR))
-    if err is not None and isinstance(err.get("detail"), str):
-        return err["detail"]
-    return f"agent exited with non-zero exit code {exit_code}"
+    if err is None:
+        return (
+            agentrun.FailureCode.NONZERO_EXIT,
+            f"agent exited with non-zero exit code {exit_code}",
+        )
+    detail = err.get("detail")
+    if not isinstance(detail, str):
+        detail = f"agent exited with non-zero exit code {exit_code}"
+    failure_code = (
+        agentrun.FailureCode.TIMEOUT
+        if err.get("stop") == "timeout"
+        else agentrun.FailureCode.INVALID_OUTPUT
+    )
+    return failure_code, detail
 
 
 def _snapshot(
@@ -293,11 +304,12 @@ def run_stage(
     )
 
     if exit_code != 0:
+        failure_code, detail = _runtime_failure(stdout, exit_code)
         return StageOutcome(
             ok=False,
             stop=None,
             obj=None,
-            invalid_reason="non_zero_exit",
+            invalid_reason=failure_code,
             gate_failures=[],
             events=[
                 (
@@ -306,7 +318,7 @@ def run_stage(
                         "stage": req.stage,
                         "run_id": req.run_id,
                         "exit_code": exit_code,
-                        "detail": _runtime_error_detail(stdout, exit_code),
+                        "detail": detail,
                     },
                 )
             ],
@@ -318,7 +330,7 @@ def run_stage(
             ok=False,
             stop=None,
             obj=None,
-            invalid_reason="no_object",
+            invalid_reason=agentrun.FailureCode.NO_OBJECT,
             gate_failures=[],
             events=[
                 (
@@ -341,7 +353,7 @@ def run_stage(
             ok=False,
             stop=obj.get("stop"),
             obj=obj,
-            invalid_reason="invalid_output",
+            invalid_reason=agentrun.FailureCode.INVALID_OUTPUT,
             gate_failures=[],
             events=[
                 (
