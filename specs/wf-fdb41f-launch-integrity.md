@@ -47,3 +47,7 @@ Goal 的 `dd.gate_release.v1` 必须绑定 dispatcher、generation 对应请求�
 `goal_enroll` 通过七道门后持久化申请；`goal_admit` 验证监督身份，未提供外部 decision_ref 时生成内生审计引用。裁决先封存，再把线写到服务名册；重投可恢复中断的名册写入。`FLEET_GRAPH_RUNTIME_ROSTER` 默认 `/data/fleet-graph/goal/roster.json`，已有代码名册作种子，新增线不需要改代码。scheduler、状态面和裁决发现每轮合并读取；alias 不可与种子或运行线冲突。入编队列跨进程串行、锁内重读、原子持久化，不能用旧实例覆盖其他申请。
 
 `verify-rebuild.sh` 的旧重构专项判据保留原语义，仅修复缺少 `VRB_MCP_STATE` 默认值导致的脚本早退。其中退役资产清理项与主动合成请求不能替代本 SPEC 的交付验收，也不能直接对生产盲跑整份脚本。
+
+## 完整 Goal 启动接线
+
+正常 line run 与中断恢复必须绑定同一真实 DD 控制面，同时提供 Stop dispatch 和 gate 消费者；不得只在测试注入时可用。scheduler 的 dd_root 是子进程派单与唤醒共同的数据根，经 FLEET_GRAPH_DD_ROOT 透传。DD 执行程序钉住启动 Goal 的实际发布路径，避免运行中 current 切换造成跨版本执行。

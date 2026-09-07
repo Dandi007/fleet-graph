@@ -8,10 +8,11 @@ of the real collaborators.
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +33,7 @@ from fleet_graph.goal_interrupt.runtime import LineInterruptPort, resume_line
 from fleet_graph.goal_interrupt.store import GoalInterruptStore
 from fleet_graph.graphs.adapters import AgentRunCoordinator, AgentSessionWorker
 from fleet_graph.graphs.dd_gate import GraphGateNode
-from fleet_graph.graphs.dd_subgraph import DdSubgraph, DevelopmentGateway
+from fleet_graph.graphs.dd_subgraph import ControlPlaneGateway, DdSubgraph, DevelopmentGateway
 from fleet_graph.graphs.goal_line import LineDeps, build_goal_line_graph
 from fleet_graph.graphs.guards import LineBounds, LineGuards
 from fleet_graph.state.line_metrics import LineMetrics, line_metrics_exposition_dir
@@ -516,7 +517,31 @@ def resume_start(compiled: Any, invoke_config: dict[str, Any]) -> dict[str, Any]
     return {"round_no": 1}
 
 
+def bind_dd_dependencies(config: LineConfig) -> LineConfig:
+    """生产启动与中断恢复共用真实 DD 控制面，隔离根随调度配置传入。"""
+    from fleet_graph.dd.control_plane import DdControlPlane
+
+    root = config.dd_root or Path(os.environ.get("FLEET_GRAPH_DD_ROOT", str(_default_dd_root())))
+    plane = config.dd_gate_plane
+    if plane is None and isinstance(config.dd_gateway, ControlPlaneGateway):
+        plane = config.dd_gateway.plane
+    if plane is None:
+        release = Path(__file__).resolve().parents[3]
+        plane = DdControlPlane(
+            root=root,
+            working_directory=str(release),
+            executable=str(release / ".venv/bin/fleet-graph"),
+        )
+    return replace(
+        config,
+        dd_root=root,
+        dd_gate_plane=plane,
+        dd_gateway=config.dd_gateway or ControlPlaneGateway(plane),
+    )
+
+
 def run_line(config: LineConfig, *, run_id: str | None = None) -> dict[str, Any]:
+    config = bind_dd_dependencies(config)
     graph, deps = build_line(config, run_id=run_id)
     invoke_config: dict[str, Any] = {
         "configurable": {"thread_id": config.thread_id},
@@ -563,6 +588,7 @@ def resume_goal_line(config: LineConfig, decision: DecisionInput) -> tuple[dict[
     human verdict in production actually resumes the same generation and
     continuation instead of parking.
     """
+    config = bind_dd_dependencies(config)
     store = GoalInterruptStore(config.run_root).open()
     deps: LineDeps | None = None
     try:

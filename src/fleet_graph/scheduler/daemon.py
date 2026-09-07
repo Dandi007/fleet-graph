@@ -1669,6 +1669,7 @@ class Scheduler:
         """
         env = {"PATH": os.environ.get("PATH", "")}
         env.update(self.config.extra_line_environment)
+        env["FLEET_GRAPH_DD_ROOT"] = str(self.config.dd_root)
         return {k: v for k, v in env.items() if v}
 
     def unproductive_recent(self, now: float) -> int:
