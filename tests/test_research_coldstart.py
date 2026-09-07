@@ -195,6 +195,7 @@ class TestRealLaunchArgvRecording:
             "R8 冷启动：程序内调用记录真实签名",
             tier="light",
             run_root=run_root,
+            wiki_root=tmp_path / "wiki",
             text_node=FakeTextNode(seed_text='["单一线索"]'),
             launcher=FakeLauncher(),
         )

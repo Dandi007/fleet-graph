@@ -881,6 +881,7 @@ class TestServiceAndMCP:
         from fastmcp import Client
         from fastmcp.exceptions import ToolError
 
+        from fleet_graph.bus.tokens import build_line_token_ownership_check
         from fleet_graph.goal.service import build_goal_mcp_server
         from test_dd_service import running_server
 
@@ -890,6 +891,11 @@ class TestServiceAndMCP:
             goal_folders=source,
             goal_queue=EnrollQueue(str(tmp_path / "queue")),
             real_roster=RealRosterReader(tmp_path / "absent.json"),
+            alias_token_check=build_line_token_ownership_check(
+                template=str(tmp_path / "secrets" / "{alias}.token"),
+                secrets_root=tmp_path / "secrets",
+                supervision_roots=(tmp_path / "supervision",),
+            ),
         )
 
         async def call(url: str) -> str:
