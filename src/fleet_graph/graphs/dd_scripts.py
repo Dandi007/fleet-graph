@@ -265,7 +265,9 @@ class ConfigureStage:
             return record
 
         tracking = f"refs/remotes/origin/{self.line_ref.removeprefix('refs/heads/')}"
-        fetched = self._git("fetch", "--quiet", "origin")
+        # origin URL 可能已切换；清除旧 remote 留下的 tracking，避免把
+        # 当前远端已不存在的 release 分支当作本线基线。
+        fetched = self._git("fetch", "--quiet", "--prune", "origin")
         if fetched.returncode != 0:
             # Transport/environment: the fetch -- not the spec/branch pair --
             # is what failed. A fault, honestly labelled.
