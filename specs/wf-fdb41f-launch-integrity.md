@@ -51,3 +51,5 @@ Goal 的 `dd.gate_release.v1` 必须绑定 dispatcher、generation 对应请求�
 ## 完整 Goal 启动接线
 
 正常 line run 与中断恢复必须绑定同一真实 DD 控制面，同时提供 Stop dispatch 和 gate 消费者；不得只在测试注入时可用。scheduler 的 dd_root 是子进程派单与唤醒共同的数据根，经 FLEET_GRAPH_DD_ROOT 透传。DD 执行程序钉住启动 Goal 的实际发布路径，避免运行中 current 切换造成跨版本执行。
+
+Stop actions 的并行执行经共同 join 节点汇流，每项只消费一次；gate-only 也必须继续后续路由。每次调用只收到尚未交接的 action_results（round、receipt、可选单个 dd_result），失败原因也必须交接，历史仍保留在 checkpoint/运行回执。观察预算耗尽时保留最后一次真实 get 的代际和阶段，不回退到入单时代际。
