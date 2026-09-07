@@ -49,9 +49,28 @@ class ToolCaller(Protocol):
 class FastMCPCaller:
     """Calls one tool per short-lived session, like the ronin-mcp backend.
 
-    `timeout` (seconds) bounds the HTTP layer when set. The scheduler's wake
-    probes need this: a hung MCP must cost a few seconds and fail open, not
-    stall the tick loop.
+    `timeout` (seconds) bounds the *whole* call -- connect through handshake,
+    tool call, and stream read -- when set. The scheduler's wake probes need
+    this: a hung MCP must cost a few seconds and fail open, not stall the
+    tick loop.
+
+    Why two layers (X-6, 2026-09-06): fastmcp 3.4.7's StreamableHttpTransport
+    only forwards a timeout into the httpx client factory when the fastmcp
+    ``Client`` itself was built with ``timeout=...`` (its
+    ``read_timeout_seconds``). A factory-injected scalar alone bounds every
+    transport-level read, but the MCP session's request/response wait
+    (``ClientSession.send_request``) is armed by ``read_timeout_seconds``,
+    which stayed None. A server that keeps its stream alive (SSE keep-alive
+    comments, or any periodic byte) never trips the transport read bound, the
+    JSON-RPC response never arrives, and the session wait -- and so the whole
+    ``asyncio.run`` -- hangs forever. That is the ``selectors.select`` stack
+    py-spy caught on katana's ``fs_stat goal.md`` (2026-09-06 04:24 / 20:39).
+
+    So: ``Client(timeout=...)`` arms the per-round-trip session bound, and the
+    outer ``asyncio.wait_for`` caps the entire session -- connect through
+    stream end -- so no composition of individually-bounded segments
+    (connect retries, disconnect teardown, ...) can exceed the caller's
+    budget by more than fastmcp's own bounded cleanup.
     """
 
     def __init__(
@@ -61,7 +80,25 @@ class FastMCPCaller:
         self.timeout = timeout
 
     def call(self, tool: str, arguments: dict[str, Any]) -> Any:
-        return asyncio.run(self._call(tool, arguments))
+        return asyncio.run(self._call_bounded(tool, arguments))
+
+    async def _call_bounded(self, tool: str, arguments: dict[str, Any]) -> Any:
+        """Run one tool call under the whole-call timeout.
+
+        ``timeout=None`` keeps the historical unbounded semantics (a caller
+        that opted out of the bound gets exactly what it got before). A
+        timeout fires as ``WorkFolderError`` -- the same family every other
+        transport failure maps to -- so callers cannot confuse "slow MCP"
+        with a new failure mode.
+        """
+        if self.timeout is None:
+            return await self._call(tool, arguments)
+        try:
+            return await asyncio.wait_for(self._call(tool, arguments), timeout=self.timeout)
+        except TimeoutError as exc:
+            raise WorkFolderError(
+                f"work-folder MCP {tool} did not finish within {self.timeout}s"
+            ) from exc
 
     async def _call(self, tool: str, arguments: dict[str, Any]) -> Any:
         from fastmcp import Client
@@ -72,7 +109,14 @@ class FastMCPCaller:
                 kwargs["timeout"] = self.timeout
             return _loopback_httpx_client(**kwargs)
 
-        client = Client(StreamableHttpTransport(self.url, httpx_client_factory=factory))
+        # Client(timeout=...) is what makes fastmcp arm the session-level read
+        # bound (read_timeout_seconds -> anyio.fail_after around every
+        # send_request); the factory scalar only bounds transport-level reads
+        # and is NOT sufficient on its own -- see the class docstring.
+        client = Client(
+            StreamableHttpTransport(self.url, httpx_client_factory=factory),
+            timeout=self.timeout,
+        )
         try:
             async with client:
                 result = await client.call_tool(tool, arguments)

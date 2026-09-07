@@ -181,7 +181,9 @@ class TickResult:
     parked: bool = False
     #: What the parking machinery did this tick, when anything happened:
     #: "established", "woken:inbox", "woken:goal_revision",
-    #: "woken:board_decision", "woken:decision_consumed", "woken:probe_failed".
+    #: "woken:board_decision", "woken:decision_consumed", "woken:probe_failed",
+    #: "parked:no_goal_fact[:tag]" (X-6 M1: the goal probe had no fact this
+    #: tick -- park held, retried next tick).
     park_event: str | None = None
     #: Wake fact 4 observability: the red missed-delivery annotation. Filled
     #: on the wake tick when a decision for a dd development this line
@@ -1150,10 +1152,17 @@ class Scheduler:
             # still performed as the anchor availability check (fail-open
             # discipline), but its value is deliberately not used as the
             # baseline.
-            self.wake.goal_revision(line.folder_id)
+            anchor_revision = self.wake.goal_revision(line.folder_id)
         except Exception as exc:  # fail open, by design: no anchor, no parking
             self._write_stall_state(line.folder_id, state)
             return ParkOutcome(event=f"not_parked:probe_failed:{probe_error_tag(exc)}")
+        if anchor_revision is None:
+            # X-6 M1: the probe came back without a fact (timeout, MCP
+            # unreachable, statless answer). Same fail-open as a raise: no
+            # anchor, no parking -- but named distinctly so an operator can
+            # tell "probe had no fact" from "probe raised".
+            self._write_stall_state(line.folder_id, state)
+            return ParkOutcome(event="not_parked:no_goal_fact")
 
         consumed = record.get("goal_revision")
         if not consumed:
@@ -1240,13 +1249,39 @@ class Scheduler:
             except Exception:  # skip this source, the goal.md anchor still holds
                 pass
 
+        # X-6 M1: the goal.md probe's failure direction changed. It used to
+        # wake the line (the wake-direction fail-open shared with the other
+        # sources) -- but a probe failure is not a goal change, and waking on
+        # one re-ignites a line the human has not touched. So: "no fact"
+        # (probe timed out / unreachable / no revision) holds the park and
+        # retries next tick. This does not lock the line shut: the probe runs
+        # every tick, a healthy MCP restores the fact on the next tick, the
+        # other wake sources stay armed, and the operator escape hatch
+        # (clearing the parked fields) still applies. A probe that *succeeds*
+        # and names a different revision is still the wake it always was.
+        if self.wake is None:
+            # The scheduler lost its wake source entirely: the probe can
+            # never recover, so the wake-direction fail-open (unlock) still
+            # applies here -- holding would be a permanent lock.
+            return self._wake(line, state, "woken:probe_failed:RuntimeError")
+        probe_tag: str | None = None
         try:
-            if self.wake is None:
-                raise RuntimeError("scheduler has no wake signals configured")
-            if self.wake.goal_revision(line.folder_id) != state["parked_goal_revision"]:
-                return self._wake(line, state, "woken:goal_revision")
-        except Exception as exc:  # fail open, by design
-            return self._wake(line, state, f"woken:probe_failed:{probe_error_tag(exc)}")
+            current_revision = self.wake.goal_revision(line.folder_id)
+        except Exception as exc:  # probe doubles that still raise, not None
+            current_revision = None
+            probe_tag = probe_error_tag(exc)
+        if current_revision is None:
+            event = (
+                "parked:no_goal_fact" if probe_tag is None else (f"parked:no_goal_fact:{probe_tag}")
+            )
+            return ParkOutcome(
+                parked=True,
+                event=event,
+                blocker=self.blocker_summary(line.folder_id),
+                kind="decision",
+            )
+        if current_revision != state["parked_goal_revision"]:
+            return self._wake(line, state, "woken:goal_revision")
         return ParkOutcome(
             parked=True, blocker=self.blocker_summary(line.folder_id), kind="decision"
         )
