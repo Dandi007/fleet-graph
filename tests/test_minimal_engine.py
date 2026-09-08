@@ -220,6 +220,7 @@ def _run(harness: dict[str, Any], tmp_path: Path) -> int:
         bash_runner=harness["bash"],
         gh_runner=object(),  # never reached: pr_mergeable grades UNKNOWN → merge agent
         timeout_s=60,
+        scribe_enabled=False,  # these end-to-end runs do not script the scribe role
     )
 
 
@@ -268,6 +269,27 @@ def test_bad_goal_id_is_startup_error(tmp_path: Path, capsys: pytest.CaptureFixt
     code = engine.main(["--goal-id", "not-an-id", "--engine-root", str(tmp_path)])
     assert code == engine.EXIT_STARTUP_ERROR
     assert len(capsys.readouterr().err.strip().splitlines()) == 1
+
+
+# ---------------------------------------------------------------------------
+# 2b. build_deps wires the scribe on by default (GO-21 / production wiring)
+# ---------------------------------------------------------------------------
+
+
+def _build_deps(tmp_path: Path, **kwargs: Any) -> Any:
+    run_root = runroot.goal_run_root(GOAL_ID, engine_root=str(tmp_path))
+    run_root.root.mkdir(parents=True, exist_ok=True)
+    return engine.build_deps(run_root, ENROLL, **kwargs)
+
+
+def test_build_deps_scribes_by_default(tmp_path: Path) -> None:
+    deps = _build_deps(tmp_path)
+    assert deps.scribe_enabled is True
+
+
+def test_build_deps_can_disable_scribe(tmp_path: Path) -> None:
+    deps = _build_deps(tmp_path, scribe_enabled=False)
+    assert deps.scribe_enabled is False
 
 
 # ---------------------------------------------------------------------------

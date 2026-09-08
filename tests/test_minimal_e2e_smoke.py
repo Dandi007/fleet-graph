@@ -348,6 +348,7 @@ def _run(world: World) -> int:
         git_runner=world.git_runner,
         gh_runner=world.gh_runner,
         timeout_s=60,
+        scribe_enabled=False,  # the smoke invoker scripts only the six main roles
     )
 
 

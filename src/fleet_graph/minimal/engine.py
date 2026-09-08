@@ -473,12 +473,16 @@ def build_deps(
     timeout_s: int = 300,
     warn_turns: int = 30,
     warn_dd_rounds: int = 6,
+    scribe_enabled: bool = True,
 ) -> goalgraph.GoalDeps:
     """Wire every IO seam to its real module and return a ready ``GoalDeps``.
 
     ``run_dd`` and ``final_merge`` are the two goalgraph seams built here from
     ``ddgraph`` / ``prlifecycle`` / ``mergegate``. The injectables default to the real
     subprocess-based implementations and exist so tests can swap in fakes.
+
+    ``scribe_enabled`` defaults to True so the read-only scribe (GO-21) runs in
+    production; tests that do not script the scribe role pass False explicitly.
     """
     log = events.EventLog(run_root.root)
     control_log = control.ControlLog(run_root.root)
@@ -514,6 +518,7 @@ def build_deps(
         session_overrides=session_overrides,
         model_by_role=model_by_role,
         timeout_s=timeout_s,
+        scribe_enabled=scribe_enabled,
     )
 
 
@@ -709,6 +714,7 @@ def run_engine(
     timeout_s: int = 300,
     warn_turns: int = 30,
     warn_dd_rounds: int = 6,
+    scribe_enabled: bool = True,
 ) -> int:
     """Run one goal's engine lifecycle to a terminal stop and return the exit code.
 
@@ -756,6 +762,7 @@ def run_engine(
         timeout_s=timeout_s,
         warn_turns=warn_turns,
         warn_dd_rounds=warn_dd_rounds,
+        scribe_enabled=scribe_enabled,
     )
 
     terminal = _fold_terminal_state(deps.event_log)

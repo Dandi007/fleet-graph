@@ -24,7 +24,9 @@ Seams this module deliberately keeps (each belongs to another DD):
 - **The read-only scribe (GO-21) is opt-in.** ``scribe_enabled`` defaults to
   False, so an unwired graph is byte-identical to the pre-scribe graph. When
   enabled it runs the ``scribe`` stage once per goal boundary (turn finished,
-  DD finished); its failures never block the loop.
+  DD finished, done, blocked, and the turn-boundary warning); its failures
+  never block the loop. The engine wires it on by default (``engine.build_deps``
+  passes ``scribe_enabled=True``).
 
 Beyond the caller-injected ``stagerunner`` events, the boundary events
 written here are exactly the protocol §8/§10 ones: ``control.received`` (one
@@ -241,9 +243,11 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
     def run_scribe(state: GoalGraphState, trigger: str) -> None:
         """Run the read-only scribe at one goal boundary; never block the loop.
 
-        GO-21 / dd-23: on each goal-level boundary (turn finished, DD
-        finished) the scribe reads L0 with a seq-range folded from the event
-        log (``cursor+1 .. last_seq``), runs once through ``stagerunner`` with
+        GO-21 / dd-23: on each goal-level boundary (``goal.turn.finished``,
+        ``dd.merged`` / ``dd.failed``, ``goal.done`` / ``goal.blocked``, and the
+        turn-boundary ``goal.warning``) the scribe reads L0 with a seq-range
+        folded from the event log (``cursor+1 .. last_seq``), runs once through
+        ``stagerunner`` with
         role ``scribe``, then validates the ``scribe/1`` output and gates each
         observation (§12). Passed observations append to
         ``observations.jsonl`` and are recorded as ``scribe.observed``; every
@@ -428,6 +432,10 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
             warnings.append(text)
             if not _has_warning(events_list, text):
                 log.append("goal.warning", {"message": text})
+                # §12 触发点之一（goal.warning）：只在 turn 边界这一处起书记员，
+                # 避免噪声 — control 解析失败类的内部 warning（read_control 里
+                # 的 :362/:379/:388/:406/:410）不起，protocol §12 原文如此要求。
+                run_scribe(state, trigger="goal.warning")
         # GO-20: steers since the previous turn's start are this turn's diff.
         since = max((ev.seq for ev in events_list if ev.kind == "goal.turn.started"), default=0)
         steer_diff = steer.steer_diff_since(events_list, since)
@@ -581,14 +589,23 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
         if stop == "merged":
             log.append("goal.merged_to_target", dict(payload))
             log.append("goal.done", {"summary": state.get("summary") or ""})
+            # §12 顺序要求：先落终态 event，再起书记员，使 seq 区间能覆盖到
+            # goal.done 这一条。
+            run_scribe(state, trigger="goal.done")
             return {"stop": "done"}
         handoff = f"final_merge {stop}: {_blurb(payload)}"
         log.append("goal.warning", {"message": handoff})
+        # §12 触发点之一（goal.warning）：收尾的 handoff warning 起书记员；
+        # 同样是「只在边界起，避免噪声」。
+        run_scribe(state, trigger="goal.warning")
         return {"stop": None, "warnings": [handoff]}
 
     def finish_blocked(state: GoalGraphState) -> dict[str, Any]:
         blocked = dict(state.get("blocked") or {})
         deps.event_log.append("goal.blocked", {"summary": state.get("summary") or "", **blocked})
+        # §12 顺序要求：先落终态 event，再起书记员，使 seq 区间能覆盖到
+        # goal.blocked 这一条。
+        run_scribe(state, trigger="goal.blocked")
         return {}
 
     graph = StateGraph(GoalGraphState)

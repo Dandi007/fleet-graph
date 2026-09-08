@@ -88,6 +88,15 @@ def done_stop() -> dict[str, Any]:
     return {"schema": "goal.turn/1", "stop": "done", "summary": "X 已在 release 上完成"}
 
 
+def blocked_stop() -> dict[str, Any]:
+    return {
+        "schema": "goal.turn/1",
+        "stop": "blocked",
+        "summary": "缺外部依赖",
+        "blocked": {"kind": "external", "detail": "上游没有测试环境"},
+    }
+
+
 class FakeGitRunner:
     """Answers the gates' read-only git queries from per-cwd scripts."""
 
@@ -323,14 +332,15 @@ def test_scribe_runs_once_per_goal_boundary_in_order(tmp_path: Path) -> None:
 
     assert result["stop"] == "done"
     assert len(harness.invoker.goal_calls) == 2
-    # one per boundary: turn(done-dispatch) → DD → turn(done) = 3 scribe runs
-    assert len(harness.invoker.scribe_calls) == 3
+    # one per boundary: turn(dispatch) → DD → turn(done) → goal.done = 4 scribe runs
+    assert len(harness.invoker.scribe_calls) == 4
 
     observed = harness.events_of("scribe.observed")
     assert [ev.payload["trigger"] for ev in observed] == [
         "goal.turn.finished",
         "dd.merged",
         "goal.turn.finished",
+        "goal.done",
     ]
 
     kinds = harness.kinds()
@@ -339,7 +349,43 @@ def test_scribe_runs_once_per_goal_boundary_in_order(tmp_path: Path) -> None:
     assert positions["scribe.observed"][0] > positions["goal.turn.finished"][0]
     assert positions["scribe.observed"][1] > positions["dd.merged"][0]
     assert positions["scribe.observed"][2] > positions["goal.turn.finished"][1]
-    assert kinds[-1] == "goal.done"
+    assert positions["scribe.observed"][3] > positions["goal.done"][0]
+
+    # the goal.done-triggered run's seq range covers the terminal event itself
+    done_run = observed[3]
+    done_seq = harness.events_of("goal.done")[0].seq
+    assert done_run.payload["since_seq"] <= done_seq <= done_run.payload["until_seq"]
+
+
+def test_scribe_runs_on_goal_blocked_with_terminal_in_range(tmp_path: Path) -> None:
+    harness = Harness(
+        tmp_path,
+        goal_stops=[blocked_stop()],
+        scribe_fn=valid_scribe,
+        scribe_enabled=True,
+    )
+
+    result = run_goal(harness.deps, goal_id=GOAL_ID, enroll=dict(ENROLL))
+
+    assert result["stop"] == "blocked"
+    observed = harness.events_of("scribe.observed")
+    assert [ev.payload["trigger"] for ev in observed] == [
+        "goal.turn.finished",
+        "goal.blocked",
+    ]
+
+    # the goal.blocked-triggered run's seq range covers the terminal event itself
+    blocked_run = observed[-1]
+    blocked_seq = harness.events_of("goal.blocked")[0].seq
+    assert blocked_run.payload["since_seq"] <= blocked_seq <= blocked_run.payload["until_seq"]
+
+    obs_path = tmp_path / GOAL_ID / "observations.jsonl"
+    lines = obs_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert [json.loads(raw)["trigger"] for raw in lines] == [
+        "goal.turn.finished",
+        "goal.blocked",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -360,11 +406,12 @@ def test_scribe_invalid_output_writes_failure_and_goal_done(tmp_path: Path) -> N
     assert result["stop"] == "done"
     assert harness.run_dd.calls, "the DD must still run"
     failed = harness.events_of("scribe.failed")
-    assert len(failed) == 3
+    assert len(failed) == 4
     assert all(ev.payload["reason"] == "no_object" for ev in failed)
+    assert failed[-1].payload["trigger"] == "goal.done"
     assert harness.events_of("scribe.observed") == []
     kinds = harness.kinds()
-    assert kinds[-1] == "goal.done"
+    assert kinds[-1] == "scribe.failed"
 
 
 def test_scribe_evidence_gate_drop_writes_failure_and_goal_done(tmp_path: Path) -> None:
@@ -380,10 +427,11 @@ def test_scribe_evidence_gate_drop_writes_failure_and_goal_done(tmp_path: Path) 
     assert result["stop"] == "done"
     assert harness.run_dd.calls, "the DD must still run"
     failed = harness.events_of("scribe.failed")
-    assert len(failed) == 3
+    assert len(failed) == 4
     assert all(ev.payload["reason"] == "observation_without_evidence" for ev in failed)
+    assert failed[-1].payload["trigger"] == "goal.done"
     assert harness.events_of("scribe.observed") == []
-    assert harness.kinds()[-1] == "goal.done"
+    assert harness.kinds()[-1] == "scribe.failed"
 
 
 def test_scribe_raising_invoker_writes_failure_and_goal_done(tmp_path: Path) -> None:
@@ -399,10 +447,11 @@ def test_scribe_raising_invoker_writes_failure_and_goal_done(tmp_path: Path) -> 
     assert result["stop"] == "done"
     assert harness.run_dd.calls, "the DD must still run"
     failed = harness.events_of("scribe.failed")
-    assert len(failed) == 3
+    assert len(failed) == 4
     assert all(ev.payload["reason"] == "exception" for ev in failed)
+    assert failed[-1].payload["trigger"] == "goal.done"
     assert harness.events_of("scribe.observed") == []
-    assert harness.kinds()[-1] == "goal.done"
+    assert harness.kinds()[-1] == "scribe.failed"
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +473,7 @@ def test_scribe_cursor_is_monotonic_without_overlap(tmp_path: Path) -> None:
         (harness.invoker.scribe_in(i)["since_seq"], harness.invoker.scribe_in(i)["until_seq"])
         for i in range(len(harness.invoker.scribe_calls))
     ]
-    assert len(ranges) == 3
+    assert len(ranges) == 4
     assert ranges[0][0] == 1
     for (since, until), (next_since, next_until) in pairwise(ranges):
         assert since <= until
@@ -450,9 +499,9 @@ def test_scribe_appends_observations_to_observations_log(tmp_path: Path) -> None
     obs_path = tmp_path / GOAL_ID / "observations.jsonl"
     assert obs_path.exists()
     lines = obs_path.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 3
+    assert len(lines) == 4
     for raw in lines:
         record = json.loads(raw)
         assert record["kind"] == "progress"
-        assert record["trigger"] in ("goal.turn.finished", "dd.merged")
+        assert record["trigger"] in ("goal.turn.finished", "dd.merged", "goal.done")
         assert record["seq_range"][0] <= record["seq_range"][1]
