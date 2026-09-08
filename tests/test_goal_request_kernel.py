@@ -1266,6 +1266,195 @@ class TestStopSuspendsEffects:
         assert [d["ctx"]["idempotency_key"] for d in effects.dispatches] == ["k1", "k2"]
 
 
+# --- final review rf-b8cad9f2 #1: stopped is authoritative over a weaker stop ---
+
+
+class TestStoppedAuthoritativeOverWeakerStop:
+    def test_repeated_graceful_stop_does_not_lift_a_confirmed_stop(self) -> None:
+        runtime = FakeRuntime()  # stop_answer defaults to terminated=True
+        effects = FakeEffects()
+        kernel = make_kernel(effects, runtime)
+        kernel.submit(GOAL, make_request("A"))
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None
+
+        # Immediate stop is confirmed -> ``stopped``; the in-flight call keeps
+        # its fence and persists its Stop List while unstarted effects suspend.
+        kernel.stop(GOAL, mode="immediate")
+        result = kernel.finish_goal_call(
+            GOAL, call["call_id"], {"actions": [dispatch_action("k1"), reply_action("k2")]}
+        )
+        assert result["suspended"] is True
+        assert effects.dispatches == [] and effects.replies == []
+
+        # A weaker (graceful) stop must not downgrade ``stopped`` to ``stopping``:
+        # that would re-open admission of the suspended list with no resume.
+        resp = kernel.stop(GOAL, mode="graceful")
+        assert resp["stopped"] is True
+        assert kernel._state[GOAL]["mode"] == MODE_STOPPED
+
+        # The suspended list is still not executable: no call, no effect.
+        assert kernel.next_goal_call(GOAL) is None
+        assert effects.dispatches == [] and effects.replies == []
+
+        # Only resume lifts the stop; the original list then drains exactly once.
+        kernel.resume(GOAL)
+        nxt = kernel.next_goal_call(GOAL)
+        assert nxt is not None and nxt["resume"] is True
+        outcome = kernel.finish_goal_call(GOAL, nxt["call_id"], nxt["stop_list"])
+        assert [r["status"] for r in outcome["results"]] == [DELIVERED, DELIVERED]
+        assert len(effects.dispatches) == 1 and len(effects.replies) == 1
+
+    def test_repeated_graceful_stop_survives_rebuild_without_resume(self, tmp_path) -> None:
+        runtime = FakeRuntime()
+        home = tmp_path / "journal"
+        kernel = GoalRequestKernel(
+            journal=Journal(home=home), effects=FakeEffects(), runtime=runtime
+        )
+        kernel.activate_version(GOAL, "v1")
+        kernel.submit(GOAL, make_request("A"))
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None
+
+        kernel.stop(GOAL, mode="immediate")
+        assert kernel.finish_goal_call(
+            GOAL, call["call_id"], {"actions": [dispatch_action("k1"), reply_action("k2")]}
+        )["suspended"] is True
+        assert kernel.stop(GOAL, mode="graceful")["stopped"] is True
+
+        # A fresh reconstruction still honors the confirmed stop: the suspended
+        # list is not executable until a resume is issued.
+        effects2 = FakeEffects()
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=effects2)
+        assert rebuilt._state[GOAL]["mode"] == MODE_STOPPED
+        assert rebuilt.next_goal_call(GOAL) is None
+        assert effects2.dispatches == [] and effects2.replies == []
+
+        rebuilt.resume(GOAL)
+        nxt = rebuilt.next_goal_call(GOAL)
+        assert nxt is not None and nxt["resume"] is True
+        outcome = rebuilt.finish_goal_call(GOAL, nxt["call_id"], nxt["stop_list"])
+        assert [r["status"] for r in outcome["results"]] == [DELIVERED, DELIVERED]
+
+
+# --- final review rf-b8cad9f2 #2: stop confirmation recovers the stopped state ---
+
+
+class TestStopConfirmationRecovery:
+    def _interrupted_confirmation_journal(self, home: Any, *, terminated: bool) -> str:
+        """Write the immediate-stop crash window: the ``control=stop``
+        confirmation is durable, but its separately-persisted ``mode`` record is
+        missing. Returns the call id."""
+        journal = Journal(home=home)
+        journal.append(
+            GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v1", "at": "t"}
+        )
+        journal.append(
+            GOAL,
+            {
+                "record": RECORD_REQUEST,
+                "goal": GOAL,
+                "request_id": "A",
+                "caller": "line-a",
+                "kind": KIND_DD_RESULT,
+                "input": {"note": "A"},
+                "goal_version": "v1",
+                "accepted_at": "t",
+            },
+        )
+        call_id = "call:A"
+        journal.append(
+            GOAL,
+            {
+                "record": RECORD_CALL,
+                "goal": GOAL,
+                "call_id": call_id,
+                "request_id": "A",
+                "run_id": "run-A",
+                "caller": "line-a",
+                "goal_version": "v1",
+                "at": "t",
+            },
+        )
+        journal.append(
+            GOAL,
+            {
+                "record": RECORD_STOP_LIST,
+                "goal": GOAL,
+                "call_id": call_id,
+                "request_id": "A",
+                "run_id": "run-A",
+                "intent": None,
+                "raw_actions": [],
+                "raw_intent": None,
+                "actions": [
+                    {
+                        "kind": ACTION_DISPATCH,
+                        "payload": {
+                            "repo_path": "repo-a",
+                            "dispatched_by": "line-a",
+                            "spec_text": "s",
+                        },
+                        "idempotency_key": "k1",
+                        "list_index": 1,
+                    }
+                ],
+                "malformed": [],
+                "at": "t",
+            },
+        )
+        journal.append(
+            GOAL,
+            {
+                "record": RECORD_CONTROL,
+                "goal": GOAL,
+                "control": "stop",
+                "mode": "immediate",
+                "terminated": terminated,
+                "at": "t",
+            },
+        )
+        # Deliberately no control=mode=stopped record: the crash landed between
+        # the stop confirmation and its mode persistence.
+        return call_id
+
+    def test_confirmed_stop_derives_stopped_when_mode_record_is_missing(
+        self, tmp_path
+    ) -> None:
+        home = tmp_path / "journal"
+        self._interrupted_confirmation_journal(home, terminated=True)
+
+        effects = FakeEffects()
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=effects)
+        # The archived confirmation alone recovers ``stopped``: the persisted
+        # Stop List is suspended, not resumed, until a resume is issued.
+        assert rebuilt._state[GOAL]["mode"] == MODE_STOPPED
+        assert rebuilt.journal.inflight(GOAL) is not None  # fence still held
+        assert rebuilt.next_goal_call(GOAL) is None
+        assert effects.dispatches == []
+
+        rebuilt.resume(GOAL)
+        nxt = rebuilt.next_goal_call(GOAL)
+        assert nxt is not None and nxt["resume"] is True
+        outcome = rebuilt.finish_goal_call(GOAL, nxt["call_id"], nxt["stop_list"])
+        assert [r["status"] for r in outcome["results"]] == [DELIVERED]
+        assert len(effects.dispatches) == 1
+
+    def test_unterminated_stop_confirmation_does_not_derive_stopped(self, tmp_path) -> None:
+        # Over-reach guard: a stop the runtime *refused* (terminated=false)
+        # records the fact honestly and must not recover a stopped state that
+        # never existed.
+        home = tmp_path / "journal"
+        self._interrupted_confirmation_journal(home, terminated=False)
+
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        assert rebuilt._state[GOAL]["mode"] == MODE_RUNNING
+        # The persisted Stop List is resumed (not suspended) under its original
+        # identities, since no stop was ever confirmed.
+        nxt = rebuilt.next_goal_call(GOAL)
+        assert nxt is not None and nxt["resume"] is True
+
+
 # --- final review rf-3c65b36f: stop is serialized with effect admission ----------
 
 

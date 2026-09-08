@@ -732,8 +732,19 @@ class GoalRequestKernel:
                 record = line.get("record")
                 if record == RECORD_VERSION:
                     version = str(line.get("version") or "")
-                elif record == RECORD_CONTROL and line.get("control") == "mode":
-                    mode = str(line.get("value") or MODE_RUNNING)
+                elif record == RECORD_CONTROL:
+                    control = line.get("control")
+                    if control == "mode":
+                        mode = str(line.get("value") or MODE_RUNNING)
+                    elif control == "stop" and line.get("terminated"):
+                        # A persisted immediate-stop confirmation the runtime
+                        # confirmed (``terminated``) is itself a durable stop
+                        # event: derive ``stopped`` from it even when the
+                        # separately-persisted mode record is missing (a crash
+                        # between the two writes). A later ``control=mode`` line
+                        # still overrides -- e.g. a resume *after* the stop --
+                        # because records are replayed in durable order.
+                        mode = MODE_STOPPED
                 elif record == RECORD_CALL:
                     called.add(str(line.get("request_id") or ""))
                     current_call = str(line.get("call_id") or "") or None
@@ -1953,6 +1964,13 @@ class GoalRequestKernel:
         # The inflight check + mode transition is serialized with call
         # completion and call admission via ``_request_lock`` (rf-1b50bcf1).
         with self._request_lock:
+            if self._mode_of(goal) == MODE_STOPPED:
+                # A confirmed stop (immediate, runtime ``terminated``) is
+                # authoritative over a repeated or *weaker* graceful stop: it
+                # must never be downgraded to ``stopping``, which would re-open
+                # admission of the suspended unstarted list without a resume
+                # (behavior 5, final review finding rf-b8cad9f2).
+                return {"goal": goal, "mode": mode, "stopped": True, "cancel": None}
             if self.journal.inflight(goal):
                 self._set_mode(goal, MODE_STOPPING)
                 return {
