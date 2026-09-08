@@ -1582,3 +1582,38 @@ class TestANewAttemptWithoutARejectLinkIsNeverReplayed:
         # closeable link, so it is declined and the review re-runs for real.
         assert replayed_stages(state) == ["configure", "implement"]
         assert next(stage for stage, _ in actor.calls) == "continuous_review"
+
+
+class TestConfigureRebaseReceipt:
+    def _seed(self, repo: Path, tmp_path: Path) -> tuple[G1, dict[str, Any]]:
+        g1 = G1(repo, tmp_path)
+        rebase = {"event": "rebase", "rebased": False, "actual_head": g1.seed}
+        receipt = {"stage": "configure", "input_commit": g1.seed,
+                   "output_commit": g1.configure, "rebase": rebase}
+        g1.receipt["parent_handoff_receipt_digest"] = compute_json_digest(receipt)
+        g1.raw = write_receipt(g1.state_root, 1, 1, "implement-receipt.json", g1.receipt)
+        event = {"stage": "configure", "event": "success",
+                 "output_commit": g1.configure, "rebase": rebase}
+        (g1.dev_root / "events.jsonl").write_text(json.dumps(event) + "\n")
+        return g1, event
+
+    def test_machine_facts_replay_without_new_implementation(self, repo: Path, tmp_path: Path):
+        g1, _ = self._seed(repo, tmp_path)
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), g1.implement)
+        assert replayed_stages(state) == ["configure", "implement"]
+        assert "implement" not in [stage for stage, _ in actor.calls]
+        assert "final_review" in [stage for stage, _ in actor.calls]
+
+    def test_tampered_machine_facts_do_not_authorize_replay(self, repo: Path, tmp_path: Path):
+        g1, event = self._seed(repo, tmp_path)
+        event["rebase"]["rebased"] = True
+        (g1.dev_root / "events.jsonl").write_text(json.dumps(event) + "\n")
+        assert g1.replayer()._candidate_plans() == []
+        assert head(repo) == g1.implement
+
+    def test_missing_machine_facts_do_not_authorize_replay(self, repo: Path, tmp_path: Path):
+        g1, _ = self._seed(repo, tmp_path)
+        (g1.dev_root / "events.jsonl").unlink()
+        assert g1.replayer()._candidate_plans() == []
+        assert head(repo) == g1.implement
