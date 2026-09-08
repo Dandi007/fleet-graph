@@ -1,0 +1,41 @@
+# systemd *user* unit for the minimal system's MCP surface (dd-28).
+#
+# The minimal system's ONLY resident service (protocol §10): the nine MCP
+# tools over JSON-RPC 2.0 on stdio. Engine processes are spawned per goal by
+# this server itself (GO-10) -- never by systemd -- so this unit supervises
+# exactly one process.
+#
+# Template only: shipped in the repo, deliberately not enabled or installed
+# by any script here -- deployment is a supervision-plane decision (same
+# ruling as fleet-graph-dd-mcp.service). Nothing in this repo runs systemctl.
+#
+# ExecStart goes through uv: uv resolves the project (and the
+# fleet-graph-minimal-mcp console script) from WorkingDirectory, so the unit
+# must point at the repo checkout. The checkout also carries the six harness
+# profiles under profiles/harness/ -- the wheel does not ship them, and the
+# engine resolves profiles relative to the repo root (see docs/minimal-runbook.md).
+#
+# The engine root (protocol §1, where g-<id>/ run roots live) is given via
+# Environment; fleet-graph-minimal-mcp falls back to $FLEET_ENGINE_ROOT when
+# --engine-root is not passed. Restart=on-failure (not always): a clean stdin
+# EOF exit is a normal shutdown, not something to paper over with a loop.
+[Unit]
+Description=fleet-graph minimal MCP surface (stdio)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/apps/fleet-graph/current
+Environment=FLEET_ENGINE_ROOT=/data/fleet/goals
+ExecStart=%h/.local/bin/uv run fleet-graph-minimal-mcp
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+# Same PATH as fleet-graph-dd-mcp.service, for the same reason: the server
+# spawns engine processes which exec git / gh / agent-run, and agent-run is a
+# bun script the systemd user manager's default PATH cannot find.
+Environment=PATH=%h/.bun/bin:%h/.local/bin:%h/.opencode/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=default.target
