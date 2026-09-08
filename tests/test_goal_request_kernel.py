@@ -1051,6 +1051,54 @@ class TestUncertainReconciliation:
         assert replay["results"][0]["status"] == DELIVERED
         assert replay["results"][0]["reconciled"] is True
 
+    def test_unknown_observation_is_persisted_and_survives_reconstruction(self, tmp_path) -> None:
+        # A crash leaves an action intent durably behind with no delivery result.
+        home = tmp_path / "journal"
+        crashed = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        crashed.activate_version(GOAL, "v1")
+        crashed.journal.append(
+            GOAL,
+            {
+                "record": RECORD_ACTION,
+                "goal": GOAL,
+                "action_id": "dead:dispatch:K",
+                "kind": ACTION_DISPATCH,
+                "idempotency_key": "K",
+                "payload": {"repo_path": "repo-a"},
+                "request_id": "crashed",
+                "run_id": "run-crashed",
+                "list_index": 1,
+            },
+        )
+
+        # Reconstruct and reconcile the orphaned intent: the external-effect port
+        # answers "unknown", so the outcome must be persisted, not returned and
+        # silently dropped.
+        effects = FakeEffects()
+        effects.observations[(ACTION_DISPATCH, "K")] = OBSERVED_UNKNOWN
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=effects)
+        result = run_one(rebuilt, make_request("A"), {"actions": [dispatch_action("K")]})
+        assert result["results"][0]["status"] == UNKNOWN
+        assert result["results"][0]["reconciled"] is True
+
+        # A second reconstruction exposes the persisted unknown outcome through
+        # pagination, carrying the original action identity and the current
+        # request/run/index attribution.
+        rebuilt_again = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        outcomes = [
+            e
+            for e in rebuilt_again.list_events(GOAL)["events"]
+            if e["record"] == RECORD_ACTION_RESULT and e.get("action_id") == "dead:dispatch:K"
+        ]
+        assert len(outcomes) == 1
+        assert outcomes[0]["kind"] == ACTION_DISPATCH
+        assert outcomes[0]["status"] == UNKNOWN
+        assert outcomes[0]["detail"] == "outcome unknown; recoverable and requires Goal judgement"
+        assert outcomes[0]["final"] is False
+        assert outcomes[0]["request_id"] == "A"
+        assert outcomes[0]["run_id"]
+        assert outcomes[0]["list_index"] == 1
+
 
 # --- finding 1: interrupted call resumes its persisted list, never re-Goal -----
 

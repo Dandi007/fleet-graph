@@ -1264,6 +1264,26 @@ class GoalRequestKernel:
                 caller=caller,
                 action_id=action_id,
             )
+        # An unknown observation is a first-class reconciliation outcome, not a
+        # silent return: persist it against the original action identity with
+        # the current request/run/index attribution so pagination and a later
+        # reconstruction can expose that the outcome is unknown and requires
+        # Goal judgement (behaviors 4 and 6). It stays non-final, so a future
+        # confirmation or observed absence is never locked out by this receipt.
+        self.journal.append(
+            goal,
+            self._result_record(
+                goal,
+                action_id,
+                request_id,
+                run_id,
+                index,
+                kind,
+                UNKNOWN,
+                "outcome unknown; recoverable and requires Goal judgement",
+                final=False,
+            ),
+        )
         return self._result(
             action,
             action_id,
