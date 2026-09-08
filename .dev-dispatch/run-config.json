@@ -1,7 +1,31 @@
 {
  "development_id": "dev-fg-91bb67e8747f",
- "generation": 1,
- "acceptance_commands": [],
- "setup_commands": [],
- "acceptance_env": {}
+ "generation": 2,
+ "acceptance_commands": [
+  [
+   ".venv/bin/python",
+   "-m",
+   "compileall",
+   "-q",
+   "src"
+  ],
+  [
+   ".venv/bin/python",
+   "-m",
+   "pytest",
+   "-q",
+   "tests/test_goal_request_kernel.py"
+  ]
+ ],
+ "setup_commands": [
+  [
+   "uv",
+   "sync",
+   "--frozen"
+  ]
+ ],
+ "acceptance_env": {
+  "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+  "PYTEST_PLUGINS": ""
+ }
 }
