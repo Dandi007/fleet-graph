@@ -732,3 +732,17 @@ class TestTheCapabilityCheckIsNotBypassed:
         assert "invoke_review_materializer" in body
         assert "materialize-handoff" not in body
         assert "subprocess" not in body
+
+
+def test_command_provenance_survives_materializer_request(repo: Path) -> None:
+    evidence = {"verification_commands": [{"argv": ["true"], "exit_code": 0,
+        "provenance": {"cwd": str(repo), "started_at": "2026-08-26T04:00:00Z",
+        "finished_at": "2026-08-26T04:00:01Z", "work_head_commit": "2" * 40,
+        "stdout": "", "stderr": "真实 stderr\n"}}]}
+    receipt = applied_receipt()
+    receipt["verification_record"] = evidence
+    request = make_materializer(repo).request(
+        IMPLEMENT, dispatch_for(repo, "implement"), StageOutcome(receipt=receipt)
+    )
+    adapted = plugin_adapter._implement_actor_result_with_outcome(request["actor_result"])
+    assert adapted["verification_record"] == evidence

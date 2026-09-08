@@ -93,6 +93,21 @@ No outer `result` key, no outer `effects` key -- those belong to the other
 harness. For DISPUTED or BLOCKED, replace `work_head_commit` and
 `verification_record` with `rebuttal` or `blocker` respectively.
 
+
+## 本线检查证据采集
+
+需要完整开发检查证据时，提交产品代码后再执行原验收 argv；不得仅回填 exit_code。
+每条 verification_commands 可携带 provenance 对象，出现该对象时必须完整包含
+cwd（实际绝对路径）、started_at/finished_at（UTC、Z 后缀）、work_head_commit
+（检查实际绑定的完整产品 SHA）、stdout、stderr（完整原始两流，可为空）。
+使用 Python subprocess.run(argv, cwd=实际路径, capture_output=True) 等机器采集入口，
+由返回的 returncode 填 exit_code，执行前后取得 UTC 和 Git HEAD 并确认 HEAD 未改变。
+不要用 echo 的成功码代替被测命令、不要把两流合并或 tail 后当成完整输出；
+缺失或截断时报告缺口，不填空字符串伪造成功。不要从历史回显推测独立两流。
+这不授权运行不安全的检查；执行前仍须满足本线独立 HOME、状态及共享服务边界。
+不能安全执行时 BLOCKED 并报告具体原因，不能填该命令 exit_code=0。
+旧回执允许省略 provenance 仅用于历史兼容，不代表满足当前 SPEC 的证据要求。
+
 Doing the work and returning a shape the seal cannot read is the same as not
 doing it: there is no other way for it to learn what you produced.\
 """
