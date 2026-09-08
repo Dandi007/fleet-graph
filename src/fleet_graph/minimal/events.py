@@ -25,6 +25,9 @@ GOAL_KINDS: frozenset[str] = frozenset(
         "goal.message",
         "goal.steered",
         "goal.merged_to_target",
+        # dd-18 goalgraph: a dispatch that failed the engine's GO-36 checks is
+        # bounced back to the next turn, never silently dropped.
+        "goal.dispatch_rejected",
     }
 )
 

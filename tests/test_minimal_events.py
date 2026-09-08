@@ -88,6 +88,7 @@ def test_kinds_match_protocol_section_8() -> None:
                 "goal.message",
                 "goal.steered",
                 "goal.merged_to_target",
+                "goal.dispatch_rejected",
                 "dd.dispatched",
                 "dd.stage.started",
                 "dd.stage.finished",
