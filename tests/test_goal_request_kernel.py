@@ -1266,6 +1266,71 @@ class TestStopSuspendsEffects:
         assert [d["ctx"]["idempotency_key"] for d in effects.dispatches] == ["k1", "k2"]
 
 
+# --- final review rf-3c65b36f: stop is serialized with effect admission ----------
+
+
+class TestStopSerializedWithEffectAdmission:
+    @pytest.mark.parametrize("kind", ["approve", "reject"])
+    def test_confirmed_stop_lands_between_mode_check_and_review_delivery(self, kind: str) -> None:
+        # An approve/reject can pass the loop-top mode check, then park acquiring
+        # ``_version_lock`` while a confirmed immediate stop persists
+        # ``MODE_STOPPED`` -- and then deliver to the external port after the
+        # stop, with no resume. The fix re-checks ``MODE_STOPPED`` under the
+        # per-goal admission lock at the delivery boundary; holding
+        # ``_version_lock`` here parks the review in exactly that window.
+        import threading
+        import time
+
+        runtime = FakeRuntime()  # stop_answer defaults to terminated=True
+        effects = FakeEffects()
+        kernel = make_kernel(effects, runtime)  # active version v1
+
+        action = {
+            "kind": kind,
+            "idempotency_key": f"{kind}-1",
+            "payload": {"development_id": "d1", "verdict": "APPROVE", "goal_version": "v1"},
+        }
+        kernel.submit(GOAL, make_request("A"))
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None
+
+        box: dict[str, Any] = {}
+
+        def deliver() -> None:
+            box["result"] = kernel.finish_goal_call(GOAL, call["call_id"], {"actions": [action]})
+
+        kernel._version_lock.acquire()  # park the review before its port admission
+        worker = threading.Thread(target=deliver)
+        worker.start()
+        try:
+            time.sleep(0.1)  # the review is now parked on ``_version_lock``
+            assert effects.approvals == [] and effects.rejects == []  # nothing yet
+            resp = kernel.stop(GOAL, mode="immediate")
+            assert resp["stopped"] is True
+        finally:
+            kernel._version_lock.release()
+
+        worker.join(timeout=30)
+        assert not worker.is_alive()
+        result = box["result"]
+
+        # The confirmed stop won: the review was suspended, never delivered.
+        assert result["suspended"] is True
+        assert effects.approvals == [] and effects.rejects == []
+        assert kernel.next_goal_call(GOAL) is None  # fence held / stopped
+
+        # On resume the preserved action is delivered exactly once.
+        kernel.resume(GOAL)
+        nxt = kernel.next_goal_call(GOAL)
+        assert nxt is not None and nxt["resume"] is True
+        outcome = kernel.finish_goal_call(GOAL, nxt["call_id"], nxt["stop_list"])
+        assert [r["status"] for r in outcome["results"]] == [DELIVERED]
+        if kind == "approve":
+            assert len(effects.approvals) == 1
+        else:
+            assert len(effects.rejects) == 1
+
+
 # --- finding 3: crash-safe incomplete-tail repair preserves the valid prefix -----
 
 

@@ -792,6 +792,7 @@ class GoalRequestKernel:
                 "mode": mode,
                 "stopping_drain": None,
                 "resume": resume_call,
+                "effect_lock": threading.RLock(),
             }
             inflight[goal] = current_call
         self.journal._inflight = inflight
@@ -881,7 +882,13 @@ class GoalRequestKernel:
             "mode": MODE_RUNNING,
             "stopping_drain": None,
             "resume": None,
+            "effect_lock": threading.RLock(),
         }
+
+    def _effect_admission_lock(self, goal: str) -> threading.RLock:
+        """The per-goal lock that serializes a confirmed stop against effect
+        admission (final review rf-3c65b36f, behavior 5)."""
+        return self._state.setdefault(goal, self._default_state())["effect_lock"]
 
     def _queue(self, goal: str, record: dict[str, Any]) -> None:
         st = self._state.setdefault(goal, self._default_state())
@@ -1239,22 +1246,6 @@ class GoalRequestKernel:
         }
         repo_admission: dict[str, str] = {}
         for position, action in enumerate(consumable, start=1):
-            if self._mode_of(goal) == MODE_STOPPED:
-                # Finding 2: a confirmed stop suspends unstarted effects. The
-                # already-persisted list (and any earlier results) survive; the
-                # fence is held and resume() re-runs these items through
-                # reconciliation -- never by re-invoking Goal.
-                st = self._state.setdefault(goal, self._default_state())
-                st["resume"] = call_id
-                return {
-                    "call_id": call_id,
-                    "goal": goal,
-                    "request_id": request_id,
-                    "intent": intent,
-                    "receipts": [*receipts],
-                    "results": results,
-                    "suspended": True,
-                }
             index = int(action.get("list_index", position))
             # Read the active version at the review-effect boundary, not from a
             # snapshot taken before the list executes: an earlier effect may
@@ -1262,16 +1253,16 @@ class GoalRequestKernel:
             # the then-stale version must be refused against the *current* one.
             #
             # A version-bound review (approve/reject) is admitted *and* delivered
-            # under ``_version_lock`` (final review finding): the guard read and
-            # the external port call are one critical section, so a concurrent
-            # ``activate_version`` cannot persist and activate a new version in
-            # the gap between "naming v1 still passes" and "v1 reaches the
-            # port". The lock is taken again per action, so a mid-list
-            # activation by an earlier effect is still observed by a later
-            # review (the earlier activation finished and released the lock).
+            # under ``_version_lock``: the guard read and the external port call
+            # are one critical section, so a concurrent ``activate_version``
+            # cannot persist and activate a new version in the gap between
+            # "naming v1 still passes" and "v1 reaches the port". The lock is
+            # taken again per action, so a mid-list activation by an earlier
+            # effect is still observed by a later review (the earlier activation
+            # finished and released the lock).
             if action["kind"] in (ACTION_APPROVE, ACTION_REJECT):
                 with self._version_lock:
-                    result = self._process_action(
+                    result = self._admit_action(
                         goal,
                         action,
                         call_id,
@@ -1283,7 +1274,7 @@ class GoalRequestKernel:
                         repo_admission=repo_admission,
                     )
             else:
-                result = self._process_action(
+                result = self._admit_action(
                     goal,
                     action,
                     call_id,
@@ -1294,6 +1285,22 @@ class GoalRequestKernel:
                     admission_required=admission_required,
                     repo_admission=repo_admission,
                 )
+            if result.get("suspended"):
+                # Finding 2 + rf-3c65b36f: a confirmed stop suspends unstarted
+                # effects. The already-persisted list (and any earlier results)
+                # survive; the fence is held and resume() re-runs these items
+                # through reconciliation -- never by re-invoking Goal.
+                st = self._state.setdefault(goal, self._default_state())
+                st["resume"] = call_id
+                return {
+                    "call_id": call_id,
+                    "goal": goal,
+                    "request_id": request_id,
+                    "intent": intent,
+                    "receipts": [*receipts],
+                    "results": results,
+                    "suspended": True,
+                }
             if action["kind"] == ACTION_ADD_REPO:
                 repo_admission[str((action.get("payload") or {}).get("repo_path") or "")] = str(
                     result["status"]
@@ -1391,6 +1398,56 @@ class GoalRequestKernel:
             "receipts": [*receipts],
             "results": results,
         }
+
+    def _admit_action(
+        self,
+        goal: str,
+        action: dict[str, Any],
+        call_id: str,
+        request_id: str,
+        run_id: str,
+        index: int,
+        caller: str,
+        *,
+        admission_required: set[str],
+        repo_admission: dict[str, str],
+    ) -> dict[str, Any]:
+        """Admit and deliver one action, serialized against a confirmed stop.
+
+        This is the single effect-admission point (final review rf-3c65b36f,
+        behavior 5): the re-check of ``MODE_STOPPED`` and the guard read /
+        intent persistence / external delivery are one critical section held by
+        a per-goal reentrant lock that ``stop`` also acquires when it persists
+        ``MODE_STOPPED``. Without it, an action could pass an earlier mode
+        check, pause on ``_version_lock`` (approve/reject) or on journal writes
+        (dispatch/reply), and then reach its external port after a stop has
+        already persisted ``MODE_STOPPED`` and returned ``stopped`` -- starting
+        an unstarted effect after the stop, with no resume in between.
+
+        The lock is per-goal and taken per-action, so a delivery on goal A is
+        never serialized behind a delivery on goal B. It is reentrant, so a
+        stop issued from a surface already inside the admission (a port that
+        stops itself mid-delivery) does not deadlock and still suspends the
+        remaining unstarted items.
+
+        Returns ``{"suspended": True}`` when a stop has confirmed while this
+        action was still unstarted; the caller records the resume marker and
+        returns the suspended call without running this or any later effect.
+        """
+        with self._effect_admission_lock(goal):
+            if self._mode_of(goal) == MODE_STOPPED:
+                return {"suspended": True}
+            return self._process_action(
+                goal,
+                action,
+                call_id,
+                request_id,
+                run_id,
+                index,
+                caller,
+                admission_required=admission_required,
+                repo_admission=repo_admission,
+            )
 
     def _process_action(
         self,
@@ -1852,21 +1909,32 @@ class GoalRequestKernel:
             # admission via ``_request_lock`` so a concurrent completion cannot
             # overwrite a confirmed stop (final review rf-1b50bcf1, behavior 5,
             # P6). The runtime cancellation port is invoked *outside* the lock.
-            with self._request_lock:
-                self.journal.append(
-                    goal,
-                    {
-                        "record": RECORD_CONTROL,
-                        "goal": goal,
-                        "control": "stop",
-                        "mode": mode,
-                        "terminated": terminated,
-                        "cancel": cancel,
-                        "at": _iso(self.clock),
-                    },
-                )
-                if terminated:
-                    self._set_mode(goal, MODE_STOPPED)
+            #
+            # The persisted ``MODE_STOPPED`` transition is additionally
+            # serialized with effect admission via the per-goal admission lock
+            # (final review rf-3c65b36f, behavior 5): without it, an action that
+            # already passed its mode check could reach its external port after
+            # this stop has persisted ``MODE_STOPPED`` and returned ``stopped``,
+            # starting an unstarted effect after the stop with no resume in
+            # between. The admission lock is acquired *before* ``_request_lock``
+            # so a stop issued from a surface already inside an effect admission
+            # (reentrant) can never deadlock against a concurrent admission.
+            with self._effect_admission_lock(goal):
+                with self._request_lock:
+                    self.journal.append(
+                        goal,
+                        {
+                            "record": RECORD_CONTROL,
+                            "goal": goal,
+                            "control": "stop",
+                            "mode": mode,
+                            "terminated": terminated,
+                            "cancel": cancel,
+                            "at": _iso(self.clock),
+                        },
+                    )
+                    if terminated:
+                        self._set_mode(goal, MODE_STOPPED)
             # Not terminated: absent/refused cancellation is recorded honestly
             # and the goal's mode is left as it was -- it is not 'stopped'.
             return {"goal": goal, "mode": mode, "stopped": terminated, "cancel": cancel}
