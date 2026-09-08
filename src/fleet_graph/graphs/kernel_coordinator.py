@@ -191,6 +191,9 @@ class KernelCoordinator:
                     kind=KIND_STEER,
                     input={"decision": decision},
                     goal_version=version,
+                    # reply association (behavior 1): the reply to a steer is
+                    # delivered to the decision's source, never guessed later.
+                    reply_to=decided_by,
                 )
             )
 
@@ -200,6 +203,10 @@ class KernelCoordinator:
                     continue
                 message_id = str(msg.get("message_id") or "")
                 caller = str(msg.get("from_agent_id") or msg.get("from_alias") or "line")
+                # reply association (behavior 1): a message's reply is delivered
+                # to its sender; when no sender identity is present the reply
+                # target is left unset rather than fabricated.
+                reply_to = msg.get("from_agent_id") or msg.get("from_alias") or None
                 requests.append(
                     Request(
                         request_id=f"line:{folder_id}:message:{message_id or round_no}",
@@ -208,6 +215,7 @@ class KernelCoordinator:
                         kind=KIND_MESSAGE,
                         input={"inbox_message": msg},
                         goal_version=version,
+                        reply_to=str(reply_to) if reply_to is not None else None,
                     )
                 )
 

@@ -274,6 +274,23 @@ class TestOneCurrentRequestPrompt:
         assert "old" not in prompt["input"]
         assert all(isinstance(ref, str) and "text" not in ref for ref in prompt["history_refs"])
 
+    def test_prompt_carries_the_reply_association(self) -> None:
+        # Behavior 1 "reply association": the current request's reply target is
+        # carried in the prompt as a pointer so the Goal can address its reply
+        # to the original caller without re-deriving it.
+        current = make_request("cur", input={"goal": "do the thing"})
+        current = Request(
+            request_id=current.request_id,
+            goal=current.goal,
+            caller=current.caller,
+            kind=current.kind,
+            input=current.input,
+            goal_version=current.goal_version,
+            reply_to="line-a",
+        )
+        prompt = build_goal_prompt(current)
+        assert prompt["reply_to"] == "line-a"
+
 
 # --- action partial failure --------------------------------------------------
 

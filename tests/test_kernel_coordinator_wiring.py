@@ -20,6 +20,7 @@ from fleet_graph.goal.request_kernel import (
     DELIVERED,
     KIND_MESSAGE,
     NOT_READY,
+    RECORD_REQUEST,
     UNKNOWN,
     GoalRequestKernel,
     Journal,
@@ -184,6 +185,29 @@ def test_each_inbox_message_is_an_independent_request() -> None:
     assert call.prompts[0]["caller"] == "line-a"
     assert call.prompts[1]["kind"] == KIND_MESSAGE
     assert call.prompts[1]["caller"] == "line-b"
+
+
+def test_message_request_carries_reply_association(tmp_path: Path) -> None:
+    # Behavior 1 "reply association": a message request is durable with its
+    # sender as the reply target, and that pointer reaches the Goal prompt so a
+    # reply action can be addressed to the original caller (behavior 3).
+    call = SequenceGoalCall([{"actions": [], "intent": "done"}])
+    kernel = GoalRequestKernel(journal=Journal(home=tmp_path / "journal"))
+    kernel.activate_version(GOAL, "v1")
+    coordinator = KernelCoordinator(
+        kernel=kernel,
+        goal_call=call,
+        folder_id=GOAL,
+        thread_id=f"{GOAL}:g1",
+        launch_id="launch-test",
+    )
+    inbox = [{"message_id": "m-A", "from_agent_id": "line-a", "body": "msg A"}]
+    coordinator.turn(1, {"folder_id": GOAL, "inbox_messages": inbox})
+
+    requests = [r for r in kernel.journal.scan(GOAL) if r.get("record") == RECORD_REQUEST]
+    assert len(requests) == 1
+    assert requests[0]["reply_to"] == "line-a"
+    assert call.prompts[0]["reply_to"] == "line-a"
 
 
 def test_waiting_result_does_not_suppress_queued_requests() -> None:

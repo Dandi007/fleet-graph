@@ -581,6 +581,9 @@ def build_goal_prompt(current: Request, *, history: list[Request] | None = None)
     The prompt carries exactly the current request's input. Historical
     requests are referenced only by ``request_id`` pointer, never by their
     text -- so a long conversation can never be re-appended as current input.
+    The request's ``reply_to`` association rides alongside the input as the
+    reply target pointer (behavior 1 "reply association"), so the Goal can
+    address its ``reply`` action to the original caller without re-deriving it.
     """
     return {
         "request_id": current.request_id,
@@ -588,6 +591,7 @@ def build_goal_prompt(current: Request, *, history: list[Request] | None = None)
         "caller": current.caller,
         "goal_version": current.goal_version,
         "input": current.input,
+        "reply_to": current.reply_to,
         "history_refs": [r.request_id for r in (history or [])],
     }
 
