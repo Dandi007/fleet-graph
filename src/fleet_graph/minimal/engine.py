@@ -528,6 +528,19 @@ def _fold_terminal_state(log: events.EventLog) -> str | None:
     return derived.state if derived.terminal else None
 
 
+def _engine_has_run(events_list: list[events.Event]) -> bool:
+    """Whether the goal loop has actually begun (the engine has run at least once).
+
+    The only event written before the engine first starts is ``goal.enrolled``
+    (the MCP enrollment, protocol §10); every other kind implies the engine was
+    up. A log that is empty or only carries ``goal.enrolled`` is therefore a
+    *fresh* goal — first spawn, so ``engine.started`` — whereas any later event
+    (a turn, a DD, a control line) means the engine already ran and recovery is
+    replay (``engine.resumed``, protocol §11).
+    """
+    return any(ev.kind != "goal.enrolled" for ev in events_list)
+
+
 def _write_exiting(log: events.EventLog, reason: str) -> None:
     """Write the terminal ``engine.exiting`` event, deduped against the last event."""
     existing = list(log.read())
@@ -704,7 +717,8 @@ def run_engine(
     ``events.jsonl`` and a terminal fold exits immediately without re-running; otherwise
     the loop runs through ``goalgraph.run_goal`` with no checkpointer.
 
-    Non-empty, non-terminal logs resume (protocol §11): the engine writes
+    Logs that already show engine progress (anything beyond ``goal.enrolled``)
+    and are non-terminal resume (protocol §11): the engine writes
     ``engine.resumed``, then dispatches on ``resume_point.action``:
     a lost ``goal_turn`` is re-run at the same turn number; an in-flight DD is
     closed as ``lost_on_restart`` and handed back to the Goal Agent; any other
@@ -749,8 +763,9 @@ def run_engine(
         return _EXIT_CODE_BY_STATE[terminal]
 
     events_list = list(deps.event_log.read())
-    if not events_list:
-        # fresh goal: today's byte-for-byte behavior, no engine.resumed
+    if not _engine_has_run(events_list):
+        # fresh goal (empty log, or only the enrollment event): today's
+        # byte-for-byte behavior — write engine.started, no engine.resumed
         deps.event_log.append("engine.started", {"pid": os.getpid()})
         result = goalgraph.run_goal(deps, goal_id=goal_id, enroll=enroll_obj)
         stop = result.get("stop") or "blocked"
