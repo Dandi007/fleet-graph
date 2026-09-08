@@ -64,10 +64,17 @@ ENGINE_KINDS: frozenset[str] = frozenset(
     }
 )
 
+SCRIBE_KINDS: frozenset[str] = frozenset(
+    {
+        "scribe.observed",
+        "scribe.failed",
+    }
+)
+
 CONTROL_KINDS: frozenset[str] = frozenset({"control.received"})
 
 KINDS: frozenset[str] = frozenset(
-    GOAL_KINDS | DD_KINDS | AGENT_KINDS | ENGINE_KINDS | CONTROL_KINDS
+    GOAL_KINDS | DD_KINDS | AGENT_KINDS | ENGINE_KINDS | CONTROL_KINDS | SCRIBE_KINDS
 )
 
 _EVENT_KEY_ORDER = ("ts", "goal_id", "dd_id", "kind", "seq", "payload")
