@@ -38,7 +38,7 @@ from fleet_graph.executors.agent_run import (
 # lines (`ronin-model-switch`) has agent-runtime as its subject. Executing the
 # fleet's executor out of a tree that the fleet itself edits is a loop nobody
 # wants to debug at 3am.
-DEFAULT_AGENT_SESSION_BIN = "/data/code/self/agent-runtime-current/bin/agent-session"
+DEFAULT_AGENT_SESSION_BIN = "/data/code/fleet-comparison/driver/agent-runtime/bin/compare-agent-session"
 
 SEAT_KEY_NAMESPACE = uuid.UUID("2a7c9e14-8d33-5b6f-a1c2-9e4d7b05f331")
 

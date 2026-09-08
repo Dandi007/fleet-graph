@@ -779,3 +779,39 @@ class TestMeta:
         argv = spec.argv()
         assert "--audit-ref" not in argv
         assert "--record-file" not in argv
+
+
+class TestExplicitLineBinding:
+    def test_self_binding_preserves_identity_and_namespace(self) -> None:
+        assert release_line_ref("wf-2bf703") == "refs/heads/release/fleet-compare-self"
+        assert audit_branch_ref("dev-example", "wf-2bf703") == "refs/heads/dd/fleet-compare-self/dev-example"
+        assert release_line_ref("unmapped") == "refs/heads/release/unmapped"
+        assert audit_branch_ref("dev-example") == "refs/heads/dd/dev-example"
+
+    def test_admission_uses_binding_and_still_rejects_foreign_target(
+        self, tmp_path: Path, line_repo: tuple[Path, Path, str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import fleet_graph.dd.control_plane as cp
+        repo, _bare_repo, base, _advanced = line_repo
+        binding = {"release_ref": LINE_REF, "audit_prefix": "refs/heads/dd/fleet-compare-self/", "repo_root": str(tmp_path)}
+        monkeypatch.setattr(cp, "line_branch_binding", lambda line: binding if line == LINE else {})
+        with pytest.raises(ControlPlaneError) as refused:
+            _admit(tmp_path, repo, base, target_ref=OTHER_REF)
+        assert refused.value.code == CODE_TARGET_REF_CROSS_LINE
+        plane, dev = _admit(tmp_path, repo, base, target_ref=LINE_REF)
+        record = json.loads((plane.root / dev / RECORD_FILE).read_text())
+        assert record["remote_ref"] == LINE_REF
+        assert record["audit_ref"] == f"refs/heads/dd/fleet-compare-self/{dev}"
+        assert record["dispatched_by"] == LINE
+
+    def test_binding_rejects_repo_outside_group(
+        self, tmp_path: Path, line_repo: tuple[Path, Path, str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import fleet_graph.dd.control_plane as cp
+        repo, _bare_repo, base, _advanced = line_repo
+        monkeypatch.setattr(cp, "line_branch_binding", lambda line: {
+            "release_ref": LINE_REF, "audit_prefix": "refs/heads/dd/fleet-compare-self/", "repo_root": str(tmp_path / "other")
+        })
+        with pytest.raises(ControlPlaneError) as refused:
+            _admit(tmp_path, repo, base, target_ref=LINE_REF)
+        assert refused.value.code == "REPO_CROSS_LINE"

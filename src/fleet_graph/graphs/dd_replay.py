@@ -409,7 +409,7 @@ class ReceiptReplayer:
         imp_raw, imp = loaded
         if not self._valid_implement(imp, head):
             return []
-        configure_step = self._configure_step(configure_id, imp)
+        configure_step = self._configure_step(configure_id, imp, root)
         if configure_step is None:
             return []
 
@@ -600,15 +600,17 @@ class ReceiptReplayer:
             return None
         return raw, receipt
 
-    def _configure_step(self, configure_id: str, imp: dict[str, Any]) -> _Step | None:
+    def _configure_step(
+        self, configure_id: str, imp: dict[str, Any], source_root: Path
+    ) -> _Step | None:
         """The configure link, recomputed rather than believed.
 
         The first implement's parent digest is the canonical digest of the
-        WorkspaceSealer receipt its configure produced: exactly
-        ``{"stage", "input_commit", "output_commit"}``. Both commits are on
-        the chain, so the receipt is reconstructed from git and the digest
-        must recompute -- that closes the implement link back to the
-        bootstrap ancestry without trusting anything off-chain.
+        WorkspaceSealer receipt its configure produced. Legacy receipts have
+        three chain fields; current ones also bind configure's rebase facts.
+        Both commits are checked against git. Event facts are accepted only
+        if the complete candidate matches the sealed parent digest, so an
+        off-chain edit cannot authorize a different configure link.
         """
         output_commit = str(imp.get("input_commit") or "")
         if not _HEX40.fullmatch(output_commit):
@@ -621,8 +623,35 @@ class ReceiptReplayer:
             "input_commit": parents[0],
             "output_commit": output_commit,
         }
-        if imp.get("parent_handoff_receipt_digest") != compute_json_digest(receipt):
-            return None
+        expected = imp.get("parent_handoff_receipt_digest")
+        if expected != compute_json_digest(receipt):
+            # WorkspaceSealer also binds configure's structured rebase facts.
+            # The event trail supplies candidates, never authority: only an
+            # exact match to the sealed implement parent digest is accepted.
+            try:
+                lines = (source_root.parent / "events.jsonl").read_text().splitlines()
+            except OSError:
+                return None
+            matched = None
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict) or (
+                    event.get("stage") != configure_id
+                    or event.get("event") != SPINE_EVENT
+                    or event.get("output_commit") != output_commit
+                    or not isinstance(event.get("rebase"), dict)
+                ):
+                    continue
+                candidate = {**receipt, "rebase": event["rebase"]}
+                if compute_json_digest(candidate) == expected:
+                    matched = candidate
+                    break
+            if matched is None:
+                return None
+            receipt = matched
         return _Step(
             stage_id=configure_id,
             event=SPINE_EVENT,
