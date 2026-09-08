@@ -28,6 +28,8 @@
 
 测试启动约束因此明确为整个 turn 只调用工具，最后且仅输出一次符合 schema 的 JSON 文本，禁止中途 assistant 进度说明。它适配冻结解析器的首条 text 协议，没有从原始输出剥离文字、修复 JSON 或改变成功判定。
 
+测试驱动另提供有界公开反馈：只对引擎在线、稳定 blocked、所有运行结束且最新 Goal 明确为 exit 91 的情况，通过 `goal_message` 提醒模型核查副作用并按原生协议重新交接。同一失败只反馈一次，整 case 最多两次，不重置超时；原始请求、回执和失败 Session 全部保留。这是测试驱动策略，不能记为 runtime 已支持 generic conformance retry。最终仍须通过全部独立验收。
+
 ## 其他未覆盖事项
 
 - native subscription 和宿主登录态复用尚未支持；首版只验证 OpenCode static gateway。

@@ -66,6 +66,7 @@ flowchart LR
 - 第一轮仅验证 OpenCode static gateway。native subscription、宿主登录态复用及其他 Runtime 的认证方式均为后续事项。
 - Work Folder 搜索部署真实 agent-knowledge 索引器与搜索服务，使用原生 keyword 模式；不依赖宿主搜索服务或 embedding 模型，vector 检索不在本轮覆盖范围。
 - 启动配置与角色 prompt 追加本次 Docker 测试授权，配置摘要与哈希写入 candidate manifest；不修改冻结产品源码。
+- OpenCode 按冻结 runtime 的首条 text 协议运行：整轮仅工具调用加最后一次 JSON。对稳定 blocked 的明确 Goal 输出契约失败，runner 最多通过公开 `goal_message` 反馈两次，保留全部原始失败；这是测试驱动反馈，详见 [Runner](runner/README.md)。
 - 短 case 使用原生 `scribe_interval=0`，保留且要求成功的真实终局 Scribe。连续观察的输入自引用缺陷及严格 JSON 输出失败见 [已知边界](KNOWN_LIMITATIONS.md)，本 case 不证明长期观测健康。
 - 冻结 agent-runtime 没有提交 Bun lock，镜像记录实际解析 lock 的哈希及工具版本；不能据此声称不同时间重新构建会解析完全相同的依赖。
 - 两条重构线分别记账。尚未运行的候选标为待验证；协议或实现缺陷要报告到对应开发线，不能因本套测试已有一次成功而推定另一线通过。

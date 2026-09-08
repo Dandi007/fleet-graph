@@ -20,6 +20,7 @@ from pathlib import Path
 
 from adapter import Mapper
 from fastmcp import Client
+from feedback import FeedbackPolicy, send_feedback
 from monitor import BlockedIdleMonitor, EngineAbsentMonitor
 from permissions import prepare_readable
 
@@ -330,6 +331,7 @@ async def e2e(bundle, candidate):
         deadline = time.monotonic() + int(os.environ.get("E2E_TIMEOUT", "3600"))
         blocked_idle = BlockedIdleMonitor()
         engine_absent = EngineAbsentMonitor()
+        feedback = FeedbackPolicy()
         while time.monotonic() < deadline:
             status = await call(client, "goal_status", {"goal_id": goal_id})
             write(bundle / "raw/status.json", status)
@@ -356,6 +358,18 @@ async def e2e(bundle, candidate):
                 )
                 break
             if blocked_idle.observe(status):
+                try:
+                    feedback_result = await send_feedback(
+                        feedback, client, call, write, bundle, run_id, status
+                    )
+                except Exception as exc:
+                    write(bundle / "raw/feedback/error.json", {"error": str(exc)})
+                    feedback_result = "stop"
+                if feedback_result != "stop":
+                    blocked_idle = BlockedIdleMonitor()
+                    engine_absent = EngineAbsentMonitor()
+                    await asyncio.sleep(10)
+                    continue
                 status = await stop_goal(
                     client,
                     bundle,

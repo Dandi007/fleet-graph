@@ -25,7 +25,13 @@ e2e 先运行 smoke，再把固定 fixture 初始化为新 Git 历史，push `e2
 
 终局还从真实 agent-bus 的 `board:agent-runs` 频道完整回读消息，先保存 `raw/runtime-bus.json` 原始页，再核对成功 Goal/Impl 的 run_id、真实 sender、同版本 started/exited、事件顺序与退出码。普通 smoke 消息不能替代 runtime 生命周期消息；缺失或查询失败记入 collection-errors，外部验收器也独立检查原始消息。Goal reply 仍遵循候选公开 mailbox 协议。
 
-若连续两次轮询返回完全相同的 blocked 状态，且所有 run 都明确 finished，Runner 通过公开 goal_stop immediate 提前收口并保存 stop-reason、停止回执与失败证据。有 running、launching、collected、uncertain 或 paused run 时不会触发该规则；状态或新请求发生变化也会重新计数。
+若连续两次轮询返回完全相同的 blocked 状态，且所有 run 都明确 finished，Runner 进入收口判断；除下述有界反馈外，通过公开 goal_stop immediate 提前收口并保存 stop-reason、停止回执与失败证据。有 running、launching、collected、uncertain 或 paused run 时不会触发该规则；状态或新请求发生变化也会重新计数。
+
+在该稳定 blocked 分支，Runner 先尝试策略 `e2e-format-feedback-v1`：引擎必须仍在线，完整公开事件中的最近主链运行必须是 Goal，且 status 与 `run.collected` / `runtime.failed` 都明确一致地记录 `exit_code=91`、`exit_reason=contract_violation`。Impl 等角色的失败先交给产品原生 `dd.needs_goal` 处理。每个 failed run 最多反馈一次，每个 case 最多两次；历史失败之后若已有新的成功运行或其他错误，不再用历史协议失败触发反馈。
+
+反馈仅调用公开 `goal_message`，固定消息要求 Goal 核对已有副作用，对 interrupted DD 使用同一 dd_id 的原生 `revise`，让 Impl、程序验收、CR、FR 重新完成，审批必须使用当轮真实 review_ref。整个 turn 只允许工具调用和最后一次 JSON，禁止中途 assistant text。它不替模型修正 JSON、不替 Goal 执行 revise，也不代表实现或审查通过。此前失败 Session 和事件仍完整采集，Stop schema 与 verifier 不变。此机制称为“测试驱动反馈”，不称为 runtime 原生重试；反馈不会重置整条 E2E 的 deadline。
+
+每次判断保留 `raw/feedback/NN/status.json`、完整 `event-pages.json` 和发送前再次查询的 `status-before-send.json`；实际发送前保存含策略、次数、触发 run IDs、interrupted DD IDs 与完整请求的 `intent.json`，之后保存 `response.json` 或 `error.json`。发送前状态改变则重新观察；入队回执必须匹配 request_id、queued=true 且 requires_resume=false。额度耗尽、没有新合格失败、API 错误或要求 resume 均沿用原失败收口，不调用 steer/resume，也不自动重发。
 
 另一条失败收口规则是连续两次完全相同的非 done 状态且 engine_alive 明确为 false，覆盖 stopping 与 uncertain/lost 残留。它仍通过公开停止接口保存回执，并继续完整采集，不会把未确定 run 当作成功。启动期间状态或 liveness 发生变化会重置计数；停止接口报错也保留原始状态与错误继续采集。
 
