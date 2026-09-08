@@ -1,0 +1,14 @@
+{
+  "name": "minimal-impl",
+  "role": "impl",
+  "mcp": [
+    {"server": "wiki", "access": "read"},
+    {"server": "memory", "access": "read"}
+  ],
+  "tools": ["read", "write", "edit", "glob", "grep", "bash"],
+  "hooks": [],
+  "network": true,
+  "data_roots": ["$WORKSPACE"],
+  "permission_mode": "read-write",
+  "memory_injection": false
+}

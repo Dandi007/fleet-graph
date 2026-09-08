@@ -1,0 +1,13 @@
+{
+  "name": "minimal-fr",
+  "role": "fr",
+  "mcp": [
+    {"server": "wiki", "access": "read"}
+  ],
+  "tools": ["read", "glob", "grep", "bash", "webfetch"],
+  "hooks": [],
+  "network": true,
+  "data_roots": ["$DEPLOY_ROOT"],
+  "permission_mode": "read-only",
+  "memory_injection": false
+}

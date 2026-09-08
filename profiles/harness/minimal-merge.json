@@ -1,0 +1,11 @@
+{
+  "name": "minimal-merge",
+  "role": "merge",
+  "mcp": [],
+  "tools": ["read", "glob", "grep", "bash"],
+  "hooks": [],
+  "network": true,
+  "data_roots": ["$WORKSPACE"],
+  "permission_mode": "read-only",
+  "memory_injection": false
+}
