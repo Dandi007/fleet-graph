@@ -2,6 +2,23 @@
 
 本线 `wf-613744` 从 Fleet Graph main `a8d21ab51bfbfa8faf6364114a2e6949950a7ccb` 创建独立分支 `feat/docker-e2e-contracts`，交付 [PR #283](https://github.com/Dandi007/fleet-graph/pull/283)。关联 Codex 重构线 `wf-53a584`、自举重构线 `wf-2bf703` 与共同设计 `wf-cce72d`。产品比较分支、固定 driver、生产 main 和共享服务均未修改。
 
+## 完整 E2E 通过
+
+`make test-end-to-end CANDIDATE=codex CASE=single-repo` 在干净实现 HEAD `75d3f4766a49d84ad8012441814e2be7f1a936c2` 启动，运行 `fg-75a88c70368c` 真实退出 0。最终 `execution.json` 为 `status=e2e_passed`、`e2e_passed=true`、`evidence_exported=true`、`cleanup=removed`，无二进制凭证命中。此后分支仅补充交付文档。
+
+| 交付事实 | 实际证据 |
+|---|---|
+| Goal / DD | `41aa444ba2be8e761bbcacf1` / `57881389ea2b5455d5c34957`，均完成；10 个 run 全部 finished / succeeded |
+| 独立 SPEC commit | `8f5bdbf28d65e9ccea26cf3f41586929290fef22`，早于实现 |
+| Impl 与最终 target commit | `606de77638788dbbf4d9ba139c3d7e91629fc503` |
+| 真实 GitHub 交付 | [DD PR #7](https://github.com/Dandi007/fleet-graph-e2e-fixtures/pull/7) 与 [整线 PR #8](https://github.com/Dandi007/fleet-graph-e2e-fixtures/pull/8) 均已合并到本次专用分支 |
+| 终局 Scribe | `196356891050348a2046cbbf` 成功，观察范围 `[1,68]` 覆盖 `goal.done` seq 66，观察回执 seq 73 |
+| 独立 verifier | 8/8 通过：原始证据一致性、完整生命周期、终局 Scribe、runtime bus、review/approve 绑定、程序验收产物、Git/PR、17 项独立功能行为与 CLI |
+| 测试驱动反馈 | 本轮触发 0 次；有界反馈策略有单元测试，未据本轮宣称真实恢复通过 |
+| 导出与清理 | 原始公开记录、Session、实际命令日志、WF/search/bus/Git/工作目录完整导出；最终审计 13 次构建/运行，均无残留容器、网络或数据卷，镜像缓存与远端测试 PR 保留 |
+
+成功运行的证据根目录为 `.runtime/e2e/runs/fg-75a88c70368c/`：`execution.json` 记录源码及镜像、`verification/verification.json` 记录独立判定、`artifacts/fg-75a88c70368c/raw/` 保存公开原始证据。控制台日志为 `.runtime/e2e/e2e-console-7.log`，最终清理审计为 `.runtime/e2e/cleanup-audit-final.json`。原始运行产物保留在本机，不提交进 Git。
+
 ## 冻结输入
 
 | 源码 | 本次候选 commit |
@@ -31,8 +48,9 @@
 
 ## 开发检查
 
-- `make verify`：在实现 HEAD `a2dbbb39cae396a20117419c92f32d52f6a53368` 实际通过，3,254 passed、1 skipped、55 subtests；lint 和三项 conformance 检查通过。原始日志 `.runtime/e2e/verify-permissions.log`。
-- 同一实现 HEAD 的 [CI verify](https://github.com/Dandi007/fleet-graph/actions/runs/34184807049/job/101930888341) 通过。
+- `make verify`：在实现 HEAD `75d3f4766a49d84ad8012441814e2be7f1a936c2` 实际通过，3,262 passed、1 skipped、55 subtests；lint 和三项 conformance 检查通过。原始日志 `.runtime/e2e/verify-final.log`。期间只有 README 文本措辞调整，没有实现修改。
+- 同一实现 HEAD 的 [CI verify](https://github.com/Dandi007/fleet-graph/actions/runs/34186391631/job/101935463787) 通过。
+- 上一次本地回归的旧测试 `test_mkrepo_idempotent` 遇端口 25612 被占用而失败；随后端口已空闲，单项与完整回归均通过。没有终止未知监听者或修改固定 driver；原始失败日志 `.runtime/e2e/verify-feedback.log` 与单项复查日志 `.runtime/e2e/verify-port-rerun.log` 保留。
 - 独立 Docker smoke `fg-8e0caa67b529` 通过，包含真实新写 UUID 的搜索命中，证据导出完成且资源已清理；不能将 smoke 当成业务 E2E。
 - verifier 的负例覆盖提前打印成功标记、缺少函数、过期 snapshot、缺失分页、错误审批绑定、终局 Scribe 缺失/失败；另有 Git 失败 stderr 与只读权限准备的回归检查。
 

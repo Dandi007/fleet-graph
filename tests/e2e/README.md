@@ -59,9 +59,11 @@ flowchart LR
 
 运行证据写入 `.runtime/e2e/runs/<run_id>/`：实际命令日志、解析后的 Compose、候选来源、公开 API 原始记录、session、功能判定、WF/bus 数据和 Git 仓库。停止服务后才导出数据；导出成功才删除 volumes。导出失败时停止容器、保留 volumes，需按日志中的 Compose project name 恢复导出。所有结果都在 `execution.json` 明确标注。
 
-本次 token 在控制台日志中精确替换；导出文件扫描命中时脱敏并记录文件名。`.dockerignore` 只允许测试源码和 Git archive 构建副本，排除 secrets、历史运行证据和其他宿主内容。源归档与构建共用缓存由文件锁串行保护。
+本次 token 在控制台日志中精确替换；导出文本扫描命中时脱敏并记录文件名。二进制文件命中时保留原件，将导出判为失败并保留停止后的数据卷，避免破坏数据库或 Git objects；该私有导出不能作为可分享证据。`.dockerignore` 只允许测试源码和 Git archive 构建副本，排除 secrets、历史运行证据和其他宿主内容。源归档与构建共用缓存由文件锁串行保护。
 
 ## 当前能力边界
+
+已完成的真实运行、需求覆盖、失败记录与冻结版本见 [交付与检查证据](RESULTS.md)。
 
 - 第一轮仅验证 OpenCode static gateway。native subscription、宿主登录态复用及其他 Runtime 的认证方式均为后续事项。
 - Work Folder 搜索部署真实 agent-knowledge 索引器与搜索服务，使用原生 keyword 模式；不依赖宿主搜索服务或 embedding 模型，vector 检索不在本轮覆盖范围。
