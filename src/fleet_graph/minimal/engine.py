@@ -367,11 +367,24 @@ def _merge_fn(wiring: _Wiring, release_head: str) -> Any:
 
 
 def _run_dd_seam(wiring: _Wiring, enroll_obj: dict[str, Any]) -> Any:
-    """The goalgraph ``run_dd`` seam: wire DDDeps and run one DD via ``ddgraph.run_dd``."""
+    """The goalgraph ``run_dd`` seam: wire DDDeps and run one DD via ``ddgraph.run_dd``.
 
-    def run_dd(dispatch_obj: dict[str, Any]) -> dict[str, Any]:
+    goalgraph calls the seam with the dispatch object only (a fresh DD: the id
+    is derived from the folded ``dd.dispatched`` count). The engine's §11
+    resume path additionally passes ``dd_id`` (the in-flight DD) plus
+    ``initial_state`` (the ``ddgraph.resume_entry`` fold) to re-enter the
+    ddgraph at the lost stage instead of starting a new DD.
+    """
+
+    def run_dd(
+        dispatch_obj: dict[str, Any],
+        *,
+        dd_id: str | None = None,
+        initial_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         repos = list(dispatch_obj.get("repos") or [])
-        dd_id = _next_dd_id(wiring.log)
+        if dd_id is None:
+            dd_id = _next_dd_id(wiring.log)
         first = repos[0]
         release_head = (
             gitgate.remote_tip(
@@ -405,6 +418,7 @@ def _run_dd_seam(wiring: _Wiring, enroll_obj: dict[str, Any]) -> Any:
             repos=repos,
             spec_text=dispatch_obj.get("spec_text") or "",
             acceptance_cmds=acceptance_cmds,
+            initial_state=initial_state,
         )
 
     return run_dd
@@ -713,6 +727,92 @@ def _state_mismatch(
     }
 
 
+def _dispatch_for_dd(events_list: list[events.Event], dd_id: str) -> dict[str, Any] | None:
+    """The dispatch object of the turn that spawned ``dd_id``, folded from the log.
+
+    The dispatching turn's ``goal.turn.finished`` payload carries the whole Stop
+    object — including ``dispatch`` — and always precedes ``dd.dispatched``
+    (stagerunner writes it inside the goal_turn node, before the graph routes to
+    the run_dd node), so the newest one before the DD's dispatch is the DD's
+    own dispatch. ``None`` when it cannot be folded — a log no real run
+    produces.
+    """
+    dd_seq = next(
+        (ev.seq for ev in events_list if ev.kind == "dd.dispatched" and ev.dd_id == dd_id),
+        None,
+    )
+    if dd_seq is None:
+        return None
+    for ev in reversed(events_list):
+        if ev.seq >= dd_seq:
+            continue
+        if ev.kind == "goal.turn.finished":
+            dispatch = (ev.payload or {}).get("dispatch")
+            if isinstance(dispatch, dict):
+                return dict(dispatch)
+    return None
+
+
+def _unconsumed_dd(events_list: list[events.Event]) -> str | None:
+    """The last dispatched DD id when its result never reached a next turn.
+
+    goalgraph consumes a DD's result the moment the *next* turn starts (its
+    ``goal.turn.in/1`` carries ``last_dd``). The last dispatched DD is therefore
+    unconsumed when no ``goal.turn.started`` follows its ``dd.dispatched``: it
+    either is still in flight (fold ``current_dd``, resumed elsewhere) or it
+    already resolved (``dd.merged`` / ``dd.failed``) and the crash lost the
+    handoff — the caller folds the result object and injects it, never
+    re-entering the graph (protocol §11).
+
+    Only the *last* dispatch is judged: a ``goal.turn.started`` that follows an
+    earlier DD's dispatch merely consumed that DD — a DD dispatched after it is
+    a fresh handoff that needs a later turn of its own, so the scan never stops
+    early and the answer is whether a turn started after the final dispatch.
+    """
+    dd_id: str | None = None
+    dispatch_seq = 0
+    for ev in events_list:
+        if ev.kind == "dd.dispatched" and ev.dd_id is not None:
+            dd_id = ev.dd_id
+            dispatch_seq = ev.seq
+        elif ev.kind == "goal.turn.started" and dd_id is not None and ev.seq > dispatch_seq:
+            dd_id = None
+    return dd_id
+
+
+def _dd_handoff(
+    initial_state: dict[str, Any], log: events.EventLog, result: dict[str, Any]
+) -> None:
+    """Inject a finished DD's result as the next turn's handoff (mirrors run_dd).
+
+    The same handoff goalgraph's ``run_dd`` node makes: the result lands in
+    ``last_dd`` with the one-line ``dd_summary`` (GO-17). The next turn number
+    is already right — ``resume_initial_state`` folded the dispatching turn's
+    ``goal.turn.started`` without the completed cycle, so ``turn_no + 1`` in the
+    goal graph equals what ``run_dd``'s ``+1`` would have stored.
+    """
+    history = events.fold(log.read()).dd_history
+    initial_state["last_dd"] = result
+    initial_state["dd_summary"] = goalgraph._one_line_dd_summary(history, result)
+
+
+def _resume_run_dd(
+    deps: goalgraph.GoalDeps,
+    dispatch_obj: dict[str, Any],
+    *,
+    dd_id: str,
+    initial_state: dict[str, Any],
+) -> dict[str, Any]:
+    """Re-enter the ddgraph at a §11 resume point through the ``run_dd`` seam.
+
+    The seam closure built by :func:`_run_dd_seam` accepts the resume-only
+    ``dd_id`` / ``initial_state`` kwargs; ``GoalDeps.run_dd`` types only the
+    fresh one-argument call goalgraph makes, so the wider call is made here.
+    """
+    run_dd: Any = deps.run_dd
+    return run_dd(dispatch_obj, dd_id=dd_id, initial_state=initial_state)
+
+
 def run_engine(
     goal_id: str,
     *,
@@ -739,17 +839,19 @@ def run_engine(
     and are non-terminal resume (protocol §11): the engine writes
     ``engine.resumed``, then dispatches on ``resume_point.action``:
     a lost ``goal_turn`` is re-run at the same turn number; an in-flight DD is
-    closed as ``lost_on_restart`` and handed back to the Goal Agent; any other
-    boundary continues to the next turn. A state-mismatch (a recorded
-    release_head/head_commit no longer reachable on the release branch) blocks
-    with ``goal.blocked(kind=state_mismatch)`` and exit 1 — never guessed at.
+    re-entered at its lost stage; any other boundary continues to the next
+    turn. A state-mismatch (a recorded release_head/head_commit no longer
+    reachable on the release branch) blocks with
+    ``goal.blocked(kind=state_mismatch)`` and exit 1 — never guessed at.
 
-    Scope note (deliberate deviation, protocol §11): per-stage in-flight DD
-    resume — re-entering the ddgraph at the lost stage — is *not* implemented
-    here (it needs a ddgraph initial-state seam, tracked as a separate DD).
-    The in-flight DD therefore ends immediately as ``failed`` with
-    ``detail=lost_on_restart`` and is handed back to the Goal Agent; this is a
-    temporary convergence, not a claim that §11 is fully implemented.
+    In-flight DD resume (protocol §11, per-stage): the lost agent run is
+    recorded as ``agent.failed(detail=lost_on_restart)``, ``ddgraph.resume_entry``
+    folds the DD's events into an entry node plus state overrides, and the
+    ddgraph is re-entered through the ``run_dd`` seam with ``initial_state`` —
+    already-finished stages (impl commits, CR / FR conclusions) are never
+    re-run. A DD that already resolved (``dd.merged`` / ``dd.failed``) but whose
+    handoff to the next turn the crash lost is not re-entered at all: its
+    folded result object is injected as the next turn's ``last_dd`` handoff.
     """
     try:
         run_root = runroot.goal_run_root(goal_id, engine_root=engine_root)
@@ -804,6 +906,7 @@ def run_engine(
         return EXIT_BLOCKED
 
     initial_state = resume_initial_state(events_list)
+    assert initial_state is not None  # non-empty + non-exit => never None
 
     if point.action == "restart_step" and point.stage == "goal_turn":
         deps.event_log.append("agent.failed", {"stage": "goal_turn", "detail": _LOST_ON_RESTART})
@@ -815,32 +918,57 @@ def run_engine(
         deps.event_log.append(
             "agent.failed", {"stage": stage, "detail": _LOST_ON_RESTART}, dd_id=dd_id
         )
-        deps.event_log.append(
-            "dd.failed",
-            {
-                "stage": stage,
-                "detail": (
-                    "lost_on_restart: per-stage in-flight DD resume (protocol §11) "
-                    "is out of scope for this DD (needs a ddgraph initial-state "
-                    "seam, tracked separately); the DD ends here and is handed back "
-                    "to the Goal Agent"
+        entry, dd_initial = ddgraph.resume_entry(events_list, dd_id)
+        dispatch_obj = _dispatch_for_dd(events_list, dd_id)
+        if dispatch_obj is None:
+            # not a log any real run produces (the dispatching turn's Stop
+            # object is gone): the DD cannot be re-entered, so close it as
+            # lost rather than guess at its repos / spec / acceptance.
+            deps.event_log.append(
+                "dd.failed",
+                {
+                    "stage": stage,
+                    "detail": (
+                        f"{_LOST_ON_RESTART}: dispatch object for {dd_id} could not be "
+                        "folded from the event log; the DD ends here and is handed "
+                        "back to the Goal Agent"
+                    ),
+                },
+                dd_id=dd_id,
+            )
+            _dd_handoff(
+                initial_state, deps.event_log, ddflow.build_dd_result(deps.event_log.read(), dd_id)
+            )
+            initial_state["warnings"] = [
+                *list(initial_state.get("warnings") or []),
+                (
+                    f"DD {dd_id} 在引擎恢复时于 stage {stage} 丢失（lost_on_restart），"
+                    "且其 dispatch 无法从事件日志折出，已以 failed 收场交回你决定"
                 ),
-            },
-            dd_id=dd_id,
-        )
-        result = ddflow.build_dd_result(list(deps.event_log.read()), dd_id)
-        assert initial_state is not None  # non-empty + non-exit => never None
-        initial_state["last_dd"] = result
-        initial_state["warnings"] = [
-            *list(initial_state.get("warnings") or []),
-            (
-                f"DD {dd_id} 在引擎恢复时于 stage {stage} 丢失（lost_on_restart），已以 "
-                "failed 收场交回你决定；逐 stage 续跑不在本 DD 范围"
-            ),
-        ]
-    # else: rerun_acceptance / next_step → straight into the next turn.
+            ]
+        elif entry == ddgraph.RESUME_TERMINAL:
+            # defensive: the fold said in-flight but the DD's events say it
+            # already resolved — take the result object, never re-enter.
+            _dd_handoff(initial_state, deps.event_log, ddflow.build_dd_result(events_list, dd_id))
+        else:
+            result = _resume_run_dd(
+                deps,
+                dispatch_obj,
+                dd_id=dd_id,
+                initial_state={"entry": entry, **dd_initial},
+            )
+            _dd_handoff(initial_state, deps.event_log, result)
+    else:
+        unconsumed = _unconsumed_dd(events_list)
+        if unconsumed is not None:
+            # the DD already resolved (dd.merged / dd.failed) but the crash
+            # lost the handoff: fold the result object into the next turn and
+            # never re-enter the graph (protocol §11).
+            _dd_handoff(
+                initial_state, deps.event_log, ddflow.build_dd_result(events_list, unconsumed)
+            )
+        # else: rerun_acceptance / next_step → straight into the next turn.
 
-    assert initial_state is not None  # non-empty + non-exit => never None
     result = goalgraph.run_goal(
         deps, goal_id=goal_id, enroll=enroll_obj, initial_state=initial_state
     )
