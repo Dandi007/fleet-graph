@@ -335,26 +335,56 @@ class Journal:
             loaded: dict[str, list[dict[str, Any]]] = {}
             for path in sorted(self.home.glob(f"{self.scope}-*.jsonl")):
                 goal = path.name[len(self.scope) + 1 : -len(".jsonl")]
-                raw_text = path.read_text(encoding="utf-8")
-                newline_terminated = raw_text.endswith("\n")
+                # Read *bytes* and split on newlines before decoding: a crash
+                # mid-``append`` can leave a torn multi-byte UTF-8 character at
+                # the tail, and decoding the whole file up front
+                # (``read_text(encoding='utf-8')``) would raise
+                # ``UnicodeDecodeError`` and throw away the valid prefix
+                # (behavior 7, P6). Decoding one newline-delimited chunk at a
+                # time preserves every complete record before the torn tail and
+                # isolates the undecodable fragment.
+                raw_bytes = path.read_bytes()
+                newline_terminated = raw_bytes.endswith(b"\n")
                 lines: list[dict[str, Any]] = []
-                tail_fragment: str | None = None
-                raw_lines = raw_text.split("\n")
-                for i, raw in enumerate(raw_lines):
-                    raw = raw.strip()
-                    if not raw:
+                tail_fragment: bytes | None = None
+                chunks = raw_bytes.split(b"\n")
+                for i, chunk in enumerate(chunks):
+                    # A torn tail is tolerated only at the *end*: the last
+                    # non-empty chunk is the fragment; anything after it is only
+                    # newline padding.
+                    is_last_nonempty = not any(c.strip() for c in chunks[i + 1 :])
+                    if not chunk.strip():
                         continue
                     try:
-                        record = json.loads(raw)
+                        text = chunk.decode("utf-8")
+                    except UnicodeDecodeError:
+                        # A torn multi-byte character. Only the trailing
+                        # fragment is tolerated -- it is isolated so the next
+                        # append writes a clean, standalone line. A mid-file
+                        # undecodable chunk is out-of-band corruption: archive it
+                        # (never silently drop it) and keep recovering any later
+                        # lines.
+                        if is_last_nonempty:
+                            tail_fragment = chunk
+                            break
+                        self._archive_corrupt(path, chunk)
+                        continue
+                    text = text.strip()
+                    if not text:
+                        continue
+                    try:
+                        record = json.loads(text)
                     except json.JSONDecodeError:
                         # Only the *trailing* fragment is tolerated. If any
                         # non-empty line follows this one, it is out-of-band
-                        # mid-file corruption: skip just this line (best
-                        # effort) rather than silently deleting later records.
-                        if any(ln.strip() for ln in raw_lines[i + 1 :]):
-                            continue
-                        tail_fragment = raw
-                        break
+                        # mid-file corruption: archive it (never silently drop
+                        # it) and skip just this line rather than silently
+                        # deleting later records.
+                        if is_last_nonempty:
+                            tail_fragment = chunk
+                            break
+                        self._archive_corrupt(path, chunk)
+                        continue
                     lines.append(record)
                 if tail_fragment is not None:
                     self._isolate_incomplete_tail(path, lines, tail_fragment)
@@ -376,15 +406,22 @@ class Journal:
         return self
 
     def _isolate_incomplete_tail(
-        self, path: Path, lines: list[dict[str, Any]], fragment: str
+        self, path: Path, lines: list[dict[str, Any]], fragment: bytes
     ) -> None:
         """Rewrite ``path`` as only its complete, newline-terminated records and
         archive the trailing fragment so a later ``append`` no longer writes
         after a partial line."""
         self._rewrite_clean(path, lines)
+        self._archive_corrupt(path, fragment)
+
+    def _archive_corrupt(self, path: Path, raw: bytes) -> None:
+        """Append raw journal bytes to the ``*.corrupt`` sidecar in binary mode,
+        so an undecodable partial UTF-8 fragment is preserved verbatim rather
+        than rounded through a text encoder. Torn / corrupt material is parked
+        here where it is observable, never silently dropped."""
         corrupt_path = path.with_suffix(path.suffix + ".corrupt")
-        with corrupt_path.open("a", encoding="utf-8") as fh:
-            fh.write(fragment + "\n")
+        with corrupt_path.open("ab") as fh:
+            fh.write(raw + b"\n")
 
     def _rewrite_clean(self, path: Path, lines: list[dict[str, Any]]) -> None:
         """Atomically rewrite ``path`` as its complete, newline-terminated
@@ -1596,7 +1633,14 @@ class GoalRequestKernel:
             return self._deliver(goal, action, call_id, request_id, run_id, index, caller=caller)
         action_id = str(prior.get("action_id") or self._action_id(call_id, index, action))
         existing = self._prior_result(goal, action_id)
-        if existing is not None and (existing.get("final") or existing.get("status") == DELIVERED):
+        # A prior result short-circuits only when the obligation is *closed*:
+        # ``delivered`` (fulfilled) or a definitive ``failed`` refusal (explicit
+        # disposition). A ``not_ready`` receipt is final for the *attempt* but is
+        # neither fulfilled nor disposed, so a later Goal-authorized replay must
+        # NOT replay to the stale ``not_ready`` answer -- it falls through to
+        # observe / re-deliver once a port is bound, exactly as ``unknown`` (or a
+        # retryable ``failed``) already does (P3/P4, behavior 4/7).
+        if existing is not None and self._delivery_retired(existing):
             return self._result(
                 action, action_id, existing["status"], existing.get("detail", ""), reconciled=True
             )

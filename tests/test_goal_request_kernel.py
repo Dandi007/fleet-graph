@@ -973,6 +973,40 @@ class TestIncompleteTailIsolation:
         requests = [e for e in again.list_events(GOAL)["events"] if e["record"] == RECORD_REQUEST]
         assert [r["request_id"] for r in requests] == ["A", "B"]
 
+    def test_multibyte_truncated_tail_is_isolated_without_losing_the_prefix(
+        self, tmp_path
+    ) -> None:
+        home = tmp_path / "journal"
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        kernel.activate_version(GOAL, "v1")
+        kernel.submit(GOAL, make_request("A"))
+        # B's record carries a multibyte string (ensure_ascii=False writes raw
+        # UTF-8); simulate a crash mid-way through its last character so the
+        # tail ends with a torn multi-byte sequence that read_text(utf-8) would
+        # reject outright.
+        kernel.submit(GOAL, make_request("B", input={"note": "你好世界"}))
+        path = home / "goal-wf-1.jsonl"
+        content = path.read_bytes()
+        needle = "你好世界".encode("utf-8")
+        idx = content.index(needle)
+        torn = content[: idx + len(needle) - 1]  # drop the last byte of the last char
+        path.write_bytes(torn)
+
+        # Byte-level load preserves the complete prefix (version + request A) and
+        # isolates the torn tail instead of raising UnicodeDecodeError.
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        assert rebuilt.active_version(GOAL) == "v1"
+        requests = [e for e in rebuilt.list_events(GOAL)["events"] if e["record"] == RECORD_REQUEST]
+        assert [r["request_id"] for r in requests] == ["A"]
+        assert path.with_suffix(path.suffix + ".corrupt").exists()
+
+        # A later append writes a clean standalone line that survives a second
+        # reconstruction beside the preserved prefix.
+        rebuilt.submit(GOAL, make_request("C", input={"note": "还好"}))
+        again = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        requests = [e for e in again.list_events(GOAL)["events"] if e["record"] == RECORD_REQUEST]
+        assert [r["request_id"] for r in requests] == ["A", "C"]
+
 
 # --- interrupted-call recovery (behavior 7 / P6) ------------------------------
 
@@ -1095,6 +1129,42 @@ class TestOutstandingDeliveries:
         # An empty ``done`` list from a later call cannot retire that obligation.
         run_one(kernel, make_request("B"), {"actions": [], "intent": "done"})
         assert [o["idempotency_key"] for o in kernel.outstanding_deliveries(GOAL)] == ["R"]
+
+    def test_a_not_ready_delivery_is_recoverable_by_goal_retry_after_rebuild(
+        self, tmp_path
+    ) -> None:
+        # A NOT_READY reply (unsupported capability) must not lock the original
+        # delivery obligation forever: after the product is rebuilt with an
+        # available reply port, a Goal that re-emits the same reply action (its
+        # stable idempotency_key) authorizes a fresh delivery that retires the
+        # original obligation, while a confirmed (delivered) action is never
+        # blindly re-sent.
+        home = tmp_path / "journal"
+        effects = FakeEffects()
+        effects.delivery[(ACTION_REPLY, "R")] = {
+            "ok": False,
+            "status": NOT_READY,
+            "detail": "no reply sink bound",
+        }
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=effects)
+        kernel.activate_version(GOAL, "v1")
+        first = run_one(kernel, make_request("A"), {"actions": [reply_action("R")]})
+        assert first["results"][0]["status"] == NOT_READY
+        assert [o["idempotency_key"] for o in kernel.outstanding_deliveries(GOAL)] == ["R"]
+
+        # Rebuild and bind an available reply port. The obligation survives the
+        # rebuild and is still attributed to the original action identity.
+        rebuilt_effects = FakeEffects()
+        rebuilt_effects.delivery[(ACTION_REPLY, "R")] = {"ok": True}
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=rebuilt_effects)
+        assert [o["idempotency_key"] for o in rebuilt.outstanding_deliveries(GOAL)] == ["R"]
+
+        # Goal retries the same reply (same idempotency_key): the delivery is
+        # re-attempted against the now-bound port and the obligation closes.
+        second = run_one(rebuilt, make_request("B"), {"actions": [reply_action("R")]})
+        assert second["results"][0]["status"] == DELIVERED
+        assert rebuilt.outstanding_deliveries(GOAL) == []
+        assert len(rebuilt_effects.replies) == 1
 
     def test_an_explicit_refusal_disposes_its_obligation(self) -> None:
         effects = FakeEffects()
