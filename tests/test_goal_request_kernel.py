@@ -767,6 +767,34 @@ class TestAddRepoDependency:
         result = run_one(kernel, make_request("A"), {"actions": [dispatch_action("k1")]})
         assert result["results"][0]["status"] == DELIVERED
 
+    def test_dispatch_ordered_before_same_list_add_repo_is_refused(self) -> None:
+        effects = FakeEffects()
+        kernel = make_kernel(effects)
+        # The dependency is identified before effects run: a dispatch for a
+        # repo whose add_repo only appears *later* in the same list must not
+        # execute ahead of admission.
+        result = run_one(
+            kernel,
+            make_request("A"),
+            {
+                "actions": [
+                    dispatch_action("k1", repo="repo-a"),
+                    {
+                        "kind": "add_repo",
+                        "idempotency_key": "ar1",
+                        "payload": {"repo_path": "repo-a"},
+                    },
+                ]
+            },
+        )
+        statuses = {r["kind"]: r for r in result["results"]}
+        assert statuses["dispatch"]["status"] == FAILED
+        assert statuses["dispatch"]["detail"].startswith("dependent dispatch refused")
+        # the later add_repo still ran and delivered independently of the refusal
+        assert statuses["add_repo"]["status"] == DELIVERED
+        assert effects.dispatches == []
+        assert len(effects.add_repos) == 1
+
 
 # --- stop authority over the in-flight result (behavior 5) --------------------
 
@@ -889,6 +917,38 @@ class TestInterruptedCallRecovery:
 
 
 # --- uncertain-outcome reconciliation (behavior 4) ----------------------------
+
+
+class TestOutstandingDeliveries:
+    def test_unresolved_reply_is_an_outstanding_obligation_across_calls(self) -> None:
+        effects = FakeEffects()
+        effects.delivery[(ACTION_REPLY, "R")] = {"ok": False, "status": UNKNOWN, "detail": "?"}
+        kernel = make_kernel(effects)
+        first = run_one(kernel, make_request("A"), {"actions": [reply_action("R")]})
+        assert first["results"][0]["status"] == UNKNOWN
+
+        # A second call that returns an empty done list must still see the
+        # unresolved reply as an outstanding delivery obligation.
+        assert len(kernel.outstanding_deliveries(GOAL)) == 1
+        run_one(kernel, make_request("B"), {"actions": [], "intent": "done"})
+        assert [o["idempotency_key"] for o in kernel.outstanding_deliveries(GOAL)] == ["R"]
+
+    def test_a_delivered_action_retires_its_obligation(self, tmp_path) -> None:
+        home = tmp_path / "journal"
+        effects = FakeEffects()
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=effects)
+        kernel.activate_version(GOAL, "v1")
+        effects.delivery[(ACTION_REPLY, "R")] = {"ok": False, "status": UNKNOWN}
+        run_one(kernel, make_request("A"), {"actions": [reply_action("R")]})
+        assert len(kernel.outstanding_deliveries(GOAL)) == 1
+
+        # A rebuilt product reconstructs the same obligation from the journal,
+        # then resolving it (a confirmed observation) retires it.
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        assert len(rebuilt.outstanding_deliveries(GOAL)) == 1
+        rebuilt.effects.observations[(ACTION_REPLY, "R")] = OBSERVED_CONFIRMED  # type: ignore[union-attr]
+        run_one(rebuilt, make_request("B"), {"actions": [reply_action("R")]})
+        assert rebuilt.outstanding_deliveries(GOAL) == []
 
 
 class TestUncertainReconciliation:

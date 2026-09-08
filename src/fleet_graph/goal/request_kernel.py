@@ -906,9 +906,18 @@ class GoalRequestKernel:
 
         results: list[dict[str, Any]] = []
         # P1 same-list dependency: a ``dispatch`` is only admitted for a
-        # repository whose same-list ``add_repo`` succeeded first. A refused or
-        # lost admission blocks the dependent dispatch without erasing the
-        # independent results already delivered in this list.
+        # repository whose same-list ``add_repo`` succeeded first. The set of
+        # repos the whole list must admit is identified *before* any effect
+        # runs, so a dispatch ordered ahead of its ``add_repo`` (or after a
+        # failed one) is refused rather than executing before admission. A
+        # refused or lost admission blocks the dependent dispatch without
+        # erasing the independent results already delivered in this list.
+        admission_required = {
+            str((a.get("payload") or {}).get("repo_path") or "")
+            for a in consumable
+            if a["kind"] == ACTION_ADD_REPO
+            and (a.get("payload") or {}).get("repo_path")
+        }
         repo_admission: dict[str, str] = {}
         for position, action in enumerate(consumable, start=1):
             if self._mode_of(goal) == MODE_STOPPED:
@@ -936,8 +945,7 @@ class GoalRequestKernel:
                 continue
             if action["kind"] == ACTION_DISPATCH:
                 repo = str((action.get("payload") or {}).get("repo_path") or "")
-                admission = repo_admission.get(repo)
-                if admission is not None and admission != DELIVERED:
+                if repo in admission_required and repo_admission.get(repo) != DELIVERED:
                     results.append(
                         self._refuse(
                             goal,
@@ -1152,6 +1160,39 @@ class GoalRequestKernel:
             if line.get("record") == RECORD_ACTION_RESULT and line.get("action_id") == action_id:
                 found = line
         return found
+
+    def outstanding_deliveries(self, goal: str) -> list[dict[str, Any]]:
+        """The goal's actions whose delivery is still unresolved.
+
+        A delivery obligation is born when an action intent is recorded and is
+        retired only by a *final* result record for that same action identity.
+        ``delivered`` and a definitive ``not_ready`` refusal are final, while a
+        ``failed`` or ``unknown`` result (``final`` falsy) is retryable or
+        uncertain and stays outstanding until it is resolved. Derived purely
+        from the durable journal, so a rebuilt product reconstructs the same
+        obligations (P4): ``done`` must not complete while any are outstanding.
+        """
+        latest: dict[str, dict[str, Any]] = {}
+        for line in self.journal.scan(goal):
+            action_id = str(line.get("action_id") or "")
+            if not action_id:
+                continue
+            if line.get("record") == RECORD_ACTION:
+                latest.setdefault(action_id, {"intent": line, "result": None})
+            elif line.get("record") == RECORD_ACTION_RESULT:
+                entry = latest.setdefault(action_id, {"intent": None, "result": None})
+                entry["result"] = line
+        outstanding: list[dict[str, Any]] = []
+        for action_id, entry in latest.items():
+            result = entry["result"]
+            if result is None or not result.get("final"):
+                intent = entry["intent"] or {}
+                record = dict(intent)
+                record["action_id"] = action_id
+                if result is not None:
+                    record["latest_status"] = result.get("status")
+                outstanding.append(record)
+        return outstanding
 
     def _result_record(
         self,

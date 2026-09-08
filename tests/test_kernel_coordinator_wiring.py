@@ -16,8 +16,10 @@ from typing import Any
 
 from fleet_graph.goal.request_kernel import (
     ACTION_DISPATCH,
+    ACTION_REPLY,
     DELIVERED,
     KIND_MESSAGE,
+    UNKNOWN,
     GoalRequestKernel,
     Journal,
 )
@@ -196,6 +198,53 @@ def test_waiting_result_does_not_suppress_queued_requests() -> None:
     # A returned waiting, but the queued B behind it was still serviced.
     assert len(call.prompts) == 2
     assert verdict["verdict"] == "done"
+
+
+class UnresolvedReplyEffects(KernelEffectPorts):
+    """An effect port whose reply returns UNKNOWN: the delivery is outstanding
+    and must keep a later ``done`` pending (P4)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.replies: list[dict[str, Any]] = []
+
+    def reply(self, payload: dict[str, Any], *, ctx: dict[str, Any]) -> dict[str, Any]:
+        self.replies.append({"payload": payload, "ctx": dict(ctx)})
+        return {"ok": False, "status": UNKNOWN, "detail": "outcome unknown"}
+
+
+def test_done_stays_pending_while_a_prior_reply_is_unresolved() -> None:
+    # Two queued messages: A requests a reply that returns UNKNOWN, B returns an
+    # empty done list. The drained turn must NOT complete done while A's reply
+    # delivery is still outstanding (P4).
+    call = SequenceGoalCall(
+        [
+            {
+                "actions": [
+                    {
+                        "kind": ACTION_REPLY,
+                        "idempotency_key": "R",
+                        "payload": {"text": "hi", "to": "line-a"},
+                    }
+                ]
+            },
+            {"actions": [], "intent": "done"},
+        ]
+    )
+    effects = UnresolvedReplyEffects()
+    coordinator = make_coordinator(goal_call=call)
+    coordinator.kernel.effects = effects
+    inbox = [
+        {"message_id": "m-A", "from_agent_id": "line-a", "body": "msg A"},
+        {"message_id": "m-B", "from_agent_id": "line-b", "body": "msg B"},
+    ]
+
+    verdict = coordinator.turn(1, {"folder_id": GOAL, "inbox_messages": inbox})
+
+    assert len(call.prompts) == 2  # both messages were serviced, not suppressed
+    assert verdict["verdict"] == "blocked"  # done was not declared
+    assert "outstanding" in verdict["reason"]
+    assert len(effects.replies) == 1
 
 
 def test_done_intent_with_an_unfulfilled_action_stays_pending() -> None:

@@ -243,7 +243,7 @@ class KernelCoordinator:
             result = self.kernel.finish_goal_call(
                 self.folder_id, call["call_id"], call.get("stop_list") or {}
             )
-            return _to_verdict(result)
+            return _to_verdict(result, self.kernel, self.folder_id)
 
         record = call.get("request") if isinstance(call.get("request"), dict) else {}
         request = Request(
@@ -268,7 +268,7 @@ class KernelCoordinator:
             }
         stop_list = self.goal_call.call(self.folder_id, prompt)
         result = self.kernel.finish_goal_call(self.folder_id, call["call_id"], stop_list)
-        return _to_verdict(result)
+        return _to_verdict(result, self.kernel, self.folder_id)
 
     def _history(self, current_request_id: str) -> list[Request]:
         """Prior requests for the goal, as pointers (never re-appended text)."""
@@ -300,7 +300,11 @@ def _parked_verdict(kernel: GoalRequestKernel, goal: str) -> dict[str, Any]:
     }
 
 
-def _to_verdict(result: dict[str, Any]) -> dict[str, Any]:
+def _to_verdict(
+    result: dict[str, Any],
+    kernel: GoalRequestKernel | None = None,
+    goal: str | None = None,
+) -> dict[str, Any]:
     """Map a ``finish_goal_call`` result back to the graph's verdict surface."""
     if result.get("suspended"):
         # An immediate stop suspended the in-flight result's unstarted effects:
@@ -319,17 +323,22 @@ def _to_verdict(result: dict[str, Any]) -> dict[str, Any]:
 
     if intent == "done":
         incomplete = len(failed) + len(malformed)
-        if incomplete:
+        outstanding = kernel.outstanding_deliveries(goal) if (kernel is not None and goal) else []
+        if incomplete or outstanding:
             # P4: ``done`` is an intent, never a terminal shortcut -- an
             # undelivered dispatch/reply or a malformed entry keeps the line
-            # pending rather than completing it.
+            # pending, and so does any earlier call's unresolved delivery (a
+            # reply that returned UNKNOWN, a dispatch that failed) that must
+            # not be forgotten once the fence moves to the next request.
+            clauses: list[str] = []
+            if incomplete:
+                clauses.append(f"{incomplete} receipt(s) from this call are incomplete")
+            if outstanding:
+                clauses.append(f"{len(outstanding)} delivery obligation(s) are still outstanding")
             return {
                 "verdict": "blocked",
                 "waiting_on": "none",
-                "reason": (
-                    f"goal declared done but {incomplete} delivery receipt(s) "
-                    "are incomplete; line remains pending"
-                ),
+                "reason": "goal declared done but " + "; ".join(clauses) + "; line remains pending",
             }
         return {
             "verdict": "done",
