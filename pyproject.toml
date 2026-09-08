@@ -12,6 +12,8 @@ dependencies = [
 
 [project.scripts]
 fleet-graph = "fleet_graph.cli:main"
+fleet-graph-minimal-engine = "fleet_graph.minimal.engine:main"
+fleet-graph-minimal-mcp = "fleet_graph.minimal.mcpserver:main"
 
 [dependency-groups]
 dev = [

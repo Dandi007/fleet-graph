@@ -25,6 +25,7 @@ stdout/stderr 重定向到 ``<goal_run_root>/engine.log``。GO-16：崩溃的 go
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -331,10 +332,28 @@ def serve(stdin: Iterable[str], stdout: TextIO, ctx: ServerContext) -> None:
         stdout.flush()
 
 
-def main() -> None:
-    """``python -m fleet_graph.minimal.mcpserver`` 的入口。"""
-    engine_root = os.environ.get("FLEET_ENGINE_ROOT", runroot.DEFAULT_ENGINE_ROOT)
-    serve(sys.stdin, sys.stdout, ServerContext(engine_root=engine_root))
+def build_parser() -> argparse.ArgumentParser:
+    """``fleet-graph-minimal-mcp`` 的 CLI 形状：只有一个 ``--engine-root`` flag。"""
+    parser = argparse.ArgumentParser(
+        prog="fleet-graph-minimal-mcp",
+        description="run the minimal MCP stdio server (JSON-RPC 2.0, one JSON per line)",
+    )
+    parser.add_argument(
+        "--engine-root",
+        default=os.environ.get("FLEET_ENGINE_ROOT", runroot.DEFAULT_ENGINE_ROOT),
+        help="the engine state root goal run roots live under "
+        "(default: $FLEET_ENGINE_ROOT or %(default)s)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``fleet-graph-minimal-mcp`` / ``python -m fleet_graph.minimal.mcpserver``
+    的入口：解析 ``--engine-root``（缺省回退 ``FLEET_ENGINE_ROOT`` 环境变量）、
+    调既有 :func:`serve`，仅此而已——不含任何新的服务语义。"""
+    args = build_parser().parse_args(argv)
+    serve(sys.stdin, sys.stdout, ServerContext(engine_root=args.engine_root))
+    return 0
 
 
 __all__ = [
@@ -359,4 +378,4 @@ __all__ = [
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
