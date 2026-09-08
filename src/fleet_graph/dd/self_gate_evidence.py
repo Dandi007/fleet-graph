@@ -658,7 +658,40 @@ def collect_standard_gate_evidence(
         committed = run_git(ctx.workspace, "show", f"{ctx.head}:{ACCEPTANCE_PATH}", check=True)
         accepted = json.loads(committed.stdout)
         commands = ctx.record.get("acceptance_commands") or []
-        frozen = _obligation_acceptance_frozen(ctx, all_receipts)
+        # 标准协议以服务端准入/正式重配及随验收封存的 run-config 为权威。
+        # SPEC 的 prose 不等于空命令；实现者的额外检查也不改变验收 argv。
+        from fleet_graph.dd.bootstrap import SPEC_PATH
+        from fleet_graph.graphs.dd_scripts import RUN_CONFIG_PATH
+        import hashlib
+
+        spec_bytes = run_git(ctx.workspace, "show", f"{ctx.head}:{SPEC_PATH}", check=True).stdout.encode()
+        config = json.loads(run_git(
+            ctx.workspace, "show", f"{ctx.head}:{RUN_CONFIG_PATH}", check=True
+        ).stdout)
+        declaration_matches = all(
+            config.get(key, default) == ctx.record.get(key, default)
+            for key, default in (("acceptance_commands", []), ("setup_commands", []), ("acceptance_env", {}))
+        )
+        spec_commands = spec_acceptance_argv(ctx.workspace)
+        authorized_reconfiguration = any(
+            "acceptance_commands" in change.get("changed", [])
+            for change in ctx.record.get("reconfigures", [])
+        )
+        checks = impl.get("verification_record", {}).get("verification_commands", [])
+        declared_checks = [entry.get("argv") for entry in checks]
+        checks_passed = bool(checks) and all(entry.get("exit_code") == 0 for entry in checks)
+        frozen_ok = (
+            declaration_matches
+            and "sha256:" + hashlib.sha256(spec_bytes).hexdigest() == ctx.record.get("spec_digest")
+            and (not spec_commands or spec_commands == commands or authorized_reconfiguration)
+            and checks_passed
+            and all(command in declared_checks for command in commands)
+        )
+        frozen = EvidenceItem(
+            EVIDENCE_ACCEPTANCE_FROZEN, "已封存的准入/重配与验收命令一致", frozen_ok,
+            f"run_config_matches={declaration_matches}; implement_checks_passed={checks_passed}; "
+            f"declared={commands}; additional_checks={[x for x in declared_checks if x not in commands]}",
+        )
         actual_commands = [r.get("command") for r in accepted.get("results", [])]
         if not (
             accepted.get("passed") is True

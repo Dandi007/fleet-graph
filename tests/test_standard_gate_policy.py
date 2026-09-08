@@ -11,7 +11,7 @@ from fleet_graph.dd.bootstrap import SPEC_PATH
 from fleet_graph.dd.gate_policy import LEGACY, STANDARD, policy_from_spec
 from fleet_graph.dd.self_gate_evidence import STAGE_RECEIPT_FILES, collect_standard_gate_evidence
 from fleet_graph.dd.upstream_constants import compute_json_digest
-from fleet_graph.graphs.dd_scripts import ACCEPTANCE_PATH
+from fleet_graph.graphs.dd_scripts import ACCEPTANCE_PATH, RUN_CONFIG_PATH
 
 
 @pytest.fixture
@@ -47,6 +47,10 @@ def subject(tmp_path):
     }
     (repo / ACCEPTANCE_PATH).parent.mkdir(parents=True, exist_ok=True)
     (repo / ACCEPTANCE_PATH).write_text(json.dumps(accepted))
+    (repo / RUN_CONFIG_PATH).write_text(json.dumps({
+        "acceptance_commands": commands, "acceptance_env": {"CHECK_VALUE": "expected"},
+        "setup_commands": [["sh", "-c", "touch setup-ready"]],
+    }))
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "封存程序验收")
     record = {
@@ -73,7 +77,7 @@ def subject(tmp_path):
             "spec_digest": record["spec_digest"],
             "verdict": "APPROVE",
             "implementation_subject_commit": outputs["implement"],
-            "verification_record": {"verification_commands": [{"argv": commands[0]}]},
+            "verification_record": {"verification_commands": [{"argv": commands[0], "exit_code": 0}]},
         }
         filename = run / "state/receipts/g1-a1" / STAGE_RECEIPT_FILES[stage]
         filename.parent.mkdir(parents=True, exist_ok=True)
@@ -201,3 +205,34 @@ def test_policy_declaration_and_unknown_are_explicit():
         policy_from_spec(
             b"```dd-gate-policy\ndd-standard-v1\n```\n```dd-gate-policy\nlegacy-six-v1\n```"
         )
+
+
+def test_additional_successful_check_does_not_change_acceptance(subject):
+    path=subject.receipts["implement"]
+    receipt=json.loads(path.read_text())
+    receipt["verification_record"]["verification_commands"].append({"argv":["extra-guard"],"exit_code":0})
+    path.write_text(json.dumps(receipt))
+    subject.record["receipt_digests"]["implement"]=compute_json_digest(receipt)
+    assert all(x.passed for x in collect(subject))
+
+
+@pytest.mark.parametrize("change", ["missing", "failure"])
+def test_missing_or_failed_implementation_check_refuses(subject,change):
+    path=subject.receipts["implement"];receipt=json.loads(path.read_text())
+    checks=receipt["verification_record"]["verification_commands"]
+    if change=="missing": checks.clear()
+    else: checks.append({"argv":["extra-guard"],"exit_code":1})
+    path.write_text(json.dumps(receipt))
+    subject.record["receipt_digests"]["implement"]=compute_json_digest(receipt)
+    assert not {x.id:x for x in collect(subject)}["acceptance_frozen"].passed
+
+
+def test_prose_spec_uses_committed_declared_commands(subject):
+    spec="# 已批准的 prose SPEC\n"
+    (subject.repo/SPEC_PATH).write_text(spec)
+    git(subject.repo,"add","-A");git(subject.repo,"commit","-qm","prose declaration")
+    subject.record["spec_digest"]="sha256:"+hashlib.sha256(spec.encode()).hexdigest()
+    for stage,path in subject.receipts.items():
+        receipt=json.loads(path.read_text());receipt["spec_digest"]=subject.record["spec_digest"]
+        path.write_text(json.dumps(receipt));subject.record["receipt_digests"][stage]=compute_json_digest(receipt)
+    assert all(x.passed for x in collect(subject))
