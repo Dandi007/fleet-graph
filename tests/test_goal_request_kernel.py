@@ -90,6 +90,15 @@ class FakeEffects:
         return self._lookup(ACTION_REPLY, str(ctx.get("idempotency_key") or ""), {"ok": True})
 
 
+class RaisingEffects(FakeEffects):
+    """An effect port that raises mid-dispatch: the true downstream state is
+    unknown, so the resulting FAILED outcome must stay reconcilable."""
+
+    def dispatch(self, payload: dict[str, Any], *, ctx: dict[str, Any]) -> dict[str, Any]:
+        self.dispatches.append({"payload": payload, "ctx": dict(ctx)})
+        raise RuntimeError("boom")
+
+
 class FakeRuntime:
     """A runtime control port that records stop/resume and can be told how a
     cancellation request came back."""
@@ -759,3 +768,141 @@ class TestStopAuthority:
         assert kernel.next_goal_call(GOAL) is None
         kernel.resume(GOAL)
         assert kernel.next_goal_call(GOAL) is None  # now running, queue empty
+
+
+# --- incomplete-tail isolation (finding: tail fragment hides the next append) ---
+
+
+class TestIncompleteTailIsolation:
+    def test_incomplete_tail_is_isolated_before_a_further_append(self, tmp_path) -> None:
+        home = tmp_path / "journal"
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        kernel.activate_version(GOAL, "v1")
+        path = home / "goal-wf-1.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write('{"record": "request", "goal": "wf-1", "requ')
+
+        # First reconstruction isolates the fragment; the journal ends cleanly.
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        assert rebuilt.active_version(GOAL) == "v1"
+        assert path.with_suffix(path.suffix + ".corrupt").exists()
+
+        # A later append writes a clean, standalone line that survives a second
+        # reconstruction instead of concatenating onto the orphaned fragment.
+        rebuilt.submit(GOAL, make_request("A"))
+        again = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        requests = [e for e in again.list_events(GOAL)["events"] if e["record"] == RECORD_REQUEST]
+        assert [r["request_id"] for r in requests] == ["A"]
+
+
+# --- interrupted-call recovery (behavior 7 / P6) ------------------------------
+
+
+class TestInterruptedCallRecovery:
+    def test_a_call_without_result_requeues_its_request(self, tmp_path) -> None:
+        home = tmp_path / "journal"
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        kernel.activate_version(GOAL, "v1")
+        kernel.submit(GOAL, make_request("A"))
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None
+        # crash after RECORD_CALL, before any result or call_result
+
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        nxt = rebuilt.next_goal_call(GOAL)
+        assert nxt is not None and nxt["request_id"] == "A"
+
+    def test_interrupted_call_recovers_delivered_effect_without_re_running(self, tmp_path) -> None:
+        home = tmp_path / "journal"
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        kernel.activate_version(GOAL, "v1")
+        kernel.submit(GOAL, make_request("A"))
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None
+        # Simulate one effect delivered + its result durably persisted, then a
+        # crash before RECORD_CALL_RESULT was written.
+        call_id = call["call_id"]
+        action_id = f"{call_id}:1:dispatch:k1"
+        kernel.journal.append(
+            GOAL,
+            {
+                "record": RECORD_ACTION,
+                "goal": GOAL,
+                "action_id": action_id,
+                "call_id": call_id,
+                "request_id": "A",
+                "run_id": call["run_id"],
+                "list_index": 1,
+                "kind": ACTION_DISPATCH,
+                "payload": dispatch_action("k1")["payload"],
+                "idempotency_key": "k1",
+            },
+        )
+        kernel.journal.append(
+            GOAL,
+            {
+                "record": RECORD_ACTION_RESULT,
+                "goal": GOAL,
+                "action_id": action_id,
+                "request_id": "A",
+                "run_id": call["run_id"],
+                "list_index": 1,
+                "kind": ACTION_DISPATCH,
+                "status": DELIVERED,
+                "detail": "",
+                "final": True,
+            },
+        )
+
+        effects2 = FakeEffects()
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=effects2)
+        nxt = rebuilt.next_goal_call(GOAL)
+        assert nxt is not None and nxt["request_id"] == "A"
+        outcome = rebuilt.finish_goal_call(
+            GOAL, nxt["call_id"], {"actions": [dispatch_action("k1")]}
+        )
+        assert outcome["results"][0]["status"] == DELIVERED
+        assert outcome["results"][0]["reconciled"] is True
+        assert effects2.dispatches == []  # the confirmed effect is not re-run
+
+
+# --- uncertain-outcome reconciliation (behavior 4) ----------------------------
+
+
+class TestUncertainReconciliation:
+    def test_persisted_unknown_reconciles_to_confirmed(self) -> None:
+        effects = FakeEffects()
+        kernel = make_kernel(effects)
+        effects.delivery[(ACTION_REPLY, "R")] = {"ok": False, "status": UNKNOWN, "detail": "?"}
+        first = run_one(kernel, make_request("A"), {"actions": [reply_action("R")]})
+        assert first["results"][0]["status"] == UNKNOWN
+
+        effects.observations[(ACTION_REPLY, "R")] = OBSERVED_CONFIRMED
+        replay = run_one(kernel, make_request("B"), {"actions": [reply_action("R")]})
+        assert replay["results"][0]["status"] == DELIVERED
+        assert replay["results"][0]["reconciled"] is True
+        assert len(effects.replies) == 1  # never re-sent
+
+    def test_persisted_unknown_re_delivers_when_absent(self) -> None:
+        effects = FakeEffects()
+        kernel = make_kernel(effects)
+        effects.delivery[(ACTION_REPLY, "R")] = {"ok": False, "status": UNKNOWN}
+        first = run_one(kernel, make_request("A"), {"actions": [reply_action("R")]})
+        assert first["results"][0]["status"] == UNKNOWN
+
+        effects.delivery[(ACTION_REPLY, "R")] = {"ok": True}
+        effects.observations[(ACTION_REPLY, "R")] = OBSERVED_ABSENT
+        replay = run_one(kernel, make_request("B"), {"actions": [reply_action("R")]})
+        assert replay["results"][0]["status"] == DELIVERED
+        assert len(effects.replies) == 2  # first send + one re-delivery
+
+    def test_exception_during_delivery_is_reconcilable(self) -> None:
+        effects = RaisingEffects()
+        kernel = make_kernel(effects)
+        first = run_one(kernel, make_request("A"), {"actions": [dispatch_action("K")]})
+        assert first["results"][0]["status"] == FAILED
+
+        effects.observations[(ACTION_DISPATCH, "K")] = OBSERVED_CONFIRMED
+        replay = run_one(kernel, make_request("B"), {"actions": [dispatch_action("K")]})
+        assert replay["results"][0]["status"] == DELIVERED
+        assert replay["results"][0]["reconciled"] is True

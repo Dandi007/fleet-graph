@@ -319,8 +319,10 @@ class Journal:
 
         Idempotent: re-running replaces the in-memory lines with what is on
         disk, so a rebuilt product reconstructs the same durable state. A
-        trailing partially-written line (a crash mid-``append``) is skipped as
-        an incomplete tail rather than faulting the whole journal (P6).
+        trailing partially-written line (a crash mid-``append``) is isolated
+        into a ``*.jsonl.corrupt`` sidecar and removed from the live journal so
+        the next ``append`` writes a clean, standalone line instead of
+        concatenating onto the fragment (P6).
         """
         if self.home is None:
             return self
@@ -328,19 +330,28 @@ class Journal:
             loaded: dict[str, list[dict[str, Any]]] = {}
             for path in sorted(self.home.glob(f"{self.scope}-*.jsonl")):
                 goal = path.name[len(self.scope) + 1 : -len(".jsonl")]
+                raw_text = path.read_text(encoding="utf-8")
                 lines: list[dict[str, Any]] = []
-                with path.open("r", encoding="utf-8") as fh:
-                    for raw in fh:
-                        raw = raw.strip()
-                        if not raw:
+                tail_fragment: str | None = None
+                raw_lines = raw_text.split("\n")
+                for i, raw in enumerate(raw_lines):
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        record = json.loads(raw)
+                    except json.JSONDecodeError:
+                        # Only the *trailing* fragment is tolerated. If any
+                        # non-empty line follows this one, it is out-of-band
+                        # mid-file corruption: skip just this line (best
+                        # effort) rather than silently deleting later records.
+                        if any(ln.strip() for ln in raw_lines[i + 1 :]):
                             continue
-                        try:
-                            record = json.loads(raw)
-                        except json.JSONDecodeError:
-                            # Incomplete tail: the process died mid-append.
-                            # Skip the trailing fragment; it is recoverable.
-                            continue
-                        lines.append(record)
+                        tail_fragment = raw
+                        break
+                    lines.append(record)
+                if tail_fragment is not None:
+                    self._isolate_incomplete_tail(path, lines, tail_fragment)
                 loaded[goal] = lines
             self._lines = loaded
             self._seq = {}
@@ -349,6 +360,20 @@ class Journal:
                     (int(r.get("seq", 0)) for r in lines if "seq" in r), default=0
                 )
         return self
+
+    def _isolate_incomplete_tail(
+        self, path: Path, lines: list[dict[str, Any]], fragment: str
+    ) -> None:
+        """Rewrite ``path`` as only its complete, newline-terminated records and
+        archive the trailing fragment so a later ``append`` no longer writes
+        after a partial line."""
+        clean = "".join(
+            json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in lines
+        )
+        path.write_text(clean, encoding="utf-8")
+        corrupt_path = path.with_suffix(path.suffix + ".corrupt")
+        with corrupt_path.open("a", encoding="utf-8") as fh:
+            fh.write(fragment + "\n")
 
     def _next_seq(self, goal: str) -> int:
         seq = self._seq.get(goal, 0) + 1
@@ -543,8 +568,11 @@ class GoalRequestKernel:
         Rebuilds the version map, the lifecycle mode, the unserved request
         queue and the ownership fence from the journal lines alone, so a rebuilt
         product does not lose accepted requests, forget a stop, or re-run an
-        already-confirmed effect (behaviors 1/4/7, P6). Called automatically at
-        construction; safe to re-run.
+        already-confirmed effect (behaviors 1/4/7, P6). A call whose result was
+        never written is an interruption: its request is re-queued and the fence
+        dropped so the rebuilt product serves the goal again rather than leaving
+        it fenced forever (behavior 7). Called automatically at construction;
+        safe to re-run.
         """
         self.journal.load()
         self._versions = {}
@@ -556,6 +584,7 @@ class GoalRequestKernel:
             mode = MODE_RUNNING
             called: set[str] = set()
             current_call: str | None = None
+            current_call_request: str | None = None
             for line in lines:
                 record = line.get("record")
                 if record == RECORD_VERSION:
@@ -565,12 +594,20 @@ class GoalRequestKernel:
                 elif record == RECORD_CALL:
                     called.add(str(line.get("request_id") or ""))
                     current_call = str(line.get("call_id") or "") or None
+                    current_call_request = str(line.get("request_id") or "") or None
                 elif (
                     record == RECORD_CALL_RESULT
                     and current_call is not None
                     and line.get("call_id") == current_call
                 ):
                     current_call = None
+                    current_call_request = None
+            # A call whose result was never written was interrupted. Re-queue
+            # its request and release the fence (no live call survives a
+            # rebuild); already-confirmed effects reconcile on replay.
+            if current_call is not None and current_call_request:
+                called.discard(current_call_request)
+                current_call = None
             queue = [
                 line
                 for line in lines
@@ -786,6 +823,7 @@ class GoalRequestKernel:
                     str(receipt.get("kind") or ""),
                     FAILED,
                     str(receipt.get("reason") or "malformed action"),
+                    final=True,
                 ),
             )
         raw_actions = stop_list.get("actions") if isinstance(stop_list, dict) else None
@@ -893,10 +931,15 @@ class GoalRequestKernel:
             return self._deliver(goal, action, call_id, request_id, run_id, index, caller=caller)
         action_id = str(prior.get("action_id") or self._action_id(call_id, index, action))
         existing = self._prior_result(goal, action_id)
-        if existing is not None:
+        if existing is not None and (existing.get("final") or existing.get("status") == DELIVERED):
             return self._result(
                 action, action_id, existing["status"], existing.get("detail", ""), reconciled=True
             )
+        # No durable result, or an uncertain / retryable one (an UNKNOWN reply,
+        # or a FAILED that was never confirmed downstream): reconcile through
+        # the external-effect observe port before deciding, so a later
+        # confirmation is not locked out by a stale UNKNOWN/FAILED receipt
+        # (behavior 4).
         observed = self.effects.observe(kind, key)  # type: ignore[union-attr]
         if observed == OBSERVED_CONFIRMED:
             self.journal.append(
@@ -910,6 +953,7 @@ class GoalRequestKernel:
                     kind,
                     DELIVERED,
                     "already confirmed downstream; not re-run",
+                    final=True,
                 ),
             )
             return self._result(
@@ -949,10 +993,11 @@ class GoalRequestKernel:
         return None
 
     def _prior_result(self, goal: str, action_id: str) -> dict[str, Any] | None:
+        found: dict[str, Any] | None = None
         for line in self.journal.scan(goal):
             if line.get("record") == RECORD_ACTION_RESULT and line.get("action_id") == action_id:
-                return line
-        return None
+                found = line
+        return found
 
     def _result_record(
         self,
@@ -966,6 +1011,7 @@ class GoalRequestKernel:
         detail: str,
         *,
         delivery: dict[str, Any] | None = None,
+        final: bool = False,
     ) -> dict[str, Any]:
         record: dict[str, Any] = {
             "record": RECORD_ACTION_RESULT,
@@ -977,6 +1023,7 @@ class GoalRequestKernel:
             "kind": kind,
             "status": status,
             "detail": detail,
+            "final": final,
             "at": _iso(self.clock),
         }
         if isinstance(delivery, dict):
@@ -1001,24 +1048,26 @@ class GoalRequestKernel:
         caller: str = "",
         action_id: str | None = None,
     ) -> dict[str, Any]:
+        is_replay = action_id is not None
         action_id = action_id or self._action_id(call_id, index, action)
-        self.journal.append(
-            goal,
-            {
-                "record": RECORD_ACTION,
-                "goal": goal,
-                "action_id": action_id,
-                "call_id": call_id,
-                "request_id": request_id,
-                "caller": caller,
-                "run_id": run_id,
-                "list_index": index,
-                "kind": action["kind"],
-                "payload": action["payload"],
-                "idempotency_key": action["idempotency_key"],
-                "at": _iso(self.clock),
-            },
-        )
+        if not is_replay:
+            self.journal.append(
+                goal,
+                {
+                    "record": RECORD_ACTION,
+                    "goal": goal,
+                    "action_id": action_id,
+                    "call_id": call_id,
+                    "request_id": request_id,
+                    "caller": caller,
+                    "run_id": run_id,
+                    "list_index": index,
+                    "kind": action["kind"],
+                    "payload": action["payload"],
+                    "idempotency_key": action["idempotency_key"],
+                    "at": _iso(self.clock),
+                },
+            )
         ctx = {
             "goal": goal,
             "request_id": request_id,
@@ -1032,13 +1081,31 @@ class GoalRequestKernel:
             delivery = method(action["payload"], ctx=ctx)
         except Exception as exc:  # an effect fault is a fact, never a crash
             delivery = {"ok": False, "status": FAILED, "detail": f"{type(exc).__name__}: {exc}"}
+            raised = True
+        else:
+            raised = False
         if not isinstance(delivery, dict):
             delivery = {"ok": False, "status": FAILED, "detail": "effect port returned a non-dict"}
+            raised = True
         status = delivery.get("status")
         if delivery.get("ok") is True or status == DELIVERED:
             status = DELIVERED
-        elif status not in (FAILED, NOT_READY, UNKNOWN):
+            final = True
+        elif status == NOT_READY:
+            # Unsupported downstream capability: an explicit, definitive
+            # not-ready receipt, never a simulated success and never retried.
+            final = True
+        elif status == UNKNOWN or raised:
+            # An unknown outcome, or a failure whose true downstream state is
+            # uncertain (a port raised mid-effect), is retryable and must be
+            # re-observed on replay rather than locked in.
+            status = UNKNOWN if status == UNKNOWN else FAILED
+            final = False
+        elif status == FAILED:
+            final = False
+        else:
             status = FAILED
+            final = False
         downstream = self._downstream(delivery)
         self.journal.append(
             goal,
@@ -1052,6 +1119,7 @@ class GoalRequestKernel:
                 status,
                 delivery.get("detail", ""),
                 delivery=delivery,
+                final=final,
             ),
         )
         return self._result(
@@ -1088,7 +1156,15 @@ class GoalRequestKernel:
         self.journal.append(
             goal,
             self._result_record(
-                goal, action_id, request_id, run_id, index, action["kind"], FAILED, reason
+                goal,
+                action_id,
+                request_id,
+                run_id,
+                index,
+                action["kind"],
+                FAILED,
+                reason,
+                final=True,
             ),
         )
         return self._result(action, action_id, FAILED, reason)
