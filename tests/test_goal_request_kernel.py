@@ -12,6 +12,7 @@ refusal, unknown Runtime outcome, lossless pagination).
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Any
 
@@ -765,6 +766,101 @@ class TestDurableReconstruction:
 
         rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
         assert rebuilt.active_version(GOAL) == "v1"
+
+
+# --- durable journal sync barrier (behavior 1, 4, 7 / P6) ---------------------
+
+
+class TestDurableJournalSync:
+    def test_append_fsyncs_the_file_before_returning(self, tmp_path) -> None:
+        calls: list[str] = []
+
+        def sync(fd: int) -> None:
+            calls.append("file_sync")
+            os.fsync(fd)
+
+        journal = Journal(home=tmp_path / "j", file_sync=sync)
+        journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v1"})
+        assert calls == ["file_sync"]
+        # The record really reached the file: a rebuilt journal re-reads it.
+        rebuilt = Journal(home=tmp_path / "j")
+        assert any(r.get("version") == "v1" for r in rebuilt.scan(GOAL))
+
+    def test_append_many_fsyncs_once_for_the_batch(self, tmp_path) -> None:
+        calls: list[str] = []
+
+        def sync(fd: int) -> None:
+            calls.append("file_sync")
+            os.fsync(fd)
+
+        journal = Journal(home=tmp_path / "j", file_sync=sync)
+        journal.append_many(
+            GOAL,
+            [
+                {"record": RECORD_CALL, "goal": GOAL, "request_id": "A"},
+                {"record": RECORD_CALL_RESULT, "goal": GOAL, "request_id": "A"},
+            ],
+        )
+        assert calls == ["file_sync"]
+        rebuilt = Journal(home=tmp_path / "j")
+        assert len(rebuilt.scan(GOAL)) == 2
+
+    def test_append_sync_failure_aborts_without_admitting_the_record(self, tmp_path) -> None:
+        def broken_sync(fd: int) -> None:
+            raise OSError("sync failed")
+
+        journal = Journal(home=tmp_path / "j", file_sync=broken_sync)
+        with pytest.raises(OSError):
+            journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v1"})
+        assert journal.scan(GOAL) == []
+
+    def test_submit_does_not_ack_when_the_sync_fails(self, tmp_path) -> None:
+        def broken_sync(fd: int) -> None:
+            raise OSError("sync failed")
+
+        kernel = GoalRequestKernel(
+            journal=Journal(home=tmp_path / "j", file_sync=broken_sync),
+            effects=FakeEffects(),
+        )
+        with pytest.raises(OSError):
+            kernel.submit(GOAL, make_request("A"))
+
+    def test_new_file_creation_syncs_the_parent_directory(self, tmp_path) -> None:
+        synced_dirs: list[str] = []
+
+        def dir_sync(path) -> None:
+            synced_dirs.append(str(path))
+
+        journal = Journal(home=tmp_path / "j", dir_sync=dir_sync)
+        journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v1"})
+        assert synced_dirs == [str(tmp_path / "j")]
+        # An existing file is appended again without re-syncing the directory.
+        journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v2"})
+        assert synced_dirs == [str(tmp_path / "j")]
+
+    def test_external_effect_runs_only_after_intent_sync(self, tmp_path) -> None:
+        order: list[str] = []
+
+        def sync(fd: int) -> None:
+            order.append("intent-fsync")
+            os.fsync(fd)
+
+        class OrderedEffects(FakeEffects):
+            def dispatch(self, payload: dict[str, Any], *, ctx: dict[str, Any]) -> dict[str, Any]:
+                order.append("effect")
+                return super().dispatch(payload, ctx=ctx)
+
+        kernel = GoalRequestKernel(
+            journal=Journal(home=tmp_path / "j", file_sync=sync),
+            effects=OrderedEffects(),
+        )
+        kernel.activate_version(GOAL, "v1")
+        order.clear()  # drop the version record's fsync from the assertion window
+        run_one(kernel, make_request("A"), {"actions": [dispatch_action("K")]})
+        # The action intent's fsync lands immediately before the effect runs; the
+        # result receipt's fsync follows it.
+        assert "effect" in order
+        assert order[order.index("effect") - 1] == "intent-fsync"
 
 
 # --- raw event completeness (behavior 6) --------------------------------------

@@ -288,6 +288,40 @@ def _iso(clock: Callable[[], float]) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock()))
 
 
+def _fsync_file(fd: int) -> None:
+    """Durability barrier for a freshly appended journal file.
+
+    ``fh.flush()`` alone only moves Python's buffer into the OS page cache; a
+    host crash can still lose an acknowledged request or a recorded action
+    intent whose external effect already ran. This fsync forces the bytes to
+    stable storage *before* the caller issues an acceptance ack or starts an
+    effect. A sync failure propagates: no ack, no effect, no in-memory admission.
+    """
+    os.fsync(fd)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a freshly created journal file's directory entry.
+
+    After the first append creates a new ``*.jsonl`` file, its parent directory
+    entry must reach stable storage too, otherwise a crash can lose the file's
+    very existence even though its first record was already fsync'd. Opening a
+    directory read-only for fsync is not universal, so the entry-sync is a
+    best-effort gap, not a durability *failure*: the record itself is what the
+    ack and the effect ordering fence on.
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 @dataclass
 class Journal:
     """One append-only JSONL journal plus a per-goal ownership fence.
@@ -306,6 +340,11 @@ class Journal:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     #: The ownership fence: goal -> call_id of the in-flight call, or None.
     _inflight: dict[str, str | None] = field(default_factory=dict)
+    #: File-descriptor fsync, injected so offline tests can fault-inject sync
+    #: failures and assert the write/flush/sync/ACK (and sync/effect) ordering.
+    file_sync: Callable[[int], None] = field(default=_fsync_file)
+    #: Directory-entry fsync for a freshly created journal file (best-effort).
+    dir_sync: Callable[[Path], None] = field(default=_fsync_directory)
 
     def __post_init__(self) -> None:
         # A journal pointed at a real directory reconstructs its lines on
@@ -448,30 +487,54 @@ class Journal:
         self._seq[goal] = seq
         return seq
 
+    def _persist_append(self, goal: str, blob: str) -> None:
+        """Durably append ``blob`` to ``goal``'s journal file.
+
+        The bytes are written, flushed, then fsync'd *before* this returns, so
+        a caller's acceptance acknowledgement (``submit``) or the start of an
+        external effect (``_deliver``) cannot run ahead of the record reaching
+        stable storage (behavior 1, 4, 7 / P6). A freshly created file also
+        syncs its parent directory entry. A fsync failure propagates so the
+        caller issues no ack and admits nothing in memory.
+        """
+        path = self._path(goal)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existed = path.exists()
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(blob)
+            fh.flush()
+            self.file_sync(fh.fileno())
+        if not existed:
+            self.dir_sync(path.parent)
+
     def append(self, goal: str, record: dict[str, Any]) -> dict[str, Any]:
-        """Append one line; return it with its assigned ``seq`` (if absent)."""
+        """Append one line; return it with its assigned ``seq`` (if absent).
+
+        The line is fsync'd to stable storage before this returns, so a caller
+        that observes the returned record can rely on it surviving a host crash.
+        """
         with self._lock:
             if "seq" not in record:
                 record = {**record, "seq": self._next_seq(goal)}
             else:
                 self._seq[goal] = max(self._seq.get(goal, 0), int(record["seq"]))
             if self.home is not None:
-                self._path(goal).parent.mkdir(parents=True, exist_ok=True)
-                with self._path(goal).open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-                    fh.flush()
+                self._persist_append(
+                    goal,
+                    json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n",
+                )
             self._lines.setdefault(goal, []).append(record)
             return record
 
     def append_many(self, goal: str, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Append several lines as one atomic append (single lock, single write).
 
-        The lines share the lock and the file flush, so a crash either leaves
-        them all durable or a single trailing fragment (isolated by ``load``),
-        never a torn prefix where the first line is durable but the rest are
-        absent. ``finish_goal_call`` uses this to persist a completed call
-        result and its resulting lifecycle mode *together* so the crash window
-        between the two can no longer strand a drained call (final review
+        The lines share the lock, the write and the fsync, so a crash either
+        leaves them all durable or a single trailing fragment (isolated by
+        ``load``), never a torn prefix where the first line is durable but the
+        rest are absent. ``finish_goal_call`` uses this to persist a completed
+        call result and its resulting lifecycle mode *together* so the crash
+        window between the two can no longer strand a drained call (final review
         finding)."""
         with self._lock:
             assigned: list[dict[str, Any]] = []
@@ -482,14 +545,11 @@ class Journal:
                     self._seq[goal] = max(self._seq.get(goal, 0), int(record["seq"]))
                 assigned.append(record)
             if self.home is not None:
-                self._path(goal).parent.mkdir(parents=True, exist_ok=True)
                 blob = "".join(
                     json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
                     for record in assigned
                 )
-                with self._path(goal).open("a", encoding="utf-8") as fh:
-                    fh.write(blob)
-                    fh.flush()
+                self._persist_append(goal, blob)
             self._lines.setdefault(goal, []).extend(assigned)
             return assigned
 
