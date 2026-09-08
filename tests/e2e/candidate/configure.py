@@ -12,8 +12,9 @@ from pathlib import Path
 
 import yaml
 
-MODEL = "deepseek-v4-pro@opencode"
-ROUTE = MODEL + "/gw"
+MODEL = "deepseek-v4-pro"
+CHAIN = MODEL + "@opencode"
+ROUTE = CHAIN + "/gw"
 
 
 def digest(path: Path) -> str:
@@ -82,7 +83,7 @@ def configure(state=Path("/state"), fleet=Path("/opt/fleet"), assets=Path("/opt/
         yaml.safe_dump(
             {
                 "routes": {ROUTE: route},
-                "chains": {MODEL: {"routes": [ROUTE], "cost_boundary": ROUTE}},
+                "chains": {CHAIN: {"routes": [ROUTE], "cost_boundary": ROUTE}},
             },
             allow_unicode=True,
             sort_keys=False,
@@ -118,9 +119,18 @@ def configure(state=Path("/state"), fleet=Path("/opt/fleet"), assets=Path("/opt/
     )
     prompt_dir = config_dir / "prompts"
     prompt_dir.mkdir(exist_ok=True)
+    role_model_overrides = {}
     for role, settings in fleet_config["roles"].items():
-        if settings["runtime"] != "opencode" or settings["model"] != MODEL:
+        if settings["runtime"] != "opencode" or settings["model"] not in {MODEL, CHAIN}:
             raise ValueError("冻结 candidate 的角色默认模型与验收契约不符")
+        role_model_overrides[role] = {
+            "original": settings["model"],
+            "effective": MODEL,
+            "runtime": settings["runtime"],
+            "resolved_chain": CHAIN,
+        }
+        # runtime resolveChain() 将 --model 与 --runtime 拼为 model@runtime。
+        settings["model"] = MODEL
         source = prompts_source / f"{role}.md"
         # 保留原角色职责，附加本次明确授权阶段；覆盖文本与哈希进入 manifest。
         prompt = source.read_text()
@@ -152,7 +162,10 @@ def configure(state=Path("/state"), fleet=Path("/opt/fleet"), assets=Path("/opt/
             "git": version("git", "--version"),
             "gh": version("gh", "--version").splitlines()[0],
         },
-        "model": MODEL,
+        "model": CHAIN,
+        "runtime_model": MODEL,
+        "chain": CHAIN,
+        "role_model_overrides": role_model_overrides,
         "route": ROUTE,
         "gateway": "http://gateway:15722/v1",
         "fleet_mcp": "http://candidate:15611/mcp",
@@ -165,6 +178,8 @@ def configure(state=Path("/state"), fleet=Path("/opt/fleet"), assets=Path("/opt/
         },
         "overrides": [
             "仅保留默认 OpenCode static 网关路由，无 native subscription 或 fallback",
+            "修正 Fleet 与 runtime CLI 的模型配置集成差异：--model 使用 bare model，"
+            "由 runtime 追加 @opencode 选择 chain；原值与实际值逐角色记录",
             "runtime profiles 由独立生成目录接入，仅注册 candidate 与 work-folder MCP",
             "原角色 prompt 保留，附加独立 Docker E2E 阶段授权",
             "原 fleet harness 保留，Fleet CLI 保持 loopback，由容器内 TCP relay 转发 HTTP",

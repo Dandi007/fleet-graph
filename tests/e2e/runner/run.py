@@ -20,6 +20,7 @@ from pathlib import Path
 
 from adapter import Mapper
 from fastmcp import Client
+from monitor import BlockedIdleMonitor
 
 HARNESS = Path("/harness")
 REPO = Path("/workspace/fixture")
@@ -222,6 +223,18 @@ async def collect(client, bundle, goal_id, status):
     write(bundle / "raw/collection-errors.json", errors)
 
 
+async def stop_goal(client, bundle, goal_id, status, reason):
+    write(bundle / "raw/stop-reason.json", {"reason": reason, "observed_status": status})
+    status = await call(client, "goal_stop", {"goal_id": goal_id, "immediate": True})
+    write(bundle / "raw/stop-response.json", status)
+    for _ in range(30):
+        if not status["engine_alive"]:
+            break
+        await asyncio.sleep(2)
+        status = await call(client, "goal_status", {"goal_id": goal_id})
+    return status
+
+
 def pull_requests(bundle, repository, target, source, status):
     token = Path(os.environ["GH_TOKEN_FILE"]).read_text().strip()
     owner, name = repository.split("/")
@@ -310,6 +323,7 @@ async def e2e(bundle, candidate):
         }
         write(bundle / "manifest.json", manifest)
         deadline = time.monotonic() + int(os.environ.get("E2E_TIMEOUT", "3600"))
+        blocked_idle = BlockedIdleMonitor()
         while time.monotonic() < deadline:
             status = await call(client, "goal_status", {"goal_id": goal_id})
             write(bundle / "raw/status.json", status)
@@ -328,17 +342,18 @@ async def e2e(bundle, candidate):
                 break
             if status["status"] in {"blocked", "stopped"} and not status["engine_alive"]:
                 break
+            if blocked_idle.observe(status):
+                status = await stop_goal(
+                    client,
+                    bundle,
+                    goal_id,
+                    status,
+                    "连续两轮 blocked，所有 run finished 且公开状态无变化",
+                )
+                break
             await asyncio.sleep(10)
         else:
-            write(
-                bundle / "raw/stop-response.json",
-                await call(client, "goal_stop", {"goal_id": goal_id, "immediate": True}),
-            )
-            for _ in range(30):
-                await asyncio.sleep(2)
-                status = await call(client, "goal_status", {"goal_id": goal_id})
-                if not status["engine_alive"]:
-                    break
+            status = await stop_goal(client, bundle, goal_id, status, "超过 E2E_TIMEOUT")
         await collect(client, bundle, goal_id, status)
     probe = service_probe()
     try:

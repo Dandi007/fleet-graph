@@ -23,6 +23,8 @@ e2e 先运行 smoke，再把固定 fixture 初始化为新 Git 历史，push `e2
 
 终局还从真实 agent-bus 的 `board:agent-runs` 频道完整回读消息，先保存 `raw/runtime-bus.json` 原始页，再核对成功 Goal/Impl 的 run_id、真实 sender、同版本 started/exited、事件顺序与退出码。普通 smoke 消息不能替代 runtime 生命周期消息；缺失或查询失败记入 collection-errors，外部验收器也独立检查原始消息。Goal reply 仍遵循候选公开 mailbox 协议。
 
+若连续两次轮询返回完全相同的 blocked 状态，且所有 run 都明确 finished，Runner 通过公开 goal_stop immediate 提前收口并保存 stop-reason、停止回执与失败证据。有 running、launching、collected、uncertain 或 paused run 时不会触发该规则；状态或新请求发生变化也会重新计数。
+
 GitHub token 沿用此次授权凭证，其平台权限可能超出测试 repo。repo basename 与分支约束是 harness 防误写规则；域名代理不提供 GitHub repo 级权限隔离。token 不写入 remote URL、仓库文件或报告。宿主应为更强隔离使用仅授权专用 repo 的 token。
 
 ```sh

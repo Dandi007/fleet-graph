@@ -30,6 +30,8 @@ manifest 的 `config_path` 可指定 Fleet 源码内相对路径，默认 `confi
 
 只接 Compose 内部网络，不挂宿主 HOME、Docker socket 或共享服务目录。模型仅有 `deepseek-v4-pro@opencode/gw` 一个 static route，经 `http://gateway:15722/v1` 调用，没有 native subscription 或 fallback。OpenCode 所需 `@ai-sdk/openai-compatible` 已由该版本的 `BUNDLED_PROVIDERS` 内置；镜像设置 `OPENCODE_DISABLE_MODELS_FETCH=1`、`OPENCODE_DISABLE_AUTOUPDATE=1`，运行阶段不需要下载模型目录或更新 CLI。
 
+实际 E2E 暴露了一处原配置集成差异：冻结 Fleet 的 `roles.*.model` 使用 `deepseek-v4-pro@opencode`，但 runtime 的 `resolveChain()` 会把 CLI `--model` 与 `--runtime` 拼接成 `model@runtime`，导致重复后缀并报 `No default chain`。容器生成配置改传 bare model `deepseek-v4-pro`；chain 仍为 `deepseek-v4-pro@opencode`，只有原默认网关 route。manifest 的 `role_model_overrides` 逐角色保留 original、effective 和 resolved_chain；该修正不写回冻结源码，也不将原配置宣称为已通过集成。
+
 该测试验证的是显式容器配置覆盖后的候选行为。它不验证候选默认宿主配置、native subscription、其他模型/runtime 或自动发现宿主凭证的能力；这些范围不应计入通过项。
 
 配置生成后先执行 `/opt/e2e/bootstrap_runtime_bus.ts`，通过冻结 runtime 的协议描述和注册函数，在独立 agent-bus 初始化协议与 `board:agent-runs`。脚本非零退出或超过 60 秒时阻止 Fleet 启动；原始输出写入 `/state/logs/runtime-bus-bootstrap.log`，退出码保存到 manifest 的 `agent_bus.bootstrap`。该步骤不替代后续真实生命周期消息的验收。
