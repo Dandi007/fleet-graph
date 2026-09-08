@@ -207,14 +207,33 @@ AUDIT_REF_PREFIX = "refs/heads/dd/"
 CODE_TARGET_REF_CROSS_LINE = "TARGET_REF_CROSS_LINE"
 
 
+def line_branch_binding(line_id: str) -> dict[str, str]:
+    """由服务端绑定真实 line 身份；调用方不能覆盖映射或 repo 边界。"""
+    config = Path(__file__).resolve().parents[3] / "config/line-branches.json"
+    if not config.exists():
+        return {}
+    binding = json.loads(config.read_text()).get(line_id, {})
+    if not binding:
+        return {}
+    release = binding.get("release_ref", "")
+    prefix = binding.get("audit_prefix", "")
+    if not release.startswith(RELEASE_REF_PREFIX) or not prefix.startswith(AUDIT_REF_PREFIX):
+        raise ControlPlaneError("INVALID_BRANCH_BINDING", "绑定必须使用 release/ 和 dd/ 分支")
+    for ref in (release, prefix + "probe"):
+        if subprocess.run(["git", "check-ref-format", ref], capture_output=True).returncode:
+            raise ControlPlaneError("INVALID_BRANCH_BINDING", "绑定包含无效 Git ref")
+    if not prefix.endswith("/") or not Path(binding.get("repo_root", "")).is_absolute():
+        raise ControlPlaneError("INVALID_BRANCH_BINDING", "绑定缺少绝对 repo_root 或 audit_prefix 尾斜线")
+    return binding
+
+
 def release_line_ref(line_id: str) -> str:
-    """The line branch for one line id: `refs/heads/release/<line-id>`."""
-    return f"{RELEASE_REF_PREFIX}{line_id}"
+    return line_branch_binding(line_id).get("release_ref", f"{RELEASE_REF_PREFIX}{line_id}")
 
 
-def audit_branch_ref(development_id: str) -> str:
-    """The order-private audit branch: `refs/heads/dd/<development_id>`."""
-    return f"{AUDIT_REF_PREFIX}{development_id}"
+def audit_branch_ref(development_id: str, line_id: str = "") -> str:
+    prefix = line_branch_binding(line_id).get("audit_prefix", AUDIT_REF_PREFIX)
+    return f"{prefix}{development_id}"
 
 
 class ControlPlaneError(RuntimeError):
@@ -1050,13 +1069,16 @@ class DdControlPlane:
         # without provenance has no line branch -- the legacy durable ref
         # stands, unchanged, and audit_ref stays empty (same ref).
         dispatched_by = (dispatched_by or "").strip()
+        binding = line_branch_binding(dispatched_by)
+        if binding and not repo.resolve().is_relative_to(Path(binding["repo_root"]).resolve()):
+            raise ControlPlaneError("REPO_CROSS_LINE", "repo 不在本线绑定的目录内")
         if dispatched_by:
             remote_ref = release_line_ref(dispatched_by)
         else:
             remote_ref = audit_branch_ref(development_id)
         audit_ref = (
-            audit_branch_ref(development_id)
-            if remote_ref != audit_branch_ref(development_id)
+            audit_branch_ref(development_id, dispatched_by)
+            if remote_ref != audit_branch_ref(development_id, dispatched_by)
             else ""
         )
         requested_ref = (target_ref or "").strip()

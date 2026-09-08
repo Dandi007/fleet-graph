@@ -1,0 +1,7 @@
+{
+  "wf-2bf703": {
+    "release_ref": "refs/heads/release/fleet-compare-self",
+    "audit_prefix": "refs/heads/dd/fleet-compare-self/",
+    "repo_root": "/data/code/fleet-comparison/self"
+  }
+}
