@@ -108,6 +108,8 @@ def test_kinds_match_protocol_section_8() -> None:
                 "engine.resumed",
                 "engine.exiting",
                 "control.received",
+                "scribe.observed",
+                "scribe.failed",
             }
         )
         == KINDS

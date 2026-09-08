@@ -21,6 +21,10 @@ Seams this module deliberately keeps (each belongs to another DD):
 - **No process entry, no MCP transport.** MCP → engine is only
   ``control.jsonl``, read at step boundaries (GO-16): ``read_control`` runs
   before every turn and after every DD.
+- **The read-only scribe (GO-21) is opt-in.** ``scribe_enabled`` defaults to
+  False, so an unwired graph is byte-identical to the pre-scribe graph. When
+  enabled it runs the ``scribe`` stage once per goal boundary (turn finished,
+  DD finished); its failures never block the loop.
 
 Beyond the caller-injected ``stagerunner`` events, the boundary events
 written here are exactly the protocol §8/§10 ones: ``control.received`` (one
@@ -28,8 +32,10 @@ per new control line, before acting on it), ``goal.message`` (an MCP message
 made durable — state clears it after injection), ``goal.turn.started``
 (``events.fold`` counts turns from it), ``goal.steered`` (GO-20),
 ``goal.dispatch_rejected`` (dispatch bounced with field-level errors; the
-kind is registered in ``events.GOAL_KINDS`` per the DD-13 precedent), and the
-terminal ``goal.done`` / ``goal.blocked`` / ``engine.exiting(stop)``.
+kind is registered in ``events.GOAL_KINDS`` per the DD-13 precedent), the
+terminal ``goal.done`` / ``goal.blocked`` / ``engine.exiting(stop)``, and —
+only behind the opt-in seam — the scribe's ``scribe.observed`` /
+``scribe.failed`` (registered in ``events.SCRIBE_KINDS``).
 
 GO-6.4: no hard loop cap. ``warn_turns`` only produces warning text —
 injected into every turn at or beyond the line — and one ``goal.warning``
@@ -46,6 +52,7 @@ checkpointed state (design.md §7.1 / GO-16).
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, TypedDict
@@ -59,6 +66,7 @@ from fleet_graph.minimal import (
     gitgate,
     prompts,
     runroot,
+    scribe,
     stagerunner,
     steer,
 )
@@ -83,6 +91,9 @@ class GoalDeps:
     ``final_merge`` merges release → the goal's target branch and returns
     ``(stop, payload)`` with stop ∈ merged / rebased / failed; ``None`` means
     the seam is not wired and a ``done`` goal blocks instead of guessing.
+    ``scribe_enabled`` opts into the read-only scribe stage (GO-21) at goal
+    boundaries; it defaults to False so an unwired graph behaves exactly as
+    before.
     """
 
     event_log: events.EventLog
@@ -96,6 +107,7 @@ class GoalDeps:
     session_overrides: dict[str, dict[str, Any]] | None = None
     model_by_role: dict[str, str] | None = None
     timeout_s: int = 300
+    scribe_enabled: bool = False
 
 
 class GoalGraphState(TypedDict, total=False):
@@ -135,6 +147,23 @@ def _has_warning(events_list: list[events.Event], text: str) -> bool:
         ev.kind == "goal.warning" and (ev.payload or {}).get("message") == text
         for ev in events_list
     )
+
+
+def _scribe_cursor(events_list: list[events.Event]) -> int:
+    """The seq the last scribe run observed up to (0 before the first run).
+
+    GO-21 / dd-23: the scribe's cursor lives in the event log itself, not a
+    state file. Every boundary event (``scribe.observed`` / ``scribe.failed``)
+    carries ``until_seq``; the newest one is the cursor, so the next run starts
+    at ``cursor + 1`` and never re-observes an already-seen segment.
+    """
+    cursor = 0
+    for ev in events_list:
+        if ev.kind in ("scribe.observed", "scribe.failed"):
+            until_seq = (ev.payload or {}).get("until_seq")
+            if isinstance(until_seq, int) and not isinstance(until_seq, bool):
+                cursor = max(cursor, until_seq)
+    return cursor
 
 
 def _blurb(payload: dict[str, Any]) -> str:
@@ -208,6 +237,115 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
     """
     policy = agentrun.resolve_session_policy("goal", deps.session_overrides)
     goal_model = (deps.model_by_role or {}).get("goal")
+
+    def run_scribe(state: GoalGraphState, trigger: str) -> None:
+        """Run the read-only scribe at one goal boundary; never block the loop.
+
+        GO-21 / dd-23: on each goal-level boundary (turn finished, DD
+        finished) the scribe reads L0 with a seq-range folded from the event
+        log (``cursor+1 .. last_seq``), runs once through ``stagerunner`` with
+        role ``scribe``, then validates the ``scribe/1`` output and gates each
+        observation (§12). Passed observations append to
+        ``observations.jsonl`` and are recorded as ``scribe.observed``; every
+        failure — invalid output, an evidence-gate drop, a raising invoker —
+        is only a ``scribe.failed`` event and the goal keeps running. The
+        scribe never writes ``control.jsonl``, never touches git, never
+        changes goal state.
+        """
+        if not deps.scribe_enabled:
+            return
+        log = deps.event_log
+        enroll = state["enroll"]
+        events_list = list(log.read())
+        _, goal_version = steer.current_goal(enroll, events_list)
+        since_seq = _scribe_cursor(events_list) + 1
+        until_seq = max((ev.seq for ev in events_list), default=0)
+        sessions_dir = deps.session_root or str(log.goal_run_root / "sessions")
+        request = stagerunner.StageRequest(
+            stage="scribe",
+            run_id=f"goal-{state['goal_id']}-scribe-{until_seq}",
+            in_obj=prompts.build_scribe_in(
+                goal_id=state["goal_id"],
+                goal_version=goal_version,
+                trigger=trigger,
+                since_seq=since_seq,
+                until_seq=until_seq,
+                new_runs=scribe.new_runs_from_events(
+                    events_list, since_seq, until_seq, sessions_dir
+                ),
+                prior_observations=str(log.goal_run_root / "observations.jsonl"),
+                history=prompts.history_handle(
+                    goal_run_root=str(log.goal_run_root),
+                    work_folder=enroll.get("work_folder"),
+                ),
+            ),
+            repos=[],
+            expected_schema=agentrun.schema_for("scribe"),
+            policy=agentrun.resolve_session_policy("scribe", deps.session_overrides),
+            cwd=".",
+            is_first_call=not any(
+                ev.kind == "agent.exited" and (ev.payload or {}).get("stage") == "scribe"
+                for ev in events_list
+            ),
+            session_root=deps.session_root,
+            timeout_s=deps.timeout_s,
+            model=(deps.model_by_role or {}).get("scribe"),
+        )
+        try:
+            outcome = stagerunner.run_stage(
+                request, git_runner=deps.git_runner, agent_invoker=deps.agent_invoker
+            )
+        except Exception as exc:
+            log.append(
+                "scribe.failed",
+                {
+                    "trigger": trigger,
+                    "until_seq": until_seq,
+                    "reason": "exception",
+                    "detail": str(exc),
+                },
+            )
+            return
+        for kind, payload in outcome.events:
+            log.append(kind, payload)
+        if not outcome.ok:
+            log.append(
+                "scribe.failed",
+                {"trigger": trigger, "until_seq": until_seq, "reason": outcome.invalid_reason},
+            )
+            return
+        obj = outcome.obj or {}
+        observations = obj.get("observations") or []
+        kept, dropped = scribe.partition_observations(
+            observations,
+            since_seq=since_seq,
+            until_seq=until_seq,
+            session_exists=os.path.isdir,
+        )
+        observation_log = scribe.ObservationLog(log.goal_run_root)
+        for obs in kept:
+            observation_log.append(obs, trigger=trigger, seq_range=[since_seq, until_seq])
+        if dropped:
+            detail = "; ".join("; ".join(entry.get("errors", [])) for entry in dropped)
+            log.append(
+                "scribe.failed",
+                {
+                    "trigger": trigger,
+                    "until_seq": until_seq,
+                    "reason": scribe.DROP_DETAIL,
+                    "detail": detail,
+                },
+            )
+            return
+        log.append(
+            "scribe.observed",
+            {
+                "trigger": trigger,
+                "since_seq": since_seq,
+                "until_seq": until_seq,
+                "observations": len(kept),
+            },
+        )
 
     def read_control(state: GoalGraphState) -> dict[str, Any]:
         """Step boundary (GO-16): drain control.jsonl since ``last_seq``."""
@@ -361,6 +499,7 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
                 "warnings": [],
                 "goal_version": goal_version,
             }
+        run_scribe(state, trigger="goal.turn.finished")
         stop_obj = outcome.obj or {}
         blocked_obj = stop_obj.get("blocked") if outcome.stop == "blocked" else None
         return {
@@ -413,6 +552,7 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
         """Execute the dispatched DD via the seam, then loop to read_control."""
         dispatch_obj = (state.get("last_stop") or {}).get("dispatch") or {}
         result = deps.run_dd(dict(dispatch_obj))
+        run_scribe(state, trigger="dd.merged" if result.get("outcome") == "merged" else "dd.failed")
         history = events.fold(deps.event_log.read()).dd_history
         return {
             "last_dd": result,
