@@ -1,32 +1,12 @@
 {
  "development_id": "dev-fg-91bb67e8747f",
  "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
  "decided_by": "supervisor:01a07c73-4511-7402-9128-a07d6587edd0",
- "decided_by_source": "graph-gate-node",
- "action_key": "supervisor-20260909-approved:dev-fg-91bb67e8747f:g7:0d4c4836827cb4891c4ccb239c340c6c97f5b070",
  "decision_message_id": "engine-decision:7f0652249de07194720306a2656034604835d672f1c24469c3d810da1aeb9cd4",
  "rationale": "用户本线人类等价监督授权，根监督2026-09-09 04:50依据完整FR批准、当前候选0d4c4836827cb4891c4ccb239c340c6c97f5b070产品树等价、冻结开发检查完整provenance和隔离非干扰证据，裁决仅本开发DD APPROVE。完整回执在wf-fce52f及wf-2bf703对应gate-evidence/frozen-checks。非整线ready，未联合运行验收，仅合入release/fleet-compare-self，禁止main或生产部署。",
- "evidence": [
-  {
-   "id": "acceptance_frozen",
-   "passed": true,
-   "detail": "run_config_matches=True; implement_checks_passed=True; declared=[['.venv/bin/python', '-m', 'compileall', '-q', 'src'], ['.venv/bin/python', '-m', 'pytest', '-q', 'tests/test_goal_request_kernel.py']]; additional_checks=[]"
-  },
-  {
-   "id": "review_chain_approved",
-   "passed": true,
-   "detail": "implementation=3b430d26c5c3d176a042615256770205729fb410; changed_product=[]; dirty="
-  },
-  {
-   "id": "personally_rerun",
-   "passed": true,
-   "detail": "{\"results\": [{\"command\": [\"uv\", \"sync\", \"--frozen\"], \"exit_code\": 0, \"stdout_tail\": \"\", \"stderr_tail\": \"Checked 100 packages in 1ms\\n\"}, {\"command\": [\".venv/bin/python\", \"-m\", \"compileall\", \"-q\", \"src\"], \"exit_code\": 0, \"stdout_tail\": \"\", \"stderr_tail\": \"\"}, {\"command\": [\".venv/bin/python\", \"-m\", \"pytest\", \"-q\", \"tests/test_goal_request_kernel.py\"], \"exit_code\": 0, \"stdout_tail\": \"........................................................................ [ 64%]\\n.......................................                                  [100%]\\n\", \"stderr_tail\": \"\"}], \"subject_unchanged\": true}"
-  },
-  {
-   "id": "zero_test_deletion",
-   "passed": true,
-   "detail": "no test file deleted in base..head"
-  }
- ],
+ "question_note_id": "engine:dd-gate:dev-fg-91bb67e8747f:g7",
+ "card_entity_id": "",
  "output_commit": "0d4c4836827cb4891c4ccb239c340c6c97f5b070"
 }
