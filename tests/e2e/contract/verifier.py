@@ -15,12 +15,12 @@ SUCCESS = {"pass", "passed", "succeeded", "success", "done", "approved"}
 ACCEPTANCE_COMMAND = "PYTHONDONTWRITEBYTECODE=1 make verify"
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 REQUIRED = {
-    "goal": {"goal_id", "status", "commit", "pr_url"},
+    "goal": {"goal_id", "status", "commit", "pr_url", "done_seq"},
     "dds": {"dd_id", "commit", "spec_commit", "spec_path", "pr_url"},
     "runs": {"run_id", "role", "status", "session_id"},
     "reviews": {"dd_id", "role", "commit", "verdict", "run_id"},
     "acceptances": {"dd_id", "commit", "status", "run_id", "results", "workspace"},
-    "approvals": {"dd_id", "commit", "review_ref"},
+    "approvals": {"dd_id", "commit", "review_ref", "goal_run_id", "decision", "applied_review_ref"},
     "prs": {"url", "base", "head", "head_sha", "merge_sha", "state", "repository"},
 }
 
@@ -69,45 +69,72 @@ def git(repo: Path, *args: str):
 FUNCTION_SCRIPT = r"""
 import importlib.util, json, sys
 from pathlib import Path
-root = Path(sys.argv[1])
-spec = importlib.util.spec_from_file_location("subject_slugify", root / "slugify.py")
+spec = importlib.util.spec_from_file_location("subject_slugify", Path(sys.argv[1]) / "slugify.py")
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-cases = [("", ""), (" Hello World ", "hello-world"), ("A__ -- B", "a-b"),
-         ("\t\n_-", ""), ("中文 Hello_世界", "中文-hello-世界"),
-         ("A\u2003B\u00a0C", "a-b-c"), ("A.B/C+😀", "a.b/c+😀"),
-         ("ÉCOLE STRASSE", "école-strasse"), ("--A---B--", "a-b")]
-for value, expected in cases:
-    actual = module.slugify(value)
-    if not isinstance(actual, str) or actual != expected:
-        raise AssertionError((value, expected, actual))
-for value in [None, 1, 0.5, True, [], {}, b"hello"]:
-    try:
-        module.slugify(value)
-    except TypeError:
+request = json.loads(sys.stdin.read())
+value = request["value"]
+if request["input_kind"] == "bytes":
+    value = value.encode("utf-8")
+elif request["input_kind"] == "str_subclass":
+    class Text(str):
         pass
-    else:
-        raise AssertionError(("必须抛 TypeError", type(value).__name__))
-class Text(str):
-    pass
-if module.slugify(Text(" A_B ")) != "a-b":
-    raise AssertionError("str 子类不符合规范")
-print(json.dumps({"cases": len(cases) + 8, "status": "passed"}))
+    value = Text(value)
+try:
+    actual = module.slugify(value)
+except Exception as exc:
+    response = {"case_id": request["case_id"], "kind": "raised",
+                "type": type(exc).__name__, "is_type_error": isinstance(exc, TypeError)}
+else:
+    response = {"case_id": request["case_id"], "kind": "returned",
+                "type": type(actual).__name__, "is_str": isinstance(actual, str),
+                "value": actual if isinstance(actual, str) else None}
+print(json.dumps(response, ensure_ascii=False))
 """
 
 
 def check_function(repo: Path):
-    """在无写入凭证、repo 只读的 verifier 容器执行；测试不从 repo 加载。"""
-    result = subprocess.run(
-        [sys.executable, "-I", "-B", "-c", FUNCTION_SCRIPT, str(repo)],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=True,
-    )
-    marker = json.loads(result.stdout)
-    if marker != {"cases": 17, "status": "passed"}:
-        raise ValueError("功能子进程没有完成全部 17 项检查")
+    """父进程逐例判定实际值与异常；待测进程不决定成功或完成计数。"""
+    import uuid
+
+    string_cases = [
+        ("", ""),
+        (" Hello World ", "hello-world"),
+        ("A__ -- B", "a-b"),
+        ("\t\n_-", ""),
+        ("中文 Hello_世界", "中文-hello-世界"),
+        ("A\u2003B\u00a0C", "a-b-c"),
+        ("A.B/C+😀", "a.b/c+😀"),
+        ("ÉCOLE STRASSE", "école-strasse"),
+        ("--A---B--", "a-b"),
+    ]
+    cases = [("value", value, expected, False) for value, expected in string_cases]
+    cases += [("value", value, None, True) for value in (None, 1, 0.5, True, [], {})]
+    cases += [("bytes", "hello", None, True), ("str_subclass", " A_B ", "a-b", False)]
+    completed = 0
+    for input_kind, value, expected, type_error in cases:
+        case_id = uuid.uuid4().hex
+        result = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", FUNCTION_SCRIPT, str(repo)],
+            input=json.dumps({"case_id": case_id, "input_kind": input_kind, "value": value}),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        observed = json.loads(result.stdout)
+        if observed.get("case_id") != case_id:
+            raise ValueError("待测进程未返回当前用例的数据")
+        if type_error:
+            if observed.get("kind") != "raised" or observed.get("is_type_error") is not True:
+                raise ValueError("非法输入未抛 TypeError")
+        elif (
+            observed.get("kind") != "returned"
+            or observed.get("is_str") is not True
+            or observed.get("value") != expected
+        ):
+            raise ValueError(f"函数结果不符：输入={value!r}，实际={observed!r}")
+        completed += 1
     for args, expected in [([" Hello__World "], "hello-world\n"), (["_-"], "\n")]:
         cli = subprocess.run(
             [sys.executable, "-B", "-m", "slugify", *args],
@@ -128,7 +155,7 @@ def check_function(repo: Path):
         )
         if cli.returncode == 0:
             raise ValueError("CLI 参数错误时必须非零退出")
-    return result.stdout.strip()
+    return {"cases": completed, "status": "passed"}
 
 
 def verify(bundle: Path, repo: Path):
@@ -185,6 +212,20 @@ def verify(bundle: Path, repo: Path):
         seqs = [event["seq"] for event in events]
         assert all(type(n) is int for n in seqs), "事件 seq 类型无效"
         assert seqs == sorted(set(seqs)), "事件重复或乱序"
+        assert seqs[0] in {0, 1} and seqs == list(range(seqs[0], seqs[-1] + 1)), (
+            "events 起点或连续性缺失"
+        )
+        event_pages = json.loads((bundle / "raw/event-pages.json").read_text())
+        assert event_pages and event_pages[-1]["events"] == [], "events 缺少末页回执"
+        assert [event for page in event_pages for event in page["events"]] == events, (
+            "原始 events 页与汇总不一致"
+        )
+        cursor = 0
+        for page in event_pages:
+            assert page["next"] == (page["events"][-1]["seq"] if page["events"] else cursor), (
+                "events 页游标与原始记录不匹配"
+            )
+            cursor = page["next"]
         assert all("kind" in e and "payload" in e for e in events), "原始事件字段缺失"
         assert len(data["dds"]) == 1, "固定 case 必须是一张 DD"
         for role in ("goal", "impl", "cr", "fr", "scribe"):
@@ -200,8 +241,16 @@ def verify(bundle: Path, repo: Path):
                     (bundle / "raw/sessions" / (run["run_id"] + ".json")).read_text()
                 )
                 pages = session["pages"]
-                assert pages and pages[-1].get("next_offset") is None, "Session 分页不完整"
-                assert any(p.get("items") for p in pages), f"{role} Session 没有原始交互记录"
+                assert pages and pages[-1]["next_offset"] is None, "Session 分页不完整"
+                count = 0
+                for index, page in enumerate(pages):
+                    assert page["run_id"] == run["run_id"], "Session 页属于其他 run"
+                    assert page["total"] == pages[0]["total"], "Session total 在采集期间变化"
+                    count += len(page["items"])
+                    assert page["next_offset"] == (count if index + 1 < len(pages) else None), (
+                        "Session 分页偏移不连续"
+                    )
+                assert count == pages[0]["total"] and count > 0, "Session 缺页或没有原始交互记录"
             if role in {"impl", "cr", "fr"}:
                 assert any(r.get("dd_id") == data["dds"][0]["dd_id"] for r in matches), (
                     f"{role} Session 未绑定 DD"
@@ -209,6 +258,36 @@ def verify(bundle: Path, repo: Path):
         return {"events": len(events), "roles": ["goal", "impl", "cr", "fr", "scribe"]}
 
     check("lifecycle", lifecycle)
+
+    def final_scribe():
+        done_seq = goal["done_seq"]
+        assert type(done_seq) is int, "Goal done seq 无效"
+        candidates = [
+            r
+            for r in data["runs"]
+            if r["role"] == "scribe" and r["status"] in SUCCESS and r.get("final") is True
+        ]
+        for run in candidates:
+            bounds = run.get("event_range", [])
+            observed = run.get("observed_seq")
+            if (
+                len(bounds) == 2
+                and all(type(n) is int for n in bounds)
+                and bounds[0] <= done_seq <= bounds[1]
+                and type(observed) is int
+                and observed > bounds[1]
+                and run.get("observed_run_id") == run["run_id"]
+                and run.get("observations")
+            ):
+                return {
+                    "run_id": run["run_id"],
+                    "done_seq": done_seq,
+                    "event_range": bounds,
+                    "observed_seq": observed,
+                }
+        raise ValueError("缺少覆盖 Goal done 的成功终局 Scribe observed 证据")
+
+    check("final_scribe", final_scribe)
 
     def runtime_bus_lifecycle():
         bus = json.loads((bundle / "raw/runtime-bus.json").read_text())
@@ -282,7 +361,15 @@ def verify(bundle: Path, repo: Path):
             for a in data["acceptances"]
         ), "缺少绑定当前 commit 的程序验收"
         assert any(
-            a["dd_id"] == dd["dd_id"] and a["commit"] == dd["commit"] and a["review_ref"] in refs
+            a["dd_id"] == dd["dd_id"]
+            and a["commit"] == dd["commit"]
+            and a["review_ref"] in refs
+            and a["decision"] == "approve"
+            and a["applied_review_ref"] == a["review_ref"]
+            and any(
+                r["role"] == "goal" and r["run_id"] == a["goal_run_id"] and r["status"] in SUCCESS
+                for r in data["runs"]
+            )
             for a in data["approvals"]
         ), "Goal approval 未匹配本次 FR review_ref/commit"
         git(repo, "merge-base", "--is-ancestor", dd["spec_commit"], dd["commit"])

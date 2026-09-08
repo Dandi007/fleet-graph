@@ -110,6 +110,76 @@ class MapperTests(unittest.TestCase):
             acceptance["sources"]["commit"]["pointer"], "/events/1/payload/prompt/head"
         )
         self.assertEqual(acceptance["values"]["results"], [{"exit_code": 0}])
+        self.assertEqual(result["approvals"], [])  # 仅有 DD.approved 不能证明 Goal 作出了批准。
+        status = json.loads((self.bundle / "raw/status.json").read_text())
+        status["runs"]["goal-run"] = {
+            "role": "goal",
+            "owner": "request",
+            "ticket": {"run_id": "goal-run"},
+            "result": {
+                "status": "succeeded",
+                "session_ref": "goal-run",
+                "output": [{"type": "approve", "dd_id": "dd", "review_ref": "review"}],
+            },
+        }
+        self.write("raw/status.json", status)
+        approval = self.mapper.snapshot()["approvals"][0]
+        self.assertEqual(approval["values"]["goal_run_id"], "goal-run")
+        self.assertEqual(approval["values"]["decision"], "approve")
+        self.assertEqual(
+            approval["sources"]["review_ref"]["pointer"],
+            "/runs/goal-run/result/output/0/review_ref",
+        )
+
+    def test_final_scribe_maps_real_prompt_and_observed_event(self):
+        self.write(
+            "raw/status.json",
+            {
+                "goal_id": "g",
+                "status": "done",
+                "dds": {},
+                "runs": {
+                    "scribe-run": {
+                        "role": "scribe",
+                        "owner": "scribe",
+                        "ticket": {"run_id": "scribe-run"},
+                        "result": {"status": "succeeded", "session_ref": "scribe-run"},
+                    },
+                },
+            },
+        )
+        self.write(
+            "raw/events.json",
+            {
+                "events": [
+                    {"seq": 1, "kind": "goal.done", "payload": {}},
+                    {"seq": 2, "kind": "scribe.attempt", "payload": {"final": True}},
+                    {
+                        "seq": 3,
+                        "kind": "run.intent",
+                        "payload": {
+                            "run_id": "scribe-run",
+                            "prompt": {"final": True, "event_range": [1, 1]},
+                        },
+                    },
+                    {
+                        "seq": 4,
+                        "kind": "scribe.observed",
+                        "payload": {
+                            "run_id": "scribe-run",
+                            "output": {"observations": [{"title": "交付完成"}]},
+                        },
+                    },
+                ]
+            },
+        )
+        snapshot = self.mapper.snapshot()
+        self.assertEqual(snapshot["goal"]["values"]["done_seq"], 1)
+        run = snapshot["runs"][0]
+        self.assertIs(run["values"]["final"], True)
+        self.assertEqual(run["values"]["event_range"], [1, 1])
+        self.assertEqual(run["values"]["observed_run_id"], "scribe-run")
+        self.assertEqual(run["sources"]["final"]["pointer"], "/events/2/payload/prompt/final")
 
 
 if __name__ == "__main__":

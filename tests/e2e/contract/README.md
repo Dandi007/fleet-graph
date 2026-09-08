@@ -8,15 +8,21 @@ Runner 通过公开 MCP 查询 status、完整 events、Session 与 artifact，�
 
 | 记录 | 必填 values |
 |---|---|
-| goal | goal_id、status、commit、pr_url |
+| goal | goal_id、status、commit、pr_url、done_seq |
 | dds | dd_id、commit、spec_commit、spec_path、pr_url |
 | runs | run_id、role、status、session_id；Impl/CR/FR 另需 dd_id |
 | reviews | dd_id、role、commit、verdict、run_id；FR 另需 review_ref |
 | acceptances | dd_id、commit、status、run_id、workspace、results（原始命令记录，逐条检查 exit_code=0） |
-| approvals | dd_id、commit、review_ref |
+| approvals | dd_id、commit、review_ref、goal_run_id、decision、applied_review_ref |
 | prs | url、base、head、head_sha、merge_sha、state、repository |
 
 events 是指向完整原始事件数组的引用。Runner 必须从起始游标读到日志末尾，保留空页与 next 的推进，不能只存最后一页。role 使用 goal/impl/cr/fr/scribe。成功值可为 pass/passed/succeeded/success/done/approved，原始值仍须保留；Goal 最终必须为 done，PR 必须为 merged（大小写不限）。此词表只解决公共表示差异，不允许把运行结束当业务通过。
+
+events 必须从 0 或 1 开始连续，汇总与原始分页逐条一致；本组公开 API 的 seq 从 1 开始。Session 每页必须绑定同一 run_id，total 与实际项数一致、next_offset 连续且末页为 null。批准证据必须来自成功 Goal run 的真实 Stop approve 动作，且 review_ref 已应用到当前 DD；只有 DD.approved 字段不能单独充当 Goal 审单证据。
+
+功能验证的 17 个用例由可信父进程逐例提交并核对实际返回类型、值和 TypeError。待测子进程只返回当前请求的数据，不负责声明检查是否通过或执行了多少项；CLI 语义另行核对。
+
+Scribe 必须有终局成功证据：run.intent 的原始 prompt.final=true，event_range 覆盖 Goal done_seq，并有之后同一 run_id 的 scribe.observed 与非空 observations。适配器把这些原始字段映射到 Scribe run 的 final、event_range、observed_seq、observed_run_id、observations。早期 Scribe 成功不能替代终局失败或缺失的观察。
 
 验收检查角色成功 Session、同 DD 的 CR/FR/程序验收/Goal approval、review_ref 与完整 commit 绑定、先 SPEC 后实现、DD/整线真实 PR 的 source/target 与 Git ancestry、最终 tree 无未审查改动，以及外部运行固定功能用例。程序验收还直接核对 `raw/artifacts/commands/RUN/input.json` 与 `result.json`：命令必须等于登记的固定 make verify，workspace、状态、结果、日志引用与同一个 run 一致。任何 `raw/collection-errors.json` 记录都使验收失败。最终 repo 必须由可信 harness 从 target checkout；不得由候选选一个工作树冒充交付。
 

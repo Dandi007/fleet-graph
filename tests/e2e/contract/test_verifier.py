@@ -68,6 +68,7 @@ class ContractTests(unittest.TestCase):
                 "status": "done",
                 "commit": self.head,
                 "pr_url": "https://github.com/example/test/pull/2",
+                "done_seq": 1,
             },
             "dds": [
                 {
@@ -116,7 +117,14 @@ class ContractTests(unittest.TestCase):
                 }
             ],
             "approvals": [
-                {"dd_id": "dd-unit", "commit": self.code, "review_ref": "review-current"}
+                {
+                    "dd_id": "dd-unit",
+                    "commit": self.code,
+                    "review_ref": "review-current",
+                    "goal_run_id": "goal",
+                    "decision": "approve",
+                    "applied_review_ref": "review-current",
+                }
             ],
             "prs": [
                 {
@@ -138,8 +146,18 @@ class ContractTests(unittest.TestCase):
                     "repository": "example/test",
                 },
             ],
-            "events": [{"seq": 1, "kind": "unit.synthetic", "payload": {}}],
+            "events": [
+                {"seq": 1, "kind": "goal.done", "payload": {}},
+                {"seq": 2, "kind": "scribe.observed", "payload": {"run_id": "scribe"}},
+            ],
         }
+        self.raw["runs"][-1].update(
+            final=True,
+            event_range=[1, 1],
+            observed_seq=2,
+            observed_run_id="scribe",
+            observations=[{"unit": "合成测试"}],
+        )
         self.program_input = {
             "workspace": "/workspace/dd-unit",
             "timeout": 900,
@@ -193,6 +211,12 @@ class ContractTests(unittest.TestCase):
         (self.bundle / "manifest.json").write_text(json.dumps(self.manifest))
         (self.bundle / "snapshot.json").write_text(json.dumps(snapshot))
         (self.bundle / "raw/observed.json").write_text(json.dumps(self.raw))
+        last_seq = self.raw["events"][-1]["seq"] if self.raw["events"] else 0
+        (self.bundle / "raw/event-pages.json").write_text(
+            json.dumps(
+                [{"events": self.raw["events"], "next": last_seq}, {"events": [], "next": last_seq}]
+            )
+        )
         (self.bundle / "raw/collection-errors.json").write_text(json.dumps(self.collection_errors))
         (self.bundle / "raw/runtime-bus.json").write_text(
             json.dumps(
@@ -214,7 +238,18 @@ class ContractTests(unittest.TestCase):
             path = self.bundle / "raw/sessions" / (run["run_id"] + ".json")
             path.parent.mkdir(exist_ok=True)
             path.write_text(
-                json.dumps({"pages": [{"items": [{"unit": "合成测试"}], "next_offset": None}]})
+                json.dumps(
+                    {
+                        "pages": [
+                            {
+                                "run_id": run["run_id"],
+                                "total": 1,
+                                "items": [{"unit": "合成测试"}],
+                                "next_offset": None,
+                            }
+                        ]
+                    }
+                )
             )
 
     def report(self):
@@ -281,6 +316,60 @@ class ContractTests(unittest.TestCase):
     def test_early_process_exit_cannot_skip_function_checks(self):
         (self.repo / "slugify.py").write_text("import os\nos._exit(0)\n")
         self.assert_fails("independent_functional_acceptance")
+
+    def test_fake_old_marker_without_exported_function_is_rejected(self):
+        (self.repo / "slugify.py").write_text("""import os, json, argparse, re
+if __name__ == "subject_slugify":
+    print(json.dumps({"cases": 17, "status": "passed"}), flush=True)
+    os._exit(0)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("text")
+    print(re.sub(r"[\\s_-]+", "-", parser.parse_args().text.lower()).strip("-"))
+""")
+        self.assert_fails("independent_functional_acceptance")
+
+    def test_approval_must_come_from_successful_goal_run(self):
+        self.raw["approvals"][0]["goal_run_id"] = "impl"
+        self.assert_fails("review_commit_chain")
+
+    def test_waiting_action_cannot_be_used_as_approval(self):
+        self.raw["approvals"][0]["decision"] = "waiting"
+        self.assert_fails("review_commit_chain")
+
+    def test_missing_middle_event_fails(self):
+        self.raw["events"].append({"seq": 4, "kind": "unit.synthetic", "payload": {}})
+        self.assert_fails("lifecycle")
+
+    def test_early_scribe_success_cannot_replace_final_success(self):
+        self.raw["runs"][-1]["final"] = False
+        self.assert_fails("final_scribe")
+
+    def test_final_scribe_range_must_cover_goal_done(self):
+        self.raw["runs"][-1]["event_range"] = [2, 2]
+        self.raw["runs"][-1]["observed_seq"] = 3
+        self.assert_fails("final_scribe")
+
+    def test_final_scribe_without_observed_event_fails(self):
+        del self.raw["runs"][-1]["observed_run_id"]
+        self.assert_fails("final_scribe")
+
+    def test_missing_initial_event_fails(self):
+        self.raw["events"][0]["seq"] = 7
+        self.assert_fails("lifecycle")
+
+    def test_wrong_session_run_and_missing_pages_fail(self):
+        for mutation in ({"run_id": "other-run"}, {"total": 1001}):
+            self.write()
+            path = self.bundle / "raw/sessions/cr.json"
+            session = json.loads(path.read_text())
+            session["pages"][0].update(mutation)
+            path.write_text(json.dumps(session))
+            report = verifier.verify(self.bundle, self.repo)
+            self.assertEqual(report["status"], "failed")
+            self.assertTrue(
+                any(c["name"] == "lifecycle" and c["status"] == "failed" for c in report["checks"])
+            )
 
     def test_true_command_cannot_replace_make_verify(self):
         self.program_input["commands"] = ["true"]
