@@ -1226,3 +1226,102 @@ class TestCrashSafeRepair:
         rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
         requests = [e for e in rebuilt.list_events(GOAL)["events"] if e["record"] == RECORD_REQUEST]
         assert [r["request_id"] for r in requests] == ["A"]
+
+
+# --- finding: version-bound review reads the live version at the effect boundary ---
+
+
+class TestLiveVersionAtReviewBoundary:
+    def test_a_mid_list_version_activation_refuses_a_later_stale_review(self) -> None:
+        effects = FakeEffects()
+        kernel = make_kernel(effects)
+        kernel.activate_version(GOAL, "v1")
+
+        def activate_v2_and_dispatch(payload: dict[str, Any], *, ctx: Any) -> dict[str, Any]:
+            # An explicit version event lands *while this list is executing*.
+            kernel.activate_version(GOAL, "v2")
+            return {"ok": True}
+
+        effects.dispatch = activate_v2_and_dispatch  # type: ignore[method-assign]
+        approve_at_v1 = {
+            "kind": "approve",
+            "idempotency_key": "ap1",
+            "payload": {"development_id": "d1", "verdict": "APPROVE", "goal_version": "v1"},
+        }
+        result = run_one(
+            kernel,
+            make_request("A"),
+            {"actions": [dispatch_action("k1"), approve_at_v1]},
+        )
+        by_kind = {r["kind"]: r for r in result["results"]}
+        assert by_kind["dispatch"]["status"] == DELIVERED
+        # The later approve bound to v1 is refused against the *current* v2,
+        # not the pre-list snapshot that cached v1.
+        assert by_kind["approve"]["status"] == FAILED
+        assert "stale_version" in by_kind["approve"]["detail"]
+        assert effects.approvals == []  # the stale review never reached the gate
+
+
+# --- finding: complete raw Goal response survives interruption (lossless events) ---
+
+
+class TestRawResponsePreservation:
+    def test_interrupted_call_preserves_malformed_entries_and_raw_intent(
+        self, tmp_path
+    ) -> None:
+        home = tmp_path / "journal"
+        effects = CrashEffects(crash_on={"k2"})
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=effects)
+        kernel.activate_version(GOAL, "v1")
+        kernel.submit(GOAL, make_request("A"))
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None and call["request_id"] == "A"
+
+        raw = {
+            "actions": [
+                {"kind": "bogus", "payload": {"x": 1}, "idempotency_key": "bad"},
+                dispatch_action("k1"),
+                dispatch_action("k2"),
+            ],
+            "intent": "mystery",  # an unsupported intent value
+        }
+        with pytest.raises(KeyboardInterrupt):
+            kernel.finish_goal_call(GOAL, call["call_id"], raw)
+
+        # The stop list -- durable *before* any effect -- retains the complete
+        # raw response, not a normalized projection.
+        durable = Journal(home=home)
+        stop_lists = [
+            line
+            for line in durable.scan(GOAL)
+            if line.get("record") == RECORD_STOP_LIST and line.get("call_id") == call["call_id"]
+        ]
+        assert len(stop_lists) == 1
+        sl = stop_lists[0]
+        assert sl["raw_intent"] == "mystery"  # the unsupported intent survives
+        assert sl["raw_actions"] == raw["actions"]  # malformed entry retained verbatim
+        # routable actions keep their *original* list positions (2 and 3), never
+        # rewritten by the normalization that dropped the interleaved malformed
+        # entry at position 1.
+        assert [a["idempotency_key"] for a in sl["actions"]] == ["k1", "k2"]
+        assert [a["list_index"] for a in sl["actions"]] == [2, 3]
+        assert [(r["idempotency_key"], r.get("list_index")) for r in sl["malformed"]] == [
+            ("bad", 1)
+        ]
+
+        # Resume: pagination at the resumed call still exposes the raw outcome,
+        # not the reduced list reconstructed from the normalized projection.
+        effects2 = FakeEffects()
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=effects2)
+        nxt = rebuilt.next_goal_call(GOAL)
+        assert nxt is not None and nxt["resume"] is True
+        rebuilt.finish_goal_call(GOAL, nxt["call_id"], nxt["stop_list"])
+
+        call_results = [
+            e
+            for e in rebuilt.list_events(GOAL)["events"]
+            if e.get("record") == RECORD_CALL_RESULT and e.get("call_id") == call["call_id"]
+        ]
+        assert len(call_results) == 1
+        assert call_results[0]["raw_intent"] == "mystery"
+        assert call_results[0]["actions"] == raw["actions"]

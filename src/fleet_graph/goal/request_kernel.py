@@ -480,27 +480,48 @@ def validate_stop_list(
     consumable: list[dict[str, Any]] = []
     receipts: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for entry in raw:
+    # ``position`` is the action's 1-based index in the *original* raw list, so
+    # list-index attribution is never rewritten by the normalization: a
+    # malformed entry interleaved between two valid ones does not shift the
+    # later entries' original positions (behavior 4, lossless raw events).
+    for position, entry in enumerate(raw, start=1):
         if not isinstance(entry, dict):
-            receipts.append(_receipt(None, reason="action must be an object"))
+            receipts.append(
+                _receipt(entry, reason="action must be an object", list_index=position)
+            )
             continue
         kind = entry.get("kind")
         payload = entry.get("payload")
         key = entry.get("idempotency_key")
         if kind not in ACTION_KINDS:
-            receipts.append(_receipt(entry, reason=f"unknown action kind {kind!r}"))
+            receipts.append(
+                _receipt(entry, reason=f"unknown action kind {kind!r}", list_index=position)
+            )
             continue
         if not isinstance(payload, dict):
-            receipts.append(_receipt(entry, reason="action payload must be an object"))
+            receipts.append(
+                _receipt(entry, reason="action payload must be an object", list_index=position)
+            )
             continue
         if not isinstance(key, str) or not key.strip():
-            receipts.append(_receipt(entry, reason="idempotency_key is required"))
+            receipts.append(
+                _receipt(entry, reason="idempotency_key is required", list_index=position)
+            )
             continue
         if key in seen:
-            receipts.append(_receipt(entry, reason=f"duplicate idempotency_key {key!r}"))
+            receipts.append(
+                _receipt(entry, reason=f"duplicate idempotency_key {key!r}", list_index=position)
+            )
             continue
         seen.add(key)
-        consumable.append({"kind": kind, "payload": payload, "idempotency_key": key})
+        consumable.append(
+            {
+                "kind": kind,
+                "payload": payload,
+                "idempotency_key": key,
+                "list_index": position,
+            }
+        )
     return consumable, receipts, _norm_intent(result)
 
 
@@ -509,14 +530,19 @@ def _norm_intent(result: dict[str, Any]) -> str | None:
     return intent if intent in INTENT_KINDS else None
 
 
-def _receipt(entry: dict[str, Any] | None, *, reason: str) -> dict[str, Any]:
+def _receipt(
+    entry: dict[str, Any] | None, *, reason: str, list_index: int | None = None
+) -> dict[str, Any]:
     identified = entry if isinstance(entry, dict) else {}
-    return {
+    receipt: dict[str, Any] = {
         "kind": str(identified.get("kind") or ""),
         "idempotency_key": str(identified.get("idempotency_key") or ""),
         "status": FAILED,
         "reason": reason,
     }
+    if list_index is not None:
+        receipt["list_index"] = list_index
+    return receipt
 
 
 def business_guards(action: dict[str, Any], *, active_version: str) -> str | None:
@@ -851,6 +877,9 @@ class GoalRequestKernel:
         consumable: list[dict[str, Any]],
         receipts: list[dict[str, Any]],
         intent: str | None,
+        *,
+        raw_actions: Any,
+        raw_intent: Any,
     ) -> dict[str, Any]:
         """Durably record the *validated* Stop List before any effect runs.
 
@@ -858,6 +887,14 @@ class GoalRequestKernel:
         disk, an interruption no longer needs a fresh Goal answer -- the
         original action identities (kind/idempotency_key/list_index) are
         recoverable and only outstanding items are executed on resume.
+
+        The *complete raw Goal response* is persisted here too, before effects
+        (finding: lossless raw events): ``raw_actions`` are the original action
+        entries verbatim -- a malformed entry's payload and original position
+        survive even though it is not routable -- and ``raw_intent`` is the
+        original, possibly unsupported intent value. Neither may be reconstructed
+        from the normalized projection, so both are written first and retained
+        through resume so pagination never reduces the raw outcome.
         """
         return self.journal.append(
             goal,
@@ -868,12 +905,14 @@ class GoalRequestKernel:
                 "request_id": request_id,
                 "run_id": run_id,
                 "intent": intent,
+                "raw_actions": raw_actions,
+                "raw_intent": raw_intent,
                 "actions": [
                     {
                         "kind": a["kind"],
                         "payload": a["payload"],
                         "idempotency_key": a["idempotency_key"],
-                        "list_index": i,
+                        "list_index": int(a.get("list_index", i)),
                     }
                     for i, a in enumerate(consumable, start=1)
                 ],
@@ -913,11 +952,26 @@ class GoalRequestKernel:
             consumable = [dict(a) for a in persisted.get("actions") or []]
             receipts = [dict(r) for r in (persisted.get("malformed") or [])]
             intent = persisted.get("intent")
+            # The complete raw response survives the interruption: retain the
+            # original action entries and unsupported intent verbatim so the
+            # resumed call result never collapses into a reduced projection.
+            raw_actions = persisted.get("raw_actions")
+            raw_intent = persisted.get("raw_intent")
         else:
             consumable, receipts, intent = validate_stop_list(stop_list)
-            self._persist_stop_list(goal, call_id, request_id, run_id, consumable, receipts, intent)
-
-        active_version = self._versions.get(goal, "")
+            raw_actions = stop_list.get("actions") if isinstance(stop_list, dict) else None
+            raw_intent = stop_list.get("intent") if isinstance(stop_list, dict) else None
+            self._persist_stop_list(
+                goal,
+                call_id,
+                request_id,
+                run_id,
+                consumable,
+                receipts,
+                intent,
+                raw_actions=raw_actions,
+                raw_intent=raw_intent,
+            )
 
         results: list[dict[str, Any]] = []
         # P1 same-list dependency: a ``dispatch`` is only admitted for a
@@ -952,7 +1006,11 @@ class GoalRequestKernel:
                     "suspended": True,
                 }
             index = int(action.get("list_index", position))
-            refusal = business_guards(action, active_version=active_version)
+            # Read the active version at the review-effect boundary, not from a
+            # snapshot taken before the list executes: an earlier effect may
+            # have activated a new version mid-list, and an approve/reject naming
+            # the then-stale version must be refused against the *current* one.
+            refusal = business_guards(action, active_version=self.active_version(goal))
             if refusal:
                 results.append(
                     self._refuse(goal, action, call_id, request_id, run_id, index, refusal)
@@ -991,14 +1049,13 @@ class GoalRequestKernel:
                     f"{call_id}:malformed:{receipt.get('idempotency_key') or 'unknown'}",
                     request_id,
                     run_id,
-                    0,
+                    int(receipt.get("list_index") or 0),
                     str(receipt.get("kind") or ""),
                     FAILED,
                     str(receipt.get("reason") or "malformed action"),
                     final=True,
                 ),
             )
-        raw_actions = stop_list.get("actions") if isinstance(stop_list, dict) else None
         self.journal.append(
             goal,
             {
@@ -1008,6 +1065,7 @@ class GoalRequestKernel:
                 "request_id": request_id,
                 "run_id": run_id,
                 "intent": intent,
+                "raw_intent": raw_intent,
                 "actions": raw_actions if isinstance(raw_actions, list) else [],
                 "at": _iso(self.clock),
             },
