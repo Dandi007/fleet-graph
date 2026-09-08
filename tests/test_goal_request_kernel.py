@@ -1087,6 +1087,80 @@ class TestDurableJournalSync:
         requests = [e for e in again.list_events(GOAL)["events"] if e["record"] == RECORD_REQUEST]
         assert [r["request_id"] for r in requests] == ["A"]
 
+    def test_reconstruction_re_syncs_the_directory_chain(self, tmp_path) -> None:
+        # Final review finding (behavior 1, 4, 7 / P6): after a first append's
+        # directory-entry sync failure leaves a file behind, a rebuilt Journal
+        # must not treat that readable file as already durably synced -- the OS
+        # page cache proving readability is not durability proof. Reconstructing
+        # and re-submitting must re-establish the full directory-entry barrier
+        # (the file's own parent entry plus every created ancestor's parent
+        # entry), then -- and only then -- acknowledge the request.
+        attempts: list[str] = []
+
+        def flaky_dir_sync(path) -> None:
+            attempts.append(str(path))
+            if len(attempts) == 1:
+                raise OSError("first directory sync fails")
+
+        home = tmp_path / "a" / "b" / "j"
+        journal = Journal(home=home, dir_sync=flaky_dir_sync)
+        with pytest.raises(OSError):
+            journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v1"})
+        assert journal.scan(GOAL) == []
+
+        # "Destroy" the instance: reconstruct a fresh Journal (new process
+        # equivalent). load() must record -- not assume -- the directory-sync
+        # obligations for the discovered file.
+        resynced: list[str] = []
+
+        def recording_dir_sync(path) -> None:
+            resynced.append(str(path))
+
+        rebuilt = Journal(home=home, dir_sync=recording_dir_sync)
+        rebuilt.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v2"})
+        assert any(r.get("version") == "v2" for r in rebuilt.scan(GOAL))
+
+        # The barrier is re-established deepest-first: the file's own parent
+        # entry, then each ancestor's parent entry back up to the filesystem
+        # root's direct child. The root itself is never fsync'd.
+        expected: list[str] = []
+        directory = home
+        while directory.parent != directory:
+            expected.append(str(directory))
+            directory = directory.parent
+        assert resynced == expected
+
+    def test_reconstruction_recovers_a_crashed_repair_rename(self, tmp_path) -> None:
+        # A repaired journal tail is written via an atomic rename, which binds a
+        # *new inode* to the filename. If that fresh directory-entry sync fails
+        # after the rename, the repaired file is readable but its entry is not
+        # durable -- a later reconstruction must re-sync it instead of trusting
+        # readability (behavior 1, 4, 7 / P6).
+        home = tmp_path / "j"
+        journal = Journal(home=home)
+        journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v1"})
+        path = home / "goal-wf-1.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write('{"record": "request", "goal": "wf-1", "requ')
+
+        def broken_dir_sync(_path) -> None:
+            raise OSError("directory sync fails during repair rename")
+
+        # The rename happens, then the directory sync fails: construction raises.
+        with pytest.raises(OSError):
+            Journal(home=home, dir_sync=broken_dir_sync)
+
+        resynced: list[str] = []
+
+        def recording_dir_sync(directory) -> None:
+            resynced.append(str(directory))
+
+        rebuilt = Journal(home=home, dir_sync=recording_dir_sync)
+        rebuilt.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v2"})
+        assert any(r.get("version") == "v2" for r in rebuilt.scan(GOAL))
+        # The new inode's directory entry is re-synced on the next append.
+        assert str(home) in resynced
+
 
 # --- raw event completeness (behavior 6) --------------------------------------
 

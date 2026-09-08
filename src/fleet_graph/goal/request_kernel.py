@@ -383,6 +383,40 @@ class Journal:
         assert self.home is not None
         return self.home / f"{self.scope}-{goal}.jsonl"
 
+    def _recover_sync_duty(self, path: Path) -> None:
+        """Re-establish the directory-entry durability obligations lost by a
+        restart.
+
+        After reconstruction, a discovered journal file being *readable* only
+        shows its directory entry is still in the OS page cache -- not that it
+        was ever durably fsync'd. A host crash in the window between the
+        file-content fsync and the parent-directory entry fsync leaves exactly
+        this state, so ``load`` must not treat readability as durability proof
+        (behavior 1, 4, 7 / P6).
+
+        Two obligations are re-derived here, both consumed lazily by the next
+        ``_persist_append`` (so no sync runs merely because reconstruction
+        happened, and a sync failure still blocks the acceptance ack):
+
+        * the journal file's *own* entry in ``path.parent`` -- recovered by
+          keeping ``path`` out of ``_files_synced`` so the append re-syncs
+          ``path.parent`` before it can ack; and
+        * the parent entry of every directory this journal may have created --
+          ``path.parent`` (``home``) and each ancestor back up to the filesystem
+          root, re-added to ``_created_dirs`` so the append's ancestor loop
+          re-syncs their parent entries instead of skipping them because the
+          paths now merely exist.
+        """
+        # ``path.parent`` is ``home``. Keep the file out of ``_files_synced``
+        # (its own entry is re-synced on the next append) and remember the full
+        # ancestor chain this journal may have created. The walk stops one level
+        # short of the filesystem root so the deepest append never fsync's the
+        # root itself, only the entry of its direct child.
+        directory = path.parent
+        while directory.parent.parent != directory.parent:
+            self._created_dirs.add(directory)
+            directory = directory.parent
+
     def load(self) -> Journal:
         """Load every existing journal line for every goal from disk.
 
@@ -398,11 +432,16 @@ class Journal:
         with self._lock:
             loaded: dict[str, list[dict[str, Any]]] = {}
             for path in sorted(self.home.glob(f"{self.scope}-*.jsonl")):
-                # A file that survived to be read back already has a durable
-                # directory entry; mark *that file* as synced so a later append
-                # re-syncs only for a genuinely new file entry, never because a
-                # different goal's file once synced the same directory.
-                self._files_synced.add(path)
+                # A file that survived to be read back only proves its directory
+                # entry is still in the OS page cache, not that it was ever
+                # durably fsync'd (a crash between the file-content fsync and the
+                # directory-entry sync can leave the file readable but its entry
+                # unpersisted). Treating readability as durability here -- or
+                # leaving the created-ancestor chain empty -- would let the next
+                # append skip the still-incomplete directory-entry syncs and then
+                # issue an acceptance ack. Re-derive the durability obligation
+                # instead (behavior 1, 4, 7 / P6).
+                self._recover_sync_duty(path)
                 goal = path.name[len(self.scope) + 1 : -len(".jsonl")]
                 # Read *bytes* and split on newlines before decoding: a crash
                 # mid-``append`` can leave a torn multi-byte UTF-8 character at
