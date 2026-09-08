@@ -102,13 +102,15 @@ class TestNoUnguardedGitIsLeftInTheSource:
         # duplicates the guards in its own argv builders; those builds are
         # guarded calls and are checked behaviorally (guards directly follow
         # the git token) in tests/test_minimal_gitgate.py,
-        # tests/test_minimal_enroll.py, tests/test_minimal_runroot.py, and
-        # tests/test_minimal_prlifecycle.py.
+        # tests/test_minimal_enroll.py, tests/test_minimal_runroot.py,
+        # tests/test_minimal_prlifecycle.py, and
+        # tests/test_minimal_mergegate.py.
         whitelisted = {
             "minimal/gitgate.py",
             "minimal/enroll.py",
             "minimal/runroot.py",
             "minimal/prlifecycle.py",
+            "minimal/mergegate.py",
         }
         offenders = []
         for path in sorted(root.rglob("*.py")):
