@@ -99,6 +99,25 @@ goal 一个目录（`<goal_run_root>`）：
     └── engine.log            # 引擎进程的 stdout / stderr（spawn 时重定向）
 ```
 
+### 4.1 WF 侧（work-folder）的四个人读文件：谁写、什么时候写
+
+引擎根布局（上面）放运行时状态；人读正本在 work-folder（GO-19 / GO-34），两边不混。
+每个 goal 的 WF 里有四个人读文件：
+
+| 文件 | 内容 | 谁写 | 什么时候 |
+|---|---|---|---|
+| `goal.md` | `goal_text`（人读目标） | MCP 在 enroll 建 WF 时 | 一次，enroll 时 |
+| `spec.md` | 目标补充说明（可选） | Goal Agent | 需要时 |
+| `progress.md` | 一行一条进度 | **引擎** + Goal Agent | 引擎在每个 goal 级 event（turn 结束、DD 结束、done / blocked）后经 work-folder MCP 追加一行；Goal Agent Stop `done` / `blocked` 时写自己的 summary |
+| `findings.md` | 书记员高严重度 observation | **引擎**（经 work-folder MCP） | 书记员跑完，把 `severity ∈ {warn, high}` 的那批镜像进来（`info` 不进） |
+
+两条纪律：
+
+- 引擎这几次写都是「尽力而为」：work-folder MCP 不可达 / 超时 / 返回错，一律吞掉
+  异常、只落一条 `goal.warning`，goal 循环照常往下跑——WF 故障永不阻塞主流程。
+- 运行时状态永远不进 WF：`events.jsonl` / `control.jsonl` / `sessions/` / `worktrees/`
+  / `goal.enroll.json` 只在上面的引擎根，WF 只收人读的 progress / findings 文本行（GO-34）。
+
 ## 5. 观测、stop 与 resume
 
 **观测**（全是只读）：
