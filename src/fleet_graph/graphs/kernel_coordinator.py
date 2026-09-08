@@ -479,25 +479,33 @@ class KernelEffectPorts:
             return self._failed(f"{type(exc).__name__}: {exc}")
         receipt = receipt or {}
         status = str(receipt.get("status") or "")
-        if status == "consumed":
-            out: dict[str, Any] = {
-                "ok": True,
-                "status": DELIVERED,
-                "detail": str(receipt.get("detail") or ""),
-            }
-            # Preserve the raw gate receipt fields (decision, decided_by,
-            # decided_by_source, decision_file, decision_message_id,
-            # post_release_state, launches, evidence, development_id) on the
-            # delivery so the kernel's raw result record retains the release's
-            # original result and evidence -- the adapter used to reduce it to a
-            # status/detail string, which kernel pagination could not expose
-            # (final review finding; behavior 6).
-            for key, value in receipt.items():
-                if key in ("status", "detail") or key in out:
-                    continue
-                out[key] = value
-            return out
-        return self._failed(str(receipt.get("detail") or receipt.get("code") or "gate refused"))
+        consumed = status == "consumed"
+        out: dict[str, Any] = {
+            "ok": consumed,
+            "status": DELIVERED if consumed else FAILED,
+            "detail": (
+                str(receipt.get("detail") or "")
+                if consumed
+                else str(
+                    receipt.get("detail") or receipt.get("reason") or receipt.get("code") or "gate refused"
+                )
+            ),
+        }
+        # Preserve the raw gate receipt fields (decision, decided_by,
+        # decided_by_source, decision_file, decision_message_id,
+        # post_release_state, launches, evidence, development_id, and the
+        # *structured* ``reason``/``code`` of a refusal) on the delivery on
+        # *both* the consumed and the refused path, so the kernel's raw result
+        # record retains the release's original result and evidence -- the
+        # adapter used to reduce a refused gate (gate_obligations_failed,
+        # not_awaiting_gate, not_dispatcher, ...) to a bare status/detail
+        # string, which kernel pagination and a rebuilt product could not query
+        # (final review finding; behavior 6).
+        for key, value in receipt.items():
+            if key in ("ok", "status", "detail") or key in out:
+                continue
+            out[key] = value
+        return out
 
     @staticmethod
     def _not_ready(detail: str) -> dict[str, Any]:

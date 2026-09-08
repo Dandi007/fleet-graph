@@ -495,6 +495,79 @@ class TestStoppedVsWaiting:
         assert runtime.stops == [{"goal": GOAL, "mode": "immediate"}]
 
 
+# --- blocked request->wake crash-recovery (final review finding; behaviors 5/7/P6)
+
+
+class TestBlockedWakeRecovery:
+    """The wake a new request applies to a blocked/waiting goal is itself
+    durable state that must be recoverable from the request event alone. A crash
+    between the request append and the separately-persisted ``mode=running``
+    control line could strand a request behind a blocked mode; ``restore`` (and
+    the duplicate-submission path) must complete that wake in durable order,
+    while never lifting ``stopped``/``stopping``."""
+
+    def _write_crashed_wake_goal(self, home: Any, initial: str) -> None:
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        kernel.activate_version(GOAL, "v1")
+        if initial == MODE_BLOCKED:
+            kernel.blocked(GOAL, blocker="needs human")
+        elif initial == MODE_WAITING:
+            kernel.waiting(GOAL, waiting_on="decision")
+        elif initial == MODE_STOPPED:
+            kernel.stop(GOAL)
+        # The request was accepted and persisted, but the process crashed before
+        # the separately-persisted ``mode=running`` wake line landed.
+        kernel.journal.append(
+            GOAL,
+            make_request("A").as_record(accepted_at="2024-01-01T00:00:00Z", goal_version="v1"),
+        )
+
+    def test_a_blocked_goal_recovers_the_request_wake_from_the_durable_event(
+        self, tmp_path
+    ) -> None:
+        home = tmp_path / "journal"
+        self._write_crashed_wake_goal(home, MODE_BLOCKED)
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        # The wake is recovered from the request event, so next_goal_call no
+        # longer refuses the already-durable request.
+        call = rebuilt.next_goal_call(GOAL)
+        assert call is not None and call["request_id"] == "A"
+
+    def test_a_waiting_goal_recovers_the_request_wake_from_the_durable_event(
+        self, tmp_path
+    ) -> None:
+        home = tmp_path / "journal"
+        self._write_crashed_wake_goal(home, MODE_WAITING)
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        assert rebuilt._mode_of(GOAL) == MODE_RUNNING
+        call = rebuilt.next_goal_call(GOAL)
+        assert call is not None and call["request_id"] == "A"
+
+    def test_a_request_recorded_while_stopped_does_not_lift_stopped(self, tmp_path) -> None:
+        home = tmp_path / "journal"
+        self._write_crashed_wake_goal(home, MODE_STOPPED)
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        # ``stopped`` is not lifted by a request event -- only resume moves it.
+        assert rebuilt.next_goal_call(GOAL) is None
+        rebuilt.resume(GOAL)
+        call = rebuilt.next_goal_call(GOAL)
+        assert call is not None and call["request_id"] == "A"
+
+    def test_same_identity_resubmission_wakes_a_blocked_goal(self) -> None:
+        # The duplicate branch must still complete a lost wake: a request that
+        # is durable + queued but whose mode stayed blocked (the crash window
+        # above) is re-acknowledged as a duplicate, and that re-submission must
+        # not leave the caller with an ack the kernel then refuses to service.
+        kernel = make_kernel()
+        kernel.submit(GOAL, make_request("A"))
+        kernel.blocked(GOAL, blocker="needs human")
+        assert kernel.next_goal_call(GOAL) is None  # parked; A is still queued
+        resubmit = kernel.submit(GOAL, make_request("A"))
+        assert resubmit["duplicate"] is True
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None and call["request_id"] == "A"
+
+
 # --- explicit goal versions --------------------------------------------------
 
 
@@ -2647,3 +2720,101 @@ class TestEffectPortsPreserveDownstream:
             if e["record"] == RECORD_ACTION_RESULT and e.get("kind") == ACTION_APPROVE
         ]
         assert approved and approved[0]["decision_file"] == ".dev-dispatch/gate/decision-g3.json"
+
+
+class _FakeRefusingGateNode:
+    """A fake gate node returning a *failed* receipt with a structured reason
+    and per-item evidence, exactly as ``GraphGateNode`` refuses a release
+    (``gate_obligations_failed``)."""
+
+    def __init__(self, development_id: str = "d-1") -> None:
+        self.development_id = development_id
+        self.consumed: list[dict[str, Any]] = []
+
+    def consume(self, action: dict[str, Any], *, folder_id: str, round_no: int) -> dict[str, Any]:
+        self.consumed.append(action)
+        return {
+            "kind": str(action.get("kind") or ""),
+            "idempotency_key": str(action.get("idempotency_key") or ""),
+            "status": "failed",
+            "reason": "gate_obligations_failed",
+            "detail": "obligation(s) incomplete: e2",
+            "development_id": self.development_id,
+            "evidence": [
+                {"id": "e1", "passed": True, "detail": "ok"},
+                {"id": "e2", "passed": False, "detail": "verify-rebuild missing"},
+            ],
+        }
+
+
+class TestEffectPortsPreserveGateFailures:
+    """A refused gate must retain its raw receipt on the delivery too, not just
+    the consumed path: the kernel journal and rebuilt pagination must expose the
+    structured reason, identity and per-item evidence of a real failure rather
+    than reduce it to a status/detail string (final review finding; behavior 6)."""
+
+    def _refused_approve(
+        self, home: Any, effects: KernelEffectPorts
+    ) -> dict[str, Any]:
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=effects)
+        kernel.activate_version(GOAL, "v1")
+        return run_one(
+            kernel,
+            make_request("A"),
+            {
+                "actions": [
+                    {
+                        "kind": ACTION_APPROVE,
+                        "idempotency_key": "k1",
+                        "payload": {
+                            "development_id": "d-1",
+                            "verdict": "APPROVE",
+                            "goal_version": "v1",
+                        },
+                    },
+                ]
+            },
+        )
+
+    def test_refused_gate_receipt_facts_are_retained_and_queryable(self, tmp_path) -> None:
+        home = tmp_path / "journal"
+        effects = KernelEffectPorts(
+            folder_id=GOAL, dd=_FakeDdSubgraph(), gate=_FakeRefusingGateNode()
+        )
+        result = self._refused_approve(home, effects)
+        assert result["results"][0]["status"] == FAILED
+        assert result["results"][0]["reason"] == "gate_obligations_failed"
+        assert result["results"][0]["development_id"] == "d-1"
+
+        kernel = GoalRequestKernel(journal=Journal(home=home))
+        refused = [
+            e
+            for e in kernel.list_events(GOAL)["events"]
+            if e["record"] == RECORD_ACTION_RESULT and e.get("kind") == ACTION_APPROVE
+        ]
+        assert len(refused) == 1
+        assert refused[0]["status"] == FAILED
+        assert refused[0]["reason"] == "gate_obligations_failed"
+        assert refused[0]["development_id"] == "d-1"
+        assert refused[0]["evidence"] == [
+            {"id": "e1", "passed": True, "detail": "ok"},
+            {"id": "e2", "passed": False, "detail": "verify-rebuild missing"},
+        ]
+
+    def test_rebuilt_pagination_retains_refused_gate_facts(self, tmp_path) -> None:
+        home = tmp_path / "journal"
+        effects = KernelEffectPorts(
+            folder_id=GOAL, dd=_FakeDdSubgraph(), gate=_FakeRefusingGateNode()
+        )
+        self._refused_approve(home, effects)
+
+        rebuilt = GoalRequestKernel(journal=Journal(home=home))
+        refused = [
+            e
+            for e in rebuilt.list_events(GOAL)["events"]
+            if e["record"] == RECORD_ACTION_RESULT and e.get("kind") == ACTION_APPROVE
+        ]
+        assert refused and refused[0]["reason"] == "gate_obligations_failed"
+        assert refused[0]["development_id"] == "d-1"
+        assert refused[0]["evidence"][1]["id"] == "e2"
+        assert refused[0]["evidence"][1]["passed"] is False

@@ -745,6 +745,18 @@ class GoalRequestKernel:
                         # still overrides -- e.g. a resume *after* the stop --
                         # because records are replayed in durable order.
                         mode = MODE_STOPPED
+                elif record == RECORD_REQUEST:
+                    # A durable request is a wake event: it lifts
+                    # blocked/waiting to running (behavior 5). Replaying it here
+                    # in durable order recovers a wake that was lost when the
+                    # process crashed after the request append but before the
+                    # separately-persisted ``mode=running`` control line (final
+                    # review finding; behaviors 5/7, P6). ``stopped`` and
+                    # ``stopping`` are deliberately not lifted -- only
+                    # ``resume`` moves a stopped goal, and a request recorded
+                    # while stopped stays parked.
+                    if mode in (MODE_BLOCKED, MODE_WAITING):
+                        mode = MODE_RUNNING
                 elif record == RECORD_CALL:
                     called.add(str(line.get("request_id") or ""))
                     current_call = str(line.get("call_id") or "") or None
@@ -870,6 +882,17 @@ class GoalRequestKernel:
         with self._request_lock:
             existing = self._find_request(request.request_id)
             if existing is not None:
+                # A duplicate acceptance reuses the persisted record (P5) but
+                # must still complete the wake a prior acceptance began: if the
+                # original wake was lost to a crash (request durable, the
+                # ``mode=running`` control line never written), the
+                # re-submission restores it instead of acknowledging a request
+                # that ``next_goal_call`` keeps refusing until an unrelated new
+                # request or an explicit resume arrives (final review finding;
+                # behavior 5). ``stopped``/``stopping`` are deliberately not
+                # lifted -- only ``resume`` moves a stopped goal.
+                if self._mode_of(goal) in (MODE_BLOCKED, MODE_WAITING):
+                    self._set_mode(goal, MODE_RUNNING)
                 return {"request_id": request.request_id, "duplicate": True, "record": existing}
             record = self.journal.append(
                 goal,
