@@ -1,0 +1,114 @@
+x-proxy-env: &proxy-env
+  HTTP_PROXY: http://egress:3128
+  HTTPS_PROXY: http://egress:3128
+  http_proxy: http://egress:3128
+  https_proxy: http://egress:3128
+  NO_PROXY: localhost,127.0.0.1,candidate,work-folder,agent-bus,git-remote,gateway
+  no_proxy: localhost,127.0.0.1,candidate,work-folder,agent-bus,git-remote,gateway
+
+services:
+  # 仅边界 relay 使用 host 网络，固定转发一个网关端口，无宿主数据挂载。
+  host-gateway-relay:
+    build: {context: ../.., dockerfile: tests/e2e/edge/Dockerfile}
+    network_mode: host
+    environment:
+      EDGE_MODE: relay
+      BIND_HOST: ${E2E_HOST_GATEWAY_IP:?}
+      BIND_PORT: ${E2E_GATEWAY_RELAY_PORT:?}
+      UPSTREAM_HOST: 127.0.0.1
+      UPSTREAM_PORT: ${E2E_GATEWAY_PORT:-15722}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+  gateway:
+    build: {context: ../.., dockerfile: tests/e2e/edge/Dockerfile}
+    networks: [backend, outbound]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    environment:
+      EDGE_MODE: relay
+      BIND_PORT: 15722
+      UPSTREAM_HOST: host.docker.internal
+      UPSTREAM_PORT: ${E2E_GATEWAY_RELAY_PORT:?}
+    depends_on: [host-gateway-relay]
+    read_only: true
+    cap_drop: [ALL]
+  egress:
+    build: {context: ../.., dockerfile: tests/e2e/edge/Dockerfile}
+    networks: [backend, outbound]
+    environment: {EDGE_MODE: proxy, BIND_PORT: 3128}
+    read_only: true
+    cap_drop: [ALL]
+  git-remote:
+    build: {context: ../.., dockerfile: tests/e2e/services/git-remote.Dockerfile}
+    networks: [backend]
+    volumes: [git-data:/data/git]
+  work-folder:
+    build: {context: ../.., dockerfile: tests/e2e/services/work-folder.Dockerfile}
+    networks: [backend]
+    volumes: [wf-data:/data/work-folder, search-data:/data/search]
+    depends_on:
+      git-remote: {condition: service_healthy}
+  agent-bus:
+    build: {context: ../.., dockerfile: tests/e2e/services/agent-bus.Dockerfile}
+    networks: [backend]
+    volumes: [bus-data:/data/agent-bus]
+    secrets: [bus_admin_token, bus_gateway_token]
+  candidate:
+    build: {context: ../.., dockerfile: tests/e2e/candidate/Dockerfile}
+    networks: [backend]
+    volumes: [candidate-state:/state, workspace:/workspace]
+    secrets: [gateway_token, gh_token, bus_gateway_token]
+    environment:
+      <<: *proxy-env
+      AGENT_BUS_URL: http://agent-bus:7470
+      AGENT_BUS_TOKEN_FILE: /run/secrets/bus_gateway_token
+    depends_on:
+      work-folder: {condition: service_healthy}
+      agent-bus: {condition: service_healthy}
+      gateway: {condition: service_started}
+      egress: {condition: service_started}
+  runner:
+    build: {context: ../.., dockerfile: tests/e2e/runner/Dockerfile}
+    networks: [backend]
+    volumes: [workspace:/workspace, artifacts:/artifacts]
+    secrets: [gh_token, bus_admin_token, gateway_token]
+    environment:
+      <<: *proxy-env
+      E2E_RUN_ID: ${E2E_RUN_ID:?}
+      FIXTURE_REPOSITORY: ${FIXTURE_REPOSITORY:-Dandi007/fleet-graph-e2e-fixtures}
+      GH_TOKEN_FILE: /run/secrets/gh_token
+      CANDIDATE_URL: http://candidate:15611/mcp
+      WF_URL: http://work-folder:5602/mcp
+      E2E_TIMEOUT: ${E2E_TIMEOUT:-3600}
+    depends_on:
+      candidate: {condition: service_healthy}
+    profiles: [test]
+  verifier:
+    build: {context: ../.., dockerfile: tests/e2e/runner/Dockerfile}
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    volumes: [workspace:/workspace:ro, artifacts:/artifacts:ro, verification:/verification]
+    environment: {E2E_RUN_ID: "${E2E_RUN_ID:?}"}
+    entrypoint: [python, /harness/contract/verifier.py]
+    profiles: [test]
+
+networks:
+  backend: {internal: true}
+  outbound: {}
+volumes:
+  git-data: {}
+  wf-data: {}
+  search-data: {}
+  bus-data: {}
+  candidate-state: {}
+  workspace: {}
+  artifacts: {}
+  verification: {}
+secrets:
+  gateway_token: {file: "${E2E_SECRETS_DIR:?}/gateway_token"}
+  gh_token: {file: "${E2E_SECRETS_DIR:?}/gh_token"}
+  bus_admin_token: {file: "${E2E_SECRETS_DIR:?}/bus_admin_token"}
+  bus_gateway_token: {file: "${E2E_SECRETS_DIR:?}/bus_gateway_token"}

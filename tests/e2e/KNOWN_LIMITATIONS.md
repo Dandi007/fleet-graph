@@ -1,0 +1,49 @@
+# Docker E2E 已知边界与候选问题
+
+## Scribe 连续观察的输入自引用
+
+固定候选 Fleet Graph `5e601d8d256c5d4d855e3d8b87556fb19c36c824` 在运行 `fg-3c42620a7957` 中暴露了连续观察缺陷。Scribe 的 `run.intent` 保存完整 prompt；下一次观察虽然计算了排除 Scribe 事件的 `meaningful`，实际输入仍使用完整 `page["events"]`。失败后 cursor 不推进，后续输入重复包含之前的 Scribe 输入并持续膨胀。
+
+公开 `goal_session` 的实测证据，Goal `9e06f56a38d44f91fc4ee770`：
+
+| Scribe run | 当前 user prompt 字符数 | 实际结果 |
+|---|---:|---|
+| `15d50b45a66eaf0936084a2a` | 977,560 | HTTP 400，输入长度超过上游限制 |
+| `8c53041a80be25939746049f` | 1,961,896 | HTTP 400，请求体超过 6,291,456 bytes |
+| `b0a6ef927c6d67d5fe280f0d` | 3,930,393 | HTTP 400，相同请求体超限 |
+
+另一次 Scribe `63cb21143859199246e263f8` 因最终 JSON 包含非法 `\s` 转义而 exit 91。这与请求体膨胀是两个问题。上游长度错误标记 `isRetryable:false`，原样恢复同一会话无法解决。
+
+本测试短 case 采用候选原生配置 `scribe_interval=0`，只在 Goal 完成时运行真实终局 Scribe；配置原值、有效值和模式写入 candidate manifest，独立 verifier 要求终局 Scribe 成功。它减少本 case 的中途观察，不修复连续观察缺陷。没有修改冻结候选源码、截断产品输入或伪造角色输出。
+
+后续产品修复应在对应开发线处理输入事件过滤、失败 cursor 与上下文容量，再用连续观察 case 验证。仅将 `roles.scribe.session_policy` 改为 `fresh` 无法解决单轮 prompt 自嵌套。
+
+## 严格 JSON 输出失败与重试边界
+
+运行 `fg-ed6ba65407da` 的 Goal `28eadb00464cd816662feb7b` 已实际提交 SPEC，但在最终 dispatch JSON 前附加解释文字，runtime 以 exit 91 拒绝，测试整体失败。该运行完整导出并清理，没有剥离文字后把它当作成功，也没有沿用其工作目录继续测试。
+
+冻结 runtime 的 `max_conformance_retries` 只用于 `--role` 协议；Fleet 使用的 `--output-schema` 与 `--role` 互斥，当前路径没有模型修复重试入口。测试不注入无效配置，不把重新启动整个干净 case 称为原生 conformance retry。真实模型输出可能违反契约，因此一次成功不能证明重复运行永远成功；历史失败与最终通过均须保留。
+
+运行 `fg-bffdbdaaefbf` 进一步确认了 OpenCode 的解析语义：冻结 runtime 遇到首条 `type=text` 就立即尝试 JSON 解析并返回，不会继续检查后续 text。该轮纠正 Goal 的三条 text 长度分别为 126、70、326 字符，前两条为进度说明，第三条虽是合法 JSON，解析器仍返回空结果。Impl 也因解释与代码围栏而 exit 91，整轮失败、证据已导出且资源已清理。
+
+测试启动约束因此明确为整个 turn 只调用工具，最后且仅输出一次符合 schema 的 JSON 文本，禁止中途 assistant 进度说明。它适配冻结解析器的首条 text 协议，没有从原始输出剥离文字、修复 JSON 或改变成功判定。
+
+测试驱动另提供有界公开反馈：只对引擎在线、稳定 blocked、所有运行结束且最新 Goal 明确为 exit 91 的情况，通过 `goal_message` 提醒模型核查副作用并按原生协议重新交接。同一失败只反馈一次，整 case 最多两次，不重置超时；原始请求、回执和失败 Session 全部保留。这是测试驱动策略，不能记为 runtime 已支持 generic conformance retry。最终仍须通过全部独立验收。
+
+## 其他未覆盖事项
+
+- native subscription 和宿主登录态复用尚未支持；首版只验证 OpenCode static gateway。
+- 搜索使用真实 agent-knowledge 的 keyword 索引；vector 与 embedding 服务不在本 case 中。
+- 另一条重构线尚未用本测试执行；共用契约不代表所有候选已通过，启动适配和公开输出不一致时须明确报告。
+- 冻结 agent-runtime 未提交 Bun lock；证据保存本次解析结果及工具版本，不保证以后重新构建获得相同依赖。
+- GitHub 域名代理不提供仓库级授权隔离，继承的 token 可能拥有更大权限；测试驱动固定专用仓库与运行分支。
+- 功能 verifier 针对错误实现与提前退出作独立断言，不是任意恶意 Python 代码的证明系统。候选功能执行容器无网络、无凭证、输入只读。
+
+# References
+
+- 冻结候选 `src/fleet_graph/engine.py`：`observe()` 的事件筛选和 prompt 构造；`_launch()` 的 `run.intent`；Scribe 结果收集的 cursor 更新。
+- 冻结候选 `src/fleet_graph/service.py`、`src/fleet_graph/cli.py`：`scribe_interval` 配置与终局等待。
+- 冻结 runtime `src/dispatch.ts`：generic output schema 的结果校验、typed-role 重试及互斥参数约束。
+- `.runtime/e2e/runs/fg-3c42620a7957/`：公开 Session、运行状态和导出证据。
+- `.runtime/e2e/runs/fg-ed6ba65407da/`：第四轮失败、停止回执与清理证据。
+- 工作线 `wf-613744`；候选开发线 `wf-53a584`。

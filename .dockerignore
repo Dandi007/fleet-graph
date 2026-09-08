@@ -1,0 +1,16 @@
+**
+!tests/
+tests/*
+!tests/e2e/
+!tests/e2e/**
+!.runtime/
+.runtime/*
+!.runtime/e2e/
+.runtime/e2e/*
+!.runtime/e2e/build/
+!.runtime/e2e/build/**
+**/__pycache__/
+**/.git/
+.runtime/e2e/runs/
+.runtime/e2e/build.lock
+**/secrets/
