@@ -47,7 +47,7 @@ allowed-confusables = ["，", "：", "；", "（", "）", "、", "「", "」", "
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q --ignore=tests/e2e/contract/fixture"
 
 [tool.ruff.format]
 exclude = ["src/fleet_graph/dd/vendor/*.py"]

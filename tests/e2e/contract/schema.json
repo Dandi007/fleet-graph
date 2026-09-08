@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Fleet E2E 公共证据契约 v1",
+  "type": "object",
+  "required": [
+    "manifest",
+    "snapshot"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "run_id",
+        "candidate",
+        "repository",
+        "target_branch",
+        "source_branch",
+        "goal_id",
+        "fixture",
+        "seed_commit"
+      ],
+      "properties": {
+        "schema": {
+          "const": "fleet-e2e.run/1"
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "candidate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "commits"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "commits": {
+              "type": "object",
+              "required": [
+                "fleet_graph",
+                "agent_runtime",
+                "katana"
+              ],
+              "additionalProperties": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              }
+            }
+          }
+        },
+        "repository": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "target_branch": {
+          "type": "string",
+          "pattern": "^e2e/"
+        },
+        "source_branch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "goal_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fixture": {
+          "const": "slugify-v1"
+        },
+        "seed_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "required": [
+        "schema",
+        "goal",
+        "events",
+        "dds",
+        "runs",
+        "reviews",
+        "acceptances",
+        "approvals",
+        "prs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "fleet-e2e.snapshot/1"
+        },
+        "goal": {
+          "$ref": "#/$defs/record"
+        },
+        "events": {
+          "$ref": "#/$defs/reference"
+        },
+        "dds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/record"
+          }
+        },
+        "runs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/record"
+          }
+        },
+        "reviews": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/record"
+          }
+        },
+        "acceptances": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/record"
+          }
+        },
+        "approvals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/record"
+          }
+        },
+        "prs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/record"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "reference": {
+      "type": "object",
+      "required": [
+        "file",
+        "pointer"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "type": "string",
+          "pattern": "^raw/"
+        },
+        "pointer": {
+          "type": "string",
+          "pattern": "^(/|$)"
+        }
+      }
+    },
+    "record": {
+      "type": "object",
+      "required": [
+        "values",
+        "sources"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "values": {
+          "type": "object",
+          "minProperties": 1
+        },
+        "sources": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/reference"
+          }
+        }
+      }
+    }
+  }
+}

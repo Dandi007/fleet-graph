@@ -30,6 +30,7 @@ SCAN_EXCLUDED_DIRS = {
     ".ruff_cache",
     ".pytest_cache",
     ".mypy_cache",
+    ".runtime",  # Docker 归档、依赖与实际运行证据不属于本仓源码。
 }
 D5_ANCHORS = ("D5", "decided_by", "dispatched_by")
 SHADOW = "S" + "8"
