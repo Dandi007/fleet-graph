@@ -46,11 +46,19 @@ Design anchors (spec inputs/design.md v2.1):
   control records are all first-class, losslessly pageable journal lines -- not
   summaries and not tails.
 
-This first slice owns the request-to-call composition seam. Live runtime
-binding, real runtime-process stop/resume, full Session query, per-repo merge
-serialization and the removal of the legacy round-prompt line are follow-up
-slices; until they land, this kernel reports unsupported portions precisely
-instead of pretending.
+This kernel is wired into the product composition at ``build_line`` (see
+``fleet_graph.graphs.kernel_coordinator.KernelCoordinator``) so it *replaces*
+the coordinator/worker round-prompt progression for the goal-facing
+responsibility, rather than sitting beside it: one accepted request produces
+one Goal ReAct call and one validated Stop action List, and the round-prompt
+line no longer carries that responsibility. The kernel itself owns the
+request-to-call seam, Stop List validation and effect routing.
+
+Follow-up slices are the *live binding* only: the real runtime ReAct call, real
+runtime-process stop/resume, full Session query and per-repo merge
+serialization. Until those land, this kernel reports its unsupported portions
+precisely instead of pretending (the Goal ReAct port reports
+``goal_call_unwired``; unwired effect ports fail closed with ``not_ready``).
 """
 
 from __future__ import annotations

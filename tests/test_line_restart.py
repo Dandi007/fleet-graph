@@ -1,7 +1,5 @@
-"""Stable thread identity and the kill-restart contract, on the real wiring.
-
-tests/test_re_adopt.py pins the launcher primitives. This file pins the two
-layers above them, which is where the fleet actually broke:
+"""Stable thread identity and the durable-serial-kernel contract, on the real
+wiring.
 
 1. **Thread identity** (R0a): `build_line` used to fold a per-process uuid4
    into thread_id, so every restart re-randomised every derived run id and
@@ -10,45 +8,30 @@ layers above them, which is where the fleet actually broke:
 2. **Resume semantics** (R0a): what `invoke` does on a thread with an existing
    SqliteSaver checkpoint is measured here, not assumed -- see
    TestResumeSemantics and the `resume_start` docstring.
-3. **Kill-restart** (R0b): a line built by `build_line`, killed while a (fake)
-   coordinator agent-run is in flight, restarted with the same
-   folder_id+generation, must derive the same run id, adopt instead of
-   re-spawning, and carry the adopted result to a terminal.
+3. **Durable serial kernel** (DD01): `build_line` composes the Goal
+   request-to-Goal-call kernel as the goal-facing coordinator, and a round's
+   request + call records land in a durable journal under the run root. The
+   round-prompt agent-run kill-restart contract (adopt the in-flight run)
+   belongs to the retired path; the launcher primitives it used stay pinned by
+   tests/test_re_adopt.py and tests/test_adapters.py.
 
 Reverting the thread_id fix (thread_id = f"{folder_id}:{uuid4}") turns
-TestKillRestartContract red: the restarted line derives a different run id,
-spawns a second fake, and the dispatch ledger shows 2. That revert run is
-recorded in the PR description.
+TestThreadIdentity red: two `build_line` calls disagree on the identity every
+run id is derived from.
 """
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from fleet_graph.executors.agent_run import derive_run_id
 from fleet_graph.graphs.goal_line import LineDeps, build_goal_line_graph
 from fleet_graph.graphs.guards import LineBounds, LineGuards
 from fleet_graph.graphs.runner import LineConfig, build_line, resume_start
 from fleet_graph.work_report import SCHEMA_VERSION
-
-SLOW_FAKE = str(Path(__file__).parent / "fakes" / "fake_slow_coordinator_run.py")
-
-
-def wait_until(predicate, timeout: float = 20.0, interval: float = 0.05) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(interval)
-    return False
 
 
 class TestThreadIdentity:
@@ -301,143 +284,45 @@ class TestResumeSemantics:
         assert state["terminal"] == "done"
 
 
-# --- the kill-restart contract, on the production wiring --------------------
+# --- the durable serial-kernel contract, on the production wiring -------------
 
 
-class TestKillRestartContract:
-    """build_line/run_line wiring, a real detached fake agent-run, a real
-    SIGKILL of the line process, and a restart under the same identity."""
+class TestKernelDurability:
+    """DD01: the round-prompt kill-restart contract (adopt the in-flight
+    agent-run) is superseded by the kernel's durable per-goal journal. ``build_line``
+    composes the kernel as the goal-facing coordinator; a round whose Goal ReAct
+    call is still unbound parks with ``goal_call_unwired`` and leaves its request
+    + call records durably under the run root for a restart to re-observe."""
 
-    def test_restarted_line_adopts_the_in_flight_coordinator_run(self, tmp_path: Path) -> None:
+    def test_build_line_composes_the_kernel_and_writes_a_durable_journal(
+        self, tmp_path: Path
+    ) -> None:
+        import json
+
+        from fleet_graph.graphs.kernel_coordinator import KernelCoordinator
+
         run_root = tmp_path / "run"
-        folder_id = "wf-killrestart"
-        # The identity every run id is derived from, and the whole point:
-        # both the killed process and the restarted one must compute this.
-        expected_run_id = derive_run_id(f"{folder_id}:g1", "coordinator-1")
-        session_root = run_root / "agent-runs" / expected_run_id
-        dispatch_log = session_root / "dispatch.log"
-        release = session_root / "release"
+        folder_id = "wf-kernel"
+        config = LineConfig(folder_id=folder_id, seat="test-seat", run_root=run_root)
 
-        fake_bin = tmp_path / "agent-run"
-        fake_bin.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{SLOW_FAKE}" "$@"\n')
-        fake_bin.chmod(0o755)
+        graph, deps = build_line(config)
+        assert isinstance(deps.coordinator, KernelCoordinator)
+        assert deps.coordinator.thread_id == f"{folder_id}:g1"
 
-        driver = tmp_path / "driver.py"
-        driver.write_text(
-            "from pathlib import Path\n"
-            "from fleet_graph.graphs.runner import LineConfig, run_line\n"
-            "run_line(LineConfig(\n"
-            f"    folder_id={folder_id!r},\n"
-            "    seat='test-seat',\n"
-            f"    run_root=Path({str(run_root)!r}),\n"
-            f"    agent_run_bin={str(fake_bin)!r},\n"
-            "))\n"
-        )
+        # One round through the real (kernel-coordinated) graph: the round parks
+        # (the Goal ReAct call is unbound in this slice) and the serial records
+        # land in the durable journal.
+        state = graph.compile().invoke({"round_no": 1})
+        assert state["terminal"] == "blocked"
 
-        def dispatch_count() -> int:
-            if not dispatch_log.exists():
-                return 0
-            return len([ln for ln in dispatch_log.read_text().splitlines() if ln.strip()])
-
-        line_proc = subprocess.Popen(
-            [sys.executable, str(driver)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        fake_pid: int | None = None
-        try:
-            # Phase 1: the line dispatched the coordinator run exactly once and
-            # the durable checkpoint reached disk (kill can only be survived
-            # from state that was persisted before it).
-            assert wait_until(lambda: dispatch_count() == 1), (
-                "the line never dispatched its coordinator run; stderr: "
-                + line_proc.stderr.peek().decode(errors="replace")[:2000]
-            )
-            assert wait_until(lambda: (run_root / "checkpoint.sqlite3").exists())
-            fake_pid = int((session_root / "launcher.pid").read_text())
-
-            # Kill the line process. The detached fake must survive it.
-            line_proc.kill()
-            line_proc.wait(timeout=10)
-            os.kill(fake_pid, 0)  # raises if the in-flight run died with it
-
-            # Phase 2: rebuild under the same folder_id + generation.
-            config = LineConfig(
-                folder_id=folder_id,
-                seat="test-seat",
-                run_root=run_root,
-                agent_run_bin=str(fake_bin),
-            )
-            graph, deps = build_line(config)
-            assert deps.coordinator.thread_id == f"{folder_id}:g1"
-
-            launches = []
-            inner = deps.coordinator.launcher
-            original_launch = inner.launch
-
-            def recording_launch(spec: Any, run_id: str) -> Any:
-                ticket = original_launch(spec, run_id)
-                launches.append(ticket)
-                return ticket
-
-            inner.launch = recording_launch  # type: ignore[method-assign]
-
-            # Deterministic adopt-before-release ordering (de-flake). The old
-            # `threading.Timer(2.0, release.touch)` raced resume_start: under
-            # full-suite load resume_start (checkpoint read + graph compile)
-            # took >2.0s, the timer fired first, the fake wrote result.json
-            # and exited before the restart adopted it, and resume_start
-            # returned {'round_no': 1} instead of None. Now the adopt verdict
-            # is taken first, while the fake is still in-flight by
-            # construction: release has not been signalled, so launch() must
-            # adopt the running run (adopted=True, one dispatch). Only then is
-            # release signalled so the fake can finish, and invoke(None)
-            # resumes the wait() to the adopted result.
-            #
-            # Known negative path (the defect this test pins): signal release
-            # *before* resume_start, or restore the threading.Timer(2.0, ...)
-            # race, and `assert start is None` reds with
-            # `assert {'round_no': 1} is None` -- the restart replays round 1
-            # instead of adopting the in-flight run. The assertions are not
-            # gutted for green: the ordering is what makes the contract
-            # deterministic.
-            invoke_config: dict[str, Any] = {
-                "configurable": {"thread_id": config.thread_id},
-                "recursion_limit": 100,
-            }
-            with SqliteSaver.from_conn_string(config.resolved_checkpoint_path) as saver:
-                compiled = graph.compile(checkpointer=saver)
-                start = resume_start(compiled, invoke_config)
-                assert start is None, "the restart must resume, not replay round 1"
-                release.parent.mkdir(parents=True, exist_ok=True)
-                release.touch()
-                state = compiled.invoke(start, config=invoke_config)
-
-            # The contract, in order of importance.
-            assert [t.run_id for t in launches] == [expected_run_id], (
-                "the restarted line derived a different run id -- thread "
-                "identity is no longer stable"
-            )
-            assert launches[0].adopted is True, "restart re-dispatched an in-flight run"
-            assert dispatch_count() == 1, "the fake agent-run was spawned twice"
-            assert state["terminal"] == "done"
-            assert (run_root / "terminal.json").exists()
-        finally:
-            release.parent.mkdir(parents=True, exist_ok=True)
-            release.touch()
-            if line_proc.poll() is None:
-                line_proc.kill()
-                line_proc.wait(timeout=10)
-            if fake_pid is not None:
-                wait_until(lambda: not _alive(fake_pid), timeout=10)
-
-
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+        journal = run_root / "goal-kernel" / f"goal-{folder_id}.jsonl"
+        assert journal.exists(), "the kernel journal must be durable under the run root"
+        records = [
+            line for line in journal.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
+        parsed = [json.loads(record) for record in records]
+        assert any(r["record"] == "request" for r in parsed)
+        assert any(r["record"] == "call" for r in parsed)
 
 
 class TestBumpedGenerationGivesAFreshThread:
