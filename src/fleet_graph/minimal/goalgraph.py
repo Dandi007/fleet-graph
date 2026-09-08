@@ -71,6 +71,7 @@ from fleet_graph.minimal import (
     scribe,
     stagerunner,
     steer,
+    workfolder,
 )
 from fleet_graph.minimal import (
     dispatch as dispatch_mod,
@@ -95,7 +96,11 @@ class GoalDeps:
     the seam is not wired and a ``done`` goal blocks instead of guessing.
     ``scribe_enabled`` opts into the read-only scribe stage (GO-21) at goal
     boundaries; it defaults to False so an unwired graph behaves exactly as
-    before.
+    before. ``wf_writer`` is the GO-19 work-folder writer that receives one
+    progress line per goal boundary and the scribe's ``warn`` / ``high``
+    findings; it defaults to None (no writes) so an unwired graph behaves
+    exactly as before, and its failures are always swallowed into a
+    ``goal.warning`` — a WF outage never blocks the loop.
     """
 
     event_log: events.EventLog
@@ -104,6 +109,7 @@ class GoalDeps:
     git_runner: gitgate.GitRunner
     run_dd: Callable[[dict[str, Any]], dict[str, Any]]
     final_merge: Callable[[], tuple[str, dict[str, Any]]] | None = None
+    wf_writer: workfolder.WorkFolderWriter | None = None
     warn_turns: int = 30
     session_root: str = ""
     session_overrides: dict[str, dict[str, Any]] | None = None
@@ -240,6 +246,41 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
     policy = agentrun.resolve_session_policy("goal", deps.session_overrides)
     goal_model = (deps.model_by_role or {}).get("goal")
 
+    def _work_folder(state: GoalGraphState) -> str | None:
+        """The bound work-folder id, or None when this goal has no WF to write."""
+        value = (state.get("enroll") or {}).get("work_folder")
+        return value if isinstance(value, str) and value else None
+
+    def _append_progress(state: GoalGraphState, kind: str, payload: dict[str, Any]) -> None:
+        """One goal-level progress line; a WF failure is a ``goal.warning``, never a block."""
+        writer = deps.wf_writer
+        if writer is None:
+            return
+        work_folder = _work_folder(state)
+        if work_folder is None:
+            return
+        try:
+            writer.append_progress(work_folder, workfolder.progress_line(kind, payload))
+        except Exception as exc:
+            deps.event_log.append(
+                "goal.warning", {"message": f"work folder progress append failed: {exc}"}
+            )
+
+    def _append_findings(state: GoalGraphState, lines: list[str]) -> None:
+        """Mirror the kept ``warn`` / ``high`` observations; failures never block."""
+        writer = deps.wf_writer
+        if writer is None or not lines:
+            return
+        work_folder = _work_folder(state)
+        if work_folder is None:
+            return
+        try:
+            writer.append_findings(work_folder, list(lines))
+        except Exception as exc:
+            deps.event_log.append(
+                "goal.warning", {"message": f"work folder findings append failed: {exc}"}
+            )
+
     def run_scribe(state: GoalGraphState, trigger: str) -> None:
         """Run the read-only scribe at one goal boundary; never block the loop.
 
@@ -329,6 +370,9 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
         observation_log = scribe.ObservationLog(log.goal_run_root)
         for obs in kept:
             observation_log.append(obs, trigger=trigger, seq_range=[since_seq, until_seq])
+        # GO-19 / protocol §12: the kept warn/high observations mirror into the WF's
+        # findings.md (L1's high-severity subset); info never leaves the engine root.
+        _append_findings(state, scribe.findings_subset(kept))
         if dropped:
             detail = "; ".join("; ".join(entry.get("errors", [])) for entry in dropped)
             log.append(
@@ -508,6 +552,15 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
                 "goal_version": goal_version,
             }
         run_scribe(state, trigger="goal.turn.finished")
+        _append_progress(
+            state,
+            "goal.turn.finished",
+            {
+                "turn_no": turn_no,
+                "stop": outcome.stop,
+                "summary": (outcome.obj or {}).get("summary"),
+            },
+        )
         stop_obj = outcome.obj or {}
         blocked_obj = stop_obj.get("blocked") if outcome.stop == "blocked" else None
         return {
@@ -560,7 +613,18 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
         """Execute the dispatched DD via the seam, then loop to read_control."""
         dispatch_obj = (state.get("last_stop") or {}).get("dispatch") or {}
         result = deps.run_dd(dict(dispatch_obj))
-        run_scribe(state, trigger="dd.merged" if result.get("outcome") == "merged" else "dd.failed")
+        outcome = result.get("outcome")
+        dd_kind = "dd.merged" if outcome == "merged" else "dd.failed"
+        run_scribe(state, trigger=dd_kind)
+        failure = result.get("failure")
+        dd_blurb = result.get("impl_summary")
+        if not dd_blurb and isinstance(failure, dict):
+            dd_blurb = failure.get("detail")
+        _append_progress(
+            state,
+            dd_kind,
+            {"dd_id": result.get("dd_id"), "outcome": outcome, "summary": dd_blurb},
+        )
         history = events.fold(deps.event_log.read()).dd_history
         return {
             "last_dd": result,
@@ -588,6 +652,7 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
         stop, payload = deps.final_merge()
         if stop == "merged":
             log.append("goal.merged_to_target", dict(payload))
+            _append_progress(state, "goal.done", {"summary": state.get("summary") or ""})
             log.append("goal.done", {"summary": state.get("summary") or ""})
             # §12 顺序要求：先落终态 event，再起书记员，使 seq 区间能覆盖到
             # goal.done 这一条。
@@ -602,6 +667,11 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
 
     def finish_blocked(state: GoalGraphState) -> dict[str, Any]:
         blocked = dict(state.get("blocked") or {})
+        _append_progress(
+            state,
+            "goal.blocked",
+            {"summary": state.get("summary") or "", "kind": blocked.get("kind")},
+        )
         deps.event_log.append("goal.blocked", {"summary": state.get("summary") or "", **blocked})
         # §12 顺序要求：先落终态 event，再起书记员，使 seq 区间能覆盖到
         # goal.blocked 这一条。

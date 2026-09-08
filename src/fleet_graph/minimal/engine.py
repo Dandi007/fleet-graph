@@ -55,6 +55,7 @@ from fleet_graph.minimal import (
     runroot,
     stagerunner,
     steer,
+    workfolder,
 )
 from fleet_graph.minimal import (
     dispatch as dispatch_mod,
@@ -492,6 +493,16 @@ def build_deps(
     gh = gh_runner or mergegate.SubprocessGhRunner()
     goal, _version = steer.current_goal(enroll_obj, log.read())
     release_branch = runroot.release_branch(enroll_obj)
+    # GO-19 / GO-34: WF is a first-class citizen of enroll. A bound work_folder gets
+    # the real MCP writer; None degrades to the null writer (never blocks the goal).
+    # ``work_folder`` is a steer-immutable field, so the enroll value is authoritative.
+    bound_wf = enroll_obj.get("work_folder")
+    if isinstance(bound_wf, str) and bound_wf:
+        wf_writer: workfolder.WorkFolderWriter = workfolder.McpWorkFolderWriter(
+            git, cwd=str(run_root.root)
+        )
+    else:
+        wf_writer = workfolder.NullWorkFolderWriter()
     wiring = _Wiring(
         log=log,
         agent_invoker=invoker,
@@ -513,6 +524,7 @@ def build_deps(
         git_runner=git,
         run_dd=_run_dd_seam(wiring, enroll_obj),
         final_merge=_final_merge_seam(wiring, enroll_obj),
+        wf_writer=wf_writer,
         warn_turns=warn_turns,
         session_root=str(run_root.sessions_dir),
         session_overrides=session_overrides,
