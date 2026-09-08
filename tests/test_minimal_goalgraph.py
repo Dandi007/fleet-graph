@@ -16,12 +16,35 @@ import json
 from pathlib import Path
 from typing import Any
 
-from langgraph.checkpoint.memory import InMemorySaver
+import pytest
 
 from fleet_graph.minimal import gitgate
 from fleet_graph.minimal.control import ControlLog
 from fleet_graph.minimal.events import EventLog, fold
-from fleet_graph.minimal.goalgraph import GoalDeps, run_goal
+
+try:
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from fleet_graph.minimal.goalgraph import GoalDeps, run_goal
+except ModuleNotFoundError as exc:
+    # goalgraph is a LangGraph graph: exercising it needs the real dependency.
+    # Bare ``pytest`` resolves to a user-site interpreter without the project's
+    # deps installed (see the pythonpath note in pyproject.toml), so a missing
+    # langgraph downgrades to per-test skips — collected, skipped, exit 0 —
+    # rather than a collection error (a module-level importorskip would leave
+    # nothing collected and pytest exits 5). ``make verify`` runs the full
+    # suite under uv, where langgraph==1.2.11 is pinned. Anything else missing
+    # is a real bug and must surface.
+    if exc.name != "langgraph":
+        raise
+    InMemorySaver = None
+    GoalDeps = None
+    run_goal = None
+
+pytestmark = pytest.mark.skipif(
+    run_goal is None,
+    reason="langgraph not installed — goalgraph runs are exercised under make verify",
+)
 
 GOAL_ID = "g-7f3a2c"
 RELEASE = "release/g-7f3a2c"
