@@ -35,6 +35,13 @@ class MapperTests(unittest.TestCase):
         record = self.mapper.record({"review_ref": ("raw/result.json", "/review_ref")})
         self.assertEqual(record, {"values": {}, "sources": {}})
 
+    def test_new_snapshot_does_not_reuse_cached_success(self):
+        self.write("raw/status.json", {"goal_id": "g", "status": "done", "runs": {}, "dds": {}})
+        self.write("raw/events.json", {"events": []})
+        self.assertEqual(self.mapper.snapshot()["goal"]["values"]["status"], "done")
+        self.write("raw/status.json", {"goal_id": "g", "status": "blocked", "runs": {}, "dds": {}})
+        self.assertEqual(self.mapper.snapshot()["goal"]["values"]["status"], "blocked")
+
     def test_pointer_preserves_escaped_keys(self):
         key = "path/with~separator"
         self.write("raw/result.json", {key: 0})

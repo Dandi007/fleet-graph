@@ -11,9 +11,12 @@ def pointer_escape(value):
 class Mapper:
     def __init__(self, bundle: Path):
         self.bundle = bundle
+        self.documents = {}
 
     def value(self, file, pointer):
-        value = json.loads((self.bundle / file).read_text())
+        if file not in self.documents:
+            self.documents[file] = json.loads((self.bundle / file).read_text())
+        value = self.documents[file]
         for key in pointer.split("/")[1:]:
             key = key.replace("~1", "/").replace("~0", "~")
             value = value[int(key)] if isinstance(value, list) else value[key]
@@ -30,6 +33,7 @@ class Mapper:
         return {"values": values, "sources": sources}
 
     def snapshot(self):
+        self.documents.clear()  # 只在本次只读快照内复用，下一次重建重新读取源文件。
         status_file = "raw/status.json"
         status = self.value(status_file, "")
         events_file = "raw/events.json"

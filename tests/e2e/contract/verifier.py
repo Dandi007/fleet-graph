@@ -25,13 +25,18 @@ REQUIRED = {
 }
 
 
-def resolve(bundle: Path, ref: dict):
+def resolve(bundle: Path, ref: dict, documents=None):
     """JSON Pointer 指向只读采集结果；不得越出 raw 目录。"""
     path = (bundle / ref["file"]).resolve()
     raw = (bundle / "raw").resolve()
     if not path.is_relative_to(raw) or not path.is_file():
         raise ValueError("证据引用必须是 bundle/raw 内的文件")
-    value = json.loads(path.read_text())
+    if documents is None:
+        value = json.loads(path.read_text())
+    else:
+        if path not in documents:
+            documents[path] = json.loads(path.read_text())
+        value = documents[path]
     pointer = ref["pointer"]
     if pointer and not pointer.startswith("/"):
         raise ValueError("无效 JSON Pointer")
@@ -41,7 +46,7 @@ def resolve(bundle: Path, ref: dict):
     return value
 
 
-def records(bundle: Path, snapshot: dict, name: str):
+def records(bundle: Path, snapshot: dict, name: str, documents=None):
     items = [snapshot[name]] if name == "goal" else snapshot[name]
     result = []
     for item in items:
@@ -49,7 +54,7 @@ def records(bundle: Path, snapshot: dict, name: str):
         if not REQUIRED[name] <= values.keys() or values.keys() != sources.keys():
             raise ValueError(f"{name} 字段或源引用缺失")
         for key, value in values.items():
-            if value != resolve(bundle, sources[key]):
+            if value != resolve(bundle, sources[key], documents):
                 raise ValueError(f"{name}.{key} 与原始证据不一致")
         result.append(values)
     return result
@@ -186,8 +191,9 @@ def verify(bundle: Path, repo: Path):
         schema = json.loads(SCHEMA.read_text())
         jsonschema.validate({"manifest": manifest, "snapshot": snapshot}, schema)
         report.update(run_id=manifest["run_id"], candidate=manifest["candidate"])
-        data = {name: records(bundle, snapshot, name) for name in REQUIRED}
-        data["events"] = resolve(bundle, snapshot["events"])
+        documents = {}
+        data = {name: records(bundle, snapshot, name, documents) for name in REQUIRED}
+        data["events"] = resolve(bundle, snapshot["events"], documents)
         return manifest, data
 
     state = {}

@@ -267,6 +267,11 @@ class ContractTests(unittest.TestCase):
         result = self.report()
         self.assertEqual(result["status"], "passed", result)
 
+    def test_new_verification_does_not_reuse_cached_raw_success(self):
+        self.assertEqual(self.report()["status"], "passed")
+        self.raw["goal"]["status"] = "blocked"
+        self.assert_fails("lifecycle")
+
     def test_done_without_roles_fails(self):
         self.raw["runs"] = []
         self.assert_fails("lifecycle")
