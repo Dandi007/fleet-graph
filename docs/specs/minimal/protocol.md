@@ -1,6 +1,6 @@
 # 最小系统 —— 输入输出协议（agent 起草，GO-12 授权）
 
-> 状态：v1（2026-09-06 10:5x）。§0.2 由 GO-13 定、§10 与 §11 由 GO-16 / GO-14 确认、§6 按 GO-15 改；其余字段级细节仍是 agent 起草，用户可改任意字段。
+> 状态：v1（2026-09-06 10:5x）。§0.2 由 GO-13 定、§10 与 §11 由 GO-16 / GO-14 确认、§6 按 GO-15 改；2026-09-08 按 GO-26~36 回写 §0.10 / §1 / §2 / §4（dd-24），正文与 golden-order 一致；其余字段级细节仍是 agent 起草，用户可改任意字段。
 > 依据 design.md 已定内容；本文件只定「字段与规则」，不改流程。
 > 每个 agent 的输入是一个 JSON 对象，输出必须是**恰好一个** JSON 对象，无 prose、无代码围栏。
 
@@ -23,61 +23,66 @@
 | Merge Agent | 每次合并 | fresh | – |
 | 书记员 | 一个 goal 一个 session | resume | 0.6 |
 
-可在 enroll 的 `sessions` 字段按 goal 覆盖（§1）。恢复（§11）时 resume 模式的丢失 run 也重起同一步骤，但带上该作用域的 session 目录续用，而不是新开。
+session 策略是引擎默认配置——〔GO-27〕已把 `sessions` 从 enroll 移除（less is more），按 goal 覆盖的入口随之取消。恢复（§11）时 resume 模式的丢失 run 也重起同一步骤，但带上该作用域的 session 目录续用，而不是新开。
 9. **协议输入怎么变成 prompt**〔GO-24〕。两层对应两种 prompt：
    - **system prompt**，一个 session 只给一次（fresh 起时；resume 时已在 session 里，不重发）：角色与做事框架（role persona）、本协议的输出 schema 约束、`history` 句柄（历史都在哪、需要自己读）、harness 边界说明。
    - **user prompt**，每次调用一条：就是该轮的 `*.in/1` 输入对象（本次交接内容，如 reviewer 打回 implementer 时这一轮的 review 意见）。**只含最新**，不重复历史。
    - 因此 §2 到 §6、§12 里的 `history` 字段在 resume 模式下可省（已在 system prompt），fresh 模式下随首条 user prompt 一并给。引擎侧 adapter（§9）按此渲染。
 10. **机械化原则：能机械化确定的都由引擎确定并核对，agent 只做自由裁量**〔GO-25〕。
-   - **git 上下文由引擎填、由引擎核**。§4 到 §6 输入里的 `workspace` / `branch` / `base_commit` / `head_commit` 是引擎按分支规则算出来的，不是 agent 报的；agent 输出里凡引用 commit 的字段（`impl/1.commit`、`merge/1.merged_commit` / `new_head`），引擎都拿 git 核一遍，对不上判**无效输出**（与 §0.1 同级），写 event `agent.invalid_output`，按 §0.2 收尾（DD 内 → 该 DD `failed` 交回 Goal Agent）。
-   - **分支规则全部程序化**：release 分支 `release/<goal_id>`，从目标分支 head 开；单的分支 `dd/<goal_id>/<dd_id>`，从 release 当前 head 开；worktree 路径 `<goal_run_root>/worktrees/<dd_id>/`；rebased 之后 review 的 base / head 按 §6。agent 不选分支、不选目录，只在给定 worktree 里干活。
-   - **每个 agent 节点前后引擎核对什么**：
+    - **交接核对是 GO-28 的三条**。每个 agent 节点调用前后，引擎对涉及的每个 repo 核：① 分支已 push 到 remote（分支在 remote 上存在）；② 本地 HEAD == remote 分支 tip；③ 工作树干净。对不上判**无效输出**（与 §0.1 同级），写 event `agent.invalid_output`（payload 带 `phase: pre|post` 与逐 repo 的失败码，如 `not_pushed` / `head_behind_remote` / `dirty_worktree`），按 §0.2 收尾（DD 内 → 该 DD `failed` 交回 Goal Agent）。commit sha **不再是交接核对项**——「分支 + 与 remote 一致」已唯一确定代码状态〔GO-28〕；sha 只由引擎记进 event 供观测（`impl/1.commit` 等输出字段是 agent 的汇报记录，引擎核形状并落 event，不拿它定状态）。
+    - **分支规则**：release 分支名是 goal 级的 `source_branch`（§1，写一次、所有 repo 同名〔GO-29/30/31〕），enroll 后由引擎准备——每 repo fetch，缺失时从该 repo 的 `target_branch` 切出并 push。dd 分支与 worktree 由 **Goal Agent** 在 Stop 前自己建好并 push（§2〔GO-36〕），路径与命名由 Goal Agent 决定（dispatch 里以绝对路径 + 分支名给出），引擎只机械核对、不代建。
+    - **每个 agent 节点前后引擎核对什么**：
 
 | 节点 | 调用前核对 | Stop 后核对 |
 |---|---|---|
-| Impl | worktree 存在且在 `branch` 上；HEAD == 上一轮 head（首轮 == `base_commit`）；工作树干净 | `commit` 在 `branch` 上且是 tip；工作树干净 |
-| CR / FR | HEAD == `head_commit`；工作树干净 | 工作树与 tip 均未变（review 不改代码，改了判无效） |
-| Merge Agent | `source_head` / `target_head` 与两分支 tip 一致 | `merged`：`merged_commit` == 目标分支 tip 且包含 `source_head`；`rebased`：`new_head` 是源分支 tip、目标分支 tip 未变；`failed`：两分支 tip 均未变 |
-| Goal Agent | `goal_version` 是最新 | `dispatch` 的 spec 非空；`done` 时无未合并的 DD |
+| Impl | 交接三条（worktree / 分支在开 DD 时已过 §2 五条核） | 交接三条（新 commit 已 push 且为 tip） |
+| CR / FR | 交接三条 | 交接三条，且 remote tip 与调用前一致（review 不改代码，改了判无效） |
+| Merge Agent | `source_branch` / `target_branch` 两端都与 remote tip 一致 | `merged`：目标分支 tip 已前进且包含 `source_head`；`rebased`：源分支 tip 是 `new_head`、目标分支 tip 未变；`failed`：两分支 tip 均未变（一律从 remote 读） |
+| Goal Agent | `goal_version` 是最新 | `dispatch`：每个 repo 过 §2 的 GO-36 五条核；`done` 时无未合并的 DD |
 
-   - **通过即 merge 的归属**〔推荐〕（采纳则修订 GO-15）：Goal approve 后先由引擎试无冲突合并（`git merge --ff-only`，或干净的 `--no-ff`），成功且验收命令在结果上过就直接 `merged`；只在冲突或验收失败时才调 Merge Agent，让它只处理需要裁量的冲突。目前按 GO-15 仍全部交 Merge Agent。
+   - **approve 后先看平台 mergeable**〔GO-36 定稿；本条原为〔推荐〕「无冲突 fast-forward 收回程序」，已由 GO-36 的回复关闭〕：Goal Agent approve 后，引擎先查平台（gh）该 PR 的 mergeable：MERGEABLE → 引擎直接执行平台合并，不调 Merge Agent；CONFLICTING 或 UNKNOWN → 交 Merge Agent 处理冲突（UNKNOWN 绝不当 mergeable 猜）。线 done 的 release → 目标分支合并仍一律走 Merge Agent（§6〔GO-15〕），按 repo 各自的 `target_branch` 逐一执行〔GO-31〕。
 
 ## 1. goal enroll 请求（MCP 入口，校验节点的对象）
 
+`goal.enroll/2`〔GO-26~33〕，六个顶层字段：
+
 ```json
 {
-  "schema": "goal.enroll/1",
-  "goal_id": "g-7f3a2c",              // 可选；缺省由 MCP 生成
+  "schema": "goal.enroll/2",
   "work_folder": "wf-ab12cd",          // 一等公民〔GO-19〕：有就传 folder_id；传 null 则 MCP 经 katana-work-folder-mcp 新建，topic 用 title
   "title": "把 X 功能做出来",
-  "goal_text": "……自然语言目标，含完成定义……",   // 或 "goal_path": "goal.md"，指该 WF 内文件，二选一
-  "repo": { "path": "/data/code/self/foo", "target_branch": "main" },
-  "acceptance": [ "make test" ],       // 至少一条；进入 CR 前必须全部 exit 0
-  "models": {                          // 可选；缺省用引擎默认表
-    "goal": "claude-opus-5", "impl": "glm-5.3", "cr": "glm-5.3",
-    "fr": "claude-opus-5", "merge": "glm-5.3"
-  },
-  "warn": { "turns": 30, "dd_rounds": 6 },  // 可选；warning 线，越线只告警
-  "sessions": {                        // 可选〔GO-23〕；缺省用 §0.8 的默认表
-    "goal": { "mode": "resume", "compact_at": 0.7 },
-    "impl": { "mode": "resume", "compact_at": 0.7 },
-    "cr":   { "mode": "fresh" } }
+  "goal_text": "……自然语言目标，含完成定义……",
+  "source_branch": "release/loopx-minimal",  // goal 级 release 分支名，写一次、所有 repo 同名〔GO-29/30/31〕；DD 的 PR 都合进它，线 done 时它合回各 repo 的 target_branch
+  "repos": [                            // 一个 goal 可涉及多个 repo，数量不定、可后加〔GO-26〕
+    {
+      "path": "/data/worktrees/foo",    // 本地 worktree 路径（不是原始 repo 的 checkout）〔GO-27〕，引擎从 worktree 反推 repo
+      "remote": "git@github.com:org/foo.git",  // 必有；没有 remote 的 repo 不接受 enroll〔GO-32〕
+      "target_branch": "main",          // 每 repo 可不同〔GO-31〕
+      "acceptance": [ "make test" ]     // 该 repo 的验收命令，至少一条；进入 CR 前必须全部 exit 0
+    }
+  ]
 }
 ```
 
-**校验节点规则**（全部程序化，任一不过即拒绝 enroll，不 spawn）：
-- `goal_text` 非空；`repo.path` 存在且是 git 仓；`target_branch` 在该仓存在。
-- `acceptance` 非空，每条能被 `bash -lc` 解析（dry-run：`bash -n`）。
-- `models` 里的每个值在 agent-runtime 可用模型表里。
-- 同一 `goal_id` 不重复 enroll。
-- `work_folder` 非 null 时必须能 `wf_resume`；`goal_path` 给了则该文件必须存在于 WF。
+**已废弃字段**（enroll 校验显式识别并报字段级错误）：`goal_path`〔GO-27 删，goal 文件按默认约定落 WF〕、`sessions` / `warn`〔GO-27 删，session 策略与 warning 线都是引擎默认配置，less is more〕、单 `repo` 字段〔GO-26/29 起由 `repos[]` 取代〕。`models` 的去留仍待用户拍板（见 context.md），当前校验不收该键。`goal_id` 不在请求里，由 MCP 生成（`g-` + 6 位十六进制）。
 
-MCP 通过后：绑定或新建 WF，把 enroll 对象原样写进 WF 的 `goal.enroll.json`；建 release 分支 `release/<goal_id>`（自 `target_branch` 切出）；spawn 引擎进程；返回 `goal_id` 与 `work_folder`。
+**校验节点规则**（全部程序化，任一不过即拒绝 enroll，不 spawn；错误定位到字段，如 `repos[1].remote: missing (GO-32: every repo must have a remote)`）：
+- 顶层只允许上述六键，出现已废弃或未知键即报错。
+- `work_folder` 为 null 或形如 `wf-<小写字母数字>`。
+- `title` / `goal_text` 非空字符串。
+- `source_branch` 非空且是合法 git 分支名。
+- `repos` 非空数组；每项只允许 `path` / `remote` / `target_branch` / `acceptance` 四键：`path` 非空、是 git worktree〔GO-27〕、不与其他项重复；`remote` 非空〔GO-32〕；`target_branch` 是合法分支名且存在于该 repo；`acceptance` 非空数组、每条非空且能被 `bash -n` 解析。
+- 同一 `goal_id` 不重复 enroll（引擎根下已有该 id 且 enroll 对象不同则拒绝覆盖）。
 
-**WF 是一等公民**〔GO-19〕的含义（〔推荐〕，字段级请用户过目）：
-- goal 的正本在 WF：`goal.md`（= goal_text）、`spec.md`（可选）、`progress.md`、`findings.md`。引擎在每个 goal 级 event（turn 结束、DD 结束、done / blocked）后经 work-folder MCP 追加一行 progress。
-- `<goal_run_root>` = 该 WF 内的 `runs/<goal_id>/`（events.jsonl、dd/、control.jsonl 都在这里），因此 `history` 句柄同时带 `work_folder` id，agent 经 work-folder MCP 或直接路径读历史都行。
-- Goal Agent 的 Stop 输出 `done` / `blocked` 时，引擎把 summary 同步写进 WF `progress.md`，wf_save 一次。
+**MCP 通过后的程序化准备**（GO-33/34；引擎自己做，不在 WF 里维护状态）：
+- 建引擎根 `<engine_root>/<goal_id>/`（默认 `/data/fleet/goals/<goal_id>/`），`events.jsonl`、`control.jsonl`、`sessions/`、`worktrees/`、`dd/` 与 `goal.enroll.json` 都在这里。
+- 把 enroll 对象原样写入 `goal.enroll.json`，落首条 event（`goal.enrolled`）。
+- 每个 repo fetch；release 分支（`source_branch`）在该 repo 尚不存在时，从其 `target_branch` 切出并 push。
+- spawn 该 goal 的引擎进程，返回 `goal_id` 与 `work_folder`。
+
+**WF 与运行时状态的分工**〔GO-19 / GO-34〕：
+- WF 只放人读的正本：`goal.md`（= goal_text）、`spec.md`（可选）、`progress.md`、`findings.md`。引擎在每个 goal 级 event（turn 结束、DD 结束、done / blocked）后经 work-folder MCP 追加一行 progress；Goal Agent Stop `done` / `blocked` 时把 summary 同步写进 `progress.md`。
+- 运行时状态（events.jsonl、control.jsonl、sessions、worktrees、goal.enroll.json）**不放 WF**，由引擎在引擎根维护〔GO-34〕。`<goal_run_root>` 即引擎根下该 goal 的目录，`history` 句柄指向它、同时带 `work_folder` id，agent 经 work-folder MCP 或直接路径读历史都行。
 
 ## 2. Goal Agent · turn
 
@@ -85,13 +90,13 @@ MCP 通过后：绑定或新建 WF，把 enroll 对象原样写进 WF 的 `goal.
 ```json
 {
   "schema": "goal.turn.in/1",
-  "goal": { /* §1 的 enroll 对象，含 steer 后的当前值 */ },
+  "goal": { /* §1 的 enroll 对象（六字段，含 steer 后的当前值） */ },
   "goal_version": 3,                   // enroll 为 1，每次 goal_steer +1〔GO-20〕
   "steer_diff": [                      // 自上一个 turn 以来的 steer，注入（本次交接内容）；没有则为空数组
     { "version": 3, "ts": "…", "changed": { "acceptance": ["make test", "make e2e"] }, "added": { "deadline": "…" }, "note": "操作者附言" } ],
   "turn_no": 4,
-  "release_branch": "release/g-7f3a2c",
-  "release_head": "<sha>",
+  "release_branch": "release/loopx-minimal",   // = goal 的 source_branch〔GO-30/31〕
+  "release_head": "<sha>",             // 引擎填，观测用（不是交接核对项，见 §0.10）
   "dd_summary": "3 张 DD：2 merged，1 failed（dd-02：…一句话…）",   // 一行，不是整表〔GO-17〕
   "last_dd": { /* 上一张 DD 的结果对象，见 §7 —— 这是本次交接的核心内容，注入 */ },
   "last_stop": { /* 上一个 turn 的输出对象原样；首轮为 null */ },
@@ -102,21 +107,29 @@ MCP 通过后：绑定或新建 WF，把 enroll 对象原样写进 WF 的 `goal.
 }
 ```
 
-**输出** `goal.turn/1`，`stop` ∈ `dispatch | done | blocked`
+**输出** `goal.turn/1`，`stop` ∈ `dispatch | done | blocked`。`dispatch` 的输出对象就是 **DD 启动协议**〔GO-36〕：
 ```json
 { "schema": "goal.turn/1", "stop": "dispatch",
   "summary": "为什么派这张单、它在目标里的位置",
   "dispatch": {
     "spec_text": "……给 Impl 的完整任务书，自含验收期望……",
-    "acceptance_extra": [ "pytest tests/test_x.py" ]   // 可选，叠加在 goal.acceptance 之后
-  } }
+    "acceptance_extra": [ "pytest tests/test_x.py" ],   // 可选，叠加在 goal 的验收命令之后（保序去重合并）
+    "repos": [                        // 一张 DD 可跨多个 repo，不限于一个〔GO-36〕
+      { "path": "/data/worktrees/foo",          // Goal Agent 开好的 worktree（绝对路径）
+        "remote": "git@github.com:org/foo.git",
+        "branch": "dd/loopx-minimal/dd-25-foo", // Goal Agent 建好并已 push 的 dd 分支（这张 DD 的 source）
+        "spec_path": "docs/specs/25-foo.md" }   // spec 在该仓内的相对路径（如 docs/specs/N-XX.md）
+    ] } }
 { "schema": "goal.turn/1", "stop": "done",
   "summary": "目标已完成的依据（引用 dd_history / release_head 上的事实）" }
 { "schema": "goal.turn/1", "stop": "blocked",
   "summary": "…", "blocked": { "kind": "needs_human | external | contradiction", "detail": "…" } }
 ```
-- 一个 turn 只派**一张** DD（GO-4.4「派 DD 本质就是 waiting DD」）。
-- `dispatch.spec_text` 非空是硬校验。
+- 一个 turn 只派**一张** DD（GO-4.4「派 DD 本质就是 waiting DD」）；这张 DD 可以涉及 `repos` 里的多个 repo〔GO-36〕。
+- **开 DD 的前置由 Goal Agent 在 Stop 前自己做完**〔GO-36〕：为每个涉及的 repo 从 goal 的 release 分支切出 dd 分支（DD 的 source）、开 worktree、把 spec 写成仓内文件 `docs/specs/N-XX.md`，commit 并 push。DD 的 target 就是 goal 的 release 分支。
+- **引擎机械核五条**（对每个 repo〔GO-36/25〕）：① `branch` 在 remote 上存在；② worktree 在该 `branch` 上；③ worktree HEAD == remote tip（已 push）；④ 工作树干净；⑤ `spec_path` 文件在该 HEAD commit 里存在。任一不过 → 落 `goal.dispatch_rejected`（字段级错误），不开 DD，作为下一个 turn 的交接内容打回。
+- 字段级校验：`spec_text` 非空；`repos` 非空，每项 `path` 非空绝对路径、`remote` 非空、`branch` 是合法分支名、`spec_path` 是仓内相对路径（无前导 `/`、无 `..`）；`path` 不重复、`(path, branch)` 组合不重复；`acceptance_extra` 可选、每条非空。
+- **核过之后引擎做三件事**：每个 repo 开 PR（dd 分支 → goal 的 release 分支，body 带 spec 文件，落 `dd.pr_opened`）；在 base（release head）上把 goal 级验收命令跑一遍做**基线**〔GO-34〕——红了该 DD 直接以 `failed`（stage=baseline）收场、不起 Impl；绿了起 Impl（§4）。
 
 ## 3. Goal Agent · review（DD 过 FR 后）
 
@@ -135,8 +148,8 @@ MCP 通过后：绑定或新建 WF，把 enroll 对象原样写进 WF 的 `goal.
 ```json
 { "schema": "impl.in/1",
   "dd_id": "dd-03", "round": 2,
-  "workspace": "/data/worktrees/g-7f3a2c/dd-03",   // 已 checkout 到单的分支
-  "branch": "dd/g-7f3a2c/dd-03", "base_commit": "<release_head>",
+  "workspace": "/data/worktrees/dd-03",   // Goal Agent 开好的 worktree，已在该 DD 的分支上
+  "branch": "dd/loopx-minimal/dd-03-foo", "base_commit": "<release_head>",   // git 字段由引擎填；base_commit 是观测信息，不是核对项（§0.10）
   "spec_text": "…", "acceptance": [ "make test", "pytest tests/test_x.py" ],
   "feedback": {                        // 本轮为什么回到 impl，只这一条，注入〔GO-17〕；首轮为 null
     "from": "acceptance | cr | fr | goal | merge", "detail": "…写清楚要改什么…", "findings": [ /* §5 格式，可空 */ ] },
@@ -148,9 +161,11 @@ MCP 通过后：绑定或新建 WF，把 enroll 对象原样写进 WF 的 `goal.
 { "schema": "impl/1", "stop": "committed", "commit": "<sha>", "summary": "改了什么、为什么" }
 { "schema": "impl/1", "stop": "failed", "detail": "为什么做不了（缺依赖、spec 矛盾……）" }
 ```
-- `committed` 时引擎校验：`commit` 存在于 `branch` 且工作树干净；否则判无效。
+- `committed` 时引擎跑 §0.10 交接闸：已 push、HEAD == remote tip、工作树干净；`commit` 是 40 位 sha 的汇报字段，引擎核形状、记 event，不作为核对依据〔GO-28〕。
 - `failed` 直接结束该 DD（`outcome: failed`），不重试，交回 Goal Agent。
-- `workspace` / `branch` / `base_commit` 由引擎填写，调用前后按 §0.10 表核对；agent 不改分支、不切目录〔GO-25〕。
+- `workspace` / `branch` 来自 dispatch 对象、由引擎填写，调用前后按 §0.10 表核对；agent 不改分支、不切目录〔GO-25〕。
+
+**DD 生命周期：开单与收尾**〔GO-28/29/34/35/36〕。PR 与 worktree 以 **DD** 为粒度开与收，不属于 enroll：开单见 §2（引擎核五条 → 每 repo 开 PR → base 上跑基线）。DD 结束（`merged` 或 `failed`）时引擎机械收尾：`merged` → PR 已合并（平台合并或 Merge Agent，§0.10 末条），引擎确认其已 closed；`failed` → close PR，**不合并**；两种结局都删 worktree、删远端 dd 分支；每步结果落 event，随后 `dd.merged` / `dd.failed` 收口，结果对象（§7）交回 Goal Agent 的下一个 turn。
 
 ## 5. CR 与 FR（同一协议，`role` 区分）
 
@@ -177,11 +192,11 @@ MCP 通过后：绑定或新建 WF，把 enroll 对象原样写进 WF 的 `goal.
 - `fail` 时 `findings` 至少一条 `blocker` 或 `major`，否则判无效（防止无理由打回）。
 - FR 可以部署、跑任何东西（GO-6.1, GO-9）；做了什么写进 `evidence`，引擎只落 event。
 - CR 与 FR 的区别只在 prompt 与模型，协议相同。
-- `head_commit` 由引擎填、引擎核（§0.10）；review 不改工作树，改了判无效〔GO-25〕。
+- `head_commit` 由引擎填（观测信息）；引擎核的是 §0.10 的交接三条加「remote tip 与调用前一致」——review 不改工作树，改了判无效〔GO-25/28〕。
 
 ## 6. Merge Agent（所有合并的唯一执行者，GO-15）
 
-一个协议覆盖两种合并：`kind: "dd"`（单的分支 → 本线 release）与 `kind: "release"`（release → goal 的目标分支）。引擎自己不做 merge、不做 fast-forward。
+一个协议覆盖两种合并：`kind: "dd"`（dd 分支 → 本线 release 分支）与 `kind: "release"`（线 done：release → 各 repo 自己的 `target_branch`〔GO-31〕）。DD 的 PR 在 Goal approve 后先看平台 mergeable，MERGEABLE 由引擎直接平台合并（§0.10 末条〔GO-36〕）；只有 CONFLICTING / UNKNOWN，或线 done 的 release 收尾合并，才调 Merge Agent〔GO-5, GO-15〕。
 
 **输入** `merge.in/1`
 ```json
@@ -189,8 +204,8 @@ MCP 通过后：绑定或新建 WF，把 enroll 对象原样写进 WF 的 `goal.
   "kind": "dd | release",
   "dd_id": "dd-03",                    // kind=release 时为 null
   "workspace": "…",
-  "source_branch": "dd/g-7f3a2c/dd-03", "source_head": "<sha>",
-  "target_branch": "release/g-7f3a2c", "target_head": "<sha>",
+  "source_branch": "dd/loopx-minimal/dd-03-foo", "source_head": "<sha>",
+  "target_branch": "release/loopx-minimal", "target_head": "<sha>",
   "acceptance": [ "make test" ] }
 ```
 **输出** `merge/1`，`stop` ∈ `merged | rebased | failed`
@@ -199,7 +214,7 @@ MCP 通过后：绑定或新建 WF，把 enroll 对象原样写进 WF 的 `goal.
 { "schema": "merge/1", "stop": "rebased", "new_head": "<source 新 head>", "summary": "解决了哪些冲突、改了哪些文件" }
 { "schema": "merge/1", "stop": "failed",  "detail": "…" }
 ```
-- `merged`：Stop 时目标分支已包含改动、验收命令已在合并结果上跑过且过（GO-5「stop 的时候都处理好了」）。引擎校验 `merged_commit` 是目标分支当前 head。
+- `merged`：Stop 时目标分支已包含改动、验收命令已在合并结果上跑过且过（GO-5「stop 的时候都处理好了」）。引擎从 remote 校验 `merged_commit` 是目标分支当前 head。
 - `rebased`：rebase 动了代码，**不合并**。源分支停在 `new_head`，引擎对它**完整再走 CR → FR → Goal Agent 审单**（design §3.6 / §2.4），Goal approve 后再调一次 Merge Agent。kind=release 时 review 的 `base_commit` 是目标分支 head、`head_commit` 是 `new_head`，`spec_text` 用 goal_text。
 - `failed`：kind=dd → DD 回 Impl，approve 清零，`feedback.from = "merge"`；kind=release → goal 置 blocked（`kind: merge_failed`），不猜。
 - `source_head` / `target_head` 由引擎填写；Stop 后引擎按 §0.10 表核对三种结果各自的 git 状态，对不上判无效输出〔GO-25〕。
@@ -225,7 +240,7 @@ MCP 通过后：绑定或新建 WF，把 enroll 对象原样写进 WF 的 `goal.
 ```
 `kind` 全集（引擎每次状态变化恰好一条）：
 - goal：`goal.enrolled` `goal.turn.started` `goal.turn.finished`(payload=输出对象) `goal.done` `goal.blocked` `goal.warning` `goal.message`(MCP 送入) `goal.steered`(payload: version, diff, note) `goal.merged_to_target`(Merge Agent kind=release 成功后) `goal.dispatch_rejected`(dispatch 未过引擎 GO-36 核对被打回：字段级错误，作为下一 turn 交接内容)
-- dd：`dd.dispatched` `dd.stage.started` `dd.stage.finished` `dd.acceptance`(每条命令一条) `dd.review_requested` `dd.approved` `dd.rejected` `dd.merged` `dd.failed`
+- dd：`dd.dispatched` `dd.stage.started` `dd.stage.finished` `dd.pr_opened`(开 PR 时每 repo 一条) `dd.acceptance`(每条命令一条) `dd.review_requested` `dd.approved` `dd.rejected` `dd.merged` `dd.failed`
 - agent：`agent.spawned` `agent.exited`(exit code, usage) `agent.failed`(runtime 非零退出，含 invalid_output / timeout 等 detail) `agent.invalid_output`(引擎判无效输出：解不出 / 校验不过 / 前后置闸不过 / commit 对不上，§0.1 / §0.10)
 - engine：`engine.started` `engine.resumed`(from_seq) `engine.exiting`(reason: done | blocked | stop | crash)
 - control：`control.received`(MCP 送入的每条操作，payload=操作对象)
@@ -261,12 +276,12 @@ MCP 是唯一常驻服务，对外 8 个工具。**读**只读 events.jsonl；**
 
 | 工具 | 输入 | 做什么 | 对引擎的语义 |
 |---|---|---|---|
-| `goal_enroll` | §1 请求对象 | 校验节点 → 建 release 分支 → spawn 引擎 | 新进程，`engine.started` |
+| `goal_enroll` | §1 请求对象 | 校验节点 → 程序化准备（引擎根 + release 分支，§1）→ spawn 引擎 | 新进程，`engine.started` |
 | `goal_list` | 无 | 每个 goal 一行：`goal_id / title / state / step / turn_no / dd_count / last_event_ts / warnings / pid` | 只读 |
 | `goal_status` | `goal_id`, `tail`(默认 20) | §11 的派生状态 + 最近 N 条 event | 只读 |
 | `goal_events` | `goal_id`, `since_seq` | 原始 event 流，给观测面拉 | 只读 |
 | `goal_message` | `goal_id`, `text` | 写 control `{op:"message"}` | 进 Goal Agent **下一个 turn** 的 `messages`；不打断当前 agent |
-| `goal_steer` | `goal_id`, `patch`（可改或**新增**任意 goal 字段，`goal_id` / `work_folder` / `repo.path` 除外） | 写 control `{op:"steer"}`；`goal_version` +1 | 下一个步骤边界起生效，落 `goal.steered` event（含 diff 与新版本号）；**Goal Agent 下一个 turn 的输入注入 `goal_version` 与 `steer_diff`**〔GO-20〕 |
+| `goal_steer` | `goal_id`, `patch`（可改或**新增**任意 goal 字段，`goal_id` / `work_folder` / repo 的 `path` 除外；嵌套 dict 一律整值替换，不递归 merge） | 写 control `{op:"steer"}`；`goal_version` +1 | 下一个步骤边界起生效，落 `goal.steered` event（含 diff 与新版本号）；**Goal Agent 下一个 turn 的输入注入 `goal_version` 与 `steer_diff`**〔GO-20〕 |
 | `goal_stop` | `goal_id`, `mode`: `graceful` \| `kill` | graceful 写 control `{op:"stop"}`；kill 直接 SIGTERM 进程组 | graceful：当前 agent 跑完即 `engine.exiting(stop)`，不起下一个；kill：立即退出，在跑的 agent run 视为丢失（§11） |
 | `goal_resume` | `goal_id` | 对 state ∈ {stopped, blocked, crashed} 的 goal 重新 spawn | `engine.resumed`，按 §11 续跑；blocked 的 goal 通常先 `goal_message` 再 resume |
 
