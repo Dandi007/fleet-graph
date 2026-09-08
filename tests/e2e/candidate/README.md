@@ -34,6 +34,10 @@ manifest 的 `config_path` 可指定 Fleet 源码内相对路径，默认 `confi
 
 各角色系统 prompt 末尾显式要求最终回复只输出当前 Stop schema 对应的 JSON 值：Goal 为数组，其他角色按各自 schema；禁止说明文字、Markdown 代码围栏以及虚构 StructuredOutput 工具。该文本完整保存在 manifest 的 `final_response_override`，不修改 schema 或 runtime parser，不替模型生成结果。它针对真实运行中“说明文字加 fenced JSON”导致的 structured output 失败明确格式要求。
 
+冻结 runtime 的 OpenCode 解析分支取**第一条** `type=text` 事件并立即尝试 JSON 解析；它不会选择最后一条，也不会在首条失败后继续寻找。因此整个 turn 的系统规则进一步要求：工具执行期间只允许真实 tool calls，禁止中途 assistant 进度、计划或解释；最后且仅一次输出 schema JSON。manifest 的 `assistant_text_override` 记录完整规则及 `first_opencode_text_event` 行为。该修改仅说明协议，不剥离输出、不修改解析器，也不把后面的 JSON 单独提取后强判成功。
+
+已导出第六轮 Goal `ff1a0b6dd93169e9fe0fffad` 的真实 stdout 含三条 text，长度分别为 126、70、326 字符；前两条不是 JSON，最后一条是合法 JSON。直接调用冻结 `extractStructuredPayload()` 返回 null，确认失败来自首条 text 的选择规则。
+
 固定短 case 使用公开顶层配置 `scribe_interval=0`：冻结引擎仅在非终局跳过周期观察，Goal 达到 done 后仍启动一次真实终局 Scribe。引擎等待该调用结束，验收继续要求本次 bundle 存在成功 Scribe Session；失败时不能用“已关闭周期观察”或历史 case 的成功证据代替。manifest 的 `scribe_observation_override` 保存原周期、实际值 0、final_only 模式及理由。角色 session policy 保留原值，不修改当前 live case。
 
 这项配置用于避免固定短流程反复触发已知事件自引用膨胀，不是候选长期观测缺陷的修复。它没有删除事件、截断内容或放宽输出协议；终局观察仍受候选硬编码的单次 1000 条事件窗口限制，也可能因原始业务事件过大而失败，不能据此声称任意长度目标的完整观测已通过。下一轮必须在干净环境真实执行，并保留终局 Scribe 成功的原始 Session 证据。
@@ -49,6 +53,6 @@ manifest 的 `config_path` 可指定 Fleet 源码内相对路径，默认 `confi
 # References
 
 - 被测 Fleet：`config/codex.json`、`config/prompts/`、`src/fleet_graph/cli.py`、`src/fleet_graph/runtime.py`；`src/fleet_graph/engine.py:906` 的 observe 与 `src/fleet_graph/service.py:93` 的原生 scribe_interval 配置。
-- 被测 runtime：`src/recipes/opencode.ts`、`src/agent-bus.ts`、`profiles/harness/fleet-*.yaml`、`profiles/routes.yaml`。
+- 被测 runtime：`src/recipes/opencode.ts`、`src/agent-bus.ts`、`src/dispatch.ts:1308` 的 OpenCode 首条 text 解析、`profiles/harness/fleet-*.yaml`、`profiles/routes.yaml`。
 - [OpenCode v1.17.13 内置 Provider](https://github.com/anomalyco/opencode/blob/v1.17.13/packages/opencode/src/provider/provider.ts)。
 - [OpenCode v1.17.13 环境开关](https://github.com/anomalyco/opencode/blob/v1.17.13/packages/core/src/flag/flag.ts)。

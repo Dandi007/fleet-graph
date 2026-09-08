@@ -15,6 +15,12 @@ import yaml
 MODEL = "deepseek-v4-pro"
 CHAIN = MODEL + "@opencode"
 ROUTE = CHAIN + "/gw"
+TURN_TEXT_RULE = (
+    "整个 turn 的 assistant 文本协议：在全部工具操作完成前，不得输出任何中途 assistant text。"
+    "不得输出进度、计划、解释、过渡句或操作总结；需要行动时仅发出真实 tool calls。"
+    "所有工具操作结束后，最后且仅一次输出满足当前 Stop schema 的 JSON 文本。"
+    "不要在该 JSON 前后输出任何其他 assistant 文本；不得虚构工具调用或结果。\n"
+)
 FINAL_RESPONSE_RULE = (
     "最终回复格式要求：最终回复只能包含给定 Stop schema 对应的一个 JSON 值。"
     "Goal 输出 JSON 数组，其他角色严格按当轮提供的 schema 输出 JSON 值。"
@@ -152,7 +158,7 @@ def configure(state=Path("/state"), fleet=Path("/opt/fleet"), assets=Path("/opt/
             "不得模拟工具结果、伪造证据或把未运行检查写成通过。\n"
         )
         target = prompt_dir / f"{role}.md"
-        target.write_text(prompt + override + "\n" + FINAL_RESPONSE_RULE)
+        target.write_text(prompt + override + "\n" + TURN_TEXT_RULE + "\n" + FINAL_RESPONSE_RULE)
         settings["system_prompt_file"] = str(target)
     config_path = config_dir / "fleet.json"
     config_path.write_text(json.dumps(fleet_config, ensure_ascii=False, indent=2) + "\n")
@@ -176,6 +182,14 @@ def configure(state=Path("/state"), fleet=Path("/opt/fleet"), assets=Path("/opt/
         "chain": CHAIN,
         "role_model_overrides": role_model_overrides,
         "final_response_override": FINAL_RESPONSE_RULE,
+        "assistant_text_override": {
+            "rule": TURN_TEXT_RULE,
+            "native_text_selection": "first_opencode_text_event",
+            "reason": (
+                "冻结 runtime 遇到首个 OpenCode text 事件即尝试 JSON 解析并返回；"
+                "中途说明会使后续合法最终 JSON 无法被采用，因此整个 turn 只允许最后一次 JSON text"
+            ),
+        },
         "scribe_observation_override": {
             "original_interval": original_scribe_interval,
             "effective_interval": fleet_config["scribe_interval"],
@@ -205,6 +219,8 @@ def configure(state=Path("/state"), fleet=Path("/opt/fleet"), assets=Path("/opt/
             "由 runtime 追加 @opencode 选择 chain；原值与实际值逐角色记录",
             "runtime profiles 由独立生成目录接入，仅注册 candidate 与 work-folder MCP",
             "原角色 prompt 保留，附加独立 Docker E2E 阶段授权",
+            "整个 turn 禁止中途 assistant text，只允许真实 tool calls 和最后一次 JSON 文本；"
+            "适配原解析器选择首条 text 的行为，不剥离输出或修改解析器",
             "最终回复仅允许给定 Stop schema 的 JSON 值，禁止说明、Markdown 代码围栏和虚构工具；"
             "这是 prompt 格式约束，schema 与 runtime parser 保持原样",
             "原 fleet harness 保留，Fleet CLI 保持 loopback，由容器内 TCP relay 转发 HTTP",

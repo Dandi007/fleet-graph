@@ -90,6 +90,15 @@ class ModelConfigurationTests(unittest.TestCase):
                     self.assertEqual(
                         manifest["final_response_override"], configure.FINAL_RESPONSE_RULE
                     )
+                    prompt = Path(settings["system_prompt_file"]).read_text()
+                    self.assertEqual(prompt.count(configure.TURN_TEXT_RULE), 1)
+                    self.assertEqual(
+                        manifest["assistant_text_override"]["rule"], configure.TURN_TEXT_RULE
+                    )
+                    self.assertEqual(
+                        manifest["assistant_text_override"]["native_text_selection"],
+                        "first_opencode_text_event",
+                    )
                     # 这是 runtime CLI 的调用边界；重复 @opencode 会在这里回归失败。
                     chain_key = settings["model"] + "@" + settings["runtime"]
                     self.assertEqual(
