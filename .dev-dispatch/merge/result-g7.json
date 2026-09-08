@@ -1,0 +1,12 @@
+{
+ "development_id": "dev-fg-91bb67e8747f",
+ "result": "MERGED",
+ "subject_commit": "d615acd1c86ca4209c5b8c4dccca4a1ede80a76f",
+ "target_ref": "refs/heads/release/fleet-compare-self",
+ "released_commit": "5a0c392f45a5cf2b66231e61061a27201469edc6",
+ "stripped_paths": [
+  ".dev-dispatch",
+  ".dd-evidence"
+ ],
+ "previous_target_head": "ff8a15c1117bfa506c84031814a07d2b26c096f8"
+}
