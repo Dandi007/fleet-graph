@@ -426,6 +426,36 @@ class Journal:
             self._lines.setdefault(goal, []).append(record)
             return record
 
+    def append_many(self, goal: str, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Append several lines as one atomic append (single lock, single write).
+
+        The lines share the lock and the file flush, so a crash either leaves
+        them all durable or a single trailing fragment (isolated by ``load``),
+        never a torn prefix where the first line is durable but the rest are
+        absent. ``finish_goal_call`` uses this to persist a completed call
+        result and its resulting lifecycle mode *together* so the crash window
+        between the two can no longer strand a drained call (final review
+        finding)."""
+        with self._lock:
+            assigned: list[dict[str, Any]] = []
+            for record in records:
+                if "seq" not in record:
+                    record = {**record, "seq": self._next_seq(goal)}
+                else:
+                    self._seq[goal] = max(self._seq.get(goal, 0), int(record["seq"]))
+                assigned.append(record)
+            if self.home is not None:
+                self._path(goal).parent.mkdir(parents=True, exist_ok=True)
+                blob = "".join(
+                    json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+                    for record in assigned
+                )
+                with self._path(goal).open("a", encoding="utf-8") as fh:
+                    fh.write(blob)
+                    fh.flush()
+            self._lines.setdefault(goal, []).extend(assigned)
+            return assigned
+
     def scan(self, goal: str | None = None) -> list[dict[str, Any]]:
         """All lines for one goal (or every goal, in append order), in order."""
         with self._lock:
@@ -708,6 +738,16 @@ class GoalRequestKernel:
                     and current_call is not None
                     and line.get("call_id") == current_call
                 ):
+                    # Completing the call also moved the lifecycle mode. Derive
+                    # it here so an interruption between the call-result write
+                    # and the separately-persisted mode record (see
+                    # ``_finish_goal_call_owned``) is recovered on replay: a
+                    # drained graceful stop must rest ``stopped`` and a terminal
+                    # intent must still move waiting/blocked, so a rebuilt
+                    # product is neither stuck ``stopping`` forever nor left
+                    # ``running`` when the Goal meant ``waiting``/``blocked``. A
+                    # later ``control``/``mode`` line still overrides ``mode``.
+                    mode = _derive_completion_mode(mode, line.get("intent"))
                     current_call = None
                     current_call_request = None
                 elif (
@@ -1273,8 +1313,18 @@ class GoalRequestKernel:
                     final=True,
                 ),
             )
-        self.journal.append(
-            goal,
+        # A stop that landed while this call was in flight is authoritative:
+        # graceful stop drains this result then rests ``stopped``; an immediate
+        # stop the runtime confirmed holds ``stopped``. Neither is overwritten
+        # by the returned intent (behavior 5). The completion's lifecycle mode
+        # is derived with the *same* rule ``restore`` replays, and it is
+        # persisted atomically *with* the completed call result: a crash can no
+        # longer leave a drained call whose durable mode still reads
+        # ``stopping`` (or ``running`` when the Goal meant waiting/blocked) with
+        # no record to finish the transition (final review finding).
+        mode = self._mode_of(goal)
+        next_mode = _derive_completion_mode(mode, intent)
+        records: list[dict[str, Any]] = [
             {
                 "record": RECORD_CALL_RESULT,
                 "goal": goal,
@@ -1285,8 +1335,24 @@ class GoalRequestKernel:
                 "raw_intent": raw_intent,
                 "actions": raw_actions if isinstance(raw_actions, list) else [],
                 "at": _iso(self.clock),
-            },
-        )
+            }
+        ]
+        if mode != MODE_STOPPED:
+            # A stop the runtime already confirmed needs no further transition;
+            # every other completion moves the lifecycle (a graceful stop
+            # reaches ``stopped``, a terminal intent moves waiting/blocked, and
+            # otherwise the mode is re-asserted) and is written with the call
+            # result as one atomic append.
+            records.append(
+                {
+                    "record": RECORD_CONTROL,
+                    "goal": goal,
+                    "control": "mode",
+                    "value": next_mode,
+                    "at": _iso(self.clock),
+                }
+            )
+        self.journal.append_many(goal, records)
 
         self.journal.release_call(goal, call_id)
 
@@ -1295,17 +1361,10 @@ class GoalRequestKernel:
         if st and st.get("resume") == call_id:
             st["resume"] = None
 
-        # A stop that landed while this call was in flight is authoritative:
-        # graceful stop drains this result then rests ``stopped``; an immediate
-        # stop the runtime confirmed holds ``stopped``. Neither is overwritten
-        # by the returned intent (behavior 5).
-        mode = self._mode_of(goal)
-        if mode == MODE_STOPPING:
-            self._set_mode(goal, MODE_STOPPED)
-        elif mode == MODE_STOPPED:
-            pass
-        else:
-            self._set_mode(goal, _intent_mode(intent) or mode)
+        # The transition is already durable above; keep the in-memory projection
+        # in step without a second journal write.
+        self._state.setdefault(goal, self._default_state())["mode"] = next_mode
+        self._mode[goal] = next_mode
 
         return {
             "call_id": call_id,
@@ -1841,6 +1900,21 @@ def _intent_mode(intent: str | None) -> str | None:
     if intent == INTENT_BLOCKED:
         return MODE_BLOCKED
     return None
+
+
+def _derive_completion_mode(mode: str, intent: str | None) -> str:
+    """The lifecycle mode a *completed* Goal call transitions into.
+
+    Shared by ``restore`` (reconstruction) and ``_finish_goal_call_owned`` (the
+    live path) so both land on the same mode. A call that drained a graceful
+    stop rests ``stopped``; an already-stopped goal stays stopped; otherwise a
+    terminal intent (waiting/blocked) moves the mode and an absent/unknown
+    intent (``None`` or ``done``) leaves it unchanged -- ``done`` is an intent,
+    never a terminal shortcut (P4).
+    """
+    if mode in (MODE_STOPPING, MODE_STOPPED):
+        return MODE_STOPPED
+    return _intent_mode(intent) or mode
 
 
 __all__ = [

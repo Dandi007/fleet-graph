@@ -25,16 +25,24 @@ from fleet_graph.goal.request_kernel import (
     KIND_DD_REVIEW,
     KIND_MESSAGE,
     KIND_STEER,
+    MODE_BLOCKED,
+    MODE_RUNNING,
+    MODE_STOPPED,
+    MODE_STOPPING,
+    MODE_WAITING,
     NOT_READY,
     OBSERVED_ABSENT,
     OBSERVED_CONFIRMED,
     OBSERVED_UNKNOWN,
     RECORD_ACTION,
     RECORD_ACTION_RESULT,
+    RECORD_CALL,
     RECORD_CALL_RESULT,
     RECORD_CALL_UNAVAILABLE,
+    RECORD_CONTROL,
     RECORD_REQUEST,
     RECORD_STOP_LIST,
+    RECORD_VERSION,
     UNKNOWN,
     GoalRequestKernel,
     Journal,
@@ -1816,3 +1824,138 @@ class TestUnboundGoalCallPreservesRequests:
             f"line:{GOAL}:message:m-B",
             f"line:{GOAL}:message:m-C",
         ]
+
+
+# --- final review: completion + lifecycle transition recover as one operation ---
+
+
+class TestCompletionModeRecovery:
+    def _crash_window(self, home: Any, *, pre_mode: str, intent: str | None) -> str:
+        """Write a durable journal capturing the *finished* call result with its
+        resulting lifecycle-mode record still missing -- the window a crash
+        between the completion record and the mode persistence used to leave
+        open. Returns the call id."""
+        journal = Journal(home=home)
+        journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v1", "at": "t"})
+        journal.append(
+            GOAL,
+            {
+                "record": RECORD_REQUEST,
+                "goal": GOAL,
+                "request_id": "A",
+                "caller": "line-a",
+                "kind": KIND_DD_RESULT,
+                "input": {"note": "A"},
+                "goal_version": "v1",
+                "accepted_at": "t",
+            },
+        )
+        call_id = "call:crash"
+        journal.append(
+            GOAL,
+            {
+                "record": RECORD_CALL,
+                "goal": GOAL,
+                "call_id": call_id,
+                "request_id": "A",
+                "run_id": "run-A",
+                "caller": "line-a",
+                "goal_version": "v1",
+                "at": "t",
+            },
+        )
+        journal.append(
+            GOAL,
+            {"record": RECORD_CONTROL, "goal": GOAL, "control": "mode", "value": pre_mode, "at": "t"},
+        )
+        journal.append(
+            GOAL,
+            {
+                "record": RECORD_STOP_LIST,
+                "goal": GOAL,
+                "call_id": call_id,
+                "request_id": "A",
+                "run_id": "run-A",
+                "intent": intent,
+                "actions": [],
+                "malformed": [],
+                "at": "t",
+            },
+        )
+        # The completed call result is durable, but the separately-persisted
+        # resulting mode record never landed (the crash window).
+        journal.append(
+            GOAL,
+            {
+                "record": RECORD_CALL_RESULT,
+                "goal": GOAL,
+                "call_id": call_id,
+                "request_id": "A",
+                "run_id": "run-A",
+                "intent": intent,
+                "actions": [],
+                "at": "t",
+            },
+        )
+        return call_id
+
+    def test_graceful_stop_drain_reconstructs_as_stopped_not_stuck(self, tmp_path) -> None:
+        # A graceful stop drained the in-flight call; the completed result is
+        # durable but the resulting ``stopped`` mode record is missing. Restore
+        # must derive the drained stop instead of leaving the goal stuck in
+        # ``stopping`` with no in-flight call and no pending transition.
+        home = tmp_path / "journal"
+        self._crash_window(home, pre_mode=MODE_STOPPING, intent="done")
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+
+        assert rebuilt._state[GOAL]["mode"] == MODE_STOPPED
+        assert rebuilt._state[GOAL]["mode"] != MODE_STOPPING
+        assert rebuilt.journal.inflight(GOAL) is None
+        assert rebuilt.next_goal_call(GOAL) is None  # stopped: nothing starts
+        rebuilt.resume(GOAL)
+        assert rebuilt._state[GOAL]["mode"] == MODE_RUNNING
+
+    @pytest.mark.parametrize(
+        ("intent", "expected_mode"),
+        [(None, MODE_RUNNING), ("waiting", MODE_WAITING), ("blocked", MODE_BLOCKED)],
+    )
+    def test_terminal_intent_reconstructs_when_mode_record_is_missing(
+        self, tmp_path, intent: str | None, expected_mode: str
+    ) -> None:
+        # A completed call whose terminal-intent mode record never landed must
+        # still reconstruct the intent's lifecycle mode -- the completed call
+        # result carries it, and a missing record must not leave the goal
+        # ``running`` when the Goal meant waiting/blocked.
+        home = tmp_path / "journal"
+        self._crash_window(home, pre_mode=MODE_RUNNING, intent=intent)
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        assert rebuilt._state[GOAL]["mode"] == expected_mode
+
+    def test_live_path_persists_call_result_and_mode_together(self, tmp_path) -> None:
+        # The live path no longer leaves the crash window open: the completed
+        # call result and the resulting ``stopped`` mode land as one atomic
+        # append, so a fresh reconstruction from disk sees one consistent
+        # completion and never needs to guess the transition.
+        home = tmp_path / "journal"
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        kernel.activate_version(GOAL, "v1")
+        kernel.submit(GOAL, make_request("A"))
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None
+        kernel.stop(GOAL, mode="graceful")
+        kernel.finish_goal_call(
+            GOAL, call["call_id"], {"actions": [dispatch_action("k1")], "intent": "waiting"}
+        )
+
+        events = kernel.list_events(GOAL)["events"]
+        mode_values = [
+            e["value"]
+            for e in events
+            if e.get("record") == RECORD_CONTROL and e.get("control") == "mode"
+        ]
+        assert mode_values[-1] == MODE_STOPPED
+        assert any(e.get("record") == RECORD_CALL_RESULT for e in events)
+
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        assert rebuilt._state[GOAL]["mode"] == MODE_STOPPED
+        assert rebuilt.journal.inflight(GOAL) is None
