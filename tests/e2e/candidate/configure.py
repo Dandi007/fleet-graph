@@ -119,10 +119,12 @@ def configure(state=Path("/state"), fleet=Path("/opt/fleet"), assets=Path("/opt/
     }
     (profiles / "mcp.yaml").write_text(yaml.safe_dump({"servers": servers}))
     fleet_config = json.loads(config_source.read_text())
+    original_scribe_interval = fleet_config.get("scribe_interval", 60)
     fleet_config.update(
         agent_run="/opt/agent-runtime/bin/agent-run",
         agent_session="/opt/agent-runtime/bin/agent-session",
         work_folder_mcp="http://work-folder:5602/mcp",
+        scribe_interval=0,
     )
     prompt_dir = config_dir / "prompts"
     prompt_dir.mkdir(exist_ok=True)
@@ -174,6 +176,17 @@ def configure(state=Path("/state"), fleet=Path("/opt/fleet"), assets=Path("/opt/
         "chain": CHAIN,
         "role_model_overrides": role_model_overrides,
         "final_response_override": FINAL_RESPONSE_RULE,
+        "scribe_observation_override": {
+            "original_interval": original_scribe_interval,
+            "effective_interval": fleet_config["scribe_interval"],
+            "mode": "final_only",
+            "final_success_required": True,
+            "native_event_window_limit": 1000,
+            "reason": (
+                "固定短 case 通过公开配置减少周期观察，避免已知 Scribe 事件自引用膨胀；"
+                "保留并验收真实终局 Scribe，不代表长期观测缺陷已修复"
+            ),
+        },
         "route": ROUTE,
         "gateway": "http://gateway:15722/v1",
         "fleet_mcp": "http://candidate:15611/mcp",
@@ -186,6 +199,8 @@ def configure(state=Path("/state"), fleet=Path("/opt/fleet"), assets=Path("/opt/
         },
         "overrides": [
             "仅保留默认 OpenCode static 网关路由，无 native subscription 或 fallback",
+            "公开 scribe_interval=0 采用 final-only 观察，仍要求本次真实终局 Scribe 成功；"
+            "不删除事件、不修改冻结引擎或放宽验收",
             "修正 Fleet 与 runtime CLI 的模型配置集成差异：--model 使用 bare model，"
             "由 runtime 追加 @opencode 选择 chain；原值与实际值逐角色记录",
             "runtime profiles 由独立生成目录接入，仅注册 candidate 与 work-folder MCP",

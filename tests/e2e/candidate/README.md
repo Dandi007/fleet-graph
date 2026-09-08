@@ -34,6 +34,10 @@ manifest 的 `config_path` 可指定 Fleet 源码内相对路径，默认 `confi
 
 各角色系统 prompt 末尾显式要求最终回复只输出当前 Stop schema 对应的 JSON 值：Goal 为数组，其他角色按各自 schema；禁止说明文字、Markdown 代码围栏以及虚构 StructuredOutput 工具。该文本完整保存在 manifest 的 `final_response_override`，不修改 schema 或 runtime parser，不替模型生成结果。它针对真实运行中“说明文字加 fenced JSON”导致的 structured output 失败明确格式要求。
 
+固定短 case 使用公开顶层配置 `scribe_interval=0`：冻结引擎仅在非终局跳过周期观察，Goal 达到 done 后仍启动一次真实终局 Scribe。引擎等待该调用结束，验收继续要求本次 bundle 存在成功 Scribe Session；失败时不能用“已关闭周期观察”或历史 case 的成功证据代替。manifest 的 `scribe_observation_override` 保存原周期、实际值 0、final_only 模式及理由。角色 session policy 保留原值，不修改当前 live case。
+
+这项配置用于避免固定短流程反复触发已知事件自引用膨胀，不是候选长期观测缺陷的修复。它没有删除事件、截断内容或放宽输出协议；终局观察仍受候选硬编码的单次 1000 条事件窗口限制，也可能因原始业务事件过大而失败，不能据此声称任意长度目标的完整观测已通过。下一轮必须在干净环境真实执行，并保留终局 Scribe 成功的原始 Session 证据。
+
 该测试验证的是显式容器配置覆盖后的候选行为。它不验证候选默认宿主配置、native subscription、其他模型/runtime 或自动发现宿主凭证的能力；这些范围不应计入通过项。
 
 配置生成后先执行 `/opt/e2e/bootstrap_runtime_bus.ts`，通过冻结 runtime 的协议描述和注册函数，在独立 agent-bus 初始化协议与 `board:agent-runs`。脚本非零退出或超过 60 秒时阻止 Fleet 启动；原始输出写入 `/state/logs/runtime-bus-bootstrap.log`，退出码保存到 manifest 的 `agent_bus.bootstrap`。该步骤不替代后续真实生命周期消息的验收。
@@ -44,7 +48,7 @@ manifest 的 `config_path` 可指定 Fleet 源码内相对路径，默认 `confi
 
 # References
 
-- 被测 Fleet：`config/codex.json`、`config/prompts/`、`src/fleet_graph/cli.py`、`src/fleet_graph/runtime.py`。
+- 被测 Fleet：`config/codex.json`、`config/prompts/`、`src/fleet_graph/cli.py`、`src/fleet_graph/runtime.py`；`src/fleet_graph/engine.py:906` 的 observe 与 `src/fleet_graph/service.py:93` 的原生 scribe_interval 配置。
 - 被测 runtime：`src/recipes/opencode.ts`、`src/agent-bus.ts`、`profiles/harness/fleet-*.yaml`、`profiles/routes.yaml`。
 - [OpenCode v1.17.13 内置 Provider](https://github.com/anomalyco/opencode/blob/v1.17.13/packages/opencode/src/provider/provider.ts)。
 - [OpenCode v1.17.13 环境开关](https://github.com/anomalyco/opencode/blob/v1.17.13/packages/core/src/flag/flag.ts)。

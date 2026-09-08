@@ -105,6 +105,26 @@ class ModelConfigurationTests(unittest.TestCase):
                         },
                     )
 
+    def test_final_only_keeps_original_interval_and_requires_real_scribe_success(self):
+        for original_interval in (60, 120):
+            with self.subTest(original_interval=original_interval):
+                self.write_config("deepseek-v4-pro@opencode")
+                path = self.fleet / "config/codex.json"
+                original = json.loads(path.read_text())
+                original["scribe_interval"] = original_interval
+                path.write_text(json.dumps(original))
+                effective_path = configure.configure(self.state, self.fleet, self.assets)
+                effective = json.loads(effective_path.read_text())
+                manifest = json.loads((self.state / "candidate-manifest.json").read_text())
+                observed = manifest["scribe_observation_override"]
+                self.assertEqual(effective["scribe_interval"], 0)
+                self.assertEqual(observed["original_interval"], original_interval)
+                self.assertEqual(observed["effective_interval"], 0)
+                self.assertEqual(observed["mode"], "final_only")
+                self.assertIs(observed["final_success_required"], True)
+                self.assertIn("scribe", effective["roles"])
+                self.assertEqual(json.loads(path.read_text()), original)
+
     def test_unapproved_model_or_native_runtime_is_rejected(self):
         for model, runtime in (("other-model", "opencode"), ("deepseek-v4-pro", "codex")):
             with self.subTest(model=model, runtime=runtime):
