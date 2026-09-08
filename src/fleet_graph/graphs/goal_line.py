@@ -1033,11 +1033,19 @@ def build_goal_line_graph(deps: LineDeps) -> StateGraph:
         coord_input = _coordinator_input(deps, state, round_no)
 
         # Must-deliver ordering: the messages land in the durable coordinator
-        # input before anything is acked. See bus/inbox.py.
+        # input *and* in the kernel journal before anything is acked. See
+        # bus/inbox.py. The kernel enqueue happens here too, not in the later
+        # ``coordinator.turn``, so an acked message cannot be lost to a crash
+        # in the ack-to-turn window: the turn re-derives the same stable
+        # request identity and the kernel's request dedup reuses the persisted
+        # record (behavior 1/7; final review finding).
         def persist(messages: list[dict[str, Any]]) -> None:
             coord_input["inbox_messages"] = messages
             if deps.persist_coord_input is not None:
                 deps.persist_coord_input(round_no, coord_input)
+            enqueue = getattr(deps.coordinator, "enqueue_requests", None)
+            if enqueue is not None:
+                enqueue(round_no, coord_input)
 
         # The drain is kept so the M4 ack obligation can see which of the
         # round's deliveries were supervisor line-messages.

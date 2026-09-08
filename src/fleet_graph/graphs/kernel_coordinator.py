@@ -111,9 +111,7 @@ class KernelCoordinator:
         mode blocks it. A waiting result must not suppress the queued requests
         behind it (behavior 2/5).
         """
-        requests = self._requests_for(round_no, coord_input)
-        for request in requests:
-            self.kernel.submit(self.folder_id, request)
+        self.enqueue_requests(round_no, coord_input)
 
         last: dict[str, Any] | None = None
         while True:
@@ -134,6 +132,25 @@ class KernelCoordinator:
         if last is None:
             return _parked_verdict(self.kernel, self.folder_id)
         return last
+
+    def enqueue_requests(
+        self, round_no: int, coord_input: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Durably enqueue the round's independent requests into the kernel
+        journal *before* a caller acknowledges them.
+
+        ``turn`` re-derives the same stable identities from the same
+        ``coord_input`` and re-submits them here, so the request dedup reuses
+        the persisted record -- never appending a duplicate. Making this a
+        separate entry point lets ``goal_line.coordinator_turn``'s persist
+        callback land the requests durably *before* the inbox messages are
+        acked, closing the interrupt window where an acked message could be
+        lost before the coordinator turn reached the kernel journal (final
+        review finding; behaviors 1/7)."""
+        records: list[dict[str, Any]] = []
+        for request in self._requests_for(round_no, coord_input):
+            records.append(self.kernel.submit(self.folder_id, request))
+        return records
 
     # -- request ingress -----------------------------------------------------
 
@@ -399,15 +416,31 @@ class KernelEffectPorts:
             answer = self.dd.invoke({"line_folder": self.folder_id, "intent": payload})
         except Exception as exc:  # a gateway fault is a fact, never a crash
             return self._failed(f"{type(exc).__name__}: {exc}")
-        result = answer.get("dd_result") if isinstance(answer, dict) else None
-        if isinstance(result, dict) and result.get("development_id"):
-            return {
-                "ok": True,
-                "status": DELIVERED,
-                "detail": f"development {result.get('development_id')}",
-                "development_id": result.get("development_id"),
-            }
-        return self._failed("the dispatch subgraph returned no development")
+        if not isinstance(answer, dict):
+            return self._failed("the dispatch subgraph returned a non-dict")
+        result = answer.get("dd_result")
+        if not (isinstance(result, dict) and result.get("development_id")):
+            return self._failed("the dispatch subgraph returned no development")
+        out: dict[str, Any] = {
+            "ok": True,
+            "status": DELIVERED,
+            "detail": f"development {result.get('development_id')}",
+        }
+        # Preserve the raw downstream projection (development_id, state, stage,
+        # generation, output_commit, terminal, terminal_reason) and the
+        # admission/launch facts as first-class fields on the delivery so the
+        # kernel's raw result record retains them -- the adapter used to keep
+        # only ``development_id`` and drop the DD's current-state projection and
+        # admission evidence, which kernel pagination must be able to expose
+        # (final review finding; behaviors 2/6).
+        for key, value in result.items():
+            out.setdefault(key, value)
+        record = answer.get("record")
+        if isinstance(record, dict):
+            admission = {k: v for k, v in record.items() if k not in out}
+            if admission:
+                out["admission"] = admission
+        return out
 
     def approve(self, payload: dict[str, Any], *, ctx: dict[str, Any]) -> dict[str, Any]:
         return self._gate(payload, "APPROVE")
@@ -444,9 +477,26 @@ class KernelEffectPorts:
             receipt = self.gate.consume(action, folder_id=self.folder_id, round_no=0)
         except Exception as exc:
             return self._failed(f"{type(exc).__name__}: {exc}")
-        status = str((receipt or {}).get("status") or "")
+        receipt = receipt or {}
+        status = str(receipt.get("status") or "")
         if status == "consumed":
-            return {"ok": True, "status": DELIVERED, "detail": str(receipt.get("detail") or "")}
+            out: dict[str, Any] = {
+                "ok": True,
+                "status": DELIVERED,
+                "detail": str(receipt.get("detail") or ""),
+            }
+            # Preserve the raw gate receipt fields (decision, decided_by,
+            # decided_by_source, decision_file, decision_message_id,
+            # post_release_state, launches, evidence, development_id) on the
+            # delivery so the kernel's raw result record retains the release's
+            # original result and evidence -- the adapter used to reduce it to a
+            # status/detail string, which kernel pagination could not expose
+            # (final review finding; behavior 6).
+            for key, value in receipt.items():
+                if key in ("status", "detail") or key in out:
+                    continue
+                out[key] = value
+            return out
         return self._failed(str(receipt.get("detail") or receipt.get("code") or "gate refused"))
 
     @staticmethod

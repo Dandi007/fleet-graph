@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from fleet_graph.goal.request_kernel import (
+    ACTION_APPROVE,
     ACTION_DISPATCH,
     ACTION_REPLY,
     DELIVERED,
@@ -52,7 +53,7 @@ from fleet_graph.goal.request_kernel import (
     business_guards,
     validate_stop_list,
 )
-from fleet_graph.graphs.kernel_coordinator import KernelCoordinator
+from fleet_graph.graphs.kernel_coordinator import KernelCoordinator, KernelEffectPorts
 
 GOAL = "wf-1"
 
@@ -2432,3 +2433,217 @@ class TestStopNotLostByConcurrentCompletion:
 
     def test_confirmed_immediate_stop_is_not_lost_by_concurrent_completion(self) -> None:
         self._concurrent_completion_and_stop("immediate", runtime=FakeRuntime())
+
+
+# --- ACK-before-enqueue window (final review finding; behaviors 1/7) ---------
+
+
+class TestEnqueueDurabilityBeforeAck:
+    """The persist callback in ``goal_line.coordinator_turn`` must durably
+    enqueue a round's requests into the kernel journal *before* the inbox ack,
+    so a crash between ack and the coordinator turn cannot lose an accepted
+    message. ``KernelCoordinator.enqueue_requests`` is that pre-ack entry point;
+    ``turn`` re-derives the same stable identities and the request dedup reuses
+    the persisted records (finding: ACK-after loss window)."""
+
+    def _coordinator(self, home: Any) -> KernelCoordinator:
+        kernel = GoalRequestKernel(journal=Journal(home=home))
+        kernel.activate_version(GOAL, "v1")
+        return KernelCoordinator(
+            kernel=kernel,
+            goal_call=None,
+            folder_id=GOAL,
+            thread_id=f"{GOAL}:g1",
+            launch_id="launch-test",
+        )
+
+    def test_enqueue_persists_requests_before_any_ack(self, tmp_path) -> None:
+        home = tmp_path / "journal"
+        coordinator = self._coordinator(home)
+        coord_input = {
+            "folder_id": GOAL,
+            "inbox_messages": [
+                {"message_id": "m-A", "from_agent_id": "line-a", "body": "msg A"},
+                {"message_id": "m-B", "from_agent_id": "line-b", "body": "msg B"},
+            ],
+        }
+        coordinator.enqueue_requests(1, coord_input)
+
+        # A crash lands right after this (no turn was run): a rebuilt product
+        # must see both messages from the durable journal alone.
+        rebuilt = GoalRequestKernel(journal=Journal(home=home))
+        requests = [
+            r
+            for r in rebuilt.list_events(GOAL)["events"]
+            if r["record"] == RECORD_REQUEST and r.get("kind") == KIND_MESSAGE
+        ]
+        assert [r["request_id"] for r in requests] == [
+            f"line:{GOAL}:message:m-A",
+            f"line:{GOAL}:message:m-B",
+        ]
+
+    def test_turn_reuses_the_pre_ack_records_instead_of_duplicating(self, tmp_path) -> None:
+        home = tmp_path / "journal"
+        coordinator = self._coordinator(home)
+        coord_input = {
+            "folder_id": GOAL,
+            "inbox_messages": [
+                {"message_id": "m-A", "from_agent_id": "line-a", "body": "msg A"},
+            ],
+        }
+        coordinator.enqueue_requests(1, coord_input)
+        # The later turn (after ack) re-derives the same identity and must not
+        # append a second request record for the same message.
+        coordinator.turn(1, dict(coord_input))
+
+        rebuilt = GoalRequestKernel(journal=Journal(home=home))
+        requests = [
+            r
+            for r in rebuilt.list_events(GOAL)["events"]
+            if r["record"] == RECORD_REQUEST and r.get("kind") == KIND_MESSAGE
+        ]
+        assert len(requests) == 1
+
+
+# --- effect-port downstream preservation (final review finding; behavior 6) --
+
+
+class _FakeDdSubgraph:
+    """A fake dd subgraph port returning a full projection + admit record."""
+
+    def __init__(self, development_id: str = "d-1") -> None:
+        self.development_id = development_id
+        self.invokes: list[dict[str, Any]] = []
+
+    def invoke(self, payload: dict[str, Any], *, config: Any = None) -> dict[str, Any]:
+        self.invokes.append(payload)
+        return {
+            "line_folder": payload.get("line_folder"),
+            "intent": payload.get("intent"),
+            "record": {
+                "development_id": self.development_id,
+                "repo_path": "repo-a",
+                "dispatched_by": GOAL,
+                "already_admitted": False,
+                "launch": {"unit": f"dd-{self.development_id}", "mode": "start"},
+            },
+            "dd_result": {
+                "development_id": self.development_id,
+                "state": "in_flight",
+                "terminal": "",
+                "terminal_reason": "",
+                "output_commit": "deadbeef",
+                "stage": "implement",
+                "generation": 3,
+            },
+        }
+
+
+class _FakeGateNode:
+    """A fake gate node returning a full consumption receipt."""
+
+    def __init__(self, development_id: str = "d-1") -> None:
+        self.development_id = development_id
+        self.consumed: list[dict[str, Any]] = []
+
+    def consume(self, action: dict[str, Any], *, folder_id: str, round_no: int) -> dict[str, Any]:
+        self.consumed.append(action)
+        return {
+            "kind": str(action.get("kind") or ""),
+            "idempotency_key": str(action.get("idempotency_key") or ""),
+            "status": "consumed",
+            "reason": "",
+            "detail": "gate release consumed: verdict APPROVE by wf-1 sealed",
+            "development_id": self.development_id,
+            "decision": "APPROVE",
+            "decided_by": str(folder_id),
+            "decided_by_source": "graph-gate-node",
+            "decision_file": ".dev-dispatch/gate/decision-g3.json",
+            "decision_message_id": "msg-gate-1",
+            "post_release_state": "running",
+            "launches": {"unit": f"dd-{self.development_id}", "mode": "resume", "generation": 3},
+            "evidence": [{"id": "e1", "passed": True, "detail": "ok"}],
+        }
+
+
+class TestEffectPortsPreserveDownstream:
+    """The real ``KernelEffectPorts`` adapter must preserve the downstream dd
+    projection/admission facts and the gate release receipt on the delivery, so
+    the kernel's raw result record (and rebuilt pagination) retains them rather
+    than collapsing to a status/detail string (finding; behavior 6)."""
+
+    def _run_dispatch_and_approve(self, home: Any, effects: KernelEffectPorts) -> None:
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=effects)
+        kernel.activate_version(GOAL, "v1")
+        run_one(
+            kernel,
+            make_request("A"),
+            {
+                "actions": [
+                    dispatch_action("k1"),
+                    {
+                        "kind": ACTION_APPROVE,
+                        "idempotency_key": "k2",
+                        "payload": {
+                            "development_id": "d-1",
+                            "verdict": "APPROVE",
+                            "goal_version": "v1",
+                        },
+                    },
+                ]
+            },
+        )
+
+    def test_dispatch_and_gate_results_retain_downstream_facts(self, tmp_path) -> None:
+        home = tmp_path / "journal"
+        effects = KernelEffectPorts(folder_id=GOAL, dd=_FakeDdSubgraph(), gate=_FakeGateNode())
+        self._run_dispatch_and_approve(home, effects)
+
+        kernel = GoalRequestKernel(journal=Journal(home=home))
+        dispatched = [
+            e
+            for e in kernel.list_events(GOAL)["events"]
+            if e["record"] == RECORD_ACTION_RESULT and e.get("kind") == ACTION_DISPATCH
+        ]
+        assert len(dispatched) == 1
+        assert dispatched[0]["development_id"] == "d-1"
+        assert dispatched[0]["state"] == "in_flight"
+        assert dispatched[0]["stage"] == "implement"
+        assert dispatched[0]["generation"] == 3
+        assert dispatched[0]["output_commit"] == "deadbeef"
+        assert dispatched[0]["admission"]["launch"]["mode"] == "start"
+
+        approved = [
+            e
+            for e in kernel.list_events(GOAL)["events"]
+            if e["record"] == RECORD_ACTION_RESULT and e.get("kind") == ACTION_APPROVE
+        ]
+        assert len(approved) == 1
+        assert approved[0]["decision"] == "APPROVE"
+        assert approved[0]["decided_by"] == GOAL
+        assert approved[0]["decision_file"] == ".dev-dispatch/gate/decision-g3.json"
+        assert approved[0]["decision_message_id"] == "msg-gate-1"
+        assert approved[0]["post_release_state"] == "running"
+        assert approved[0]["launches"]["mode"] == "resume"
+        assert approved[0]["evidence"] == [{"id": "e1", "passed": True, "detail": "ok"}]
+
+    def test_rebuilt_pagination_retains_downstream_facts(self, tmp_path) -> None:
+        home = tmp_path / "journal"
+        effects = KernelEffectPorts(folder_id=GOAL, dd=_FakeDdSubgraph(), gate=_FakeGateNode())
+        self._run_dispatch_and_approve(home, effects)
+
+        rebuilt = GoalRequestKernel(journal=Journal(home=home))
+        events = rebuilt.list_events(GOAL)["events"]
+        dispatched = [
+            e
+            for e in events
+            if e["record"] == RECORD_ACTION_RESULT and e.get("kind") == ACTION_DISPATCH
+        ]
+        assert dispatched and dispatched[0]["output_commit"] == "deadbeef"
+        assert dispatched[0]["admission"]["already_admitted"] is False
+        approved = [
+            e
+            for e in events
+            if e["record"] == RECORD_ACTION_RESULT and e.get("kind") == ACTION_APPROVE
+        ]
+        assert approved and approved[0]["decision_file"] == ".dev-dispatch/gate/decision-g3.json"

@@ -325,6 +325,81 @@ class TestKernelDurability:
         assert any(r["record"] == "call" for r in parsed)
 
 
+class CrashAfterAckInbox:
+    """A fake inbox that hands the drained messages to ``persist`` (which now
+    durably enqueues them into the kernel journal *before* the ack), records the
+    ack, then simulates a kill *after* the ack and *before* the coordinator turn
+    reaches the kernel's submit path."""
+
+    def __init__(self, messages: list[dict[str, Any]]) -> None:
+        self.messages = list(messages)
+        self.acked = 0
+        self.persisted: list[list[dict[str, Any]]] = []
+
+    def drain_then_ack(self, persist: Any) -> tuple[list[Any], list[str]]:
+        persist(self.messages)
+        self.persisted.append(list(self.messages))
+        self.acked = len(self.messages)
+        raise Boom("killed after ack, before the coordinator turn")
+
+
+class TestAckToTurnWindow:
+    """final review finding: an acked message cannot be lost to a crash between
+    the inbox ack and the coordinator turn's kernel submit."""
+
+    def test_acked_message_survives_rebuild_when_the_turn_was_crashed(
+        self, tmp_path: Path
+    ) -> None:
+        import json
+
+        from fleet_graph.goal.request_kernel import GoalRequestKernel, Journal
+        from fleet_graph.graphs.kernel_coordinator import KernelCoordinator
+
+        folder_id = "wf-ack"
+        home = tmp_path / "run" / "goal-kernel"
+
+        kernel = GoalRequestKernel(journal=Journal(home=home))
+        kernel.activate_version(folder_id, "v1")
+        coordinator = KernelCoordinator(
+            kernel=kernel,
+            goal_call=None,
+            folder_id=folder_id,
+            thread_id=f"{folder_id}:g1",
+            launch_id="launch-test",
+        )
+        inbox = CrashAfterAckInbox(
+            [{"message_id": "m-A", "from_agent_id": "line-a", "body": "msg A"}]
+        )
+        deps = LineDeps(
+            coordinator=coordinator,
+            worker=RecordingWorker(),
+            inbox=inbox,
+            artifacts=RecordingArtifacts(),
+            guards=LineGuards(bounds=LineBounds(max_rounds=50)),
+            folder_id=folder_id,
+        )
+        graph = build_goal_line_graph(deps)
+
+        with pytest.raises(Boom):
+            graph.compile().invoke({"round_no": 1})
+
+        # The ack happened (the message was surfaced once) but the coordinator
+        # turn never ran: the rebuilt kernel must still see the message, because
+        # the persist callback durably enqueued it before the ack.
+        assert inbox.acked == 1
+        journal = home / f"goal-{folder_id}.jsonl"
+        assert journal.exists()
+        records = [
+            json.loads(line)
+            for line in journal.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        requests = [
+            r for r in records if r.get("record") == "request" and r.get("kind") == "message"
+        ]
+        assert [r["request_id"] for r in requests] == [f"line:{folder_id}:message:m-A"]
+
+
 class TestBumpedGenerationGivesAFreshThread:
     """R0a-2, across both layers: a blocked line's thread is spent (relaunching
     it no-op finalises, pinned above), so the scheduler's accounted-terminal
