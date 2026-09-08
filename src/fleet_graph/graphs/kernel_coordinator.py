@@ -234,6 +234,17 @@ class KernelCoordinator:
     # -- the serial Goal call -------------------------------------------------
 
     def _run_call(self, call: dict[str, Any]) -> dict[str, Any]:
+        if call.get("resume"):
+            # A call interrupted after its validated Stop List was durable is
+            # resumed, not re-answered: re-invoking Goal could return a
+            # different list and duplicate a confirmed effect or drop an
+            # outstanding one (finding 1). Execute the persisted list's
+            # outstanding items through reconciliation instead.
+            result = self.kernel.finish_goal_call(
+                self.folder_id, call["call_id"], call.get("stop_list") or {}
+            )
+            return _to_verdict(result)
+
         record = call.get("request") if isinstance(call.get("request"), dict) else {}
         request = Request(
             request_id=str(record.get("request_id") or call.get("request_id") or ""),
@@ -291,6 +302,15 @@ def _parked_verdict(kernel: GoalRequestKernel, goal: str) -> dict[str, Any]:
 
 def _to_verdict(result: dict[str, Any]) -> dict[str, Any]:
     """Map a ``finish_goal_call`` result back to the graph's verdict surface."""
+    if result.get("suspended"):
+        # An immediate stop suspended the in-flight result's unstarted effects:
+        # the line parks until resume, never completing on a half-drained list.
+        return {
+            "verdict": "blocked",
+            "waiting_on": "external",
+            "reason": "goal stopped; in-flight result suspended until resume",
+        }
+
     intent = result.get("intent")
     results = result.get("results") or []
     receipts = result.get("receipts") or []

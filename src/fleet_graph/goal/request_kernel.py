@@ -64,6 +64,7 @@ precisely instead of pretending (the Goal ReAct port reports
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -120,6 +121,7 @@ RECORD_ACTION = "action"
 RECORD_ACTION_RESULT = "action_result"
 RECORD_CONTROL = "control"
 RECORD_VERSION = "version"
+RECORD_STOP_LIST = "stop_list"
 RECORDS = (
     RECORD_REQUEST,
     RECORD_CALL,
@@ -128,6 +130,7 @@ RECORDS = (
     RECORD_ACTION_RESULT,
     RECORD_CONTROL,
     RECORD_VERSION,
+    RECORD_STOP_LIST,
 )
 
 #: Action delivery statuses.
@@ -370,7 +373,18 @@ class Journal:
         clean = "".join(
             json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in lines
         )
-        path.write_text(clean, encoding="utf-8")
+        # Crash-safe repair (finding 3 / behavior 7 / P6): never truncate the
+        # acknowledged prefix in place. Write the retained records to a scratch
+        # file in the same directory, flush it, then atomically rename over the
+        # original. A crash at any point before the rename leaves the original
+        # journal intact (the valid prefix plus its trailing fragment), so the
+        # next load re-runs the same repair instead of reading a torn file.
+        tmp = path.with_suffix(path.suffix + ".repair")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(clean)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
         corrupt_path = path.with_suffix(path.suffix + ".corrupt")
         with corrupt_path.open("a", encoding="utf-8") as fh:
             fh.write(fragment + "\n")
@@ -569,10 +583,19 @@ class GoalRequestKernel:
         queue and the ownership fence from the journal lines alone, so a rebuilt
         product does not lose accepted requests, forget a stop, or re-run an
         already-confirmed effect (behaviors 1/4/7, P6). A call whose result was
-        never written is an interruption: its request is re-queued and the fence
-        dropped so the rebuilt product serves the goal again rather than leaving
-        it fenced forever (behavior 7). Called automatically at construction;
-        safe to re-run.
+        never written is an interruption (behavior 7). How it is recovered
+        depends on what was already durable:
+
+        - A call with a persisted Stop List (validated *before* effects, per
+          finding 1) is *resumed*, not re-answered: the fence is re-acquired
+          with the original call id and the outstanding items are reconciled
+          against their original action identities -- never re-invoking Goal,
+          which could answer with a different list and duplicate a confirmed
+          effect or drop a not-yet-run one.
+        - A call with no persisted Stop List ran no effect yet, so its request
+          is re-queued and the fence dropped, and a fresh Goal call is safe.
+
+        Called automatically at construction; safe to re-run.
         """
         self.journal.load()
         self._versions = {}
@@ -602,12 +625,16 @@ class GoalRequestKernel:
                 ):
                     current_call = None
                     current_call_request = None
-            # A call whose result was never written was interrupted. Re-queue
-            # its request and release the fence (no live call survives a
-            # rebuild); already-confirmed effects reconcile on replay.
+            resume_call: str | None = None
             if current_call is not None and current_call_request:
-                called.discard(current_call_request)
-                current_call = None
+                if self._stop_list_line(goal, current_call) is not None:
+                    # Interrupted *after* the validated list was durable: resume
+                    # its original identities/outstanding items, keep the fence.
+                    resume_call = current_call
+                else:
+                    # Interrupted before any effect: re-queue and re-answer.
+                    called.discard(current_call_request)
+                    current_call = None
             queue = [
                 line
                 for line in lines
@@ -621,6 +648,7 @@ class GoalRequestKernel:
                 "delivered": [],
                 "mode": mode,
                 "stopping_drain": None,
+                "resume": resume_call,
             }
             inflight[goal] = current_call
         self.journal._inflight = inflight
@@ -689,20 +717,25 @@ class GoalRequestKernel:
 
     # -- per-goal state ----------------------------------------------------
 
+    @staticmethod
+    def _default_state() -> dict[str, Any]:
+        return {
+            "queue": [],
+            "delivered": [],
+            "mode": MODE_RUNNING,
+            "stopping_drain": None,
+            "resume": None,
+        }
+
     def _queue(self, goal: str, record: dict[str, Any]) -> None:
-        st = self._state.setdefault(
-            goal,
-            {"queue": [], "delivered": [], "mode": MODE_RUNNING, "stopping_drain": None},
-        )
+        st = self._state.setdefault(goal, self._default_state())
         st["queue"].append(record)
 
     def _mode_of(self, goal: str) -> str:
         return self._state.get(goal, {}).get("mode", MODE_RUNNING)
 
     def _set_mode(self, goal: str, mode: str, *, record: bool = True) -> None:
-        st = self._state.setdefault(
-            goal, {"queue": [], "delivered": [], "mode": MODE_RUNNING, "stopping_drain": None}
-        )
+        st = self._state.setdefault(goal, self._default_state())
         st["mode"] = mode
         if record:
             self.journal.append(
@@ -724,12 +757,37 @@ class GoalRequestKernel:
         Returns ``None`` when a call is already in flight (the fence), when the
         goal is ``stopped`` (a stop must be lifted by resume before any new call
         or effect), or when the queue is empty. Otherwise it pops the oldest
-        queued request, claims the fence, and returns a call envelope."""
+        queued request, claims the fence, and returns a call envelope.
+
+        A call that was interrupted *after* its validated Stop List was durable
+        (finding 1) is returned as a ``resume`` envelope: its original action
+        identities and outstanding items are resumed through reconciliation and
+        the Goal is *not* re-invoked. A stopped goal suspends that resume until
+        ``resume()`` lifts the stop (finding 2).
+        """
+        st = self._state.setdefault(goal, self._default_state())
+        resume_id = st.get("resume")
+        if resume_id:
+            if self._mode_of(goal) == MODE_STOPPED:
+                return None  # suspended unstarted effects; wait for resume()
+            persisted = self._stop_list_line(goal, resume_id)
+            if persisted is None:
+                st["resume"] = None
+            else:
+                call_line = self._call_line(goal, resume_id) or {}
+                return {
+                    "call_id": resume_id,
+                    "goal": goal,
+                    "request_id": call_line.get("request_id"),
+                    "run_id": call_line.get("run_id"),
+                    "request": call_line,
+                    "resume": True,
+                    "stop_list": persisted,
+                }
         if self.journal.inflight(goal):
             return None
         if self._mode_of(goal) in (MODE_STOPPING, MODE_STOPPED, MODE_BLOCKED):
             return None
-        st = self._state.get(goal, {"queue": [], "delivered": [], "mode": MODE_RUNNING})
         if not st["queue"]:
             return None
         request = st["queue"].pop(0)
@@ -757,6 +815,58 @@ class GoalRequestKernel:
             "request": request,
         }
 
+    def _call_line(self, goal: str, call_id: str) -> dict[str, Any] | None:
+        for line in self.journal.scan(goal):
+            if line.get("record") == RECORD_CALL and line.get("call_id") == call_id:
+                return line
+        return None
+
+    def _stop_list_line(self, goal: str, call_id: str) -> dict[str, Any] | None:
+        for line in self.journal.scan(goal):
+            if line.get("record") == RECORD_STOP_LIST and line.get("call_id") == call_id:
+                return line
+        return None
+
+    def _persist_stop_list(
+        self,
+        goal: str,
+        call_id: str,
+        request_id: str,
+        run_id: str,
+        consumable: list[dict[str, Any]],
+        receipts: list[dict[str, Any]],
+        intent: str | None,
+    ) -> dict[str, Any]:
+        """Durably record the *validated* Stop List before any effect runs.
+
+        This is the fork point for resume (finding 1): once this record is on
+        disk, an interruption no longer needs a fresh Goal answer -- the
+        original action identities (kind/idempotency_key/list_index) are
+        recoverable and only outstanding items are executed on resume.
+        """
+        return self.journal.append(
+            goal,
+            {
+                "record": RECORD_STOP_LIST,
+                "goal": goal,
+                "call_id": call_id,
+                "request_id": request_id,
+                "run_id": run_id,
+                "intent": intent,
+                "actions": [
+                    {
+                        "kind": a["kind"],
+                        "payload": a["payload"],
+                        "idempotency_key": a["idempotency_key"],
+                        "list_index": i,
+                    }
+                    for i, a in enumerate(consumable, start=1)
+                ],
+                "malformed": [dict(r) for r in receipts],
+                "at": _iso(self.clock),
+            },
+        )
+
     def finish_goal_call(
         self, goal: str, call_id: str, stop_list: dict[str, Any]
     ) -> dict[str, Any]:
@@ -764,12 +874,34 @@ class GoalRequestKernel:
 
         Execution is the only place effects run. It is ordered, per-item: a
         failed item does not erase earlier successes, and an already-confirmed
-        item is observed -- never blindly re-run (spec behavior 4)."""
+        item is observed -- never blindly re-run (spec behavior 4).
+
+        The *validated* Stop List is persisted to the journal before the first
+        effect runs (finding 1). A subsequent interruption is then resumed from
+        that durable list -- the same ``call_id``, action identities and
+        idempotency keys -- rather than by re-invoking Goal, so a differing
+        second answer can neither duplicate a confirmed effect nor drop a
+        not-yet-run one.
+
+        A goal that is ``stopped`` (an immediate stop the runtime confirmed)
+        *suspends* unstarted effects: the in-flight result is preserved, the
+        fence stays held, and nothing runs until ``resume()`` (finding 2)."""
         call = next((r for r in self.journal.scan(goal) if r.get("call_id") == call_id), None)
         request_id = str(call.get("request_id") or "") if call else ""
         run_id = str(call.get("run_id") or "") if call else ""
         caller = str(call.get("caller") or "") if call else ""
-        consumable, receipts, intent = validate_stop_list(stop_list)
+
+        persisted = self._stop_list_line(goal, call_id)
+        if persisted is not None:
+            # Resuming an interrupted call: reconstruct the original validated
+            # identities, never revalidate a possibly-different re-answer.
+            consumable = [dict(a) for a in persisted.get("actions") or []]
+            receipts = [dict(r) for r in (persisted.get("malformed") or [])]
+            intent = persisted.get("intent")
+        else:
+            consumable, receipts, intent = validate_stop_list(stop_list)
+            self._persist_stop_list(goal, call_id, request_id, run_id, consumable, receipts, intent)
+
         active_version = self._versions.get(goal, "")
 
         results: list[dict[str, Any]] = []
@@ -778,7 +910,24 @@ class GoalRequestKernel:
         # lost admission blocks the dependent dispatch without erasing the
         # independent results already delivered in this list.
         repo_admission: dict[str, str] = {}
-        for index, action in enumerate(consumable, start=1):
+        for position, action in enumerate(consumable, start=1):
+            if self._mode_of(goal) == MODE_STOPPED:
+                # Finding 2: a confirmed stop suspends unstarted effects. The
+                # already-persisted list (and any earlier results) survive; the
+                # fence is held and resume() re-runs these items through
+                # reconciliation -- never by re-invoking Goal.
+                st = self._state.setdefault(goal, self._default_state())
+                st["resume"] = call_id
+                return {
+                    "call_id": call_id,
+                    "goal": goal,
+                    "request_id": request_id,
+                    "intent": intent,
+                    "receipts": [*receipts],
+                    "results": results,
+                    "suspended": True,
+                }
+            index = int(action.get("list_index", position))
             refusal = business_guards(action, active_version=active_version)
             if refusal:
                 results.append(
@@ -842,6 +991,11 @@ class GoalRequestKernel:
         )
 
         self.journal.release_call(goal, call_id)
+
+        # A call was fully drained (fresh or resumed): clear any resume marker.
+        st = self._state.get(goal)
+        if st and st.get("resume") == call_id:
+            st["resume"] = None
 
         # A stop that landed while this call was in flight is authoritative:
         # graceful stop drains this result then rests ``stopped``; an immediate
@@ -913,18 +1067,18 @@ class GoalRequestKernel:
     ) -> dict[str, Any]:
         """Deliver one effect, or reconcile it against a prior attempt.
 
-        The durable prior-attempt memory is the journal: a dispatch/reply whose
+        The durable prior-attempt memory is the journal: an action whose
         ``(kind, idempotency_key)`` already has an action-intent record is a
-        *replay*, not a fresh send. A replay that already has a result is
-        answered from that stored status and never re-run; a replay whose result
-        was lost (a crash after the effect receipt, before the result write) is
-        arbitrated by the external-effect port's ``observe`` -- ``confirmed``
-        skips, ``absent`` re-sends, ``unknown`` stays recoverable and requires
-        Goal judgement. This is exactly-once-with-truth, never exactly-once-as-
-        theatre (spec behavior 4)."""
+        *replay* (of every kind, so a resumed interrupted call reconciles
+        approve/reject/add_repo exactly like dispatch/reply), not a fresh send.
+        A replay that already has a result is answered from that stored status
+        and never re-run; a replay whose result was lost (a crash after the
+        effect receipt, before the result write) is arbitrated by the
+        external-effect port's ``observe`` -- ``confirmed`` skips, ``absent``
+        re-sends, ``unknown`` stays recoverable and requires Goal judgement.
+        This is exactly-once-with-truth, never exactly-once-as-theatre (spec
+        behavior 4)."""
         kind = action["kind"]
-        if kind not in (ACTION_DISPATCH, ACTION_REPLY):
-            return self._deliver(goal, action, call_id, request_id, run_id, index, caller=caller)
         key = action["idempotency_key"]
         prior = self._prior_intent(goal, kind, key)
         if prior is None:
@@ -1137,6 +1291,13 @@ class GoalRequestKernel:
         reason: str,
     ) -> dict[str, Any]:
         action_id = self._action_id(call_id, index, action)
+        existing = self._prior_result(goal, action_id)
+        if existing is not None and existing.get("final"):
+            # A resumed call must not re-refuse an already-recorded refusal
+            # (at most one terminal intent, P1).
+            return self._result(
+                action, action_id, existing["status"], existing.get("detail", ""), reconciled=True
+            )
         self.journal.append(
             goal,
             {
@@ -1306,6 +1467,7 @@ __all__ = [
     "RECORD_CALL_RESULT",
     "RECORD_CONTROL",
     "RECORD_REQUEST",
+    "RECORD_STOP_LIST",
     "RECORD_VERSION",
     "REQUEST_KINDS",
     "STOP_GRACEFUL",

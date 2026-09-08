@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from fleet_graph.goal.request_kernel import (
     ACTION_DISPATCH,
     ACTION_REPLY,
@@ -31,6 +33,7 @@ from fleet_graph.goal.request_kernel import (
     RECORD_ACTION_RESULT,
     RECORD_CALL_RESULT,
     RECORD_REQUEST,
+    RECORD_STOP_LIST,
     UNKNOWN,
     GoalRequestKernel,
     Journal,
@@ -39,6 +42,7 @@ from fleet_graph.goal.request_kernel import (
     business_guards,
     validate_stop_list,
 )
+from fleet_graph.graphs.kernel_coordinator import KernelCoordinator
 
 GOAL = "wf-1"
 
@@ -97,6 +101,24 @@ class RaisingEffects(FakeEffects):
     def dispatch(self, payload: dict[str, Any], *, ctx: dict[str, Any]) -> dict[str, Any]:
         self.dispatches.append({"payload": payload, "ctx": dict(ctx)})
         raise RuntimeError("boom")
+
+
+class CrashEffects(FakeEffects):
+    """An effect port that *dies* mid-dispatch on chosen keys: it writes its
+    intent first (via the kernel's intent-before-effect ordering), then raises a
+    ``KeyboardInterrupt`` that ``_deliver`` does not catch -- simulating a real
+    process crash after the action intent but before its result receipt."""
+
+    def __init__(self, crash_on: set[str] | None = None) -> None:
+        super().__init__()
+        self.crash_on = crash_on or set()
+
+    def dispatch(self, payload: dict[str, Any], *, ctx: dict[str, Any]) -> dict[str, Any]:
+        key = str(ctx.get("idempotency_key") or "")
+        self.dispatches.append({"payload": payload, "ctx": dict(ctx)})
+        if key in self.crash_on:
+            raise KeyboardInterrupt
+        return self._lookup(ACTION_DISPATCH, key, {"ok": True})
 
 
 class FakeRuntime:
@@ -906,3 +928,180 @@ class TestUncertainReconciliation:
         replay = run_one(kernel, make_request("B"), {"actions": [dispatch_action("K")]})
         assert replay["results"][0]["status"] == DELIVERED
         assert replay["results"][0]["reconciled"] is True
+
+
+# --- finding 1: interrupted call resumes its persisted list, never re-Goal -----
+
+
+class TestResumePersistedStopList:
+    def _crash_mid_list(self, tmp_path, *, crash_on: set[str]) -> tuple[str, list[dict[str, Any]]]:
+        home = tmp_path / "journal"
+        effects = CrashEffects(crash_on=crash_on)
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=effects)
+        kernel.activate_version(GOAL, "v1")
+        kernel.submit(GOAL, make_request("A"))
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None and call["request_id"] == "A"
+        with pytest.raises(KeyboardInterrupt):
+            kernel.finish_goal_call(
+                GOAL, call["call_id"], {"actions": [dispatch_action("k1"), dispatch_action("k2")]}
+            )
+        return call["call_id"], list(effects.dispatches)
+
+    def test_validated_stop_list_is_durable_before_effects(self, tmp_path) -> None:
+        call_id, _ = self._crash_mid_list(tmp_path, crash_on={"k2"})
+        durable = Journal(home=tmp_path / "journal")
+        stop_lists = [
+            line
+            for line in durable.scan(GOAL)
+            if line.get("record") == RECORD_STOP_LIST and line.get("call_id") == call_id
+        ]
+        assert len(stop_lists) == 1
+        assert [a["idempotency_key"] for a in stop_lists[0]["actions"]] == ["k1", "k2"]
+        assert [a["list_index"] for a in stop_lists[0]["actions"]] == [1, 2]
+
+    def test_interrupted_call_resumes_outstanding_items_without_replay_of_source_list(
+        self, tmp_path
+    ) -> None:
+        call_id, crashed = self._crash_mid_list(tmp_path, crash_on={"k2"})
+        # k1 delivered + confirmed before the crash; k2 intent written, no result.
+        assert [d["ctx"]["idempotency_key"] for d in crashed] == ["k1", "k2"]
+
+        effects2 = FakeEffects()
+        rebuilt = GoalRequestKernel(journal=Journal(home=tmp_path / "journal"), effects=effects2)
+        nxt = rebuilt.next_goal_call(GOAL)
+        # The interrupted call resumes under its original identities, not a
+        # fresh Goal answer: same call/request, no re-supplied list.
+        assert nxt is not None and nxt["resume"] is True
+        assert nxt["call_id"] == call_id
+        assert nxt["request_id"] == "A"
+        outcome = rebuilt.finish_goal_call(GOAL, nxt["call_id"], nxt["stop_list"])
+        statuses = {r["idempotency_key"]: r for r in outcome["results"]}
+        assert statuses["k1"]["status"] == DELIVERED
+        assert statuses["k1"]["reconciled"] is True  # confirmed effect not re-run
+        assert statuses["k2"]["status"] == DELIVERED
+        # only the not-yet-confirmed k2 was re-delivered; k1 was reconciled.
+        assert [d["ctx"]["idempotency_key"] for d in effects2.dispatches] == ["k2"]
+
+    def test_coordinator_does_not_reinvoke_goal_for_a_resumed_call(self, tmp_path) -> None:
+        self._crash_mid_list(tmp_path, crash_on={"k2"})
+
+        class RecordingGoalPort:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def call(self, goal: str, prompt: dict[str, Any]) -> dict[str, Any]:
+                self.calls.append(str(prompt.get("request_id") or ""))
+                return {"actions": [], "intent": "done"}
+
+        port = RecordingGoalPort()
+        effects2 = FakeEffects()
+        rebuilt = GoalRequestKernel(journal=Journal(home=tmp_path / "journal"), effects=effects2)
+        coord = KernelCoordinator(kernel=rebuilt, goal_call=port, folder_id=GOAL)
+        coord.turn(1, {})
+
+        # The interrupted request "A" was resumed from its persisted list and the
+        # Goal was never re-invoked for it; only the round-1 enroll fallback
+        # reached the Goal port.
+        assert "A" not in port.calls
+        assert port.calls == [f"line:{GOAL}:enroll"]
+        assert [d["ctx"]["idempotency_key"] for d in effects2.dispatches] == ["k2"]
+
+
+# --- finding 2: confirmed immediate stop suspends unstarted effects -------------
+
+
+class TestStopSuspendsEffects:
+    def test_confirmed_immediate_stop_preserves_result_and_runs_nothing(self) -> None:
+        runtime = FakeRuntime()  # stop_answer defaults to terminated=True
+        effects = FakeEffects()
+        kernel = make_kernel(effects, runtime)
+        kernel.submit(GOAL, make_request("A"))
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None
+
+        kernel.stop(GOAL, mode="immediate")  # confirmed -> MODE_STOPPED
+        result = kernel.finish_goal_call(
+            GOAL, call["call_id"], {"actions": [dispatch_action("k1"), reply_action("k2")]}
+        )
+        assert result["suspended"] is True
+        assert effects.dispatches == []  # nothing ran while stopped
+        assert effects.replies == []
+        assert kernel.next_goal_call(GOAL) is None  # fence still held / stopped
+
+        kernel.resume(GOAL)
+        nxt = kernel.next_goal_call(GOAL)
+        assert nxt is not None and nxt["resume"] is True
+        outcome = kernel.finish_goal_call(GOAL, nxt["call_id"], nxt["stop_list"])
+        assert [r["status"] for r in outcome["results"]] == [DELIVERED, DELIVERED]
+        assert len(effects.dispatches) == 1
+        assert len(effects.replies) == 1
+
+    def test_stop_during_multi_item_list_suspends_only_unstarted_items(self) -> None:
+        runtime = FakeRuntime()
+        effects = FakeEffects()
+        kernel = make_kernel(effects, runtime)
+        original_dispatch = effects.dispatch
+
+        def dispatch_that_stops(payload: dict[str, Any], *, ctx: dict[str, Any]) -> dict[str, Any]:
+            if str(ctx.get("idempotency_key") or "") == "k1":
+                kernel.stop(GOAL, mode="immediate")
+            return original_dispatch(payload, ctx=ctx)
+
+        effects.dispatch = dispatch_that_stops  # type: ignore[method-assign]
+        kernel.submit(GOAL, make_request("A"))
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None
+        result = kernel.finish_goal_call(
+            GOAL, call["call_id"], {"actions": [dispatch_action("k1"), dispatch_action("k2")]}
+        )
+        assert result["suspended"] is True
+        # k1 landed before the stop; k2 was suspended without running.
+        assert [d["ctx"]["idempotency_key"] for d in effects.dispatches] == ["k1"]
+
+        kernel.resume(GOAL)
+        nxt = kernel.next_goal_call(GOAL)
+        assert nxt is not None and nxt["resume"] is True
+        outcome = kernel.finish_goal_call(GOAL, nxt["call_id"], nxt["stop_list"])
+        statuses = {r["idempotency_key"]: r for r in outcome["results"]}
+        assert statuses["k1"]["status"] == DELIVERED
+        assert statuses["k1"]["reconciled"] is True  # not re-run on resume
+        assert statuses["k2"]["status"] == DELIVERED
+        assert [d["ctx"]["idempotency_key"] for d in effects.dispatches] == ["k1", "k2"]
+
+
+# --- finding 3: crash-safe incomplete-tail repair preserves the valid prefix -----
+
+
+class TestCrashSafeRepair:
+    def test_repair_interruption_preserves_the_acknowledged_prefix(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        home = tmp_path / "journal"
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        kernel.activate_version(GOAL, "v1")
+        kernel.submit(GOAL, make_request("A"))
+        path = home / "goal-wf-1.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write('{"record": "request", "goal": "wf-1", "requ')
+        original = path.read_text()
+
+        import fleet_graph.goal.request_kernel as rk
+
+        real_replace = rk.os.replace
+
+        def fail_replace(src: str, dst: str) -> None:
+            raise OSError("simulated crash during atomic replace")
+
+        monkeypatch.setattr(rk.os, "replace", fail_replace)
+        with pytest.raises(OSError):
+            GoalRequestKernel(journal=Journal(home=home))
+
+        # The original journal (valid prefix + fragment) was never truncated in
+        # place; a retry re-runs the same repair.
+        assert path.read_text() == original
+
+        monkeypatch.setattr(rk.os, "replace", real_replace)
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        requests = [e for e in rebuilt.list_events(GOAL)["events"] if e["record"] == RECORD_REQUEST]
+        assert [r["request_id"] for r in requests] == ["A"]
