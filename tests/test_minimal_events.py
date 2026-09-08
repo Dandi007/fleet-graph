@@ -92,6 +92,7 @@ def test_kinds_match_protocol_section_8() -> None:
                 "dd.dispatched",
                 "dd.stage.started",
                 "dd.stage.finished",
+                "dd.pr_opened",
                 "dd.acceptance",
                 "dd.review_requested",
                 "dd.approved",

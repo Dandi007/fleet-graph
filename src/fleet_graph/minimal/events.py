@@ -36,6 +36,7 @@ DD_KINDS: frozenset[str] = frozenset(
         "dd.dispatched",
         "dd.stage.started",
         "dd.stage.finished",
+        "dd.pr_opened",
         "dd.acceptance",
         "dd.review_requested",
         "dd.approved",

@@ -225,7 +225,7 @@ MCP 通过后：绑定或新建 WF，把 enroll 对象原样写进 WF 的 `goal.
 ```
 `kind` 全集（引擎每次状态变化恰好一条）：
 - goal：`goal.enrolled` `goal.turn.started` `goal.turn.finished`(payload=输出对象) `goal.done` `goal.blocked` `goal.warning` `goal.message`(MCP 送入) `goal.steered`(payload: version, diff, note) `goal.merged_to_target`(Merge Agent kind=release 成功后) `goal.dispatch_rejected`(dispatch 未过引擎 GO-36 核对被打回：字段级错误，作为下一 turn 交接内容)
-- dd：`dd.dispatched` `dd.stage.started` `dd.stage.finished` `dd.acceptance`(每条命令一条) `dd.review_requested` `dd.approved` `dd.rejected` `dd.merged` `dd.failed`
+- dd：`dd.dispatched` `dd.stage.started` `dd.stage.finished` `dd.pr_opened`(每个 repo 开 PR 一条) `dd.acceptance`(每条命令一条) `dd.review_requested` `dd.approved` `dd.rejected` `dd.merged` `dd.failed`
 - agent：`agent.spawned` `agent.exited`(exit code, usage) `agent.failed`(runtime 非零退出，含 invalid_output / timeout 等 detail) `agent.invalid_output`(引擎判无效输出：解不出 / 校验不过 / 前后置闸不过 / commit 对不上，§0.1 / §0.10)
 - engine：`engine.started` `engine.resumed`(from_seq) `engine.exiting`(reason: done | blocked | stop | crash)
 - control：`control.received`(MCP 送入的每条操作，payload=操作对象)
