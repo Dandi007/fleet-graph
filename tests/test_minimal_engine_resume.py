@@ -164,6 +164,7 @@ class Harness:
             bash_runner=object(),
             gh_runner=object(),
             timeout_s=60,
+            scribe_enabled=False,  # resume runs do not script the scribe role
         )
 
     def kinds(self) -> list[str]:

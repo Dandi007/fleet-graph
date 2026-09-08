@@ -11,6 +11,7 @@ GO-26~36 已回写进 design.md / protocol.md 正文（2026-09-08，dd-24），�
 - DD 生命周期收尾（merged → PR 已合并即收，failed → close 不合并；删 worktree、删远端 dd 分支）：`prlifecycle.py`（`open_pr` / `close_pr` / `remove_worktree` / `delete_remote_branch`）+ `ddgraph.py`（cleanup 节点）。
 - approve 后先看平台 mergeable（MERGEABLE → 引擎平台合并；CONFLICTING / UNKNOWN → Merge Agent，UNKNOWN 不当 mergeable 猜；线尾 release → 各 repo 自己 target_branch 的合并计划）：`mergegate.py`（`decide` / `platform_merge` / `verify_merge_output` / `final_merge_plan`）。
 - 支撑层：事件日志与回放 `events.py`、输入对象与 prompt 渲染 `prompts.py`、goal 版本 / steer 投射 `steer.py`。
+- 书记员（GO-21）已在生产接线里默认启用：`engine.build_deps` / `run_engine` 默认 `scribe_enabled=True` 透传进 `GoalDeps`，五个 §12 goal 级触发点全部接上（`goal.turn.finished`、`dd.merged`/`dd.failed`、`goal.done`/`goal.blocked`、turn 边界的 `goal.warning`）。
 
 ## 待用户拍板（仍待人拍，未替拍）
 1. 加 repo 走 dispatch（Goal Agent 列新 repo 带 remote+target_branch，引擎按 enroll 规则核过即加、版本+1、goal.steered 来源 goal_agent）〔推荐〕，还是只允许人经 goal_steer。
