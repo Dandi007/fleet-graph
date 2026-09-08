@@ -34,6 +34,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,6 +42,7 @@ from fleet_graph.minimal import (
     acceptance,
     agentrun,
     control,
+    ddflow,
     ddgraph,
     enroll,
     events,
@@ -534,6 +536,153 @@ def _write_exiting(log: events.EventLog, reason: str) -> None:
     log.append("engine.exiting", {"reason": reason})
 
 
+# ---------------------------------------------------------------------------
+# recovery = replay (protocol §11)
+# ---------------------------------------------------------------------------
+
+_LOST_ON_RESTART = "lost_on_restart"
+
+# protocol §11 only checks the release_head / head_commit the engine recorded on
+# these three boundaries; if none of them carries a sha there is nothing to
+# verify and the state-mismatch gate is skipped.
+_GIT_STATE_KINDS: tuple[str, ...] = ("dd.pr_opened", "dd.merged", "goal.merged_to_target")
+
+
+def _full_sha(value: Any) -> str | None:
+    """The 40-hex sha ``value`` is, or None when it is not (never guess)."""
+    if not isinstance(value, str) or len(value) != 40:
+        return None
+    return value if all(ch in "0123456789abcdef" for ch in value) else None
+
+
+def _control_cursor(events_list: list[events.Event]) -> int:
+    """The control.jsonl cursor: the largest ``seq`` of any ``control.received`` event.
+
+    This is the control-log seq space (each control.jsonl line carries its own
+    ``seq``), NOT the event seq space; ``goalgraph``'s ``read_control`` re-drains
+    only control lines whose seq is greater than this value, so a resume never
+    re-plays — and never re-records ``control.received`` for — lines already
+    consumed before the crash.
+    """
+    cursor = 0
+    for ev in events_list:
+        if ev.kind != "control.received":
+            continue
+        seq = (ev.payload or {}).get("seq")
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            cursor = max(cursor, seq)
+    return cursor
+
+
+def _dd_summary_line(history: list[events.DDSummary]) -> str:
+    """GO-17's one-line ``dd_summary`` from a folded ``dd_history`` (never a table).
+
+    Shaped identically to ``goalgraph._one_line_dd_summary``; a folded history
+    carries no impl summary / failure detail (those live in the not-yet-rebuilt
+    DD result object), so the last DD's blurb is its folded outcome.
+    """
+    if not history:
+        return ""
+    merged = sum(1 for item in history if item.outcome == "merged")
+    failed = sum(1 for item in history if item.outcome == "failed")
+    last = history[-1]
+    return f"{len(history)} 张 DD：{merged} merged，{failed} failed（{last.dd_id}：{last.outcome}）"
+
+
+def resume_initial_state(events_list: Iterable[events.Event]) -> dict[str, Any] | None:
+    """Fold the event log into the ``goalgraph.run_goal`` resumed-start overrides.
+
+    ``events.jsonl`` is the only source of truth (protocol §11): recovery is
+    replay, and this is the pure fold-to-initial-state step. Returns ``None``
+    when there is nothing to resume — an empty log (fresh goal) or a terminal
+    fold — so ``run_engine`` falls back to today's fresh-start / immediate-exit
+    paths.
+
+    ``turn_no`` alignment: in ``goalgraph`` the ``goal_turn`` node starts a turn
+    by injecting ``state["turn_no"] + 1`` and only the ``run_dd`` node bumps the
+    stored ``turn_no`` (``+1``) once a DD completes. ``events.fold`` counts
+    ``goal.turn.started`` events, i.e. turns *started*, which during an in-flight
+    turn is one ahead of the stored value. So:
+
+    - a lost ``goal_turn`` (``restart_step`` / stage ``goal_turn``) re-runs the
+      turn ``fold`` already counted; it must come out as ``turn_no + 1 ==
+      fold.turn_no``, hence the stored ``turn_no`` is ``fold.turn_no - 1``;
+    - otherwise the next turn is a *new* turn and must start at ``fold.turn_no +
+      1``, hence the stored ``turn_no`` stays ``fold.turn_no``.
+    """
+    evs = list(events_list)
+    if not evs:
+        return None
+    derived = events.fold(evs)
+    point = events.resume_point(evs)
+    if point.action == "exit":
+        return None
+    turn_no = derived.turn_no
+    if point.action == "restart_step" and point.stage == "goal_turn":
+        turn_no -= 1
+    return {
+        "turn_no": turn_no,
+        "goal_version": derived.goal_version,
+        "last_seq": _control_cursor(evs),
+        "dd_summary": _dd_summary_line(derived.dd_history),
+        "warnings": list(derived.warnings),
+    }
+
+
+def _recorded_head(events_list: list[events.Event]) -> str | None:
+    """The most recently recorded ``release_head``/``head_commit`` sha, or None."""
+    for ev in reversed(events_list):
+        if ev.kind not in _GIT_STATE_KINDS:
+            continue
+        payload = ev.payload or {}
+        for key in ("release_head", "head_commit"):
+            sha = _full_sha(payload.get(key))
+            if sha is not None:
+                return sha
+    return None
+
+
+def _state_mismatch(
+    events_list: list[events.Event],
+    enroll_obj: dict[str, Any],
+    git_runner: gitgate.GitRunner,
+) -> dict[str, Any] | None:
+    """The §11 git state-mismatch gate: block on rewritten state, never guess.
+
+    Code state is git's truth and is NOT replayed by recovery. Before resuming,
+    verify the most recently recorded ``release_head`` / ``head_commit`` (in
+    ``dd.pr_opened`` / ``dd.merged`` / ``goal.merged_to_target``) is still
+    reachable from the release branch's remote tip; if it is not, the branch was
+    rewritten underneath us and a ``state_mismatch`` blocked payload is returned.
+    Returns ``None`` when there is no recorded sha to verify (skip) or when the
+    recorded sha is still reachable.
+    """
+    sha = _recorded_head(events_list)
+    if sha is None:
+        return None
+    repos = enroll_obj.get("repos") or []
+    if not repos:
+        return None
+    try:
+        release = runroot.release_branch(enroll_obj)
+    except ValueError:
+        return None
+    repo = repos[0]
+    if gitgate.revision_reachable(repo["path"], repo["remote"], release, sha, runner=git_runner):
+        return None
+    detail = (
+        f"recorded release_head/head_commit {sha} is no longer reachable on "
+        f"remote {repo['remote']}/{release}; refusing to resume on rewritten "
+        "git state (protocol §11)"
+    )
+    return {
+        "kind": "state_mismatch",
+        "detail": detail,
+        "release_head": sha,
+        "release_branch": release,
+    }
+
+
 def run_engine(
     goal_id: str,
     *,
@@ -554,6 +703,21 @@ def run_engine(
     return 2. Recovery is replay (design §7.1 / GO-16): the state is folded from
     ``events.jsonl`` and a terminal fold exits immediately without re-running; otherwise
     the loop runs through ``goalgraph.run_goal`` with no checkpointer.
+
+    Non-empty, non-terminal logs resume (protocol §11): the engine writes
+    ``engine.resumed``, then dispatches on ``resume_point.action``:
+    a lost ``goal_turn`` is re-run at the same turn number; an in-flight DD is
+    closed as ``lost_on_restart`` and handed back to the Goal Agent; any other
+    boundary continues to the next turn. A state-mismatch (a recorded
+    release_head/head_commit no longer reachable on the release branch) blocks
+    with ``goal.blocked(kind=state_mismatch)`` and exit 1 — never guessed at.
+
+    Scope note (deliberate deviation, protocol §11): per-stage in-flight DD
+    resume — re-entering the ddgraph at the lost stage — is *not* implemented
+    here (it needs a ddgraph initial-state seam, tracked as a separate DD).
+    The in-flight DD therefore ends immediately as ``failed`` with
+    ``detail=lost_on_restart`` and is handed back to the Goal Agent; this is a
+    temporary convergence, not a claim that §11 is fully implemented.
     """
     try:
         run_root = runroot.goal_run_root(goal_id, engine_root=engine_root)
@@ -584,8 +748,68 @@ def run_engine(
     if terminal is not None:
         return _EXIT_CODE_BY_STATE[terminal]
 
-    deps.event_log.append("engine.started", {"pid": os.getpid()})
-    result = goalgraph.run_goal(deps, goal_id=goal_id, enroll=enroll_obj)
+    events_list = list(deps.event_log.read())
+    if not events_list:
+        # fresh goal: today's byte-for-byte behavior, no engine.resumed
+        deps.event_log.append("engine.started", {"pid": os.getpid()})
+        result = goalgraph.run_goal(deps, goal_id=goal_id, enroll=enroll_obj)
+        stop = result.get("stop") or "blocked"
+        reason = _REASON_BY_STOP.get(stop, "blocked")
+        _write_exiting(deps.event_log, reason)
+        return _EXIT_CODE_BY_STOP.get(stop, EXIT_STARTUP_ERROR)
+
+    # non-empty + non-terminal → resume (protocol §11)
+    derived = events.fold(events_list)
+    point = events.resume_point(events_list)
+    deps.event_log.append("engine.resumed", {"pid": os.getpid(), "from_seq": derived.last_seq})
+
+    mismatch = _state_mismatch(events_list, enroll_obj, deps.git_runner)
+    if mismatch is not None:
+        deps.event_log.append("goal.blocked", {"summary": mismatch["detail"], **mismatch})
+        _write_exiting(deps.event_log, "blocked")
+        return EXIT_BLOCKED
+
+    initial_state = resume_initial_state(events_list)
+
+    if point.action == "restart_step" and point.stage == "goal_turn":
+        deps.event_log.append("agent.failed", {"stage": "goal_turn", "detail": _LOST_ON_RESTART})
+        # resume_initial_state already rolled turn_no back one, so the re-run
+        # turn number equals the lost one.
+    elif derived.current_dd.dd_id is not None:
+        dd_id = derived.current_dd.dd_id
+        stage = point.stage or "impl"
+        deps.event_log.append(
+            "agent.failed", {"stage": stage, "detail": _LOST_ON_RESTART}, dd_id=dd_id
+        )
+        deps.event_log.append(
+            "dd.failed",
+            {
+                "stage": stage,
+                "detail": (
+                    "lost_on_restart: per-stage in-flight DD resume (protocol §11) "
+                    "is out of scope for this DD (needs a ddgraph initial-state "
+                    "seam, tracked separately); the DD ends here and is handed back "
+                    "to the Goal Agent"
+                ),
+            },
+            dd_id=dd_id,
+        )
+        result = ddflow.build_dd_result(list(deps.event_log.read()), dd_id)
+        assert initial_state is not None  # non-empty + non-exit => never None
+        initial_state["last_dd"] = result
+        initial_state["warnings"] = [
+            *list(initial_state.get("warnings") or []),
+            (
+                f"DD {dd_id} 在引擎恢复时于 stage {stage} 丢失（lost_on_restart），已以 "
+                "failed 收场交回你决定；逐 stage 续跑不在本 DD 范围"
+            ),
+        ]
+    # else: rerun_acceptance / next_step → straight into the next turn.
+
+    assert initial_state is not None  # non-empty + non-exit => never None
+    result = goalgraph.run_goal(
+        deps, goal_id=goal_id, enroll=enroll_obj, initial_state=initial_state
+    )
     stop = result.get("stop") or "blocked"
     reason = _REASON_BY_STOP.get(stop, "blocked")
     _write_exiting(deps.event_log, reason)
