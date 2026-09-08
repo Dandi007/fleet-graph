@@ -4,7 +4,7 @@
 
 Runner 通过公开 MCP 查询 status、完整 events、Session 与 artifact，并通过 GitHub 查询 PR。原始返回值保存在 `bundle/raw/`。适配器只能重命名字段、选择已有记录；不得补出成功状态、commit、Session、review_ref。无法观察的字段应缺失，让验收失败并报告证据缺口。公开字段不足属于可观察性缺口，不能用内部 SQLite 或私有 graph 状态补齐。
 
-`manifest.json` 由可信 harness 建立，冻结 run_id、候选三个 repo 的完整 commit、fixture、测试 repo、seed commit、goal_id、source/target。它不是候选输出。`snapshot.json` 满足 `schema.json`：每条 record 含 `values` 和 `sources`，每一个值都带 `{file,pointer}` 原始 JSON Pointer；验收器逐字段比对，禁止转换值。两份输入通过 JSON Schema 验证。
+`manifest.json` 由可信 harness 建立，冻结 run_id、候选及其依赖源码的完整 commit、fixture、测试 repo、seed commit、goal_id、source/target。它不是候选输出。`snapshot.json` 满足 `schema.json`：每条 record 含 `values` 和 `sources`，每一个值都带 `{file,pointer}` 原始 JSON Pointer；验收器逐字段比对，禁止转换值。两份输入通过 JSON Schema 验证。
 
 | 记录 | 必填 values |
 |---|---|
@@ -31,7 +31,7 @@ python tests/e2e/contract/verifier.py --bundle /artifacts/RUN --repo /workspace/
 python -m unittest discover -s tests/e2e/contract -p 'test_*.py' -v
 ```
 
-验收器需要 Python、git、jsonschema；它应运行在独立 Docker 容器，repo 与 bundle 只读挂载，无 GitHub/model 凭证、无网络，只有报告输出可写。功能代码是待测程序，不能与保存最终报告的可信 runner 共用权限。报告统一包含 status、checks、evidence、run_id、candidate commits。返回 0 仅表示所有固定检查通过；失败返回 1，不能以 Goal done 替代。
+验收器需要 Python、git、jsonschema；它应运行在独立 Docker 容器，repo 与 bundle 只读挂载，无 GitHub/model 凭证、无网络，只有报告输出可写。待测功能在 verifier 内执行，持有写入凭证的 runner 负责采集公开证据与准备 checkout。报告统一包含 status、checks、evidence、run_id、candidate commits。返回 0 仅表示所有固定检查通过；失败返回 1，不能以 Goal done 替代。
 
 单测的 `unit.synthetic` 事件和本地 Git 历史是拒绝条件测试用例，不能计入真实运行。公共 v1 只覆盖单 repo 正常交付，不宣称覆盖冲突、崩溃恢复、多 repo 或持续监督。
 

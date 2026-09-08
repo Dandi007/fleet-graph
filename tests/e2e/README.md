@@ -4,7 +4,7 @@
 
 ## 运行
 
-需要 Linux Docker Engine、Docker Compose、Python 3.11+、本地候选 Git 仓库，以及模型网关和 GitHub 凭证。所有产品运行依赖在 Docker 内安装；宿主不运行 Fleet、work-folder 或 agent-bus。
+需要 Linux Docker Engine、Docker Compose、Python 3.12+、Git CLI、本地候选 Git 仓库，以及模型网关和 GitHub 凭证。使用 `gh auth token` 获取凭证时还需要宿主 gh CLI。所有产品运行依赖在 Docker 内安装；宿主不运行 Fleet、work-folder 或 agent-bus。
 
 ```sh
 make docker-build

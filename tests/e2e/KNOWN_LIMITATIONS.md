@@ -24,6 +24,10 @@
 
 冻结 runtime 的 `max_conformance_retries` 只用于 `--role` 协议；Fleet 使用的 `--output-schema` 与 `--role` 互斥，当前路径没有模型修复重试入口。测试不注入无效配置，不把重新启动整个干净 case 称为原生 conformance retry。真实模型输出可能违反契约，因此一次成功不能证明重复运行永远成功；历史失败与最终通过均须保留。
 
+运行 `fg-bffdbdaaefbf` 进一步确认了 OpenCode 的解析语义：冻结 runtime 遇到首条 `type=text` 就立即尝试 JSON 解析并返回，不会继续检查后续 text。该轮纠正 Goal 的三条 text 长度分别为 126、70、326 字符，前两条为进度说明，第三条虽是合法 JSON，解析器仍返回空结果。Impl 也因解释与代码围栏而 exit 91，整轮失败、证据已导出且资源已清理。
+
+测试启动约束因此明确为整个 turn 只调用工具，最后且仅输出一次符合 schema 的 JSON 文本，禁止中途 assistant 进度说明。它适配冻结解析器的首条 text 协议，没有从原始输出剥离文字、修复 JSON 或改变成功判定。
+
 ## 其他未覆盖事项
 
 - native subscription 和宿主登录态复用尚未支持；首版只验证 OpenCode static gateway。
