@@ -1,11 +1,15 @@
-"""Tests for dd-25: engine recovery = replay (protocol §11).
+"""Tests for dd-25 + dd-30: engine recovery = replay (protocol §11).
 
 Everything drives ``engine.run_engine`` against a pre-seeded tmp goal root plus
-a scripted ``FakeInvoker`` / ``FakeGitRunner``, so the resume dispatch in
-``run_engine`` is asserted end-to-end without touching the real agent-run or
-git. The goal graph is the *real* one, but the DD seams are never reached in
-these cases (a scripted ``blocked`` Goal Agent terminates the loop before any
-dispatch), except where a test asserts the injected resume handoff itself.
+a scripted ``FakeInvoker`` / ``FakeGitRunner`` / ``FakeBashRunner``, so the
+resume dispatch in ``run_engine`` is asserted end-to-end without touching the
+real agent-run, git, or acceptance shell. The goal graph and the DD seams are
+the *real* wiring: the dd-30 cases re-enter an in-flight DD through the
+``run_dd`` seam (impl lost → impl re-runs; CR done / FR lost → FR continues
+with the CR conclusion; acceptance mid-round → the whole batch re-runs;
+``dd.merged`` → the folded result is handed to the next turn, no re-entry),
+while the goal-level cases (fresh start, terminal exit, lost goal turn,
+control cursor, state mismatch) never reach a DD.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from typing import Any
 import pytest
 
 from fleet_graph.minimal import events as events_mod
+from fleet_graph.minimal.acceptance import Completed
 
 try:
     from langgraph.checkpoint.memory import InMemorySaver  # noqa: F401
@@ -45,8 +50,13 @@ pytestmark = pytest.mark.skipif(
 
 GOAL_ID = "g-7f3a2c"
 RELEASE = "release/loopx-minimal"
+DD_ID = "dd-01"
+DD_BRANCH = f"dd/{GOAL_ID}/{DD_ID}"
+DD_WORKTREE = "/wt/dd-01"
 
 SHA_R = "a" * 40  # release tip
+SHA_D = "b" * 40  # dd branch tip / impl commit
+SHA_M = "d" * 40  # DD merged commit
 SHA_X = "f" * 40  # a release_head that is not on the remote
 
 ENROLL: dict[str, Any] = {
@@ -65,6 +75,18 @@ ENROLL: dict[str, Any] = {
     ],
 }
 
+DISPATCH: dict[str, Any] = {
+    "spec_text": "实现 X",
+    "repos": [
+        {
+            "path": DD_WORKTREE,
+            "remote": "origin",
+            "branch": DD_BRANCH,
+            "spec_path": "docs/specs/x.md",
+        }
+    ],
+}
+
 
 def _blocked_stop() -> dict[str, Any]:
     return {
@@ -73,6 +95,65 @@ def _blocked_stop() -> dict[str, Any]:
         "summary": "先停",
         "blocked": {"kind": "external", "detail": "upstream down"},
     }
+
+
+def _impl_committed() -> dict[str, Any]:
+    return {"schema": "impl/1", "stop": "committed", "commit": SHA_D, "summary": "done"}
+
+
+def _review(role: str, stop: str) -> dict[str, Any]:
+    return {"schema": "review/1", "role": role, "stop": stop, "summary": stop}
+
+
+def _approve() -> dict[str, Any]:
+    return {"schema": "goal.review/1", "stop": "approve", "summary": "ok"}
+
+
+def _dd_merge() -> dict[str, Any]:
+    return {"schema": "merge/1", "stop": "merged", "merged_commit": SHA_M, "summary": "合入"}
+
+
+def _dispatch_turn_prefix() -> list[tuple[str, dict[str, Any], str | None]]:
+    """The dispatching turn: enrolled → turn 1 started → turn finished (dispatch).
+
+    ``goal.turn.finished`` carries the whole Stop object — including the
+    ``dispatch`` — exactly as stagerunner writes it before the graph routes to
+    the run_dd node; the engine's §11 resume folds the dispatch back out of it.
+    """
+    return [
+        ("goal.enrolled", {"title": "t"}, None),
+        ("goal.turn.started", {"turn_no": 1}, None),
+        (
+            "goal.turn.finished",
+            {
+                "run_id": f"goal-{GOAL_ID}-turn-1",
+                "stop": "dispatch",
+                "summary": "派单",
+                "dispatch": dict(DISPATCH),
+            },
+            None,
+        ),
+    ]
+
+
+def _dd_opened() -> list[tuple[str, dict[str, Any], str]]:
+    """The DD's own opening events: dispatched → PR opened."""
+    return [
+        (
+            "dd.dispatched",
+            {"spec_text": "实现 X", "branch": DD_BRANCH, "head_commit": SHA_R},
+            DD_ID,
+        ),
+        (
+            "dd.pr_opened",
+            {"repo": DD_WORKTREE, "number": 31, "url": "https://github.com/x/y/pull/31"},
+            DD_ID,
+        ),
+    ]
+
+
+def _stage_finished(stage: str, stop: str, **extra: Any) -> tuple[str, dict[str, Any], str]:
+    return ("dd.stage.finished", {"stage": stage, "stop": stop, **extra}, DD_ID)
 
 
 class FakeInvoker:
@@ -132,6 +213,17 @@ class FakeGitRunner:
         return gitgate.CompletedResult(0, "", "")
 
 
+class FakeBashRunner:
+    """Every acceptance command exits 0; the commands are recorded."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def run(self, cmd: str, cwd: str, timeout_s: int, env: dict[str, str] | None) -> Completed:
+        self.calls.append(cmd)
+        return Completed(exit_code=0, output="ok", timed_out=False)
+
+
 class Harness:
     """One goal root, pre-seeded with events, ready for ``run_engine``."""
 
@@ -152,7 +244,9 @@ class Harness:
         self.invoker = FakeInvoker(stops)
         self.git = git if git is not None else FakeGitRunner()
         self.git.branches["/goal/repo"] = {RELEASE: SHA_R, "main": SHA_X}
+        self.git.branches[DD_WORKTREE] = {DD_BRANCH: SHA_D}
         self.git.reachable.add(SHA_R)
+        self.bash = FakeBashRunner()
         self.root = root
 
     def run(self, tmp_path: Path) -> int:
@@ -161,7 +255,7 @@ class Harness:
             engine_root=str(tmp_path),
             agent_invoker=self.invoker,
             git_runner=self.git,
-            bash_runner=object(),
+            bash_runner=self.bash,
             gh_runner=object(),
             timeout_s=60,
             scribe_enabled=False,  # resume runs do not script the scribe role
@@ -172,6 +266,13 @@ class Harness:
 
     def events_of(self, kind: str) -> list[Any]:
         return [ev for ev in self.log.read() if ev.kind == kind]
+
+    def in_schemas(self) -> list[str]:
+        """The ``*.in/1`` schema of every agent call, in order."""
+        return [
+            json.loads(call["user_prompt"].split("\n", 1)[1])["schema"]
+            for call in self.invoker.calls
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -231,12 +332,14 @@ def test_lost_goal_turn_reruns_same_turn_number(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ④ last event dd.stage.started: dd.failed(lost_on_restart) + the DD conclusion
-#    lands in the next turn's input
+# ④ last event dd.stage.started but no goal.turn.finished carries the
+#    dispatch (a log no real run produces): the DD cannot be re-entered →
+#    closed lost (dd-30's defensive fallback), the conclusion still lands in
+#    the next turn's input
 # ---------------------------------------------------------------------------
 
 
-def test_inflight_dd_ends_lost_and_feeds_last_dd(tmp_path: Path) -> None:
+def test_unfoldable_dispatch_closes_dd_as_lost_and_feeds_last_dd(tmp_path: Path) -> None:
     harness = Harness(
         tmp_path,
         seed=[
@@ -333,3 +436,198 @@ def test_engine_resumed_from_seq_equals_fold_last_seq(tmp_path: Path) -> None:
     resumed = harness.events_of("engine.resumed")
     assert len(resumed) == 1
     assert resumed[0].payload["from_seq"] == expected_last_seq
+
+
+# ---------------------------------------------------------------------------
+# ⑧ dd-30 ①: impl started then lost → agent.failed(lost_on_restart), impl
+#    re-runs at the same round, the DD is never judged failed
+# ---------------------------------------------------------------------------
+
+
+def test_lost_impl_run_restarts_and_dd_resumes(tmp_path: Path) -> None:
+    harness = Harness(
+        tmp_path,
+        seed=[
+            *_dispatch_turn_prefix(),
+            *_dd_opened(),
+            ("dd.stage.started", {"stage": "impl"}, DD_ID),
+        ],
+        stops=[
+            _impl_committed(),
+            _review("cr", "pass"),
+            _review("fr", "pass"),
+            _approve(),
+            _dd_merge(),
+            _blocked_stop(),
+        ],
+    )
+
+    assert harness.run(tmp_path) == engine.EXIT_BLOCKED
+
+    kinds = harness.kinds()
+    assert "dd.failed" not in kinds  # the in-flight DD is no longer judged failed
+    assert kinds.count("dd.dispatched") == 1  # same DD resumed, never re-dispatched
+    failed = harness.events_of("agent.failed")
+    assert [(f.payload["stage"], f.payload["detail"]) for f in failed] == [
+        ("impl", "lost_on_restart")
+    ]
+
+    assert harness.in_schemas() == [
+        "impl.in/1",  # impl re-ran
+        "review.in/1",
+        "review.in/1",
+        "goal.review.in/1",
+        "merge.in/1",
+        "goal.turn.in/1",  # then the next goal turn
+    ]
+    impl_in = harness.invoker.in_obj(0)
+    assert impl_in["round"] == 1
+    assert "dd.merged" in kinds
+
+    turn_in = harness.invoker.in_obj(5)
+    assert turn_in["turn_no"] == 2  # the DD completed → the *next* turn
+    assert turn_in["last_dd"]["dd_id"] == DD_ID
+    assert turn_in["last_dd"]["outcome"] == "merged"
+    assert "1 merged" in turn_in["dd_summary"]
+
+
+# ---------------------------------------------------------------------------
+# ⑨ dd-30 ②: CR finished, FR lost → resume at FR with the CR conclusion in
+#    the FR input; CR is not re-run
+# ---------------------------------------------------------------------------
+
+
+def test_cr_done_fr_lost_resumes_at_fr(tmp_path: Path) -> None:
+    harness = Harness(
+        tmp_path,
+        seed=[
+            *_dispatch_turn_prefix(),
+            *_dd_opened(),
+            _stage_finished("impl", "committed", commit=SHA_D, summary="done"),
+            ("dd.acceptance", {"cmd": "make base", "exit": 0, "index": 0, "total": 1}, DD_ID),
+            _stage_finished("acceptance", "pass"),
+            _stage_finished("cr", "pass", summary="cr ok", findings=[]),
+        ],
+        stops=[_review("fr", "pass"), _approve(), _dd_merge(), _blocked_stop()],
+    )
+
+    assert harness.run(tmp_path) == engine.EXIT_BLOCKED
+
+    kinds = harness.kinds()
+    assert "dd.failed" not in kinds
+    assert kinds.count("dd.dispatched") == 1
+    failed = harness.events_of("agent.failed")
+    assert [(f.payload["stage"], f.payload["detail"]) for f in failed] == [
+        ("cr", "lost_on_restart")
+    ]
+
+    assert harness.in_schemas() == [
+        "review.in/1",  # fr only: cr is not re-run
+        "goal.review.in/1",
+        "merge.in/1",
+        "goal.turn.in/1",
+    ]
+    fr_in = harness.invoker.in_obj(0)
+    assert fr_in["role"] == "fr"
+    # the CR conclusion survived the crash and rode into the FR input
+    assert fr_in["cr_result"] == {"stop": "pass", "summary": "cr ok", "findings": []}
+    assert "dd.merged" in kinds
+
+    turn_in = harness.invoker.in_obj(3)
+    assert turn_in["last_dd"]["outcome"] == "merged"
+    assert [r["role"] for r in turn_in["last_dd"]["reviews"]] == ["cr", "fr"]
+
+
+# ---------------------------------------------------------------------------
+# ⑩ dd-30 ③: acceptance crashed mid-batch → the whole round's commands re-run
+# ---------------------------------------------------------------------------
+
+
+def test_mid_acceptance_reruns_the_whole_batch(tmp_path: Path) -> None:
+    dispatch = {**DISPATCH, "acceptance_extra": ["make extra"]}
+    harness = Harness(
+        tmp_path,
+        seed=[
+            ("goal.enrolled", {"title": "t"}, None),
+            ("goal.turn.started", {"turn_no": 1}, None),
+            (
+                "goal.turn.finished",
+                {
+                    "run_id": f"goal-{GOAL_ID}-turn-1",
+                    "stop": "dispatch",
+                    "summary": "派单",
+                    "dispatch": dispatch,
+                },
+                None,
+            ),
+            *_dd_opened(),
+            _stage_finished("impl", "committed", commit=SHA_D, summary="done"),
+            ("dd.acceptance", {"cmd": "make base", "exit": 0, "index": 0, "total": 2}, DD_ID),
+        ],
+        stops=[
+            _review("cr", "pass"),
+            _review("fr", "pass"),
+            _approve(),
+            _dd_merge(),
+            _blocked_stop(),
+        ],
+    )
+
+    assert harness.run(tmp_path) == engine.EXIT_BLOCKED
+
+    kinds = harness.kinds()
+    assert "dd.failed" not in kinds
+    # the whole batch re-ran from the first command (no mid-batch checkpoint)
+    assert harness.bash.calls == ["make base", "make extra"]
+    acceptance = [ev.payload["cmd"] for ev in harness.events_of("dd.acceptance")]
+    assert acceptance == ["make base", "make base", "make extra"]
+    finished = [
+        ev.payload["stage"]
+        for ev in harness.events_of("dd.stage.finished")
+        if ev.payload["stage"] == "acceptance"
+    ]
+    assert finished == ["acceptance"]  # the interrupted round never finished
+    assert "dd.merged" in kinds
+
+
+# ---------------------------------------------------------------------------
+# ⑪ dd-30 ④: dd.merged then crash → no re-entry, the folded result object is
+#    handed to the next turn
+# ---------------------------------------------------------------------------
+
+
+def test_merged_dd_hands_result_to_next_turn_without_reentry(tmp_path: Path) -> None:
+    harness = Harness(
+        tmp_path,
+        seed=[
+            *_dispatch_turn_prefix(),
+            *_dd_opened(),
+            _stage_finished("impl", "committed", commit=SHA_D, summary="done"),
+            ("dd.acceptance", {"cmd": "make base", "exit": 0, "index": 0, "total": 1}, DD_ID),
+            _stage_finished("acceptance", "pass"),
+            _stage_finished("cr", "pass", summary="ok", findings=[]),
+            _stage_finished("fr", "pass", summary="ok", findings=[]),
+            _stage_finished("goal_review", "approve", summary="ok"),
+            _stage_finished("merge", "merged", merged_commit=SHA_M),
+            ("dd.merged", {"merged_commit": SHA_M}, DD_ID),
+        ],
+        stops=[_blocked_stop()],
+    )
+
+    assert harness.run(tmp_path) == engine.EXIT_BLOCKED
+
+    kinds = harness.kinds()
+    # no re-entry at all: exactly the seeded DD events, no agent runs, no
+    # lost-run marker, no re-dispatch
+    assert kinds.count("dd.dispatched") == 1
+    assert kinds.count("dd.merged") == 1
+    assert harness.events_of("agent.failed") == []
+    assert len(harness.invoker.calls) == 1  # the next goal turn only
+    assert harness.bash.calls == []
+
+    turn_in = harness.invoker.in_obj(0)
+    assert turn_in["turn_no"] == 2
+    assert turn_in["last_dd"]["dd_id"] == DD_ID
+    assert turn_in["last_dd"]["outcome"] == "merged"
+    assert turn_in["last_dd"]["merged_commit"] == SHA_M
+    assert "1 merged" in turn_in["dd_summary"]

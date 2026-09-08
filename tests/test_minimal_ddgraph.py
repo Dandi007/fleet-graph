@@ -4,11 +4,16 @@ Everything drives the graph with a real ``EventLog`` on a tmp root, scripted
 fakes for every IO seam (``agent_invoker`` / ``git_runner`` / ``bash_runner`` /
 ``pr_open`` / ``pr_cleanup`` / ``pr_mergeable`` / ``merge_fn``), so the
 assertions double as the contract that the DD graph only ever acts through its
-injected seams. The seven spec acceptance cases are covered: happy path to
-``merged``, CR fail bouncing back to Impl, a rebased merge returning to CR with
-approve cleared, the dd-ready gate failing with zero agent calls, a red
+injected seams. The seven dd-17 spec acceptance cases are covered: happy path
+to ``merged``, CR fail bouncing back to Impl, a rebased merge returning to CR
+with approve cleared, the dd-ready gate failing with zero agent calls, a red
 baseline, an agent failure that is never re-run, and an unknown (stage, stop)
 surfacing ``ddflow.next_stage``'s ``ValueError`` instead of a swallowed bypass.
+
+dd-30 adds the protocol §11 resume seam: ``resume_entry``'s fold table (pure
+function), ``run_dd(initial_state=...)`` re-entering the graph at the folded
+entry without re-dispatching, and the ``initial_state=None`` fresh-run
+regression.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from typing import Any
 import pytest
 
 from fleet_graph.minimal import ddflow, gitgate
+from fleet_graph.minimal import events as events_mod
 from fleet_graph.minimal.acceptance import Completed
 from fleet_graph.minimal.events import EventLog
 from fleet_graph.minimal.prlifecycle import CleanupResult, PrRef
@@ -27,12 +33,19 @@ from fleet_graph.minimal.prlifecycle import CleanupResult, PrRef
 try:
     from langgraph.checkpoint.memory import InMemorySaver
 
-    from fleet_graph.minimal.ddgraph import DDDeps, build_dd_graph, run_dd
+    from fleet_graph.minimal.ddgraph import (
+        RESUME_TERMINAL,
+        DDDeps,
+        build_dd_graph,
+        resume_entry,
+        run_dd,
+    )
 except ModuleNotFoundError as exc:
     if exc.name != "langgraph":
         raise
     InMemorySaver = None
     build_dd_graph = None
+    resume_entry = None
     run_dd = None
 
 pytestmark = pytest.mark.skipif(
@@ -482,3 +495,242 @@ def test_unknown_merge_stop_raises(tmp_path: Path) -> None:
 def test_unknown_stage_stop_is_not_bypassed(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         ddflow.next_stage("merge", "bogus")
+
+
+# ---------------------------------------------------------------------------
+# 8. resume_entry (protocol §11): fold one DD's events into (entry, overrides)
+# ---------------------------------------------------------------------------
+
+
+def _rev(kind: str, payload: dict[str, Any]) -> events_mod.Event:
+    return events_mod.Event(ts="t", goal_id=GOAL_ID, dd_id=DD_ID, kind=kind, seq=0, payload=payload)
+
+
+def test_resume_entry_dispatched_only_enters_at_dd_ready() -> None:
+    entry, overrides = resume_entry([_rev("dd.dispatched", {"spec_text": "do it"})], DD_ID)
+
+    assert entry == "dd_ready"
+    assert overrides == {"round": 1, "approve_valid": False, "history": (), "prs": {}}
+
+
+def test_resume_entry_lost_stage_restarts_the_same_step() -> None:
+    events_list = [
+        _rev("dd.dispatched", {}),
+        _rev("dd.pr_opened", {"repo": REPOS[0]["path"], "number": 31, "url": "u31"}),
+        _rev("dd.stage.started", {"stage": "impl"}),
+        _rev("agent.spawned", {"run_id": "dd-01-impl-1", "role": "impl"}),
+    ]
+
+    entry, overrides = resume_entry(events_list, DD_ID)
+
+    assert entry == "impl"
+    assert overrides["prs"] == {REPOS[0]["path"]: {"number": 31, "url": "u31"}}
+
+
+def test_resume_entry_mid_acceptance_reruns_whole_round() -> None:
+    events_list = [
+        _rev("dd.dispatched", {}),
+        _rev("dd.pr_opened", {"repo": REPOS[0]["path"], "number": 31, "url": "u31"}),
+        _rev("dd.stage.finished", {"stage": "impl", "stop": "committed", "commit": SHA_C}),
+        _rev("dd.acceptance", {"cmd": "make test", "exit": 0, "index": 0, "total": 2}),
+    ]
+
+    entry, overrides = resume_entry(events_list, DD_ID)
+
+    assert entry == "acceptance"
+    assert overrides["history"] == (("impl", "committed"),)
+
+
+def test_resume_entry_acceptance_fail_bounces_with_feedback_and_round() -> None:
+    events_list = [
+        _rev("dd.dispatched", {}),
+        _rev("dd.stage.finished", {"stage": "impl", "stop": "committed"}),
+        _rev("dd.acceptance", {"cmd": "make test", "exit": 1, "index": 0, "total": 2}),
+        _rev("dd.stage.finished", {"stage": "acceptance", "stop": "fail"}),
+    ]
+
+    entry, overrides = resume_entry(events_list, DD_ID)
+
+    assert entry == "impl"
+    assert overrides["round"] == 2  # every re-entry into impl bumps the round
+    assert overrides["approve_valid"] is False
+    assert overrides["feedback"] == {
+        "from": "acceptance",
+        "detail": "acceptance command failed: make test",
+    }
+
+
+def test_resume_entry_cr_pass_restores_the_fr_handoff() -> None:
+    events_list = [
+        _rev("dd.dispatched", {}),
+        _rev("dd.stage.finished", {"stage": "impl", "stop": "committed"}),
+        _rev("dd.stage.finished", {"stage": "acceptance", "stop": "pass"}),
+        _rev("dd.stage.finished", {"stage": "cr", "stop": "pass", "summary": "ok", "findings": []}),
+    ]
+
+    entry, overrides = resume_entry(events_list, DD_ID)
+
+    assert entry == "fr"
+    assert overrides["last_stop"] == "pass"
+    assert overrides["last_obj"] == {"summary": "ok", "findings": []}
+
+
+def test_resume_entry_terminal_transition_reenters_at_cleanup() -> None:
+    merged = [
+        _rev("dd.dispatched", {}),
+        _rev("dd.stage.finished", {"stage": "goal_review", "stop": "approve"}),
+        _rev("dd.stage.finished", {"stage": "merge", "stop": "merged", "merged_commit": SHA_M}),
+    ]
+    entry, overrides = resume_entry(merged, DD_ID)
+    assert entry == "cleanup"
+    assert overrides["terminal"] == "merged"
+    assert overrides["approve_valid"] is True
+
+    impl_failed = [
+        _rev("dd.dispatched", {}),
+        _rev("dd.stage.finished", {"stage": "impl", "stop": "failed", "detail": "nope"}),
+    ]
+    entry, overrides = resume_entry(impl_failed, DD_ID)
+    assert entry == "cleanup"
+    assert overrides["terminal"] == "failed"
+    assert overrides["last_stop"] == "impl"  # _fail_result shape: the stage name
+    assert overrides["last_obj"] == {"detail": "nope"}
+
+
+def test_resume_entry_resolved_dd_is_the_terminal_sentinel() -> None:
+    assert resume_entry(
+        [_rev("dd.dispatched", {}), _rev("dd.merged", {"merged_commit": SHA_M})], DD_ID
+    ) == (RESUME_TERMINAL, {})
+    assert resume_entry(
+        [_rev("dd.dispatched", {}), _rev("dd.failed", {"stage": "impl", "detail": "x"})], DD_ID
+    ) == (RESUME_TERMINAL, {})
+
+
+def test_resume_entry_trailing_agent_failure_closes_never_reruns() -> None:
+    # a stagerunner-written failure (run_id-bearing, §0.2) one hop before
+    # cleanup: the failed agent is closed out, never re-run
+    stagerunner_failure = [
+        _rev("dd.dispatched", {}),
+        _rev("dd.stage.finished", {"stage": "fr", "stop": "pass"}),
+        _rev("dd.stage.started", {"stage": "goal_review"}),
+        _rev(
+            "agent.failed",
+            {
+                "stage": "goal_review",
+                "run_id": "dd-01-goal_review-1",
+                "exit_code": 1,
+                "detail": "agent exited with non-zero exit code 1",
+            },
+        ),
+    ]
+    entry, overrides = resume_entry(stagerunner_failure, DD_ID)
+    assert entry == "cleanup"
+    assert overrides["terminal"] == "failed"
+    assert overrides["last_stop"] == "goal_review"
+
+    # the engine's own lost-run marker (no run_id) names the step to restart
+    # and never masks an earlier stagerunner failure
+    events_list = [*stagerunner_failure, _rev("dd.stage.started", {"stage": "impl"})]
+    entry, _overrides = resume_entry(events_list, DD_ID)
+    assert entry == "impl"
+
+    with_marker = [
+        *stagerunner_failure,
+        _rev("agent.failed", {"stage": "impl", "detail": "lost_on_restart"}),
+    ]
+    entry, _overrides = resume_entry(with_marker, DD_ID)
+    assert entry == "cleanup"
+
+
+# ---------------------------------------------------------------------------
+# 9. run_dd resume: re-enter at the folded entry, never re-dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_run_dd_resumes_at_folded_entry_without_redispatch(tmp_path: Path) -> None:
+    harness = Harness(
+        tmp_path,
+        stops=[_review("fr", "pass"), _approve()],
+        merge_results=[("merged", {"merged_commit": SHA_M})],
+    )
+    # a DD that died between CR finishing and FR starting
+    harness.log.append(
+        "dd.dispatched",
+        {"spec_text": "do it", "branch": DD_BRANCH, "head_commit": SHA_R},
+        dd_id=DD_ID,
+    )
+    harness.log.append(
+        "dd.pr_opened",
+        {"repo": REPOS[0]["path"], "number": 11, "url": "https://github.com/x/y/pull/11"},
+        dd_id=DD_ID,
+    )
+    harness.log.append(
+        "dd.stage.finished",
+        {"stage": "impl", "stop": "committed", "commit": SHA_C, "summary": "done"},
+        dd_id=DD_ID,
+    )
+    harness.log.append(
+        "dd.acceptance", {"cmd": "make test", "exit": 0, "index": 0, "total": 2}, dd_id=DD_ID
+    )
+    harness.log.append(
+        "dd.acceptance",
+        {"cmd": "pytest tests/test_x.py", "exit": 0, "index": 1, "total": 2},
+        dd_id=DD_ID,
+    )
+    harness.log.append("dd.stage.finished", {"stage": "acceptance", "stop": "pass"}, dd_id=DD_ID)
+    harness.log.append(
+        "dd.stage.finished",
+        {"stage": "cr", "stop": "pass", "summary": "pass", "findings": []},
+        dd_id=DD_ID,
+    )
+
+    entry, overrides = resume_entry(list(harness.log.read()), DD_ID)
+    assert entry == "fr"
+
+    result = run_dd(
+        harness.deps,
+        goal_id=GOAL_ID,
+        dd_id=DD_ID,
+        repos=REPOS,
+        spec_text="do it",
+        acceptance_cmds=ACCEPTANCE_CMDS,
+        initial_state={"entry": entry, **overrides},
+    )
+
+    assert result["outcome"] == "merged"
+    assert result["reviews"] == [
+        {"role": "cr", "stop": "pass", "summary": "pass", "findings": []},
+        {"role": "fr", "stop": "pass", "summary": "pass", "findings": []},
+    ]
+    kinds = harness.kinds()
+    assert kinds.count("dd.dispatched") == 1  # the resume never re-dispatches
+    assert kinds.count("agent.exited") == 2  # fr + goal_review only: cr not re-run
+    assert kinds[-1] == "dd.merged"
+    # the CR conclusion rode into the FR input via the folded handoff
+    fr_in = _in_obj(harness.invoker.calls[0])
+    assert fr_in["cr_result"] == {"stop": "pass", "summary": "pass", "findings": []}
+
+
+def test_run_dd_initial_state_none_runs_the_fresh_path(tmp_path: Path) -> None:
+    harness = Harness(
+        tmp_path,
+        stops=[_impl_committed(), _review("cr", "pass"), _review("fr", "pass"), _approve()],
+        merge_results=[("merged", {"merged_commit": SHA_M})],
+    )
+
+    result = run_dd(
+        harness.deps,
+        goal_id=GOAL_ID,
+        dd_id=DD_ID,
+        repos=REPOS,
+        spec_text="do it",
+        acceptance_cmds=ACCEPTANCE_CMDS,
+        initial_state=None,
+    )
+
+    assert result["outcome"] == "merged"
+    kinds = harness.kinds()
+    assert kinds[0] == "dd.dispatched"  # fresh: the opening event is written here
+    assert kinds.count("dd.dispatched") == 1
+    assert kinds[-1] == "dd.merged"
+    assert len(harness.pr_open_calls) == 1  # fresh: the graph ran from dd_ready

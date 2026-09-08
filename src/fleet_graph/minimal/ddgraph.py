@@ -29,6 +29,12 @@ never resumes from checkpointed state (design.md §7.1 / GO-16). Derived values
 that a stage needs (head commit, acceptance results, the awaiting-approval DD
 object) are re-folded from ``deps.event_log.read()`` via
 :func:`ddflow.build_dd_result` rather than carried in the graph state.
+
+DD-level resume (protocol §11): :func:`resume_entry` folds one DD's events
+into the re-entry point plus state overrides, and ``run_dd(initial_state=...)``
+re-enters the graph at that point instead of running from ``dd_ready`` — the
+event log stays the only source of truth, and a fresh ``initial_state=None``
+run is byte-identical to the pre-resume graph.
 """
 
 from __future__ import annotations
@@ -94,7 +100,9 @@ class DDGraphState(TypedDict, total=False):
     failure descriptor (``{"detail": ...}``) for the teardown node's terminal
     event. ``round`` counts Impl entries (1-based), ``approve_valid`` mirrors
     :class:`ddflow.DDState`, and ``history`` is the replayed ``(stage, stop)``
-    sequence.
+    sequence. ``entry`` is the protocol §11 resumed-start node (from
+    :func:`resume_entry`); it is absent on fresh runs, which always start at
+    ``dd_ready``.
     """
 
     goal_id: str
@@ -112,6 +120,7 @@ class DDGraphState(TypedDict, total=False):
     prs: dict[str, dict[str, Any]]
     dd_result: dict[str, Any] | None
     terminal: str | None
+    entry: str
 
 
 def _ddstate_from(state: DDGraphState) -> ddflow.DDState:
@@ -480,7 +489,21 @@ def build_dd_graph(deps: DDDeps, *, checkpointer: Any = None) -> Any:
     graph.add_node("merge", merge_node)
     graph.add_node("cleanup", cleanup_node)
 
-    graph.add_edge(START, "dd_ready")
+    graph.add_conditional_edges(
+        START,
+        _route_entry,
+        {
+            "dd_ready": "dd_ready",
+            "baseline": "baseline",
+            "impl": "impl",
+            "acceptance": "acceptance",
+            "cr": "cr",
+            "fr": "fr",
+            "goal_review": "goal_review",
+            "merge": "merge",
+            "cleanup": "cleanup",
+        },
+    )
     graph.add_conditional_edges("dd_ready", _route_after_dd_ready, {"open_pr": "open_pr", END: END})
     graph.add_edge("open_pr", "baseline")
     graph.add_conditional_edges("baseline", _route_after_baseline, {"impl": "impl", END: END})
@@ -511,6 +534,11 @@ def _advance(
     return transition, new
 
 
+def _route_entry(state: DDGraphState) -> str:
+    """protocol §11 resumed start: the folded entry node, or ``dd_ready`` when fresh."""
+    return state.get("entry") or "dd_ready"
+
+
 def _route_after_dd_ready(state: DDGraphState) -> str:
     return END if state.get("terminal") == "failed" else "open_pr"
 
@@ -528,6 +556,146 @@ def _route_loop(state: DDGraphState) -> str:
     return stage
 
 
+# protocol §11 resume: the sentinel entry for a DD that already resolved
+# (``dd.merged`` / ``dd.failed`` folded from its events). The caller folds the
+# result object and never re-enters the graph.
+RESUME_TERMINAL = "terminal"
+
+
+def resume_entry(events_list: list[events.Event], dd_id: str) -> tuple[str, dict[str, Any]]:
+    """Fold one DD's events into ``(entry node, state overrides)`` (protocol §11).
+
+    Pure replay over ``events.jsonl`` — the only source of truth:
+
+    - a ``dd.stage.started`` / ``agent.spawned`` run without its finished →
+      re-enter at that stage itself (the lost run restarts the same step);
+    - ``dd.acceptance`` mid-round (no ``dd.stage.finished(acceptance)`` yet) →
+      re-enter at the acceptance node; the round's commands re-run in full —
+      no checkpointing mid-batch;
+    - a ``dd.stage.finished`` boundary → re-enter at the next node per
+      :func:`ddflow.next_stage`; a terminal transition re-enters at ``cleanup``
+      so the DD's own terminal event still gets written;
+    - ``dd.merged`` / ``dd.failed`` → :data:`RESUME_TERMINAL`: the DD already
+      resolved; the caller takes the result object, no re-entry.
+
+    One §0.2 completion: a trailing ``agent.failed`` / ``agent.invalid_output``
+    (stagerunner-written — they carry ``run_id``) for a non-merge stage means
+    the graph was one hop from ``cleanup`` when it died; the entry is
+    ``cleanup`` so the failed agent is closed out, never re-run. A merge-stage
+    failure is an ordinary loop transition (back to Impl), and §11 itself
+    calls merge re-runs side-effect-free.
+
+    The overrides carry what the finished siblings would have left in state:
+    ``round`` / ``approve_valid`` / ``history`` re-folded through
+    :func:`ddflow.advance` (every re-entry into Impl clears approve, GO-14),
+    ``prs`` from ``dd.pr_opened``, and ``last_stop`` / ``last_obj`` /
+    ``feedback`` / ``terminal`` rebuilt from the last ``dd.stage.finished``
+    payload (``_fail_result`` shape on failure: ``last_stop`` names the stage).
+    """
+    state = ddflow.DDState()
+    prs: dict[str, dict[str, Any]] = {}
+    entry = "dd_ready"
+    open_stage: str | None = None
+    acceptance_partial = False
+    trailing_failure: tuple[str, str | None] | None = None
+    failed_acceptance_cmd: str | None = None
+    last_finished: tuple[str, str, dict[str, Any]] | None = None
+    for ev in events_list:
+        if ev.dd_id != dd_id:
+            continue
+        payload = ev.payload or {}
+        kind = ev.kind
+        if kind == "dd.dispatched":
+            entry = "dd_ready"
+            trailing_failure = None
+        elif kind == "dd.pr_opened":
+            prs[str(payload.get("repo"))] = {
+                "number": payload.get("number"),
+                "url": payload.get("url"),
+            }
+            entry = "baseline"
+            trailing_failure = None
+        elif kind == "dd.stage.started":
+            open_stage = payload.get("stage")
+            trailing_failure = None
+        elif kind == "agent.spawned":
+            # the enclosing dd.stage.started run is the lost one (§11); the
+            # open stage above already names it
+            trailing_failure = None
+        elif kind == "dd.acceptance":
+            acceptance_partial = True
+            if payload.get("exit") != 0 or payload.get("timed_out"):
+                failed_acceptance_cmd = payload.get("cmd")
+            trailing_failure = None
+        elif kind == "dd.stage.finished":
+            open_stage = None
+            acceptance_partial = False
+            trailing_failure = None
+            stage = payload.get("stage")
+            stop = payload.get("stop")
+            if isinstance(stage, str) and isinstance(stop, str):
+                state = ddflow.advance(state, stage, stop)
+                last_finished = (stage, stop, payload)
+                entry = ddflow.next_stage(stage, stop).next_stage or "cleanup"
+        elif kind in ("agent.failed", "agent.invalid_output"):
+            # engine-written lost-run markers carry no run_id and add no
+            # DD-progress information (the missing finished event already
+            # implies the loss) — ignored entirely. stagerunner-written ones
+            # (with run_id) mean the agent already failed (§0.2): a non-merge
+            # stage's failure is one hop from cleanup; a merge failure is an
+            # ordinary loop transition back to Impl (and §11 itself calls
+            # merge re-runs side-effect-free), so it clears like progress.
+            if "run_id" not in payload:
+                continue
+            stage = payload.get("stage")
+            if isinstance(stage, str) and stage != "merge":
+                trailing_failure = (stage, payload.get("detail"))
+            else:
+                trailing_failure = None
+        elif kind == "agent.exited":
+            trailing_failure = None
+        elif kind in ("dd.merged", "dd.failed"):
+            return (RESUME_TERMINAL, {})
+    if open_stage is not None:
+        entry = open_stage
+    elif acceptance_partial:
+        entry = "acceptance"
+    overrides: dict[str, Any] = {
+        "round": state.round,
+        "approve_valid": state.approve_valid,
+        "history": state.history,
+        "prs": prs,
+    }
+    if trailing_failure is not None:
+        stage, detail = trailing_failure
+        entry = "cleanup"
+        overrides["terminal"] = "failed"
+        overrides["last_stop"] = stage
+        overrides["last_obj"] = {"detail": detail}
+        return (entry, overrides)
+    if last_finished is not None:
+        stage, stop, payload = last_finished
+        last_obj = {k: v for k, v in payload.items() if k not in ("stage", "stop", "run_id")}
+        transition = ddflow.next_stage(stage, stop)
+        overrides["last_obj"] = last_obj
+        if transition.outcome is not None:
+            # _fail_result shape: last_stop names the failing stage
+            overrides["terminal"] = transition.outcome
+            overrides["last_stop"] = stage
+        else:
+            overrides["last_stop"] = stop
+        if transition.feedback_from == "acceptance":
+            detail = (
+                f"acceptance command failed: {failed_acceptance_cmd}"
+                if failed_acceptance_cmd
+                else "acceptance failed"
+            )
+            overrides["feedback"] = {"from": "acceptance", "detail": detail}
+        elif transition.feedback_from is not None:
+            overrides["feedback"] = _feedback_for(stage, transition.feedback_from, last_obj)
+    return (entry, overrides)
+
+
 def run_dd(
     deps: DDDeps,
     *,
@@ -537,27 +705,37 @@ def run_dd(
     spec_text: str,
     acceptance_cmds: list[str],
     checkpointer: Any = None,
+    initial_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one DD end-to-end and return the protocol §7 DD result object.
 
     ``repos`` are the DD launch repos (``path`` / ``remote`` / ``branch`` /
     ``spec_path``) and ``acceptance_cmds`` the full acceptance batch (goal
-    acceptance plus ``acceptance_extra``), already combined by the caller. The
-    opening ``dd.dispatched`` event is written here; the result is re-folded
-    from ``deps.event_log.read()`` — ``events.jsonl`` is the only source of
-    truth (protocol §11), and the checkpointer is only a droppable cache:
-    recovery replays the event log and never resumes from checkpointed state
-    (GO-16 / design §7.1).
+    acceptance plus ``acceptance_extra``), already combined by the caller. On a
+    fresh DD the opening ``dd.dispatched`` event is written here; the result is
+    re-folded from ``deps.event_log.read()`` — ``events.jsonl`` is the only
+    source of truth (protocol §11), and the checkpointer is only a droppable
+    cache: recovery replays the event log and never resumes from checkpointed
+    state (GO-16 / design §7.1).
+
+    ``initial_state`` is the resumed-start override (protocol §11), shaped
+    exactly like ``goalgraph.run_goal``'s namesake: ``None`` runs a fresh DD
+    precisely as before (``dd.dispatched`` written, graph entered at
+    ``dd_ready``); otherwise its keys override the initial graph state and the
+    graph enters at ``initial_state["entry"]`` — the resume point folded by
+    :func:`resume_entry` — instead of re-running from ``dd_ready``. The DD's
+    ``dd.dispatched`` event is already in the log and is never re-written.
     """
-    deps.event_log.append(
-        "dd.dispatched",
-        {
-            "spec_text": spec_text,
-            "branch": repos[0]["branch"],
-            "head_commit": deps.release_head,
-        },
-        dd_id=dd_id,
-    )
+    if initial_state is None:
+        deps.event_log.append(
+            "dd.dispatched",
+            {
+                "spec_text": spec_text,
+                "branch": repos[0]["branch"],
+                "head_commit": deps.release_head,
+            },
+            dd_id=dd_id,
+        )
     graph = build_dd_graph(deps, checkpointer=checkpointer)
     initial: DDGraphState = {
         "goal_id": goal_id,
@@ -576,6 +754,8 @@ def run_dd(
         "dd_result": None,
         "terminal": None,
     }
+    if initial_state is not None:
+        initial.update(initial_state)
     graph.invoke(
         initial,
         config={
@@ -587,8 +767,10 @@ def run_dd(
 
 
 __all__ = [
+    "RESUME_TERMINAL",
     "DDDeps",
     "DDGraphState",
     "build_dd_graph",
+    "resume_entry",
     "run_dd",
 ]
