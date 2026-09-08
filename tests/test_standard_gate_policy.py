@@ -236,3 +236,20 @@ def test_prose_spec_uses_committed_declared_commands(subject):
         receipt=json.loads(path.read_text());receipt["spec_digest"]=subject.record["spec_digest"]
         path.write_text(json.dumps(receipt));subject.record["receipt_digests"][stage]=compute_json_digest(receipt)
     assert all(x.passed for x in collect(subject))
+
+@pytest.mark.parametrize('authorized',[True,False])
+def test_explicit_spec_command_change_requires_reconfigure(subject,authorized):
+    spec='# 已批准SPEC\n```dd-acceptance\nold-command\n```\n'
+    (subject.repo/SPEC_PATH).write_text(spec)
+    git(subject.repo,'add','-A');git(subject.repo,'commit','-qm','explicit original declaration')
+    subject.record['spec_digest']='sha256:'+hashlib.sha256(spec.encode()).hexdigest()
+    for stage,path in subject.receipts.items():
+        receipt=json.loads(path.read_text());receipt['spec_digest']=subject.record['spec_digest']
+        path.write_text(json.dumps(receipt));subject.record['receipt_digests'][stage]=compute_json_digest(receipt)
+    if authorized: subject.record['reconfigures']=[{'generation':1,'changed':['acceptance_commands']}]
+    assert {x.id:x for x in collect(subject)}['acceptance_frozen'].passed is authorized
+
+
+def test_missing_committed_run_config_refuses(subject):
+    git(subject.repo,'rm',str(RUN_CONFIG_PATH));git(subject.repo,'commit','-qm','missing configuration')
+    assert not all(x.passed for x in collect(subject))
