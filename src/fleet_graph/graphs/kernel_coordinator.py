@@ -185,7 +185,11 @@ class KernelCoordinator:
                     goal_version=version,
                 )
             )
-        elif gate_wake:
+        # A DD review report and a gate-wake (DD result) are independent inputs:
+        # both must enter the queue on the same round. An if/elif here silently
+        # dropped the gate-wake whenever a ``last_turn_report`` was also present,
+        # losing an accepted DD input (final review finding rf-f0171f54).
+        if gate_wake:
             requests.append(
                 Request(
                     request_id=f"line:{folder_id}:dd_result:{gate_wake}",

@@ -361,8 +361,9 @@ class Journal:
     #: over the filename changes the entry again. "The directory was synced
     #: once" can therefore never stand in for syncing this specific entry
     #: (final review finding, behavior 1/4/7, P6). A file enters only after its
-    #: parent's ``dir_sync`` succeeds (or after ``load`` observes a file that
-    #: already survived to disk).
+    #: parent's ``dir_sync`` succeeds. A reconstructed file is deliberately kept
+    #: *out* of this set: ``load`` recovers its sync obligation via
+    #: ``_recover_sync_duty`` so the next ``_persist_append`` re-syncs the entry.
     _files_synced: set[Path] = field(default_factory=set, init=False)
     #: Every directory this journal has ever created (via ``_ensure_directory``).
     #: Remembering them -- rather than only the directories created on the

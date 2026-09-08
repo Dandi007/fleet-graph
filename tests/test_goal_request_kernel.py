@@ -3042,6 +3042,53 @@ class TestEnqueueDurabilityBeforeAck:
         ]
         assert len(requests) == 1
 
+    def test_round_with_dd_review_and_gate_wake_enqueues_both_independently(
+        self, tmp_path
+    ) -> None:
+        home = tmp_path / "journal"
+        coordinator = self._coordinator(home)
+        coord_input = {
+            "folder_id": GOAL,
+            "last_turn_report": {"turn_id": "t3", "outcome": "completed"},
+            "dd_awaiting_gate_development_id": "dev-gate-1",
+        }
+        coordinator.enqueue_requests(2, coord_input)
+
+        rebuilt = GoalRequestKernel(journal=Journal(home=home))
+        events = rebuilt.list_events(GOAL)["events"]
+        review = [
+            e
+            for e in events
+            if e["record"] == RECORD_REQUEST and e.get("kind") == KIND_DD_REVIEW
+        ]
+        result = [
+            e
+            for e in events
+            if e["record"] == RECORD_REQUEST and e.get("kind") == KIND_DD_RESULT
+        ]
+        assert [e["request_id"] for e in review] == [f"line:{GOAL}:dd_review:t3"]
+        assert [e["request_id"] for e in result] == [
+            f"line:{GOAL}:dd_result:dev-gate-1"
+        ]
+
+        # A later turn re-derives the same identities and must not duplicate
+        # either request (stable identity by input, not round).
+        coordinator.turn(2, dict(coord_input))
+        rebuilt = GoalRequestKernel(journal=Journal(home=home))
+        events = rebuilt.list_events(GOAL)["events"]
+        review = [
+            e
+            for e in events
+            if e["record"] == RECORD_REQUEST and e.get("kind") == KIND_DD_REVIEW
+        ]
+        result = [
+            e
+            for e in events
+            if e["record"] == RECORD_REQUEST and e.get("kind") == KIND_DD_RESULT
+        ]
+        assert len(review) == 1
+        assert len(result) == 1
+
 
 # --- effect-port downstream preservation (final review finding; behavior 6) --
 
