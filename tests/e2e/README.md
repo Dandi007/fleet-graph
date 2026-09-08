@@ -14,7 +14,7 @@ make test-end-to-end CANDIDATE=codex CASE=single-repo
 
 `test-docker` 验证真实 Work Folder MCP 读写及 Git commit/push、agent-bus 注册与消息消费/ack、真实模型网关调用、Fleet MCP 就绪和出网边界。它不等于业务 E2E。
 
-`test-end-to-end` 进一步在专用 GitHub 仓库登记真实 Goal，执行 SPEC、DD、实现、程序验收、CR、FR、Goal approval 和合并，最后由独立 verifier 容器验证公开证据及最终代码。完整通过才写 `e2e_passed: true`；异常、超时、导出失败均非成功。
+`test-end-to-end` 进一步在专用 GitHub 仓库登记真实 Goal，执行 SPEC、DD、实现、程序验收、CR、FR、Goal approval、合并及终局 Scribe，最后由独立 verifier 容器验证公开证据及最终代码。完整通过才写 `e2e_passed: true`；异常、超时、导出失败均非成功。
 
 契约单测入口为 `make test-docker-contracts`。首次构建需要下载基础镜像、CLI 和依赖，耗时取决于网络；构建联网不属于测试运行网络。
 
@@ -66,6 +66,7 @@ flowchart LR
 - 第一轮仅验证 OpenCode static gateway。native subscription、宿主登录态复用及其他 Runtime 的认证方式均为后续事项。
 - Work Folder 搜索部署真实 agent-knowledge 索引器与搜索服务，使用原生 keyword 模式；不依赖宿主搜索服务或 embedding 模型，vector 检索不在本轮覆盖范围。
 - 启动配置与角色 prompt 追加本次 Docker 测试授权，配置摘要与哈希写入 candidate manifest；不修改冻结产品源码。
+- 短 case 使用原生 `scribe_interval=0`，保留且要求成功的真实终局 Scribe。连续观察的输入自引用缺陷及严格 JSON 输出失败见 [已知边界](KNOWN_LIMITATIONS.md)，本 case 不证明长期观测健康。
 - 冻结 agent-runtime 没有提交 Bun lock，镜像记录实际解析 lock 的哈希及工具版本；不能据此声称不同时间重新构建会解析完全相同的依赖。
 - 两条重构线分别记账。尚未运行的候选标为待验证；协议或实现缺陷要报告到对应开发线，不能因本套测试已有一次成功而推定另一线通过。
 

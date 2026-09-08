@@ -18,6 +18,12 @@
 
 后续产品修复应在对应开发线处理输入事件过滤、失败 cursor 与上下文容量，再用连续观察 case 验证。仅将 `roles.scribe.session_policy` 改为 `fresh` 无法解决单轮 prompt 自嵌套。
 
+## 严格 JSON 输出失败与重试边界
+
+运行 `fg-ed6ba65407da` 的 Goal `28eadb00464cd816662feb7b` 已实际提交 SPEC，但在最终 dispatch JSON 前附加解释文字，runtime 以 exit 91 拒绝，测试整体失败。该运行完整导出并清理，没有剥离文字后把它当作成功，也没有沿用其工作目录继续测试。
+
+冻结 runtime 的 `max_conformance_retries` 只用于 `--role` 协议；Fleet 使用的 `--output-schema` 与 `--role` 互斥，当前路径没有模型修复重试入口。测试不注入无效配置，不把重新启动整个干净 case 称为原生 conformance retry。真实模型输出可能违反契约，因此一次成功不能证明重复运行永远成功；历史失败与最终通过均须保留。
+
 ## 其他未覆盖事项
 
 - native subscription 和宿主登录态复用尚未支持；首版只验证 OpenCode static gateway。
@@ -31,5 +37,7 @@
 
 - 冻结候选 `src/fleet_graph/engine.py`：`observe()` 的事件筛选和 prompt 构造；`_launch()` 的 `run.intent`；Scribe 结果收集的 cursor 更新。
 - 冻结候选 `src/fleet_graph/service.py`、`src/fleet_graph/cli.py`：`scribe_interval` 配置与终局等待。
+- 冻结 runtime `src/dispatch.ts`：generic output schema 的结果校验、typed-role 重试及互斥参数约束。
 - `.runtime/e2e/runs/fg-3c42620a7957/`：公开 Session、运行状态和导出证据。
+- `.runtime/e2e/runs/fg-ed6ba65407da/`：第四轮失败、停止回执与清理证据。
 - 工作线 `wf-613744`；候选开发线 `wf-53a584`。
