@@ -1560,6 +1560,146 @@ class TestRequestTransitionAtomicity:
         assert nxt is not None and nxt["request_id"] == "B"
 
 
+# --- resumed-execution ownership (final review rf-25eeb86e) --------------------
+
+
+class TestResumedExecutionOwnership:
+    def _interrupted_dispatch(self, tmp_path) -> tuple[str, Any]:
+        """Build a durable journal holding an interrupted two-item dispatch: its
+        Stop List was validated and persisted, k1 was delivered + confirmed, and
+        k2 crashed with only its intent written. Returns ``(call_id, home)``."""
+        home = tmp_path / "journal"
+        effects = CrashEffects(crash_on={"k2"})
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=effects)
+        kernel.activate_version(GOAL, "v1")
+        kernel.submit(GOAL, make_request("A"))
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None and call["request_id"] == "A"
+        with pytest.raises(KeyboardInterrupt):
+            kernel.finish_goal_call(
+                GOAL, call["call_id"], {"actions": [dispatch_action("k1"), dispatch_action("k2")]}
+            )
+        return call["call_id"], home
+
+    def test_concurrent_next_goal_call_admits_a_resume_exactly_once(self, tmp_path) -> None:
+        # Offline reconstruction: a rebuilt product re-derives exactly one
+        # pending-resume from the durable journal and re-acquires the fence for
+        # that call. Two concurrent callers must not both receive the interrupted
+        # call -- the loser observes no pending resume and the held fence, and
+        # gets ``None`` instead of re-executing the same call (rf-25eeb86e).
+        import threading
+
+        call_id, home = self._interrupted_dispatch(tmp_path)
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+
+        calls: list[dict[str, Any] | None] = []
+        errors: list[Exception] = []
+        barrier = threading.Barrier(2)
+
+        def open_call() -> None:
+            barrier.wait()
+            try:
+                calls.append(rebuilt.next_goal_call(GOAL))
+            except Exception as exc:
+                errors.append(exc)
+
+        t1 = threading.Thread(target=open_call)
+        t2 = threading.Thread(target=open_call)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert not errors
+        winners = [c for c in calls if c is not None]
+        assert len(winners) == 1
+        assert winners[0]["resume"] is True
+        assert winners[0]["call_id"] == call_id
+        # the losing caller observed the fence, never the interrupted call
+        assert calls.count(None) == 1
+
+    def test_concurrent_resume_execution_runs_effects_once_and_releases_the_fence_once(
+        self, tmp_path
+    ) -> None:
+        # Even if a duplicated resume envelope reached two executors, only one
+        # may own execution: the other neither runs an effect nor releases the
+        # fence a second time (rf-25eeb86e). The owner is parked inside its one
+        # outstanding delivery so the loser deterministically observes the held
+        # execution token rather than racing to claim after the owner finished.
+        import threading
+        import time
+
+        call_id, home = self._interrupted_dispatch(tmp_path)
+        effects2 = FakeEffects()
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=effects2)
+        nxt = rebuilt.next_goal_call(GOAL)
+        assert nxt is not None and nxt["resume"] is True and nxt["call_id"] == call_id
+
+        in_delivery = threading.Barrier(2)
+        release = threading.Event()
+        real_dispatch = effects2.dispatch
+
+        def blocking_dispatch(payload: dict[str, Any], *, ctx: dict[str, Any]) -> dict[str, Any]:
+            # Park here *before* delegating to the recording dispatch so only the
+            # owner's single delivery is recorded (delegation appends to
+            # ``effects2.dispatches`` exactly once per delivery).
+            in_delivery.wait(timeout=30)
+            release.wait(timeout=30)
+            return real_dispatch(payload, ctx=ctx)
+
+        effects2.dispatch = blocking_dispatch  # type: ignore[method-assign]
+
+        results: list[dict[str, Any]] = []
+        errors: list[Exception] = []
+        start = threading.Barrier(2)
+
+        def finish() -> None:
+            start.wait()
+            try:
+                results.append(rebuilt.finish_goal_call(GOAL, call_id, nxt["stop_list"]))
+            except Exception as exc:
+                errors.append(exc)
+
+        t1 = threading.Thread(target=finish)
+        t2 = threading.Thread(target=finish)
+        t1.start()
+        t2.start()
+
+        # The owner reaches k2's dispatch and parks on ``in_delivery``; the loser
+        # then fails ``_claim_execution`` and returns ``executing_elsewhere``
+        # without touching an effect or the fence.
+        in_delivery.wait(timeout=30)
+        deadline = time.time() + 10
+        while sum(t.is_alive() for t in (t1, t2)) > 1 and time.time() < deadline:
+            time.sleep(0.005)
+
+        # Exactly one thread (the winner) remains parked inside the effect; the
+        # loser has already returned its busy result before we release it.
+        assert sum(t.is_alive() for t in (t1, t2)) == 1
+        busy = [r for r in results if r.get("executing_elsewhere")]
+        owners = [r for r in results if not r.get("executing_elsewhere")]
+        assert len(busy) == 1
+        assert len(owners) == 0
+
+        release.set()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+        assert not t1.is_alive()
+        assert not t2.is_alive()
+        assert not errors  # no AssertionError from a second fence release
+
+        owners = [r for r in results if not r.get("executing_elsewhere")]
+        busy = [r for r in results if r.get("executing_elsewhere")]
+        assert len(owners) == 1
+        assert len(busy) == 1
+
+        # The outstanding k2 was delivered exactly once (k1 was reconciled from
+        # its pre-crash confirmed delivery, never re-run).
+        assert [d["ctx"]["idempotency_key"] for d in effects2.dispatches] == ["k2"]
+        # The fence was released exactly once.
+        assert rebuilt.journal.inflight(GOAL) is None
+
+
 # --- finding: complete raw Goal response survives interruption (lossless events) ---
 
 

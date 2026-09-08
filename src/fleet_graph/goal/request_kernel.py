@@ -641,6 +641,20 @@ class GoalRequestKernel:
     #: *transitions*, not Goal calls, and a call on goal A is never serialized
     #: behind a call on goal B.
     _request_lock: threading.RLock = field(default_factory=threading.RLock)
+    #: Serializes resumed-execution *ownership* (final review rf-25eeb86e,
+    #: behaviors 2/4/7, P6). The journal lock guards individual journal
+    #: operations and ``_request_lock`` guards request/queue/fence *transitions*;
+    #: neither guards the single-executor claim for a call whose execution was
+    #: interrupted after its Stop List became durable. ``next_goal_call`` claims
+    #: the pending-resume marker under ``_request_lock`` so only one caller
+    #: receives the interrupted call; ``finish_goal_call`` additionally claims a
+    #: per-goal executor token here so a second (erroneous) executor can neither
+    #: re-run an effect nor release the fence a second time. The guarded section
+    #: is a check-and-set only -- the effect loop runs outside it -- so a call on
+    #: goal A is never serialized behind an external delivery on goal B.
+    _execution_lock: threading.Lock = field(default_factory=threading.Lock)
+    #: goal -> call_id currently executing ``finish_goal_call`` (ownership token).
+    _executing: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.effects is None:
@@ -885,6 +899,17 @@ class GoalRequestKernel:
                 if persisted is None:
                     st["resume"] = None
                 else:
+                    # Atomically claim the interrupted call for exactly this
+                    # caller (final review rf-25eeb86e): clear the pending-resume
+                    # marker before returning the envelope, so a second caller
+                    # observes no pending resume and -- with the fence still held
+                    # by this call id -- falls through to ``None`` instead of
+                    # receiving the same interrupted call and re-executing it.
+                    # The durable journal, not this in-memory marker, remains the
+                    # recovery source: a crash before ``finish_goal_call`` leaves
+                    # the uncompleted call + Stop List on disk and the next
+                    # ``restore()`` re-derives a fresh resume marker.
+                    st["resume"] = None
                     call_line = self._call_line(goal, resume_id) or {}
                     return {
                         "call_id": resume_id,
@@ -937,6 +962,44 @@ class GoalRequestKernel:
             if line.get("record") == RECORD_STOP_LIST and line.get("call_id") == call_id:
                 return line
         return None
+
+    def _call_result_line(self, goal: str, call_id: str) -> dict[str, Any] | None:
+        for line in self.journal.scan(goal):
+            if line.get("record") == RECORD_CALL_RESULT and line.get("call_id") == call_id:
+                return line
+        return None
+
+    def _claim_execution(self, goal: str, call_id: str) -> bool:
+        """Atomically claim the single-executor slot for one call (rf-25eeb86e).
+
+        Returns ``True`` if this caller now owns execution; ``False`` if another
+        caller is already executing a call for ``goal`` -- in which case the
+        caller must neither run effects nor release the fence. Check-and-set
+        only: the effect loop runs outside ``_execution_lock``, so a delivery on
+        goal A is never serialized behind a delivery on goal B."""
+        with self._execution_lock:
+            if goal in self._executing:
+                return False
+            self._executing[goal] = call_id
+            return True
+
+    def _release_execution(self, goal: str, call_id: str) -> None:
+        with self._execution_lock:
+            if self._executing.get(goal) == call_id:
+                del self._executing[goal]
+
+    def _execution_busy(self, goal: str, call_id: str) -> dict[str, Any]:
+        """The no-op result for a caller that lost execution ownership."""
+        call = self._call_line(goal, call_id) or {}
+        return {
+            "call_id": call_id,
+            "goal": goal,
+            "request_id": str(call.get("request_id") or ""),
+            "intent": None,
+            "receipts": [],
+            "results": [],
+            "executing_elsewhere": True,
+        }
 
     def _persist_stop_list(
         self,
@@ -1048,7 +1111,40 @@ class GoalRequestKernel:
 
         A goal that is ``stopped`` (an immediate stop the runtime confirmed)
         *suspends* unstarted effects: the in-flight result is preserved, the
-        fence stays held, and nothing runs until ``resume()`` (finding 2)."""
+        fence stays held, and nothing runs until ``resume()`` (finding 2).
+
+        Execution is also *exclusively owned* (final review rf-25eeb86e,
+        behaviors 2/4/7, P6): the executor claims the per-goal token up front and
+        releases it on every exit path, so a second (duplicated) execution of the
+        same call neither re-runs an effect nor releases the fence a second time.
+        The durable journal -- not the in-memory token -- remains the recovery
+        source across a rebuild."""
+        if not self._claim_execution(goal, call_id):
+            # A concurrent executor already owns this call. Do not run effects or
+            # release the fence (the owner releases it on completion).
+            return self._execution_busy(goal, call_id)
+        try:
+            return self._finish_goal_call_owned(goal, call_id, stop_list)
+        finally:
+            self._release_execution(goal, call_id)
+
+    def _finish_goal_call_owned(
+        self, goal: str, call_id: str, stop_list: dict[str, Any]
+    ) -> dict[str, Any]:
+        existing = self._call_result_line(goal, call_id)
+        if existing is not None:
+            # This call already completed durably (a sequential re-finish of a
+            # drained call). Return the durable result without re-running effects
+            # or releasing the fence again.
+            return {
+                "call_id": call_id,
+                "goal": goal,
+                "request_id": str(existing.get("request_id") or ""),
+                "intent": existing.get("intent"),
+                "receipts": [],
+                "results": [],
+                "reconciled": True,
+            }
         call = next((r for r in self.journal.scan(goal) if r.get("call_id") == call_id), None)
         request_id = str(call.get("request_id") or "") if call else ""
         run_id = str(call.get("run_id") or "") if call else ""
