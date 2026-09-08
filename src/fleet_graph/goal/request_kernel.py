@@ -305,19 +305,16 @@ def _fsync_directory(path: Path) -> None:
 
     After the first append creates a new ``*.jsonl`` file, its parent directory
     entry must reach stable storage too, otherwise a crash can lose the file's
-    very existence even though its first record was already fsync'd. Opening a
-    directory read-only for fsync is not universal, so the entry-sync is a
-    best-effort gap, not a durability *failure*: the record itself is what the
-    ack and the effect ordering fence on.
+    very existence even though its first record was already fsync'd. Unlike a
+    file-content fsync, this is *not* best-effort: an ``OSError`` here (open or
+    fsync) propagates, so the caller issues no acceptance ack and admits nothing
+    in memory while the file's directory entry is not yet durable (behavior 1,
+    4, 7 / P6). Swallowing it would let ``submit`` acknowledge a request whose
+    journal file a host crash can still erase outright.
     """
-    try:
-        fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
-        return
+    fd = os.open(str(path), os.O_RDONLY)
     try:
         os.fsync(fd)
-    except OSError:
-        pass
     finally:
         os.close(fd)
 
@@ -343,8 +340,15 @@ class Journal:
     #: File-descriptor fsync, injected so offline tests can fault-inject sync
     #: failures and assert the write/flush/sync/ACK (and sync/effect) ordering.
     file_sync: Callable[[int], None] = field(default=_fsync_file)
-    #: Directory-entry fsync for a freshly created journal file (best-effort).
+    #: Directory-entry fsync for a freshly created journal file. A failure here
+    #: must block the caller's acceptance (behavior 1, 4, 7 / P6), so unlike a
+    #: best-effort sync it is allowed to raise.
     dir_sync: Callable[[Path], None] = field(default=_fsync_directory)
+    #: Parent directories whose journal-file entry has already been durably
+    #: synced. A path enters here only after its ``dir_sync`` succeeds (or after
+    #: ``load`` observes a file that already survived to disk), so a failed sync
+    #: is not skipped on retry merely because the file now exists.
+    _dir_synced: set[Path] = field(default_factory=set, init=False)
 
     def __post_init__(self) -> None:
         # A journal pointed at a real directory reconstructs its lines on
@@ -373,6 +377,10 @@ class Journal:
         with self._lock:
             loaded: dict[str, list[dict[str, Any]]] = {}
             for path in sorted(self.home.glob(f"{self.scope}-*.jsonl")):
+                # A file that survived to be read back already has a durable
+                # directory entry; mark its parent as synced so a later append
+                # does not re-sync (or skip) it incorrectly.
+                self._dir_synced.add(path.parent)
                 goal = path.name[len(self.scope) + 1 : -len(".jsonl")]
                 # Read *bytes* and split on newlines before decoding: a crash
                 # mid-``append`` can leave a torn multi-byte UTF-8 character at
@@ -487,6 +495,28 @@ class Journal:
         self._seq[goal] = seq
         return seq
 
+    def _ensure_directory(self, path: Path) -> list[Path]:
+        """Create ``path`` and any missing ancestors, returning the newly
+        created directories deepest-first (empty when the chain already exists).
+
+        ``mkdir(parents=True, exist_ok=True)`` cannot report which ancestor
+        links are new, and a journal file's parent directory plus every
+        newly-created ancestor's parent directory entry must each reach stable
+        storage or a host crash can still lose the file or an entire directory
+        level (behavior 1, 4, 7 / P6).
+        """
+        missing: list[Path] = []
+        current = path
+        while not current.exists():
+            missing.append(current)
+            parent = current.parent
+            if parent == current:  # filesystem root; cannot go higher
+                break
+            current = parent
+        for directory in reversed(missing):
+            directory.mkdir()
+        return missing
+
     def _persist_append(self, goal: str, blob: str) -> None:
         """Durably append ``blob`` to ``goal``'s journal file.
 
@@ -494,18 +524,31 @@ class Journal:
         a caller's acceptance acknowledgement (``submit``) or the start of an
         external effect (``_deliver``) cannot run ahead of the record reaching
         stable storage (behavior 1, 4, 7 / P6). A freshly created file also
-        syncs its parent directory entry. A fsync failure propagates so the
-        caller issues no ack and admits nothing in memory.
+        syncs its parent directory entry *and* every newly-created ancestor
+        directory entry, so a crash cannot lose the file's very existence or a
+        whole directory level. A file or directory fsync failure propagates: the
+        caller issues no ack and admits nothing in memory, and the directory
+        entry is not marked synced, so a retry re-attempts the incomplete sync
+        instead of skipping it because the path now exists.
         """
         path = self._path(goal)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        existed = path.exists()
+        new_dirs = self._ensure_directory(path.parent)
+        needs_dir_sync = path.parent not in self._dir_synced
         with path.open("a", encoding="utf-8") as fh:
             fh.write(blob)
             fh.flush()
             self.file_sync(fh.fileno())
-        if not existed:
-            self.dir_sync(path.parent)
+        if needs_dir_sync:
+            # Deepest-first: the journal file's own parent directory (which
+            # gained the file entry), then each newly-created directory's parent
+            # (which gained the new child entry).
+            dirs: list[Path] = [path.parent]
+            for directory in new_dirs:
+                if directory.parent not in dirs:
+                    dirs.append(directory.parent)
+            for directory in dirs:
+                self.dir_sync(directory)
+            self._dir_synced.add(path.parent)
 
     def append(self, goal: str, record: dict[str, Any]) -> dict[str, Any]:
         """Append one line; return it with its assigned ``seq`` (if absent).

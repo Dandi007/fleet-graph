@@ -825,7 +825,7 @@ class TestDurableJournalSync:
         with pytest.raises(OSError):
             kernel.submit(GOAL, make_request("A"))
 
-    def test_new_file_creation_syncs_the_parent_directory(self, tmp_path) -> None:
+    def test_new_file_creation_syncs_the_parent_directory_and_its_chain(self, tmp_path) -> None:
         synced_dirs: list[str] = []
 
         def dir_sync(path) -> None:
@@ -833,10 +833,74 @@ class TestDurableJournalSync:
 
         journal = Journal(home=tmp_path / "j", dir_sync=dir_sync)
         journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v1"})
-        assert synced_dirs == [str(tmp_path / "j")]
+        # Deepest-first: the journal file's own parent directory, then the parent
+        # that gained the new directory entry pointing at that parent, so a crash
+        # cannot lose the newly-created directory level (behavior 1, 4, 7 / P6).
+        assert synced_dirs == [str(tmp_path / "j"), str(tmp_path)]
         # An existing file is appended again without re-syncing the directory.
         journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v2"})
-        assert synced_dirs == [str(tmp_path / "j")]
+        assert synced_dirs == [str(tmp_path / "j"), str(tmp_path)]
+
+    def test_new_file_creation_syncs_every_new_directory_ancestor(self, tmp_path) -> None:
+        synced_dirs: list[str] = []
+
+        def dir_sync(path) -> None:
+            synced_dirs.append(str(path))
+
+        # tmp_path/"a"/"b"/"j" is entirely new below the existing tmp_path; the
+        # file's own parent plus every new ancestor's parent must be synced
+        # deepest-first (tmp_path gained the "a" entry, a gained "b", b gained
+        # "j", and j gained the journal file).
+        journal = Journal(home=tmp_path / "a" / "b" / "j", dir_sync=dir_sync)
+        journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v1"})
+        a = tmp_path / "a"
+        b = a / "b"
+        j = b / "j"
+        assert synced_dirs == [str(j), str(b), str(a), str(tmp_path)]
+
+    def test_dir_sync_failure_aborts_without_admitting_the_record(self, tmp_path) -> None:
+        def broken_dir_sync(path) -> None:
+            raise OSError("directory sync failed")
+
+        journal = Journal(home=tmp_path / "j", dir_sync=broken_dir_sync)
+        with pytest.raises(OSError):
+            journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v1"})
+        # The directory entry was not durable, so the record is not admitted and
+        # the file's very existence must not be relied upon.
+        assert journal.scan(GOAL) == []
+
+    def test_submit_does_not_ack_when_the_directory_sync_fails(self, tmp_path) -> None:
+        def broken_dir_sync(path) -> None:
+            raise OSError("directory sync failed")
+
+        kernel = GoalRequestKernel(
+            journal=Journal(home=tmp_path / "j", dir_sync=broken_dir_sync),
+            effects=FakeEffects(),
+        )
+        with pytest.raises(OSError):
+            kernel.submit(GOAL, make_request("A"))
+        # The acknowledgement was withheld: nothing was queued or recorded.
+        assert kernel.list_events(GOAL)["events"] == []
+
+    def test_dir_sync_retry_reattempts_the_sync_even_when_the_path_exists(
+        self, tmp_path
+    ) -> None:
+        attempts: list[str] = []
+
+        def flaky_dir_sync(path) -> None:
+            attempts.append(str(path))
+            if len(attempts) == 1:
+                raise OSError("first directory sync fails")
+
+        journal = Journal(home=tmp_path / "j", dir_sync=flaky_dir_sync)
+        with pytest.raises(OSError):
+            journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v1"})
+        assert journal.scan(GOAL) == []
+        # The file now exists on disk, but its directory entry was never durably
+        # synced: a retry must not skip the sync merely because the path exists.
+        journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v2"})
+        assert attempts == [str(tmp_path / "j"), str(tmp_path / "j")]
+        assert any(r.get("version") == "v2" for r in journal.scan(GOAL))
 
     def test_external_effect_runs_only_after_intent_sync(self, tmp_path) -> None:
         order: list[str] = []
