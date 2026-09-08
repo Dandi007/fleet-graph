@@ -2027,6 +2027,154 @@ class TestCompletionModeRecovery:
         assert rebuilt.journal.inflight(GOAL) is None
 
 
+# --- final review: interrupted graceful stop reconciles to stopped, not stranded ---
+
+
+class TestInterruptedGracefulStopReconciles:
+    def test_graceful_stop_interrupted_before_stop_list_reconciles_to_stopped(
+        self, tmp_path
+    ) -> None:
+        # A graceful stop records ``stopping`` while a call is in flight; the
+        # process then dies before that call persists its Stop List (so no result
+        # was produced and no CALL_RESULT exists). Restore must reconcile the
+        # drained-with-nothing-to-drain state to ``stopped`` -- never strand the
+        # goal in ``stopping`` with no in-flight call left to complete it
+        # (behaviors 5/7).
+        home = tmp_path / "journal"
+        journal = Journal(home=home)
+        journal.append(
+            GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v1", "at": "t"}
+        )
+        journal.append(
+            GOAL,
+            {
+                "record": RECORD_REQUEST,
+                "goal": GOAL,
+                "request_id": "A",
+                "caller": "line-a",
+                "kind": KIND_DD_RESULT,
+                "input": {"note": "A"},
+                "goal_version": "v1",
+                "accepted_at": "t",
+            },
+        )
+        journal.append(
+            GOAL,
+            {
+                "record": RECORD_CALL,
+                "goal": GOAL,
+                "call_id": "call:A",
+                "request_id": "A",
+                "run_id": "run-A",
+                "caller": "line-a",
+                "goal_version": "v1",
+                "at": "t",
+            },
+        )
+        journal.append(
+            GOAL,
+            {
+                "record": RECORD_CONTROL,
+                "goal": GOAL,
+                "control": "mode",
+                "value": MODE_STOPPING,
+                "at": "t",
+            },
+        )
+
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        # The interrupted drain reconciles to ``stopped``, never ``stopping``.
+        assert rebuilt._state[GOAL]["mode"] == MODE_STOPPED
+        assert rebuilt._state[GOAL]["mode"] != MODE_STOPPING
+        assert rebuilt.journal.inflight(GOAL) is None
+        assert rebuilt.next_goal_call(GOAL) is None  # stopped: nothing starts
+
+        # The interrupted request was not lost: resume lifts the stop and the
+        # requeued request is served again.
+        rebuilt.resume(GOAL)
+        assert rebuilt._state[GOAL]["mode"] == MODE_RUNNING
+        nxt = rebuilt.next_goal_call(GOAL)
+        assert nxt is not None and nxt["request_id"] == "A"
+        assert not nxt.get("resume")  # a fresh Goal call, not a resume
+
+    def test_graceful_stop_with_a_persisted_stop_list_still_drains_on_resume(
+        self, tmp_path
+    ) -> None:
+        # The reconciliation must not over-reach: a ``stopping`` goal whose call
+        # *did* persist its validated Stop List before the crash still has a
+        # result to drain, so it resumes under its original identities instead of
+        # being collapsed to ``stopped`` (behaviors 5/7).
+        home = tmp_path / "journal"
+        journal = Journal(home=home)
+        journal.append(
+            GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v1", "at": "t"}
+        )
+        journal.append(
+            GOAL,
+            {
+                "record": RECORD_REQUEST,
+                "goal": GOAL,
+                "request_id": "A",
+                "caller": "line-a",
+                "kind": KIND_DD_RESULT,
+                "input": {"note": "A"},
+                "goal_version": "v1",
+                "accepted_at": "t",
+            },
+        )
+        journal.append(
+            GOAL,
+            {
+                "record": RECORD_CALL,
+                "goal": GOAL,
+                "call_id": "call:A",
+                "request_id": "A",
+                "run_id": "run-A",
+                "caller": "line-a",
+                "goal_version": "v1",
+                "at": "t",
+            },
+        )
+        journal.append(
+            GOAL,
+            {
+                "record": RECORD_CONTROL,
+                "goal": GOAL,
+                "control": "mode",
+                "value": MODE_STOPPING,
+                "at": "t",
+            },
+        )
+        journal.append(
+            GOAL,
+            {
+                "record": RECORD_STOP_LIST,
+                "goal": GOAL,
+                "call_id": "call:A",
+                "request_id": "A",
+                "run_id": "run-A",
+                "intent": None,
+                "raw_actions": [],
+                "raw_intent": None,
+                "actions": [],
+                "malformed": [],
+                "at": "t",
+            },
+        )
+
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        # Still ``stopping``: a persisted Stop List keeps the drain alive; the
+        # call is resumed (not requeued) and ``next_goal_call`` admits it.
+        assert rebuilt._state[GOAL]["mode"] == MODE_STOPPING
+        nxt = rebuilt.next_goal_call(GOAL)
+        assert nxt is not None and nxt["resume"] is True
+        assert nxt["call_id"] == "call:A"
+        # Draining the resumed call completes the graceful stop.
+        outcome = rebuilt.finish_goal_call(GOAL, nxt["call_id"], nxt["stop_list"])
+        assert not outcome.get("suspended")
+        assert rebuilt._state[GOAL]["mode"] == MODE_STOPPED
+
+
 # --- final review: completion must not overwrite a concurrent stop ----------
 
 

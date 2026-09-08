@@ -778,6 +778,15 @@ class GoalRequestKernel:
                     # Interrupted before any effect: re-queue and re-answer.
                     called.discard(current_call_request)
                     current_call = None
+            # A graceful stop that recorded ``stopping`` leaves no in-flight call
+            # to drain once its call is interrupted before persisting a Stop List
+            # (there is no result produced to drain). Reconcile that interrupted
+            # drain to ``stopped`` instead of stranding the goal in ``stopping``
+            # with no completion left to move it (behaviors 5/7, rf-823fba32).
+            # ``stopping`` is only retained when a resume marker keeps a drain
+            # alive (current_call still references a persisted Stop List).
+            if mode == MODE_STOPPING and current_call is None:
+                mode = MODE_STOPPED
             queue = [
                 line
                 for line in lines
