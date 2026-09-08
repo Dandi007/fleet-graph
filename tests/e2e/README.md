@@ -34,6 +34,27 @@ make test-end-to-end CANDIDATE=codex CASE=single-repo
 
 backend 是 Docker internal network。candidate、runner、Work Folder、agent-bus、Git remote 均只有该网络，工作目录、session 和数据库使用本次 named volumes。不存在宿主 HOME、生产工作目录或 Docker socket 挂载。验证器使用只读 workspace，candidate 镜像不包含隐藏功能测试。
 
+```mermaid
+flowchart LR
+  subgraph Docker[本次 Docker project]
+    subgraph Internal[internal network]
+      Runner[测试驱动] --> Candidate[Fleet + Runtime]
+      Candidate --> WF[Work Folder + 搜索 + 索引器]
+      Candidate --> Bus[agent-bus]
+      WF --> Git[内部 Git remote]
+      Candidate --> Workspace[工作目录 volume]
+      Runner --> Evidence[原始证据 volume]
+    end
+    Candidate --> Gateway[固定网关转发]
+    Candidate --> Egress[GitHub HTTPS 代理]
+    Verifier[独立 verifier / 无网络] -.只读.-> Workspace
+    Verifier -.只读.-> Evidence
+    Gateway --> Relay[专用 host-network relay]
+  end
+  Relay --> HostGateway[宿主模型网关]
+  Egress --> GitHub[GitHub 专用测试仓库]
+```
+
 `egress` 只接收 GitHub 域名的 HTTPS CONNECT；`gateway` 只转发固定模型网关。宿主网关监听 loopback 时，由一个无宿主数据挂载的 host-network relay 转发到固定端口，该 relay 仅绑定 Docker host-gateway 地址。它是明确的外部接口边界，产品工作容器仍在独立网络中。
 
 运行证据写入 `.runtime/e2e/runs/<run_id>/`：实际命令日志、解析后的 Compose、候选来源、公开 API 原始记录、session、功能判定、WF/bus 数据和 Git 仓库。停止服务后才导出数据；导出成功才删除 volumes。导出失败时停止容器、保留 volumes，需按日志中的 Compose project name 恢复导出。所有结果都在 `execution.json` 明确标注。
