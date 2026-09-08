@@ -1,6 +1,6 @@
 {
  "development_id": "dev-fg-91bb67e8747f",
- "generation": 5,
+ "generation": 7,
  "acceptance_commands": [
   [
    ".venv/bin/python",
@@ -26,6 +26,9 @@
  ],
  "acceptance_env": {
   "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
-  "PYTEST_PLUGINS": ""
+  "PYTEST_PLUGINS": "",
+  "UV_CACHE_DIR": "/data/code/fleet-comparison/self/wf-2bf703-fleet-graph-dd01/.uv/cache",
+  "UV_LINK_MODE": "copy",
+  "UV_OFFLINE": "1"
  }
 }
