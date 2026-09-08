@@ -540,34 +540,68 @@ class Journal:
         caller issues no ack and admits nothing in memory, and the directory
         entry is not marked synced, so a retry re-attempts the incomplete sync
         instead of skipping it because the path now exists.
+
+        On any sync failure the partially-written record is rolled back to the
+        file's original size (best-effort). Without that, a failure *after* the
+        bytes were flushed (a ``file_sync`` or ``dir_sync`` error) would leave
+        the record on disk while ``append`` admits nothing in memory; a
+        same-identity retry would then blindly re-append the same request, and a
+        rebuilt kernel would serve it twice (final review finding, behavior
+        1/2/7, P5/P6). Rolling the partial write back keeps disk and memory in
+        agreement -- nothing admitted, nothing durable -- so the retry writes the
+        record exactly once.
         """
         path = self._path(goal)
         new_dirs = self._ensure_directory(path.parent)
         self._created_dirs.update(new_dirs)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(blob)
-            fh.flush()
-            self.file_sync(fh.fileno())
-        # Directories whose child entries must reach stable storage, deepest-
-        # first: the journal file's own parent (which gained the file entry),
-        # then the parent of each directory this journal has ever created (which
-        # gained a new child-directory entry). The order is driven by the durable
-        # ``_dir_synced`` watermark, *not* by which directories happen to be new
-        # on this specific append: after a partial failure the retry re-derives
-        # the still-unsynced ancestors from ``_created_dirs`` and re-syncs them,
-        # never skipping the intermediate ancestor entries just because those
-        # paths now exist (final review finding, behavior 1/4/7, P6).
-        needed: list[Path] = []
-        if path.parent not in self._dir_synced:
-            needed.append(path.parent)
-        for directory in sorted(self._created_dirs, key=lambda d: len(d.parts), reverse=True):
-            parent = directory.parent
-            if parent in self._dir_synced or parent in needed:
-                continue
-            needed.append(parent)
-        for directory in needed:
-            self.dir_sync(directory)
-            self._dir_synced.add(directory)
+        original_size = path.stat().st_size if path.exists() else 0
+        try:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(blob)
+                fh.flush()
+                self.file_sync(fh.fileno())
+            # Directories whose child entries must reach stable storage, deepest-
+            # first: the journal file's own parent (which gained the file entry),
+            # then the parent of each directory this journal has ever created
+            # (which gained a new child-directory entry). The order is driven by
+            # the durable ``_dir_synced`` watermark, *not* by which directories
+            # happen to be new on this specific append: after a partial failure
+            # the retry re-derives the still-unsynced ancestors from
+            # ``_created_dirs`` and re-syncs them, never skipping the
+            # intermediate ancestor entries just because those paths now exist
+            # (final review finding, behavior 1/4/7, P6).
+            needed: list[Path] = []
+            if path.parent not in self._dir_synced:
+                needed.append(path.parent)
+            for directory in sorted(self._created_dirs, key=lambda d: len(d.parts), reverse=True):
+                parent = directory.parent
+                if parent in self._dir_synced or parent in needed:
+                    continue
+                needed.append(parent)
+            for directory in needed:
+                self.dir_sync(directory)
+                self._dir_synced.add(directory)
+        except Exception:
+            self._rollback_append(path, original_size)
+            raise
+
+    def _rollback_append(self, path: Path, original_size: int) -> None:
+        """Best-effort undo of a partially-durable append (sync failure).
+
+        The sync failure above has already propagated; this simply truncates the
+        just-written bytes so the on-disk journal agrees with the still-empty
+        in-memory state. ``load`` isolates any torn tail left behind if the
+        truncate itself cannot run (e.g. a crash between the write and this
+        rollback), so the invariant "at most one durable record per request
+        identity" is never lost.
+        """
+        try:
+            with path.open("r+b") as fh:
+                fh.truncate(original_size)
+        except OSError:
+            # Best-effort: the sync failure is already the reported error. A
+            # torn append left behind is isolated by ``load`` on reconstruction.
+            pass
 
     def append(self, goal: str, record: dict[str, Any]) -> dict[str, Any]:
         """Append one line; return it with its assigned ``seq`` (if absent).
@@ -969,12 +1003,23 @@ class GoalRequestKernel:
             # alive (current_call still references a persisted Stop List).
             if mode == MODE_STOPPING and current_call is None:
                 mode = MODE_STOPPED
-            queue = [
-                line
-                for line in lines
-                if line.get("record") == RECORD_REQUEST
-                and str(line.get("request_id") or "") not in called
-            ]
+            # Rebuild the unserved request queue in durable order, dedup'd by
+            # request id: besides skipping requests that were already called, a
+            # request identity that reached disk twice is served at most once
+            # after reconstruction (final review finding, behavior 1/2/7,
+            # P5/P6). The durable event stream is unchanged -- this only governs
+            # which records ``next_goal_call`` may claim -- so lossless
+            # pagination still sees every recorded payload.
+            queue: list[dict[str, Any]] = []
+            queued_ids: set[str] = set()
+            for line in lines:
+                if line.get("record") != RECORD_REQUEST:
+                    continue
+                request_id = str(line.get("request_id") or "")
+                if request_id in called or request_id in queued_ids:
+                    continue
+                queued_ids.add(request_id)
+                queue.append(line)
             self._versions[goal] = version
             self._mode[goal] = mode
             self._state[goal] = {

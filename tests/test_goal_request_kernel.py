@@ -936,6 +936,57 @@ class TestDurableJournalSync:
         ]
         assert any(r.get("version") == "v2" for r in journal.scan(GOAL))
 
+    def test_same_request_retry_after_dir_sync_failure_serves_once(self, tmp_path) -> None:
+        # Final review finding: a directory-sync failure *after* the request was
+        # flushed left the record on disk while the caller had admitted nothing,
+        # so a same-identity retry re-appended it and a rebuilt kernel served the
+        # request twice. The partial write is rolled back on the failed append;
+        # the retry writes exactly once and a rebuild serves exactly once.
+        calls: list[str] = []
+
+        def flaky_dir_sync(path) -> None:
+            calls.append(str(path))
+            if len(calls) == 1:
+                raise OSError("first directory sync fails")
+
+        home = tmp_path / "j"
+        journal = Journal(home=home, dir_sync=flaky_dir_sync)
+        kernel = GoalRequestKernel(journal=journal, effects=FakeEffects())
+
+        with pytest.raises(OSError):
+            kernel.submit(GOAL, make_request("A"))
+        # The failed append admitted nothing and rolled back its partial write.
+        assert kernel.list_events(GOAL)["events"] == []
+
+        acked = kernel.submit(GOAL, make_request("A"))
+        assert acked["duplicate"] is False
+        requests = [
+            e for e in kernel.list_events(GOAL)["events"] if e["record"] == RECORD_REQUEST
+        ]
+        assert [r["request_id"] for r in requests] == ["A"]
+
+        # Rebuild from the durable journal: the request is served exactly once.
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        first = rebuilt.next_goal_call(GOAL)
+        assert first is not None and first["request_id"] == "A"
+        rebuilt.finish_goal_call(GOAL, first["call_id"], {"actions": []})
+        assert rebuilt.next_goal_call(GOAL) is None
+
+    def test_reconstruction_dedups_a_duplicate_durable_request_identity(self, tmp_path) -> None:
+        # Defense-in-depth for "serve once": even if two durable records carry the
+        # same request identity (a crash in the rollback window), reconstruction
+        # claims the request at most once instead of draining duplicate rows.
+        home = tmp_path / "j"
+        journal = Journal(home=home)
+        journal.append(GOAL, make_request("A").as_record(accepted_at="t", goal_version="v1"))
+        journal.append(GOAL, make_request("A").as_record(accepted_at="t", goal_version="v1"))
+
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        first = rebuilt.next_goal_call(GOAL)
+        assert first is not None and first["request_id"] == "A"
+        rebuilt.finish_goal_call(GOAL, first["call_id"], {"actions": []})
+        assert rebuilt.next_goal_call(GOAL) is None
+
     def test_external_effect_runs_only_after_intent_sync(self, tmp_path) -> None:
         order: list[str] = []
 
