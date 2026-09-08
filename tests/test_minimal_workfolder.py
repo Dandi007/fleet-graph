@@ -349,8 +349,9 @@ def test_findings_mirror_only_warn_and_high(tmp_path: Path) -> None:
 
     assert result["stop"] == "done"
     assert harness.invoker.scribe_calls, "the scribe must have run"
-    # findings are mirrored once per goal boundary (turn → dd → turn = 3 scribe runs).
-    assert len(writer.findings_calls) == 3
+    # findings are mirrored once per goal boundary
+    # (turn → dd → turn → done = 4 scribe runs; done is a §12 boundary too).
+    assert len(writer.findings_calls) == 4
     for work_folder, lines in writer.findings_calls:
         assert work_folder == "wf-ab12cd"
         assert len(lines) == 2
