@@ -117,6 +117,7 @@ STOP_MODES = (STOP_GRACEFUL, STOP_IMMEDIATE)
 RECORD_REQUEST = "request"
 RECORD_CALL = "call"
 RECORD_CALL_RESULT = "call_result"
+RECORD_CALL_UNAVAILABLE = "call_unavailable"
 RECORD_ACTION = "action"
 RECORD_ACTION_RESULT = "action_result"
 RECORD_CONTROL = "control"
@@ -126,6 +127,7 @@ RECORDS = (
     RECORD_REQUEST,
     RECORD_CALL,
     RECORD_CALL_RESULT,
+    RECORD_CALL_UNAVAILABLE,
     RECORD_ACTION,
     RECORD_ACTION_RESULT,
     RECORD_CONTROL,
@@ -666,6 +668,19 @@ class GoalRequestKernel:
                 ):
                     current_call = None
                     current_call_request = None
+                elif (
+                    record == RECORD_CALL_UNAVAILABLE
+                    and current_call is not None
+                    and line.get("call_id") == current_call
+                ):
+                    # A Goal call that could not be executed (the ReAct port was
+                    # unavailable) is a recoverable failure, never a served
+                    # request: its request stays pending for a later bound port
+                    # instead of being dropped as "called" (final review finding).
+                    if current_call_request:
+                        called.discard(current_call_request)
+                    current_call = None
+                    current_call_request = None
             resume_call: str | None = None
             if current_call is not None and current_call_request:
                 if self._stop_list_line(goal, current_call) is not None:
@@ -771,6 +786,12 @@ class GoalRequestKernel:
     def _queue(self, goal: str, record: dict[str, Any]) -> None:
         st = self._state.setdefault(goal, self._default_state())
         st["queue"].append(record)
+
+    def _queue_front(self, goal: str, record: dict[str, Any]) -> None:
+        """Re-queue a request at its original head position (an aborted Goal
+        call restores its place so submission order is preserved)."""
+        st = self._state.setdefault(goal, self._default_state())
+        st["queue"].insert(0, record)
 
     def _mode_of(self, goal: str) -> str:
         return self._state.get(goal, {}).get("mode", MODE_RUNNING)
@@ -920,6 +941,40 @@ class GoalRequestKernel:
                 "at": _iso(self.clock),
             },
         )
+
+    def abort_unavailable_call(self, goal: str, call_id: str, *, reason: str) -> dict[str, Any]:
+        """Record an explicit Goal-call capability failure and release the fence
+        *without* consuming the request.
+
+        ``finish_goal_call`` persists a validated Stop List and a completed call
+        result -- but when the Goal-call port is unavailable there is no Goal
+        response to validate or execute, and fabricating an empty Stop List would
+        mark the accepted request served (restore would then treat it as called
+        and resubmission of its stable identity would be refused as a duplicate,
+        so a later bound port could not deliver the original request). Instead
+        this records the capability failure as a first-class journal line,
+        releases the ownership fence, and re-queues the request at its original
+        head position so it stays pending for a later bound port (final review
+        finding)."""
+        call = self._call_line(goal, call_id) or {}
+        request_id = str(call.get("request_id") or "")
+        record = self.journal.append(
+            goal,
+            {
+                "record": RECORD_CALL_UNAVAILABLE,
+                "goal": goal,
+                "call_id": call_id,
+                "request_id": request_id,
+                "reason": reason,
+                "at": _iso(self.clock),
+            },
+        )
+        self.journal.release_call(goal, call_id)
+        if request_id:
+            request = self._find_request(request_id)
+            if request is not None:
+                self._queue_front(goal, request)
+        return record
 
     def finish_goal_call(
         self, goal: str, call_id: str, stop_list: dict[str, Any]
@@ -1602,6 +1657,7 @@ __all__ = [
     "RECORD_ACTION_RESULT",
     "RECORD_CALL",
     "RECORD_CALL_RESULT",
+    "RECORD_CALL_UNAVAILABLE",
     "RECORD_CONTROL",
     "RECORD_REQUEST",
     "RECORD_STOP_LIST",

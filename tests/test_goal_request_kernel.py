@@ -32,6 +32,7 @@ from fleet_graph.goal.request_kernel import (
     RECORD_ACTION,
     RECORD_ACTION_RESULT,
     RECORD_CALL_RESULT,
+    RECORD_CALL_UNAVAILABLE,
     RECORD_REQUEST,
     RECORD_STOP_LIST,
     UNKNOWN,
@@ -1325,3 +1326,56 @@ class TestRawResponsePreservation:
         assert len(call_results) == 1
         assert call_results[0]["raw_intent"] == "mystery"
         assert call_results[0]["actions"] == raw["actions"]
+
+
+# --- final review: an unavailable Goal-call port must not consume requests -----
+
+
+class TestUnboundGoalCallPreservesRequests:
+    def test_requests_survive_an_unbound_port_and_deliver_once_in_order(self, tmp_path) -> None:
+        home = tmp_path / "journal"
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        kernel.activate_version(GOAL, "v1")
+        coord = KernelCoordinator(kernel=kernel, goal_call=None, folder_id=GOAL)
+
+        inbox = [
+            {"message_id": "m-A", "from_agent_id": "line-a", "body": "A"},
+            {"message_id": "m-B", "from_agent_id": "line-b", "body": "B"},
+            {"message_id": "m-C", "from_agent_id": "line-c", "body": "C"},
+        ]
+        verdict = coord.turn(1, {"folder_id": GOAL, "inbox_messages": inbox})
+        assert verdict["verdict"] == "blocked"
+        assert verdict["reason"] == "goal_call_unwired"
+
+        events = kernel.list_events(GOAL)["events"]
+        # Nothing was fabricated into a served request: no Stop List, no
+        # completed call result -- and the capability failure is recorded.
+        assert not [e for e in events if e["record"] == RECORD_STOP_LIST]
+        assert not [e for e in events if e["record"] == RECORD_CALL_RESULT]
+        assert any(e["record"] == RECORD_CALL_UNAVAILABLE for e in events)
+
+        # Reconstruct a fresh product and bind a fake Goal port: every original
+        # request is then delivered exactly once, oldest first.
+        class RecordingGoalCall:
+            def __init__(self) -> None:
+                self.request_ids: list[str] = []
+
+            def call(self, goal: str, prompt: dict[str, Any]) -> dict[str, Any]:
+                self.request_ids.append(str(prompt.get("request_id") or ""))
+                return {"actions": [], "intent": "done"}
+
+        port = RecordingGoalCall()
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        while True:
+            nxt = rebuilt.next_goal_call(GOAL)
+            if nxt is None:
+                break
+            rebuilt.finish_goal_call(
+                GOAL, nxt["call_id"], port.call(GOAL, {"request_id": nxt["request_id"]})
+            )
+
+        assert port.request_ids == [
+            f"line:{GOAL}:message:m-A",
+            f"line:{GOAL}:message:m-B",
+            f"line:{GOAL}:message:m-C",
+        ]

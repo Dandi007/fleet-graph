@@ -125,6 +125,11 @@ class KernelCoordinator:
             # drain (blocked/stopped return None from next_goal_call). Breaking
             # here on a waiting result would suppress the queued requests that
             # the waiting intent must not suppress.
+            if self.goal_call is None:
+                # An unbound Goal ReAct port keeps the request queued (aborted,
+                # never served) and every further pop would abort the same way,
+                # so stop draining this round instead of burning the queue.
+                break
 
         if last is None:
             return _parked_verdict(self.kernel, self.folder_id)
@@ -257,10 +262,13 @@ class KernelCoordinator:
         )
         prompt = build_goal_prompt(request, history=self._history(request.request_id))
         if self.goal_call is None:
-            # Release the fence and park: the Goal ReAct call is not bound, and
-            # fabricating an answer would be exactly the simulated success the
-            # spec forbids.
-            self.kernel.finish_goal_call(self.folder_id, call["call_id"], {"actions": []})
+            # The Goal ReAct call is not bound. Record the explicit capability
+            # failure and release the fence *without* fabricating a Stop List or
+            # a completed call result: the accepted request stays pending and a
+            # later bound port delivers it exactly once (final review finding).
+            self.kernel.abort_unavailable_call(
+                self.folder_id, call["call_id"], reason=GOAL_CALL_UNWIRED
+            )
             return {
                 "verdict": "blocked",
                 "waiting_on": "external",
