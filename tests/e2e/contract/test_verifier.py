@@ -27,6 +27,13 @@ if __name__ == "__main__":
 
 
 class ContractTests(unittest.TestCase):
+    def test_git_failure_includes_stderr(self):
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            self.assertRaisesRegex(RuntimeError, "not a git repository"),
+        ):
+            verifier.git(Path(temporary), "rev-parse", "HEAD")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

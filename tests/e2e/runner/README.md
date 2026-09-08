@@ -21,6 +21,8 @@ e2e 先运行 smoke，再把固定 fixture 初始化为新 Git 历史，push `e2
 
 独立 verifier 使用无网络、root filesystem 只读的容器，bundle 与最终 repo 只读挂载，报告单独写入 `/verification/verification.json`。可信 Runner 只采集输入，不在带写入凭证的容器里执行待验收功能代码。
 
+引擎退出并完成最终 target checkout 后，Runner 为仓库目录补齐读取与遍历权限，为普通文件补齐读取权限，跳过 symlink；原有写权限与文件 executable bit 保持不变。调整清单保存为 `raw/checkout-permissions.json`。这让移除全部 Linux capabilities 的独立 verifier 能读取候选用户创建的 Git objects，文件内容与 commit 不变。
+
 终局还从真实 agent-bus 的 `board:agent-runs` 频道完整回读消息，先保存 `raw/runtime-bus.json` 原始页，再核对成功 Goal/Impl 的 run_id、真实 sender、同版本 started/exited、事件顺序与退出码。普通 smoke 消息不能替代 runtime 生命周期消息；缺失或查询失败记入 collection-errors，外部验收器也独立检查原始消息。Goal reply 仍遵循候选公开 mailbox 协议。
 
 若连续两次轮询返回完全相同的 blocked 状态，且所有 run 都明确 finished，Runner 通过公开 goal_stop immediate 提前收口并保存 stop-reason、停止回执与失败证据。有 running、launching、collected、uncertain 或 paused run 时不会触发该规则；状态或新请求发生变化也会重新计数。

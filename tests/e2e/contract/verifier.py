@@ -66,8 +66,12 @@ def git(repo: Path, *args: str):
         text=True,
         capture_output=True,
         timeout=30,
-        check=True,
+        check=False,
     )
+    if result.returncode:
+        raise RuntimeError(
+            f"git {' '.join(args)} 失败（exit {result.returncode}）：{result.stderr.strip()[:4000]}"
+        )
     return result.stdout.strip()
 
 

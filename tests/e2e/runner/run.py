@@ -21,6 +21,7 @@ from pathlib import Path
 from adapter import Mapper
 from fastmcp import Client
 from monitor import BlockedIdleMonitor, EngineAbsentMonitor
+from permissions import prepare_readable
 
 HARNESS = Path("/harness")
 REPO = Path("/workspace/fixture")
@@ -384,6 +385,7 @@ async def e2e(bundle, candidate):
         raise RuntimeError("引擎仍活跃，不能变更最终 checkout")
     git("fetch", "origin", f"refs/heads/{target}")
     git("checkout", "--detach", "FETCH_HEAD")
+    write(bundle / "raw/checkout-permissions.json", prepare_readable(REPO))
     write(
         bundle / "raw/target-checkout.json",
         {"repository": repository, "target": target, "head": git("rev-parse", "HEAD")},
