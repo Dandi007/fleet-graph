@@ -48,4 +48,5 @@ test-docker-contracts:
 	uv run python -m unittest discover -s tests/e2e/contract -p 'test_*.py'
 	uv run python -m unittest discover -s tests/e2e/runner -p 'test_*.py'
 	uv run python -m unittest discover -s tests/e2e/candidate -p 'test_*.py'
+	uv run python -m unittest discover -s tests/e2e/services -p 'test_*.py'
 	uv run python -m unittest discover -s tests/e2e -p 'test_boundary.py'

@@ -262,6 +262,7 @@ def main():
                 for service, source, target in (
                     ("verifier", "/verification", "verification"),
                     ("work-folder", "/data/work-folder", "work-folder"),
+                    ("work-folder", "/data/search", "search"),
                     ("agent-bus", "/data/agent-bus", "agent-bus"),
                     ("git-remote", "/data/git", "git-remote"),
                     ("runner", "/workspace", "workspace"),

@@ -45,7 +45,7 @@ services:
   work-folder:
     build: {context: ../.., dockerfile: tests/e2e/services/work-folder.Dockerfile}
     networks: [backend]
-    volumes: [wf-data:/data/work-folder]
+    volumes: [wf-data:/data/work-folder, search-data:/data/search]
     depends_on:
       git-remote: {condition: service_healthy}
   agent-bus:
@@ -101,6 +101,7 @@ networks:
 volumes:
   git-data: {}
   wf-data: {}
+  search-data: {}
   bus-data: {}
   candidate-state: {}
   workspace: {}

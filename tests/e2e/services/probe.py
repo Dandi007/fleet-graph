@@ -49,13 +49,31 @@ async def wf_probe(write=False):
 
         await call("wf_list", {"limit": 1})
         if not write:
+            from work_folder_search import validate_index
+
+            index = validate_index(Path("/data/work-folder"), Path("/data/search"))
             found = await call("wf_search", {"query": "e2e-readiness", "top_k": 1})
             require(isinstance(found, list), "Work Folder 搜索 readiness 返回格式错误")
             backend = http_json(
-                "http://127.0.0.1:18082", "/search", body={"query": "e2e-readiness"}
+                "http://127.0.0.1:18082",
+                "/search",
+                body={
+                    "query": "INDEX",
+                    "top_k": 20,
+                    "filter": {"source_root": "/data/work-folder", "source_id": index["source_id"]},
+                },
             )
             require(backend.get("mode") == "keyword", "搜索服务未启用真实 keyword 模式")
-            return {"service": "work-folder", "readiness": "ok", "search_mode": "keyword"}
+            require(
+                any(hit.get("path") == "INDEX.md" for hit in backend.get("results", [])),
+                "真实搜索未命中已知存在的 INDEX.md",
+            )
+            return {
+                "service": "work-folder",
+                "readiness": "ok",
+                "search_mode": "keyword",
+                "index": index,
+            }
         run_id = uuid.uuid4().hex
         created = await call("wf_create", {"topic": f"容器契约探针-{run_id}"})
         folder_id = created["folder_id"]
@@ -76,29 +94,42 @@ async def wf_probe(write=False):
         )
         require(bool(written.get("commit")), "Work Folder 写入未返回 Git commit")
         deadline = asyncio.get_running_loop().time() + 20
+        transient_errors = []
         while True:
-            found = await call("wf_search", {"query": run_id, "top_k": 20})
-            require(isinstance(found, list), "Work Folder 搜索返回格式错误")
-            hits = [
-                hit
-                for hit in found
-                if hit.get("folder_id") == folder_id
-                and hit.get("filename") == "service-probe.md"
-                and run_id in hit.get("snippet", "")
-            ]
-            if hits:
-                break
+            remaining = deadline - asyncio.get_running_loop().time()
             require(
-                asyncio.get_running_loop().time() < deadline, "新写内容未在20秒内进入真实搜索索引"
+                remaining > 0, f"新写内容未在20秒内进入真实搜索索引；暂态错误：{transient_errors}"
             )
-            await asyncio.sleep(0.5)
+            try:
+                found = await asyncio.wait_for(
+                    call("wf_search", {"query": run_id, "top_k": 20}), timeout=remaining
+                )
+                require(isinstance(found, list), "Work Folder 搜索返回格式错误")
+                hits = [
+                    hit
+                    for hit in found
+                    if hit.get("folder_id") == folder_id
+                    and hit.get("filename") == "service-probe.md"
+                    and run_id in hit.get("snippet", "")
+                ]
+                if hits:
+                    require(asyncio.get_running_loop().time() <= deadline, "搜索结果超过20秒期限")
+                    break
+            except Exception as error:
+                transient_errors.append({"type": type(error).__name__, "detail": str(error)[:500]})
+            await asyncio.sleep(min(0.5, max(0, deadline - asyncio.get_running_loop().time())))
         return {
             "service": "work-folder",
             "read_write": "ok",
             "folder_id": folder_id,
             "commit": written["commit"],
             "content_revision": read.get("content_revision"),
-            "search": {"status": "passed", "query": run_id, "hits": hits},
+            "search": {
+                "status": "passed",
+                "query": run_id,
+                "hits": hits,
+                "transient_errors": transient_errors,
+            },
         }
 
 

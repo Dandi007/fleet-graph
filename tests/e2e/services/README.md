@@ -16,7 +16,7 @@ Work Folder 安装上述三个真实 Python package，固定 FastMCP `3.2.4`；�
 | Compose 服务名 | 端口与 API | 本次 named volume 目标 | 配置 |
 |---|---|---|---|
 | `git-remote` | `9418`，Git daemon | `/data/git` | 自动创建 `work-folder.git` bare 仓 |
-| `work-folder` | `5602/mcp`，真实 Streamable HTTP MCP | `/data/work-folder` | 等待 git-remote healthy 后启动 |
+| `work-folder` | `5602/mcp`，真实 Streamable HTTP MCP | `/data/work-folder` 与 `/data/search` | 等待 git-remote healthy 后启动 |
 | `agent-bus` | `7470`，真实 HTTP API | `/data/agent-bus` | 本次独立 `BUS_ADMIN_TOKEN`、`BUS_GATEWAY_TOKEN` |
 
 这些服务只接入本次 Compose 内部网络，不发布宿主端口。Git daemon 的 receive-pack
@@ -59,13 +59,16 @@ work-folder 容器执行。Work Folder 探针经过真实 `wf_create → fs_crea
 不访问外部 embedding。该测试覆盖真实关键词检索，**不覆盖向量检索质量**。
 
 索引只扫描 `/data/work-folder`，来源 ID 由真实 indexer 对该根路径生成，和 WF
-传入的 source filter 一致。缓存与搜索日志放在该 named volume 的
-`.katana/runtime/search`，通过容器自身缓存路径的 symlink 接入原服务默认配置；
+传入的 source filter 一致。缓存与搜索日志放在独立 named volume `/data/search`，
+通过容器自身缓存路径的 symlink 接入原服务默认配置；搜索产物不进入 WF Git 仓，
 不挂载宿主 HOME。原生 watcher 的更新等待为 0.5 秒 quiet / 2 秒 max-wait。
 
-healthcheck 真正调用 `wf_search` 和底层 `/search`，要求 backend mode 为 keyword。
+healthcheck 核对 manifest、chunks、来源 ID 与当前全部 Markdown 文件的 SHA256，
+真正调用 `wf_search` 和底层 `/search`，要求 backend mode 为 keyword 且命中 INDEX.md。
 读写探针还要求刚写入的唯一标识在 20 秒内通过 `wf_search` 返回，匹配 folder ID、
-filename 和 snippet。搜索服务或 watcher 退出时，入口停止 WF，避免数据面残缺仍假健康。
+filename 和 snippet。真实刷新期间的暂态错误记录在探针结果中并在同一20秒期限内
+重试，逾期仍然失败。搜索服务或 watcher 退出，或索引连续20秒失效/未保鲜时，
+入口停止 WF 并以非零状态退出，避免数据面残缺仍假健康。
 
 ## Runtime 生命周期接入
 
