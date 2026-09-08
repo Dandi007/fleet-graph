@@ -1,0 +1,11 @@
+{
+  "name": "minimal-cr",
+  "role": "cr",
+  "mcp": [],
+  "tools": ["read", "glob", "grep", "bash"],
+  "hooks": [],
+  "network": false,
+  "data_roots": [],
+  "permission_mode": "read-only",
+  "memory_injection": false
+}

@@ -1,0 +1,13 @@
+{
+  "name": "minimal-scribe",
+  "role": "scribe",
+  "mcp": [
+    {"server": "work-folder", "access": "read"}
+  ],
+  "tools": ["read", "glob", "grep"],
+  "hooks": [],
+  "network": false,
+  "data_roots": [],
+  "permission_mode": "read-only",
+  "memory_injection": false
+}
