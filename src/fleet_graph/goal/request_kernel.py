@@ -344,11 +344,21 @@ class Journal:
     #: must block the caller's acceptance (behavior 1, 4, 7 / P6), so unlike a
     #: best-effort sync it is allowed to raise.
     dir_sync: Callable[[Path], None] = field(default=_fsync_directory)
-    #: Parent directories whose journal-file entry has already been durably
-    #: synced. A path enters here only after its ``dir_sync`` succeeds (or after
-    #: ``load`` observes a file that already survived to disk), so a failed sync
-    #: is not skipped on retry merely because the file now exists.
+    #: Directories whose *child entries* have been durably synced. Every synced
+    #: directory is tracked here -- the journal file's own parent *and* each
+    #: created ancestor's parent, not just ``path.parent`` -- so a retry after a
+    #: partial failure re-derives the still-unsynced intermediate ancestors
+    #: instead of skipping them merely because the paths now exist (final review
+    #: finding, behavior 1/4/7, P6). A path enters only after its ``dir_sync``
+    #: succeeds (or after ``load`` observes a file that already survived to
+    #: disk), so a failed sync is never skipped just because the file exists.
     _dir_synced: set[Path] = field(default_factory=set, init=False)
+    #: Every directory this journal has ever created (via ``_ensure_directory``).
+    #: Remembering them -- rather than only the directories created on the
+    #: current append -- lets a retry after a partial directory sync re-derive
+    #: the full ancestor chain that still owes a child-entry sync, even though
+    #: the directories now exist and ``_ensure_directory`` reports nothing new.
+    _created_dirs: set[Path] = field(default_factory=set, init=False)
 
     def __post_init__(self) -> None:
         # A journal pointed at a real directory reconstructs its lines on
@@ -533,22 +543,31 @@ class Journal:
         """
         path = self._path(goal)
         new_dirs = self._ensure_directory(path.parent)
-        needs_dir_sync = path.parent not in self._dir_synced
+        self._created_dirs.update(new_dirs)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(blob)
             fh.flush()
             self.file_sync(fh.fileno())
-        if needs_dir_sync:
-            # Deepest-first: the journal file's own parent directory (which
-            # gained the file entry), then each newly-created directory's parent
-            # (which gained the new child entry).
-            dirs: list[Path] = [path.parent]
-            for directory in new_dirs:
-                if directory.parent not in dirs:
-                    dirs.append(directory.parent)
-            for directory in dirs:
-                self.dir_sync(directory)
-            self._dir_synced.add(path.parent)
+        # Directories whose child entries must reach stable storage, deepest-
+        # first: the journal file's own parent (which gained the file entry),
+        # then the parent of each directory this journal has ever created (which
+        # gained a new child-directory entry). The order is driven by the durable
+        # ``_dir_synced`` watermark, *not* by which directories happen to be new
+        # on this specific append: after a partial failure the retry re-derives
+        # the still-unsynced ancestors from ``_created_dirs`` and re-syncs them,
+        # never skipping the intermediate ancestor entries just because those
+        # paths now exist (final review finding, behavior 1/4/7, P6).
+        needed: list[Path] = []
+        if path.parent not in self._dir_synced:
+            needed.append(path.parent)
+        for directory in sorted(self._created_dirs, key=lambda d: len(d.parts), reverse=True):
+            parent = directory.parent
+            if parent in self._dir_synced or parent in needed:
+                continue
+            needed.append(parent)
+        for directory in needed:
+            self.dir_sync(directory)
+            self._dir_synced.add(directory)
 
     def append(self, goal: str, record: dict[str, Any]) -> dict[str, Any]:
         """Append one line; return it with its assigned ``seq`` (if absent).

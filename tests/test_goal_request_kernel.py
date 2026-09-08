@@ -896,10 +896,44 @@ class TestDurableJournalSync:
         with pytest.raises(OSError):
             journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v1"})
         assert journal.scan(GOAL) == []
-        # The file now exists on disk, but its directory entry was never durably
-        # synced: a retry must not skip the sync merely because the path exists.
+        # The file now exists on disk, but neither its own parent entry nor the
+        # newly-created directory's parent entry was durably synced: a retry must
+        # re-sync *both*, never skipping either merely because the paths exist
+        # (behavior 1/4/7, P6).
         journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v2"})
-        assert attempts == [str(tmp_path / "j"), str(tmp_path / "j")]
+        assert attempts == [
+            str(tmp_path / "j"),
+            str(tmp_path / "j"),
+            str(tmp_path),
+        ]
+        assert any(r.get("version") == "v2" for r in journal.scan(GOAL))
+
+    def test_dir_sync_retry_re_syncs_intermediate_ancestors_after_partial_failure(
+        self, tmp_path
+    ) -> None:
+        attempts: list[str] = []
+
+        def flaky_dir_sync(path) -> None:
+            attempts.append(str(path))
+            if len(attempts) == 3:
+                raise OSError("intermediate ancestor directory sync fails")
+
+        journal = Journal(home=tmp_path / "a" / "b" / "j", dir_sync=flaky_dir_sync)
+        with pytest.raises(OSError):
+            journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v1"})
+        assert journal.scan(GOAL) == []
+        # The two deepest directory entries (j, b) reached stable storage before
+        # the failure hit the "a" entry; the retry must re-sync only the still-
+        # unsynced "a" and its parent "tmp_path", never skipping an intermediate
+        # ancestor just because those paths now exist (final review finding).
+        journal.append(GOAL, {"record": RECORD_VERSION, "goal": GOAL, "version": "v2"})
+        assert attempts == [
+            str(tmp_path / "a" / "b" / "j"),
+            str(tmp_path / "a" / "b"),
+            str(tmp_path / "a"),  # the partial failure
+            str(tmp_path / "a"),  # retried
+            str(tmp_path),  # the topmost ancestor's parent entry
+        ]
         assert any(r.get("version") == "v2" for r in journal.scan(GOAL))
 
     def test_external_effect_runs_only_after_intent_sync(self, tmp_path) -> None:
