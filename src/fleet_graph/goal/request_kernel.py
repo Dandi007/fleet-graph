@@ -344,15 +344,26 @@ class Journal:
     #: must block the caller's acceptance (behavior 1, 4, 7 / P6), so unlike a
     #: best-effort sync it is allowed to raise.
     dir_sync: Callable[[Path], None] = field(default=_fsync_directory)
-    #: Directories whose *child entries* have been durably synced. Every synced
-    #: directory is tracked here -- the journal file's own parent *and* each
-    #: created ancestor's parent, not just ``path.parent`` -- so a retry after a
-    #: partial failure re-derives the still-unsynced intermediate ancestors
-    #: instead of skipping them merely because the paths now exist (final review
-    #: finding, behavior 1/4/7, P6). A path enters only after its ``dir_sync``
-    #: succeeds (or after ``load`` observes a file that already survived to
-    #: disk), so a failed sync is never skipped just because the file exists.
+    #: Ancestor directories whose *child-directory entries* have been durably
+    #: synced. Only directories this journal *created* (via
+    #: ``_ensure_directory``) and its parents are tracked here -- the parents
+    #: that gained a new child-directory entry, not the journal file's own
+    #: parent. Tracking them lets a retry after a partial failure re-derive the
+    #: still-unsynced intermediate ancestors instead of skipping them merely
+    #: because the paths now exist (final review finding, behavior 1/4/7, P6).
+    #: A parent enters only after its ``dir_sync`` succeeds, so a failed sync is
+    #: never skipped just because the directory now exists.
     _dir_synced: set[Path] = field(default_factory=set, init=False)
+    #: Journal files whose own directory entry has been durably synced. A *new*
+    #: file entry is a new durability obligation every time -- a second goal's
+    #: file in the same directory must re-sync that directory even though an
+    #: earlier file already synced it, and a repair that renames a new inode
+    #: over the filename changes the entry again. "The directory was synced
+    #: once" can therefore never stand in for syncing this specific entry
+    #: (final review finding, behavior 1/4/7, P6). A file enters only after its
+    #: parent's ``dir_sync`` succeeds (or after ``load`` observes a file that
+    #: already survived to disk).
+    _files_synced: set[Path] = field(default_factory=set, init=False)
     #: Every directory this journal has ever created (via ``_ensure_directory``).
     #: Remembering them -- rather than only the directories created on the
     #: current append -- lets a retry after a partial directory sync re-derive
@@ -388,9 +399,10 @@ class Journal:
             loaded: dict[str, list[dict[str, Any]]] = {}
             for path in sorted(self.home.glob(f"{self.scope}-*.jsonl")):
                 # A file that survived to be read back already has a durable
-                # directory entry; mark its parent as synced so a later append
-                # does not re-sync (or skip) it incorrectly.
-                self._dir_synced.add(path.parent)
+                # directory entry; mark *that file* as synced so a later append
+                # re-syncs only for a genuinely new file entry, never because a
+                # different goal's file once synced the same directory.
+                self._files_synced.add(path)
                 goal = path.name[len(self.scope) + 1 : -len(".jsonl")]
                 # Read *bytes* and split on newlines before decoding: a crash
                 # mid-``append`` can leave a torn multi-byte UTF-8 character at
@@ -497,8 +509,15 @@ class Journal:
         with tmp.open("w", encoding="utf-8") as fh:
             fh.write(clean)
             fh.flush()
-            os.fsync(fh.fileno())
+            self.file_sync(fh.fileno())
         os.replace(tmp, path)
+        # The rename bound a *new inode* to the filename. That fresh directory
+        # entry must reach stable storage too, or a crash can revert to the old
+        # entry and lose every later append that reached the new inode (final
+        # review finding, behavior 1/4/7, P6). The repair file's own transient
+        # entry is already gone by now, so one parent-directory sync captures
+        # the final binding.
+        self.dir_sync(path.parent)
 
     def _next_seq(self, goal: str) -> int:
         seq = self._seq.get(goal, 0) + 1
@@ -560,27 +579,34 @@ class Journal:
                 fh.write(blob)
                 fh.flush()
                 self.file_sync(fh.fileno())
-            # Directories whose child entries must reach stable storage, deepest-
-            # first: the journal file's own parent (which gained the file entry),
-            # then the parent of each directory this journal has ever created
-            # (which gained a new child-directory entry). The order is driven by
-            # the durable ``_dir_synced`` watermark, *not* by which directories
-            # happen to be new on this specific append: after a partial failure
-            # the retry re-derives the still-unsynced ancestors from
-            # ``_created_dirs`` and re-syncs them, never skipping the
-            # intermediate ancestor entries just because those paths now exist
-            # (final review finding, behavior 1/4/7, P6).
-            needed: list[Path] = []
-            if path.parent not in self._dir_synced:
-                needed.append(path.parent)
+            # Directory entries whose child entries must reach stable storage.
+            # Two distinct obligations are kept apart (final review finding,
+            # behavior 1/4/7, P6):
+            #
+            # 1. The journal *file's own* entry. A new file is a new entry in
+            #    ``path.parent`` every time -- a second goal's file in the same
+            #    directory must re-sync that directory even though an earlier
+            #    file already synced it, and "the directory was synced once"
+            #    can never stand in for syncing this specific entry. Tracked by
+            #    ``_files_synced``: the file is marked only after its parent's
+            #    ``dir_sync`` succeeds, so a partial-failure retry re-syncs it.
+            if path not in self._files_synced:
+                self.dir_sync(path.parent)
+                self._files_synced.add(path)
+            # 2. The parent entry of every directory this journal has *created*
+            #    (each gained a new child-directory entry exactly once). The
+            #    durable ``_dir_synced`` watermark -- updated immediately after
+            #    each successful sync, driven by the remembered ``_created_dirs``
+            #    -- lets a partial-failure retry re-derive the still-unsynced
+            #    intermediate ancestors and re-sync only those, never skipping
+            #    an ancestor entry just because the path now exists (final
+            #    review finding, behavior 1/4/7, P6).
             for directory in sorted(self._created_dirs, key=lambda d: len(d.parts), reverse=True):
                 parent = directory.parent
-                if parent in self._dir_synced or parent in needed:
+                if parent in self._dir_synced:
                     continue
-                needed.append(parent)
-            for directory in needed:
-                self.dir_sync(directory)
-                self._dir_synced.add(directory)
+                self.dir_sync(parent)
+                self._dir_synced.add(parent)
         except Exception:
             self._rollback_append(path, original_size)
             raise

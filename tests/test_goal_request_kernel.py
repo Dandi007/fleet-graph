@@ -1011,6 +1011,82 @@ class TestDurableJournalSync:
         assert "effect" in order
         assert order[order.index("effect") - 1] == "intent-fsync"
 
+    def test_second_goal_file_resyncs_the_directory_entry(self, tmp_path) -> None:
+        # A second goal's file in the same directory is a *new* directory entry:
+        # it must re-sync the parent directory even though the first goal's file
+        # already synced it. "The directory was synced once" can never stand in
+        # for syncing this specific entry (final review finding, behavior 1/4/7,
+        # P6).
+        synced_dirs: list[str] = []
+
+        def dir_sync(path) -> None:
+            synced_dirs.append(str(path))
+
+        home = tmp_path / "j"
+        journal = Journal(home=home, dir_sync=dir_sync)
+        journal.append("wf-1", {"record": RECORD_VERSION, "goal": "wf-1", "version": "v1"})
+        journal.append("wf-2", {"record": RECORD_VERSION, "goal": "wf-2", "version": "v1"})
+        # wf-1: file entry (home) + created ancestor parent (tmp_path). wf-2:
+        # its own new file entry (home) again; the already-synced ancestor is not
+        # re-synced.
+        assert synced_dirs == [str(home), str(tmp_path), str(home)]
+        assert any(r.get("version") == "v1" for r in journal.scan("wf-2"))
+
+    def test_second_goal_file_entry_sync_failure_rolls_back_and_resyncs(
+        self, tmp_path
+    ) -> None:
+        # Failure injection for the per-file-entry barrier: wf-2's own entry sync
+        # fails, so wf-2 is not admitted; the retry re-syncs wf-2's entry instead
+        # of skipping it because the directory was already synced for wf-1.
+        attempts: list[str] = []
+
+        def flaky_dir_sync(path) -> None:
+            attempts.append(str(path))
+            if len(attempts) == 3:
+                raise OSError("second goal file entry sync fails")
+
+        home = tmp_path / "j"
+        journal = Journal(home=home, dir_sync=flaky_dir_sync)
+        journal.append("wf-1", {"record": RECORD_VERSION, "goal": "wf-1", "version": "v1"})
+        assert journal.scan("wf-1") != []
+        with pytest.raises(OSError):
+            journal.append("wf-2", {"record": RECORD_VERSION, "goal": "wf-2", "version": "v1"})
+        assert journal.scan("wf-2") == []  # nothing admitted, partial write rolled back
+        journal.append("wf-2", {"record": RECORD_VERSION, "goal": "wf-2", "version": "v1"})
+        assert attempts == [str(home), str(tmp_path), str(home), str(home)]
+        assert journal.scan("wf-2") != []
+
+    def test_repair_replace_syncs_the_directory_after_the_rename(self, tmp_path) -> None:
+        # A damaged-tail repair rewrites the journal via an atomic rename, which
+        # binds a *new inode* to the filename. That fresh entry must reach stable
+        # storage before later appends can rely on the repaired file surviving a
+        # crash (final review finding, behavior 1/4/7, P6).
+        home = tmp_path / "journal"
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        kernel.activate_version(GOAL, "v1")
+        path = home / "goal-wf-1.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write('{"record": "request", "goal": "wf-1", "requ')
+
+        synced: list[str] = []
+
+        def dir_sync(directory) -> None:
+            synced.append(str(directory))
+
+        rebuilt = GoalRequestKernel(
+            journal=Journal(home=home, dir_sync=dir_sync), effects=FakeEffects()
+        )
+        # The repair's rename re-synced the repaired file's parent directory.
+        assert str(home) in synced
+        assert path.with_suffix(path.suffix + ".corrupt").exists()
+
+        # A later append lands on the repaired inode and survives a second
+        # reconstruction, never concatenating onto the orphaned fragment.
+        rebuilt.submit(GOAL, make_request("A"))
+        again = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        requests = [e for e in again.list_events(GOAL)["events"] if e["record"] == RECORD_REQUEST]
+        assert [r["request_id"] for r in requests] == ["A"]
+
 
 # --- raw event completeness (behavior 6) --------------------------------------
 
