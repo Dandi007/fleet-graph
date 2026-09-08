@@ -334,6 +334,7 @@ class Journal:
             for path in sorted(self.home.glob(f"{self.scope}-*.jsonl")):
                 goal = path.name[len(self.scope) + 1 : -len(".jsonl")]
                 raw_text = path.read_text(encoding="utf-8")
+                newline_terminated = raw_text.endswith("\n")
                 lines: list[dict[str, Any]] = []
                 tail_fragment: str | None = None
                 raw_lines = raw_text.split("\n")
@@ -355,6 +356,14 @@ class Journal:
                     lines.append(record)
                 if tail_fragment is not None:
                     self._isolate_incomplete_tail(path, lines, tail_fragment)
+                elif not newline_terminated and lines:
+                    # A complete, valid record terminated without its final
+                    # newline (a crash between the JSON object write and its
+                    # '\n') decodes here, but must be normalized before any
+                    # further append: otherwise the next record concatenates
+                    # onto it and the combined line no longer decodes on the
+                    # next load, losing both records (behavior 1/7, P6).
+                    self._rewrite_clean(path, lines)
                 loaded[goal] = lines
             self._lines = loaded
             self._seq = {}
@@ -370,24 +379,30 @@ class Journal:
         """Rewrite ``path`` as only its complete, newline-terminated records and
         archive the trailing fragment so a later ``append`` no longer writes
         after a partial line."""
+        self._rewrite_clean(path, lines)
+        corrupt_path = path.with_suffix(path.suffix + ".corrupt")
+        with corrupt_path.open("a", encoding="utf-8") as fh:
+            fh.write(fragment + "\n")
+
+    def _rewrite_clean(self, path: Path, lines: list[dict[str, Any]]) -> None:
+        """Atomically rewrite ``path`` as its complete, newline-terminated
+        records (crash-safe repair, finding 3 / behavior 7 / P6).
+
+        Never truncate the acknowledged prefix in place: write the retained
+        records to a scratch file in the same directory, flush it, then
+        atomically rename over the original. A crash at any point before the
+        rename leaves the original journal intact (the valid prefix plus its
+        trailing fragment), so the next load re-runs the same repair instead of
+        reading a torn file."""
         clean = "".join(
             json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in lines
         )
-        # Crash-safe repair (finding 3 / behavior 7 / P6): never truncate the
-        # acknowledged prefix in place. Write the retained records to a scratch
-        # file in the same directory, flush it, then atomically rename over the
-        # original. A crash at any point before the rename leaves the original
-        # journal intact (the valid prefix plus its trailing fragment), so the
-        # next load re-runs the same repair instead of reading a torn file.
         tmp = path.with_suffix(path.suffix + ".repair")
         with tmp.open("w", encoding="utf-8") as fh:
             fh.write(clean)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
-        corrupt_path = path.with_suffix(path.suffix + ".corrupt")
-        with corrupt_path.open("a", encoding="utf-8") as fh:
-            fh.write(fragment + "\n")
 
     def _next_seq(self, goal: str) -> int:
         seq = self._seq.get(goal, 0) + 1
@@ -1162,15 +1177,19 @@ class GoalRequestKernel:
         return found
 
     def outstanding_deliveries(self, goal: str) -> list[dict[str, Any]]:
-        """The goal's actions whose delivery is still unresolved.
+        """The goal's deliveries whose obligation is still unresolved.
 
-        A delivery obligation is born when an action intent is recorded and is
-        retired only by a *final* result record for that same action identity.
-        ``delivered`` and a definitive ``not_ready`` refusal are final, while a
-        ``failed`` or ``unknown`` result (``final`` falsy) is retryable or
-        uncertain and stays outstanding until it is resolved. Derived purely
-        from the durable journal, so a rebuilt product reconstructs the same
-        obligations (P4): ``done`` must not complete while any are outstanding.
+        A delivery obligation is born when an action intent is recorded. It is
+        retired only by *fulfillment* (``delivered``) or an *explicit
+        disposition* (a definitive refusal, e.g. a business-guard refusal) --
+        the finality of the attempt is deliberately kept separate from whether
+        the required delivery ever happened or was explicitly retired. A
+        ``not_ready`` receipt is final for the attempt (never blindly retried)
+        but is neither fulfilled nor explicitly disposed, so it stays
+        outstanding; ``unknown`` and a retryable ``failed`` delivery stay
+        outstanding too. Derived purely from the durable journal, so a rebuilt
+        product reconstructs the same obligations (P4): ``done`` must not
+        complete while any remain.
         """
         latest: dict[str, dict[str, Any]] = {}
         for line in self.journal.scan(goal):
@@ -1185,14 +1204,29 @@ class GoalRequestKernel:
         outstanding: list[dict[str, Any]] = []
         for action_id, entry in latest.items():
             result = entry["result"]
-            if result is None or not result.get("final"):
-                intent = entry["intent"] or {}
-                record = dict(intent)
-                record["action_id"] = action_id
-                if result is not None:
-                    record["latest_status"] = result.get("status")
-                outstanding.append(record)
+            if result is not None and self._delivery_retired(result):
+                continue
+            intent = entry["intent"] or {}
+            record = dict(intent)
+            record["action_id"] = action_id
+            if result is not None:
+                record["latest_status"] = result.get("status")
+            outstanding.append(record)
         return outstanding
+
+    @staticmethod
+    def _delivery_retired(result: dict[str, Any]) -> bool:
+        """Whether a delivery obligation is closed: fulfilled, or explicitly
+        disposed by a definitive refusal.
+
+        ``delivered`` is fulfillment. A definitive ``failed`` receipt (``final``
+        truthy) is only ever produced by a *refusal* (a business guard or a
+        malformed entry), which is an explicit disposition -- the delivery was
+        rejected, never forgotten. A ``not_ready`` receipt is ``final`` for the
+        attempt yet is neither fulfilled nor disposed, so it is *not* retired.
+        """
+        status = result.get("status")
+        return status == DELIVERED or (status == FAILED and bool(result.get("final")))
 
     def _result_record(
         self,
@@ -1288,7 +1322,11 @@ class GoalRequestKernel:
             final = True
         elif status == NOT_READY:
             # Unsupported downstream capability: an explicit, definitive
-            # not-ready receipt, never a simulated success and never retried.
+            # not-ready receipt, never a simulated success. The *attempt* is
+            # final (it is never blindly retried), but the required delivery is
+            # neither fulfilled nor explicitly disposed: it remains an
+            # outstanding obligation (P4) until Goal explicitly retires it, so
+            # a later ``done`` must not forget it.
             final = True
         elif status == UNKNOWN or raised:
             # An unknown outcome, or a failure whose true downstream state is

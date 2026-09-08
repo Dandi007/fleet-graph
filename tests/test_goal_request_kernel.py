@@ -844,6 +844,34 @@ class TestIncompleteTailIsolation:
         requests = [e for e in again.list_events(GOAL)["events"] if e["record"] == RECORD_REQUEST]
         assert [r["request_id"] for r in requests] == ["A"]
 
+    def test_complete_record_without_trailing_newline_is_normalized(self, tmp_path) -> None:
+        home = tmp_path / "journal"
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        kernel.activate_version(GOAL, "v1")
+        kernel.submit(GOAL, make_request("A"))
+        path = home / "goal-wf-1.jsonl"
+        # Simulate a crash between the JSON object write and its terminating
+        # newline: the file ends with a COMPLETE, valid record but no '\n'.
+        content = path.read_text(encoding="utf-8")
+        assert content.endswith("\n")
+        path.write_text(content[:-1], encoding="utf-8")
+        assert not path.read_text(encoding="utf-8").endswith("\n")
+
+        # load() accepts that object and normalizes the non-newline-terminated
+        # tail back to a newline-terminated journal, preserving the record.
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        assert path.read_text(encoding="utf-8").endswith("\n")
+        assert rebuilt.active_version(GOAL) == "v1"
+        requests = [e for e in rebuilt.list_events(GOAL)["events"] if e["record"] == RECORD_REQUEST]
+        assert [r["request_id"] for r in requests] == ["A"]
+
+        # A later append writes a standalone line: reloading reconstructs both
+        # records instead of rejecting a concatenated line.
+        rebuilt.submit(GOAL, make_request("B"))
+        again = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        requests = [e for e in again.list_events(GOAL)["events"] if e["record"] == RECORD_REQUEST]
+        assert [r["request_id"] for r in requests] == ["A", "B"]
+
 
 # --- interrupted-call recovery (behavior 7 / P6) ------------------------------
 
@@ -949,6 +977,39 @@ class TestOutstandingDeliveries:
         rebuilt.effects.observations[(ACTION_REPLY, "R")] = OBSERVED_CONFIRMED  # type: ignore[union-attr]
         run_one(rebuilt, make_request("B"), {"actions": [reply_action("R")]})
         assert rebuilt.outstanding_deliveries(GOAL) == []
+
+    def test_a_not_ready_delivery_is_final_but_stays_outstanding(self) -> None:
+        effects = FakeEffects()
+        effects.delivery[(ACTION_REPLY, "R")] = {
+            "ok": False,
+            "status": NOT_READY,
+            "detail": "no reply sink bound",
+        }
+        kernel = make_kernel(effects)
+        first = run_one(kernel, make_request("A"), {"actions": [reply_action("R")]})
+        assert first["results"][0]["status"] == NOT_READY
+        # Final for the attempt (never retried), but neither fulfilled nor
+        # explicitly disposed, so the required reply stays outstanding.
+        assert [o["idempotency_key"] for o in kernel.outstanding_deliveries(GOAL)] == ["R"]
+        # An empty ``done`` list from a later call cannot retire that obligation.
+        run_one(kernel, make_request("B"), {"actions": [], "intent": "done"})
+        assert [o["idempotency_key"] for o in kernel.outstanding_deliveries(GOAL)] == ["R"]
+
+    def test_an_explicit_refusal_disposes_its_obligation(self) -> None:
+        effects = FakeEffects()
+        kernel = make_kernel(effects)
+        kernel.activate_version(GOAL, "v2")
+        action = {
+            "kind": "approve",
+            "idempotency_key": "ap1",
+            "payload": {"development_id": "d1", "verdict": "APPROVE", "goal_version": "v1"},
+        }
+        result = run_one(kernel, make_request("A"), {"actions": [action]})
+        assert result["results"][0]["status"] == FAILED
+        # The stale-version refusal is an explicit disposition: the delivery was
+        # rejected outright, not merely left unfulfilled, so it is not
+        # outstanding and cannot keep a later ``done`` pending forever.
+        assert kernel.outstanding_deliveries(GOAL) == []
 
 
 class TestUncertainReconciliation:

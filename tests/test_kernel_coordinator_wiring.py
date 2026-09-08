@@ -19,6 +19,7 @@ from fleet_graph.goal.request_kernel import (
     ACTION_REPLY,
     DELIVERED,
     KIND_MESSAGE,
+    NOT_READY,
     UNKNOWN,
     GoalRequestKernel,
     Journal,
@@ -245,6 +246,66 @@ def test_done_stays_pending_while_a_prior_reply_is_unresolved() -> None:
     assert verdict["verdict"] == "blocked"  # done was not declared
     assert "outstanding" in verdict["reason"]
     assert len(effects.replies) == 1
+
+
+class NotReadyReplyEffects(KernelEffectPorts):
+    """An effect port whose reply returns NOT_READY: the required delivery is
+    neither fulfilled nor explicitly disposed, so it must keep a later
+    ``done`` pending even though the attempt itself is final (P4)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.replies: list[dict[str, Any]] = []
+
+    def reply(self, payload: dict[str, Any], *, ctx: dict[str, Any]) -> dict[str, Any]:
+        self.replies.append({"payload": payload, "ctx": dict(ctx)})
+        return {"ok": False, "status": NOT_READY, "detail": "no reply sink bound"}
+
+
+def test_done_stays_pending_while_a_prior_reply_returned_not_ready(tmp_path: Path) -> None:
+    # Two queued messages: A requests a reply that returns NOT_READY from an
+    # unbound reply port, B returns an empty done list. A's reply was never
+    # delivered and was never explicitly retired, so the drained turn must NOT
+    # complete done, and that obligation must survive reconstruction (P4).
+    call = SequenceGoalCall(
+        [
+            {
+                "actions": [
+                    {
+                        "kind": ACTION_REPLY,
+                        "idempotency_key": "R",
+                        "payload": {"text": "hi", "to": "line-a"},
+                    }
+                ]
+            },
+            {"actions": [], "intent": "done"},
+        ]
+    )
+    home = tmp_path / "journal"
+    kernel = GoalRequestKernel(journal=Journal(home=home), effects=NotReadyReplyEffects())
+    kernel.activate_version(GOAL, "v1")
+    coordinator = KernelCoordinator(
+        kernel=kernel,
+        goal_call=call,
+        folder_id=GOAL,
+        thread_id=f"{GOAL}:g1",
+        launch_id="launch-test",
+    )
+    inbox = [
+        {"message_id": "m-A", "from_agent_id": "line-a", "body": "msg A"},
+        {"message_id": "m-B", "from_agent_id": "line-b", "body": "msg B"},
+    ]
+
+    verdict = coordinator.turn(1, {"folder_id": GOAL, "inbox_messages": inbox})
+
+    assert len(call.prompts) == 2
+    assert verdict["verdict"] == "blocked"
+    assert "outstanding" in verdict["reason"]
+
+    # Reconstruction: a rebuilt product still holds the NOT_READY reply open as
+    # an outstanding obligation, so done cannot be forgotten across a restart.
+    rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=KernelEffectPorts())
+    assert [o["idempotency_key"] for o in rebuilt.outstanding_deliveries(GOAL)] == ["R"]
 
 
 def test_done_intent_with_an_unfulfilled_action_stays_pending() -> None:
