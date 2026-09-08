@@ -635,6 +635,7 @@ def run_goal(
     goal_id: str,
     enroll: dict[str, Any],
     checkpointer: Any = None,
+    initial_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the goal loop to a terminal stop; return ``{stop, summary, blocked}``.
 
@@ -645,6 +646,13 @@ def run_goal(
     ``events.jsonl`` is the only source of truth (protocol §11), recovery
     replays the event log and never resumes from checkpointed state
     (design.md §7.1 / GO-16).
+
+    ``initial_state`` is the resumed-start override (protocol §11): when it is
+    ``None`` the loop starts exactly as before (``turn_no=0`` etc., byte-for-byte
+    compatible with the pre-resume graph); otherwise its keys override the
+    corresponding keys of the initial graph state (``turn_no`` / ``last_seq`` /
+    ``dd_summary`` / ``warnings`` / ``last_dd`` …). The fold-upstream
+    :func:`~fleet_graph.minimal.engine.resume_initial_state` produces it.
     """
     graph = build_goal_graph(deps, checkpointer=checkpointer)
     initial: GoalGraphState = {
@@ -662,6 +670,8 @@ def run_goal(
         "blocked": None,
         "last_seq": 0,
     }
+    if initial_state is not None:
+        initial.update(initial_state)
     final = graph.invoke(
         initial,
         config={

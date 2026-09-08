@@ -319,6 +319,38 @@ def file_exists_at(worktree: str, commit: str, relpath: str, *, runner: GitRunne
     return _run(runner, argv, worktree).exit_code == 0
 
 
+def revision_reachable(
+    worktree: str,
+    remote: str,
+    branch: str,
+    sha: str,
+    *,
+    runner: GitRunner,
+) -> bool:
+    """Whether ``sha`` is still part of ``branch``'s history on ``remote``.
+
+    protocol §11's recovery state-mismatch gate: the engine records a
+    ``release_head`` / ``head_commit`` sha in events and, before resuming,
+    verifies that sha is still reachable from the branch tip. The tip may have
+    advanced since (a merge moving the branch forward keeps the old head as an
+    ancestor), but a rewritten / force-pushed branch loses it. The tip is read
+    via :func:`remote_tip`; a branch that no longer exists, a git failure, or a
+    non-ancestor sha all answer ``False`` — the caller blocks rather than guess
+    on possibly-rewritten state. A verbatim tip match answers ``True`` without
+    an extra ``merge-base`` round-trip.
+    """
+    try:
+        tip = remote_tip(worktree, remote, branch, runner=runner)
+    except GitError:
+        return False
+    if tip is None:
+        return False
+    if tip == sha:
+        return True
+    argv = _git(worktree, "merge-base", "--is-ancestor", sha, tip)
+    return _run(runner, argv, worktree).exit_code == 0
+
+
 def check_handoff(repos: list[RepoRef], *, runner: GitRunner) -> GateResult:
     """GO-28's handoff gate: pushed, HEAD == remote tip, clean worktree.
 
@@ -473,5 +505,6 @@ __all__ = [
     "check_handoff",
     "file_exists_at",
     "remote_tip",
+    "revision_reachable",
     "worktree_status",
 ]
