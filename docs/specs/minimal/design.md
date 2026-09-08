@@ -2,7 +2,7 @@
 
 > 状态：**v1 定稿（2026-09-06 10:5x，GO-16）**，无待定项。后续改动走新的 golden-order 段落并在 §7 追加记录。每条标注来源：〔GO-n〕= golden-order.md 第 n 段用户原话；〔已确认 GO-n〕= agent 起草、用户已 LGTM；〔推荐〕= agent 起草、用户尚未过目；〔待定〕= 尚未拍板。
 > 纪律：agent 的建议不作为决策 base〔GO-2〕。本文件只合成用户已定的内容，派生推论单独标出。
-> 更新：2026-09-06 12:4x（GO-17~25 增补）
+> 更新：2026-09-06 12:4x（GO-17~25 增补）；2026-09-08（GO-26~36 回写：§1 / §2 / §3 / §4 / §7，dd-24）
 
 ## 1. 组成：一个引擎、一个校验节点、五个流程 agent、一个书记员
 
@@ -10,19 +10,21 @@
 - 收 MCP 来的 goal enroll〔GO-7〕，跑校验节点〔GO-3.1〕
 - 按 Goal Agent 的 Stop 输出调度下一个要跑的东西〔GO-7〕
 - 跑程序化验收命令（每个 goal 必带，类似 make test）〔GO-6.1〕
-- git：只建分支（release 分支、单的分支）。**引擎自己不做任何 merge**，所有合并都是「源分支 → 目标分支」交 Merge Agent〔GO-15〕
+- git：enroll 后准备 release 分支——每 repo fetch，release 分支（goal 级 `source_branch`）缺失时从该 repo 的 `target_branch` 切出并 push〔GO-29/30/31〕；dd 分支与 worktree 的**创建**归 Goal Agent（§1 节点表、〔GO-36〕），引擎只机械核对。合并：Goal approve 后先看平台 mergeable，能合就合（平台合并），冲突 / 未知才交 Merge Agent〔GO-36〕；线 done 的 release → 目标分支合并交 Merge Agent〔GO-15〕
 - 数 turn 数与 DD 轮数，越 warning 线只告警不停〔GO-6.4〕
 - 写 event 日志，可观测性最高优先〔GO-7.3〕
-- **填写并核对每轮输入里的 git 上下文**（worktree 在哪、分支、当前 commit id），对不上就打回，不靠 agent 自述〔GO-25〕
+- **核对每次 agent 交接**：已 push、HEAD == remote tip、工作树干净〔GO-25 / GO-28〕，对不上就打回，不靠 agent 自述
 
 **校验节点**：程序化，确认输入请求符合协议〔GO-3.1〕。
 
-**机械化原则**〔GO-25〕：能机械化确定的都机械化——脚本化，或由外层框架（LangGraph 图）调度程序节点处理；只有需要自由裁量的才给 agent。分支规则（worktree 开在哪、分支叫什么、从哪个 commit 开）全部由引擎程序化决定，agent 只在给定 worktree 里干活；每轮输入必带 worktree 路径与 commit id，由引擎填、由引擎核，有问题就打回，这与协议化输出的约束是同一件事。系统的框架图、交互图、流程图必须清晰确定：每个节点是程序还是 agent、每条边由什么输出触发，都能画出来。节点清单如下，字段级核对规则见 protocol.md §0.10。
+**机械化原则**〔GO-25〕：能机械化确定的都机械化——脚本化，或由外层框架（LangGraph 图）调度程序节点处理；只有需要自由裁量的才给 agent。dd 分支与 worktree 的**创建**由 Goal Agent 按 protocol §2 的 DD 启动协议在 Stop 前完成，其余分支规则（release 分支名 = goal 级 `source_branch`、缺失时从 target 切出）由引擎程序化决定；引擎对创建结果做机械化核对（GO-36 五条 + 每次交接的「已 push、HEAD == remote tip、工作树干净」〔GO-28〕，commit sha 不进核对），agent 只在给定 worktree 里干活。系统的框架图、交互图、流程图必须清晰确定：每个节点是程序还是 agent、每条边由什么输出触发，都能画出来。节点清单如下，字段级核对规则见 protocol.md §0.10。
 
 | 节点 | 类型 | 进入条件（上一节点的输出） | 产出 |
 |---|---|---|---|
-| 校验节点 | 程序 | MCP 收到 enroll | 通过 → spawn 引擎；不通过 → 拒绝并给字段级错误 |
-| 建分支 / 开 worktree | 程序 | enroll 通过；Goal Agent `dispatch` | release 分支；单的分支 + worktree，从 release head 开 |
+| 校验节点 | 程序 | MCP 收到 enroll（`goal.enroll/2` 六字段） | 通过 → 程序化准备 + spawn 引擎；不通过 → 拒绝并给字段级错误 |
+| 准备 release 分支 | 程序 | enroll 通过 | 引擎根（状态归引擎〔GO-34〕）；每 repo fetch，release 分支（`source_branch`）缺失时从该 repo 的 `target_branch` 切出并 push〔GO-29/30/31〕 |
+| 建 dd 分支 / 开 worktree / 写 spec | agent（Goal Agent，Stop 前） | 即将 dispatch | 每个 repo：dd 分支、worktree、`docs/specs/N-XX.md`，commit 并 push〔GO-36〕 |
+| 核对 DD 就绪 / 开 PR / 基线 | 程序 | Goal Agent `dispatch` | GO-36 五条机械核 → 每 repo 开 PR（dd 分支 → release）→ base 上跑基线验收〔GO-34〕→ 起 Impl |
 | Goal Agent turn | agent | 线开始；上一张 DD 结束 | dispatch / done / blocked |
 | Impl | agent | dispatch；任何一步不过 | committed / failed |
 | 验收命令 | 程序 | Impl committed | pass → CR；fail → Impl |
@@ -52,13 +54,13 @@ Goal Agent 只有一个，第一性原理是判断工作是否完成〔GO-4.1〕
 
 **agent 间通信原则**〔GO-17〕：本次交接的内容（「你的工作有问题，问题是……」）写清楚、直接注入 prompt；历史信息不主动注入，只告诉 agent「所有消息都在 XX，需要自己去读」。协议里每个输入因此是「本次 + history 句柄」两层，见 protocol.md §0.7。「整个 goal 线程内所有 a2a 通信互相全可见」记为备选，暂不做〔GO-18〕。
 
-**WF 是 goal-enroll 的一等公民**〔GO-19〕：每个 goal 绑定一个 work folder（enroll 时传 id 或由 MCP 新建）；goal / spec / progress / findings 的正本在 WF，运行产物（events.jsonl、dd/）落在 WF 内的 `runs/<goal_id>/`，history 句柄带 WF id。字段见 protocol.md §1〔推荐〕。
+**WF 是 goal-enroll 的一等公民**〔GO-19；GO-34 修正落法〕：每个 goal 绑定一个 work folder（enroll 时传 id 或由 MCP 新建）；WF 只放人读的 goal / design / progress / findings 正本。运行时状态（events.jsonl、control.jsonl、sessions、worktrees、goal.enroll.json）不放 WF，由引擎在引擎根（默认 `/data/fleet/goals/<goal_id>/`）维护；history 句柄指向引擎根、带 WF id。字段见 protocol.md §1。
 
 ## 2. 线的循环
-1. 请求经 MCP goal enroll 进入，过校验节点。
+1. 请求经 MCP goal enroll 进入，过校验节点（`goal.enroll/2`）。
 2. Goal Agent 跑一个 turn，Stop 输出三选一：派 DD / done / blocked〔GO-4.4〕。
-3. 派 DD → 引擎执行 DD（§3），结束后结果进下一个 turn，回 2。
-4. done → 引擎调 Merge Agent 做 release → 目标分支（如 main）的合并〔GO-6.3, GO-15〕；rebase 动了代码则对 rebased 的 release 走一遍 CR → FR → Goal 审，过了再合〔GO-15〕。blocked → 写 event。
+3. 派 DD → `dispatch` 输出对象即 DD 启动协议〔GO-36〕：Goal Agent 已在 Stop 前建好 dd 分支 / worktree / 仓内 spec 并 push，引擎机械核五条后开 PR、在 base 跑基线，再执行 DD（§3），结束后结果进下一个 turn，回 2。
+4. done → 引擎按 repo 逐一做 release → 各自 `target_branch` 的合并，交 Merge Agent〔GO-6.3, GO-15, GO-31〕；rebase 动了代码则对 rebased 的 release 走一遍 CR → FR → Goal 审，过了再合〔GO-15〕。blocked → 写 event。
 
 ## 3. DD 的循环
 1. Impl 产出 commit。
@@ -66,12 +68,13 @@ Goal Agent 只有一个，第一性原理是判断工作是否完成〔GO-4.1〕
 3. CR；不过回 1。
 4. FR，做真正的验收（可部署、测试）〔GO-6.1〕；不过回 1。
 5. Goal Agent 审单：approve / reject 带消息〔GO-5〕。reject 回 1，DD 继续。
-6. Merge Agent 做「单的分支 → 本线 release 分支」，冲突自行 rebase，Stop 时必须已处理完〔GO-5, GO-15〕。
+6. 合并「dd 分支 → 本线 release 分支」：Goal approve 后引擎先看平台 mergeable，MERGEABLE 就直接平台合并〔GO-36〕；冲突 / 未知才交 Merge Agent，冲突自行 rebase，Stop 时必须已处理完〔GO-5, GO-15〕。
    - rebase 改了代码 → 回 3，**完整再走 CR → FR → Goal Agent 审单**，Goal 再 approve 一次才合〔GO-15，覆盖 GO-14 的「直接推」〕。多一次 review 不亏。
    - 任何一步不过 → 回 1，且 **impl 每跑一次 approve 清零**〔已确认 GO-14〕。
+7. 收尾〔GO-35〕：merged → PR 已合并即收；failed → close 不合并；两种结局都删 worktree、删远端 dd 分支，结果交回 Goal Agent。
 
-## 4. 分支模型〔GO-6.3, GO-15〕
-单的分支 → 本线 release 分支（开发期间所有单都合到这里） → 线 done 后 release 合回一开始的目标分支（如 main）。**两层合并是同一件事**：源分支 → 目标分支，交 Merge Agent；有问题打回，rebase 动了代码就回给 CR → FR → Goal 再判一次。
+## 4. 分支模型〔GO-6.3, GO-15, GO-29/30/31〕
+dd 分支 → 本线 release 分支（goal 级 `source_branch`，enroll 写一次、所有 repo 同名，开发期间所有单都合到这里）→ 线 done 后 release 按 repo 合回各自的 `target_branch`（如 main，每 repo 可不同）。**两层合并是同一件事**：源分支 → 目标分支；DD 的 PR 在 approve 后先看平台 mergeable（能合就合），冲突与线尾 release 合并交 Merge Agent〔GO-15 / GO-36〕；有问题打回，rebase 动了代码就回给 CR → FR → Goal 再判一次。
 
 ## 5. 循环上限〔GO-6.4〕
 不设硬上限。引擎按 DD 轮数与线 turn 数各设一条 warning 线，越线只告警。
@@ -97,7 +100,13 @@ Goal Agent 只有一个，第一性原理是判断工作是否完成〔GO-4.1〕
 13. **agent-run 两项必备**〔GO-22〕：① harness 可配置（能读哪些 MCP、各自读写权限、挂哪些 hook；纯自动化场景不挂 claude-mem 之类写入型 hook）；② session 保存位置可指定，每条线的 session 集中存放。核对现状：agent-run 已有 `--harness` / `--mcp-allow` / `--session-root`，缺 profile 里的 `hooks` 字段与 `--output-schema`；见 protocol.md §9 需求清单与六份 profile 建议边界〔推荐〕。
 14. **session 续用与 compact**〔GO-23〕：多数角色（Goal Agent、Impl、Reviewer）resume 同一 session 而非每次 fresh，配 compact 阈值；也可按场景选 fresh；按角色、按 goal 可配。作用域与默认表见 protocol.md §0.8〔推荐〕；agent-runtime 缺 compact 阈值参数。
 15. **协议输入 = 每轮 user prompt**〔GO-24〕：system prompt 一个 session 给一次（框架、schema 约束、历史在哪）；每轮 user prompt 只注入最新的交接内容；历史自己读。见 protocol.md §0.9。
-16. **机械化原则**〔GO-25〕：能机械化确定的都机械化，自由裁量才给 agent。落法：引擎程序化决定分支与 worktree；每轮输入必带 git 上下文（worktree、分支、commit id），由引擎填、调用前后核对，对不上打回；框架图 / 交互图 / 流程图必须确定（§1 节点清单）。「通过即 merge」目前仍全部交 Merge Agent〔GO-15〕；把无冲突 fast-forward 收回程序、Merge Agent 只处理冲突，作为〔推荐〕待过目，见 protocol.md §0.10 末条。
+16. **机械化原则**〔GO-25〕：能机械化确定的都机械化，自由裁量才给 agent。落法：分支与 worktree 的确定不靠 agent 自述（归属后由 GO-36 演进，见第 21 条）；交接前后引擎核对 git 状态，对不上打回；框架图 / 交互图 / 流程图必须确定（§1 节点清单）。「通过即 merge」当时仍全部交 Merge Agent〔GO-15〕；把无冲突合并收回程序的〔推荐〕项后由 GO-36 关闭（见第 22 条与 protocol.md §0.10 末条）。
+17. **enroll 协议 v2（`goal.enroll/2`）**〔GO-26~33〕：六个顶层字段 schema / work_folder / title / goal_text / source_branch / repos[]；`source_branch` 是 goal 级 release 分支名，写一次、所有 repo 同名〔GO-29/30/31〕；每 repo 四键——`path`（本地 **worktree** 路径〔GO-27〕）、`remote`（必有〔GO-32〕）、`target_branch`（每 repo 可不同〔GO-31〕）、`acceptance`。`goal_path` / `sessions` / `warn` / 单 `repo` 字段废弃〔GO-27/29〕。详见 protocol.md §1。
+18. **运行时状态归引擎根**〔GO-34，修正 GO-19 的落法〕：events.jsonl / control.jsonl / sessions / worktrees / goal.enroll.json 不放 WF，由引擎在 `/data/fleet/goals/<goal_id>/` 维护；WF 只放人读的 goal / design / progress / findings，引擎经 work-folder MCP 写摘要；history 句柄指引擎根。enroll 通过后的程序化准备（建根、原样写 enroll、每 repo fetch、release 缺失时从 target 切出 push〔GO-33〕）也都在引擎侧。详见 protocol.md §1。
+19. **PR 强制、交接必 push 且与 remote 一致**〔GO-28〕：所有开发以 PR 为单位；每次 agent 交接引擎核「已 push、HEAD == remote tip、工作树干净」；commit sha 不再是核对项（GO-25 的「输入写清 commit id」由此收回），引擎 event 记 sha 仅供观测。详见 protocol.md §0.10。
+20. **PR / worktree 以 DD 为粒度**〔GO-29 / GO-34 / GO-35〕：PR URL 与 worktree 不属于 enroll，每张 DD 开与收——引擎核对通过后开 PR（dd 分支 → release）；收尾 merged → PR 合并即收、failed → close 不合并，并删 worktree、删远端 dd 分支；基线验收挪到每张 DD 的 worktree 开好之后、Impl 起跑之前在 base 上跑〔GO-34〕。详见 protocol.md §2 / §4。
+21. **DD 启动协议 = Goal Agent 的 Stop 响应**〔GO-36〕：`stop: dispatch` 的输出对象就是 DD 启动协议，一张 DD 可跨多个 repo；Goal Agent Stop 前自建 dd 分支、开 worktree、把 spec 写成 `docs/specs/N-XX.md` 并 push；引擎机械核五条（分支在 remote、worktree 在该分支、HEAD == remote tip、干净、spec 在该 commit 里）后才开 PR、跑基线、起 Impl，核不过打回〔GO-25〕。详见 protocol.md §2。
+22. **approve 后先看平台 mergeable**〔GO-36，修订 GO-15 的执行面〕：Goal approve 后引擎先查平台 mergeable，MERGEABLE 直接平台合并，CONFLICTING / UNKNOWN 才交 Merge Agent（UNKNOWN 不当 mergeable 猜）；线 done 的 release → 各 repo `target_branch` 合并仍走 Merge Agent〔GO-15 / GO-31〕。protocol.md §0.10 末条原〔推荐〕项由此关闭。
 
 ## 8. 与现有 fleet-graph 的对照（信息，非决策）
 - 有对应物：goal_enroll、dd 流水线三个模型阶段、executors、cost_obs、events。
