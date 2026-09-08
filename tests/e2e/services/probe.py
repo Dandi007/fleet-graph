@@ -41,14 +41,21 @@ async def wf_probe(write=False):
             result = await client.call_tool(name, arguments)
             require(not result.is_error, f"MCP {name} 返回错误")
             data = result.data
-            if not isinstance(data, dict):
+            if not isinstance(data, (dict, list)):
                 data = json.loads(result.content[0].text)
-            require(data.get("ok") is not False, f"MCP {name} 操作失败: {data}")
+            if isinstance(data, dict):
+                require(data.get("ok") is not False, f"MCP {name} 操作失败: {data}")
             return data
 
         await call("wf_list", {"limit": 1})
         if not write:
-            return {"service": "work-folder", "readiness": "ok"}
+            found = await call("wf_search", {"query": "e2e-readiness", "top_k": 1})
+            require(isinstance(found, list), "Work Folder 搜索 readiness 返回格式错误")
+            backend = http_json(
+                "http://127.0.0.1:18082", "/search", body={"query": "e2e-readiness"}
+            )
+            require(backend.get("mode") == "keyword", "搜索服务未启用真实 keyword 模式")
+            return {"service": "work-folder", "readiness": "ok", "search_mode": "keyword"}
         run_id = uuid.uuid4().hex
         created = await call("wf_create", {"topic": f"容器契约探针-{run_id}"})
         folder_id = created["folder_id"]
@@ -68,12 +75,30 @@ async def wf_probe(write=False):
             "Work Folder 回读字节不一致",
         )
         require(bool(written.get("commit")), "Work Folder 写入未返回 Git commit")
+        deadline = asyncio.get_running_loop().time() + 20
+        while True:
+            found = await call("wf_search", {"query": run_id, "top_k": 20})
+            require(isinstance(found, list), "Work Folder 搜索返回格式错误")
+            hits = [
+                hit
+                for hit in found
+                if hit.get("folder_id") == folder_id
+                and hit.get("filename") == "service-probe.md"
+                and run_id in hit.get("snippet", "")
+            ]
+            if hits:
+                break
+            require(
+                asyncio.get_running_loop().time() < deadline, "新写内容未在20秒内进入真实搜索索引"
+            )
+            await asyncio.sleep(0.5)
         return {
             "service": "work-folder",
             "read_write": "ok",
             "folder_id": folder_id,
             "commit": written["commit"],
             "content_revision": read.get("content_revision"),
+            "search": {"status": "passed", "query": run_id, "hits": hits},
         }
 
 

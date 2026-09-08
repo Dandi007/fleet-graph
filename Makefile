@@ -45,6 +45,7 @@ test-end-to-end:
 	python3 tests/e2e/run.py e2e --candidate "$(CANDIDATE)" --case "$(CASE)"
 
 test-docker-contracts:
-	python3 -m unittest discover -s tests/e2e/contract -p 'test_*.py'
-	python3 -m unittest discover -s tests/e2e/runner -p 'test_*.py'
-	python3 -m unittest discover -s tests/e2e -p 'test_boundary.py'
+	uv run python -m unittest discover -s tests/e2e/contract -p 'test_*.py'
+	uv run python -m unittest discover -s tests/e2e/runner -p 'test_*.py'
+	uv run python -m unittest discover -s tests/e2e/candidate -p 'test_*.py'
+	uv run python -m unittest discover -s tests/e2e -p 'test_boundary.py'

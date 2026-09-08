@@ -16,5 +16,7 @@ dispatch 的 `spec_path` 字段使用相对路径字符串 `docs/specs/SLUGIFY-0
 
 # References
 
-- 公共行为契约：本目录 README.md、schema.json。
-- 共同流程协议：work folder `wf-53a584` 的 `inputs/protocol.md` §6–9。
+- 本文正文：本次 slugify-v1 的完整功能与交付要求。
+- 本次 `goal.enroll/2` 输入：唯一 repo、release、专用 target 与程序验收命令。
+- 本次角色调用提供的输入和 Stop JSON schema：dispatch、review_ref、approve 与 done 的实际字段约束。
+- 本次输入中的 opaque work_folder ID：只通过本容器 work-folder MCP 读取该 WF 的 `goal.md` 与后续工作记录。

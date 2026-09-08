@@ -307,7 +307,7 @@ async def e2e(bundle, candidate):
             "schema": "fleet-e2e.run/1",
             "run_id": run_id,
             "candidate": {
-                "name": "codex",
+                "name": commits["candidate"],
                 "commits": {
                     "fleet_graph": commits["fleet_commit"],
                     "agent_runtime": commits["runtime_commit"],

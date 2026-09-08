@@ -7,6 +7,7 @@
 |---|---|---|
 | katana | `1c90073fc057b9246ffd5b0f1f0935fa8f456c45` | `.runtime/e2e/build/katana/mcp/{shared,kernel,work-folder}` |
 | agent-bus | `febbc2cc6ae11709ff448a8f0139bfa46e934c99` | `.runtime/e2e/build/agent-bus` |
+| agent-knowledge | `7c40cc76fddbdf6df55dd504da68113e5d0cfb10` | `.runtime/e2e/build/agent-knowledge` |
 
 Work Folder 安装上述三个真实 Python package，固定 FastMCP `3.2.4`；其他依赖由 pip
 解析，当前不宣称完整 Python 依赖锁定。agent-bus 使用源码自带 `uv.lock`，通过
@@ -49,6 +50,23 @@ work-folder 容器执行。Work Folder 探针经过真实 `wf_create → fs_crea
 `git-sync` 是明确的额外验收动作，推送本次数据至内部 remote 并比较 SHA；该结果
 不能解释为 Work Folder 自带异步同步或自动 push 能力。
 
+## Work Folder 搜索依赖
+
+冻结 Work Folder 的 `wf_search` 调用本机 `127.0.0.1:18082/search`。同一容器内
+启动固定 commit 的真实 `agent-knowledge` FastAPI 服务与原生
+`watch_and_index.py`；索引由唯一源 `build_lancedb_index.py` 生成。
+通过原生 `VAULT_SEARCH_DISABLE_VECTOR=1` 运行 keyword 模式，不安装向量后端，
+不访问外部 embedding。该测试覆盖真实关键词检索，**不覆盖向量检索质量**。
+
+索引只扫描 `/data/work-folder`，来源 ID 由真实 indexer 对该根路径生成，和 WF
+传入的 source filter 一致。缓存与搜索日志放在该 named volume 的
+`.katana/runtime/search`，通过容器自身缓存路径的 symlink 接入原服务默认配置；
+不挂载宿主 HOME。原生 watcher 的更新等待为 0.5 秒 quiet / 2 秒 max-wait。
+
+healthcheck 真正调用 `wf_search` 和底层 `/search`，要求 backend mode 为 keyword。
+读写探针还要求刚写入的唯一标识在 20 秒内通过 `wf_search` 返回，匹配 folder ID、
+filename 和 snippet。搜索服务或 watcher 退出时，入口停止 WF，避免数据面残缺仍假健康。
+
 ## Runtime 生命周期接入
 
 真实 bus 的 bootstrap 只内置 message/chat/envelope，不会创建 `board:agent-runs`
@@ -77,3 +95,4 @@ run ID、序号先后和成功退出码。缺少任一角色记录就失败，�
 - agent-bus 固定版本源码：`agent_bus/http_server.py`、`agent_bus/config.py`、`scripts/e2e-smoke.sh`、`uv.lock`。
 - agent-bus 固定版本源码：`agent_bus/auth.py` 的 `can_publish_to_channel` 与 `ensure_gateway_seed`。
 - agent-runtime 固定版本源码：`src/agent-bus.ts` 的 `registerBusProtocols`、`PROTOCOL_DESCRIPTORS` 和 `BUS_CHANNEL`。
+- agent-knowledge 固定版本源码：`service/app.py`、`service/search.py`、`scripts/build_lancedb_index.py`、`scripts/watch_and_index.py`。

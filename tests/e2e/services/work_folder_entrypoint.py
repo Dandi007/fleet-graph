@@ -6,6 +6,7 @@ from pathlib import Path
 
 from katana_work_folder_mcp import server
 from katana_work_folder_mcp.reindex import render_index
+from work_folder_search import running_search
 
 REMOTE = "git://git-remote:9418/work-folder.git"
 
@@ -53,4 +54,5 @@ if __name__ == "__main__":
     root = Path(os.environ.get("E2E_WORK_FOLDER_ROOT", "/data/work-folder"))
     initialize(root)
     server.configure(str(root))
-    server.mcp.run(transport="streamable-http", host="0.0.0.0", port=5602)
+    with running_search(root):
+        server.mcp.run(transport="streamable-http", host="0.0.0.0", port=5602)

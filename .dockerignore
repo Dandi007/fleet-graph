@@ -1,9 +1,12 @@
 **
 !tests/
+tests/*
 !tests/e2e/
 !tests/e2e/**
 !.runtime/
+.runtime/*
 !.runtime/e2e/
+.runtime/e2e/*
 !.runtime/e2e/build/
 !.runtime/e2e/build/**
 **/__pycache__/

@@ -267,6 +267,10 @@ class BuildContextBoundaryTests(unittest.TestCase):
             ".runtime/e2e/runs/current/secrets/gh_token",
             ".runtime/e2e/runs/current/secrets/gateway_token",
             ".runtime/e2e/runs/older/candidate-state/session.json",
+            ".runtime/e2e/candidate-config-check/selection-check.json",
+            ".runtime/e2e/e2e-console.log",
+            ".runtime/screenshots/example.png",
+            "tests/test_smoke.py",
             ".runtime/e2e/build/fleet/.git/config",
         ):
             with self.subTest(path=path):

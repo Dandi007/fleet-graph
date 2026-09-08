@@ -4,5 +4,6 @@
   "fleet": {"repo": "/data/code/fleet-comparison/codex/fleet-graph", "commit": "5e601d8d256c5d4d855e3d8b87556fb19c36c824"},
   "agent-runtime": {"repo": "/data/code/fleet-comparison/codex/agent-runtime", "commit": "1813ff1e3435031f8fbb30f1776676a25ce56b54"},
   "katana": {"repo": "/data/code/self/katana", "commit": "1c90073fc057b9246ffd5b0f1f0935fa8f456c45"},
-  "agent-bus": {"repo": "/data/code/self/agent-bus", "commit": "febbc2cc6ae11709ff448a8f0139bfa46e934c99"}
+  "agent-bus": {"repo": "/data/code/self/agent-bus", "commit": "febbc2cc6ae11709ff448a8f0139bfa46e934c99"},
+  "agent-knowledge": {"repo": "/data/code/self/agent-knowledge", "commit": "7c40cc76fddbdf6df55dd504da68113e5d0cfb10"}
 }

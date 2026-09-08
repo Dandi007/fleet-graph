@@ -20,7 +20,7 @@ make test-end-to-end CANDIDATE=codex CASE=single-repo
 
 ## 输入和凭证
 
-默认候选在 [candidates/codex.json](candidates/codex.json)，包含 Fleet Graph、agent-runtime、katana 与 agent-bus 的本地仓库及完整 commit。更换机器时复制 manifest 修改 repo 路径，通过 `CANDIDATE=/absolute/candidate.json` 传入。`config_path` 和 `prompt_dir` 可指定源码内的相对配置位置。镜像仅使用 `git archive` 的提交内容，不带本地未提交修改。
+默认候选在 [candidates/codex.json](candidates/codex.json)，包含 Fleet Graph、agent-runtime、katana、agent-bus 与 agent-knowledge 搜索服务的本地仓库及完整 commit。更换机器时复制 manifest 修改 repo 路径，通过 `CANDIDATE=/absolute/candidate.json` 传入。`config_path` 和 `prompt_dir` 可指定源码内的相对配置位置。镜像仅使用 `git archive` 的提交内容，不带本地未提交修改。
 
 外部协议一致的候选共享 fixture 和 verifier；配置或 CLI 启动方式不一致时需要单独启动适配，不能把缺失证据映射成成功，也不能改弱契约。当前已提供最小系统的启动适配，不宣称 legacy main 或未交付候选自动兼容。
 
@@ -43,6 +43,7 @@ backend 是 Docker internal network。candidate、runner、Work Folder、agent-b
 ## 当前能力边界
 
 - 第一轮仅验证 OpenCode static gateway。native subscription、宿主登录态复用及其他 Runtime 的认证方式均为后续事项。
+- Work Folder 搜索部署真实 agent-knowledge 索引器与搜索服务，使用原生 keyword 模式；不依赖宿主搜索服务或 embedding 模型，vector 检索不在本轮覆盖范围。
 - 启动配置与角色 prompt 追加本次 Docker 测试授权，配置摘要与哈希写入 candidate manifest；不修改冻结产品源码。
 - 冻结 agent-runtime 没有提交 Bun lock，镜像记录实际解析 lock 的哈希及工具版本；不能据此声称不同时间重新构建会解析完全相同的依赖。
 - 两条重构线分别记账。尚未运行的候选标为待验证；协议或实现缺陷要报告到对应开发线，不能因本套测试已有一次成功而推定另一线通过。

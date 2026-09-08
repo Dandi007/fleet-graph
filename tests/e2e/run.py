@@ -36,7 +36,7 @@ def prepare_sources(candidate):
     build = RUNTIME / "build"
     build.mkdir(parents=True, exist_ok=True)
     commits = {}
-    for name in ("fleet", "agent-runtime", "katana", "agent-bus"):
+    for name in ("fleet", "agent-runtime", "katana", "agent-bus", "agent-knowledge"):
         source = manifest[name]
         repo = str(Path(source["repo"]).resolve())
         commit = output(["git", "-C", repo, "rev-parse", source["commit"] + "^{commit}"])
