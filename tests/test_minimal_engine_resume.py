@@ -631,3 +631,86 @@ def test_merged_dd_hands_result_to_next_turn_without_reentry(tmp_path: Path) -> 
     assert turn_in["last_dd"]["outcome"] == "merged"
     assert turn_in["last_dd"]["merged_commit"] == SHA_M
     assert "1 merged" in turn_in["dd_summary"]
+
+
+# ---------------------------------------------------------------------------
+# ⑫ dd-30 ④ multi-DD: turn 1's DD merged and was consumed by turn 2, turn 2
+#     dispatched a second DD that merged right before the crash → dd-02's
+#     result (not dd-01's) is handed to turn 3, no re-entry, no re-dispatch
+# ---------------------------------------------------------------------------
+
+
+def _dd_cycle(dd_id: str) -> list[tuple[str, dict[str, Any], str]]:
+    """One DD's full event cycle from dispatch to ``dd.merged``."""
+    return [
+        (
+            "dd.dispatched",
+            {"spec_text": "实现 X", "branch": f"dd/{GOAL_ID}/{dd_id}", "head_commit": SHA_R},
+            dd_id,
+        ),
+        (
+            "dd.pr_opened",
+            {"repo": DD_WORKTREE, "number": 31, "url": "https://github.com/x/y/pull/31"},
+            dd_id,
+        ),
+        (
+            "dd.stage.finished",
+            {"stage": "impl", "stop": "committed", "commit": SHA_D, "summary": "done"},
+            dd_id,
+        ),
+        ("dd.acceptance", {"cmd": "make base", "exit": 0, "index": 0, "total": 1}, dd_id),
+        ("dd.stage.finished", {"stage": "acceptance", "stop": "pass"}, dd_id),
+        (
+            "dd.stage.finished",
+            {"stage": "cr", "stop": "pass", "summary": "ok", "findings": []},
+            dd_id,
+        ),
+        (
+            "dd.stage.finished",
+            {"stage": "fr", "stop": "pass", "summary": "ok", "findings": []},
+            dd_id,
+        ),
+        ("dd.stage.finished", {"stage": "goal_review", "stop": "approve", "summary": "ok"}, dd_id),
+        ("dd.stage.finished", {"stage": "merge", "stop": "merged", "merged_commit": SHA_M}, dd_id),
+        ("dd.merged", {"merged_commit": SHA_M}, dd_id),
+    ]
+
+
+def test_second_merged_dd_result_reaches_turn3_after_first_consumed(tmp_path: Path) -> None:
+    harness = Harness(
+        tmp_path,
+        seed=[
+            *_dispatch_turn_prefix(),
+            *_dd_cycle("dd-01"),
+            ("goal.turn.started", {"turn_no": 2}, None),
+            (
+                "goal.turn.finished",
+                {
+                    "run_id": f"goal-{GOAL_ID}-turn-2",
+                    "stop": "dispatch",
+                    "summary": "再派一单",
+                    "dispatch": dict(DISPATCH),
+                },
+                None,
+            ),
+            *_dd_cycle("dd-02"),
+        ],
+        stops=[_blocked_stop()],
+    )
+
+    assert harness.run(tmp_path) == engine.EXIT_BLOCKED
+
+    kinds = harness.kinds()
+    assert kinds.count("dd.dispatched") == 2
+    assert kinds.count("dd.merged") == 2
+    assert harness.events_of("agent.failed") == []
+    assert len(harness.invoker.calls) == 1
+    assert harness.bash.calls == []
+
+    turn_in = harness.invoker.in_obj(0)
+    assert turn_in["turn_no"] == 3
+    assert turn_in["last_dd"]["dd_id"] == "dd-02"
+    assert turn_in["last_dd"]["outcome"] == "merged"
+    assert turn_in["last_dd"]["merged_commit"] == SHA_M
+    assert "2 merged" in turn_in["dd_summary"]
+    assert "dd-02" in turn_in["dd_summary"]

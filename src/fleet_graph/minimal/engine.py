@@ -763,6 +763,11 @@ def _unconsumed_dd(events_list: list[events.Event]) -> str | None:
     already resolved (``dd.merged`` / ``dd.failed``) and the crash lost the
     handoff — the caller folds the result object and injects it, never
     re-entering the graph (protocol §11).
+
+    Only the *last* dispatch is judged: a ``goal.turn.started`` that follows an
+    earlier DD's dispatch merely consumed that DD — a DD dispatched after it is
+    a fresh handoff that needs a later turn of its own, so the scan never stops
+    early and the answer is whether a turn started after the final dispatch.
     """
     dd_id: str | None = None
     dispatch_seq = 0
@@ -771,7 +776,7 @@ def _unconsumed_dd(events_list: list[events.Event]) -> str | None:
             dd_id = ev.dd_id
             dispatch_seq = ev.seq
         elif ev.kind == "goal.turn.started" and dd_id is not None and ev.seq > dispatch_seq:
-            return None
+            dd_id = None
     return dd_id
 
 
