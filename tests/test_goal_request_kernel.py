@@ -1327,6 +1327,87 @@ class TestLiveVersionAtReviewBoundary:
         assert "stale_version" in by_kind["approve"]["detail"]
         assert effects.approvals == []  # the stale review never reached the gate
 
+    def test_concurrent_version_activation_is_excluded_from_review_delivery(self) -> None:
+        # The race the final review found: ``finish_goal_call`` reads the active
+        # version, then does journal operations before invoking the external
+        # approve/reject port. If ``activate_version`` lands in that gap, a
+        # review naming the then-stale version reaches the port after activation.
+        # The fix serializes the two under a per-kernel version lock; this
+        # barrier-controlled test pins that a review admitted for v1 cannot
+        # complete its delivery around a concurrent v2 activation.
+        import threading
+        import time
+
+        effects = FakeEffects()
+        kernel = make_kernel(effects)  # active version v1
+
+        port_reached = threading.Barrier(2)
+        port_release = threading.Event()
+        observed_at_port: list[str] = []
+        original_approve = effects.approve
+
+        def blocking_approve(payload: dict[str, Any], *, ctx: dict[str, Any]) -> dict[str, Any]:
+            # Capture the active version at the moment the review actually
+            # reaches the external gate, then park here so the main thread can
+            # attempt a concurrent activation while delivery is in progress.
+            observed_at_port.append(kernel.active_version(GOAL))
+            port_reached.wait(timeout=30)
+            port_release.wait(timeout=30)
+            return original_approve(payload, ctx=ctx)
+
+        effects.approve = blocking_approve  # type: ignore[method-assign]
+
+        approve_at_v1 = {
+            "kind": "approve",
+            "idempotency_key": "ap1",
+            "payload": {"development_id": "d1", "verdict": "APPROVE", "goal_version": "v1"},
+        }
+        kernel.submit(GOAL, make_request("A"))
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None
+
+        box: dict[str, Any] = {}
+
+        def deliver() -> None:
+            box["result"] = kernel.finish_goal_call(
+                GOAL, call["call_id"], {"actions": [approve_at_v1]}
+            )
+
+        deliver_thread = threading.Thread(target=deliver)
+        deliver_thread.start()
+        # The review has been admitted for v1 and is inside the approve port,
+        # still inside the version-lock critical section.
+        port_reached.wait(timeout=30)
+
+        activation_done = threading.Event()
+
+        def activate() -> None:
+            kernel.activate_version(GOAL, "v2")
+            activation_done.set()
+
+        activate_thread = threading.Thread(target=activate)
+        activate_thread.start()
+
+        # With serialization, activation must stay parked while the review
+        # delivery is in flight. Without the lock it would land here and the v1
+        # review would then complete its delivery after v2 became active.
+        time.sleep(0.3)
+        assert not activation_done.is_set(), "version activation landed during review admission"
+
+        port_release.set()
+        deliver_thread.join(timeout=30)
+        activate_thread.join(timeout=30)
+        assert not deliver_thread.is_alive()
+        assert not activate_thread.is_alive()
+
+        # The v1 review was delivered while v1 was still active; activation
+        # finished only after delivery released the critical section.
+        assert observed_at_port == ["v1"]
+        assert box["result"]["results"][0]["status"] == DELIVERED
+        assert len(effects.approvals) == 1
+        assert activation_done.is_set()
+        assert kernel.active_version(GOAL) == "v2"
+
 
 # --- finding: complete raw Goal response survives interruption (lossless events) ---
 

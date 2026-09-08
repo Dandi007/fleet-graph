@@ -617,6 +617,14 @@ class GoalRequestKernel:
     _versions: dict[str, str] = field(default_factory=dict)
     _mode: dict[str, str] = field(default_factory=dict)
     _state: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Serializes version activation against version-bound review admission
+    #: (approve/reject). The journal lock guards individual journal operations,
+    #: not the read-active-version -> deliver-effect boundary: without this lock,
+    #: ``activate_version`` could persist and activate a new version in the gap
+    #: after ``business_guards`` reads the active version and before the review
+    #: reaches the external port, letting a review naming the then-stale version
+    #: through after activation (behavior 3's version-bound review guard).
+    _version_lock: threading.RLock = field(default_factory=threading.RLock)
 
     def __post_init__(self) -> None:
         if self.effects is None:
@@ -725,17 +733,24 @@ class GoalRequestKernel:
         """
         if not version or not version.strip():
             raise RequestKernelError("version_required", "a goal version is required")
-        record = self.journal.append(
-            goal,
-            {
-                "record": RECORD_VERSION,
-                "goal": goal,
-                "version": version,
-                "source": source,
-                "at": _iso(self.clock),
-            },
-        )
-        self._versions[goal] = version
+        # The persist + activate pair must be atomic w.r.t. a concurrent
+        # version-bound review admission (final review finding): a review that
+        # already read the active version and is about to reach the external
+        # port must not deliver against a version that this activation lands
+        # first. Both ``activate_version`` and the approve/reject delivery path
+        # take ``_version_lock``, so they serialize.
+        with self._version_lock:
+            record = self.journal.append(
+                goal,
+                {
+                    "record": RECORD_VERSION,
+                    "goal": goal,
+                    "version": version,
+                    "source": source,
+                    "at": _iso(self.clock),
+                },
+            )
+            self._versions[goal] = version
         return record
 
     def active_version(self, goal: str) -> str:
@@ -1069,28 +1084,40 @@ class GoalRequestKernel:
             # snapshot taken before the list executes: an earlier effect may
             # have activated a new version mid-list, and an approve/reject naming
             # the then-stale version must be refused against the *current* one.
-            refusal = business_guards(action, active_version=self.active_version(goal))
-            if refusal:
-                results.append(
-                    self._refuse(goal, action, call_id, request_id, run_id, index, refusal)
-                )
-                continue
-            if action["kind"] == ACTION_DISPATCH:
-                repo = str((action.get("payload") or {}).get("repo_path") or "")
-                if repo in admission_required and repo_admission.get(repo) != DELIVERED:
-                    results.append(
-                        self._refuse(
-                            goal,
-                            action,
-                            call_id,
-                            request_id,
-                            run_id,
-                            index,
-                            f"dependent dispatch refused: add_repo for {repo!r} did not succeed",
-                        )
+            #
+            # A version-bound review (approve/reject) is admitted *and* delivered
+            # under ``_version_lock`` (final review finding): the guard read and
+            # the external port call are one critical section, so a concurrent
+            # ``activate_version`` cannot persist and activate a new version in
+            # the gap between "naming v1 still passes" and "v1 reaches the
+            # port". The lock is taken again per action, so a mid-list
+            # activation by an earlier effect is still observed by a later
+            # review (the earlier activation finished and released the lock).
+            if action["kind"] in (ACTION_APPROVE, ACTION_REJECT):
+                with self._version_lock:
+                    result = self._process_action(
+                        goal,
+                        action,
+                        call_id,
+                        request_id,
+                        run_id,
+                        index,
+                        caller,
+                        admission_required=admission_required,
+                        repo_admission=repo_admission,
                     )
-                    continue
-            result = self._effect_outcome(goal, action, call_id, request_id, run_id, index, caller)
+            else:
+                result = self._process_action(
+                    goal,
+                    action,
+                    call_id,
+                    request_id,
+                    run_id,
+                    index,
+                    caller,
+                    admission_required=admission_required,
+                    repo_admission=repo_admission,
+                )
             if action["kind"] == ACTION_ADD_REPO:
                 repo_admission[str((action.get("payload") or {}).get("repo_path") or "")] = str(
                     result["status"]
@@ -1157,6 +1184,43 @@ class GoalRequestKernel:
             "receipts": [*receipts],
             "results": results,
         }
+
+    def _process_action(
+        self,
+        goal: str,
+        action: dict[str, Any],
+        call_id: str,
+        request_id: str,
+        run_id: str,
+        index: int,
+        caller: str,
+        *,
+        admission_required: set[str],
+        repo_admission: dict[str, str],
+    ) -> dict[str, Any]:
+        """Admit and deliver one action (guard -> dependency -> effect).
+
+        The business guard is read here at the effect boundary, so an
+        approve/reject is refused against the *current* active version, never a
+        snapshot cached before the list executed. Callers decide whether version
+        activation must be excluded across the admission-delivery boundary (the
+        approve/reject path takes ``_version_lock`` around this call)."""
+        refusal = business_guards(action, active_version=self.active_version(goal))
+        if refusal:
+            return self._refuse(goal, action, call_id, request_id, run_id, index, refusal)
+        if action["kind"] == ACTION_DISPATCH:
+            repo = str((action.get("payload") or {}).get("repo_path") or "")
+            if repo in admission_required and repo_admission.get(repo) != DELIVERED:
+                return self._refuse(
+                    goal,
+                    action,
+                    call_id,
+                    request_id,
+                    run_id,
+                    index,
+                    f"dependent dispatch refused: add_repo for {repo!r} did not succeed",
+                )
+        return self._effect_outcome(goal, action, call_id, request_id, run_id, index, caller)
 
     @staticmethod
     def _action_id(call_id: str, index: int, action: dict[str, Any]) -> str:
