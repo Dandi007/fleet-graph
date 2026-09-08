@@ -11,7 +11,6 @@ self-describing signal.
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 import pytest
@@ -19,29 +18,29 @@ import pytest
 from fleet_graph.graphs.adapters import CoordinatorFault
 from fleet_graph.graphs.runner import LineConfig, run_line
 
-FAKE_RUN = str(Path(__file__).parent / "fakes" / "fake_agent_run.py")
 
+class _BoomGoalCall:
+    """A Goal ReAct call port that faults -- DD01's injected seam for the same
+    unexpected-node-exception path the retired round-prompt agent-run used to
+    trigger."""
 
-def _fake_agent_run(tmp_path: Path) -> str:
-    bin_path = tmp_path / "agent-run"
-    bin_path.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_RUN}" "$@"\n')
-    bin_path.chmod(0o755)
-    return str(bin_path)
+    def call(self, goal: str, prompt: dict) -> dict:
+        raise CoordinatorFault("injected Goal call fault")
 
 
 class TestFaultBoundary:
     def test_an_unexpected_node_exception_writes_a_fault_terminal_and_reraises(
         self, tmp_path: Path
     ) -> None:
-        # The fake agent-run writes a `succeeded` envelope with no
-        # structured_result, so the coordinator adapter raises CoordinatorFault
-        # inside the graph -- an unexpected node exception with no graceful path.
+        # The Goal ReAct call raises inside the graph -- an unexpected node
+        # exception with no graceful path -- so run_line must write a fault
+        # terminal and re-raise rather than impersonate a clean stop.
         config = LineConfig(
             folder_id="wf-fault",
             seat="s",
             run_root=tmp_path / "run",
             checkpoint_path=":memory:",
-            agent_run_bin=_fake_agent_run(tmp_path),
+            goal_call=_BoomGoalCall(),
         )
         with pytest.raises(CoordinatorFault):
             run_line(config)
@@ -83,7 +82,7 @@ class TestFaultBoundary:
             seat="s",
             run_root=tmp_path / "run",
             checkpoint_path=":memory:",
-            agent_run_bin=_fake_agent_run(tmp_path),
+            goal_call=_BoomGoalCall(),
             metrics_dir=prom_dir,
         )
         with pytest.raises(CoordinatorFault):

@@ -22,20 +22,21 @@ from fleet_graph.acceptance import AcceptanceRunner, AcceptanceSpec
 from fleet_graph.bus.client import BusClient
 from fleet_graph.bus.inbox import Inbox
 from fleet_graph.bus.tokens import resolve_line_token
-from fleet_graph.executors.agent_run import AgentRunLauncher
 from fleet_graph.executors.agent_session import (
     AgentSessionSeat,
     SeatSpec,
     derive_seat_key,
 )
+from fleet_graph.goal.request_kernel import GoalRequestKernel, Journal
 from fleet_graph.goal_interrupt.contract import DecisionInput
 from fleet_graph.goal_interrupt.runtime import LineInterruptPort, resume_line
 from fleet_graph.goal_interrupt.store import GoalInterruptStore
-from fleet_graph.graphs.adapters import AgentRunCoordinator, AgentSessionWorker
+from fleet_graph.graphs.adapters import AgentSessionWorker
 from fleet_graph.graphs.dd_gate import GraphGateNode
 from fleet_graph.graphs.dd_subgraph import ControlPlaneGateway, DdSubgraph, DevelopmentGateway
 from fleet_graph.graphs.goal_line import LineDeps, build_goal_line_graph
 from fleet_graph.graphs.guards import LineBounds, LineGuards
+from fleet_graph.graphs.kernel_coordinator import KernelCoordinator, KernelEffectPorts
 from fleet_graph.state.line_metrics import LineMetrics, line_metrics_exposition_dir
 from fleet_graph.state.run_artifacts import (
     RunArtifacts,
@@ -150,6 +151,12 @@ class LineConfig:
     #: from :data:`LINE_MCP_SERVERS`, the in-repo default.
     mcp_servers: tuple[str, ...] | None = None
     dd_plugin_binding: Path | None = None
+    #: DD01: the Goal ReAct call port (``GoalCallPort.call``). None (the default,
+    #: and what production uses until the live Runtime binding lands) makes the
+    #: kernel-coordinated line answer ``blocked`` with the explicit
+    #: ``goal_call_unwired`` reason -- never a simulated Goal answer. Tests inject
+    #: fake ports here; the live agent-run ReAct binding is a follow-up slice.
+    goal_call: Any = None
 
     @property
     def inbox_alias(self) -> str | None:
@@ -198,19 +205,36 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         release_id=capture_release_id(),
     )
 
-    launcher_kwargs: dict[str, Any] = {"state_root": str(config.run_root / "agent-runs")}
-    if config.agent_run_bin:
-        launcher_kwargs["bin_path"] = config.agent_run_bin
-    launcher = AgentRunLauncher(**launcher_kwargs)
     launch_id = config.launch_id or mint_launch_id(
         config.folder_id, config.generation, int(time.time())
     )
-    coordinator = AgentRunCoordinator(
-        launcher=launcher,
+
+    # DD01: the goal-facing coordinator is the durable, serial request-to-Goal-call
+    # kernel -- not the coordinator/worker round-prompt progression. The dd
+    # subgraph and gate node are bound as the kernel's effect ports (dispatch /
+    # approve / reject); the Goal's live ReAct call is injected at
+    # ``coordinator.goal_call`` and left unbound for this slice (fail-closed
+    # ``goal_call_unwired``, never a simulated Goal answer).
+    dd_port = DdSubgraph(config.dd_gateway) if config.dd_gateway is not None else None
+    gate_port = (
+        GraphGateNode(
+            config.dd_gate_plane,
+            dd_root=config.dd_root if config.dd_root is not None else _default_dd_root(),
+        )
+        if config.dd_gate_plane is not None
+        else None
+    )
+    kernel = GoalRequestKernel(
+        journal=Journal(home=config.run_root / "goal-kernel"),
+        effects=KernelEffectPorts(
+            folder_id=config.folder_id, dd=dd_port, gate=gate_port
+        ),
+    )
+    coordinator = KernelCoordinator(
+        kernel=kernel,
+        goal_call=config.goal_call,
         folder_id=config.folder_id,
         thread_id=thread_id,
-        run_root=config.run_root,
-        timeout_seconds=config.coordinator_timeout_seconds,
         launch_id=launch_id,
     )
 
@@ -290,18 +314,11 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         # R2 图合一: the dd subgraph port -- one invoke = one development's
         # subgraph execution over the graph edge. None (default) keeps the
         # line off the graph-edge dispatch path entirely.
-        dd=DdSubgraph(config.dd_gateway) if config.dd_gateway is not None else None,
+        dd=dd_port,
         # R3 Stop Response: the gate node -- the sole awaiting_gate release
         # path (S11). Wired only when the deployment binds a dd gate plane;
         # otherwise gate-release actions fail closed (consumer unwired).
-        gate=(
-            GraphGateNode(
-                config.dd_gate_plane,
-                dd_root=config.dd_root if config.dd_root is not None else _default_dd_root(),
-            )
-            if config.dd_gate_plane is not None
-            else None
-        ),
+        gate=gate_port,
         # R3: the dd wake anchor rides in every coordinator input as a fact;
         # the release still travels only through the gate node above.
         dd_awaiting_gate_development_id=config.dd_awaiting_gate_development_id,

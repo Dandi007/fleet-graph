@@ -23,8 +23,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from fleet_graph.dd.self_gate import (
     EVIDENCE_REGRESSION,
     REQUIRED_EVIDENCE,
@@ -600,18 +598,6 @@ def test_an_unbound_gate_plane_leaves_the_release_failed_closed(tmp_path: Path) 
     assert deps.gate is None
 
 
-def _fake_agent_run(tmp_path: Path) -> str:
-    """A fake agent-run binary whose envelope faults the coordinator adapter,
-    so run_line can be driven past the wake envelope without a gateway."""
-    import sys
-
-    fake_run = Path(__file__).parent / "fakes" / "fake_agent_run.py"
-    bin_path = tmp_path / "agent-run"
-    bin_path.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{fake_run}" "$@"\n')
-    bin_path.chmod(0o755)
-    return str(bin_path)
-
-
 class TestWakeReachesTheLineProcess:
     """Finding 1 (blocker), fixed: a dd_awaiting_gate wake names the next
     launch a self-gate run all the way down -- daemon capture, LaunchSpec
@@ -780,18 +766,18 @@ class TestRunLineCarriesTheWakeIntoTheEnvelope:
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         import fleet_graph.graphs.runner as runner
-        from fleet_graph.graphs.adapters import CoordinatorFault
 
         config = runner.LineConfig(
             folder_id="wf-1",
             seat="s",
             run_root=tmp_path / "run",
             checkpoint_path=":memory:",
-            agent_run_bin=_fake_agent_run(tmp_path),
             dd_awaiting_gate_development_id=DD_ID,
         )
-        with pytest.raises(CoordinatorFault):
-            runner.run_line(config)
+        # The kernel coordinator parks (goal_call unwired in this slice) rather
+        # than faulting; the wake anchor still rides the round's envelope.
+        result = runner.run_line(config)
+        assert result["terminal"] == "blocked"
 
         envelope = json.loads(
             (tmp_path / "run" / "coord" / "round-1-input.json").read_text(encoding="utf-8")
@@ -805,17 +791,15 @@ class TestRunLineCarriesTheWakeIntoTheEnvelope:
         self, monkeypatch: Any, tmp_path: Path
     ) -> None:
         import fleet_graph.graphs.runner as runner
-        from fleet_graph.graphs.adapters import CoordinatorFault
 
         config = runner.LineConfig(
             folder_id="wf-1",
             seat="s",
             run_root=tmp_path / "run",
             checkpoint_path=":memory:",
-            agent_run_bin=_fake_agent_run(tmp_path),
         )
-        with pytest.raises(CoordinatorFault):
-            runner.run_line(config)
+        result = runner.run_line(config)
+        assert result["terminal"] == "blocked"
 
         envelope = json.loads(
             (tmp_path / "run" / "coord" / "round-1-input.json").read_text(encoding="utf-8")
