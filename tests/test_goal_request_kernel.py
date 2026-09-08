@@ -28,6 +28,8 @@ from fleet_graph.goal.request_kernel import (
     OBSERVED_CONFIRMED,
     OBSERVED_UNKNOWN,
     RECORD_ACTION,
+    RECORD_ACTION_RESULT,
+    RECORD_CALL_RESULT,
     RECORD_REQUEST,
     UNKNOWN,
     GoalRequestKernel,
@@ -81,7 +83,7 @@ class FakeEffects:
 
     def add_repo(self, payload: dict[str, Any], *, ctx: dict[str, Any]) -> dict[str, Any]:
         self.add_repos.append({"payload": payload, "ctx": dict(ctx)})
-        return {"ok": True}
+        return self._lookup("add_repo", str(ctx.get("idempotency_key") or ""), {"ok": True})
 
     def reply(self, payload: dict[str, Any], *, ctx: dict[str, Any]) -> dict[str, Any]:
         self.replies.append({"payload": payload, "ctx": dict(ctx)})
@@ -580,3 +582,180 @@ class TestLosslessPagination:
         events = kernel.list_events(GOAL)["events"]
         request = next(e for e in events if e["record"] == "request")
         assert request["input"]["deep"]["fact"] == 42
+
+
+# --- durable reconstruction (P6 / behaviors 1, 4, 7) -------------------------
+
+
+class TestDurableReconstruction:
+    def test_kernel_reconstructs_versions_queue_and_stop_from_durable_journal(
+        self, tmp_path
+    ) -> None:
+        home = tmp_path / "journal"
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        kernel.activate_version(GOAL, "v1")
+        kernel.submit(GOAL, make_request("A"))
+        kernel.submit(GOAL, make_request("B"))
+        # A is served with a confirmed dispatch; B stays queued; then stop.
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None and call["request_id"] == "A"
+        kernel.finish_goal_call(GOAL, call["call_id"], {"actions": [dispatch_action("K")]})
+        kernel.stop(GOAL)
+
+        # A rebuilt product reconstructs the same state from the JSONL files.
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        assert rebuilt.active_version(GOAL) == "v1"
+        assert rebuilt.next_goal_call(GOAL) is None  # stop survived the rebuild
+        rebuilt.resume(GOAL)
+        nxt = rebuilt.next_goal_call(GOAL)
+        assert nxt is not None and nxt["request_id"] == "B"  # queued request survived
+
+    def test_confirmed_dispatch_is_not_re_run_after_reconstruction(self, tmp_path) -> None:
+        home = tmp_path / "journal"
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        kernel.activate_version(GOAL, "v1")
+        result = run_one(kernel, make_request("A"), {"actions": [dispatch_action("K")]})
+        assert result["results"][0]["status"] == DELIVERED
+
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        replay = run_one(rebuilt, make_request("B"), {"actions": [dispatch_action("K")]})
+        assert replay["results"][0]["status"] == DELIVERED
+        assert replay["results"][0]["reconciled"] is True
+
+    def test_incomplete_tail_is_skipped_without_faulting_the_journal(self, tmp_path) -> None:
+        home = tmp_path / "journal"
+        kernel = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        kernel.activate_version(GOAL, "v1")
+        # Simulate a crash mid-append: a partial trailing line.
+        path = home / "goal-wf-1.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write('{"record": "request", "goal": "wf-1", "requ')
+
+        rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
+        assert rebuilt.active_version(GOAL) == "v1"
+
+
+# --- raw event completeness (behavior 6) --------------------------------------
+
+
+class TestRawEventCompleteness:
+    def test_call_result_record_preserves_stop_list_and_intent(self) -> None:
+        kernel = make_kernel(FakeEffects())
+        run_one(
+            kernel, make_request("A"), {"actions": [dispatch_action("k1")], "intent": "waiting"}
+        )
+        call_results = [
+            e for e in kernel.list_events(GOAL)["events"] if e["record"] == RECORD_CALL_RESULT
+        ]
+        assert len(call_results) == 1
+        assert call_results[0]["intent"] == "waiting"
+        assert call_results[0]["actions"] == [dispatch_action("k1")]
+
+    def test_downstream_delivery_fields_are_retained_in_the_result_record(self) -> None:
+        effects = FakeEffects()
+        effects.delivery[(ACTION_DISPATCH, "k1")] = {
+            "ok": True,
+            "status": DELIVERED,
+            "development_id": "d-1",
+            "evidence": {"sha": "abc"},
+        }
+        kernel = make_kernel(effects)
+        run_one(kernel, make_request("A"), {"actions": [dispatch_action("k1")]})
+        records = [
+            e
+            for e in kernel.list_events(GOAL)["events"]
+            if e["record"] == RECORD_ACTION_RESULT and e.get("kind") == ACTION_DISPATCH
+        ]
+        assert len(records) == 1
+        assert records[0]["development_id"] == "d-1"
+        assert records[0]["evidence"] == {"sha": "abc"}
+
+    def test_malformed_action_receipts_are_journaled(self) -> None:
+        kernel = make_kernel()
+        malformed = [{"kind": "bogus", "payload": {}, "idempotency_key": "x"}]
+        result = run_one(kernel, make_request("A"), {"actions": malformed})
+        assert result["receipts"] != []
+        records = [
+            e
+            for e in kernel.list_events(GOAL)["events"]
+            if e["record"] == RECORD_ACTION_RESULT
+            and "unknown action kind" in str(e.get("detail", ""))
+        ]
+        assert len(records) == 1
+
+
+# --- same-list add_repo dependency (P1) --------------------------------------
+
+
+class TestAddRepoDependency:
+    def test_dependent_dispatch_refused_when_add_repo_failed(self) -> None:
+        effects = FakeEffects()
+        effects.delivery[("add_repo", "ar1")] = {"ok": False, "status": FAILED, "detail": "boom"}
+        kernel = make_kernel(effects)
+        result = run_one(
+            kernel,
+            make_request("A"),
+            {
+                "actions": [
+                    {
+                        "kind": "add_repo",
+                        "idempotency_key": "ar1",
+                        "payload": {"repo_path": "repo-a"},
+                    },
+                    dispatch_action("k1", repo="repo-a"),
+                ]
+            },
+        )
+        statuses = {r["kind"]: r for r in result["results"]}
+        assert statuses["add_repo"]["status"] == FAILED
+        assert statuses["dispatch"]["status"] == FAILED
+        assert statuses["dispatch"]["detail"].startswith("dependent dispatch refused")
+
+    def test_dependent_dispatch_runs_when_add_repo_succeeded(self) -> None:
+        kernel = make_kernel(FakeEffects())
+        result = run_one(
+            kernel,
+            make_request("A"),
+            {
+                "actions": [
+                    {
+                        "kind": "add_repo",
+                        "idempotency_key": "ar1",
+                        "payload": {"repo_path": "repo-a"},
+                    },
+                    dispatch_action("k1", repo="repo-a"),
+                ]
+            },
+        )
+        statuses = {r["kind"]: r for r in result["results"]}
+        assert statuses["add_repo"]["status"] == DELIVERED
+        assert statuses["dispatch"]["status"] == DELIVERED
+
+    def test_dispatch_without_same_list_add_repo_is_not_dependent(self) -> None:
+        kernel = make_kernel(FakeEffects())
+        result = run_one(kernel, make_request("A"), {"actions": [dispatch_action("k1")]})
+        assert result["results"][0]["status"] == DELIVERED
+
+
+# --- stop authority over the in-flight result (behavior 5) --------------------
+
+
+class TestStopAuthority:
+    def test_graceful_stop_drains_in_flight_result_then_remains_stopped(self) -> None:
+        effects = FakeEffects()
+        kernel = make_kernel(effects)
+        kernel.submit(GOAL, make_request("A"))
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None
+        kernel.stop(GOAL)  # graceful while a call is in flight
+        assert kernel.next_goal_call(GOAL) is None  # nothing new starts
+        result = kernel.finish_goal_call(
+            GOAL, call["call_id"], {"actions": [dispatch_action("k1")], "intent": "waiting"}
+        )
+        # the in-flight result was drained exactly once
+        assert result["results"][0]["status"] == DELIVERED
+        assert len(effects.dispatches) == 1
+        # stopped remains authoritative over the returned waiting intent
+        assert kernel.next_goal_call(GOAL) is None
+        kernel.resume(GOAL)
+        assert kernel.next_goal_call(GOAL) is None  # now running, queue empty

@@ -17,6 +17,7 @@ from typing import Any
 from fleet_graph.goal.request_kernel import (
     ACTION_DISPATCH,
     DELIVERED,
+    KIND_MESSAGE,
     GoalRequestKernel,
     Journal,
 )
@@ -78,11 +79,20 @@ def test_build_line_composes_the_kernel_as_the_coordinator(tmp_path: Path) -> No
 
 def test_one_request_produces_one_goal_call_and_a_done_terminal() -> None:
     effects = RecordingEffects()
-    coordinator = make_coordinator(goal_call=ScriptedGoalCall(
-        {"actions": [{"kind": ACTION_DISPATCH, "idempotency_key": "k1",
-                      "payload": {"repo_path": "r", "dispatched_by": "wf-1", "spec_text": "s"}}],
-         "intent": "done"}
-    ))
+    coordinator = make_coordinator(
+        goal_call=ScriptedGoalCall(
+            {
+                "actions": [
+                    {
+                        "kind": ACTION_DISPATCH,
+                        "idempotency_key": "k1",
+                        "payload": {"repo_path": "r", "dispatched_by": "wf-1", "spec_text": "s"},
+                    }
+                ],
+                "intent": "done",
+            }
+        )
+    )
     coordinator.kernel.effects = effects
 
     verdict = coordinator.turn(
@@ -111,11 +121,20 @@ def test_unbound_goal_call_reports_not_ready_instead_of_a_simulated_answer() -> 
 
 def test_replay_of_a_confirmed_dispatch_does_not_re_run_the_effect() -> None:
     effects = RecordingEffects()
-    coordinator = make_coordinator(goal_call=ScriptedGoalCall(
-        {"actions": [{"kind": ACTION_DISPATCH, "idempotency_key": "K",
-                      "payload": {"repo_path": "r", "dispatched_by": "wf-1", "spec_text": "s"}}],
-         "intent": "done"}
-    ))
+    coordinator = make_coordinator(
+        goal_call=ScriptedGoalCall(
+            {
+                "actions": [
+                    {
+                        "kind": ACTION_DISPATCH,
+                        "idempotency_key": "K",
+                        "payload": {"repo_path": "r", "dispatched_by": "wf-1", "spec_text": "s"},
+                    }
+                ],
+                "intent": "done",
+            }
+        )
+    )
     coordinator.kernel.effects = effects
 
     coordinator.turn(1, {"folder_id": GOAL, "inbox_messages": []})
@@ -133,3 +152,68 @@ def test_unbound_effect_ports_fail_closed() -> None:
     assert effects.approve({"development_id": "d"}, ctx={})["status"] == "not_ready"
     # observe answers "unknown" for effects the service cannot reconcile.
     assert effects.observe("reply", "k") == "unknown"
+
+
+class SequenceGoalCall:
+    """A fake Goal call that serves one Stop List per call, oldest first."""
+
+    def __init__(self, stop_lists: list[dict[str, Any]]) -> None:
+        self._stop_lists = list(stop_lists)
+        self.prompts: list[dict[str, Any]] = []
+
+    def call(self, goal: str, prompt: dict[str, Any]) -> dict[str, Any]:
+        self.prompts.append(prompt)
+        if not self._stop_lists:
+            return {"actions": []}
+        return self._stop_lists.pop(0)
+
+
+def test_each_inbox_message_is_an_independent_request() -> None:
+    call = SequenceGoalCall([{"actions": [], "intent": "done"}, {"actions": [], "intent": "done"}])
+    coordinator = make_coordinator(goal_call=call)
+    inbox = [
+        {"message_id": "m-A", "from_agent_id": "line-a", "body": "msg A"},
+        {"message_id": "m-B", "from_agent_id": "line-b", "body": "msg B"},
+    ]
+    coordinator.turn(1, {"folder_id": GOAL, "inbox_messages": inbox})
+    assert len(call.prompts) == 2  # one Goal call per message, never one combined
+    assert call.prompts[0]["kind"] == KIND_MESSAGE
+    assert call.prompts[0]["caller"] == "line-a"
+    assert call.prompts[1]["kind"] == KIND_MESSAGE
+    assert call.prompts[1]["caller"] == "line-b"
+
+
+def test_waiting_result_does_not_suppress_queued_requests() -> None:
+    call = SequenceGoalCall(
+        [{"actions": [], "intent": "waiting"}, {"actions": [], "intent": "done"}]
+    )
+    coordinator = make_coordinator(goal_call=call)
+    inbox = [
+        {"message_id": "m-A", "from_agent_id": "line-a", "body": "msg A"},
+        {"message_id": "m-B", "from_agent_id": "line-b", "body": "msg B"},
+    ]
+    verdict = coordinator.turn(1, {"folder_id": GOAL, "inbox_messages": inbox})
+    # A returned waiting, but the queued B behind it was still serviced.
+    assert len(call.prompts) == 2
+    assert verdict["verdict"] == "done"
+
+
+def test_done_intent_with_an_unfulfilled_action_stays_pending() -> None:
+    # default KernelEffectPorts is unbound, so the dispatch fails closed.
+    coordinator = make_coordinator(
+        goal_call=ScriptedGoalCall(
+            {
+                "actions": [
+                    {
+                        "kind": ACTION_DISPATCH,
+                        "idempotency_key": "k1",
+                        "payload": {"repo_path": "r", "dispatched_by": "wf-1", "spec_text": "s"},
+                    }
+                ],
+                "intent": "done",
+            }
+        )
+    )
+    verdict = coordinator.turn(1, {"folder_id": GOAL, "inbox_messages": []})
+    assert verdict["verdict"] == "blocked"
+    assert "incomplete" in verdict["reason"]

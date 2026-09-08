@@ -115,6 +115,7 @@ STOP_MODES = (STOP_GRACEFUL, STOP_IMMEDIATE)
 #: Journal record markers.
 RECORD_REQUEST = "request"
 RECORD_CALL = "call"
+RECORD_CALL_RESULT = "call_result"
 RECORD_ACTION = "action"
 RECORD_ACTION_RESULT = "action_result"
 RECORD_CONTROL = "control"
@@ -122,6 +123,7 @@ RECORD_VERSION = "version"
 RECORDS = (
     RECORD_REQUEST,
     RECORD_CALL,
+    RECORD_CALL_RESULT,
     RECORD_ACTION,
     RECORD_ACTION_RESULT,
     RECORD_CONTROL,
@@ -300,11 +302,53 @@ class Journal:
     #: The ownership fence: goal -> call_id of the in-flight call, or None.
     _inflight: dict[str, str | None] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # A journal pointed at a real directory reconstructs its lines on
+        # construction, so a rebuilt product sees the same durable state.
+        if self.home is not None:
+            self.load()
+
     # -- persistence ------------------------------------------------------
 
     def _path(self, goal: str) -> Path:
         assert self.home is not None
         return self.home / f"{self.scope}-{goal}.jsonl"
+
+    def load(self) -> Journal:
+        """Load every existing journal line for every goal from disk.
+
+        Idempotent: re-running replaces the in-memory lines with what is on
+        disk, so a rebuilt product reconstructs the same durable state. A
+        trailing partially-written line (a crash mid-``append``) is skipped as
+        an incomplete tail rather than faulting the whole journal (P6).
+        """
+        if self.home is None:
+            return self
+        with self._lock:
+            loaded: dict[str, list[dict[str, Any]]] = {}
+            for path in sorted(self.home.glob(f"{self.scope}-*.jsonl")):
+                goal = path.name[len(self.scope) + 1 : -len(".jsonl")]
+                lines: list[dict[str, Any]] = []
+                with path.open("r", encoding="utf-8") as fh:
+                    for raw in fh:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            record = json.loads(raw)
+                        except json.JSONDecodeError:
+                            # Incomplete tail: the process died mid-append.
+                            # Skip the trailing fragment; it is recoverable.
+                            continue
+                        lines.append(record)
+                loaded[goal] = lines
+            self._lines = loaded
+            self._seq = {}
+            for goal, lines in loaded.items():
+                self._seq[goal] = max(
+                    (int(r.get("seq", 0)) for r in lines if "seq" in r), default=0
+                )
+        return self
 
     def _next_seq(self, goal: str) -> int:
         seq = self._seq.get(goal, 0) + 1
@@ -491,6 +535,58 @@ class GoalRequestKernel:
     def __post_init__(self) -> None:
         if self.effects is None:
             self.effects = _NullEffects()
+        self.restore()
+
+    def restore(self) -> None:
+        """Reconstruct per-goal derived state from the durable journal.
+
+        Rebuilds the version map, the lifecycle mode, the unserved request
+        queue and the ownership fence from the journal lines alone, so a rebuilt
+        product does not lose accepted requests, forget a stop, or re-run an
+        already-confirmed effect (behaviors 1/4/7, P6). Called automatically at
+        construction; safe to re-run.
+        """
+        self.journal.load()
+        self._versions = {}
+        self._mode = {}
+        inflight: dict[str, str | None] = {}
+        for goal in sorted(self.journal._lines):
+            lines = self.journal._lines[goal]
+            version = ""
+            mode = MODE_RUNNING
+            called: set[str] = set()
+            current_call: str | None = None
+            for line in lines:
+                record = line.get("record")
+                if record == RECORD_VERSION:
+                    version = str(line.get("version") or "")
+                elif record == RECORD_CONTROL and line.get("control") == "mode":
+                    mode = str(line.get("value") or MODE_RUNNING)
+                elif record == RECORD_CALL:
+                    called.add(str(line.get("request_id") or ""))
+                    current_call = str(line.get("call_id") or "") or None
+                elif (
+                    record == RECORD_CALL_RESULT
+                    and current_call is not None
+                    and line.get("call_id") == current_call
+                ):
+                    current_call = None
+            queue = [
+                line
+                for line in lines
+                if line.get("record") == RECORD_REQUEST
+                and str(line.get("request_id") or "") not in called
+            ]
+            self._versions[goal] = version
+            self._mode[goal] = mode
+            self._state[goal] = {
+                "queue": queue,
+                "delivered": [],
+                "mode": mode,
+                "stopping_drain": None,
+            }
+            inflight[goal] = current_call
+        self.journal._inflight = inflight
 
     # -- goal versioning ---------------------------------------------------
 
@@ -594,7 +690,7 @@ class GoalRequestKernel:
         queued request, claims the fence, and returns a call envelope."""
         if self.journal.inflight(goal):
             return None
-        if self._mode_of(goal) in (MODE_STOPPED, MODE_BLOCKED):
+        if self._mode_of(goal) in (MODE_STOPPING, MODE_STOPPED, MODE_BLOCKED):
             return None
         st = self._state.get(goal, {"queue": [], "delivered": [], "mode": MODE_RUNNING})
         if not st["queue"]:
@@ -640,6 +736,11 @@ class GoalRequestKernel:
         active_version = self._versions.get(goal, "")
 
         results: list[dict[str, Any]] = []
+        # P1 same-list dependency: a ``dispatch`` is only admitted for a
+        # repository whose same-list ``add_repo`` succeeded first. A refused or
+        # lost admission blocks the dependent dispatch without erasing the
+        # independent results already delivered in this list.
+        repo_admission: dict[str, str] = {}
         for index, action in enumerate(consumable, start=1):
             refusal = business_guards(action, active_version=active_version)
             if refusal:
@@ -647,12 +748,75 @@ class GoalRequestKernel:
                     self._refuse(goal, action, call_id, request_id, run_id, index, refusal)
                 )
                 continue
-            results.append(
-                self._effect_outcome(goal, action, call_id, request_id, run_id, index, caller)
+            if action["kind"] == ACTION_DISPATCH:
+                repo = str((action.get("payload") or {}).get("repo_path") or "")
+                admission = repo_admission.get(repo)
+                if admission is not None and admission != DELIVERED:
+                    results.append(
+                        self._refuse(
+                            goal,
+                            action,
+                            call_id,
+                            request_id,
+                            run_id,
+                            index,
+                            f"dependent dispatch refused: add_repo for {repo!r} did not succeed",
+                        )
+                    )
+                    continue
+            result = self._effect_outcome(goal, action, call_id, request_id, run_id, index, caller)
+            if action["kind"] == ACTION_ADD_REPO:
+                repo_admission[str((action.get("payload") or {}).get("repo_path") or "")] = str(
+                    result["status"]
+                )
+            results.append(result)
+
+        # Behavior 6: persist the returned Stop List, its terminal intent and
+        # every malformed entry (not just the routed results) -- pagination must
+        # be able to reconstruct the raw outcome, never a reduced projection.
+        for receipt in receipts:
+            self.journal.append(
+                goal,
+                self._result_record(
+                    goal,
+                    f"{call_id}:malformed:{receipt.get('idempotency_key') or 'unknown'}",
+                    request_id,
+                    run_id,
+                    0,
+                    str(receipt.get("kind") or ""),
+                    FAILED,
+                    str(receipt.get("reason") or "malformed action"),
+                ),
             )
+        raw_actions = stop_list.get("actions") if isinstance(stop_list, dict) else None
+        self.journal.append(
+            goal,
+            {
+                "record": RECORD_CALL_RESULT,
+                "goal": goal,
+                "call_id": call_id,
+                "request_id": request_id,
+                "run_id": run_id,
+                "intent": intent,
+                "actions": raw_actions if isinstance(raw_actions, list) else [],
+                "at": _iso(self.clock),
+            },
+        )
 
         self.journal.release_call(goal, call_id)
-        self._set_mode(goal, _intent_mode(intent) or self._mode_of(goal))
+
+        # A stop that landed while this call was in flight is authoritative:
+        # graceful stop drains this result then rests ``stopped``; an immediate
+        # stop the runtime confirmed holds ``stopped``. Neither is overwritten
+        # by the returned intent (behavior 5).
+        mode = self._mode_of(goal)
+        if mode == MODE_STOPPING:
+            self._set_mode(goal, MODE_STOPPED)
+        elif mode == MODE_STOPPED:
+            pass
+        else:
+            self._set_mode(goal, _intent_mode(intent) or mode)
+
         return {
             "call_id": call_id,
             "goal": goal,
@@ -674,6 +838,7 @@ class GoalRequestKernel:
         detail: str,
         *,
         reconciled: bool = False,
+        downstream: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         out: dict[str, Any] = {
             "action_id": action_id,
@@ -684,7 +849,19 @@ class GoalRequestKernel:
         }
         if reconciled:
             out["reconciled"] = True
+        if isinstance(downstream, dict):
+            for key, value in downstream.items():
+                if key in ("ok", "status", "detail", "reconciled") or key in out:
+                    continue
+                out[key] = value
         return out
+
+    @staticmethod
+    def _downstream(delivery: dict[str, Any]) -> dict[str, Any]:
+        """The non-projection fields of an effect delivery (behavior 6)."""
+        return {
+            key: value for key, value in delivery.items() if key not in ("ok", "status", "detail")
+        }
 
     def _effect_outcome(
         self,
@@ -787,8 +964,10 @@ class GoalRequestKernel:
         kind: str,
         status: str,
         detail: str,
+        *,
+        delivery: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return {
+        record: dict[str, Any] = {
             "record": RECORD_ACTION_RESULT,
             "goal": goal,
             "action_id": action_id,
@@ -800,6 +979,15 @@ class GoalRequestKernel:
             "detail": detail,
             "at": _iso(self.clock),
         }
+        if isinstance(delivery, dict):
+            # Behavior 6: downstream facts (development_id, evidence references,
+            # launches, ...) are part of the raw result, never collapsed into
+            # a reduced status/detail projection.
+            for key, value in delivery.items():
+                if key in ("ok", "status", "detail") or key in record:
+                    continue
+                record[key] = value
+        return record
 
     def _deliver(
         self,
@@ -851,6 +1039,7 @@ class GoalRequestKernel:
             status = DELIVERED
         elif status not in (FAILED, NOT_READY, UNKNOWN):
             status = FAILED
+        downstream = self._downstream(delivery)
         self.journal.append(
             goal,
             self._result_record(
@@ -862,9 +1051,12 @@ class GoalRequestKernel:
                 action["kind"],
                 status,
                 delivery.get("detail", ""),
+                delivery=delivery,
             ),
         )
-        return self._result(action, action_id, status, delivery.get("detail", ""))
+        return self._result(
+            action, action_id, status, delivery.get("detail", ""), downstream=downstream
+        )
 
     def _refuse(
         self,
@@ -924,16 +1116,45 @@ class GoalRequestKernel:
         (behavior 5)."""
         if mode not in STOP_MODES:
             raise RequestKernelError("stop_mode", f"{mode!r} not in {list(STOP_MODES)}")
-        self._set_mode(goal, MODE_STOPPING)
-        result: dict[str, Any] = {"goal": goal, "mode": mode, "stopped": False, "cancel": None}
-        if mode == STOP_IMMEDIATE and self.runtime is not None:
-            result["cancel"] = self.runtime.stop(goal, mode=mode)
-            result["stopped"] = bool(result["cancel"].get("terminated", False))
-            self._set_mode(goal, MODE_STOPPED)
-        else:
-            self._set_mode(goal, MODE_STOPPED)
-            result["stopped"] = True
-        return result
+
+        if mode == STOP_IMMEDIATE:
+            cancel: dict[str, Any] = {}
+            if self.runtime is not None:
+                cancel = self.runtime.stop(goal, mode=mode) or {}
+            terminated = bool(cancel.get("terminated", False))
+            # Behavior 5/6: the cancellation answer is a recorded control fact --
+            # never a printout, never a simulated termination.
+            self.journal.append(
+                goal,
+                {
+                    "record": RECORD_CONTROL,
+                    "goal": goal,
+                    "control": "stop",
+                    "mode": mode,
+                    "terminated": terminated,
+                    "cancel": cancel,
+                    "at": _iso(self.clock),
+                },
+            )
+            if terminated:
+                self._set_mode(goal, MODE_STOPPED)
+            # Not terminated: absent/refused cancellation is recorded honestly
+            # and the goal's mode is left as it was -- it is not 'stopped'.
+            return {"goal": goal, "mode": mode, "stopped": terminated, "cancel": cancel}
+
+        # graceful: stop admitting new calls/effects, but drain an in-flight
+        # result first (behavior 5). Without an in-flight call it stops now.
+        if self.journal.inflight(goal):
+            self._set_mode(goal, MODE_STOPPING)
+            return {
+                "goal": goal,
+                "mode": mode,
+                "stopped": False,
+                "draining": True,
+                "cancel": None,
+            }
+        self._set_mode(goal, MODE_STOPPED)
+        return {"goal": goal, "mode": mode, "stopped": True, "cancel": None}
 
     def resume(self, goal: str) -> dict[str, Any]:
         """Lift a ``stopped``/``waiting``/``blocked`` goal back to running."""
@@ -1006,6 +1227,7 @@ __all__ = [
     "RECORD_ACTION",
     "RECORD_ACTION_RESULT",
     "RECORD_CALL",
+    "RECORD_CALL_RESULT",
     "RECORD_CONTROL",
     "RECORD_REQUEST",
     "RECORD_VERSION",

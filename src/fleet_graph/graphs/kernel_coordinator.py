@@ -101,15 +101,19 @@ class KernelCoordinator:
     def turn(
         self, round_no: int, coord_input: dict[str, Any], *, resume: bool = False
     ) -> dict[str, Any]:
-        """One coordinator turn = ingress a request, then drain Goal calls serially.
+        """One coordinator turn = ingress the round's independent requests, then
+        drain Goal calls serially.
 
-        The round's facts become a single durable request (persisted before we
-        proceed); the kernel then services queued requests one Goal call at a
-        time, in submission order, until the queue is empty or the Goal parks
-        the line. The final service's terminal intent is the round's verdict.
+        Every independently identified input (a message, a steer/decision, a DD
+        result or review) becomes its own durable request, persisted before we
+        proceed; the kernel then services queued requests one Goal call at a
+        time, in submission order, until the queue is drained or the goal's own
+        mode blocks it. A waiting result must not suppress the queued requests
+        behind it (behavior 2/5).
         """
-        request = self._request_for(round_no, coord_input)
-        self.kernel.submit(self.folder_id, request)
+        requests = self._requests_for(round_no, coord_input)
+        for request in requests:
+            self.kernel.submit(self.folder_id, request)
 
         last: dict[str, Any] | None = None
         while True:
@@ -117,11 +121,10 @@ class KernelCoordinator:
             if call is None:
                 break
             last = self._run_call(call)
-            # A terminal intent that is not ``done`` parks the line: remaining
-            # queued requests are preserved (behavior 2/5), never discarded and
-            # never silently combined into one call.
-            if last["verdict"] != "done":
-                break
+            # No verdict-based break: the kernel's mode fence is what stops the
+            # drain (blocked/stopped return None from next_goal_call). Breaking
+            # here on a waiting result would suppress the queued requests that
+            # the waiting intent must not suppress.
 
         if last is None:
             return _parked_verdict(self.kernel, self.folder_id)
@@ -129,48 +132,104 @@ class KernelCoordinator:
 
     # -- request ingress -----------------------------------------------------
 
-    def _request_for(self, round_no: int, coord_input: dict[str, Any]) -> Request:
-        """Derive the round's serial request from the graph's coordinator input.
+    def _requests_for(self, round_no: int, coord_input: dict[str, Any]) -> list[Request]:
+        """Derive the round's independent requests from the coordinator input.
 
-        One line round == one request. The request identity is stable per round
-        (``line:<folder>:round:<round>``) so a restart that re-enters the same
-        round reuses the persisted request instead of re-appending (P5), while
-        a new round is a genuinely new request. The kind is inferred from what
-        woke the line; the current input is the coordinator envelope verbatim --
-        one current request, never a re-appended history.
+        One line round is no longer one combined request: each independently
+        identifiable input becomes its own durable request with its own caller
+        and kind, so a multi-message inbox never collapses into a single Goal
+        prompt, and a distinct steer delivered on the same round is never
+        mistaken for a duplicate of another input. Request identity is stable by
+        input identity, not by round alone (P5).
         """
         folder_id = self.folder_id
+        version = self.kernel.active_version(folder_id)
         inbox = coord_input.get("inbox_messages") or []
         decision = coord_input.get("decision")
         last_turn_report = coord_input.get("last_turn_report")
         gate_wake = coord_input.get("dd_awaiting_gate_development_id")
 
-        if round_no == 1 and not inbox and decision is None:
-            kind = KIND_ENROLL
-            caller = "goal-enroll"
-        elif decision is not None:
-            kind = KIND_STEER
-            decided_by = (decision or {}).get("decided_by") if isinstance(decision, dict) else None
-            caller = str(decided_by or "goal")
-        elif inbox:
-            kind = KIND_MESSAGE
-            first = inbox[0] if isinstance(inbox, list) and inbox else {}
-            caller = str(first.get("sent_by") or "line") if isinstance(first, dict) else "line"
-        elif last_turn_report is not None or bool(gate_wake):
-            kind = KIND_DD_REVIEW if last_turn_report is not None else KIND_DD_RESULT
-            caller = "goal-enroll"
-        else:
-            kind = KIND_MESSAGE
-            caller = "line"
+        requests: list[Request] = []
 
-        return Request(
-            request_id=f"line:{folder_id}:round:{round_no}",
-            goal=folder_id,
-            caller=caller,
-            kind=kind,
-            input=dict(coord_input),
-            goal_version=self.kernel.active_version(folder_id),
-        )
+        if isinstance(last_turn_report, dict) and last_turn_report:
+            turn_id = str(last_turn_report.get("turn_id") or "")
+            requests.append(
+                Request(
+                    request_id=f"line:{folder_id}:dd_review:{turn_id or round_no}",
+                    goal=folder_id,
+                    caller="worker",
+                    kind=KIND_DD_REVIEW,
+                    input={"last_turn_report": last_turn_report},
+                    goal_version=version,
+                )
+            )
+        elif gate_wake:
+            requests.append(
+                Request(
+                    request_id=f"line:{folder_id}:dd_result:{gate_wake}",
+                    goal=folder_id,
+                    caller="goal-enroll",
+                    kind=KIND_DD_RESULT,
+                    input={"dd_awaiting_gate_development_id": gate_wake},
+                    goal_version=version,
+                )
+            )
+
+        if isinstance(decision, dict) and decision:
+            decided_by = str(decision.get("decided_by") or "goal")
+            decision_id = str(decision.get("message_id") or decision.get("resume_key") or "")
+            requests.append(
+                Request(
+                    request_id=f"line:{folder_id}:steer:{decision_id or round_no}",
+                    goal=folder_id,
+                    caller=decided_by,
+                    kind=KIND_STEER,
+                    input={"decision": decision},
+                    goal_version=version,
+                )
+            )
+
+        if isinstance(inbox, list):
+            for msg in inbox:
+                if not isinstance(msg, dict):
+                    continue
+                message_id = str(msg.get("message_id") or "")
+                caller = str(msg.get("from_agent_id") or msg.get("from_alias") or "line")
+                requests.append(
+                    Request(
+                        request_id=f"line:{folder_id}:message:{message_id or round_no}",
+                        goal=folder_id,
+                        caller=caller,
+                        kind=KIND_MESSAGE,
+                        input={"inbox_message": msg},
+                        goal_version=version,
+                    )
+                )
+
+        if not requests:
+            if round_no == 1:
+                requests.append(
+                    Request(
+                        request_id=f"line:{folder_id}:enroll",
+                        goal=folder_id,
+                        caller="goal-enroll",
+                        kind=KIND_ENROLL,
+                        input=dict(coord_input),
+                        goal_version=version,
+                    )
+                )
+            else:
+                requests.append(
+                    Request(
+                        request_id=f"line:{folder_id}:round:{round_no}",
+                        goal=folder_id,
+                        caller="line",
+                        kind=KIND_MESSAGE,
+                        input=dict(coord_input),
+                        goal_version=version,
+                    )
+                )
+        return requests
 
     # -- the serial Goal call -------------------------------------------------
 
@@ -234,11 +293,30 @@ def _to_verdict(result: dict[str, Any]) -> dict[str, Any]:
     """Map a ``finish_goal_call`` result back to the graph's verdict surface."""
     intent = result.get("intent")
     results = result.get("results") or []
+    receipts = result.get("receipts") or []
     failed = [r for r in results if r.get("status") not in (DELIVERED,)]
+    malformed = [r for r in receipts if r.get("status") == FAILED]
+
+    if intent == "done":
+        incomplete = len(failed) + len(malformed)
+        if incomplete:
+            # P4: ``done`` is an intent, never a terminal shortcut -- an
+            # undelivered dispatch/reply or a malformed entry keeps the line
+            # pending rather than completing it.
+            return {
+                "verdict": "blocked",
+                "waiting_on": "none",
+                "reason": (
+                    f"goal declared done but {incomplete} delivery receipt(s) "
+                    "are incomplete; line remains pending"
+                ),
+            }
+        return {
+            "verdict": "done",
+            "reason": f"goal call {result.get('call_id')} routed {len(results)} action(s)",
+        }
+
     verdict, waiting_on, reason = _intent_verdict(intent)
-    if verdict == "done":
-        tail = f"; {len(failed)} failed" if failed else ""
-        reason = f"goal call {result.get('call_id')} routed {len(results)} action(s){tail}"
     out: dict[str, Any] = {"verdict": verdict, "reason": reason}
     if waiting_on:
         out["waiting_on"] = waiting_on
