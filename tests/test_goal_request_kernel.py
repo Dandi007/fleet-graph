@@ -12,6 +12,7 @@ refusal, unknown Runtime outcome, lossless pagination).
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 import pytest
@@ -1959,3 +1960,73 @@ class TestCompletionModeRecovery:
         rebuilt = GoalRequestKernel(journal=Journal(home=home), effects=FakeEffects())
         assert rebuilt._state[GOAL]["mode"] == MODE_STOPPED
         assert rebuilt.journal.inflight(GOAL) is None
+
+
+# --- final review: completion must not overwrite a concurrent stop ----------
+
+
+class _PausingJournal(Journal):
+    """A journal whose ``append_many`` pauses at a barrier.
+
+    The completion tail calls ``append_many`` *after* it has read the current
+    lifecycle mode but *before* it releases the fence. Pausing there holds the
+    exact lost-stop window open -- mode already read, fence still held -- so a
+    test can issue a concurrent stop and assert it is not overwritten."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.at_append_many = threading.Event()
+        self.proceed = threading.Event()
+
+    def append_many(self, goal: str, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self.at_append_many.set()
+        self.proceed.wait(timeout=10)
+        return super().append_many(goal, records)
+
+
+class TestStopNotLostByConcurrentCompletion:
+    def _concurrent_completion_and_stop(
+        self, mode: str, runtime: FakeRuntime | None
+    ) -> None:
+        journal = _PausingJournal()
+        kernel = GoalRequestKernel(
+            journal=journal, effects=FakeEffects(), runtime=runtime
+        )
+        kernel.activate_version(GOAL, "v1")
+        kernel.submit(GOAL, make_request("A"))
+        call = kernel.next_goal_call(GOAL)
+        assert call is not None
+
+        def finish() -> None:
+            kernel.finish_goal_call(GOAL, call["call_id"], {"actions": []})
+
+        def stop_it() -> None:
+            kernel.stop(GOAL, mode=mode)
+
+        worker = threading.Thread(target=finish)
+        worker.start()
+        # Hold the completion tail open: mode already read, fence still held.
+        assert journal.at_append_many.wait(timeout=5)
+        stopper = threading.Thread(target=stop_it)
+        stopper.start()
+        # Let the completion tail finish. A correct kernel serializes the stop
+        # with the completion tail, so the stop either drains this in-flight
+        # call or lands after the fence is released -- never overwritten by the
+        # stale mode read.
+        journal.proceed.set()
+        worker.join(timeout=10)
+        stopper.join(timeout=10)
+        assert not worker.is_alive()
+        assert not stopper.is_alive()
+
+        # The stop is authoritative regardless of interleaving: the goal rests
+        # stopped and no queued request can start without resume.
+        assert kernel._state[GOAL]["mode"] == MODE_STOPPED
+        assert kernel.journal.inflight(GOAL) is None
+        assert kernel.next_goal_call(GOAL) is None
+
+    def test_graceful_stop_is_not_lost_by_concurrent_completion(self) -> None:
+        self._concurrent_completion_and_stop("graceful", runtime=None)
+
+    def test_confirmed_immediate_stop_is_not_lost_by_concurrent_completion(self) -> None:
+        self._concurrent_completion_and_stop("immediate", runtime=FakeRuntime())

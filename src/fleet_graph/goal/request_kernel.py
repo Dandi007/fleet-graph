@@ -669,7 +669,12 @@ class GoalRequestKernel:
     #: (behaviors 1/2/7, P5/P6). The guarded sections are in-memory +
     #: journal-mutating only -- never an external effect -- so this serializes
     #: *transitions*, not Goal calls, and a call on goal A is never serialized
-    #: behind a call on goal B.
+    #: behind a call on goal B. It also serializes the lifecycle transitions
+    #: (``stop``/``resume``) and the completion tail of ``finish_goal_call``
+    #: against each other and against call admission (final review
+    #: rf-1b50bcf1, behavior 5, P6): a concurrent stop must neither be lost by
+    #: completion's stale mode read nor let a queued request start before
+    #: resume.
     _request_lock: threading.RLock = field(default_factory=threading.RLock)
     #: Serializes resumed-execution *ownership* (final review rf-25eeb86e,
     #: behaviors 2/4/7, P6). The journal lock guards individual journal
@@ -1322,49 +1327,61 @@ class GoalRequestKernel:
         # longer leave a drained call whose durable mode still reads
         # ``stopping`` (or ``running`` when the Goal meant waiting/blocked) with
         # no record to finish the transition (final review finding).
-        mode = self._mode_of(goal)
-        next_mode = _derive_completion_mode(mode, intent)
-        records: list[dict[str, Any]] = [
-            {
-                "record": RECORD_CALL_RESULT,
-                "goal": goal,
-                "call_id": call_id,
-                "request_id": request_id,
-                "run_id": run_id,
-                "intent": intent,
-                "raw_intent": raw_intent,
-                "actions": raw_actions if isinstance(raw_actions, list) else [],
-                "at": _iso(self.clock),
-            }
-        ]
-        if mode != MODE_STOPPED:
-            # A stop the runtime already confirmed needs no further transition;
-            # every other completion moves the lifecycle (a graceful stop
-            # reaches ``stopped``, a terminal intent moves waiting/blocked, and
-            # otherwise the mode is re-asserted) and is written with the call
-            # result as one atomic append.
-            records.append(
+        #
+        # The *whole* completion tail -- mode derivation, persistence, the
+        # in-memory projection update and the fence release -- is one serialized
+        # transition shared with ``stop``/``resume`` and call admission via
+        # ``_request_lock`` (final review rf-1b50bcf1, behavior 5, P6). Without
+        # it completion could read ``running``; a concurrent stop could then
+        # record ``stopping``/``stopped`` while the fence is still held; and
+        # completion would subsequently persist its stale ``running``/``waiting``
+        # mode and drop the fence -- letting queued requests start without
+        # resume.
+        with self._request_lock:
+            mode = self._mode_of(goal)
+            next_mode = _derive_completion_mode(mode, intent)
+            records: list[dict[str, Any]] = [
                 {
-                    "record": RECORD_CONTROL,
+                    "record": RECORD_CALL_RESULT,
                     "goal": goal,
-                    "control": "mode",
-                    "value": next_mode,
+                    "call_id": call_id,
+                    "request_id": request_id,
+                    "run_id": run_id,
+                    "intent": intent,
+                    "raw_intent": raw_intent,
+                    "actions": raw_actions if isinstance(raw_actions, list) else [],
                     "at": _iso(self.clock),
                 }
-            )
-        self.journal.append_many(goal, records)
+            ]
+            if mode != MODE_STOPPED:
+                # A stop the runtime already confirmed needs no further
+                # transition; every other completion moves the lifecycle (a
+                # graceful stop reaches ``stopped``, a terminal intent moves
+                # waiting/blocked, and otherwise the mode is re-asserted) and is
+                # written with the call result as one atomic append.
+                records.append(
+                    {
+                        "record": RECORD_CONTROL,
+                        "goal": goal,
+                        "control": "mode",
+                        "value": next_mode,
+                        "at": _iso(self.clock),
+                    }
+                )
+            self.journal.append_many(goal, records)
 
-        self.journal.release_call(goal, call_id)
+            self.journal.release_call(goal, call_id)
 
-        # A call was fully drained (fresh or resumed): clear any resume marker.
-        st = self._state.get(goal)
-        if st and st.get("resume") == call_id:
-            st["resume"] = None
+            # A call was fully drained (fresh or resumed): clear any resume
+            # marker.
+            st = self._state.get(goal)
+            if st and st.get("resume") == call_id:
+                st["resume"] = None
 
-        # The transition is already durable above; keep the in-memory projection
-        # in step without a second journal write.
-        self._state.setdefault(goal, self._default_state())["mode"] = next_mode
-        self._mode[goal] = next_mode
+            # The transition is already durable above; keep the in-memory
+            # projection in step without a second journal write.
+            self._state.setdefault(goal, self._default_state())["mode"] = next_mode
+            self._mode[goal] = next_mode
 
         return {
             "call_id": call_id,
@@ -1830,42 +1847,51 @@ class GoalRequestKernel:
                 cancel = self.runtime.stop(goal, mode=mode) or {}
             terminated = bool(cancel.get("terminated", False))
             # Behavior 5/6: the cancellation answer is a recorded control fact --
-            # never a printout, never a simulated termination.
-            self.journal.append(
-                goal,
-                {
-                    "record": RECORD_CONTROL,
-                    "goal": goal,
-                    "control": "stop",
-                    "mode": mode,
-                    "terminated": terminated,
-                    "cancel": cancel,
-                    "at": _iso(self.clock),
-                },
-            )
-            if terminated:
-                self._set_mode(goal, MODE_STOPPED)
+            # never a printout, never a simulated termination. Recording it and
+            # moving the mode is serialized with call completion and call
+            # admission via ``_request_lock`` so a concurrent completion cannot
+            # overwrite a confirmed stop (final review rf-1b50bcf1, behavior 5,
+            # P6). The runtime cancellation port is invoked *outside* the lock.
+            with self._request_lock:
+                self.journal.append(
+                    goal,
+                    {
+                        "record": RECORD_CONTROL,
+                        "goal": goal,
+                        "control": "stop",
+                        "mode": mode,
+                        "terminated": terminated,
+                        "cancel": cancel,
+                        "at": _iso(self.clock),
+                    },
+                )
+                if terminated:
+                    self._set_mode(goal, MODE_STOPPED)
             # Not terminated: absent/refused cancellation is recorded honestly
             # and the goal's mode is left as it was -- it is not 'stopped'.
             return {"goal": goal, "mode": mode, "stopped": terminated, "cancel": cancel}
 
         # graceful: stop admitting new calls/effects, but drain an in-flight
         # result first (behavior 5). Without an in-flight call it stops now.
-        if self.journal.inflight(goal):
-            self._set_mode(goal, MODE_STOPPING)
-            return {
-                "goal": goal,
-                "mode": mode,
-                "stopped": False,
-                "draining": True,
-                "cancel": None,
-            }
-        self._set_mode(goal, MODE_STOPPED)
-        return {"goal": goal, "mode": mode, "stopped": True, "cancel": None}
+        # The inflight check + mode transition is serialized with call
+        # completion and call admission via ``_request_lock`` (rf-1b50bcf1).
+        with self._request_lock:
+            if self.journal.inflight(goal):
+                self._set_mode(goal, MODE_STOPPING)
+                return {
+                    "goal": goal,
+                    "mode": mode,
+                    "stopped": False,
+                    "draining": True,
+                    "cancel": None,
+                }
+            self._set_mode(goal, MODE_STOPPED)
+            return {"goal": goal, "mode": mode, "stopped": True, "cancel": None}
 
     def resume(self, goal: str) -> dict[str, Any]:
         """Lift a ``stopped``/``waiting``/``blocked`` goal back to running."""
-        self._set_mode(goal, MODE_RUNNING)
+        with self._request_lock:
+            self._set_mode(goal, MODE_RUNNING)
         if self.runtime is not None:
             return self.runtime.resume(goal)
         return {"goal": goal, "resumed": True}
