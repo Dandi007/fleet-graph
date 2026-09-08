@@ -82,6 +82,14 @@ class ModelConfigurationTests(unittest.TestCase):
                 self.assertEqual(set(routes["routes"]), {"deepseek-v4-pro@opencode/gw"})
                 for role, settings in effective["roles"].items():
                     self.assertEqual(settings["model"], "deepseek-v4-pro")
+                    self.assertTrue(
+                        Path(settings["system_prompt_file"])
+                        .read_text()
+                        .endswith(configure.FINAL_RESPONSE_RULE)
+                    )
+                    self.assertEqual(
+                        manifest["final_response_override"], configure.FINAL_RESPONSE_RULE
+                    )
                     # 这是 runtime CLI 的调用边界；重复 @opencode 会在这里回归失败。
                     chain_key = settings["model"] + "@" + settings["runtime"]
                     self.assertEqual(

@@ -47,5 +47,38 @@ class MonitorTests(unittest.TestCase):
         self.assertTrue(self.monitor.observe(self.status))
 
 
+class EngineAbsentTests(unittest.TestCase):
+    def setUp(self):
+        self.monitor = monitor.EngineAbsentMonitor()
+        self.status = {
+            "status": "stopping",
+            "engine_alive": False,
+            "runs": {"impl": {"status": "uncertain", "result": {"status": "lost"}}},
+        }
+
+    def test_stable_stopping_uncertain_requests_failure_collection(self):
+        original = copy.deepcopy(self.status)
+        self.assertFalse(self.monitor.observe(self.status))
+        self.assertTrue(self.monitor.observe(self.status))
+        self.assertEqual(self.status, original)
+
+    def test_transient_startup_absence_does_not_request_stop(self):
+        starting = {**self.status, "status": "active"}
+        self.assertFalse(self.monitor.observe(starting))
+        self.assertFalse(self.monitor.observe({**starting, "engine_alive": True}))
+        self.assertFalse(self.monitor.observe(starting))
+
+    def test_changed_run_result_restarts_observation_count(self):
+        self.assertFalse(self.monitor.observe(self.status))
+        self.status["runs"]["impl"]["result"]["status"] = "failed"
+        self.assertFalse(self.monitor.observe(self.status))
+        self.assertTrue(self.monitor.observe(self.status))
+
+    def test_done_and_missing_liveness_never_request_failure_stop(self):
+        for status in [{**self.status, "status": "done"}, {"status": "active"}]:
+            self.assertFalse(self.monitor.observe(status))
+            self.assertFalse(self.monitor.observe(status))
+
+
 if __name__ == "__main__":
     unittest.main()

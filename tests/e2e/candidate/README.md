@@ -32,6 +32,8 @@ manifest 的 `config_path` 可指定 Fleet 源码内相对路径，默认 `confi
 
 实际 E2E 暴露了一处原配置集成差异：冻结 Fleet 的 `roles.*.model` 使用 `deepseek-v4-pro@opencode`，但 runtime 的 `resolveChain()` 会把 CLI `--model` 与 `--runtime` 拼接成 `model@runtime`，导致重复后缀并报 `No default chain`。容器生成配置改传 bare model `deepseek-v4-pro`；chain 仍为 `deepseek-v4-pro@opencode`，只有原默认网关 route。manifest 的 `role_model_overrides` 逐角色保留 original、effective 和 resolved_chain；该修正不写回冻结源码，也不将原配置宣称为已通过集成。
 
+各角色系统 prompt 末尾显式要求最终回复只输出当前 Stop schema 对应的 JSON 值：Goal 为数组，其他角色按各自 schema；禁止说明文字、Markdown 代码围栏以及虚构 StructuredOutput 工具。该文本完整保存在 manifest 的 `final_response_override`，不修改 schema 或 runtime parser，不替模型生成结果。它针对真实运行中“说明文字加 fenced JSON”导致的 structured output 失败明确格式要求。
+
 该测试验证的是显式容器配置覆盖后的候选行为。它不验证候选默认宿主配置、native subscription、其他模型/runtime 或自动发现宿主凭证的能力；这些范围不应计入通过项。
 
 配置生成后先执行 `/opt/e2e/bootstrap_runtime_bus.ts`，通过冻结 runtime 的协议描述和注册函数，在独立 agent-bus 初始化协议与 `board:agent-runs`。脚本非零退出或超过 60 秒时阻止 Fleet 启动；原始输出写入 `/state/logs/runtime-bus-bootstrap.log`，退出码保存到 manifest 的 `agent_bus.bootstrap`。该步骤不替代后续真实生命周期消息的验收。

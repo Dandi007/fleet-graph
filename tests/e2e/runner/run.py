@@ -20,7 +20,7 @@ from pathlib import Path
 
 from adapter import Mapper
 from fastmcp import Client
-from monitor import BlockedIdleMonitor
+from monitor import BlockedIdleMonitor, EngineAbsentMonitor
 
 HARNESS = Path("/harness")
 REPO = Path("/workspace/fixture")
@@ -225,7 +225,11 @@ async def collect(client, bundle, goal_id, status):
 
 async def stop_goal(client, bundle, goal_id, status, reason):
     write(bundle / "raw/stop-reason.json", {"reason": reason, "observed_status": status})
-    status = await call(client, "goal_stop", {"goal_id": goal_id, "immediate": True})
+    try:
+        status = await call(client, "goal_stop", {"goal_id": goal_id, "immediate": True})
+    except Exception as exc:
+        write(bundle / "raw/stop-response.json", {"error": str(exc)})
+        return status  # 停止接口失败也继续采集原始状态，不把 uncertain 改写成终态。
     write(bundle / "raw/stop-response.json", status)
     for _ in range(30):
         if not status["engine_alive"]:
@@ -324,6 +328,7 @@ async def e2e(bundle, candidate):
         write(bundle / "manifest.json", manifest)
         deadline = time.monotonic() + int(os.environ.get("E2E_TIMEOUT", "3600"))
         blocked_idle = BlockedIdleMonitor()
+        engine_absent = EngineAbsentMonitor()
         while time.monotonic() < deadline:
             status = await call(client, "goal_status", {"goal_id": goal_id})
             write(bundle / "raw/status.json", status)
@@ -340,7 +345,14 @@ async def e2e(bundle, candidate):
             )
             if status["status"] == "done" and not status["engine_alive"]:
                 break
-            if status["status"] in {"blocked", "stopped"} and not status["engine_alive"]:
+            if engine_absent.observe(status):
+                status = await stop_goal(
+                    client,
+                    bundle,
+                    goal_id,
+                    status,
+                    "连续两轮引擎离线且目标非 done，公开状态无变化；保留 uncertain/lost 证据",
+                )
                 break
             if blocked_idle.observe(status):
                 status = await stop_goal(

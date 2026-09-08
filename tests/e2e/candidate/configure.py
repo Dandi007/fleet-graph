@@ -15,6 +15,13 @@ import yaml
 MODEL = "deepseek-v4-pro"
 CHAIN = MODEL + "@opencode"
 ROUTE = CHAIN + "/gw"
+FINAL_RESPONSE_RULE = (
+    "最终回复格式要求：最终回复只能包含给定 Stop schema 对应的一个 JSON 值。"
+    "Goal 输出 JSON 数组，其他角色严格按当轮提供的 schema 输出 JSON 值。"
+    "不得添加中文说明、前言、结语或 Markdown 代码围栏。"
+    "不要调用或虚构未提供的 StructuredOutput 工具；直接在最终回复正文输出 JSON。"
+    "需要的工具操作必须先真实执行，JSON 只陈述已有事实，不得伪造成功或证据。\n"
+)
 
 
 def digest(path: Path) -> str:
@@ -143,7 +150,7 @@ def configure(state=Path("/state"), fleet=Path("/opt/fleet"), assets=Path("/opt/
             "不得模拟工具结果、伪造证据或把未运行检查写成通过。\n"
         )
         target = prompt_dir / f"{role}.md"
-        target.write_text(prompt + override)
+        target.write_text(prompt + override + "\n" + FINAL_RESPONSE_RULE)
         settings["system_prompt_file"] = str(target)
     config_path = config_dir / "fleet.json"
     config_path.write_text(json.dumps(fleet_config, ensure_ascii=False, indent=2) + "\n")
@@ -166,6 +173,7 @@ def configure(state=Path("/state"), fleet=Path("/opt/fleet"), assets=Path("/opt/
         "runtime_model": MODEL,
         "chain": CHAIN,
         "role_model_overrides": role_model_overrides,
+        "final_response_override": FINAL_RESPONSE_RULE,
         "route": ROUTE,
         "gateway": "http://gateway:15722/v1",
         "fleet_mcp": "http://candidate:15611/mcp",
@@ -182,6 +190,8 @@ def configure(state=Path("/state"), fleet=Path("/opt/fleet"), assets=Path("/opt/
             "由 runtime 追加 @opencode 选择 chain；原值与实际值逐角色记录",
             "runtime profiles 由独立生成目录接入，仅注册 candidate 与 work-folder MCP",
             "原角色 prompt 保留，附加独立 Docker E2E 阶段授权",
+            "最终回复仅允许给定 Stop schema 的 JSON 值，禁止说明、Markdown 代码围栏和虚构工具；"
+            "这是 prompt 格式约束，schema 与 runtime parser 保持原样",
             "原 fleet harness 保留，Fleet CLI 保持 loopback，由容器内 TCP relay 转发 HTTP",
             "宿主 HOME、socket、凭证配置未挂入；测试 secrets 只从文件注入环境",
             "agent-bus 通过原生 AGENT_BUS_URL / AGENT_BUS_TOKEN_FILE 接入独立容器；"

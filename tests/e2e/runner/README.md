@@ -25,6 +25,8 @@ e2e 先运行 smoke，再把固定 fixture 初始化为新 Git 历史，push `e2
 
 若连续两次轮询返回完全相同的 blocked 状态，且所有 run 都明确 finished，Runner 通过公开 goal_stop immediate 提前收口并保存 stop-reason、停止回执与失败证据。有 running、launching、collected、uncertain 或 paused run 时不会触发该规则；状态或新请求发生变化也会重新计数。
 
+另一条失败收口规则是连续两次完全相同的非 done 状态且 engine_alive 明确为 false，覆盖 stopping 与 uncertain/lost 残留。它仍通过公开停止接口保存回执，并继续完整采集，不会把未确定 run 当作成功。启动期间状态或 liveness 发生变化会重置计数；停止接口报错也保留原始状态与错误继续采集。
+
 GitHub token 沿用此次授权凭证，其平台权限可能超出测试 repo。repo basename 与分支约束是 harness 防误写规则；域名代理不提供 GitHub repo 级权限隔离。token 不写入 remote URL、仓库文件或报告。宿主应为更强隔离使用仅授权专用 repo 的 token。
 
 ```sh
