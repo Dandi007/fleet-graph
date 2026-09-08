@@ -625,6 +625,22 @@ class GoalRequestKernel:
     #: reaches the external port, letting a review naming the then-stale version
     #: through after activation (behavior 3's version-bound review guard).
     _version_lock: threading.RLock = field(default_factory=threading.RLock)
+    #: Serializes per-goal request acceptance and call admission. The journal
+    #: lock guards *individual* journal operations, not the multi-step
+    #: transitions this kernel performs: ``submit`` (dedup -> durable append ->
+    #: enqueue -> mode wake), ``next_goal_call`` (resume/fence/mode check -> pop
+    #: -> claim -> call record) and ``abort_unavailable_call`` (release fence ->
+    #: re-queue front). Without this lock two concurrent ``submit`` callers of
+    #: the same identity could both pass ``_find_request`` and both append/queue,
+    #: two distinct callers could append A then B durably but enqueue B then A,
+    #: and two ``next_goal_call`` callers could both pass the inflight check and
+    #: pop separate requests before ``claim_call`` -- the loser raising after
+    #: removing its request and leaving it unserved until reconstruction
+    #: (behaviors 1/2/7, P5/P6). The guarded sections are in-memory +
+    #: journal-mutating only -- never an external effect -- so this serializes
+    #: *transitions*, not Goal calls, and a call on goal A is never serialized
+    #: behind a call on goal B.
+    _request_lock: threading.RLock = field(default_factory=threading.RLock)
 
     def __post_init__(self) -> None:
         if self.effects is None:
@@ -766,22 +782,28 @@ class GoalRequestKernel:
         durable. Duplicate request identity reuses the persisted record (P5);
         it never re-appends and never re-runs.
         """
-        existing = self._find_request(request.request_id)
-        if existing is not None:
-            return {"request_id": request.request_id, "duplicate": True, "record": existing}
-        record = self.journal.append(
-            goal,
-            request.as_record(
-                accepted_at=_iso(self.clock),
-                goal_version=request.goal_version or self.active_version(goal),
-            ),
-        )
-        self._queue(goal, record)
-        if self._mode_of(goal) in (MODE_BLOCKED, MODE_WAITING):
-            # A new request is new input: a blocked goal is woken by it
-            # (behavior 5). ``stopped`` is not -- only resume lifts a stop.
-            self._set_mode(goal, MODE_RUNNING)
-        return {"request_id": request.request_id, "duplicate": False, "record": record}
+        # Dedup + durable append + enqueue + mode wake are one serialized
+        # transition: two concurrent submissions of the same identity must not
+        # both pass the dedup check and both append, and two distinct
+        # submissions must be appended and enqueued in the same order (they
+        # share ``_request_lock`` with ``next_goal_call``).
+        with self._request_lock:
+            existing = self._find_request(request.request_id)
+            if existing is not None:
+                return {"request_id": request.request_id, "duplicate": True, "record": existing}
+            record = self.journal.append(
+                goal,
+                request.as_record(
+                    accepted_at=_iso(self.clock),
+                    goal_version=request.goal_version or self.active_version(goal),
+                ),
+            )
+            self._queue(goal, record)
+            if self._mode_of(goal) in (MODE_BLOCKED, MODE_WAITING):
+                # A new request is new input: a blocked goal is woken by it
+                # (behavior 5). ``stopped`` is not -- only resume lifts a stop.
+                self._set_mode(goal, MODE_RUNNING)
+            return {"request_id": request.request_id, "duplicate": False, "record": record}
 
     def _find_request(self, request_id: str) -> dict[str, Any] | None:
         for goal in sorted(self.journal._lines):
@@ -847,54 +869,62 @@ class GoalRequestKernel:
         ``resume()`` lifts the stop (finding 2).
         """
         st = self._state.setdefault(goal, self._default_state())
-        resume_id = st.get("resume")
-        if resume_id:
-            if self._mode_of(goal) == MODE_STOPPED:
-                return None  # suspended unstarted effects; wait for resume()
-            persisted = self._stop_list_line(goal, resume_id)
-            if persisted is None:
-                st["resume"] = None
-            else:
-                call_line = self._call_line(goal, resume_id) or {}
-                return {
-                    "call_id": resume_id,
+        # The resume/fence/mode/queue admission is one serialized transition,
+        # shared with ``submit`` and ``abort_unavailable_call`` via
+        # ``_request_lock``: two concurrent callers must not both pass the
+        # inflight check and pop separate requests before ``claim_call`` (the
+        # loser raising after removing its request and leaving it unserved), and
+        # a request must not be re-queued by ``abort_unavailable_call`` between
+        # the queue-is-empty check and this pop.
+        with self._request_lock:
+            resume_id = st.get("resume")
+            if resume_id:
+                if self._mode_of(goal) == MODE_STOPPED:
+                    return None  # suspended unstarted effects; wait for resume()
+                persisted = self._stop_list_line(goal, resume_id)
+                if persisted is None:
+                    st["resume"] = None
+                else:
+                    call_line = self._call_line(goal, resume_id) or {}
+                    return {
+                        "call_id": resume_id,
+                        "goal": goal,
+                        "request_id": call_line.get("request_id"),
+                        "run_id": call_line.get("run_id"),
+                        "request": call_line,
+                        "resume": True,
+                        "stop_list": persisted,
+                    }
+            if self.journal.inflight(goal):
+                return None
+            if self._mode_of(goal) in (MODE_STOPPING, MODE_STOPPED, MODE_BLOCKED):
+                return None
+            if not st["queue"]:
+                return None
+            request = st["queue"].pop(0)
+            call_id = f"call:{goal}:{uuid.uuid4().hex}"
+            run_id = str(request.get("run_id") or "") or f"run::{goal}::{request.get('request_id')}"
+            self.journal.claim_call(goal, call_id)
+            self.journal.append(
+                goal,
+                {
+                    "record": RECORD_CALL,
                     "goal": goal,
-                    "request_id": call_line.get("request_id"),
-                    "run_id": call_line.get("run_id"),
-                    "request": call_line,
-                    "resume": True,
-                    "stop_list": persisted,
-                }
-        if self.journal.inflight(goal):
-            return None
-        if self._mode_of(goal) in (MODE_STOPPING, MODE_STOPPED, MODE_BLOCKED):
-            return None
-        if not st["queue"]:
-            return None
-        request = st["queue"].pop(0)
-        call_id = f"call:{goal}:{uuid.uuid4().hex}"
-        run_id = str(request.get("run_id") or "") or f"run::{goal}::{request.get('request_id')}"
-        self.journal.claim_call(goal, call_id)
-        self.journal.append(
-            goal,
-            {
-                "record": RECORD_CALL,
-                "goal": goal,
+                    "call_id": call_id,
+                    "request_id": request.get("request_id"),
+                    "caller": request.get("caller"),
+                    "run_id": run_id,
+                    "goal_version": request.get("goal_version") or self.active_version(goal),
+                    "at": _iso(self.clock),
+                },
+            )
+            return {
                 "call_id": call_id,
+                "goal": goal,
                 "request_id": request.get("request_id"),
-                "caller": request.get("caller"),
                 "run_id": run_id,
-                "goal_version": request.get("goal_version") or self.active_version(goal),
-                "at": _iso(self.clock),
-            },
-        )
-        return {
-            "call_id": call_id,
-            "goal": goal,
-            "request_id": request.get("request_id"),
-            "run_id": run_id,
-            "request": request,
-        }
+                "request": request,
+            }
 
     def _call_line(self, goal: str, call_id: str) -> dict[str, Any] | None:
         for line in self.journal.scan(goal):
@@ -988,11 +1018,16 @@ class GoalRequestKernel:
                 "at": _iso(self.clock),
             },
         )
-        self.journal.release_call(goal, call_id)
-        if request_id:
-            request = self._find_request(request_id)
-            if request is not None:
-                self._queue_front(goal, request)
+        # Releasing the fence and putting the request back at the head is part
+        # of the same admission serialization as ``next_goal_call``'s pop: a
+        # concurrent ``next_goal_call`` must not observe the released fence and
+        # an empty queue before this re-queues the request.
+        with self._request_lock:
+            self.journal.release_call(goal, call_id)
+            if request_id:
+                request = self._find_request(request_id)
+                if request is not None:
+                    self._queue_front(goal, request)
         return record
 
     def finish_goal_call(

@@ -1409,6 +1409,157 @@ class TestLiveVersionAtReviewBoundary:
         assert kernel.active_version(GOAL) == "v2"
 
 
+# --- request-transition atomicity (final review rf-49b88ef6) -------------------
+
+
+class TestRequestTransitionAtomicity:
+    def test_concurrent_duplicate_submission_is_deduplicated(self) -> None:
+        # The final review's race: two concurrent ``submit`` callers of the same
+        # identity can both pass ``_find_request`` before either appends,
+        # creating duplicate queued requests and Goal calls. The fix serializes
+        # the dedup -> append -> enqueue transition under ``_request_lock``; the
+        # slice here widens the window so the regression is deterministic.
+        import threading
+        import time
+
+        kernel = make_kernel()
+        real_append = kernel.journal.append
+
+        def slow_request_append(goal: str, record: dict[str, Any]) -> dict[str, Any]:
+            if record.get("record") == RECORD_REQUEST:
+                time.sleep(0.05)  # widen find -> append
+            return real_append(goal, record)
+
+        kernel.journal.append = slow_request_append  # type: ignore[method-assign]
+
+        request = make_request("A")
+        outcomes: list[dict[str, Any]] = []
+        barrier = threading.Barrier(2)
+
+        def submit_once() -> None:
+            barrier.wait()
+            outcomes.append(kernel.submit(GOAL, request))
+
+        t1 = threading.Thread(target=submit_once)
+        t2 = threading.Thread(target=submit_once)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        # exactly one acceptance, exactly one duplicate ack, exactly one record
+        assert sorted(o["duplicate"] for o in outcomes) == [False, True]
+        requests = [
+            e for e in kernel.list_events(GOAL)["events"] if e["record"] == RECORD_REQUEST
+        ]
+        assert [r["request_id"] for r in requests] == ["A"]
+
+    def test_concurrent_distinct_submissions_keep_journal_and_queue_order(self) -> None:
+        # The final review's race: distinct submissions can append A then B
+        # durably but enqueue B then A. Serialized acceptance keeps the queue in
+        # durable journal order, so the drain order equals the record order.
+        import threading
+        import time
+
+        kernel = make_kernel()
+        real_append = kernel.journal.append
+
+        def slow_request_append(goal: str, record: dict[str, Any]) -> dict[str, Any]:
+            if record.get("record") == RECORD_REQUEST:
+                time.sleep(0.05)  # widen append -> enqueue
+            return real_append(goal, record)
+
+        kernel.journal.append = slow_request_append  # type: ignore[method-assign]
+
+        barrier = threading.Barrier(2)
+
+        def submit_a() -> None:
+            barrier.wait()
+            kernel.submit(GOAL, make_request("A"))
+
+        def submit_b() -> None:
+            barrier.wait()
+            kernel.submit(GOAL, make_request("B"))
+
+        ta = threading.Thread(target=submit_a)
+        tb = threading.Thread(target=submit_b)
+        ta.start()
+        tb.start()
+        ta.join()
+        tb.join()
+
+        journal_order = [
+            e["request_id"] for e in kernel.list_events(GOAL)["events"] if e["record"] == RECORD_REQUEST
+        ]
+        assert sorted(journal_order) == ["A", "B"]
+
+        served: list[str] = []
+        while True:
+            nxt = kernel.next_goal_call(GOAL)
+            if nxt is None:
+                break
+            served.append(str(nxt["request_id"]))
+            kernel.finish_goal_call(GOAL, nxt["call_id"], {"actions": []})
+
+        # every accepted request is served exactly once, in durable journal
+        # order -- never a queue that diverged from the append order.
+        assert served == journal_order
+
+    def test_concurrent_next_goal_call_claims_exactly_once_without_losing_a_request(
+        self,
+    ) -> None:
+        # The final review's race: two ``next_goal_call`` callers both pass the
+        # inflight check and pop separate requests before ``claim_call``; the
+        # loser raises after removing its request, leaving it unserved until
+        # reconstruction. The fix serializes the fence/mode/queue admission so
+        # exactly one caller claims and no request is dropped.
+        import threading
+        import time
+
+        kernel = make_kernel()
+        kernel.submit(GOAL, make_request("A"))
+        kernel.submit(GOAL, make_request("B"))
+
+        real_inflight = kernel.journal.inflight
+
+        def slow_inflight(goal: str) -> str | None:
+            time.sleep(0.05)  # widen the check -> pop window
+            return real_inflight(goal)
+
+        kernel.journal.inflight = slow_inflight  # type: ignore[method-assign]
+
+        calls: list[dict[str, Any] | None] = []
+        errors: list[Exception] = []
+        barrier = threading.Barrier(2)
+
+        def open_call() -> None:
+            barrier.wait()
+            try:
+                calls.append(kernel.next_goal_call(GOAL))
+            except Exception as exc:  # a lost claim must not surface as a raise
+                errors.append(exc)
+
+        t1 = threading.Thread(target=open_call)
+        t2 = threading.Thread(target=open_call)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert not errors
+        winners = [c for c in calls if c is not None]
+        assert len(winners) == 1
+        winner = winners[0]
+        assert winner["request_id"] == "A"
+
+        # Finishing the winner releases the fence; the other queued request
+        # (the one a racing loser would have popped and dropped) is still
+        # servable, in order.
+        kernel.finish_goal_call(GOAL, winner["call_id"], {"actions": []})
+        nxt = kernel.next_goal_call(GOAL)
+        assert nxt is not None and nxt["request_id"] == "B"
+
+
 # --- finding: complete raw Goal response survives interruption (lossless events) ---
 
 
