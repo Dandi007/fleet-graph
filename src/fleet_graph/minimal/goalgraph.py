@@ -17,11 +17,13 @@ Seams this module deliberately keeps (each belongs to another DD):
   seam — ``Callable[[dispatch_obj], dict]`` returning the protocol §7 DD
   result object — so the goal graph and the DD graph land as parallel DDs.
 - **No merge logic.** ``final_merge`` is a seam returning
-  ``(stop, payload)`` with stop ∈ merged / rebased / failed. On ``rebased`` /
-  ``failed`` this module only writes an event and bounces the result back
-  into the next turn's handoff (``warnings``); GO-15's "a rebase that touched
-  code must re-run CR → FR → Goal review in full" is a later DD's job —
-  nothing here re-reviews or re-merges.
+  ``(stop, payload)`` with stop ∈ merged / rebased / failed. On ``merged`` it
+  writes the terminal events and ends; on ``rebased`` it re-runs CR → FR →
+  Goal review in full against the rebased release branch (GO-15 / protocol
+  §6) and, on Goal approve, calls the seam one more time (at most one
+  re-review); on ``failed`` — and on a review ``fail`` / ``reject`` or a
+  second ``rebased`` — it bounces the result into the next turn's handoff
+  (``warnings``), never guessing or auto-retrying.
 - **No process entry, no MCP transport.** MCP → engine is only
   ``control.jsonl``, read at step boundaries (GO-16): ``read_control`` runs
   before every turn and after every DD.
@@ -187,6 +189,26 @@ def _blurb(payload: dict[str, Any]) -> str:
         if isinstance(value, str) and value:
             return value
     return "no detail"
+
+
+def _findings_summary(obj: dict[str, Any] | None) -> str:
+    """A one-line summary of a CR/FR output, preferring the finding details.
+
+    protocol §5: a ``fail`` carries findings (at least one blocker/major); the
+    bounce-back warning surfaces those details so the Goal Agent sees *why*
+    the release re-review failed without the engine parsing them further.
+    """
+    findings = (obj or {}).get("findings")
+    if isinstance(findings, list):
+        details = [
+            finding.get("detail")
+            for finding in findings
+            if isinstance(finding, dict) and finding.get("detail")
+        ]
+        if details:
+            return "; ".join(details)
+    summary = (obj or {}).get("summary")
+    return summary if isinstance(summary, str) and summary else "no detail"
 
 
 def _one_line_dd_summary(history: list[events.DDSummary], result: dict[str, Any]) -> str:
@@ -698,13 +720,16 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
         }
 
     def final_merge_node(state: GoalGraphState) -> dict[str, Any]:
-        """release → target via the seam; only bounce back, never re-review.
+        """release → target via the seam; a ``rebased`` stop re-runs GO-15 re-review.
 
-        Boundary (deliberate, dd-18): on ``rebased`` / ``failed`` this module
-        writes an event and injects the result as the next turn's handoff
-        (``warnings``) so the Goal Agent can decide the next dispatch. GO-15's
-        rule that a rebase which touched code must re-run CR → FR → Goal
-        review in full is a later DD's graph — nothing here re-reviews.
+        On ``merged`` the terminal events go out in §12 order (terminal event
+        before the scribe). On ``rebased`` — the rebase touched code — the
+        rebased release branch is re-run through CR → FR → Goal review once
+        (protocol §6 / GO-15): a CR/FR ``fail`` or a Goal ``reject`` bounces
+        the findings/message into the next turn's handoff (``warnings``) and
+        never auto-retries; Goal ``approve`` calls the seam one more time. A
+        second ``rebased`` (or any ``failed``) bounces back without a third
+        review — one closing merge re-reviews at most once.
         """
         log = deps.event_log
         if deps.final_merge is None:
@@ -713,8 +738,16 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
                 "detail": "final_merge seam is not configured; a done goal cannot finish",
             }
             return {"stop": "blocked", "summary": blocked["detail"], "blocked": blocked}
-        stop, payload = deps.final_merge()
-        if stop == "merged":
+
+        def _merge_handoff(stop: str, payload: dict[str, Any]) -> dict[str, Any]:
+            handoff = f"final_merge {stop}: {_blurb(payload)}"
+            log.append("goal.warning", {"message": handoff})
+            # §12 触发点之一（goal.warning）：收尾的 handoff warning 起书记员；
+            # 同样是「只在边界起，避免噪声」。
+            run_scribe(state, trigger="goal.warning")
+            return {"stop": None, "warnings": [handoff]}
+
+        def _merged(payload: dict[str, Any]) -> dict[str, Any]:
             log.append("goal.merged_to_target", dict(payload))
             _append_progress(state, "goal.done", {"summary": state.get("summary") or ""})
             log.append("goal.done", {"summary": state.get("summary") or ""})
@@ -722,10 +755,219 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
             # goal.done 这一条。
             run_scribe(state, trigger="goal.done")
             return {"stop": "done"}
-        handoff = f"final_merge {stop}: {_blurb(payload)}"
+
+        def _review_stage(
+            *,
+            role: str,
+            release_branch: str,
+            workspace: str,
+            refs: list[gitgate.RepoRef],
+            base_commit: str,
+            head_commit: str,
+            spec_text: str,
+            cr_result: dict[str, Any] | None,
+        ) -> stagerunner.StageOutcome:
+            """One CR/FR stage of the release re-review, via the single agent seam."""
+            in_obj = prompts.build_review_in(
+                role=role,
+                dd_id=state["goal_id"],
+                round=1,
+                workspace=workspace,
+                branch=release_branch,
+                base_commit=base_commit,
+                head_commit=head_commit,
+                spec_text=spec_text,
+                acceptance_results=[],
+                cr_result=cr_result,
+                history=prompts.history_handle(
+                    goal_run_root=str(log.goal_run_root),
+                    work_folder=(state["enroll"] or {}).get("work_folder"),
+                ),
+            )
+            request = stagerunner.StageRequest(
+                stage=role,
+                run_id=f"goal-{state['goal_id']}-release-review-{role}",
+                in_obj=in_obj,
+                repos=list(refs),
+                expected_schema=agentrun.schema_for(role),
+                policy=agentrun.resolve_session_policy(role, deps.session_overrides),
+                cwd=workspace,
+                is_first_call=True,
+                session_root=deps.session_root,
+                timeout_s=deps.timeout_s,
+                model=(deps.model_by_role or {}).get(role),
+            )
+            outcome = stagerunner.run_stage(
+                request, git_runner=deps.git_runner, agent_invoker=deps.agent_invoker
+            )
+            for kind, ev_payload in outcome.events:
+                log.append(kind, ev_payload)
+            return outcome
+
+        def _goal_review_stage(
+            *,
+            goal_obj: dict[str, Any],
+            dd: dict[str, Any],
+            release_head: str,
+            workspace: str,
+        ) -> stagerunner.StageOutcome:
+            """The Goal bubble's approval step for the release re-review."""
+            events_list = list(log.read())
+            is_first_call = not any(
+                ev.kind == "agent.exited"
+                and (ev.payload or {}).get("stage") in ("goal_turn", "goal_review")
+                for ev in events_list
+            )
+            in_obj = prompts.build_goal_review_in(
+                goal=goal_obj,
+                dd=dd,
+                release_head=release_head,
+                history=prompts.history_handle(
+                    goal_run_root=str(log.goal_run_root),
+                    work_folder=(state["enroll"] or {}).get("work_folder"),
+                ),
+            )
+            request = stagerunner.StageRequest(
+                stage="goal_review",
+                run_id=f"goal-{state['goal_id']}-release-review-goal",
+                in_obj=in_obj,
+                repos=[],
+                expected_schema=agentrun.schema_for("goal", "review"),
+                policy=agentrun.resolve_session_policy("goal", deps.session_overrides),
+                cwd=workspace,
+                is_first_call=is_first_call,
+                session_root=deps.session_root,
+                timeout_s=deps.timeout_s,
+                model=(deps.model_by_role or {}).get("goal"),
+            )
+            outcome = stagerunner.run_stage(
+                request, git_runner=deps.git_runner, agent_invoker=deps.agent_invoker
+            )
+            for kind, ev_payload in outcome.events:
+                log.append(kind, ev_payload)
+            return outcome
+
+        def _review_bounce(role: str, outcome: stagerunner.StageOutcome) -> dict[str, Any]:
+            """CR/FR did not pass (a real ``fail`` or an agent failure): bounce, don't guess."""
+            obj = outcome.obj or {}
+            detail: str
+            if outcome.ok:
+                detail = _findings_summary(obj)
+            else:
+                detail = outcome.invalid_reason or _findings_summary(obj) or "review failed"
+            handoff = f"final_merge review {role} failed: {detail}"
+            log.append("goal.warning", {"message": handoff})
+            run_scribe(state, trigger="goal.warning")
+            return {"stop": None, "warnings": [handoff]}
+
+        stop, payload = deps.final_merge()
+        if stop == "merged":
+            return _merged(payload)
+        if stop != "rebased":
+            return _merge_handoff(stop, payload)
+
+        # GO-15 / protocol §6: the rebase touched code, so re-run CR → FR →
+        # Goal review against the rebased release branch before merging again.
+        enroll = state["enroll"]
+        repos = [repo for repo in (enroll.get("repos") or []) if isinstance(repo, dict)]
+        first = repos[0] if repos else {}
+        release_branch = runroot.release_branch(enroll)
+        goal_obj, _ = steer.current_goal(enroll, list(log.read()))
+        goal_text = goal_obj.get("goal_text") or ""
+        workspace = first.get("path") or "."
+        refs = [
+            gitgate.RepoRef(
+                worktree=repo["path"],
+                remote=repo["remote"],
+                branch=release_branch,
+                label=repo["path"],
+            )
+            for repo in repos
+        ]
+        target_head = ""
+        if first.get("path") and first.get("remote") and first.get("target_branch"):
+            target_head = (
+                gitgate.remote_tip(
+                    first["path"], first["remote"], first["target_branch"], runner=deps.git_runner
+                )
+                or ""
+            )
+        new_head = payload.get("new_head") or ""
+
+        cr = _review_stage(
+            role="cr",
+            release_branch=release_branch,
+            workspace=workspace,
+            refs=refs,
+            base_commit=target_head,
+            head_commit=new_head,
+            spec_text=goal_text,
+            cr_result=None,
+        )
+        if not cr.ok or cr.stop != "pass":
+            return _review_bounce("cr", cr)
+        cr_obj = cr.obj or {}
+
+        fr = _review_stage(
+            role="fr",
+            release_branch=release_branch,
+            workspace=workspace,
+            refs=refs,
+            base_commit=target_head,
+            head_commit=new_head,
+            spec_text=goal_text,
+            cr_result={
+                "stop": "pass",
+                "summary": cr_obj.get("summary"),
+                "findings": cr_obj.get("findings", []),
+            },
+        )
+        if not fr.ok or fr.stop != "pass":
+            return _review_bounce("fr", fr)
+        fr_obj = fr.obj or {}
+
+        dd_result = {
+            "dd_id": state["goal_id"],
+            "spec_text": goal_text,
+            "outcome": "awaiting_approval",
+            "rounds": 1,
+            "branch": release_branch,
+            "head_commit": new_head,
+            "merged_commit": None,
+            "acceptance_results": [],
+            "reviews": [
+                {
+                    "role": "cr",
+                    "stop": "pass",
+                    "summary": cr_obj.get("summary"),
+                    "findings": cr_obj.get("findings", []),
+                },
+                {
+                    "role": "fr",
+                    "stop": "pass",
+                    "summary": fr_obj.get("summary"),
+                    "findings": fr_obj.get("findings", []),
+                },
+            ],
+            "impl_summary": None,
+            "failure": None,
+        }
+        goal_review = _goal_review_stage(
+            goal_obj=goal_obj,
+            dd=dd_result,
+            release_head=target_head,
+            workspace=workspace,
+        )
+        if goal_review.ok and goal_review.stop == "approve":
+            stop2, payload2 = deps.final_merge()
+            if stop2 == "merged":
+                return _merged(payload2)
+            # A second ``rebased`` (or ``failed``) must not start a third
+            # review: bounce the result back and let the Goal Agent decide.
+            return _merge_handoff(stop2, payload2)
+        message = (goal_review.obj or {}).get("message") or ""
+        handoff = f"final_merge goal_review {goal_review.stop}: {message or 'no message'}"
         log.append("goal.warning", {"message": handoff})
-        # §12 触发点之一（goal.warning）：收尾的 handoff warning 起书记员；
-        # 同样是「只在边界起，避免噪声」。
         run_scribe(state, trigger="goal.warning")
         return {"stop": None, "warnings": [handoff]}
 

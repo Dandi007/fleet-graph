@@ -51,8 +51,10 @@ RELEASE = "release/g-7f3a2c"
 DD_BRANCH = f"dd/{GOAL_ID}/dd-01"
 
 SHA_R = "a" * 40  # release branch tip
-SHA_D = "b" * 40  # dd branch tip
+SHA_D = "b" * 40  # dd branch tip / rebased release new_head
 SHA_M = "c" * 40  # release → target merged commit
+SHA_T = "e" * 40  # target branch (main) tip
+SHA_N = "f" * 40  # second rebased new_head
 
 ENROLL: dict[str, Any] = {
     "schema": "goal.enroll/1",
@@ -95,6 +97,30 @@ def blocked_stop() -> dict[str, Any]:
         "summary": "缺外部依赖",
         "blocked": {"kind": "external", "detail": "上游服务没有测试环境"},
     }
+
+
+def review_stop(role: str, *, stop: str = "pass") -> dict[str, Any]:
+    """A CR/FR output object (protocol §5): pass, or fail with a blocker finding."""
+    obj: dict[str, Any] = {
+        "schema": "review/1",
+        "role": role,
+        "stop": stop,
+        "summary": f"{role} {stop}",
+        "findings": [],
+    }
+    if stop == "fail":
+        obj["findings"] = [
+            {"severity": "blocker", "file": "a.py", "line": 1, "detail": f"{role} 发现冲突没清干净"}
+        ]
+    return obj
+
+
+def approve_stop() -> dict[str, Any]:
+    return {"schema": "goal.review/1", "stop": "approve", "summary": "审过了"}
+
+
+def reject_stop() -> dict[str, Any]:
+    return {"schema": "goal.review/1", "stop": "reject", "message": "release 还有问题，要修 X"}
 
 
 class FakeGitRunner:
@@ -553,37 +579,150 @@ def test_invalid_steer_ignored_with_event(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# final_merge rebased/failed bounces back into the next turn (GO-15 boundary)
+# final_merge rebased → CR → FR → Goal review → merge again (GO-15, dd-32)
 # ---------------------------------------------------------------------------
 
 
-def test_final_merge_rebased_bounces_back_to_goal_turn(tmp_path: Path) -> None:
+def _rebased_harness(
+    tmp_path: Path,
+    *,
+    merge_results: list[tuple[str, dict[str, Any]]],
+    review_stops: list[dict[str, Any]],
+    tail_stops: list[dict[str, Any]] | None = None,
+) -> Harness:
+    """A goal that hits ``done`` on turn 2, so final_merge returns ``rebased``.
+
+    ``review_stops`` are the CR/FR/Goal-review outputs popped in order by the
+    invoker during the release re-review; ``tail_stops`` script what the Goal
+    Agent says on any turn after the re-review (defaults to a single blocked so
+    the loop terminates without a further merge).
+    """
     harness = Harness(
         tmp_path,
-        stops=[dispatch_stop(), done_stop()],
-        final_merge=FakeFinalMerge(
-            [
-                ("rebased", {"new_head": SHA_D, "summary": "解了冲突"}),
-                ("merged", {"merged_commit": SHA_M, "summary": "合到 main"}),
-            ]
-        ),
+        stops=[dispatch_stop(), done_stop(), *review_stops, *(tail_stops or [blocked_stop()])],
+        final_merge=FakeFinalMerge(merge_results),
     )
-    # Turn 2 says done → final_merge rebased → turn 3 must run and see the
-    # result as handoff content, then finish the goal.
-    harness.invoker.stops.append(done_stop())
+    # Give the goal a target-branch ("main") tip so the re-review's base_commit
+    # resolves to a real sha while the release worktree stays on RELEASE.
+    harness.runner.branches["/goal/repo"]["main"] = SHA_T
+    return harness
+
+
+def _exited_stages(harness: Harness) -> list[str]:
+    return [
+        ev.payload.get("stage")
+        for ev in harness.events_of("agent.exited")
+        if ev.payload.get("stage") in ("cr", "fr", "goal_review")
+    ]
+
+
+def test_rebased_review_approve_then_merged(tmp_path: Path) -> None:
+    harness = _rebased_harness(
+        tmp_path,
+        merge_results=[
+            ("rebased", {"new_head": SHA_D, "summary": "解了冲突"}),
+            ("merged", {"merged_commit": SHA_M, "summary": "合到 main"}),
+        ],
+        review_stops=[review_stop("cr"), review_stop("fr"), approve_stop()],
+    )
 
     result = run_goal(harness.deps, goal_id=GOAL_ID, enroll=dict(ENROLL))
 
     assert result["stop"] == "done"
     assert harness.final_merge.calls == 2
-    in3 = harness.invoker.in_obj(2)
-    assert any("final_merge rebased" in warning for warning in in3["warnings"])
-    assert any("解了冲突" in warning for warning in in3["warnings"])
+    assert harness.kinds()[-1] == "goal.done"
+    assert harness.kinds().count("goal.merged_to_target") == 1
+
+    # CR → FR → Goal review all ran, in that order.
+    assert _exited_stages(harness) == ["cr", "fr", "goal_review"]
+
+    # protocol §6: base_commit = target head, head_commit = payload new_head,
+    # spec_text = goal_text; FR carries this round's CR conclusion.
+    cr_in = harness.invoker.in_obj(2)
+    assert cr_in["schema"] == "review.in/1"
+    assert cr_in["role"] == "cr"
+    assert cr_in["base_commit"] == SHA_T
+    assert cr_in["head_commit"] == SHA_D
+    assert cr_in["spec_text"] == ENROLL["goal_text"]
+    assert cr_in["acceptance_results"] == []
+    assert cr_in["branch"] == RELEASE
+
+    fr_in = harness.invoker.in_obj(3)
+    assert fr_in["role"] == "fr"
+    assert fr_in["cr_result"]["stop"] == "pass"
+
+    goal_in = harness.invoker.in_obj(4)
+    assert goal_in["schema"] == "goal.review.in/1"
+    assert goal_in["dd"]["outcome"] == "awaiting_approval"
+    assert goal_in["dd"]["head_commit"] == SHA_D
+
+
+def test_rebased_cr_fail_bounces_to_goal_turn(tmp_path: Path) -> None:
+    harness = _rebased_harness(
+        tmp_path,
+        merge_results=[("rebased", {"new_head": SHA_D, "summary": "解了冲突"})],
+        review_stops=[review_stop("cr", stop="fail")],
+    )
+
+    result = run_goal(harness.deps, goal_id=GOAL_ID, enroll=dict(ENROLL))
+
+    # No re-merge, no FR, no Goal review — bounce straight back to goal_turn.
+    assert result["stop"] == "blocked"
+    assert harness.final_merge.calls == 1
+    assert _exited_stages(harness) == ["cr"]
+
+    turn3 = harness.invoker.in_obj(3)
+    assert any("final_merge review cr failed" in warning for warning in turn3["warnings"])
+    assert any("冲突没清干净" in warning for warning in turn3["warnings"])
     assert any(
-        "final_merge rebased" in ev.payload.get("message", "")
+        "final_merge review cr failed" in ev.payload.get("message", "")
         for ev in harness.events_of("goal.warning")
     )
-    assert harness.kinds()[-1] == "goal.done"
+    assert "goal.done" not in harness.kinds()
+
+
+def test_rebased_review_reject_bounces_to_goal_turn(tmp_path: Path) -> None:
+    harness = _rebased_harness(
+        tmp_path,
+        merge_results=[("rebased", {"new_head": SHA_D, "summary": "解了冲突"})],
+        review_stops=[review_stop("cr"), review_stop("fr"), reject_stop()],
+    )
+
+    result = run_goal(harness.deps, goal_id=GOAL_ID, enroll=dict(ENROLL))
+
+    assert result["stop"] == "blocked"
+    assert harness.final_merge.calls == 1
+    assert _exited_stages(harness) == ["cr", "fr", "goal_review"]
+
+    turn3 = harness.invoker.in_obj(5)
+    assert any("要修 X" in warning for warning in turn3["warnings"])
+    assert any(
+        "要修 X" in ev.payload.get("message", "") for ev in harness.events_of("goal.warning")
+    )
+    assert "goal.done" not in harness.kinds()
+
+
+def test_rebased_twice_bounces_without_third_review(tmp_path: Path) -> None:
+    harness = _rebased_harness(
+        tmp_path,
+        merge_results=[
+            ("rebased", {"new_head": SHA_D, "summary": "解了冲突"}),
+            ("rebased", {"new_head": SHA_N, "summary": "又冲突了"}),
+        ],
+        review_stops=[review_stop("cr"), review_stop("fr"), approve_stop()],
+    )
+
+    result = run_goal(harness.deps, goal_id=GOAL_ID, enroll=dict(ENROLL))
+
+    # One re-review only: a second rebased never starts a third CR/FR round.
+    assert result["stop"] == "blocked"
+    assert harness.final_merge.calls == 2
+    assert _exited_stages(harness) == ["cr", "fr", "goal_review"]
+
+    turn3 = harness.invoker.in_obj(5)
+    assert any("final_merge rebased" in warning for warning in turn3["warnings"])
+    assert any("又冲突了" in warning for warning in turn3["warnings"])
+    assert "goal.done" not in harness.kinds()
 
 
 # ---------------------------------------------------------------------------
