@@ -62,6 +62,15 @@ class MergeFeedback:
 _CODE_KINDS: dict[str, MergeFeedbackKind] = {
     # Target advanced past the frozen base: a race, remedied by re-dispatch.
     "RELEASE_HEAD_ADVANCED": MergeFeedbackKind.TARGET_COMPETITION,
+    # -- the vendored CAS's own structured codes ---------------------------
+    # The remote target moved after the settlement was frozen: a relay, not a
+    # judgement on the content (spec L6: never misread as a conflict).
+    "TARGET_HEAD_CONFLICT": MergeFeedbackKind.TARGET_COMPETITION,
+    # The handoff no longer contains the frozen base / the trees do not merge:
+    # the content must change and re-implement before the work can land.
+    "TARGET_UPDATE_REQUIRED": MergeFeedbackKind.CONTENT_CONFLICT,
+    "TARGET_MERGE_CONFLICT": MergeFeedbackKind.CONTENT_CONFLICT,
+    "SYNTHETIC_INTEGRATION_CONFLICT": MergeFeedbackKind.CONTENT_CONFLICT,
     # A genuine rebase/fast-forward incompatibility on the content.
     "REBASE_SPEC_INCOMPATIBLE": MergeFeedbackKind.CONTENT_CONFLICT,
     # Already there: the CAS found the remote already at the handoff commit.
@@ -72,7 +81,14 @@ _CODE_KINDS: dict[str, MergeFeedbackKind] = {
 
 
 #: Codes whose meaning is "the content must change and return to implement".
-_CONTENT_CODES = frozenset({"REBASE_SPEC_INCOMPATIBLE"})
+_CONTENT_CODES = frozenset(
+    {
+        "REBASE_SPEC_INCOMPATIBLE",
+        "TARGET_UPDATE_REQUIRED",
+        "TARGET_MERGE_CONFLICT",
+        "SYNTHETIC_INTEGRATION_CONFLICT",
+    }
+)
 
 
 def classify_merge_feedback(code: str = "", detail: str = "", *, result: str = "") -> MergeFeedback:
@@ -111,9 +127,38 @@ def requires_rework(feedback: MergeFeedback) -> bool:
 BOUNDARY_CODES = (
     "RELEASE_HEAD_ADVANCED",
     "REBASE_SPEC_INCOMPATIBLE",
+    "TARGET_HEAD_CONFLICT",
+    "TARGET_UPDATE_REQUIRED",
+    "TARGET_MERGE_CONFLICT",
+    "SYNTHETIC_INTEGRATION_CONFLICT",
     "ALREADY_MERGED",
     "PROVIDER_UNAVAILABLE",
 )
+
+#: The pipeline event each merge feedback kind carries, for the merger stage's
+#: typed transitions. A content conflict (or any code-change feedback) is the
+#: loop's REJECT; target competition, transport/unknown and already-merged are
+#: not code changes and carry no rework loop back to implement.
+_CONTENT_EVENT = "REJECT"
+
+
+def merge_event(feedback: MergeFeedback) -> str:
+    """The merger-stage event this feedback selects, or "" for none.
+
+    ``MERGED`` and ``PREPARED`` are their own first-class events; a code-change
+    feedback (rebase/content conflict) is the rework loop's REJECT. Target
+    competition, transport/unknown and already-merged are handled outside the
+    in-graph loop (refusal / bounded retry), so they carry no forward event
+    here -- an empty result means "no loop transition for this feedback".
+    """
+    if feedback.kind == MergeFeedbackKind.MERGED:
+        return "MERGED"
+    if feedback.kind == MergeFeedbackKind.PREPARED_ONLY:
+        return "PREPARED"
+    if feedback.requires_code_change:
+        return _CONTENT_EVENT
+    return ""
+
 
 __all__ = [
     "BOUNDARY_CODES",
@@ -121,5 +166,6 @@ __all__ = [
     "MergeFeedbackKind",
     "classify_merge_feedback",
     "is_merge_success",
+    "merge_event",
     "requires_rework",
 ]

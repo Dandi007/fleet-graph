@@ -19,6 +19,7 @@ from fleet_graph.dd.self_gate import (
     render_rationale,
 )
 from fleet_graph.dd.self_gate_evidence import DEFAULT_DD_ROOT, collect_gate_evidence
+from fleet_graph.dd.validity_binding import BindingFacts, build_validity_binding, verify_binding
 from fleet_graph.graphs.dd_scripts import AUTHOR_EMAIL, AUTHOR_NAME, GATE_PATH, write_json
 from fleet_graph.graphs.stop_response import (
     REASON_CONSUMER_UNWIRED,
@@ -128,6 +129,29 @@ class GraphGateNode:
             **kwargs,
         )
 
+    def _validity_binding(
+        self, workspace: Path, head_commit: str, status: dict[str, Any]
+    ) -> dict[str, Any]:
+        """The version-bound validity key (spec L3/L5) the verdict seals against.
+
+        Measures the product revision/tree out of the subject's git at its
+        accepted head and binds the single's recorded spec digest; the verdict
+        is only as good as the version it names, so the key travels on the
+        sealed decision as a durability fact, never an agent's claim.
+        """
+        try:
+            facts = BindingFacts(spec_digest=str(status.get("spec_digest") or ""))
+            key = build_validity_binding(str(workspace), head_commit, facts)
+            changed, matches = verify_binding(str(workspace), head_commit, facts, key)
+            return {
+                "digest": key.digest,
+                "fields": key.fields,
+                "matches": bool(matches),
+                "changed": list(changed),
+            }
+        except Exception as exc:
+            return {"unavailable": str(exc)}
+
     def _seal_decision_file(
         self,
         *,
@@ -141,6 +165,7 @@ class GraphGateNode:
         head_commit: str,
         rationale: str = "",
         decision_message_id: str = "",
+        validity: dict[str, Any] | None = None,
     ) -> str:
         """Write and commit the gate verdict into the subject workspace.
 
@@ -166,6 +191,7 @@ class GraphGateNode:
                     for item in evidence
                 ],
                 "output_commit": head_commit,
+                **({"validity": validity} if validity is not None else {}),
             },
         )
         run_git(workspace, "add", "--", relative, check=True)
@@ -386,6 +412,7 @@ class GraphGateNode:
                 head_commit=head,
                 rationale=str(published.get("rationale") or rationale),
                 decision_message_id=str(published.get("message_id") or ""),
+                validity=self._validity_binding(workspace, head, status),
             )
             resume = dict(self.plane.gate(development_id, resume=True, action_key=action_key))
             resume_entry = dict(resume.get("resume") or {})

@@ -47,7 +47,7 @@
     "merge_result": {
       "path_pattern": ".dev-dispatch/merge/result-g{generation}.json",
       "required_fields": {
-        "result": ["MERGED", "PREPARED"]
+        "result": ["MERGED", "PREPARED", "REJECT"]
       }
     },
     "attempt_context_development": {

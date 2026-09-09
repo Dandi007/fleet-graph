@@ -52,6 +52,7 @@ from fleet_graph.graphs.dd_pipeline import (
     SPINE_EVENT,
     TERMINAL_COMPLETE,
     TERMINAL_FAILED,
+    TERMINAL_PREPARED,
     PipelineBounds,
     Replayed,
     StageOutcome,
@@ -62,6 +63,7 @@ from fleet_graph.graphs.dd_pipeline import (
 # The fake stage/effect ports shared by the pipeline walk tests, reused from
 # the historical pipeline test so the two never drift on what a scriptable
 # actor or an attesting sealer is.
+from conftest import git, head
 from test_dd_pipeline import ContractActor, Sealer, make_deps
 
 LIFECYCLE = Lifecycle.load()
@@ -538,6 +540,45 @@ class TestTypedMergeFeedback:
         assert is_merge_success(fb) is True
 
 
+class TestTypedMergeFeedbackIsWiredIntoTheLifecycle:
+    """The contract declares the merger's typed edges, and the walker routes
+    them: MERGED completes, PREPARED ends prepared (not complete), a code-change
+    REJECT re-enters implement (same DD, next attempt)."""
+
+    def test_merger_declares_typed_terminal_edges(self) -> None:
+        merged = LIFECYCLE.transition("merger", "MERGED")
+        prepared = LIFECYCLE.transition("merger", "PREPARED")
+        reject = LIFECYCLE.transition("merger", "REJECT")
+        assert merged.terminal == TERMINAL_COMPLETE
+        assert prepared.terminal == TERMINAL_PREPARED
+        assert reject.is_rework and reject.target == "implement"
+
+    def test_a_prepared_merge_ends_prepared_not_complete(self) -> None:
+        actor = ContractActor(
+            {
+                "continuous_review": ["APPROVE"],
+                "final_review": ["APPROVE"],
+                "merger": ["PREPARED"],
+            }
+        )
+        state = run_actor(actor)
+        assert state["terminal"] == TERMINAL_PREPARED
+        assert state["terminal"] != TERMINAL_COMPLETE
+
+    def test_a_code_change_merge_feedback_reenters_implement(self) -> None:
+        actor = ContractActor(
+            {
+                "continuous_review": ["APPROVE", "APPROVE"],
+                "final_review": ["APPROVE", "APPROVE"],
+                "merger": ["REJECT", "MERGED"],
+            }
+        )
+        state = run_actor(actor)
+        assert state["terminal"] == TERMINAL_COMPLETE
+        implements = [attempt for stage, attempt in actor.calls if stage == "implement"]
+        assert implements == [1, 2], "the rejecting merge re-entered implement under rework"
+
+
 # --------------------------------------------------------------------------
 # L7: the raw-event boundary
 # --------------------------------------------------------------------------
@@ -594,3 +635,89 @@ class TestLifecycleSchemaConsistency:
         contracts = LIFECYCLE_PATH.parent
         schema = json.loads((contracts / "development-lifecycle.schema.json").read_text())
         assert schema["properties"]["contract_version"]["const"] == LIFECYCLE.contract_version
+
+
+# --------------------------------------------------------------------------
+# L3 (wiring): the validity key is measured from real facts and re-verified
+# by the dispatch, gate and recovery paths -- not just a pure test helper.
+# --------------------------------------------------------------------------
+
+
+class TestValidityBindingIsWired:
+    def test_binding_measures_git_facts_and_detects_a_spec_change(
+        self, repo: Path
+    ) -> None:
+        from fleet_graph.dd.validity_binding import (
+            BindingFacts,
+            build_validity_binding,
+            verify_binding,
+        )
+
+        commit = head(repo)
+        facts = BindingFacts(spec_digest="sha256:" + "d" * 64)
+        key = build_validity_binding(str(repo), commit, facts)
+        assert key.digest.startswith("sha256:")
+        assert key.inputs.product_revision == commit
+        assert key.inputs.product_tree, "the tree is measured out of git, not guessed"
+
+        changed, matches = verify_binding(str(repo), commit, facts, key)
+        assert changed == () and matches is True
+
+        moved = BindingFacts(spec_digest="sha256:" + "e" * 64)
+        changed, matches = verify_binding(str(repo), commit, moved, key)
+        assert changed == ("spec_digest",) and matches is False
+
+    def test_the_dispatch_builder_measures_a_validity_key(self, repo: Path) -> None:
+        from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder
+
+        builder = StageDispatchBuilder(
+            DevelopmentChain(
+                development_id="dev-1",
+                workspace_path=str(repo),
+                target_base_commit="0" * 40,
+                root_handoff_digest="sha256:" + "0" * 64,
+            )
+        )
+        key = builder.validity_key({"input_commit": head(repo)})
+        assert key.digest.startswith("sha256:")
+        assert key.inputs.product_revision == head(repo)
+        assert key.inputs.spec_digest.startswith("sha256:")
+        assert key.inputs.target_identity == "0" * 40  # the chain's frozen base
+
+    def test_the_gate_binds_and_verifies_a_validity_key(self, repo: Path) -> None:
+        from fleet_graph.graphs.dd_gate import GraphGateNode
+
+        node = GraphGateNode(plane=None)
+        binding = node._validity_binding(
+            repo, head(repo), {"spec_digest": "sha256:" + "d" * 64}
+        )
+        assert binding["matches"] is True
+        assert binding["changed"] == []
+        assert binding["digest"].startswith("sha256:")
+        assert "product_revision" in binding["fields"]
+
+    def test_recovery_binds_the_validity_digest(self) -> None:
+        from fleet_graph.dd.recovery import HumanRecoveryExit, recovery_validity_digest
+        from fleet_graph.dd.validity import ValidityInputs
+
+        inputs = ValidityInputs(
+            product_revision="a" * 40,
+            product_tree="b" * 40,
+            spec_digest="sha256:" + "c" * 64,
+        )
+        digest = recovery_validity_digest(inputs)
+        exit_ = HumanRecoveryExit()
+        recorded = exit_.record(
+            target_ref="refs/heads/release/x",
+            decision="rework",
+            decided_by="human",
+            question_note_id="note-1",
+            validity_digest=digest,
+        )
+        assert recorded.validity_digest == digest
+        other = ValidityInputs(
+            product_revision="f" * 40,
+            product_tree="b" * 40,
+            spec_digest="sha256:" + "c" * 64,
+        )
+        assert recovery_validity_digest(other) != digest

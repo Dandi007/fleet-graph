@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from fleet_graph.dd.upstream_constants import compute_json_digest
+from fleet_graph.dd.validity import ValidityInputs, build_validity_key
 
 #: What produced a recovery decision. Stored on the record itself (and bound by
 #: its digest) so a downstream evidence link can assert the artifact was produced
@@ -49,6 +50,9 @@ class RecoveryDecision:
     at: str = ""
     digest: str = ""
     mechanism: str = RECOVERY_MECHANISM
+    #: The version-bound validity key digest this decision was cast against
+    #: (spec L3/L5): a resume is only valid while the target still binds it.
+    validity_digest: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -59,7 +63,13 @@ class RecoveryDecision:
             "at": self.at,
             "digest": self.digest,
             "mechanism": self.mechanism,
+            "validity_digest": self.validity_digest,
         }
+
+
+def recovery_validity_digest(inputs: ValidityInputs) -> str:
+    """The validity key digest a recovery decision binds its target to."""
+    return build_validity_key(inputs).digest
 
 
 def decision_digest(
@@ -70,6 +80,7 @@ def decision_digest(
     question_note_id: str,
     at: str,
     mechanism: str = RECOVERY_MECHANISM,
+    validity_digest: str = "",
 ) -> str:
     return compute_json_digest(
         {
@@ -79,6 +90,7 @@ def decision_digest(
             "question_note_id": question_note_id,
             "at": at,
             "mechanism": mechanism,
+            "validity_digest": validity_digest,
         }
     )
 
@@ -118,12 +130,17 @@ class HumanRecoveryExit:
         decided_by: str,
         question_note_id: str = "",
         at: str = "",
+        validity_digest: str = "",
     ) -> RecoveryDecision:
         """Seal one recovery decision, or refuse.
 
         The immutable target reference and the human decision are both
         required; authentication runs before anything is recorded, so an
-        unauthenticated claim never reaches the trail.
+        unauthenticated claim never reaches the trail. ``validity_digest`` is
+        the version-bound validity key (spec L3/L5) the caller measured for the
+        target; when supplied it joins the decision's own digest, so a resume
+        that no longer binds the same key can be told apart from the one that
+        was authorized.
         """
         if not target_ref:
             raise RecoveryError("a recovery decision needs an immutable target reference")
@@ -147,7 +164,9 @@ class HumanRecoveryExit:
                 question_note_id=question_note_id,
                 at=at,
                 mechanism=RECOVERY_MECHANISM,
+                validity_digest=validity_digest,
             ),
+            validity_digest=validity_digest,
         )
         self._records.append(record)
         self._by_target[record.target_ref] = record
@@ -189,4 +208,5 @@ __all__ = [
     "RecoveryDecision",
     "RecoveryError",
     "decision_digest",
+    "recovery_validity_digest",
 ]

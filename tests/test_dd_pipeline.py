@@ -32,6 +32,9 @@ from source_tools import executable_source
 
 SPEC_COMMIT = "0" * 40
 
+# The terminal merge stage's name, for the actor's unsteered-success default.
+MERGER_STAGE = "merger"
+
 
 def sealed_commit(dispatch: Dispatch) -> str:
     """What the sealer would produce. Actor and materializer derive it alike."""
@@ -52,10 +55,22 @@ class ContractActor:
     def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
         self.calls.append((stage.id, dispatch["attempt"]))
         queue = self.verdicts.get(stage.id)
-        event = queue.pop(0) if queue else SPINE_EVENT
+        if queue:
+            event = queue.pop(0)
+        elif stage.id == MERGER_STAGE:
+            # The terminal merge stage's unsteered success is a measured merge
+            # (MERGED), not the spine event -- the spine event is no longer a
+            # declared merge outcome after spec L6 typed merge feedback.
+            event = "MERGED"
+        else:
+            event = SPINE_EVENT
         return StageOutcome(
             event=event,
-            receipt={"stage": stage.id, "verdict": event, "output_commit": sealed_commit(dispatch)},
+            receipt={
+                "stage": stage.id,
+                "verdict": event,
+                "output_commit": sealed_commit(dispatch),
+            },
             produced=tuple(stage.produced_artifacts),
         )
 

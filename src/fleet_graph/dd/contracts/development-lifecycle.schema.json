@@ -185,8 +185,8 @@
     },
     "transitions": {
       "type": "array",
-      "minItems": 7,
-      "maxItems": 7,
+      "minItems": 10,
+      "maxItems": 10,
       "uniqueItems": true,
       "items": {
         "oneOf": [
@@ -301,6 +301,39 @@
               "to": "human_gate",
               "next_mode": "inherit",
               "required_receipt": "final_review",
+              "event_binding": {
+                "source": "required_receipt.verdict",
+                "target": "transition.on",
+                "operator": "equal"
+              },
+              "commit_binding": {
+                "source": "required_receipt.output_commit",
+                "target": "next_dispatch.input_commit",
+                "operator": "equal"
+              }
+            }
+          },
+          {
+            "const": {
+              "from": "merger",
+              "on": "MERGED",
+              "terminal": "complete"
+            }
+          },
+          {
+            "const": {
+              "from": "merger",
+              "on": "PREPARED",
+              "terminal": "prepared"
+            }
+          },
+          {
+            "const": {
+              "from": "merger",
+              "on": "REJECT",
+              "to": "implement",
+              "next_mode": "rework",
+              "required_receipt": "merger",
               "event_binding": {
                 "source": "required_receipt.verdict",
                 "target": "transition.on",

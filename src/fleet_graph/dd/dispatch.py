@@ -51,6 +51,7 @@ from fleet_graph.dd.upstream_constants import (
     ATTEMPT_CONTEXT_CONTRACT_VERSION,
     compute_json_digest,
 )
+from fleet_graph.dd.validity_binding import BindingFacts, build_validity_binding
 from fleet_graph.dd.vendor import git_ops
 
 DISPATCH_SCHEMA_PATH = CONTRACTS_DIR / "stage-dispatch.schema.json"
@@ -313,6 +314,40 @@ class StageDispatchBuilder:
         if parent_receipt:
             return compute_json_digest(parent_receipt)
         return self.chain.root_handoff_digest
+
+    def validity_key(
+        self,
+        dispatch: dict[str, Any],
+        *,
+        facts: BindingFacts | None = None,
+    ) -> Any:
+        """The version-bound validity key (spec L3) for one dispatch.
+
+        Measures the product revision and tree out of git at the dispatch's
+        input commit, binds the committed SPEC digest read from that commit, and
+        closes over the caller-supplied acceptance-context / target / PR facts.
+        The strict ``stage-dispatch`` object stays untouched -- this key travels
+        on the raw-event boundary, not inside the dispatch the plugin reads.
+        """
+        input_commit = str(dispatch.get("input_commit", ""))
+        if git_ops._FULL_COMMIT_RE.fullmatch(input_commit) is None:
+            raise DispatchError(f"input_commit must be a full object id, got {input_commit!r}")
+        merged = facts or BindingFacts()
+        # The spec digest is the committed blob's own digest, read out of the
+        # commit -- never an agent's word.
+        spec_ref = git_ops.exact_artifact_identity(
+            self.chain.workspace_path, input_commit, self.spec_path
+        )
+        return build_validity_binding(
+            self.chain.workspace_path,
+            input_commit,
+            BindingFacts(
+                spec_digest=spec_ref["digest"],
+                acceptance_context_revision=merged.acceptance_context_revision,
+                target_identity=merged.target_identity or self.chain.target_base_commit,
+                pr_identity=merged.pr_identity,
+            ),
+        )
 
 
 __all__ = [

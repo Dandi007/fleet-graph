@@ -42,6 +42,7 @@ from fleet_graph.graphs.dd_actors import (
     review_stages,
 )
 from fleet_graph.graphs.dd_pipeline import (
+    TERMINAL_PREPARED,
     Dispatch,
     PipelineDeps,
     Sealed,
@@ -249,7 +250,9 @@ class TestSettlementAndAbsenceComeFromTheWalker:
         plane = CostDataPlane()
         state = run_settle(plane, tmp_path, "dev-1")
 
-        assert state["terminal"] == "complete"
+        # The merge stage never publishes here, so it seals a prepared result;
+        # the order's management lifecycle is still settled exactly once.
+        assert state["terminal"] == TERMINAL_PREPARED
         settlements = [s for s in plane.samples() if s.name == SETTLEMENT_METRIC]
         assert {s.label_map()["order_id"] for s in settlements} == {"dev-1"}
         assert [s.value for s in settlements] == [1.0]
@@ -473,7 +476,7 @@ class TestTheManagementCostIsEmittedByTheWalker:
         plane = CostDataPlane()
         state = run_settle(plane, tmp_path, "dev-1", management_cost=lambda _oid: 10.0)
 
-        assert state["terminal"] == "complete"
+        assert state["terminal"] == TERMINAL_PREPARED
         management = [
             s
             for s in plane.samples()
@@ -485,7 +488,7 @@ class TestTheManagementCostIsEmittedByTheWalker:
         plane = CostDataPlane()
         state = run_settle(plane, tmp_path, "dev-1")
 
-        assert state["terminal"] == "complete"
+        assert state["terminal"] == TERMINAL_PREPARED
         management = [
             s
             for s in plane.samples()

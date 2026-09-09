@@ -93,6 +93,11 @@ TERMINAL_FAILED = "failed"
 TERMINAL_REFUSED = "refused"
 TERMINAL_BOUNDS = "bounds"
 TERMINAL_FAULT = "fault"
+# The terminal kind a prepared-only merge lands in. The contract declares this
+# kind on the merger's PREPARED edge; the walker carries it through verbatim,
+# so a PREPARED result is recorded and observed as "prepared", never as the
+# "complete" a measured merge produces (spec L6: PREPARED is not a merge).
+TERMINAL_PREPARED = "prepared"
 
 # Terminal codes minted historically by the walker's now-removed business
 # bounds. Business rework is unbounded (spec L2); these codes survive only so
@@ -188,6 +193,12 @@ class Sealed:
     # commits whatever the stage left behind leaves this None, so the stage's
     # own report still has to survive output_verify.
     produced: tuple[str, ...] | None = None
+    # The version-bound validity key (spec L3/L7) the sealer measured and
+    # sealed with this stage's output. None when no validity binding is wired,
+    # which keeps the seal schema untouched. When present it is recorded on the
+    # raw-event boundary so a later stage can re-measure and detect which input
+    # moved -- the walker invents nothing here, it only observes the sealer.
+    validity: Any = None
 
 
 class Materializer(Protocol):
@@ -400,6 +411,21 @@ def _transport_exhausted_outcome(stage_id: str, exhausted: TransportExhausted) -
     )
 
 
+def _validity_record(validity: Any) -> dict[str, Any]:
+    """The shape a sealed validity key is recorded in on the raw-event boundary.
+
+    A sealer hands back either a ``ValidityKey`` (digest + bound fields) or a
+    plain dict carrying those same facts. The walker records it verbatim --
+    it does not re-measure and does not invent a digest -- so the event trail
+    names exactly what the sealer bound, no more, no less.
+    """
+    if hasattr(validity, "digest") and hasattr(validity, "fields"):
+        return {"digest": validity.digest, "fields": validity.fields}
+    if isinstance(validity, dict):
+        return dict(validity)
+    return {"value": str(validity)}
+
+
 def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
     lifecycle = deps.lifecycle
 
@@ -521,6 +547,10 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         digests = dict(state.get("receipt_digests", {}))
         outcome: StageOutcome | None = None
         head_commit = state.get("head_commit", "")
+        # The validity key the sealer measured for this stage's output (spec
+        # L3/L7), None when no materializer carries a validity binding. It is
+        # recorded on the raw-event boundary only, never invented by the walker.
+        sealed_validity: Any = None
 
         if deps.replayer is not None:
             replayed = deps.replayer.replay(stage, dispatch)
@@ -614,6 +644,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                 try:
                     sealed = deps.materializer.materialize(stage, dispatch, outcome)
                     head_commit = sealed.commit
+                    sealed_validity = getattr(sealed, "validity", None)
                     if sealed.receipt is not None:
                         # The sealer attested; its account supersedes the
                         # actor's claim for every downstream binding.
@@ -719,6 +750,11 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     "event": outcome.event,
                     "attempt": dispatch["attempt"],
                     "output_commit": head_commit,
+                    **(
+                        {"validity": _validity_record(sealed_validity)}
+                        if sealed_validity is not None
+                        else {}
+                    ),
                     **({"rebase": rebase_record} if rebase_record is not None else {}),
                     **(
                         {
@@ -742,11 +778,6 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         event = state.get("last_event", "")
         receipt = state.get("last_receipt") or None
         failure_code = str(state.get("last_failure_code", ""))
-
-        if lifecycle.is_terminal(stage_id):
-            if deps.cost_plane is not None and state.get("development_id"):
-                deps.cost_plane.record_settlement(order_id=str(state.get("development_id")))
-            return _terminal(state, TERMINAL_COMPLETE, f"{stage_id} is the last declared stage")
 
         exit_ = lifecycle.failure_transition(stage_id, event)
         # Egress layering (spec 交付面 2/4): a transport-rooted failure keeps
@@ -794,8 +825,29 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             except AmbiguousSpine as ambiguous:
                 return _terminal(state, TERMINAL_FAULT, str(ambiguous), fault=True)
             if successor is None:
+                # A stage with no declared verdict edge and no derived
+                # successor is the last one: reaching it is completion.
+                if lifecycle.is_terminal(stage_id):
+                    if deps.cost_plane is not None and state.get("development_id"):
+                        deps.cost_plane.record_settlement(
+                            order_id=str(state.get("development_id"))
+                        )
+                    return _terminal(state, TERMINAL_COMPLETE, f"{stage_id} is the last stage")
                 return _terminal(state, TERMINAL_FAULT, str(exc), fault=True)
             return {"stage": successor, "mode": state.get("mode", MODE_INITIAL)}
+
+        if transition.terminal:
+            # A terminal transition ends the run in the kind the contract
+            # declares -- "complete" for a measured merge, "prepared" for a
+            # prepared-only result. The walker carries the kind through
+            # verbatim, so it can tell the two apart without knowing either
+            # by name (spec L6). Whichever end it is, the order's management
+            # lifecycle is over, so its spend is settled exactly once.
+            if deps.cost_plane is not None and state.get("development_id"):
+                deps.cost_plane.record_settlement(order_id=str(state.get("development_id")))
+            return _terminal(
+                state, transition.terminal, f"{stage_id} {event}", code=""
+            )
 
         if not transition.is_rework:
             # `inherit` means what it says: an attempt that entered as rework
@@ -876,6 +928,7 @@ __all__ = [
     "TERMINAL_COMPLETE",
     "TERMINAL_FAILED",
     "TERMINAL_FAULT",
+    "TERMINAL_PREPARED",
     "TERMINAL_REFUSED",
     "Actor",
     "Dispatch",

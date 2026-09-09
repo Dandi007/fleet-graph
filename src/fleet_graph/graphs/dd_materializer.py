@@ -45,7 +45,8 @@ from fleet_graph.dd.dispatch import (
     read_committed_refs,
 )
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
-from fleet_graph.dd.vendor import plugin_adapter
+from fleet_graph.dd.validity_binding import BindingFacts
+from fleet_graph.dd.vendor import git_ops, plugin_adapter
 from fleet_graph.graphs.dd_actors import (
     implement_stage,
     review_stages,
@@ -396,7 +397,28 @@ class PluginMaterializer:
             commit=sealed.commit,
             receipt=sealed.receipt,
             produced=tuple(stage.produced_artifacts),
+            validity=self._validity_key(sealed.commit),
         )
+
+    def _validity_key(self, output_commit: str) -> Any:
+        """The validity key (spec L3) sealed with this stage's output commit.
+
+        The product revision/tree are measured out of git at the output commit
+        the plugin just wrote; the spec digest comes from the committed spec
+        blob; the target identity is the durable ref this order merges onto.
+        A read that cannot bind (no git object, unreadable spec) returns None
+        -- the seal schema is untouched, and a later verify treats an absent
+        binding as absent rather than inventing one.
+        """
+        if not self.builder.chain.workspace_path:
+            return None
+        try:
+            return self.builder.validity_key(
+                {"input_commit": output_commit},
+                facts=BindingFacts(target_identity=self.target.remote_ref),
+            )
+        except (DispatchError, git_ops.ExactWorkspaceError):
+            return None
 
     def parent_digest(self, stage_id: str, attempt_id: str) -> str | None:
         """The parent receipt's byte digest, or None where there is no file."""

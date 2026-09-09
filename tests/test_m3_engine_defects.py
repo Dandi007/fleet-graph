@@ -542,6 +542,8 @@ class ReworkRetryActor:
             event = "APPROVE" if dispatch["attempt"] >= 2 else "REJECT"
         if stage.id == "final_review":
             event = "APPROVE"
+        if stage.id == "merger":
+            event = "MERGED"
         return StageOutcome(
             event=event,
             receipt={
@@ -573,6 +575,8 @@ class FlakyImplementActor:
                     detail="provider down",
                 )
         event = "APPROVE" if stage.id in ("continuous_review", "final_review") else SPINE_EVENT
+        if stage.id == "merger":
+            event = "MERGED"
         return StageOutcome(
             event=event,
             receipt={

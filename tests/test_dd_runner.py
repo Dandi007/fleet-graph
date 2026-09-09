@@ -24,6 +24,7 @@ from fleet_graph.executors.agent_run import RunStatus, RunTicket
 from fleet_graph.graphs.dd_pipeline import (
     TERMINAL_COMPLETE,
     TERMINAL_FAULT,
+    TERMINAL_PREPARED,
     TERMINAL_REFUSED,
     Dispatch,
     Sealed,
@@ -38,6 +39,8 @@ from fleet_graph.graphs.dd_runner import (
 from fleet_graph.graphs.dd_scripts import ACCEPTANCE_PATH, GATE_PATH, RUN_CONFIG_PATH
 
 LIFECYCLE = Lifecycle.load()
+
+MERGER_STAGE = "merger"
 
 
 def make_config(repo: Path, tmp_path: Path) -> DevelopmentConfig:
@@ -101,8 +104,11 @@ class ScriptStub:
 
     def act(self, stage: Any, dispatch: Dispatch) -> StageOutcome:
         self.ran.append(stage.id)
+        # The merger's unsteered success is a measured merge now; the spine
+        # event is no longer a declared merge outcome (spec L6).
+        event = "MERGED" if stage.id == MERGER_STAGE else "success"
         return StageOutcome(
-            event="success",
+            event=event,
             receipt={"stage": stage.id},
             produced=tuple(stage.produced_artifacts),
         )
@@ -301,7 +307,9 @@ class TestTheDefaultsMakeItRunnable:
             scripts={"human_gate": ScriptStub()},
             launcher=AgentRunStub({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}),
         )
-        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        # publish_merge is off by default, so the real merger seals a
+        # prepared -- not merged -- result, and the run ends "prepared".
+        assert result["terminal"] == TERMINAL_PREPARED, result["terminal_reason"]
         assert (repo / RUN_CONFIG_PATH).is_file()
         assert (repo / ACCEPTANCE_PATH).is_file()
 
@@ -426,7 +434,7 @@ class TestWaitingOnAHumanAndComingBack:
         )
         result = self._run(config, board, resume=True)
 
-        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        assert result["terminal"] == TERMINAL_PREPARED, result["terminal_reason"]
         assert result["awaiting"] is None
         # The verdict outlives the run: an assembled pipeline seals it into
         # the product tree without the caller asking for it.
@@ -536,7 +544,7 @@ class TestWaitingOnAHumanAndComingBack:
             resume=True,
         )
         assert launcher.dispatched == [], "a resume must not re-dispatch a sealed stage"
-        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        assert result["terminal"] == TERMINAL_PREPARED, result["terminal_reason"]
         assert result["gate_refused"] is None
         sealed = json.loads((repo / GATE_PATH.format(generation=1)).read_text(encoding="utf-8"))
         assert sealed["decision"] == "APPROVE"
@@ -578,7 +586,7 @@ class TestWaitingOnAHumanAndComingBack:
             raw={},
         )
         result = self._run(config, board, resume=True)
-        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        assert result["terminal"] == TERMINAL_PREPARED, result["terminal_reason"]
 
         scraped = parse(
             (tmp_path / "textfile" / "cost-obs-dev-001.prom").read_text(encoding="utf-8")
@@ -663,7 +671,7 @@ class TestARestartedGenerationKeepsItsCostFacts:
             gate_card_entity_id="card-1",
             launcher=AgentRunStub({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}),
         )
-        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        assert result["terminal"] == TERMINAL_PREPARED, result["terminal_reason"]
 
         scraped = parse((textfile / "cost-obs-dev-001.prom").read_text(encoding="utf-8"))
         # launch and both reviews survive the fresh generation's overwrite; the
