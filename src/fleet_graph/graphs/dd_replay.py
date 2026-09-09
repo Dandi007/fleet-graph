@@ -36,24 +36,21 @@ Continuous intent when it seals a Final review. Replay therefore re-installs
 that intent with its receipt; a review receipt whose intent the source
 generation no longer holds is an un-rechargeable link and re-runs for real.
 
-**Replay may trim dead weight, and only dead weight.** A pre-F4 restart left
-junk commits above the sealed tip (a fresh generation's `configure` re-seal,
-an acceptance record of a run that then failed). The plugin sealer requires
-the remote head to equal the input commit, so those commits must go before a
-review can seal on the replayed tip. The trim is fail-closed: it happens only
-when every commit above the tip touches nothing outside the reserved
-`.dev-dispatch/` / `.dd-evidence/` namespaces -- product code above the tip
-means no trim and no replay at all.
+**Replay never resets the branch.** Spec L4 forbids replay from resetting the
+branch, losing dirty state, or re-sending a confirmed effect. A prefix is
+reused only when the worktree already sits exactly on its sealed tip -- then
+nothing has to move, and the receipts are simply re-installed under the
+identity they were sealed with. When `HEAD` has moved past (or off) the tip,
+whatever sits above it is an unknown effect that must be preserved, not cut,
+so the replayer refuses fail-closed and the stage re-runs for real against the
+preserved scene (the pre-existing recoverable path).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import random
 import re
-import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -61,13 +58,6 @@ from typing import Any
 from fleet_graph.dd import chain_rules
 from fleet_graph.dd.bootstrap import INDEX_PATH
 from fleet_graph.dd.dispatch import derive_attempt_id
-from fleet_graph.dd.egress import (
-    DEFAULT_EGRESS_POLICY,
-    EgressPolicy,
-    EgressRepoError,
-    TransportExhausted,
-    retry_remote,
-)
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.dd.upstream_constants import compute_json_digest
@@ -105,11 +95,6 @@ APPROVE = "APPROVE"
 # supervise/audit.py's chain check, so the topology cannot drift between the
 # replayer and the auditor. REJECT is re-exported for existing importers.
 REJECT = chain_rules.REJECT
-
-#: The reserved control namespaces. Commits above the sealed tip that touch
-#: only these may be trimmed on replay; anything else is product drift and
-#: refuses the whole replay.
-RESERVED_PREFIXES = (".dev-dispatch/", ".dd-evidence/")
 
 #: Mechanical bound on the within-generation rework walk. The pipeline's own
 #: rework bound is single digits; this only stops a pathological directory.
@@ -189,8 +174,6 @@ class ReceiptReplayer:
     prior_state_roots: tuple[tuple[int, Path], ...]
     development_id: str
     generation: int
-    remote_url: str = ""
-    remote_ref: str = ""
     #: The current generation's declared acceptance context (acceptance
     #: commands, setup commands, environment). The replayed configure commit
     #: carries the *previous* generation's run-config; when the operator
@@ -200,13 +183,6 @@ class ReceiptReplayer:
     #: means "leave the replayed tree alone" (the pre-reconfigure behaviour).
     run_config: dict[str, Any] | None = None
     lifecycle: Lifecycle = field(default_factory=Lifecycle.load)
-    # Egress resilience: the replay-time remote probe and the trim push retry
-    # transport-class failures under the bounded backoff. A probe or push
-    # that stays dark past the budget leaves the replay disabled -- the
-    # stage re-runs for real, the pre-existing fail-closed path.
-    egress_policy: EgressPolicy = field(default_factory=lambda: DEFAULT_EGRESS_POLICY)
-    sleep: Callable[[float], None] = time.sleep
-    rand: Callable[[], float] = random.random
 
     def __post_init__(self) -> None:
         self._plan: list[_Step] | None = None
@@ -716,7 +692,7 @@ class ReceiptReplayer:
         output = str(receipt.get("output_commit") or "")
         return bool(_HEX40.fullmatch(output)) and self._is_ancestor(output, head)
 
-    # --- the one mutation: trim to the tip, install the receipts -----------
+    # --- install the receipts onto the unchanged tip (never reset) ----------
 
     def _prepare(self, plan: list[_Step]) -> bool:
         tip = plan[-1].output_commit
@@ -724,50 +700,15 @@ class ReceiptReplayer:
         if not head:
             return False
         if head != tip:
-            # The trim below runs `reset --hard`, which would destroy any
-            # uncommitted product work in the tree or index. Spec L4 forbids
-            # both the reset of product state and the loss of dirty state:
-            # before touching anything, refuse the replay when the tree carries
-            # uncommitted non-reserved changes (or cannot be inspected), so the
-            # stage re-runs for real against the preserved scene (fail-closed).
-            # Controller-owned `.dev-dispatch`/`.dd-evidence` residue is dead
-            # weight the trim already cuts, so it stays permitted.
-            if self._has_uncommitted_product_changes() is not False:
-                return False
-            diff = run_git(self.workspace, "diff", "--name-only", tip, head)
-            if diff.returncode != 0:
-                return False
-            names = [line.strip() for line in diff.stdout.splitlines() if line.strip()]
-            if not all(name.startswith(RESERVED_PREFIXES) for name in names):
-                # Product drift above the sealed tip: refuse rather than cut.
-                # (An empty diff is fine -- tree-identical junk commits, e.g.
-                # an --allow-empty re-seal, are the safest trim of all.)
-                return False
-            if self.remote_url and self.remote_ref:
-                observed = self._remote_head()
-                if observed != head:
-                    return False
-                try:
-                    retry_remote(
-                        lambda: run_git(
-                            self.workspace,
-                            "push",
-                            "--quiet",
-                            f"--force-with-lease={self.remote_ref}:{observed}",
-                            self.remote_url,
-                            f"{tip}:{self.remote_ref}",
-                        ),
-                        op_name="push",
-                        policy=self.egress_policy,
-                        sleep=self.sleep,
-                        rand=self.rand,
-                    )
-                except (TransportExhausted, EgressRepoError):
-                    return False
-            reset = run_git(self.workspace, "reset", "--hard", "--quiet", tip)
-            if reset.returncode != 0:
-                return False
-        elif not self._clear_stale_run_config_residue():
+            # Spec L4: replay must not reset the branch, lose dirty state, or
+            # re-send a confirmed effect. A prefix is safe to reuse only when
+            # the worktree already sits exactly on its sealed tip; anything
+            # sitting above the tip is an unknown effect that must be
+            # preserved, not cut. Refuse fail-closed here and let the stage
+            # re-run for real against the preserved scene (the recoverable
+            # state, reached through a real transition).
+            return False
+        if not self._clear_stale_run_config_residue():
             return False
 
         # Installed under the identity the receipts were sealed with -- their
@@ -795,39 +736,11 @@ class ReceiptReplayer:
             self._pending_run_config = self._reconfigured_run_config(plan[0].output_commit)
         return True
 
-    def _has_uncommitted_product_changes(self) -> bool | None:
-        """Whether the tree/index carries uncommitted changes outside the
-        reserved (controller-owned) namespaces.
-
-        Used only before the ``reset --hard`` trim, where an uncommitted product
-        change would be silently destroyed (spec L4: no reset, no lost dirty
-        state). Reserved ``.dev-dispatch``/``.dd-evidence`` dirt is itself dead
-        weight the trim already cuts, and the stale-run-config case on the
-        ``HEAD == tip`` path is handled separately, so it stays permitted here.
-        ``False`` means the product paths are provably clean; ``True`` means a
-        product change is uncommitted; ``None`` means the tree could not be
-        inspected -- a caller must treat both ``True`` and ``None`` as "refuse to
-        trim", never guess.
-        """
-        status = run_git(
-            self.workspace,
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-        )
-        if status.returncode != 0:
-            return None
-        for line in status.stdout.splitlines():
-            path = line[3:] if len(line) > 3 else ""
-            if path and not path.startswith(RESERVED_PREFIXES):
-                return True
-        return False
-
     def _clear_stale_run_config_residue(self) -> bool:
         """Drop a previous generation's controller-owned ``run-config.json`` dirt.
 
-        When ``HEAD`` already equals the replay tip, ``_prepare`` skips its
-        ``reset --hard`` branch, so a reconfigured acceptance declaration a
+        ``_prepare`` only ever runs when ``HEAD`` already equals the replay tip
+        and never resets the branch, so a reconfigured acceptance declaration a
         *previous* failed generation left uncommitted survives into the fresh
         final reviewer and is blamed on the actor (ACTOR_RESERVED_PATH_CHANGED).
         Restore HEAD's committed copy of exactly that one file, and only when
@@ -968,20 +881,6 @@ class ReceiptReplayer:
     def _is_ancestor(self, commit: str, head: str) -> bool:
         return run_git(self.workspace, "merge-base", "--is-ancestor", commit, head).returncode == 0
 
-    def _remote_head(self) -> str:
-        try:
-            proc = retry_remote(
-                lambda: run_git(self.workspace, "ls-remote", self.remote_url, self.remote_ref),
-                op_name="ls-remote",
-                policy=self.egress_policy,
-                sleep=self.sleep,
-                rand=self.rand,
-            )
-        except (TransportExhausted, EgressRepoError):
-            return ""
-        heads = [line.split()[0] for line in proc.stdout.splitlines() if line.strip()]
-        return heads[0] if heads else ""
-
     def _spine_predecessor(self, stage_id: str | None) -> str | None:
         if not stage_id:
             return None
@@ -1011,7 +910,6 @@ __all__ = [
     "MAX_WALK_ATTEMPTS",
     "RECEIPT_FILES",
     "REJECT",
-    "RESERVED_PREFIXES",
     "ReceiptReplayer",
     "byte_digest",
     "prior_generation_state_roots",

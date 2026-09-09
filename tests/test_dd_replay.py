@@ -231,9 +231,10 @@ class TestASealedPrefixReplays:
         """The F4 scenario end to end: no fresh implement agent is dispatched
         against a tree that already carries the work."""
         g1 = G1(repo, tmp_path)
-        junk = g1.junk_configure()
         actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
-        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), head_commit=junk)
+        state = run_generation_two(
+            make_deps(actor=actor, replayer=g1.replayer()), head_commit=g1.implement
+        )
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert [stage for stage, _ in actor.calls] == [
@@ -247,14 +248,19 @@ class TestASealedPrefixReplays:
         implement_entry = state["history"][1]
         assert implement_entry["output_commit"] == g1.implement
 
-    def test_the_dead_weight_above_the_tip_is_trimmed(self, repo: Path, tmp_path: Path) -> None:
-        """The plugin sealer requires remote head == input commit, so the
-        junk configure commit of the failed restart must go."""
+    def test_the_dead_weight_above_the_tip_is_preserved_not_trimmed(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """Spec L4 forbids replay from resetting the branch. Commits above the
+        sealed tip are unknown effects that must be preserved, not cut -- so
+        when the tree has moved past the tip the replay refuses fail-closed and
+        the scene is left untouched."""
         g1 = G1(repo, tmp_path)
         junk = g1.junk_configure()
         assert head(repo) == junk
-        run_generation_two(make_deps(actor=ContractActor(), replayer=g1.replayer()), junk)
-        assert head(repo) == g1.implement
+        state = run_generation_two(make_deps(actor=ContractActor(), replayer=g1.replayer()), junk)
+        assert replayed_stages(state) == []
+        assert head(repo) == junk, "a moved tip must not be reset: the scene is preserved"
 
     def test_the_replayed_receipt_bytes_are_installed_for_this_generation(
         self, repo: Path, tmp_path: Path
@@ -263,9 +269,7 @@ class TestASealedPrefixReplays:
         from this generation's receipts directory -- so the bytes must be
         there, and must be exactly the sealed bytes."""
         g1 = G1(repo, tmp_path)
-        run_generation_two(
-            make_deps(actor=ContractActor(), replayer=g1.replayer()), g1.junk_configure()
-        )
+        run_generation_two(make_deps(actor=ContractActor(), replayer=g1.replayer()), g1.implement)
         installed = g1.installed("implement-receipt.json")
         assert installed.read_bytes() == g1.raw
         assert byte_digest(installed.read_bytes()) == byte_digest(g1.raw)
@@ -283,10 +287,9 @@ class TestASealedPrefixReplays:
         )
         raw = write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", receipt)
         write_intent(g1.state_root, receipt)
-        junk = g1.junk_configure()
 
         actor = ContractActor({"final_review": ["APPROVE"]})
-        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), review_commit)
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
@@ -313,10 +316,9 @@ class TestASealedPrefixReplays:
         )
         write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", receipt)
         intent_raw = write_intent(g1.state_root, receipt)
-        junk = g1.junk_configure()
 
         actor = ContractActor({"final_review": ["APPROVE"]})
-        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), review_commit)
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
@@ -331,9 +333,6 @@ class TestASealedPrefixReplays:
         longer holds is an un-rechargeable link: it re-runs for real rather
         than replaying half a link the next materialization cannot continue."""
         g1 = G1(repo, tmp_path)
-        review_commit = commit_file(
-            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
-        )
         write_receipt(
             g1.state_root,
             1,
@@ -342,14 +341,13 @@ class TestASealedPrefixReplays:
             review_receipt(
                 parent_digest=byte_digest(g1.raw),
                 subject=g1.implement,
-                output=review_commit,
+                output=g1.implement,
                 verdict="APPROVE",
             ),
         )
-        junk = g1.junk_configure()
 
         actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
-        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), g1.implement)
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert replayed_stages(state) == ["configure", "implement"]
@@ -389,9 +387,7 @@ class TestABrokenChainRunsRealFromTheBreak:
             ),
         )
         actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
-        state = run_generation_two(
-            make_deps(actor=actor, replayer=g1.replayer()), g1.junk_configure()
-        )
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), g1.implement)
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert replayed_stages(state) == ["configure", "implement"]
@@ -403,9 +399,6 @@ class TestARejectionIsNeverReplayed:
         """The REJECT receipt is complete and chained -- and still not
         replayed: only the success/APPROVE prefix is."""
         g1 = G1(repo, tmp_path)
-        review_commit = commit_file(
-            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "REJECT"}'
-        )
         write_receipt(
             g1.state_root,
             1,
@@ -414,17 +407,17 @@ class TestARejectionIsNeverReplayed:
             review_receipt(
                 parent_digest=byte_digest(g1.raw),
                 subject=g1.implement,
-                output=review_commit,
+                output=g1.implement,
                 verdict="REJECT",
             ),
         )
         actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
-        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), head(repo))
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), g1.implement)
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert replayed_stages(state) == ["configure", "implement"]
         assert next(stage for stage, _ in actor.calls) == "acceptance"
-        assert head(repo) == g1.implement, "the rejected review's seal is dead weight"
+        assert head(repo) == g1.implement, "a rejected review is never replayed"
 
 
 class TestAReviewedChainContinuesThroughItsReviews:
@@ -463,10 +456,8 @@ class TestAReviewedChainContinuesThroughItsReviews:
         )
         write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr)
         write_intent(g1.state_root, fr)
-        junk = g1.junk_configure()
-
         actor = ContractActor()
-        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), rf)
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert replayed_stages(state) == [
@@ -492,28 +483,23 @@ class TestAReviewedChainContinuesThroughItsReviews:
         review, so the sealed reviews re-run for real rather than being reused
         against a context they never graded (spec L3/L5)."""
         g1 = G1(repo, tmp_path)
-        rc = commit_file(
-            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
-        )
         cr = review_receipt(
             parent_digest=byte_digest(g1.raw),
             subject=g1.implement,
-            output=rc,
+            output=g1.implement,
             verdict="APPROVE",
         )
         cr_raw = write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
         write_intent(g1.state_root, cr)
-        rf = commit_file(repo, ".dev-dispatch/reviews/final/g1-a1.json", '{"verdict": "APPROVE"}')
         fr = review_receipt(
             parent_digest=byte_digest(cr_raw),
-            subject=rc,
-            output=rf,
+            subject=g1.implement,
+            output=g1.implement,
             verdict="APPROVE",
             phase="final",
         )
         write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr)
         write_intent(g1.state_root, fr)
-        junk = g1.junk_configure()
 
         declared = {"acceptance_commands": [["true"]], "setup_commands": [], "acceptance_env": {}}
         replayer = ReceiptReplayer(
@@ -526,7 +512,7 @@ class TestAReviewedChainContinuesThroughItsReviews:
             run_config=declared,
         )
         actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
-        state = run_generation_two(make_deps(actor=actor, replayer=replayer), junk)
+        state = run_generation_two(make_deps(actor=actor, replayer=replayer), g1.implement)
 
         assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
         assert replayed_stages(state) == ["configure", "implement"]
@@ -565,10 +551,9 @@ class TestAReviewedChainContinuesThroughItsReviews:
         )
         write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr)
         write_intent(g1.state_root, fr)
-        junk = g1.junk_configure()
 
         actor = ContractActor()
-        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), rf)
 
         assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
         assert replayed_stages(state) == [
@@ -716,9 +701,7 @@ class TestAReviewedChainContinuesThroughItsReviews:
                 return super().act(stage, dispatch)
 
         actor = Recorder({"continuous_review": ["REJECT", "APPROVE"], "final_review": ["APPROVE"]})
-        state = run_generation_two(
-            make_deps(actor=actor, replayer=g1.replayer()), g1.junk_configure()
-        )
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), g1.implement)
 
         assert state["terminal"] == TERMINAL_COMPLETE
         sealed_identity = g1.receipt["attempt_id"]
@@ -820,22 +803,38 @@ class TestAPartialPrefixRespectsTheInheritedChain:
         self, repo: Path, tmp_path: Path
     ) -> None:
         g1 = G1(repo, tmp_path)
-        committed_index(
-            repo,
-            [
+        # The inherited index that lets a fresh attempt after a REJECT proceed.
+        # Replay never resets the branch, so the index the replayer reads must
+        # already live on the sealed implement tip: fold it onto that commit.
+        index = {
+            "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
+            "development_id": DEVELOPMENT_ID,
+            "entries": [
                 index_entry(2, 1, "continuous", "APPROVE"),
                 index_entry(2, 1, "final", "REJECT"),
             ],
+        }
+        path = repo / ".dev-dispatch" / "feedback" / "index.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(index, sort_keys=True), encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "--amend", "--no-edit")
+        implement = head(repo)
+        write_receipt(
+            g1.state_root,
+            1,
+            1,
+            "implement-receipt.json",
+            implement_receipt(g1.seed, g1.configure, implement),
         )
-        junk = g1.junk_configure()
 
         actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
-        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), implement)
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert replayed_stages(state) == ["configure", "implement"]
         assert next(stage for stage, _ in actor.calls) == "acceptance"
-        assert head(repo) == g1.implement
+        assert head(repo) == implement
 
     def test_a_cross_generation_history_fails_closed_without_erasing(
         self, repo: Path, tmp_path: Path
@@ -887,9 +886,7 @@ class TestTheReplayedIdentityBindsTheRealReview:
                 return super().act(stage, dispatch)
 
         actor = Recorder({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
-        state = run_generation_two(
-            make_deps(actor=actor, replayer=g1.replayer()), g1.junk_configure()
-        )
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), g1.implement)
 
         assert state["terminal"] == TERMINAL_COMPLETE
         sealed_identity = g1.receipt["attempt_id"]
@@ -914,9 +911,7 @@ class TestTheReplayedIdentityBindsTheRealReview:
                 return super().act(stage, dispatch)
 
         actor = Recorder({"continuous_review": ["REJECT", "APPROVE"], "final_review": ["APPROVE"]})
-        state = run_generation_two(
-            make_deps(actor=actor, replayer=g1.replayer()), g1.junk_configure()
-        )
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), g1.implement)
 
         assert state["terminal"] == TERMINAL_COMPLETE
         sealed_identity = g1.receipt["attempt_id"]
@@ -1031,7 +1026,6 @@ class TestAReconfiguredContextRewritesTheRunConfig:
         self, repo: Path, tmp_path: Path
     ) -> None:
         g1 = G1(repo, tmp_path)
-        junk = g1.junk_configure()
         declared = {
             "acceptance_commands": [["true"]],
             "setup_commands": [],
@@ -1055,7 +1049,9 @@ class TestAReconfiguredContextRewritesTheRunConfig:
             env=declared["acceptance_env"],
         )
 
-        state = run_generation_two(make_deps(actor=actor, scripts=scripts, replayer=replayer), junk)
+        state = run_generation_two(
+            make_deps(actor=actor, scripts=scripts, replayer=replayer), g1.implement
+        )
 
         assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
         # The sealed prefix still replays; configure is not re-dispatched.
@@ -1072,7 +1068,6 @@ class TestAReconfiguredContextRewritesTheRunConfig:
         self, repo: Path, tmp_path: Path
     ) -> None:
         g1 = G1(repo, tmp_path)
-        junk = g1.junk_configure()
         # Same (empty) context as g1 configured: nothing to rewrite.
         replayer = ReceiptReplayer(
             workspace=g1.repo,
@@ -1085,7 +1080,7 @@ class TestAReconfiguredContextRewritesTheRunConfig:
         )
         actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
 
-        state = run_generation_two(make_deps(actor=actor, replayer=replayer), junk)
+        state = run_generation_two(make_deps(actor=actor, replayer=replayer), g1.implement)
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert head(repo) == g1.implement
@@ -1159,19 +1154,15 @@ class TestAReconfiguredReplayDoesNotBlameTheReviewer:
 
     def _g1_with_replayed_continuous_review(self, repo: Path, tmp_path: Path) -> tuple[G1, str]:
         g1 = G1(repo, tmp_path)
-        rc = commit_file(
-            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
-        )
         cr = review_receipt(
             parent_digest=byte_digest(g1.raw),
             subject=g1.implement,
-            output=rc,
+            output=g1.implement,
             verdict="APPROVE",
         )
         write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
         write_intent(g1.state_root, cr)
-        junk = g1.junk_configure()
-        return g1, junk
+        return g1, g1.implement
 
     def _reconfigured_replayer(self, g1: G1, tmp_path: Path) -> ReceiptReplayer:
         declared = {
@@ -1192,7 +1183,7 @@ class TestAReconfiguredReplayDoesNotBlameTheReviewer:
     def test_the_final_review_materializes_clean_and_acceptance_sees_the_context(
         self, repo: Path, tmp_path: Path
     ) -> None:
-        g1, junk = self._g1_with_replayed_continuous_review(repo, tmp_path)
+        g1, tip = self._g1_with_replayed_continuous_review(repo, tmp_path)
         replayer = self._reconfigured_replayer(g1, tmp_path)
         declared = {
             "acceptance_commands": [["true"]],
@@ -1211,7 +1202,7 @@ class TestAReconfiguredReplayDoesNotBlameTheReviewer:
 
         state = run_generation_two(
             make_deps(actor=actor, scripts=scripts, replayer=replayer, materializer=guard),
-            junk,
+            tip,
         )
 
         assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
@@ -1234,7 +1225,7 @@ class TestAReconfiguredReplayDoesNotBlameTheReviewer:
     def test_a_genuine_actor_reserved_path_modification_still_refuses(
         self, repo: Path, tmp_path: Path
     ) -> None:
-        g1, junk = self._g1_with_replayed_continuous_review(repo, tmp_path)
+        g1, tip = self._g1_with_replayed_continuous_review(repo, tmp_path)
         replayer = self._reconfigured_replayer(g1, tmp_path)
 
         class ReviewerThatWrites(ContractActor):
@@ -1249,7 +1240,7 @@ class TestAReconfiguredReplayDoesNotBlameTheReviewer:
         guard = ReviewReservedPathGuard(repo)
 
         state = run_generation_two(
-            make_deps(actor=actor, replayer=replayer, materializer=guard), junk
+            make_deps(actor=actor, replayer=replayer, materializer=guard), tip
         )
 
         # The deferred controller rewrite never caused the blame; the actor's
@@ -1267,25 +1258,22 @@ class TestAStaleRunConfigResidueAtTheReplayTipIsRemoved:
     dirt left by an earlier failed generation, so ``_prepare`` must drop it
     without blaming the fresh reviewer (ACTOR_RESERVED_PATH_CHANGED). A
     reconfigured context invalidates the sealed reviews (spec L3/L5), so the
-    residue is dropped by the trim to the implement tip; a non-controller
-    run-config is never hidden, and acceptance still observes the current
-    declaration."""
+    stale residue is dropped by the same ``HEAD == tip`` restore (no branch
+    reset); a non-controller run-config is never hidden, and acceptance still
+    observes the current declaration."""
 
     def _g1_with_replayed_continuous_review_at_tip(self, repo: Path, tmp_path: Path) -> G1:
-        """The replay tip is already HEAD: no junk above it to trim."""
+        """The replay tip is already HEAD: replay never resets the branch."""
         g1 = G1(repo, tmp_path)
-        rc = commit_file(
-            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
-        )
         cr = review_receipt(
             parent_digest=byte_digest(g1.raw),
             subject=g1.implement,
-            output=rc,
+            output=g1.implement,
             verdict="APPROVE",
         )
         write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
         write_intent(g1.state_root, cr)
-        assert head(repo) == rc
+        assert head(repo) == g1.implement
         return g1
 
     def _generation_n_player(
@@ -1351,8 +1339,8 @@ class TestAStaleRunConfigResidueAtTheReplayTipIsRemoved:
 
         assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
         # The reconfigured context invalidated the sealed reviews, so the stale
-        # run-config residue is dropped by the trim to the implement tip and
-        # both reviews re-run for real -- without a reserved-path blame.
+        # run-config residue is dropped by the HEAD==tip restore and both
+        # reviews re-run for real -- without a reserved-path blame.
         assert replayed_stages(state) == ["configure", "implement"]
         assert ("continuous_review", 1) in actor.calls
         assert ("final_review", 1) in actor.calls
@@ -1559,7 +1547,6 @@ class TestAReworkedPrefixReplaysAsRework:
         self, repo: Path, tmp_path: Path
     ) -> None:
         g1, reworked_tip = self._reworked_g1(repo, tmp_path)
-        junk = g1.junk_configure()
         modes: list[tuple[str, str]] = []
 
         class Recorder(ContractActor):
@@ -1568,7 +1555,7 @@ class TestAReworkedPrefixReplaysAsRework:
                 return super().act(stage, dispatch)
 
         actor = Recorder({"final_review": ["APPROVE"]})
-        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), reworked_tip)
 
         assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
         # The reworked implement + continuous APPROVE prefix replays; the final
@@ -1599,7 +1586,6 @@ class TestAReworkedPrefixReplaysAsRework:
         )
         write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
         write_review_intent(g1.state_root, cr, dispatch_mode="initial")
-        junk = g1.junk_configure()
         modes: list[tuple[str, str]] = []
 
         class Recorder(ContractActor):
@@ -1608,7 +1594,7 @@ class TestAReworkedPrefixReplaysAsRework:
                 return super().act(stage, dispatch)
 
         actor = Recorder({"final_review": ["APPROVE"]})
-        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), cr_commit)
 
         assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
         assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
@@ -1627,19 +1613,13 @@ class TestANewAttemptWithoutARejectLinkIsNeverReplayed:
         (where the plugin's attempt-context guard may then reject it)."""
         g1 = G1(repo, tmp_path)
         # attempt 1: continuous APPROVE, final REJECT (a real rework steer).
-        cr_commit = commit_file(
-            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
-        )
         cr = review_receipt(
             parent_digest=byte_digest(g1.raw),
             subject=g1.implement,
-            output=cr_commit,
+            output=g1.implement,
             verdict="APPROVE",
         )
         write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
-        fr_commit = commit_file(
-            repo, ".dev-dispatch/reviews/final/g1-a1.json", '{"verdict": "REJECT"}'
-        )
         fr = review_receipt(
             parent_digest=byte_digest(
                 (
@@ -1650,13 +1630,12 @@ class TestANewAttemptWithoutARejectLinkIsNeverReplayed:
                 ).read_bytes()
             ),
             subject=g1.implement,
-            output=fr_commit,
+            output=g1.implement,
             verdict="REJECT",
             phase="final",
         )
         write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr)
 
-        rework_commit = commit_file(repo, ".dd-evidence/rework.json", '{"attempt": 2}')
         # A rework implement that does NOT name the rejecting review: a "new
         # attempt" with no REJECT predecessor, so it is not a rework link.
         rework = {
@@ -1666,19 +1645,19 @@ class TestANewAttemptWithoutARejectLinkIsNeverReplayed:
             "contract_version": ATTEMPT_CONTEXT_CONTRACT_VERSION,
             "development_id": DEVELOPMENT_ID,
             "feedback_digest": "sha256:" + "0" * 64,
-            "input_commit": fr_commit,
+            "input_commit": g1.implement,
             "materialization_intent_id": "intent-rework",
-            "output_commit": rework_commit,
+            "output_commit": g1.implement,
             "parent_handoff_receipt_digest": "sha256:" + "f" * 64,
             "spec_digest": "sha256:" + "1" * 64,
             "verification_record": {"verification_commands": []},
-            "work_head_commit": rework_commit,
+            "work_head_commit": g1.implement,
         }
         assert set(rework) == plugin_adapter.IMPLEMENT_RECEIPT_FIELDS
         write_receipt(g1.state_root, 1, 2, "implement-receipt.json", rework)
 
         actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
-        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), head(repo))
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), g1.implement)
 
         # Only the pre-rejection prefix replays: the rework attempt is not a
         # closeable link, so it is declined and the review re-runs for real.

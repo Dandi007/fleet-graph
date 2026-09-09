@@ -299,13 +299,6 @@ def build_pipeline(
                 prior_state_roots=prior_roots,
                 development_id=config.development_id,
                 generation=config.generation,
-                remote_url=config.remote_url,
-                # The seals being replayed live on the audit branch
-                # (publish_ref); verifying and re-publishing the chain must
-                # target the same ref or a line dispatch's replay would land
-                # receipts on the release branch and advance it past the
-                # frozen base.
-                remote_ref=publish_ref,
                 lifecycle=lifecycle,
                 run_config=dict(config.run_config or {}),
             )
