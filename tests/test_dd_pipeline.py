@@ -417,6 +417,34 @@ class TestFailureExits:
         assert state["terminal"] == TERMINAL_COMPLETE
         assert dispatched == [("0", False), ("1", True), ("2", False)]
 
+    def test_transport_retry_budget_belongs_to_each_rework_attempt(self) -> None:
+        calls: list[tuple[int, int, bool]] = []
+
+        class EachAttemptFlaky(ContractActor):
+            def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:
+                if stage.id == "implement":
+                    attempt = int(dispatch["attempt"])
+                    retry = int(dispatch.get("retry", 0))
+                    calls.append((attempt, retry, bool(dispatch.get("re_adopt"))))
+                    if retry < 2:
+                        return StageOutcome(
+                            event="failed", failure_code="PROVIDER_UNAVAILABLE",
+                            run_in_flight=True,
+                        )
+                return super().act(stage, dispatch)
+
+        actor = EachAttemptFlaky({
+            "continuous_review": ["APPROVE", "APPROVE"],
+            "final_review": ["REJECT", "APPROVE"],
+        })
+        state = run(make_deps(actor=actor, bounds=PipelineBounds(max_retries=2)))
+        assert state["terminal"] == TERMINAL_COMPLETE
+        assert calls == [
+            (1, 0, False), (1, 1, True), (1, 2, True),
+            (2, 0, False), (2, 1, True), (2, 2, True),
+        ]
+        assert state["rework_count"] == 1
+
     def test_retries_stop_at_the_bound(self) -> None:
         class AlwaysDown(ContractActor):
             def act(self, stage: Stage, dispatch: Dispatch) -> StageOutcome:

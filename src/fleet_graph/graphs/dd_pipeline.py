@@ -822,6 +822,10 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             # A new attempt is new work under its own derived identity; the
             # replayed prefix's sealed identity ends here.
             "pinned_attempt_id": "",
+            # 运输重试绑定实际产品 attempt；新返工身份不继承旧调用预算。
+            # max_rework/max_steps 仍限制整单，单次运输重试仍由 max_retries 限制。
+            "retries": {},
+            "re_adopt": {},
             "rework_count": rework,
         }
 
