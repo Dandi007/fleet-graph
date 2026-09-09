@@ -282,10 +282,15 @@ class ReceiptReplayer:
             return None
         step = self._plan[self._index]
         if step.stage_id != stage.id:
-            # A resumed thread mid-walk, or a contract whose order moved:
-            # either way this is not the prefix, so nothing is replayed --
-            # and, the index still being 0, nothing has been mutated.
-            self._disabled = True
+            # The linear order interleaves script stages between the sealed
+            # stages the plan covers (acceptance sits between implement and
+            # review). A script stage has no sealed receipt and always re-runs
+            # for real, but reaching it is not a chain break: the sealed review
+            # after it is still replayed. Only a mismatch on a sealed (llm)
+            # stage -- or a planned script stage such as configure -- is a real
+            # divergence and disables the prefix.
+            if stage.id in RECEIPT_FILES or any(s.stage_id == stage.id for s in self._plan):
+                self._disabled = True
             return None
         self._index += 1
         return Replayed(

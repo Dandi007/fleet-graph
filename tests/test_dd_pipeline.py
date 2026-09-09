@@ -111,9 +111,9 @@ class TestTheHappyPathWalksTheWholeContract:
         assert [stage for stage, _ in actor.calls] == [
             "configure",
             "implement",
+            "acceptance",
             "continuous_review",
             "final_review",
-            "acceptance",
             "human_gate",
             "merger",
         ]
@@ -170,17 +170,20 @@ class TestReworkComesBackAsRework:
         after_rejection = modes[modes.index(("implement", "rework")) :]
         assert all(mode == "rework" for _, mode in after_rejection), after_rejection
 
-    def test_an_endless_rework_loop_is_bounded(self) -> None:
+    def test_business_rework_is_unbounded(self) -> None:
+        """A reject verdict returns to implement without a cap (spec L2). The
+        walker keeps progressing the same DD: each REJECT is a new attempt, and
+        no business bound ends the run."""
         actor = ContractActor({"continuous_review": ["REJECT"] * 20})
-        state = run(make_deps(actor=actor, bounds=PipelineBounds(max_rework=3)))
+        state = run(make_deps(actor=actor))
 
-        assert state["terminal"] == TERMINAL_BOUNDS
-        assert "3" in state["terminal_reason"]
-
-    def test_the_step_bound_stops_a_runaway_walk(self) -> None:
-        actor = ContractActor({"continuous_review": ["REJECT"] * 50})
-        state = run(make_deps(actor=actor, bounds=PipelineBounds(max_steps=5, max_rework=99)))
-        assert state["terminal"] == TERMINAL_BOUNDS
+        implements = [attempt for stage, attempt in actor.calls if stage == "implement"]
+        assert state["terminal"] != TERMINAL_BOUNDS, "no business bound may end rework"
+        assert len(implements) > 6, "rework used to stop at 6 attempts; it now continues"
+        # With nothing but REJECTs queued the final review never approves, and the
+        # walk ends on the unsteered spine event -- not on a bound.
+        assert state["terminal"] == TERMINAL_FAULT
+        assert "no declared transition" in state["terminal_reason"]
 
 
 class TestTheWrapperIsEnforced:
@@ -307,6 +310,7 @@ class TestBindingsAreEnforcedNotTrusted:
         assert [stage for stage, _ in actor.calls] == [
             "configure",
             "implement",
+            "acceptance",
             "continuous_review",
         ]
 
@@ -641,18 +645,6 @@ class TestTerminalCarriesItsCause:
         assert state["terminal_code"] == "ACCEPTANCE_FAILED"
         refusal = next(e for e in state["history"] if e.get("refused"))
         assert refusal["refusal_code"] == "ACCEPTANCE_FAILED"
-
-    def test_the_rework_bound_names_its_own_code(self) -> None:
-        actor = ContractActor({"continuous_review": ["REJECT"] * 20})
-        state = run(make_deps(actor=actor, bounds=PipelineBounds(max_rework=3)))
-        assert state["terminal"] == TERMINAL_BOUNDS
-        assert state["terminal_code"] == "REWORK_LIMIT_REACHED"
-
-    def test_the_step_bound_names_its_own_code(self) -> None:
-        actor = ContractActor({"continuous_review": ["REJECT"] * 50})
-        state = run(make_deps(actor=actor, bounds=PipelineBounds(max_steps=5, max_rework=99)))
-        assert state["terminal"] == TERMINAL_BOUNDS
-        assert state["terminal_code"] == "STEP_LIMIT_REACHED"
 
     def test_complete_carries_no_code(self) -> None:
         actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})

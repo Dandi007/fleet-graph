@@ -393,10 +393,13 @@ class ConfigureStage:
 class AcceptanceStage:
     """Runs the declared acceptance commands and records what they did.
 
-    A failing command refuses the pipeline rather than faulting it: the run
-    happened, the answer was no. The contract declares no failure edge out of
-    acceptance, and inventing one to express "the tests failed" would be
-    reading meaning the contract does not carry.
+    A failing command is a business REJECT (spec L2): the run happened, the
+    answer was no, and the stage returns it to implement as rework -- the same
+    DD, the next attempt -- rather than ending the pipeline. Acceptance failure
+    therefore blocks continuous review (spec L1), because review never runs on
+    work that did not pass. Environment/declaration problems (a missing run
+    config, a tampered declaration, a failed setup) remain refusals: they are
+    not a verdict on the work.
 
     **The operator's declaration is the authority, not the file in the
     worktree.** The implementer's role grants it `write: [worktree_path]`, so
@@ -495,8 +498,36 @@ class AcceptanceStage:
             "stderr_tail": (proc.stderr or "")[-2000:],
         }
 
+    def _sandbox_unavailable(self) -> bool:
+        """The isolated acceptance sandbox cannot run at all.
+
+        A bounded environment fact, typed distinctly from a business reject
+        (spec L2: non-recoverable infrastructure errors stay bounded). bwrap
+        present but forbidden to create namespaces fails fast here, before any
+        acceptance command runs, so a broken sandbox refuses the run instead of
+        masquerading as a failing test and re-entering implement forever.
+        """
+        try:
+            from fleet_graph.executors.sandbox import git_write_paths, sandbox_argv
+
+            argv = sandbox_argv(["true"], writable=git_write_paths(self.repo))
+        except (OSError, FileNotFoundError, ValueError, ImportError):
+            return True
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return True
+        return proc.returncode != 0
+
     def act(self, stage: Any, dispatch: Dispatch) -> StageOutcome:
         declared = self.commands()
+        commands_to_run = [list(command) for command in self.setup if command] + declared
+        if self.isolated and commands_to_run and self._sandbox_unavailable():
+            raise StageRefused(
+                "acceptance could not run: the isolated sandbox is unavailable "
+                "(bwrap missing or unable to create namespaces)",
+                code="ACCEPTANCE_SANDBOX_UNAVAILABLE",
+            )
 
         setup_results = []
         for command in [list(c) for c in self.setup if c]:
@@ -539,7 +570,22 @@ class AcceptanceStage:
             },
         )
         if failed:
-            raise StageRefused(f"acceptance failed: {failed}", code="ACCEPTANCE_FAILED")
+            # Business rejection, not a fault and not a terminal refusal: the
+            # tests failed, so the work goes back to implement as a REJECT --
+            # the same DD, the next attempt (spec L2). The environment/declaration
+            # problems above stay refusals; this is a verdict on the work itself.
+            # The acceptance record (passed: false) is still sealed, and the
+            # receipt carries the verdict the contract's `acceptance REJECT ->
+            # implement` edge binds against.
+            return StageOutcome(
+                event="REJECT",
+                receipt={
+                    "verdict": "REJECT",
+                    "acceptance_failed": [list(command) for command in failed],
+                    "results": results,
+                },
+                produced=tuple(stage.produced_artifacts),
+            )
         return StageOutcome(produced=tuple(stage.produced_artifacts))
 
 

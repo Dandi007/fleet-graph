@@ -172,11 +172,16 @@ class TestAcceptance:
         assert "hello" in written["results"][1]["stdout_tail"]
         assert outcome.produced == ACCEPTANCE.produced_artifacts
 
-    def test_a_failing_command_refuses_and_still_records(self, repo: Path) -> None:
-        """The run happened and the answer was no. That is a refusal, not a fault."""
+    def test_a_failing_command_rejects_and_still_records(self, repo: Path) -> None:
+        """The run happened and the answer was no. That is a business REJECT:
+        the work returns to implement as rework (spec L2), not a fault and not
+        a terminal refusal."""
         self._configure(repo, [["false"]])
-        with pytest.raises(StageRefused, match="acceptance failed"):
-            self._acceptance(repo, [["false"]]).act(ACCEPTANCE, dispatch())
+        outcome = self._acceptance(repo, [["false"]]).act(ACCEPTANCE, dispatch())
+
+        assert outcome.event == "REJECT"
+        assert outcome.receipt is not None and outcome.receipt["verdict"] == "REJECT"
+        assert outcome.produced == ACCEPTANCE.produced_artifacts
 
         written = json.loads((repo / ACCEPTANCE_PATH).read_text(encoding="utf-8"))
         assert written["passed"] is False
@@ -361,11 +366,13 @@ class TestAcceptanceContext:
         record = json.loads((repo / ACCEPTANCE_PATH).read_text(encoding="utf-8"))
         assert record["passed"] is True
 
-    def test_a_failing_acceptance_names_its_own_code(self, repo: Path) -> None:
+    def test_a_failing_acceptance_rejects_for_rework(self, repo: Path) -> None:
         stage = self._wire(repo, commands=[["false"]])
-        with pytest.raises(StageRefused, match="acceptance failed") as refused:
-            stage.act(ACCEPTANCE, dispatch())
-        assert refused.value.code == "ACCEPTANCE_FAILED"
+        outcome = stage.act(ACCEPTANCE, dispatch())
+        assert outcome.event == "REJECT"
+        assert outcome.receipt is not None and outcome.receipt["verdict"] == "REJECT"
+        record = json.loads((repo / ACCEPTANCE_PATH).read_text(encoding="utf-8"))
+        assert record["passed"] is False
 
     def test_the_graded_cannot_edit_the_setup_either(self, repo: Path) -> None:
         stage = self._wire(repo, commands=[["true"]], setup=[["true"]])

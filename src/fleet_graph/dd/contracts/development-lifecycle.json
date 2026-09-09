@@ -1,5 +1,5 @@
 {
-  "contract_version": 2,
+  "contract_version": 3,
   "capabilities": {
     "attempt_context": {
       "protocol": "dev-dispatch.attempt-context/v1",
@@ -53,10 +53,17 @@
       }
     },
     {
+      "id": "acceptance",
+      "actor": "script",
+      "wrapper": true,
+      "required_artifacts": ["spec", "product_code"],
+      "produced_artifacts": ["acceptance_result"]
+    },
+    {
       "id": "continuous_review",
       "actor": "llm",
       "wrapper": true,
-      "required_artifacts": ["spec", "implementation_evidence"],
+      "required_artifacts": ["spec", "acceptance_result"],
       "produced_artifacts": ["continuous_verdict", "feedback"],
       "failure_outputs": ["review_stage_failure"],
       "protocol_artifacts": {
@@ -100,17 +107,10 @@
       }
     },
     {
-      "id": "acceptance",
-      "actor": "script",
-      "wrapper": true,
-      "required_artifacts": ["spec"],
-      "produced_artifacts": ["acceptance_result"]
-    },
-    {
       "id": "human_gate",
       "actor": "script",
       "wrapper": true,
-      "required_artifacts": ["acceptance_result"],
+      "required_artifacts": ["final_verdict"],
       "produced_artifacts": ["gate_decision"]
     },
     {
@@ -125,9 +125,38 @@
     {
       "from": "implement",
       "on": "success",
-      "to": "continuous_review",
+      "to": "acceptance",
       "next_mode": "inherit",
       "required_receipt": "implement",
+      "commit_binding": {
+        "source": "required_receipt.output_commit",
+        "target": "next_dispatch.input_commit",
+        "operator": "equal"
+      }
+    },
+    {
+      "from": "acceptance",
+      "on": "success",
+      "to": "continuous_review",
+      "next_mode": "inherit",
+      "required_receipt": "acceptance",
+      "commit_binding": {
+        "source": "required_receipt.output_commit",
+        "target": "next_dispatch.input_commit",
+        "operator": "equal"
+      }
+    },
+    {
+      "from": "acceptance",
+      "on": "REJECT",
+      "to": "implement",
+      "next_mode": "rework",
+      "required_receipt": "acceptance",
+      "event_binding": {
+        "source": "required_receipt.verdict",
+        "target": "transition.on",
+        "operator": "equal"
+      },
       "commit_binding": {
         "source": "required_receipt.output_commit",
         "target": "next_dispatch.input_commit",
@@ -188,7 +217,7 @@
     {
       "from": "final_review",
       "on": "APPROVE",
-      "to": "acceptance",
+      "to": "human_gate",
       "next_mode": "inherit",
       "required_receipt": "final_review",
       "event_binding": {
@@ -256,6 +285,8 @@
     "INVALID_REQUIREMENT_MAPPER_ENVELOPE": {"retryable": false, "meaning": "Requirement mapper output is not a valid structured envelope"},
     "INVALID_VERDICT_AUDITOR_ENVELOPE": {"retryable": false, "meaning": "Verdict auditor output is not a valid structured envelope"},
     "EXTERNAL_REVIEW_RESULT_SCHEMA_MISMATCH": {"retryable": false, "meaning": "External ReviewResult does not match the canonical schema"},
-    "UNVERIFIED_TEST_CLAIM": {"retryable": false, "meaning": "Implement seal re-executed verification commands and their real exit codes differ from the claimed ones"}
+    "UNVERIFIED_TEST_CLAIM": {"retryable": false, "meaning": "Implement seal re-executed verification commands and their real exit codes differ from the claimed ones"},
+    "VALIDITY_KEY_MISMATCH": {"retryable": false, "meaning": "The sealed validity key does not match the product/git facts the stage was bound to"},
+    "ACCEPTANCE_RESULT_INVALID": {"retryable": false, "meaning": "The acceptance result is missing, malformed, or did not pass while reviewing it"}
   }
 }

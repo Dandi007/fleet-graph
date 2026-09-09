@@ -94,9 +94,10 @@ TERMINAL_REFUSED = "refused"
 TERMINAL_BOUNDS = "bounds"
 TERMINAL_FAULT = "fault"
 
-# Terminal codes minted by the walker itself, for the two bounds exits. They
-# are not in the contract's failure taxonomy because the contract declares no
-# bound of its own (PipelineBounds' docstring); each names exactly one cause.
+# Terminal codes minted historically by the walker's now-removed business
+# bounds. Business rework is unbounded (spec L2); these codes survive only so
+# the control plane's failure classification can keep naming legacy results
+# that carried them. The walker itself no longer mints them.
 REWORK_LIMIT_REACHED = "REWORK_LIMIT_REACHED"
 STEP_LIMIT_REACHED = "STEP_LIMIT_REACHED"
 
@@ -236,10 +237,16 @@ class Replayer(Protocol):
 
 @dataclass(frozen=True)
 class PipelineBounds:
-    """Pure counting, INV-8 style. The contract declares no bound of its own."""
+    """Infrastructure-only bounds. Business progress is unbounded (spec L2).
 
-    max_steps: int = 40
-    max_rework: int = 6
+    A reject verdict -- acceptance, CR, FR, the gate, or a code-changing merge
+    feedback -- re-enters the same DD at implement and increments the attempt;
+    there is no cap on how many times. What stays bounded is what is genuinely
+    infrastructure: the per-call retry of a retryable failure (provider
+    unavailable, transport exhaustion). Per-call timeouts are owned by the
+    actors and scripts that set them, not by the walker.
+    """
+
     max_retries: int = 2
 
 
@@ -508,13 +515,6 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             return _terminal(state, TERMINAL_FAULT, f"unknown stage {stage_id!r}", fault=True)
 
         steps = state.get("steps", 0) + 1
-        if steps > deps.bounds.max_steps:
-            return _terminal(
-                state,
-                TERMINAL_BOUNDS,
-                f"step limit {deps.bounds.max_steps} reached",
-                code=STEP_LIMIT_REACHED,
-            )
 
         dispatch: Dispatch = _dispatch_for(state, stage)
         artifacts = dict(state.get("artifacts", {}))
@@ -807,13 +807,9 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             return {"stage": transition.target, "mode": mode}
 
         rework = state.get("rework_count", 0) + 1
-        if rework > deps.bounds.max_rework:
-            return _terminal(
-                state,
-                TERMINAL_BOUNDS,
-                f"rework limit {deps.bounds.max_rework} reached at {stage_id}",
-                code=REWORK_LIMIT_REACHED,
-            )
+        # No cap here on purpose: business rework is unbounded (spec L2). The
+        # only guard against a runaway run is the recursion backstop the runner
+        # sets, which is a technical limit, not a business verdict.
         return {
             "stage": transition.target,
             "mode": transition.next_mode,

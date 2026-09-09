@@ -237,9 +237,9 @@ class TestASealedPrefixReplays:
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert [stage for stage, _ in actor.calls] == [
+            "acceptance",
             "continuous_review",
             "final_review",
-            "acceptance",
             "human_gate",
             "merger",
         ], "neither configure nor implement may be re-dispatched"
@@ -290,7 +290,7 @@ class TestASealedPrefixReplays:
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
-        assert next(stage for stage, _ in actor.calls) == "final_review"
+        assert next(stage for stage, _ in actor.calls) == "acceptance"
         assert head(repo) == review_commit
         assert g1.installed("continuous-review-receipt.json").read_bytes() == raw
 
@@ -353,7 +353,7 @@ class TestASealedPrefixReplays:
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert replayed_stages(state) == ["configure", "implement"]
-        assert next(stage for stage, _ in actor.calls) == "continuous_review"
+        assert next(stage for stage, _ in actor.calls) == "acceptance"
 
 
 class TestABrokenChainRunsRealFromTheBreak:
@@ -395,7 +395,7 @@ class TestABrokenChainRunsRealFromTheBreak:
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert replayed_stages(state) == ["configure", "implement"]
-        assert next(stage for stage, _ in actor.calls) == "continuous_review"
+        assert next(stage for stage, _ in actor.calls) == "acceptance"
 
 
 class TestARejectionIsNeverReplayed:
@@ -423,7 +423,7 @@ class TestARejectionIsNeverReplayed:
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert replayed_stages(state) == ["configure", "implement"]
-        assert next(stage for stage, _ in actor.calls) == "continuous_review"
+        assert next(stage for stage, _ in actor.calls) == "acceptance"
         assert head(repo) == g1.implement, "the rejected review's seal is dead weight"
 
 
@@ -783,7 +783,7 @@ class TestAPartialPrefixRespectsTheInheritedChain:
 
         assert state["terminal"] == TERMINAL_COMPLETE
         assert replayed_stages(state) == ["configure", "implement"]
-        assert next(stage for stage, _ in actor.calls) == "continuous_review"
+        assert next(stage for stage, _ in actor.calls) == "acceptance"
         assert head(repo) == g1.implement
 
     def test_a_cross_generation_history_fails_closed_without_erasing(
@@ -1030,6 +1030,12 @@ class ReviewReservedPathGuard:
     or unstaged change, or the actor is refused with ACTOR_RESERVED_PATH_CHANGED.
     Script stages (acceptance, the gate, the merge) seal through the ordinary
     fake, which -- like the real WorkspaceSealer -- has no such gate.
+
+    In the reordered walk acceptance runs *before* the reviews, so its machine
+    writes (the reconfigured run-config, the acceptance record) must be
+    committed by its own seal the way the real WorkspaceSealer does -- otherwise
+    a stale `.dev-dispatch` drift would sit in the worktree and blame the
+    read-only reviewer that follows.
     """
 
     def __init__(self, repo: Path) -> None:
@@ -1054,7 +1060,15 @@ class ReviewReservedPathGuard:
                     "Reviewer worktree has staged or unstaged .dev-dispatch/** changes",
                     code="ACTOR_RESERVED_PATH_CHANGED",
                 )
+        else:
+            self._commit_machine_roots()
         return self.inner.materialize(stage, dispatch, outcome)
+
+    def _commit_machine_roots(self) -> None:
+        for root in (".dev-dispatch", ".dd-evidence"):
+            if (self.repo / root).exists():
+                git(self.repo, "add", "-A", "--", root)
+        git(self.repo, "commit", "-q", "--allow-empty", "-m", "dev-dispatch: machine seal")
 
 
 class TestAReconfiguredReplayDoesNotBlameTheReviewer:
@@ -1275,18 +1289,23 @@ class TestAStaleRunConfigResidueAtTheReplayTipIsRemoved:
     def test_a_non_controller_run_config_change_is_not_hidden(
         self, repo: Path, tmp_path: Path
     ) -> None:
-        g1 = self._g1_with_replayed_continuous_review_at_tip(repo, tmp_path)
         # A run-config rewrite that carries no controller signature -- an
-        # attempt to edit the exam -- must not be silently removed; the
-        # reserved-path guard has to refuse it instead.
+        # attempt to edit the exam -- must not be silently removed. In the
+        # reordered walk acceptance runs before the reviews, so the tamper is
+        # caught by acceptance's own declaration check (the in-tree commands no
+        # longer match what the controller declared), not by the review's
+        # reserved-path gate.
+        g1 = self._g1_with_replayed_continuous_review_at_tip(repo, tmp_path)
         (repo / RUN_CONFIG_PATH).write_text(
             json.dumps({"acceptance_commands": [["true"]]}), encoding="utf-8"
         )
         replayer = self._generation_n_player(g1, 5, None)
         actor = ContractActor({"final_review": ["APPROVE"]})
+        scripts = {name: actor for name, stage in LIFECYCLE.stages.items() if not stage.is_llm}
+        scripts["acceptance"] = AcceptanceStage(repo=repo, declared=[], setup=[], env={})
         guard = ReviewReservedPathGuard(repo)
         graph = build_dd_pipeline_graph(
-            make_deps(actor=actor, replayer=replayer, materializer=guard)
+            make_deps(actor=actor, scripts=scripts, replayer=replayer, materializer=guard)
         ).compile()
         state = graph.invoke(
             initial_state(
@@ -1300,7 +1319,11 @@ class TestAStaleRunConfigResidueAtTheReplayTipIsRemoved:
         )
 
         assert state["terminal"] == TERMINAL_REFUSED, state.get("terminal_reason")
-        assert any(stage == "final_review" for stage, _ in guard.violations)
+        assert state["terminal_code"] == "ACCEPTANCE_DECLARATION_MISMATCH"
+        assert any(
+            entry.get("refusal_code") == "ACCEPTANCE_DECLARATION_MISMATCH"
+            for entry in state["history"]
+        )
 
 
 def write_review_intent(state_root: Path, receipt: dict[str, Any], *, dispatch_mode: str) -> bytes:
@@ -1474,7 +1497,8 @@ class TestAReworkedPrefixReplaysAsRework:
         # The reworked implement + continuous APPROVE prefix replays; the final
         # review is the first real stage and must inherit `rework`.
         assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
-        assert modes[:1] == [("final_review", MODE_REWORK)], modes
+        assert ("final_review", MODE_REWORK) in modes, modes
+        assert ("acceptance", MODE_REWORK) in modes, modes
         assert head(repo) == reworked_tip
 
     def test_an_initial_prefix_keeps_the_final_review_initial(
@@ -1511,7 +1535,8 @@ class TestAReworkedPrefixReplaysAsRework:
 
         assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
         assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
-        assert modes[:1] == [("final_review", MODE_INITIAL)], modes
+        assert ("final_review", MODE_INITIAL) in modes, modes
+        assert ("acceptance", MODE_INITIAL) in modes, modes
 
 
 class TestANewAttemptWithoutARejectLinkIsNeverReplayed:
@@ -1581,4 +1606,4 @@ class TestANewAttemptWithoutARejectLinkIsNeverReplayed:
         # Only the pre-rejection prefix replays: the rework attempt is not a
         # closeable link, so it is declined and the review re-runs for real.
         assert replayed_stages(state) == ["configure", "implement"]
-        assert next(stage for stage, _ in actor.calls) == "continuous_review"
+        assert next(stage for stage, _ in actor.calls) == "acceptance"

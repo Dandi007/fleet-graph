@@ -219,9 +219,9 @@ class TestTheWholePipelineComposes:
         assert [entry["stage"] for entry in result["history"]] == [
             "configure",
             "implement",
+            "acceptance",
             "continuous_review",
             "final_review",
-            "acceptance",
             "human_gate",
             "merger",
         ]

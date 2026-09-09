@@ -623,7 +623,7 @@ class TestDefectThreeReceiptParentAnchorsLatestChainHead:
         actor = ReworkRetryActor(lifecycle)
         sealer = RecordingSealer()
 
-        state = run_walker(make_deps(lifecycle, actor, sealer, max_rework=4, max_retries=2))
+        state = run_walker(make_deps(lifecycle, actor, sealer, max_retries=2))
 
         assert state.get("terminal") == "complete", state.get("terminal_reason")
 
