@@ -28,8 +28,8 @@ Git/PR 副作用与新引擎部署一律留待联合验证阶段。
 | --- | --- | --- |
 | L1 严格线性顺序：Impl -> acceptance -> continuous review -> final review -> Goal gate -> typed merge authorization -> merge；configure/PREPARED 不完成；acceptance 失败阻挡 CR；顺序在 contract/executor/materializer/replay/恢复一致 | `src/fleet_graph/dd/contracts/development-lifecycle.json`（contract_version 3，7 stages、10 transitions）；`src/fleet_graph/dd/lifecycle.py`（由契约派生 spine/binding/terminal）；`src/fleet_graph/graphs/dd_pipeline.py`、`dd_scripts.py`、`dd_runner.py`、`dd_replay.py`（同序执行） | `tests/test_dd_lifecycle_contract.py::TestStrictLinearOrder`、`TestAcceptanceBlocksReview` |
 | L2 五类拒绝（acceptance/CR/FR/goal gate/需改码 merge feedback）同身份返工；移除 6 次/40 步业务上限；per-call 超时与不可恢复基础设施错误有界分型 | `src/fleet_graph/graphs/dd_pipeline.py`（unbounded business rework + 技术 backstop）；`src/fleet_graph/graphs/dd_scripts.py`（per-call timeout=exit 124）；`src/fleet_graph/dd/control_plane.py::classify_failure` | `tests/test_dd_lifecycle_contract.py::TestSameIdentityRework`、`TestFiveRejectionKinds` |
-| L3 validity key：绑定 product revision/tree、SPEC digest、acceptance-context revision、target identity、PR identity；任一变化失效重验；记账-only 不重审；SPEC 改是新 DD | `src/fleet_graph/dd/validity.py`（纯原语）；`src/fleet_graph/dd/validity_binding.py`（真实 git 事实测量与绑定）；接入 `dd/dispatch.py::StageDispatchBuilder.validity_key`、`dd_materializer.py`（seal validity）、`dd_gate.py`（bind+verify 入 sealed decision）、`dd/recovery.py`（validity_digest 入 decision digest） | `tests/test_dd_lifecycle_contract.py::TestValidityKey`、`TestValidityBindingIsWired` |
-| L4 replay 验证新顺序封存前缀；先询外部效果再决定 collect/reuse/rework/unknown；不丢 dirty、不重建 PR、不 reset 分支、不重发效果；legacy 契约解释或安全拒绝 | `src/fleet_graph/graphs/dd_replay.py`（每个 receipt 的 digest 链 + ancestor + product-drift 封闭；`_prepare` 在 HEAD≠tip 时 fail-closed 拒绝、绝不 reset/trim，dirty/上方效果保留；`_clear_stale_run_config_residue` 仅清除 controller 所有的 run-config 残留、其余交 reserved-path guard 拒绝；`_acceptance_context_changed` 上下文变更失效审查；`_sealed_validity`/`_validity_allows` 按 L3 validity key 重验、使受影响 stage 失效重跑）；`src/fleet_graph/dd/lifecycle.py`（prefix/未知→fault） | `tests/test_dd_replay.py::TestReplayFailsClosed`（`test_product_drift_above_the_tip_refuses_the_whole_replay`、`test_an_uncommitted_product_change_refuses_the_trim_and_is_preserved`）、`TestAChangedValidityKeyInvalidatesTheSealedStages`、`TestAReviewedChainContinuesThroughItsReviews::test_a_reconfigured_context_invalidates_the_sealed_reviews`、`TestAStaleRunConfigResidueAtTheReplayTipIsRemoved`；`tests/test_dd_lifecycle_contract.py::TestReplayPrefix`、`TestLegacyContractsAreExplainedOrRefused` |
+| L3 validity key：绑定 product revision/tree、SPEC digest、acceptance-context revision、target identity、PR identity；任一变化失效重验；记账-only 不重审；SPEC 改是新 DD；完整 validity key（target/PR 必须绑定，未知即拒绝封存） | `src/fleet_graph/dd/validity.py`（纯原语）；`src/fleet_graph/dd/validity_binding.py`（真实 git 事实测量与绑定）；接入 `dd/dispatch.py::StageDispatchBuilder.validity_key`（未知 target/PR → `DispatchError`，不封存未知事实）、`dd_materializer.py`（seal validity，target_ref/audit_ref 缺失 → `VALIDITY_BINDING_FAILED`）、`dd_gate.py`（bind+verify 入 sealed decision）、`dd/recovery.py`（validity_digest 入 decision digest） | `tests/test_dd_lifecycle_contract.py::TestValidityKey`、`TestValidityBindingIsWired`（`test_the_dispatch_builder_refuses_to_seal_an_unknown_target_or_pr`、`test_the_materializer_refuses_to_seal_with_an_unknown_target_or_pr`）；`tests/test_dd_materializer.py::TestTheValidityKeyIsPersistedFailClosed::test_a_seal_with_an_unknown_target_or_pr_is_refused` |
+| L4 replay 验证新顺序封存前缀；先询外部效果再决定 collect/reuse/rework/unknown；不丢 dirty、不重建 PR、不 reset 分支、不重发效果；legacy 契约解释或安全拒绝；validity 证据缺失/损坏/不可测时产生可追踪安全拒绝（非静默 `return False`） | `src/fleet_graph/graphs/dd_replay.py`（每个 receipt 的 digest 链 + ancestor + product-drift 封闭；`_prepare` 在 HEAD≠tip 时 fail-closed 拒绝、绝不 reset/trim，dirty/上方效果保留；`_clear_stale_run_config_residue` 仅清除 controller 所有的 run-config 残留、其余交 reserved-path guard 拒绝；`_acceptance_context_changed` 上下文变更失效审查；`_sealed_validity`/`_validity_allows` 按 L3 validity key 重验、使受影响 stage 失效重跑，并对 `VALIDITY_EVIDENCE_MISSING`/`VALIDITY_EVIDENCE_CORRUPT`/`VALIDITY_FACTS_UNMEASURABLE` 记录可追踪拒绝并写入 observe/raw-event 边界）；`src/fleet_graph/dd/lifecycle.py`（prefix/未知→fault） | `tests/test_dd_replay.py::TestReplayFailsClosed`（`test_product_drift_above_the_tip_refuses_the_whole_replay`、`test_an_uncommitted_product_change_refuses_the_trim_and_is_preserved`）、`TestAChangedValidityKeyInvalidatesTheSealedStages`、`TestAReviewedChainContinuesThroughItsReviews::test_a_reconfigured_context_invalidates_the_sealed_reviews`、`TestAMissingOrCorruptedValidityKeyRefusesReplay`、`TestAStaleRunConfigResidueAtTheReplayTipIsRemoved`；`tests/test_dd_lifecycle_contract.py::TestReplayPrefix`、`TestLegacyContractsAreExplainedOrRefused`、`TestValidityBindingIsWired::test_replay_records_a_traceable_refusal_when_validity_evidence_is_lost` |
 | L5 Goal gate 绑定同一已验收已审查版本与完整 validity key；缺 FR/反馈/版本一致不批准；过期 verdict 无效；合法 reject 走共同返工 | `src/fleet_graph/graphs/dd_runner.py`（gate stage）；`src/fleet_graph/graphs/dd_gate.py::_validity_binding`（measure+bind+verify 入 decision 文件，`previous` sealed key 对照而非自比较，`expired` 判定 → `CODE_EXPIRED_VERDICT`）；`src/fleet_graph/dd/validity_binding.py::binding_key_from_fields`；`src/fleet_graph/dd/control_plane.py::classify_failure`（GATE_REJECTED→rework） | `tests/test_dd_lifecycle_contract.py::TestGoalGateBinding`、`TestValidityBindingIsWired`（`test_the_gate_verifies_against_the_sealed_key_and_flags_expiry`、`test_a_bookkeeping_only_advance_does_not_expire_the_verdict`）；`tests/test_m2_dd_gate_delivery.py::test_a_drifted_version_refuses_the_gate_as_expired` |
 | L6 typed merge feedback：target 竞争/内容冲突/transport+unknown/already-merged/PREPARED-only/measured MERGED；target 竞争不误报冲突；transport 不改业务 verdict；PREPARED 非成功 | `src/fleet_graph/dd/merge_feedback.py`（分类 + merge_event）；接入 `dd_scripts.py::MergeStage.act`（typed event：MERGED/PREPARED 为 terminal，内容冲突 RAISE→REJECT 返工）；契约 `merger MERGED->complete`、`PREPARED->prepared`、`REJECT->implement`；`dd_pipeline.py`（terminal 类型流经） | `tests/test_dd_lifecycle_contract.py::TestTypedMergeFeedback`、`TestTypedMergeFeedbackIsWiredIntoTheLifecycle` |
 | L7 raw-event 边界可靠记录 DD/stage/attempt/validity/opaque runtime refs；journal 写失败不吞错误迁移状态；恢复保留引用；L1 clerk 无批准/阻塞/返工/合并权限 | `src/fleet_graph/graphs/dd_pipeline.py`（history/observe sink 分离 + sealed validity 记入事件）；`src/fleet_graph/graphs/dd_runner.py::persist_event`（events.jsonl 写失败抛 `EventPersistenceError`，不吞） | `tests/test_dd_lifecycle_contract.py::TestRawEventBoundary::test_a_failing_observability_sink_is_not_swallowed`；`tests/test_dd_runner.py::TestTheRunLeavesArtifactsBehind::test_a_failed_event_write_fails_the_run_loudly` |
@@ -46,24 +46,27 @@ Git/PR 副作用与新引擎部署一律留待联合验证阶段。
 - 目标交付 ref（唯一交付分支）: `refs/heads/release/fleet-compare-self`
 - 开发分支: `dd/fleet-compare-self/dev-fg-4053bbf02dcf`
 - 产品候选 commit（本交付覆盖的产品内容精确 HEAD，已存在、可验证的完整对象 ID）:
-  `ac67c8590bb5d6be7b5aabc7e76e1532152ea5a6`
-  （`src/fleet_graph` 与 `tests/` 中 L1–L7 DD 生命周期实现最后一次改动的 commit，
-  即 1753ec77 FR 的 fail-closed L3 validity binding 与 no-substitute target/PR
-  identity 修复；覆盖 `src/fleet_graph/dd/**`、`src/fleet_graph/graphs/{dd_pipeline,
-  dd_scripts,dd_runner,dd_replay,dd_gate,dd_materializer}.py`、
-  `tests/test_dd_lifecycle_contract.py` 及其余生命周期测试 `tests/test_dd_*.py`）。
+  `b688d698844f7640b46958ad5fea509f5ba12bf4`
+  （本次返工针对 rf-bfe89f96 两个 major 的真实产品改动：L3 完整 validity key——
+  未知 target/PR 拒绝封存；L4/L5 replay——validity 证据缺失/损坏/不可测的可追踪
+  安全拒绝。覆盖 `src/fleet_graph/dd/dispatch.py`、
+  `src/fleet_graph/graphs/{dd_materializer,dd_replay,dd_runner}.py`、
+  `tests/test_dd_lifecycle_contract.py`、`tests/test_dd_materializer.py`、
+  `tests/test_dd_runner.py`、`tests/test_rework_contract.py`）。
 - 本 `delivery.md` 与产品候选的关系：本文件是纯文档提交，落在产品候选
-  `ac67c859…` 之上——`git merge-base --is-ancestor ac67c859… <最终HEAD>` 成立
-  （其间 `.dev-dispatch/**` 仅有 controller 的 `materialize implement`/
-  `materialize continuous_review`/`materialize final_review`（73d1dfb6）记账提交，
-  不含产品代码变更），且
-  `git diff --name-only ac67c859… <最终HEAD> -- . ':(exclude).dev-dispatch'`
-  仅含 `delivery.md`（无任何产品代码变更，`ac67c859…` 之后没有任何 `src/` 或
-  `tests/` 改动）。
+  `b688d698…` 之上——`git merge-base --is-ancestor b688d698… <最终HEAD>` 成立，
+  且 `git diff --name-only b688d698… <最终HEAD> -- . ':(exclude).dev-dispatch'`
+  仅含 `delivery.md`（`b688d698…` 之后的最终 HEAD 无任何 `src/`/`tests/` 改动）。
+- 产品变更沿链关系（机械证据）：`b688d698…` 直接落在本次返工输入
+  `c5c1a7e2…` 之后（`git merge-base --is-ancestor c5c1a7e2… b688d698…` 成立），
+  中间仅本次 8 个 `src/`/`tests/` 文件改动；再上溯，
+  `git diff --name-only ac67c859… b688d698… -- . ':(exclude).dev-dispatch'`
+  仅含本次返工的 `src/`/`tests/` 文件与 `delivery.md`，即 `ac67c859…` 之后的
+  `.dev-dispatch/**` 记账提交不含产品代码变更。
 - 最终交付 HEAD（`work_head_commit`，即携带本文件定稿的 commit 对象 ID）由
   controller 在 Implement handoff receipt（`.dev-dispatch`）内机械封存于本文档
   之外；本文件不得把文档自引用 SHA 冒充产品 SHA。
-- 输入 commit（本次返工的精确起点）: `4b1431f83b000ec493d0467e060c08570727cbfd`
+- 输入 commit（本次返工的精确起点）: `c5c1a7e2084ba3c565679fd8267eb20a820a4a4a`
 - PR：尚未创建（本开发阶段无任何 live PR/远端副作用）；PR 将在 L1「typed merge
   authorization -> merge」阶段对 `release/fleet-compare-self` 创建，其精确
   PR number/URL 届时由 merge 授权记录。
