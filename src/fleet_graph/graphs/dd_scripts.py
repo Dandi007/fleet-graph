@@ -38,12 +38,14 @@ from fleet_graph.dd.feedback_scope import scope_index_for_generation
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.merge_feedback import (
     MergeFeedback,
+    MergeFeedbackKind,
     classify_merge_feedback,
     merge_event,
     requires_rework,
 )
 from fleet_graph.dd.vendor import git_ops
 from fleet_graph.graphs.dd_pipeline import (
+    TERMINAL_TARGET_COMPETITION,
     Dispatch,
     PipelineFault,
     Sealed,
@@ -665,8 +667,22 @@ class MergeStage:
             # the refusing code and re-raise with the kind named, so the
             # refusal that reaches the walker and the control plane carries the
             # same typed judgement the merge_feedback table produces.
-            kind = classify_merge_feedback(refused.code, str(refused)).kind
-            raise StageRefused(f"[{kind}] {refused}", code=refused.code) from None
+            feedback = classify_merge_feedback(refused.code, str(refused))
+            kind = feedback.kind
+            # A target that advanced under the order is the line's cue to
+            # reconfigure from the new head -- a distinct terminal, never a
+            # plain refusal and never a content conflict (spec L6). Other
+            # refusals (transport/unknown, already-merged, generic merge
+            # refusal) keep the plain `refused` terminal: transport must not
+            # change the business verdict.
+            terminal_kind = (
+                TERMINAL_TARGET_COMPETITION
+                if kind == MergeFeedbackKind.TARGET_COMPETITION
+                else ""
+            )
+            raise StageRefused(
+                f"[{kind}] {refused}", code=refused.code, terminal_kind=terminal_kind
+            ) from None
 
         feedback = classify_merge_feedback(result=result)
         event = merge_event(feedback)

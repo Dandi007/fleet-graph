@@ -56,12 +56,18 @@ from pathlib import Path
 from typing import Any
 
 from fleet_graph.dd import chain_rules
-from fleet_graph.dd.bootstrap import INDEX_PATH
+from fleet_graph.dd.bootstrap import INDEX_PATH, SPEC_PATH
 from fleet_graph.dd.dispatch import derive_attempt_id
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.dd.upstream_constants import compute_json_digest
-from fleet_graph.dd.vendor import plugin_adapter
+from fleet_graph.dd.validity import ValidityInputs, affected_stages, changed_fields
+from fleet_graph.dd.validity_binding import (
+    binding_key_from_fields,
+    git_product_facts,
+    measure_acceptance_context_revision,
+)
+from fleet_graph.dd.vendor import git_ops, plugin_adapter
 from fleet_graph.graphs.dd_actors import implement_stage, review_stages
 from fleet_graph.graphs.dd_pipeline import (
     MODE_INITIAL,
@@ -89,6 +95,14 @@ RECEIPT_FILES = {
 # Final sealer cannot continue (measured: RECEIPT_CONFLICT "Continuous
 # materialization intent is unreadable").
 INTENTS_DIR = "intents"
+
+# Where the sealer persists the sealed validity key beside each receipt, under
+# `<state_root>/receipts/<attempt_id>/<stage>-validity.json` (the same layout the
+# receipts themselves use). The replayer loads it to re-verify the previously
+# sealed validity key against the current generation's facts (spec L3/L4) --
+# a changed product tree, SPEC, target identity or PR identity invalidates the
+# affected stage and re-runs it for real instead of reusing its receipt.
+VALIDITY_FILE_SUFFIX = "-validity.json"
 
 APPROVE = "APPROVE"
 # The rework-edge rules live in dd/chain_rules.py -- one source, shared with
@@ -182,6 +196,12 @@ class ReceiptReplayer:
     #: stage's tamper check sees agreement rather than a stale mismatch. None
     #: means "leave the replayed tree alone" (the pre-reconfigure behaviour).
     run_config: dict[str, Any] | None = None
+    #: The current generation's launch facts the validity key binds. They name
+    #: the durable merge target and the PR head/base pair this generation was
+    #: dispatched under; when either differs from what a previous generation
+    #: sealed, the affected replayed stages re-run for real (spec L3/L4).
+    target_identity: str = ""
+    pr_identity: str = ""
     lifecycle: Lifecycle = field(default_factory=Lifecycle.load)
 
     def __post_init__(self) -> None:
@@ -390,6 +410,8 @@ class ReceiptReplayer:
         imp_raw, imp = loaded
         if not self._valid_implement(imp, head):
             return []
+        if not self._validity_allows(root, imp, implement_id, str(imp["output_commit"])):
+            return []
         configure_step = self._configure_step(configure_id, imp)
         if configure_step is None:
             return []
@@ -442,6 +464,8 @@ class ReceiptReplayer:
                 "parent_handoff_receipt_digest"
             ) != byte_digest(imp_raw):
                 return steps  # broken at the review link; re-run from there
+            if not self._validity_allows(root, cr, continuous_id, str(cr["output_commit"])):
+                return steps  # a changed bound fact invalidates the review; re-run real
 
             verdict = str(cr.get("verdict") or "")
             if verdict == REJECT:
@@ -496,6 +520,8 @@ class ReceiptReplayer:
                 "parent_handoff_receipt_digest"
             ) != byte_digest(cr_raw):
                 return steps
+            if not self._validity_allows(root, fr, final_id, str(fr["output_commit"])):
+                return steps  # a changed bound fact invalidates the review; re-run real
 
             verdict = str(fr.get("verdict") or "")
             if verdict == REJECT:
@@ -561,6 +587,8 @@ class ReceiptReplayer:
             return False
         if str(fr.get("verdict") or "") != APPROVE:
             return False
+        if not self._validity_allows(root, fr, final_id, str(fr["output_commit"])):
+            return False
         return self._plugin_intent(root, fr) is not None
 
     def _rework_implement(
@@ -583,6 +611,8 @@ class ReceiptReplayer:
             return None
         raw, receipt = loaded
         if not self._valid_implement(receipt, head):
+            return None
+        if not self._validity_allows(root, receipt, implement_id, str(receipt["output_commit"])):
             return None
         if receipt.get("parent_handoff_receipt_digest") != chain_rules.rework_link_parent(
             rejecting_receipt
@@ -691,6 +721,92 @@ class ReceiptReplayer:
             return False
         output = str(receipt.get("output_commit") or "")
         return bool(_HEX40.fullmatch(output)) and self._is_ancestor(output, head)
+
+    # --- validity key comparison (spec L3/L4) ------------------------------
+
+    def _sealed_validity(
+        self, root: Path, receipt: dict[str, Any], stage_id: str
+    ) -> dict[str, Any] | None:
+        """The previously sealed validity key this receipt was sealed with, if any.
+
+        Read from `<root>/receipts/<attempt_id>/<stage>-validity.json`, the same
+        standard layout the receipt itself uses. None means no prior key was
+        persisted -- a legacy receipt -- and the replayer degrades to the
+        receipt-mechanics + acceptance-context checks it already performs.
+        """
+        attempt_id = str(receipt.get("attempt_id") or "")
+        if not attempt_id:
+            return None
+        path = root / "receipts" / attempt_id / f"{stage_id}{VALIDITY_FILE_SUFFIX}"
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return raw if isinstance(raw, dict) else None
+
+    def _committed_spec_digest(self, output_commit: str) -> str:
+        """The committed SPEC digest at `output_commit`, or "" when unreadable."""
+        try:
+            identity = git_ops.exact_artifact_identity(
+                str(self.workspace), output_commit, SPEC_PATH
+            )
+        except git_ops.ExactWorkspaceError:
+            return ""
+        return str(identity.get("digest") or "")
+
+    def _current_validity_inputs(self, output_commit: str) -> ValidityInputs | None:
+        """Re-measure the six bound validity facts for the current generation.
+
+        The product revision and tree are measured out of git at `output_commit`;
+        the SPEC digest is read from the committed spec blob; the
+        acceptance-context revision is the committed run-config's blob oid, and
+        the target/PR identities are this generation's declared launch facts.
+        None means one of the git facts is unreadable -- fail closed, never a
+        guessed SHA.
+        """
+        try:
+            revision, tree = git_product_facts(str(self.workspace), output_commit)
+        except git_ops.ExactWorkspaceError:
+            return None
+        try:
+            acceptance_revision = measure_acceptance_context_revision(
+                str(self.workspace), output_commit
+            )
+        except git_ops.ExactWorkspaceError:
+            acceptance_revision = ""
+        return ValidityInputs(
+            product_revision=revision.lower(),
+            product_tree=tree.lower(),
+            spec_digest=self._committed_spec_digest(output_commit),
+            acceptance_context_revision=acceptance_revision,
+            target_identity=self.target_identity,
+            pr_identity=self.pr_identity,
+        )
+
+    def _validity_allows(
+        self, root: Path, receipt: dict[str, Any], stage_id: str, output_commit: str
+    ) -> bool:
+        """Whether the previously sealed validity key still binds this stage.
+
+        True means the receipt may be replayed; False means a bound fact that
+        re-verifies/re-reviews this stage changed (product tree, SPEC, target,
+        PR, acceptance context), so the stage must re-run for real. When no
+        previously sealed key can be loaded there is nothing to compare -- the
+        receipt-mechanics checks and the acceptance-context reconfigure check
+        already ran -- so the stage is allowed rather than guessing a change.
+        """
+        sealed = self._sealed_validity(root, receipt, stage_id)
+        if sealed is None:
+            return True
+        fields = sealed.get("validity", {}).get("fields") if isinstance(sealed, dict) else None
+        key = binding_key_from_fields(fields)
+        if key is None:
+            return False  # a persisted key that cannot be reconstructed: fail closed
+        current = self._current_validity_inputs(output_commit)
+        if current is None:
+            return False  # cannot measure the current facts: fail closed
+        changed = changed_fields(current, key.inputs)
+        return stage_id not in affected_stages(changed)
 
     # --- install the receipts onto the unchanged tip (never reset) ----------
 

@@ -293,6 +293,12 @@ def build_pipeline(
         # the roots helper does not recognize replays nothing.
         prior_roots = prior_generation_state_roots(config.run_root, config.generation)
         if prior_roots:
+            # The current generation's launch facts the validity key binds: the
+            # durable merge target and the PR head/base pair. The replayer loads
+            # the previously sealed validity key and re-verifies these, so a
+            # target or PR change between generations invalidates the affected
+            # replayed stages rather than reusing the old receipts (spec L3/L4).
+            merge_head = config.audit_ref or config.remote_ref
             replayer = ReceiptReplayer(
                 workspace=config.workspace_path,
                 state_root=config.state_root,
@@ -301,6 +307,12 @@ def build_pipeline(
                 generation=config.generation,
                 lifecycle=lifecycle,
                 run_config=dict(config.run_config or {}),
+                target_identity=config.remote_ref,
+                pr_identity=(
+                    f"{merge_head}->{config.remote_ref}"
+                    if (merge_head and config.remote_ref)
+                    else ""
+                ),
             )
 
     builder = StageDispatchBuilder(

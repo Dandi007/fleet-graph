@@ -53,9 +53,12 @@ from fleet_graph.graphs.dd_pipeline import (
     TERMINAL_COMPLETE,
     TERMINAL_FAILED,
     TERMINAL_PREPARED,
+    TERMINAL_REFUSED,
+    TERMINAL_TARGET_COMPETITION,
     PipelineBounds,
     Replayed,
     StageOutcome,
+    StageRefused,
     build_dd_pipeline_graph,
     initial_state,
 )
@@ -579,6 +582,57 @@ class TestTypedMergeFeedbackIsWiredIntoTheLifecycle:
         assert implements == [1, 2], "the rejecting merge re-entered implement under rework"
 
 
+class TestTargetCompetitionIsADistinctTerminal:
+    """Spec L6: a target that advanced under the order is neither a content
+    conflict nor a generic refusal -- it is a distinct, named non-content
+    outcome that selects the line's reconfigure recovery (``spec_conflict`` /
+    ``reconfigure`` exit), never a plain terminal refusal."""
+
+    def test_a_target_competition_refusal_ends_in_a_distinct_terminal(self) -> None:
+        class TargetMoved(ContractActor):
+            def act(self, stage: Any, dispatch: dict[str, Any]) -> StageOutcome:
+                if stage.id == "merger":
+                    raise StageRefused(
+                        "[target_competition] the target advanced past the frozen base",
+                        code="RELEASE_HEAD_ADVANCED",
+                        terminal_kind=TERMINAL_TARGET_COMPETITION,
+                    )
+                return super().act(stage, dispatch)
+
+        actor = TargetMoved(
+            {"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}
+        )
+        state = run_actor(actor)
+
+        assert state["terminal"] == TERMINAL_TARGET_COMPETITION
+        assert state["terminal"] != TERMINAL_REFUSED
+        assert state["terminal_code"] == "RELEASE_HEAD_ADVANCED"
+        assert state.get("fault") is False
+
+    def test_the_distinct_terminal_still_classifies_as_a_reconfigure(self) -> None:
+        record = classify_failure(
+            TERMINAL_TARGET_COMPETITION,
+            "the target advanced past the frozen base",
+            "RELEASE_HEAD_ADVANCED",
+        )
+        assert record is not None
+        assert record["class"] == CLASS_SPEC_CONFLICT
+        assert record["exit"] == EXIT_RECONFIGURE
+
+    def test_a_generic_refusal_is_not_being_reclassified(self) -> None:
+        class Refusing(ContractActor):
+            def act(self, stage: Any, dispatch: dict[str, Any]) -> StageOutcome:
+                if stage.id == "merger":
+                    raise StageRefused("merge refused for transport reasons", code="MERGE_REFUSED")
+                return super().act(stage, dispatch)
+
+        actor = Refusing(
+            {"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}
+        )
+        state = run_actor(actor)
+        assert state["terminal"] == TERMINAL_REFUSED
+
+
 # --------------------------------------------------------------------------
 # L7: the raw-event boundary
 # --------------------------------------------------------------------------
@@ -627,6 +681,38 @@ class TestRawEventBoundary:
         with pytest.raises(OSError):
             run_actor(actor, observe=failing_observe)
         assert seen, "the failing observer was invoked before it failed"
+
+    def test_history_entries_carry_the_sealed_receipt_digest(self) -> None:
+        """Spec L7: the raw-event boundary records the sealed receipt's digest,
+        not just the stage and its commit -- so a later recovery pass can re-trace
+        which receipt each history entry was sealed under."""
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_actor(actor, materializer=Sealer())
+        for entry in state["history"]:
+            assert entry["receipt_digest"].startswith("sha256:"), entry
+
+    def test_history_entries_carry_opaque_runtime_receipt_refs(self) -> None:
+        """Spec L7: the opaque Runtime run/session/receipt references a sealed
+        receipt carries are emitted on the raw-event boundary, verbatim -- the
+        walker invents none and elides none."""
+
+        class RuntimeCarrier(ContractActor):
+            def act(self, stage: Any, dispatch: dict[str, Any]) -> StageOutcome:
+                outcome = super().act(stage, dispatch)
+                if stage.id != "implement":
+                    return outcome
+                receipt = dict(outcome.receipt or {})
+                receipt["actor_job_id"] = "job-implement"
+                receipt["materialization_intent_id"] = "intent-implement"
+                return StageOutcome(
+                    event=outcome.event, receipt=receipt, produced=outcome.produced
+                )
+
+        actor = RuntimeCarrier({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_actor(actor, materializer=Sealer())
+        implement = next(e for e in state["history"] if e["stage"] == "implement")
+        assert implement["receipt_refs"]["actor_job_id"] == "job-implement"
+        assert implement["receipt_refs"]["materialization_intent_id"] == "intent-implement"
 
 
 # --------------------------------------------------------------------------

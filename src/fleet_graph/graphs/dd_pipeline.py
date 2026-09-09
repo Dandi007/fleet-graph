@@ -99,6 +99,16 @@ TERMINAL_FAULT = "fault"
 # "complete" a measured merge produces (spec L6: PREPARED is not a merge).
 TERMINAL_PREPARED = "prepared"
 
+# The terminal kind a typed target-competition merge refusal lands in (spec
+# L6). A target that advanced under the order is neither a content conflict
+# nor a generic refusal: it is the line's cue to re-run configure from the new
+# head (the control plane's `spec_conflict` / `reconfigure` exit), so the run
+# record carries a distinct, named terminal kind instead of burying the
+# distinction inside a plain `refused`. The stage actor selects it by raising
+# a ``StageRefused`` with ``terminal_kind`` set; the walker only carries it
+# through verbatim, it never classifies the feedback itself.
+TERMINAL_TARGET_COMPETITION = "target_competition"
+
 # Terminal codes minted historically by the walker's now-removed business
 # bounds. Business rework is unbounded (spec L2); these codes survive only so
 # the control plane's failure classification can keep naming legacy results
@@ -128,6 +138,12 @@ class StageRefused(RuntimeError):
     gate's awaiting ticket so the suspended state still reports which question
     note is holding the line; a resumable refusal without a ticket degrades to
     a plain suspension.
+
+    `terminal_kind` lets the raising stage name a distinct terminal kind for its
+    refusal when "refused" is the wrong label for it -- a target-competition
+    merge refusal wants `target_competition`, not a generic refusal (spec L6).
+    The walker never classifies the feedback itself; it carries the stage's
+    chosen kind through verbatim, so a refusal without one stays `refused`.
     """
 
     def __init__(
@@ -137,11 +153,13 @@ class StageRefused(RuntimeError):
         code: str = "",
         resumable: bool = False,
         ticket: dict[str, Any] | None = None,
+        terminal_kind: str = "",
     ) -> None:
         super().__init__(message)
         self.code = code
         self.resumable = resumable
         self.ticket = ticket
+        self.terminal_kind = terminal_kind
 
 
 @dataclass(frozen=True)
@@ -426,6 +444,36 @@ def _validity_record(validity: Any) -> dict[str, Any]:
     return {"value": str(validity)}
 
 
+#: The opaque runtime run/session/receipt references a sealed receipt carries.
+#: Spec L7: the raw-event boundary must preserve the complete traceability --
+#: the Runtime run/session/receipt refs -- not just the stage/attempt/commit.
+#: These are the field names; anything absent from a given receipt is simply
+#: omitted, so the walker invents no reference and elides none that exists.
+_RECEIPT_REF_KEYS = (
+    "attempt_id",
+    "materialization_intent_id",
+    "actor_job_id",
+    "review_id",
+    "reviewer_job_id",
+    "work_head_commit",
+    "subject_commit",
+    "implementation_subject_commit",
+    "implementation_handoff_receipt_digest",
+    "parent_handoff_receipt_digest",
+)
+
+
+def _receipt_refs(receipt: Any) -> dict[str, Any]:
+    """The opaque runtime run/session/receipt refs present on a sealed receipt.
+
+    Never invents a reference: only fields the sealer actually wrote are
+    carried, so the event trail names exactly what the sealer bound.
+    """
+    if not isinstance(receipt, dict):
+        return {}
+    return {key: receipt[key] for key in _RECEIPT_REF_KEYS if key in receipt}
+
+
 def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
     lifecycle = deps.lifecycle
 
@@ -520,8 +568,11 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         `_terminal`, exactly as for the other non-complete terminals.
         """
         code = getattr(refused, "code", "")
+        # A refusal may name a distinct terminal kind (spec L6 target
+        # competition); the walker carries it through, never classifying it.
+        kind = getattr(refused, "terminal_kind", "") or TERMINAL_REFUSED
         return {
-            **_terminal(state, TERMINAL_REFUSED, str(refused), code=code),
+            **_terminal(state, kind, str(refused), code=code),
             "steps": steps,
             "history": _record(
                 state,
@@ -581,6 +632,16 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                             "attempt": dispatch["attempt"],
                             "output_commit": replayed.output_commit,
                             "replayed": True,
+                            **(
+                                {"receipt_digest": digests.get(stage.id)}
+                                if digests.get(stage.id)
+                                else {}
+                            ),
+                            **(
+                                {"receipt_refs": _receipt_refs(replayed.receipt)}
+                                if _receipt_refs(replayed.receipt)
+                                else {}
+                            ),
                         },
                     ),
                 }
@@ -723,6 +784,14 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             if isinstance(outcome.receipt, dict) and "rebase" in outcome.receipt
             else None
         )
+        # Spec L7: the raw-event boundary carries the sealed receipt's digest
+        # and its opaque Runtime run/session/receipt refs, so a later stage (or
+        # a recovery pass) can re-trace exactly which receipt and which run this
+        # history entry was sealed under -- not just which stage and commit.
+        receipt_digest = digests.get(stage.id)
+        if not receipt_digest and isinstance(carried_receipt, dict) and carried_receipt:
+            receipt_digest = compute_json_digest(carried_receipt)
+        receipt_refs = _receipt_refs(carried_receipt)
         return {
             "steps": steps,
             "artifacts": artifacts,
@@ -756,6 +825,8 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                         else {}
                     ),
                     **({"rebase": rebase_record} if rebase_record is not None else {}),
+                    **({"receipt_digest": receipt_digest} if receipt_digest else {}),
+                    **({"receipt_refs": receipt_refs} if receipt_refs else {}),
                     **(
                         {
                             "failure_code": outcome.failure_code,
@@ -930,6 +1001,7 @@ __all__ = [
     "TERMINAL_FAULT",
     "TERMINAL_PREPARED",
     "TERMINAL_REFUSED",
+    "TERMINAL_TARGET_COMPETITION",
     "Actor",
     "Dispatch",
     "GatePending",

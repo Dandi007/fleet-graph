@@ -127,6 +127,33 @@ def write_intent(state_root: Path, receipt: dict[str, Any]) -> bytes:
     return raw
 
 
+def write_validity(
+    state_root: Path,
+    receipt: dict[str, Any],
+    stage_id: str,
+    fields: dict[str, Any],
+    output_commit: str = "",
+) -> None:
+    """The sealed validity key persisted beside its receipt, in the sealer's
+    `<state_root>/receipts/<attempt_id>/<stage>-validity.json` layout."""
+    attempt_id = str(receipt.get("attempt_id") or "")
+    assert attempt_id
+    directory = state_root / "receipts" / attempt_id
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{stage_id}-validity.json").write_text(
+        json.dumps(
+            {
+                "stage": stage_id,
+                "attempt_id": attempt_id,
+                "output_commit": output_commit or str(receipt.get("output_commit") or ""),
+                "validity": {"digest": "sha256:" + "1" * 64, "fields": fields},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
 class G1:
     """One previous generation: configure and implement sealed on a real repo."""
 
@@ -707,6 +734,129 @@ class TestAReviewedChainContinuesThroughItsReviews:
         sealed_identity = g1.receipt["attempt_id"]
         assert ("continuous_review", sealed_identity) in seen
         assert ("implement", "") in seen, "the rework implement must not inherit the pin"
+
+
+class TestAChangedValidityKeyInvalidatesTheSealedStages:
+    """Spec L3/L4: replay loads the previously sealed validity key and re-verifies
+    it against the current generation's facts, so a change to a bound fact (product
+    tree, SPEC, target identity, PR identity) invalidates the affected stage and
+    re-runs it for real instead of reusing its receipt against the new facts."""
+
+    def _current_fields(self, replayer: ReceiptReplayer, commit: str) -> dict[str, Any]:
+        from fleet_graph.dd.validity import validity_fields
+
+        inputs = replayer._current_validity_inputs(commit)
+        assert inputs is not None
+        return {name: getattr(inputs, name) for name in validity_fields()}
+
+    def test_a_pr_identity_change_invalidates_the_final_review(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """A fully reviewed, approved chain is replayed -- but its PR identity is
+        the head/base pair the final review and the merge were bound to. When a
+        fresh generation re-dispatches under a different PR identity, the bound
+        fact changed, so the final review re-runs for real; implement and the
+        continuous review (graded before the PR binding is named) still replay."""
+        g1 = G1(repo, tmp_path)
+        cr = review_receipt(
+            parent_digest=byte_digest(g1.raw),
+            subject=g1.implement,
+            output=g1.implement,
+            verdict="APPROVE",
+        )
+        cr_raw = write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
+        write_intent(g1.state_root, cr)
+        fr = review_receipt(
+            parent_digest=byte_digest(cr_raw),
+            subject=g1.implement,
+            output=g1.implement,
+            verdict="APPROVE",
+            phase="final",
+        )
+        write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr)
+        write_intent(g1.state_root, fr)
+
+        target = "refs/heads/release/self"
+        pr_current = "refs/heads/dd/dev-fg-1->refs/heads/release/self"
+        replayer = ReceiptReplayer(
+            workspace=g1.repo,
+            state_root=g1.dev_root / "g2" / "state",
+            prior_state_roots=((1, g1.state_root),),
+            development_id=DEVELOPMENT_ID,
+            generation=2,
+            lifecycle=LIFECYCLE,
+            target_identity=target,
+            pr_identity=pr_current,
+        )
+        # The previous generation sealed the same facts except a different PR base.
+        stale_fields = self._current_fields(replayer, g1.implement)
+        stale_fields["pr_identity"] = "refs/heads/dd/dev-fg-1->refs/heads/release/other"
+        write_validity(g1.state_root, g1.receipt, "implement", stale_fields)
+        write_validity(g1.state_root, cr, "continuous_review", stale_fields)
+        write_validity(g1.state_root, fr, "final_review", stale_fields)
+
+        actor = ContractActor({"final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=replayer), g1.implement)
+
+        assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
+        # implement and continuous_review replay; the final review was invalidated
+        # by the changed PR identity and re-ran for real.
+        assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
+        assert next(stage for stage, _ in actor.calls) == "acceptance"
+        assert ("final_review", 1) in actor.calls
+
+    def test_an_unchanged_validity_key_replays_the_whole_prefix(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """The comparison is not a blanket refusal: when the persisted key still
+        binds the current facts, the full sealed prefix replays as before."""
+        g1 = G1(repo, tmp_path)
+        cr = review_receipt(
+            parent_digest=byte_digest(g1.raw),
+            subject=g1.implement,
+            output=g1.implement,
+            verdict="APPROVE",
+        )
+        cr_raw = write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
+        write_intent(g1.state_root, cr)
+        fr = review_receipt(
+            parent_digest=byte_digest(cr_raw),
+            subject=g1.implement,
+            output=g1.implement,
+            verdict="APPROVE",
+            phase="final",
+        )
+        write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr)
+        write_intent(g1.state_root, fr)
+
+        target = "refs/heads/release/self"
+        pr = "refs/heads/dd/dev-fg-1->refs/heads/release/self"
+        replayer = ReceiptReplayer(
+            workspace=g1.repo,
+            state_root=g1.dev_root / "g2" / "state",
+            prior_state_roots=((1, g1.state_root),),
+            development_id=DEVELOPMENT_ID,
+            generation=2,
+            lifecycle=LIFECYCLE,
+            target_identity=target,
+            pr_identity=pr,
+        )
+        fields = self._current_fields(replayer, g1.implement)
+        write_validity(g1.state_root, g1.receipt, "implement", fields)
+        write_validity(g1.state_root, cr, "continuous_review", fields)
+        write_validity(g1.state_root, fr, "final_review", fields)
+
+        actor = ContractActor()
+        state = run_generation_two(make_deps(actor=actor, replayer=replayer), g1.implement)
+
+        assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
+        assert replayed_stages(state) == [
+            "configure",
+            "implement",
+            "continuous_review",
+            "final_review",
+        ]
+        assert [stage for stage, _ in actor.calls] == ["acceptance", "human_gate", "merger"]
 
 
 class TestAPartialPrefixRespectsTheInheritedChain:

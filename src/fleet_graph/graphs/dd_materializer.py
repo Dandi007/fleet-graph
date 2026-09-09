@@ -29,6 +29,7 @@ contract that already states it.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -76,6 +77,14 @@ PARENT_RECEIPT_FILE = {
     "continuous_review": IMPLEMENT_RECEIPT_FILE,
     "final_review": "continuous-review-receipt.json",
 }
+
+# The sealed validity key is persisted beside its receipt, under
+# `<state_root>/receipts/<attempt_id>/<stage>-validity.json`, so a restarted
+# generation's replayer can *load* the previously sealed key and re-verify the
+# bound facts (spec L3/L4) instead of reusing a receipt against a changed
+# product tree, SPEC, target or PR. The layout mirrors the receipts directory
+# the replayer already reads.
+VALIDITY_FILE_SUFFIX = "-validity.json"
 
 APPLIED = "APPLIED"
 NON_APPLIED_OUTCOMES = ("DISPUTED", "BLOCKED")
@@ -177,6 +186,21 @@ def receipt_digest(state_root: str, attempt_id: str, filename: str, *, label: st
             "HANDOFF_CHAIN_MISMATCH", f"no sealed {label} at {path}: {exc}"
         ) from exc
     return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def validity_payload(validity: Any) -> dict[str, Any]:
+    """The sealed validity key, in the shape a replayer can re-load.
+
+    A ``ValidityKey`` carries ``digest`` + ``fields``; a plain dict (or any
+    opaque value a stubbed/test sealer hand back) is recorded verbatim. The
+    record is never re-measured or invented here -- it names exactly what the
+    sealer bound.
+    """
+    if hasattr(validity, "digest") and hasattr(validity, "fields"):
+        return {"digest": validity.digest, "fields": validity.fields}
+    if isinstance(validity, dict):
+        return dict(validity)
+    return {"value": str(validity)}
 
 
 def review_actor_result(declared: dict[str, Any]) -> dict[str, Any]:
@@ -416,12 +440,52 @@ class PluginMaterializer:
         sealed = self._read(stage, result)
         # The sealer wrote the stage's artifacts, so it -- not the agent --
         # is what output_verify should be believing.
+        validity = self._validity_key(sealed.commit)
+        # Persist the sealed key beside its receipt so a restarted generation's
+        # replayer can load and re-verify it against the current facts (spec
+        # L3/L4). Best-effort: the seal and its receipt are already durable via
+        # git + the plugin receipt; this is the replay-comparison record only.
+        self._persist_validity(stage, dispatch, sealed.commit, validity)
         return Sealed(
             commit=sealed.commit,
             receipt=sealed.receipt,
             produced=tuple(stage.produced_artifacts),
-            validity=self._validity_key(sealed.commit),
+            validity=validity,
         )
+
+    def _persist_validity(
+        self, stage: Stage, dispatch: Dispatch, output_commit: str, validity: Any
+    ) -> None:
+        """Write the sealed validity key beside its receipt for replay re-verify.
+
+        The file lives at `<state_root>/receipts/<attempt_id>/<stage>-validity.json`
+        under the same identity the receipt was sealed with, so a later
+        generation's replayer finds it exactly where it finds the receipt. An
+        unpinned dispatch re-derives the identity from (generation, attempt) as
+        the sealer normally would. A lost write is an observability gap, not a
+        chain break: the seal and its receipt are already durable via git and
+        the plugin receipt, so this supplementary replay-comparison record is
+        suppressed the same way `ConfigureStage._freeze_base` suppresses its own
+        record write (a later replayer that finds no key degrades to the
+        receipt-mechanics + acceptance-context checks it already performs).
+        """
+        attempt_id = str(dispatch.get("pinned_attempt_id") or "") or derive_attempt_id(
+            self.builder.chain.development_id,
+            int(dispatch.get("generation", 1)),
+            int(dispatch.get("attempt", 1)),
+        )
+        payload = {
+            "stage": stage.id,
+            "attempt_id": attempt_id,
+            "output_commit": output_commit,
+            "validity": validity_payload(validity),
+        }
+        with contextlib.suppress(OSError):
+            directory = Path(self.target.state_root) / "receipts" / attempt_id
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / f"{stage.id}{VALIDITY_FILE_SUFFIX}").write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
+            )
 
     def _validity_key(self, output_commit: str) -> Any:
         """The validity key (spec L3) sealed with this stage's output commit.
@@ -514,6 +578,7 @@ class StageMaterializers:
 __all__ = [
     "AUTHOR_EMAIL",
     "AUTHOR_NAME",
+    "VALIDITY_FILE_SUFFIX",
     "MaterializationFailed",
     "MaterializationTarget",
     "PluginMaterializer",
@@ -523,4 +588,5 @@ __all__ = [
     "receipt_digest",
     "review_actor_result",
     "review_result_fields",
+    "validity_payload",
 ]
