@@ -63,8 +63,8 @@ from fleet_graph.goal_interrupt.runtime import LineInterruptPort
 from fleet_graph.goal_interrupt.store import GoalInterruptStore
 from fleet_graph.graphs.goal_line import LineDeps, build_goal_line_graph
 from fleet_graph.graphs.guards import LineBounds, LineGuards
+from fleet_graph.launcher import LaunchResult
 from fleet_graph.scheduler.daemon import LineSpec, Scheduler, SchedulerConfig
-from fleet_graph.scheduler.launcher import LaunchResult
 from fleet_graph.scheduler.wake import parse_bus_timestamp
 
 FOLDER_ID = "wf-1"

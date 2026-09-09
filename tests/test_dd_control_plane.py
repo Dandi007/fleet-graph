@@ -41,7 +41,7 @@ from fleet_graph.dd.control_plane import (
     derive_acceptance_commands,
     derive_development_id,
 )
-from fleet_graph.scheduler.launcher import LaunchResult
+from fleet_graph.launcher import LaunchResult
 
 SPEC = """# SPEC: add a name parameter to greet()
 

@@ -34,8 +34,8 @@ from fleet_graph.bus.inbox import Inbox, InboxForbidden
 from fleet_graph.graphs.goal_line import LineDeps, build_goal_line_graph
 from fleet_graph.graphs.guards import LineBounds, LineGuards
 from fleet_graph.graphs.runner import LineConfig, build_line
+from fleet_graph.launcher import LaunchSpec
 from fleet_graph.scheduler.daemon import LineSpec, Scheduler, SchedulerConfig
-from fleet_graph.scheduler.launcher import LaunchSpec
 
 
 def _line_token_env(monkeypatch: Any, tmp_path: Path) -> None:

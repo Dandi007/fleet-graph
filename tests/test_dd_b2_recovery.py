@@ -22,7 +22,7 @@ from fleet_graph.bus.board import Decision
 from fleet_graph.dd.adoption import ADOPTION_MECHANISM
 from fleet_graph.dd.control_plane import ControlPlaneError, DdControlPlane
 from fleet_graph.dd.recovery import RECOVERY_MECHANISM
-from fleet_graph.scheduler.launcher import LaunchResult
+from fleet_graph.launcher import LaunchResult
 
 SPEC = """# SPEC: greet
 

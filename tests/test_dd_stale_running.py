@@ -35,7 +35,7 @@ from fleet_graph.dd.control_plane import (
     STATUS_FILE,
     DdControlPlane,
 )
-from fleet_graph.scheduler.launcher import LaunchResult
+from fleet_graph.launcher import LaunchResult
 
 SPEC = """# SPEC: recover a stale-running development
 

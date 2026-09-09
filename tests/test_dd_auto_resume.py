@@ -38,7 +38,7 @@ from fleet_graph.dd.service import (
     auto_resume_enabled_from_env,
     auto_resume_interval_from_env,
 )
-from fleet_graph.scheduler.launcher import LaunchResult
+from fleet_graph.launcher import LaunchResult
 
 SPEC = """# SPEC: add a name parameter to greet()
 

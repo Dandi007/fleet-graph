@@ -68,6 +68,7 @@ from fleet_graph.bus.board import (
     goal_line_card_payload,
     parked_question_key,
 )
+from fleet_graph.launcher import LaunchResult, LaunchSpec, TransientLauncher
 from fleet_graph.scheduler.checkpoint_terminal import CheckpointTerminal
 from fleet_graph.scheduler.ignition import (
     DEFAULT_BACKOFF_CAP_SECONDS,
@@ -79,7 +80,6 @@ from fleet_graph.scheduler.ignition import (
     Refusal,
     decide,
 )
-from fleet_graph.scheduler.launcher import LaunchResult, LaunchSpec, TransientLauncher
 from fleet_graph.scheduler.probe import (
     GatewayProber,
     MissingProbeCredential,

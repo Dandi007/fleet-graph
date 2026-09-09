@@ -34,9 +34,9 @@ from typing import Any
 
 import pytest
 
+from fleet_graph.launcher import LaunchResult
 from fleet_graph.scheduler.daemon import LineSpec, Scheduler, SchedulerConfig
 from fleet_graph.scheduler.ignition import Refusal
-from fleet_graph.scheduler.launcher import LaunchResult
 from fleet_graph.scheduler.wake import LiveDdWakeFacts, classify_dd_fact
 from fleet_graph.state.run_artifacts import (
     LINE_STATE_VALUES,

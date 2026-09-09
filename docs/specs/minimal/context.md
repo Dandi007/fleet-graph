@@ -1,6 +1,6 @@
 ## 阶段
 GO-26~36 已回写进 design.md / protocol.md 正文（2026-09-08，dd-24），正文与 golden-order 一致；golden-order 仍是最高优先级，后续新段落照旧先落 golden-order、再回写正文。三项待用户拍板仍开放（见下），拍板后只改对应字段。
-旧部件下线盘点（design §8 第二条 8 项逐项判定与批次顺序，dd-36）见 `decommission.md`；分批删除待后续 DD，release→main 合并是人工闸，删除批次由人过目。
+旧部件下线盘点（design §8 第二条 8 项逐项判定与批次顺序，dd-36）见 `decommission.md`；分批删除待后续 DD，release→main 合并是人工闸，删除批次由人过目。批次 4 前置解依赖已完成（dd-40）：启动器已中立化（`fleet_graph/launcher.py`），`supervise/events.py` 引用 scheduler 系误判已纠正；scheduler 剩余引用者只有 cli 子命令、自身与簇内测试。
 
 ## 已实现（GO-26~36，release 分支上的落地模块）
 - enroll `goal.enroll/2` 六字段（schema / work_folder / title / goal_text / source_branch / repos[]，repo 四键 path / remote / target_branch / acceptance）与字段级校验节点，REMOVED_FIELDS 显式拒绝 goal_path / sessions / warn / 单 repo：`src/fleet_graph/minimal/enroll.py`。

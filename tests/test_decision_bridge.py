@@ -596,7 +596,7 @@ class TestDdOwnerSideDedup:
 
     def _plane(self, tmp_path: Path) -> tuple[Any, Any]:
         from fleet_graph.dd.control_plane import DdControlPlane
-        from fleet_graph.scheduler.launcher import LaunchResult
+        from fleet_graph.launcher import LaunchResult
 
         class RecordingLauncher:
             dry_run = False

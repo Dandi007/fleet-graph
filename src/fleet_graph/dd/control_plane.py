@@ -623,7 +623,7 @@ class DdControlPlane:
         scope_boundary: ScopeBoundary | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        from fleet_graph.scheduler.launcher import TransientLauncher
+        from fleet_graph.launcher import TransientLauncher
 
         self.root = Path(root)
         self.plugin_binding = Path(plugin_binding)
