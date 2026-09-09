@@ -49,9 +49,8 @@ Git/PR 副作用与新引擎部署一律留待联合验证阶段。
   `b688d698844f7640b46958ad5fea509f5ba12bf4`
   （该提交完成 L3 完整 validity key——未知 target/PR 拒绝封存，与 L4/L5 replay/gate
   的 validity 证据缺失/损坏/不可测之可追踪安全拒绝（rf-bfe89f96 FR 的代码改动）。）
-- 本次 attempt 的产品代码改动（rework 针对 rf-56fcb138 Final review 的 major
-  findings，按查找位置定位：`src/fleet_graph/graphs/dd_gate.py:161-172` 与
-  `delivery.md:43-75`）：
+- 产品代码改动（前序 rf-56fcb138 返工完成、本 attempt 继承且不作改动）：
+  按查找位置定位 `src/fleet_graph/graphs/dd_gate.py:161-172` 与 `delivery.md`：
   * Goal gate 的 `_validity_binding` 不再回退：PR head（`audit_ref`）缺失即表达
     为 ""，且当 target（`remote_ref`）或 PR head/base 无法命名时 fail-closed 拒绝
     ——不封存伪造的 `release->release` 或空身份。此路径现在与
@@ -70,20 +69,21 @@ Git/PR 副作用与新引擎部署一律留待联合验证阶段。
   仅含 `delivery.md`、`src/fleet_graph/dd/validity_binding.py`、
   `src/fleet_graph/graphs/dd_replay.py`、`src/fleet_graph/graphs/dd_gate.py`、
   `tests/test_dd_lifecycle_contract.py`、`tests/test_dd_replay.py`（前序 rf-8d5a8e16
-  返工的 digest 校验改动）与本 attempt 新增的上述五个 `tests/` 假面文件；
+  返工的 digest 校验改动）与前序 rf-56fcb138 返工新增的五个 `tests/` 假面文件；
   `b688d698…` 之后的提交不涉及其它产品代码。
 - 输入 commit（本次 attempt 的精确继承起点 `input_commit`）:
-  `d526978d9821ef3a3f74f70d0ef8319b8e3b9e41`
-  （rf-56fcb138 Final review 的 materialize commit；产品代码自该 commit 继承，
+  `8e17e6120adf74f9beecf21fde435aedff083830`
+  （generation 7 重新 configure 后的基线；产品代码自该 commit 继承，
   未重构、未另选历史、未丢弃既有工作。）
-- 本次 rework 说明：attempt `2d092570-3e88-5169-b3e7-9f03825c4211`（rework mode）
-  针对 rf-56fcb138 Final review 的 major findings 返工。SPEC 无改动；`src/` 仅
-  `dd_gate.py` 上述 PR head fail-closed 改动；`tests/` 仅补结构契约用例与 gate
-  消费假面的完整身份；本 attempt 重跑开发阶段 acceptance（`compileall` 与
-  `pytest tests/test_dd_lifecycle_contract.py`）。
+- 本次 generation 7 reconfigure 说明：controller 重新 configure
+  `dev-fg-4053bbf02dcf`（generation 4→7），feedback index 归档至 `history.json`
+  并清空；`run-config.json` 的 production identity（baseline、交付 ref、开发分支）、
+  SPEC 与产品代码均未变，产品候选仍为 `b688d698…`。本 attempt 仅重验冻结的开发
+  阶段 acceptance（`compileall` 与 `pytest tests/test_dd_lifecycle_contract.py`）
+  并刷新交付身份，不新增 `src/`/`tests/` 改动。
 - 最终交付 HEAD（`work_head_commit`）：本交付的原子 commit 对象 ID——本 delivery.md
   随该 commit 定稿。其精确 40-hex SHA 等于该 commit 的 `git rev-parse HEAD`，父链
-  以 input_commit `d526978d…` 为继承起点、以产品代码祖先 `b688d698…` 为既有根；
+  以 input_commit `8e17e612…` 为继承起点、以产品代码祖先 `b688d698…` 为既有根；
   该 SHA 由确定性 seal 独立复验（Implement handoff 记录同一值），本文档不预制
   自引用的 SHA 冒充产品 HEAD。
 - PR：尚未创建（本开发阶段无任何 live PR/远端副作用）；PR 将在 L1「typed merge
