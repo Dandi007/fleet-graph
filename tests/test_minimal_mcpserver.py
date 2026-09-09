@@ -275,6 +275,22 @@ def test_read_tools_match_direct_mcptools_calls(tmp_path: Path) -> None:
     assert stub.calls == []  # 读工具绝不 spawn
 
 
+def test_goal_status_via_handle_request_carries_recent_observations(tmp_path: Path) -> None:
+    stub = StubSpawner()
+    ctx = make_ctx(tmp_path, stub)
+    seed_running(tmp_path, "g-000001", engine_pid=os.getpid())
+    (tmp_path / "g-000001" / "observations.jsonl").write_text(
+        '{"ts": "2026-09-05T10:00:00+00:00", "severity": "info", "title": "l1"}\n',
+        encoding="utf-8",
+    )
+    resp = call_tool(14, "goal_status", {"goal_id": "g-000001"}, ctx)
+    assert "error" not in resp, resp
+    result = resp["result"]["structuredContent"]
+    assert "recent_observations" in result
+    assert next(iter(result)) == "recent_observations"
+    assert [obs["title"] for obs in result["recent_observations"]] == ["l1"]
+
+
 def test_goal_message_via_tools_call_appends_one_control_line(tmp_path: Path) -> None:
     stub = StubSpawner()
     ctx = make_ctx(tmp_path, stub)
