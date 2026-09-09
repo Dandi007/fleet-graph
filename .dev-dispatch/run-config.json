@@ -1,6 +1,6 @@
 {
  "development_id": "dev-fg-4053bbf02dcf",
- "generation": 4,
+ "generation": 7,
  "acceptance_commands": [
   [
    "python3",
@@ -25,11 +25,12 @@
   ]
  ],
  "acceptance_env": {
-  "UV_CACHE_DIR": "/data/code/fleet-comparison/self/wf-2bf703-lifecycle-prep-5a0c392f/.uv/cache",
-  "UV_LINK_MODE": "copy",
-  "UV_OFFLINE": "1",
+  "GIT_TERMINAL_PROMPT": "0",
   "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
   "PYTEST_PLUGINS": "",
-  "PATH": "/data/code/fleet-comparison/self/wf-2bf703-lifecycle-prep-5a0c392f/.venv/bin:/home/uther/.local/bin:/usr/local/bin:/usr/bin:/bin"
+  "PATH": "/data/code/fleet-comparison/self/wf-2bf703-lifecycle-prep-5a0c392f/.venv/bin:/home/uther/.local/bin:/usr/local/bin:/usr/bin:/bin",
+  "UV_CACHE_DIR": "/data/code/fleet-comparison/self/wf-2bf703-lifecycle-prep-5a0c392f/.uv/cache",
+  "UV_LINK_MODE": "copy",
+  "UV_OFFLINE": "1"
  }
 }
