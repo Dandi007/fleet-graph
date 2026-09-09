@@ -251,6 +251,13 @@ class TestTheReviewPrompt:
             index_path=".dev-dispatch/feedback/index.json",
         )
 
+    def test_final_review_anchor_does_not_impersonate_actor_work_head(self) -> None:
+        rendered = self._rendered("final")
+        assert "product-tree comparison anchor: `" + "c" * 40 + "`" in rendered
+        assert "product commit (`work_head_commit`):" not in rendered
+        assert "implement stage input, not" in rendered
+        assert "do not relabel it as the actor handoff SHA" in rendered
+
     def test_it_names_every_field_the_result_schema_requires(self) -> None:
         """Seven are values we already hold and the reviewer echoes; four are
         its own."""

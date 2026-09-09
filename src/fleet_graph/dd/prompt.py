@@ -237,7 +237,13 @@ You are the {phase} Reviewer for one `dev-dispatch.attempt-context/v1` attempt.
 - `subject_commit`: `{subject_commit}` (equal to `input_commit`, by contract)
 - `implementation_subject_commit`: `{implementation_subject_commit}` (the
   implement stage's sealed output)
-- product commit (`work_head_commit`): `{product_commit}`
+- product-tree comparison anchor: `{product_commit}`
+
+This anchor may be the implement materializer output when the review parent
+contains no actor `work_head_commit`; do not relabel it as the actor handoff SHA.
+The implement handoff `input_commit` identifies the implement stage input, not
+the later review input. Read each receipt in its own stage context; do not
+require those different stage inputs or actor/materializer outputs to be equal.
 
 `subject_commit` and `implementation_subject_commit` are commits written by the
 dev-dispatch materializer. The implement materializer seals its handoff by
