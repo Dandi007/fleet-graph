@@ -182,7 +182,8 @@ class GraphGateNode:
             previous
             if hasattr(previous, "inputs") and hasattr(previous, "digest")
             else binding_key_from_fields(
-                previous.get("fields") if isinstance(previous, dict) else None
+                previous.get("fields") if isinstance(previous, dict) else None,
+                str(previous.get("digest") or "") if isinstance(previous, dict) else "",
             )
         )
         if previous_key is None:

@@ -1092,3 +1092,33 @@ class TestValidityBindingIsWired:
             spec_digest="sha256:" + "c" * 64,
         )
         assert recovery_validity_digest(other) != digest
+
+    def test_binding_key_from_fields_refuses_a_digest_that_does_not_match(self) -> None:
+        """Spec L3/L4: the persisted digest is part of the seal. Reconstructing a
+        key from fields whose digest was tampered must refuse fail-closed
+        (``None``), not silently accept the field set under a digest it no
+        longer binds."""
+        from fleet_graph.dd.validity_binding import binding_key_from_fields
+
+        key = build_validity_key(ValidityInputs(spec_digest="sha256:" + "c" * 64))
+        assert binding_key_from_fields(key.fields, key.digest) is not None
+        assert binding_key_from_fields(key.fields, "sha256:" + "f" * 64) is None
+
+    def test_the_gate_refuses_a_tampered_previous_digest(self, repo: Path) -> None:
+        """The gate compares against the sealed key through the same helper, so a
+        tampered sealed digest makes the previous key unreconstructable and the
+        verdict refuses as expired (fail-closed, spec L5)."""
+        from fleet_graph.graphs.dd_gate import GraphGateNode
+
+        commit = self._commit_run_config(repo)
+        node = GraphGateNode(plane=None)
+        status = {
+            "spec_digest": "sha256:" + "d" * 64,
+            "remote_ref": "refs/heads/release/self",
+            "audit_ref": "refs/heads/dd/dev-fg-1",
+        }
+        sealed = node._validity_binding(repo, commit, status)
+        tampered = dict(sealed)
+        tampered["digest"] = "sha256:" + "f" * 64
+        result = node._validity_binding(repo, commit, status, previous=tampered)
+        assert result["expired"] is True

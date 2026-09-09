@@ -101,8 +101,9 @@ class BindingFacts:
         )
 
 
-def binding_key_from_fields(fields: Any) -> ValidityKey | None:
-    """Reconstruct a sealed validity key from its ``fields`` record.
+def binding_key_from_fields(fields: Any, digest: str) -> ValidityKey | None:
+    """Reconstruct *and verify* a sealed validity key from its ``digest`` +
+    ``fields`` record.
 
     A sealed key travels as ``{"digest", "fields"}`` on the raw-event boundary
     and in a gate decision file. To verify a *later* set of facts against it,
@@ -110,6 +111,13 @@ def binding_key_from_fields(fields: Any) -> ValidityKey | None:
     ``ValidityKey`` from the recorded fields, refusing (``None``) any record
     that does not name the complete bound field set rather than comparing
     against a half-read key.
+
+    Rebuilding the fields alone is not enough (spec L3/L4): the persisted
+    ``digest`` is part of the seal. This re-derives the digest from the fields
+    and requires it to equal the recorded one; a mismatch means the record was
+    modified or corrupted after sealing, and is refused (``None``) rather than
+    accepted under a digest it no longer binds -- so a tampered digest can never
+    be replayed or gate-verified as if it were intact.
     """
     if not isinstance(fields, dict):
         return None
@@ -117,7 +125,10 @@ def binding_key_from_fields(fields: Any) -> ValidityKey | None:
     if any(name not in fields for name in names):
         return None
     inputs = ValidityInputs(**{name: fields[name] for name in names})
-    return build_validity_key(inputs)
+    key = build_validity_key(inputs)
+    if key.digest != digest:
+        return None
+    return key
 
 
 def build_validity_binding(

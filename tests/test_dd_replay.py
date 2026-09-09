@@ -133,11 +133,22 @@ def write_validity(
     stage_id: str,
     fields: dict[str, Any],
     output_commit: str = "",
+    digest: str | None = None,
 ) -> None:
     """The sealed validity key persisted beside its receipt, in the sealer's
-    `<state_root>/receipts/<attempt_id>/<stage>-validity.json` layout."""
+    `<state_root>/receipts/<attempt_id>/<stage>-validity.json` layout.
+
+    The ``validity.digest`` is re-derived from ``fields`` so the persisted
+    record is internally consistent (the invariant every real seal satisfies);
+    pass ``digest`` explicitly to fabricate a tampered record whose digest does
+    not match its fields."""
     attempt_id = str(receipt.get("attempt_id") or "")
     assert attempt_id
+    from fleet_graph.dd.validity import ValidityInputs, build_validity_key, validity_fields
+
+    if digest is None:
+        inputs = ValidityInputs(**{name: fields.get(name, "") for name in validity_fields()})
+        digest = build_validity_key(inputs).digest
     directory = state_root / "receipts" / attempt_id
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f"{stage_id}-validity.json").write_text(
@@ -146,7 +157,7 @@ def write_validity(
                 "stage": stage_id,
                 "attempt_id": attempt_id,
                 "output_commit": output_commit or str(receipt.get("output_commit") or ""),
-                "validity": {"digest": "sha256:" + "1" * 64, "fields": fields},
+                "validity": {"digest": digest, "fields": fields},
             },
             sort_keys=True,
         ),
@@ -929,6 +940,25 @@ class TestAMissingOrCorruptedValidityKeyRefusesReplay:
         g1 = G1(repo, tmp_path)
         key = g1.state_root / "receipts" / g1.receipt["attempt_id"] / "implement-validity.json"
         key.write_text("{not json", encoding="utf-8")
+
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), g1.implement)
+
+        assert replayed_stages(state) == []
+        assert next(stage for stage, _ in actor.calls) == "configure"
+        assert head(repo) == g1.implement
+
+    def test_a_validity_key_whose_digest_was_tampered_is_not_replayed(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """Spec L3/L4: the persisted digest is part of the seal. Fields left
+        intact while the digest is modified must refuse replay fail-closed --
+        reusing such a receipt would bypass the version check the key enforces."""
+        g1 = G1(repo, tmp_path)
+        fields = measure_fields(repo, g1.implement)
+        write_validity(
+            g1.state_root, g1.receipt, "implement", fields, digest="sha256:" + "f" * 64
+        )
 
         actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
         state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), g1.implement)

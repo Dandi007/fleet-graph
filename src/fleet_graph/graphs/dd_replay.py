@@ -879,13 +879,15 @@ class ReceiptReplayer:
             return False
         validity = sealed.get("validity") if isinstance(sealed, dict) else None
         fields = validity.get("fields") if isinstance(validity, dict) else None
-        key = binding_key_from_fields(fields)
+        digest = str(validity.get("digest") or "") if isinstance(validity, dict) else ""
+        key = binding_key_from_fields(fields, digest)
         if key is None:
             self._record_refusal(
                 stage_id,
                 VALIDITY_EVIDENCE_CORRUPT,
                 f"the persisted {stage_id} validity key cannot be reconstructed "
-                "from its recorded fields",
+                "from its recorded fields, or its sealed digest does not match "
+                "those fields",
             )
             return False
         current = self._current_validity_inputs(output_commit)
