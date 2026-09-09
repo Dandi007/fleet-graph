@@ -1,5 +1,9 @@
 # E1 Decision Event Bridge
 
+> 已下线（decommission 批次 2，dd-39，2026-09-09）：本设计对应的 supervisor
+> 事件观察器与 supervisor 图已随 supervisor 簇删除（见
+> `docs/specs/minimal/decommission.md`），本文仅作历史记录。
+
 ## Goal
 
 Bridge each newly observed, unresolved `work.note.v1` question on

@@ -18,8 +18,6 @@ A stateful fake bus and a fake reasoning executor drive the load-bearing cases:
 from __future__ import annotations
 
 import ast
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -492,31 +490,8 @@ def _direct_bus_publish_lines(source: str) -> list[int]:
     return lines
 
 
-def _imports_decision_publisher(source: str) -> bool:
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name.startswith("fleet_graph.supervise.decision_publisher"):
-                    return True
-        elif isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            if module.startswith("fleet_graph.supervise.decision_publisher"):
-                return True
-            if module == "fleet_graph.supervise" and any(
-                a.name == "decision_publisher" for a in node.names
-            ):
-                return True
-    return False
-
-
 def _arbiter_sources() -> list[tuple[str, str]]:
     return [(p.name, p.read_text(encoding="utf-8")) for p in sorted(ARBITER_PKG.glob("*.py"))]
-
-
-def test_no_arbiter_module_imports_the_decision_publisher() -> None:
-    for name, source in _arbiter_sources():
-        assert not _imports_decision_publisher(source), f"{name} imports the decision publisher"
 
 
 def test_generic_publish_is_reachable_only_inside_publisher_module() -> None:
@@ -549,22 +524,6 @@ def test_sabotage_self_verification_catches_generic_publish() -> None:
     assert _direct_bus_publish_lines('self._client.publish("ch", "work.note.v1", {}, "k")\n') == [1]
     board_note = "board.note(card_entity_id='c', text='t', note_type='finding')\n"
     assert _direct_bus_publish_lines(board_note) == []
-
-
-def test_sabotage_self_verification_catches_decision_publisher_import() -> None:
-    assert _imports_decision_publisher(
-        "from fleet_graph.supervise.decision_publisher import publish_release_decision\n"
-    )
-    assert not _imports_decision_publisher("from fleet_graph.bus.board import NOTE_KIND\n")
-
-
-def test_existing_fourth_gate_conformance_remains_green() -> None:
-    proc = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "scripts" / "check_supervisor_conformance.py")],
-        capture_output=True,
-        text=True,
-    )
-    assert proc.returncode == 0, proc.stderr
 
 
 # --- recommendation contract ------------------------------------------------
