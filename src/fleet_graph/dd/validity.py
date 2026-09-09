@@ -148,17 +148,14 @@ def is_bookkeeping_only(current: ValidityInputs, bound: ValidityInputs) -> bool:
 
 
 #: Which stages a change to each bound field invalidates. A SPEC change is a new
-#: DD (invalidates everything); a product/tree change invalidates implement's
-#: acceptance and both reviews; an acceptance-context change invalidates
-#: acceptance through final review; a target or PR change invalidates only the
-#: merge authorization (and, for PR, the reviews that bound it).
-# Which stages a change to each bound field invalidates. A SPEC change is a new
-# DD (invalidates everything). A product *revision* change alone invalidates
-# nothing: the chain may advance on a pure bookkeeping commit while the tree
-# (the content the acceptance/reviews actually graded) stays identical -- the
-# revision is bound for continuity, the tree is what triggers re-verify. A
-# target or PR change invalidates only the merge authorization (and, for PR, the
-# reviews that bound it).
+#: DD (invalidates everything). A product *revision* change alone invalidates
+#: nothing: the chain may advance on a pure bookkeeping commit while the tree
+#: (the content the acceptance/reviews actually graded) stays identical -- the
+#: revision is bound for continuity, the tree is what triggers re-verify. A
+#: product *tree* change invalidates implement, acceptance and both reviews; an
+#: acceptance-context change invalidates acceptance through final review; a
+#: target or PR change invalidates only the merge authorization (and, for PR, the
+#: reviews that bound it).
 _FIELD_INVALIDATES: dict[str, tuple[str, ...]] = {
     "spec_digest": (
         "configure",
