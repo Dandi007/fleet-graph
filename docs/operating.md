@@ -86,11 +86,10 @@ code（带失败条款）拒绝——绝无半条、绝无 warning-as-admission�
    落 `enroll-queue.jsonl`（`pending`）。若 bus 可用，同时向
    `board:work-notes` 发一条 `question` note（申请即挂板）；bus 降级（token
    缺失等）不阻断入队，entry 记 `board_notify: failed`。
-2. **挂板/E8**：state read-model（:7494）`GET /v1/enrollments` 重读
-   enroll-queue（与 `_read_roster` 同法，坏行降级不 5xx 全链）；supervisor
-   observer 消费 `/v1/enrollments` 发 E8 `enrollment_pending`（dedup key
-   `enroll:{folder_id}`；pending 超龄 24h 未裁追加提醒 attempt
-   `enroll:{folder_id}:g{n}`）——申请对监管面结构性可见。
+ 2. **挂板/E8（E8 观察器已下线，decommission 批次 2）**：state read-model
+    （:7494）`GET /v1/enrollments` 重读 enroll-queue（与 `_read_roster` 同法，
+    坏行降级不 5xx 全链）——申请对监管面结构性可见。原先消费该视图发
+    E8 `enrollment_pending` 的 supervisor observer 已随 supervisor 簇删除。
 3. **监督面裁决**：按既有裁决协议（`work.decision.v1`）拍板，或直接在板上
    讨论。裁决权不在本面。
 4. **roster PR**：放行 = 把线加进 `config/ronin-lines.json`（`enabled` 默认
@@ -329,127 +328,20 @@ fleet-graph line overrides --json          # 机器读（cleared + drift）
 
 批量换座 = 逐线 `set-seat` 原语编排，没有第二条旁路。
 
-## 监督面：supervisor 图与事件泵（R4-2/R4-3）
+## 监督面：supervisor 图与事件泵（已下线）
 
-值守的机械化：四类**机械事件**唤醒一次短跑审计，审计报告落板（evidence note）
-与 supervisor 自己的 run root。分类三种：`needs_human`、`recommend_reject`、
-`preauth_release`（R4-3 第四道闸）。逐条拍板仍是人的：唯一的自动放行路径要求
-**人先在板上签发机械预授权**，且结构上只够得到集成分支 merge（见下）。
+**已下线（decommission 批次 2，dd-39，2026-09-09）**：supervisor 图
+（`fleet-graph supervisor run` / `supervisor reset`）、寄生 fleet-graphd tick 的
+事件观察器（`scheduler/supervisor_events.py`）、看板投票（预授权放行闸 /
+`decision_publisher` + `preauth`）与 E5 收割反应器（`harvest*`）已随 supervisor
+簇整体删除，`fleet-graph --help` 不再有 `supervisor` 子命令，`make conformance`
+不再跑 `check_supervisor_conformance.py`。
 
-### 开关
-
-名册 config 里 `"supervisor_events": true`（默认 **off**）。改法同
-`probe_via_runtime`：config PR → 发布 → 重启。观察器寄生 fleet-graphd 既有
-60s tick——**没有第二个常驻循环，没有第二个调度器**；supervisor 图本身是被
-`systemd-run` 拉起的又一种 transient unit（`fleet-graph-supervisor-<key>`）。
-
-### 四类事件（去重键 = thread identity）
-
-| 事件 | 机械信号 | 去重键 |
-|---|---|---|
-| E1 `board_question` | `board:work-notes` 上 question note 无 decision ref | `e1-<note_id>` |
-| E2 `blocked_decision` | terminal `blocked` + `waiting_on: "decision"` | `e2-<run_id>` |
-| E3 `line_fault` | terminal `fault` 或 `pump_fault: true` | `e3-<run_id>` |
-| E4 `cap_breaker` | `TickResult.refusal == total_cap_reached` | `e4-cap-<时间桶>` |
-
-thread_id = `supervisor:{key}:a{attempt}`（attempt = 观察器 cursor 里该键的
-终身 launch 计数，从 1 起），checkpoint 在
-`/data/fleet-graph/supervisor/checkpoint.sqlite3`。世代语义与 ronin 线的
-`{folder_id}:g{n}` 同款：**每次 launch 是新 attempt、新 thread，checkpoint
-天然隔离**——重跑一个事件不再需要对共享 sqlite 做外科手术；同一 attempt 内
-kill-restart 照旧**精确 re-adopt 在飞审计 run**，不重派、不重付费（测试钉死）。
-旧格式 thread（无 `:aN` 后缀）留在库里成为惰性行，无需迁移。receipt 路径
-照旧按 `event.key`（一事件一 receipt，重跑覆盖写）。E2 与 R0c 停牌**共存**：
-停牌照旧省钱，观察器只负责把事实递给审计。
-
-### 预算与游标
-
-- 每 tick 至多拉起 **2** 个 supervisor run；每事件键终身至多 **3** 次尝试
-  （纯计数，落盘防重启清零）；审计已在飞（unit active）不烧预算。
-- 板游标持久于 `<run_root>/.scheduler/supervisor-cursor.json`；**首次启用
-  adopt-baseline**：游标落在当前 head，存量 pending 问题不回放（那是人已有的
-  backlog，`fleet-graph inbox list` 看得到）。要回放，把 `board_seq` 改小。
-- 事件审完出 receipt（`/data/fleet-graph/supervisor/reports/<key>.json`），
-  同键永不再拉起。**要重审，用文档化重置命令**（幂等，只动 supervisor 自己的
-  状态面）：
-
-  ```bash
-  fleet-graph supervisor reset e3-<run_id>          # 删 receipt + 清尝试计数
-  fleet-graph supervisor reset e1-<note_id>         # 另外机械回拨 board_seq 到该问题之前
-  fleet-graph supervisor reset e1-<note_id> --board-seq N   # 机械定位不了时显式指定
-  ```
-
-  三件套一次做完：删 receipt、清 cursor 里该键的 attempts、（仅 E1）回拨
-  `board_seq`——E2/E3/E4 每 tick 从 terminal/tick 结果重推导，无游标可回拨。
-  **不碰 checkpoint db**：重跑是新 attempt、新 thread，旧行天然惰性。
-  **不需要重启 fleet-graphd**：观察器每 tick 从盘上重载 cursor 文件；唯一
-  例外是 reset 恰与一个在飞 tick 竞态（该 tick 收尾覆写一次），重跑一遍
-  reset 或 `systemctl --user restart fleet-graphd` 兜底。
-
-### 一次 supervisor turn 的形状
-
-七节点：`intake → gather_evidence → rerun_acceptance → audit(llm) → classify
-→ act → receipt`。script 包夹唯一 llm 节点（`agent-run --role
-supervisor_auditor`，read-only、structured、每条断言强制 command +
-output_excerpt）；**分类闸门是 script 对机械谓词的判定**——llm 只建议，
-`recommend_reject` 必须有机械复现依据（精确报错原文 + 最小复现 argv + exit
-code），llm 喊 reject 而无机械红照样 `needs_human`。证据不全直接跳过 llm，
-以事实升报，不猜。
-
-goal 线无板卡时 evidence note 会被 bus 以 422 拒掉（既知契约缺口）——act 降级：
-报告只落本地 receipt，degraded 原因写进报告。审计产物**绝不写被监督线的
-work folder**（§38e 治理活锁的结构性消解）。
-
-### 现场怎么看
-
-```bash
-journalctl --user -u fleet-graphd -f | grep supervisor_observer   # 观察器动作
-ls /data/fleet-graph/supervisor/reports/                          # 审计 receipt
-cat /data/fleet-graph/logs/supervisor-<key>.log                   # 单次 run 日志
-# 手动补一次审计（事件词汇封闭，未知名字直接拒绝）：
-fleet-graph supervisor run --event-json \
-  '{"type":"line_fault","key":"e3-<run_id>","payload":{"folder_id":"wf-…","run_id":"<run_id>"}}'
-```
-
-### 预授权放行闸（R4-3 第四道闸）
-
-前三道防代拍闸原样不动（Board 无 decision 发布方法、gate resume 值被丢弃每次
-重读板、decision 只经 ref 图解析）。第四道 = **独立主体 + 机械预授权 + 凭证分离**：
-
-- **preauth 是板上的一等对象**：人发一条 `work.decision.v1`，payload
-  `kind: "preauth"`，机器可读字段 `{card_entity_id, allowed_actions:
-  ["approve"], target_ref_allowlist: [<ref 前缀>], expires_at}`。
-  `expires_at` **必填**（无期限 = 常开自批按钮，校验层拒收）；allowlist 用
-  **前缀白名单**（不用正则），且**构造性不可能覆盖 main/master/production/
-  release**——含它们的 preauth 在校验层被拒，负例测试钉死。
-- **classify 三要素机械判定**（script，llm 的建议不是输入）：① 原文覆盖
-  （动作 ∈ allowed_actions、卡 entity 精确匹配、now < expires_at）；② 目标
-  ref 从 git 锚定现算（development id 出自 bootstrap commit 锚定的识别文件，
-  ref = 控制面固定规则 `refs/heads/dd/<id>`，不采信任何 agent 自述）∈ 前缀
-  白名单；③ 署名锚点齐备（question note id + preauth 消息 id）。另加前置：
-  机械审计**全绿且无 gap**、该 question 尚无 decision。**缺一 → needs_human，
-  不报错、不猜**。
-- **唯一 decision publisher + 凭证分离**：`supervise/decision_publisher.py`
-  是全仓唯一允许构造/发布 `work.decision.v1` 的模块；只发 `APPROVE` +
-  `scope: "merge_only"`（**合入≠部署**），`decided_by` 固定为
-  `"supervisor-graph (依预授权 <msg_id> 代行；非人逐条拍板)"`，refs 同时指向
-  question note 与 preauth 消息。凭证走独立 env
-  `FLEET_GRAPH_DECISION_TOKEN_FILE`，只在 act script 节点进程内读取；
-  `executors/agent_run.py` 按 `FLEET_GRAPH_DECISION_` 前缀从一切 agent 子进程
-  env 剥除，dd 控制面的 env 白名单从不转发它。
-- **必须停人闸的封闭枚举**（`supervise/preauth.py` 的
-  `HUMAN_ONLY_CATEGORIES`，测试钉死）：production main/release promotion、
-  部署授权、判据/spec 改判、cancel 在跑 development、preauth 本身的签发与
-  展期、REJECT（v1 不纳入 preauth，驳回只出建议）。
-- decision 发布被拒（无凭证/bus 故障）只降级记录：板上不出现 decision，
-  question 仍开着，gate 继续等人——这条分支的失败模式是 needs_human，
-  永远不是静默放行。
-
-守卫（`make conformance`，随 verify 跑）：supervisor 模块不 import
-`scheduler.ignition`/`scheduler.launcher`；`work.decision.v1` 发布调用唯一
-豁免 `supervise/decision_publisher.py`；publisher 的 import 白名单只有
-`graphs/supervisor.py`（act script 节点），llm 执行路径（executors/、dd 图）
-结构上够不到发布入口。三条都有 sabotage 自证测试。
+minimal 取代物：审计回合由 DD 循环承担（验收→CR→FR→Goal 审单，
+`minimal/ddgraph.py`）；人裁决由 Goal 审单 approve/reject + approve 后先看平台
+mergeable（`minimal/mergegate.py`）承担。盘点与批次记录见
+`docs/specs/minimal/decommission.md`。仍保留的监督面入口只有
+`fleet-graph supervise audit`（机械化证据审计）与 `fleet-graph inbox list`。
 
 ## A2 只读仲裁（wf-7cd0a7 re-scope：只分诊只建议，永不裁决）
 
@@ -497,9 +389,9 @@ token 文件。真正的激活是监督面在后续已批准窗口里的独立�
 
 - 生产上 arbiter principal 已存在且 `agent:arbiter` binding 已可读解析；
 - 站点 env 文件 `~/.config/fleet-graph/arbiter.env` 存在且只含读凭证
-  （`FLEET_GRAPH_BUS_TOKEN` 或 `FLEET_GRAPH_BUS_TOKEN_FILE`），**不含**决策
-  发布凭证——`FLEET_GRAPH_DECISION_TOKEN_FILE` 属于 supervisor act 节点独有，
-  arbiter 永不在 git/argv/stdout/stderr/receipt/journal 中引用它。
+  （`FLEET_GRAPH_BUS_TOKEN` 或 `FLEET_GRAPH_BUS_TOKEN_FILE`），不含任何
+  `FLEET_GRAPH_DECISION_*` 决策发布凭证——arbiter 永不在
+  git/argv/stdout/stderr/receipt/journal 中引用它们。
 
 **身份 reconcile（发布前置）**：`--publish` 路径在模型工作与落板之前先做
 只读 principal/alias reconcile（`src/fleet_graph/arbiter/reconcile.py`）：
@@ -517,7 +409,6 @@ token-write 或其它 mutation 调用。
 
 ```bash
 uv run pytest -q tests/test_arbiter.py tests/test_arbiter_managed_path.py tests/test_deploy_unit.py
-uv run python scripts/check_supervisor_conformance.py
 uv run python scripts/a2_managed_path_acceptance.py
 ```
 
@@ -590,13 +481,14 @@ U3（wf-c106b9）统一的是**提交（submit）**，不是**点火（ignite）
 
 | 入口 | 协议/端点 | 准入者 | 归宿（统一\|保留） | 理由 |
 |---|---|---|---|---|
-| goal 提交面 | `:5611` `goal_enroll` | 任何 agent | 统一 | 唯一对外提交入口：任何 agent 经 goal MCP 提交入册申请，申请对监督面结构性可见（read-model + E8 + 挂板），放行权仍留监督面 |
+| goal 提交面 | `:5611` `goal_enroll` | 任何 agent | 统一 | 唯一对外提交入口：任何 agent 经 goal MCP 提交入册申请，申请对监督面结构性可见（read-model + 挂板），放行权仍留监督面 |
 | dd 派单面 | `:5610` `development_*` | roster 线 + 监督面 | 保留 | 内部执行入口且当前健康：dd 面回归纯 dev-dispatch，roster 线与监督面继续专用 |
 | 放行入口 | `roster PR` → `release` → `restart` | 监督面 | 保留 | 放行权不下放：roster `enabled` 永远留监督面；U2 后 queue entry 置 admitted 并留 decision 指针 |
 | 裁决入口 | `board question` → `work.decision.v1`；`decision serve` `:5614` `decision_deliver` | 有权作出人类裁决者/监督面 | 保留 | 治理裁决路径不变；`decision_deliver`（MCP 同步定论）提供「已送达已消费 / 明确拒绝」单次返回，board 通道保留兼容并行对账，旧桥缺陷退役前由 wf-216dc3 另案处理 |
-| 收割入口 | `supervisor harvest` + `allowlist` | 监督面 | 保留 | allowlist 已激活且仍由监督面管控（fleet-sentinel 唯一仓，09-07 手工期限） |
+| 收割入口 | `supervisor harvest` + `allowlist` | 监督面 | 已下线 | 已下线（decommission 批次 2，dd-39）：E5 收割反应器随 supervisor 簇删除；过 gate 合入默认分支由 minimal `mergegate.py` / `prlifecycle.py` 承担，部署动作无对应物（待另行拍板） |
 | 带外手工入口 | 手工 token 铸造、手工 roster 直编、spec 挂他卷、E7 goal 直写 | 监督面/历史带外操作者 | 统一 | U2 后提交一律收敛到 goal 提交面；token 铸造显式保留为放行 SOP 步骤并在提交期由闸 6 校验，不得把所有带外动作笼统保留 |
 
-一句话记法：**统一提交、保留点火/执行/裁决/收割**。带外动作不是一律豁免——
+一句话记法：**统一提交、保留点火/执行/裁决；收割已下线（decommission 批次
+2，由 minimal mergegate/prlifecycle 承担）**。带外动作不是一律豁免——
 只有写进放行 SOP 的 token 铸造步骤保留，其余手工侧门（roster 直编、spec 挂他卷、
 E7 goal 直写）随 U2 收敛并注明 owner 与理由。

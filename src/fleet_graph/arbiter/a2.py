@@ -4,7 +4,7 @@ Rescope of ``wf-7cd0a7`` (see the development spec). The arbiter reads board
 facts through the existing bus client abstractions and reasons through a
 read-only executor seam; it may publish only ``work.note.v1`` finding/progress
 notes that are plainly marked suggestions. There is no verdict authority here:
-no code path constructs a decision, imports the decision publisher, or hands
+no code path constructs a decision, imports a decision publisher, or hands
 the reasoning path a generic publish capability.
 
 Authorities this module refuses by construction:
@@ -12,9 +12,6 @@ Authorities this module refuses by construction:
 - no ``work.decision.v1`` / ``work.decision.v2`` publication -- the only writes
   go through ``arbiter/publisher.py``, whose surface is ``work.note.v1`` with
   ``note_type`` in ``{finding, progress}``;
-- no import / call / subprocess / dynamic-import / alias of
-  ``fleet_graph.supervise.decision_publisher`` (pinned by the supervisor
-  conformance guard);
 - no merge, gate release, cancel, deployment, schema/token lifecycle, or
   capability mutation;
 - no model harness spawned directly -- reasoning goes through

@@ -271,31 +271,39 @@ def test_the_gate_tool_carries_no_decision() -> None:
 
 @contextmanager
 def running_server(server: object) -> Iterator[str]:
+    # Keep the listener bound and hand the socket to uvicorn: closing it and
+    # re-binding on host/port races with the OS ephemeral allocator handing
+    # the port to an unrelated connection, which leaves uvicorn unable to
+    # bind and the endpoint forever unreachable.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
         port = listener.getsockname()[1]
 
-    app = server.http_app(path="/mcp", transport="streamable-http")  # type: ignore[attr-defined]
-    uvicorn_server = uvicorn.Server(
-        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
-    )
-    thread = threading.Thread(target=uvicorn_server.run, daemon=True)
-    thread.start()
-    url = f"http://127.0.0.1:{port}/mcp"
-    try:
-        for _ in range(100):
-            try:
-                httpx.get(url, timeout=0.1)
-            except httpx.HTTPError:
-                time.sleep(0.01)
-            else:
-                break
-        else:
-            pytest.fail("MCP endpoint did not become reachable")
-        yield url
-    finally:
-        uvicorn_server.should_exit = True
-        thread.join(timeout=5)
+        app = server.http_app(path="/mcp", transport="streamable-http")  # type: ignore[attr-defined]
+        uvicorn_server = uvicorn.Server(
+            uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+        )
+        thread = threading.Thread(
+            target=uvicorn_server.run, kwargs={"sockets": [listener]}, daemon=True
+        )
+        thread.start()
+        url = f"http://127.0.0.1:{port}/mcp"
+        try:
+            deadline = time.monotonic() + 30.0
+            while True:
+                try:
+                    httpx.get(url, timeout=0.1)
+                except httpx.HTTPError:
+                    if time.monotonic() >= deadline:
+                        pytest.fail("MCP endpoint did not become reachable")
+                    time.sleep(0.01)
+                else:
+                    break
+            yield url
+        finally:
+            uvicorn_server.should_exit = True
+            thread.join(timeout=5)
 
 
 def test_every_supported_tool_drives_the_control_plane_over_the_running_endpoint() -> None:

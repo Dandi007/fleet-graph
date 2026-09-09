@@ -441,9 +441,10 @@ class Scheduler:
         #: bus.board.Board for the best-effort question note on parking.
         #: None means parking is log-visible only.
         self.board = board
-        #: The supervisor event observer (scheduler/supervisor_events.py),
-        #: parasitic on this tick. None means no supervision events -- the
-        #: fleet schedules exactly as before. Duck-typed on `after_tick`.
+        #: An observer parasitic on this tick. Nothing wires it since the
+        #: supervisor face went away (decommission batch 2); the field stays
+        #: until the scheduler batch retires it. None means no observer --
+        #: the fleet schedules exactly as before. Duck-typed on `after_tick`.
         self.supervisor = supervisor
         #: The G2 completion gate: consulted on a `done` line before the
         #: scheduler retires it. None keeps the legacy "done is final" reading

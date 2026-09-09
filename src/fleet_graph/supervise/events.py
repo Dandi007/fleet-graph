@@ -7,9 +7,11 @@ events.py refused v0 names explicitly, and that discipline is inherited here:
 a silently-mapped event is an audit that runs against the wrong facts.
 
 This module deliberately imports nothing from `fleet_graph.scheduler`. The
-observer that *emits* these events lives on the scheduler's side and may hold
-a launcher; the graph that consumes them must not be able to reach ignition
-or launching at all (guarded by scripts/check_supervisor_conformance.py).
+observer that *emitted* these events lived on the scheduler's side and may
+have held a launcher; the vocabulary (still consumed by the retained e6/e7
+reactors) must not be able to reach ignition or launching at all. The
+observer and the consuming supervisor graph were removed in decommission
+batch 2 (dd-39).
 """
 
 from __future__ import annotations

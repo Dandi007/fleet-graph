@@ -483,7 +483,7 @@ class TestHumanGate:
     def test_v2_gate_release_decision_is_recognized_by_the_gate_read_path(
         self, board: Board, transport: RecordingTransport
     ) -> None:
-        """兼收：decision_publisher 发的 v2 gate_release 必须解锁 gate。"""
+        """兼收：v2 gate_release 形状的 decision 必须解锁 gate（读路径契约）。"""
         transport.queue(200, {"refs": [{"message_id": "msg_d", "target_entity": "msg_q"}]})
         transport.queue(200, {"messages": [], "head_seq": 12})  # head 学习针
         transport.queue(

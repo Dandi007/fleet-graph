@@ -1,8 +1,8 @@
-"""凭证分离：决策 token 绝不进入任何 agent 子进程 env。
+"""凭证分离：`FLEET_GRAPH_DECISION_*` 命名空间绝不进入任何 agent 子进程 env。
 
-三条边各钉一根钉子：launcher 剥前缀（实测子进程 env）、control plane 的
-env 白名单从不带上它（构造即隔离）、decision_publisher 的 env 名落在被剥
-前缀之下（两个模块不靠 import 对齐，靠这条测试对齐）。
+两条边各钉一根钉子：launcher 剥前缀（实测子进程 env）、control plane 的
+env 白名单从不带上它（构造即隔离）。决策凭证的发布方已随 supervisor 簇
+下线（decommission 批次 2），剥除仍按整个前缀防御性保留。
 """
 
 from __future__ import annotations
@@ -21,7 +21,9 @@ from fleet_graph.executors.agent_run import (
     AgentRunSpec,
     scrubbed_environment,
 )
-from fleet_graph.supervise.decision_publisher import DECISION_TOKEN_ENV
+
+#: 决策凭证 env 名的代表性写法：落在被剥前缀之下即可，不再对齐某个发布方。
+DECISION_TOKEN_ENV = f"{DECISION_ENV_PREFIX}TOKEN_FILE"
 
 ENV_DUMP_FAKE = """#!/usr/bin/env python3
 import json, os, sys
@@ -46,9 +48,6 @@ run_dir.mkdir(parents=True, exist_ok=True)
 
 
 class TestNamespaceAgreement:
-    def test_decision_token_env_is_inside_the_scrubbed_prefix(self) -> None:
-        assert DECISION_TOKEN_ENV.startswith(DECISION_ENV_PREFIX)
-
     def test_scrub_strips_the_namespace_and_keeps_the_rest(self) -> None:
         env = {
             "PATH": "/usr/bin",

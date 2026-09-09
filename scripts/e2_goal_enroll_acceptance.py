@@ -29,9 +29,6 @@ root, real-roster file and alias-token dir under a temp dir.
   ``enroll-rejections.jsonl``) land in the injected queue home, never in the
   work-records (goal-folder) root, and ``/v1/enrollments`` observes the same
   queue file.
-- ``e8-observable-enrollment`` -- a valid enrollment through the aligned queue
-  home is visible on ``/v1/enrollments`` and the supervisor observer emits an
-  ``enrollment_pending`` (E8) event for it.
 - ``admit-end-to-end`` -- the U4 supervisor release edge: the live MCP surface
   exposes ``goal_admit`` (tools/list), refuses a non-supervisor identity with
   ``GOAL_ENROLL_NOT_SUPERVISOR``, admits a pending application with the real
@@ -561,102 +558,6 @@ def scenario_queue_home_isolation(work_dir: Path) -> dict[str, Any]:
     )
 
 
-def scenario_e8_observable_enrollment(work_dir: Path) -> dict[str, Any]:
-    """A valid enrollment through the aligned queue home is visible on
-    /v1/enrollments and the supervisor observer emits an E8
-    ``enrollment_pending`` event for it."""
-    from fleet_graph.goal.service import build_goal_mcp_server
-    from fleet_graph.scheduler.supervisor_events import ObserverConfig, SupervisorObserver
-    from fleet_graph.supervise.events import EVENT_ENROLLMENT_PENDING
-
-    folder_root = work_dir / "folders"
-    queue_home = work_dir / "goal"
-    roster_file = work_dir / "ronin-lines.json"
-    roster_file.write_text(
-        json.dumps({"run_root": "/data/fleet-graph/runs", "lines": []}), encoding="utf-8"
-    )
-    secrets_dir = work_dir / "secrets"
-    secrets_dir.mkdir(parents=True, exist_ok=True)
-    (secrets_dir / "ronin-owned.token").write_text("owned-token", encoding="utf-8")
-
-    _goal_folder(folder_root, "wf-1")
-    server = build_goal_mcp_server(
-        goal_folders=governed_goal_folder_store(str(folder_root)),
-        goal_queue=EnrollQueue(str(queue_home)),
-        real_roster=RealRosterReader(roster_file),
-        board=None,
-        alias_token_check=lambda alias: (secrets_dir / f"{alias}.token").is_file(),
-    )
-    submitted = _submit(server, "wf-1", "ronin-owned")
-
-    state_server, state_port = _state_read_model(work_dir, roster_file, queue_home / QUEUE_FILE)
-
-    class RecordingLauncher:
-        def __init__(self) -> None:
-            self.specs: list[Any] = []
-
-        def launch(self, spec: Any):
-            self.specs.append(spec)
-
-            class _Result:
-                unit_name = spec.unit_name
-                started = True
-                detail = "recorded"
-
-            return _Result()
-
-        def events(self) -> list[dict[str, Any]]:
-            parsed = []
-            for spec in self.specs:
-                argv = spec.argv()
-                parsed.append(json.loads(argv[argv.index("--event-json") + 1]))
-            return parsed
-
-    def read_model(path: str) -> dict[str, Any] | None:
-        if path == "/v1/enrollments":
-            return httpx.get(f"http://127.0.0.1:{state_port}/v1/enrollments", timeout=5).json()
-        if path == "/v1/lines":
-            return {"schema_version": "1", "lines": []}
-        if path == "/v1/decisions":
-            return {"schema_version": "1", "decisions": []}
-        if path == "/v1/harvestable":
-            return {"schema_version": "1", "developments": []}
-        return None
-
-    launcher = RecordingLauncher()
-    observer = SupervisorObserver(
-        ObserverConfig(
-            run_root=work_dir / "runs",
-            supervisor_state_root=work_dir / "supervisor",
-        ),
-        launcher=launcher,  # type: ignore[arg-type]
-        read_model=read_model,
-    )
-    try:
-        observer.after_tick(
-            now=1_000_000.0, folder_ids=[], terminal_reader=lambda folder: None, tick_results=[]
-        )
-        events = launcher.events()
-        pending = [e for e in events if e.get("type") == EVENT_ENROLLMENT_PENDING]
-        passed = bool(
-            submitted.get("payload", {}).get("status") == QUEUE_STATUS_PENDING
-            and pending
-            and pending[0]["key"] == "enroll-wf-1"
-            and pending[0]["payload"].get("folder_id") == "wf-1"
-        )
-        return evidence(
-            "e8-observable-enrollment",
-            passed,
-            submitted_status=submitted.get("payload", {}).get("status"),
-            event_types=[e.get("type") for e in events],
-            e8_key=pending[0]["key"] if pending else None,
-            e8_payload=pending[0]["payload"] if pending else None,
-        )
-    finally:
-        state_server.shutdown()
-        state_server.server_close()
-
-
 def scenario_submit_admit_end_to_end(work_dir: Path) -> dict[str, Any]:
     """U4: submit -> goal_admit (supervisor-only) -> /v1/enrollments admitted.
 
@@ -940,7 +841,6 @@ def build_parser() -> argparse.ArgumentParser:
             "alias-token-missing-reject",
             "gate6-token-ownership",
             "queue-home-isolation",
-            "e8-observable-enrollment",
             "admit-end-to-end",
             "reject-end-to-end",
         ],
@@ -966,7 +866,6 @@ def main(argv: list[str] | None = None) -> int:
             "alias-token-missing-reject",
             "gate6-token-ownership",
             "queue-home-isolation",
-            "e8-observable-enrollment",
             "admit-end-to-end",
             "reject-end-to-end",
         ]
@@ -988,7 +887,7 @@ def main(argv: list[str] | None = None) -> int:
         elif scenario == "reject-end-to-end":
             result = scenario_submit_reject_end_to_end(work_dir)
         else:
-            result = scenario_e8_observable_enrollment(work_dir)
+            raise AssertionError(f"unknown scenario: {scenario}")
         results.append(result)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
 

@@ -47,9 +47,9 @@ from typing import Any, Literal
 RUN_ID_NAMESPACE = uuid.UUID("6f6c3c8e-2b6a-5f21-9c47-1f0f5a4d8e10")
 
 # 决策凭证隔离（R4-3 第四道闸的凭证分离半边）：FLEET_GRAPH_DECISION_* 一律
-# 不进任何 agent 子进程 env。decision token 只属于 supervisor act script
-# 节点进程（supervise/decision_publisher.py 读 FLEET_GRAPH_DECISION_TOKEN_FILE，
-# 测试钉死该名字落在这个前缀下）；一个能拿到决策凭证的 llm 子进程就是一个
+# 不进任何 agent 子进程 env。决策 token 原属 supervisor act script 节点进程
+# （该发布方已随 supervisor 簇下线，decommission 批次 2；本前缀剥除作为
+# 防御保留）；一个能拿到决策凭证的 llm 子进程就是一个
 # 能自批的 llm。按前缀剥而不是按单个名字剥：新加一个决策相关 env 不需要
 # 记得回来改这里。
 DECISION_ENV_PREFIX = "FLEET_GRAPH_DECISION_"
