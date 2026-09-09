@@ -55,7 +55,7 @@ class TestGuardAScheduler:
         src = sample_tree(
             tmp_path,
             "fleet_graph/supervise/audit.py",
-            "from fleet_graph.scheduler.launcher import TransientLauncher\n",
+            "from fleet_graph.launcher import TransientLauncher\n",
         )
         proc = run_guard(src)
         assert proc.returncode == 1
@@ -65,7 +65,7 @@ class TestGuardAScheduler:
         src = sample_tree(
             tmp_path,
             "fleet_graph/supervise/events.py",
-            "from fleet_graph.scheduler import launcher\n",
+            "from fleet_graph import launcher\n",
         )
         proc = run_guard(src)
         assert proc.returncode == 1
@@ -75,7 +75,7 @@ class TestGuardAScheduler:
         src = sample_tree(
             tmp_path,
             "fleet_graph/scheduler/supervisor_events.py",
-            "from fleet_graph.scheduler.launcher import TransientLauncher\n",
+            "from fleet_graph.launcher import TransientLauncher\n",
         )
         proc = run_guard(src)
         assert proc.returncode == 0, proc.stderr

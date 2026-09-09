@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from fleet_graph.cli import build_parser
-from fleet_graph.scheduler.launcher import (
+from fleet_graph.launcher import (
     LaunchSpec,
     TransientLauncher,
 )

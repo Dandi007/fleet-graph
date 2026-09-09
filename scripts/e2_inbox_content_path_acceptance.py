@@ -38,7 +38,7 @@ from fleet_graph.bus.client import BusClient
 from fleet_graph.bus.inbox import Inbox, InboxForbidden
 from fleet_graph.bus.tokens import LINE_TOKEN_PATH_ENV
 from fleet_graph.graphs.runner import LineConfig, build_line
-from fleet_graph.scheduler.launcher import LaunchSpec
+from fleet_graph.launcher import LaunchSpec
 
 
 def utc_now() -> str:

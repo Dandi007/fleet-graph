@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 
 from fleet_graph.cli import perform_set_seat
+from fleet_graph.launcher import LaunchResult
 from fleet_graph.scheduler.daemon import (
     LineSpec,
     Scheduler,
@@ -31,7 +32,6 @@ from fleet_graph.scheduler.daemon import (
     bump_line_generation,
 )
 from fleet_graph.scheduler.ignition import Refusal
-from fleet_graph.scheduler.launcher import LaunchResult
 from fleet_graph.scheduler.probe import UnknownSeat
 from fleet_graph.scheduler.seat_override import (
     SeatOverride,

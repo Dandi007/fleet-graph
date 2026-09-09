@@ -4,7 +4,7 @@
 Guard A -- **the supervisor cannot schedule** (r4-design §5, D9). The modules
 that make up the supervisor graph (`graphs/supervisor.py` and everything under
 `supervise/`) must not import `fleet_graph.scheduler.ignition` or
-`fleet_graph.scheduler.launcher`, in any spelling. The observer
+`fleet_graph.launcher`, in any spelling. The observer
 (`scheduler/supervisor_events.py`) is deliberately *outside* this set: it
 lives on the scheduler's side and holds the launcher -- that is the one
 sanctioned direction.
@@ -75,9 +75,16 @@ from pathlib import Path
 
 FORBIDDEN_SCHEDULER_MODULES = (
     "fleet_graph.scheduler.ignition",
-    "fleet_graph.scheduler.launcher",
+    "fleet_graph.launcher",
 )
-FORBIDDEN_SCHEDULER_NAMES = frozenset({"ignition", "launcher"})
+#: Package-level smuggling, in any spelling: ``from fleet_graph.scheduler
+#: import ignition`` and ``from fleet_graph import launcher`` (the launcher
+#: moved out of the scheduler package in dd-40-4, so its smuggling now
+#: threads through the ``fleet_graph`` package instead).
+FORBIDDEN_SCHEDULER_PACKAGE_IMPORTS: tuple[tuple[str, frozenset[str]], ...] = (
+    ("fleet_graph.scheduler", frozenset({"ignition"})),
+    ("fleet_graph", frozenset({"launcher"})),
+)
 
 DECISION_LITERALS = frozenset({"work.decision.v1", "work.decision.v2"})
 DECISION_NAMES = frozenset({"DECISION_KIND", "DECISION_KIND_V2"})
@@ -211,12 +218,14 @@ def check_no_scheduler_imports(path: Path, tree: ast.AST) -> list[str]:
                 module == mod or module.startswith(mod + ".") for mod in FORBIDDEN_SCHEDULER_MODULES
             ):
                 errors.append(f"{path}:{node.lineno}: imports from {module}")
-            elif module == "fleet_graph.scheduler":
-                bad = [a.name for a in node.names if a.name in FORBIDDEN_SCHEDULER_NAMES]
-                if bad:
-                    errors.append(
-                        f"{path}:{node.lineno}: imports {', '.join(bad)} from fleet_graph.scheduler"
-                    )
+            else:
+                for pkg, forbidden_names in FORBIDDEN_SCHEDULER_PACKAGE_IMPORTS:
+                    if module == pkg:
+                        bad = [a.name for a in node.names if a.name in forbidden_names]
+                        if bad:
+                            errors.append(
+                                f"{path}:{node.lineno}: imports {', '.join(bad)} from {pkg}"
+                            )
     return errors
 
 

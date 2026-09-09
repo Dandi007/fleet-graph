@@ -54,8 +54,8 @@ from typing import Any
 
 from fleet_graph.bus.board import NOTE_KIND, WORK_NOTES, Board, GateTicket
 from fleet_graph.bus.client import BusClient
+from fleet_graph.launcher import TransientLauncher
 from fleet_graph.scheduler.ignition import DEFAULT_CAP_WINDOW_SECONDS, Refusal
-from fleet_graph.scheduler.launcher import TransientLauncher
 from fleet_graph.supervise.events import (
     EVENT_BOARD_QUESTION,
     SupervisorEvent,

@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from fleet_graph.launcher import LaunchResult
 from fleet_graph.scheduler.daemon import (
     LineSpec,
     Scheduler,
@@ -17,7 +18,6 @@ from fleet_graph.scheduler.daemon import (
     lines_from,
 )
 from fleet_graph.scheduler.ignition import Refusal
-from fleet_graph.scheduler.launcher import LaunchResult
 from fleet_graph.state.completion import CompletionVerdict, product_on_default_branch
 
 _DEFAULT = object()

@@ -31,10 +31,10 @@ from typing import Any
 
 import pytest
 
+from fleet_graph.launcher import LaunchResult, LaunchSpec
 from fleet_graph.scheduler.checkpoint_terminal import CheckpointTerminal
 from fleet_graph.scheduler.daemon import LineSpec, Scheduler, SchedulerConfig
 from fleet_graph.scheduler.ignition import IgnitionDecision, LineStatus, Refusal, decide
-from fleet_graph.scheduler.launcher import LaunchResult, LaunchSpec
 from fleet_graph.scheduler.revive import (
     REQUIRED_REVIVE_FIELDS,
     ReviveFieldError,

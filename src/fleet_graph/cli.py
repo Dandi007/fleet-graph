@@ -839,9 +839,9 @@ def _scheduler_run(args: argparse.Namespace) -> int:
     """Run the resident scheduler: look at each line, ask, start or record why not."""
     import pathlib
 
+    from fleet_graph.launcher import TransientLauncher
     from fleet_graph.scheduler.checkpoint_terminal import SqliteCheckpointTerminalReader
     from fleet_graph.scheduler.daemon import Scheduler, SchedulerConfig
-    from fleet_graph.scheduler.launcher import TransientLauncher
     from fleet_graph.scheduler.probe import CliGatewayProber, GatewayProber, HttpxProbeTransport
     from fleet_graph.scheduler.wake import LiveDdWakeFacts, LiveWakeSignals
 
