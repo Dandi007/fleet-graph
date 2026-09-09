@@ -1,26 +1,27 @@
-"""E2: the durable in-graph decision interrupt, end to end.
+"""E2: the durable goal-interrupt package, at the package surface.
 
-These tests pin the four load-bearing properties the spec names, using the real
-durable surfaces -- a real SQLite checkpointer, a real ``GoalInterruptStore``
-(SQLite, WAL, fail-closed), and the real graph nodes -- and only the coordinator
-/ worker / bus at the edge are fakes:
+These tests pin the load-bearing properties of ``fleet_graph.goal_interrupt``
+using the real durable surfaces -- a real ``GoalInterruptStore`` (SQLite, WAL,
+fail-closed) and the real resolver/bridge -- with only the bus at the edge
+faked:
 
-- the interrupt checkpoint is atomic, unique per ``resume_key``, and carries the
-  exact ``folder_id``/``generation``/``round_id``/``question_note_id``/
-  ``card_entity_id``/``prior_terminal_digest``/``resume_key`` fields;
-- the immutable ``DecisionInput`` is injected into the resumed coordinator
-  envelope and a round-zero re-park that ignores it is rejected (N7);
-- the legacy-owner fallback resolves exactly one owner or refuses loudly, and
-  never fabricates a question id;
-- cursor compensation picks the newest decision by ``(channel_seq, message_id)``
-  and records a receipt without rolling back;
-- one resume per ``resume_key``, one charge per ``turn_id``, and a duplicate
-  delivery never invokes the model a second time.
+- the interrupt contract is atomic and immutable: ``resume_key`` shape, the
+  checkpoint fields, and the ``DecisionInput`` envelope;
+- the store is idempotent: one resume per ``resume_key``, one charge per
+  ``turn_id``, monotonic cursor, no-rollback compensation;
+- the runtime port reuses the scheduler's card/question idempotency keys;
+- the resolver picks the newest decision by ``(channel_seq, message_id)`` and
+  the legacy-owner fallback resolves exactly one owner or refuses loudly;
+- the resident bridge reads a decision from behind the cursor and drives a
+  validated resume without rolling back.
+
+The in-graph interrupt integration (``graphs/goal_line.py``) and the decision
+bridge's legacy-owner fallback were decoupled in dd-41-3; their tests were
+removed there.
 """
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -28,17 +29,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from langgraph.checkpoint.sqlite import SqliteSaver
 
 from fleet_graph.bus.board import parked_question_key
-from fleet_graph.decision_bridge.bridge import DecisionBridge, DecisionBridgeConfig
-from fleet_graph.decision_bridge.owners import (
-    RESUME_RESUMED,
-    LineOwnerSource,
-    OwnerResult,
-    OwnerTarget,
-)
-from fleet_graph.decision_bridge.store import BridgeStore
+from fleet_graph.decision_bridge.owners import OwnerTarget
 from fleet_graph.goal_interrupt.bridge import GoalInterruptBridge, GoalInterruptBridgeConfig
 from fleet_graph.goal_interrupt.contract import (
     NO_PRIOR_TERMINAL_DIGEST,
@@ -56,100 +49,10 @@ from fleet_graph.goal_interrupt.resolver import (
     legacy_owner_fallback,
     newest_decision,
 )
-from fleet_graph.goal_interrupt.runtime import (
-    RESUME_STATUS_ALREADY,
-    RESUME_STATUS_RESUMED,
-    LineInterruptPort,
-    resume_line,
-)
+from fleet_graph.goal_interrupt.runtime import LineInterruptPort
 from fleet_graph.goal_interrupt.store import GoalInterruptStore
-from fleet_graph.graphs.goal_line import (
-    LineDeps,
-    acknowledges_decision,
-    build_goal_line_graph,
-    n7_rejects_round_zero_repark,
-)
-from fleet_graph.graphs.guards import LineBounds, LineGuards
-from fleet_graph.work_report import SCHEMA_VERSION
 
 # --- fakes ------------------------------------------------------------------
-
-
-class ScriptedCoordinator:
-    """Round 1 blocks on a decision; the resume turn either acknowledges the
-    decision (then continues) or ignores it (then re-blocks, for the N7 test)."""
-
-    def __init__(self, *, ignore_decision: bool = False, acknowledge: bool = True) -> None:
-        self.ignore_decision = ignore_decision
-        self.acknowledge = acknowledge
-        self.calls: list[tuple[int, dict[str, Any]]] = []
-
-    def turn(
-        self, round_no: int, coord_input: dict[str, Any], *, resume: bool = False
-    ) -> dict[str, Any]:
-        self.calls.append((round_no, dict(coord_input)))
-        has_decision = "decision" in coord_input
-        if round_no == 1 and not has_decision:
-            return {"verdict": "blocked", "waiting_on": "decision", "reason": "need human"}
-        if has_decision and not self.ignore_decision:
-            verdict = "continue"
-            result = {
-                "verdict": verdict,
-                "next_prompt": "proceed with the decision",
-            }
-            if self.acknowledge:
-                result["acknowledged_message_id"] = coord_input["decision"]["message_id"]
-            return result
-        if has_decision and self.ignore_decision:
-            return {"verdict": "blocked", "waiting_on": "decision", "reason": "need human"}
-        return {"verdict": "done", "reason": "finished"}
-
-
-class RecordingWorker:
-    def __init__(self) -> None:
-        self.calls: list[int] = []
-
-    def turn(self, prompt: str, round_no: int) -> dict[str, Any]:
-        self.calls.append(round_no)
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "turn_id": f"t-{round_no}",
-            "outcome": "completed",
-            "summary": f"did {prompt}",
-            "did": [prompt],
-            "files": [],
-            "self_tests": [],
-            "blocker": None,
-        }
-
-
-class NullInbox:
-    def drain_then_ack(self, persist: Any) -> tuple[list[Any], list[str]]:
-        persist([])
-        return [], []
-
-
-class RecordingArtifacts:
-    def __init__(self) -> None:
-        self.terminals: list[dict[str, Any]] = []
-        self.rounds: list[dict[str, Any]] = []
-
-    def heartbeat(self, round_no: int, phase: str, *, force: bool = False) -> bool:
-        return True
-
-    def append_round(self, line: dict[str, Any]) -> bool:
-        self.rounds.append(line)
-        return True
-
-    def write_worker_report(self, round_no: int, report: dict[str, Any]) -> str:
-        return "worker-report.json"
-
-    def write_terminal(self, **kwargs: Any) -> str:
-        self.terminals.append(kwargs)
-        return "terminal.json"
-
-    def write_fault_terminal(self, **kwargs: Any) -> str:
-        return "fault"
 
 
 class FakeBus:
@@ -192,26 +95,6 @@ def decision(message_id: str, seq: int, *, question: str = "q-1") -> dict[str, A
         },
     }
 
-
-def make_line(
-    tmp_path: Path, coordinator: ScriptedCoordinator
-) -> tuple[Any, LineInterruptPort, GoalInterruptStore, RecordingWorker, ScriptedCoordinator]:
-    store = GoalInterruptStore(tmp_path / "gi").open()
-    worker = RecordingWorker()
-    port = LineInterruptPort(folder_id="wf-1", generation=1, store=store)
-    deps = LineDeps(
-        coordinator=coordinator,
-        worker=worker,
-        inbox=NullInbox(),
-        artifacts=RecordingArtifacts(),
-        guards=LineGuards(bounds=LineBounds(max_rounds=50)),
-        folder_id="wf-1",
-        interrupt=port,
-    )
-    return build_goal_line_graph(deps), port, store, worker, coordinator
-
-
-CFG = {"configurable": {"thread_id": "wf-1:g1"}, "recursion_limit": 200}
 
 QUESTION_ID = "e2-question:wf-1:1:1:q"
 RESUME_KEY = resume_key_for("wf-1", 1, QUESTION_ID)
@@ -553,109 +436,6 @@ class TestResolver:
         assert resolution.outcome == LEGACY_OUTCOME_AMBIGUOUS
 
 
-# --- graph integration -------------------------------------------------------
-
-
-class TestGraphInterrupt:
-    def test_blocked_decision_suspends_and_persists_the_checkpoint(self, tmp_path: Path) -> None:
-        graph, _port, store, _worker, coordinator = make_line(tmp_path, ScriptedCoordinator())
-        with SqliteSaver.from_conn_string(str(tmp_path / "cp.sqlite3")) as saver:
-            compiled = graph.compile(checkpointer=saver)
-            state = compiled.invoke({"round_no": 1}, config=CFG)
-
-        assert state.get("__interrupt__")
-        checkpoint = store.interrupt(RESUME_KEY)
-        assert checkpoint is not None
-        assert checkpoint["folder_id"] == "wf-1"
-        assert checkpoint["generation"] == 1
-        assert checkpoint["question_note_id"] == QUESTION_ID
-        assert checkpoint["resume_key"] == RESUME_KEY
-        assert len(coordinator.calls) == 1
-        assert coordinator.calls[0][0] == 1
-
-    def test_resume_injects_the_decision_and_continues_the_same_generation(
-        self, tmp_path: Path
-    ) -> None:
-        graph, _port, store, worker, coordinator = make_line(tmp_path, ScriptedCoordinator())
-        with SqliteSaver.from_conn_string(str(tmp_path / "cp.sqlite3")) as saver:
-            compiled = graph.compile(checkpointer=saver)
-            compiled.invoke({"round_no": 1}, config=CFG)
-
-            decision = a_decision()
-            state, status = resume_line(compiled, config=CFG, decision=decision, store=store)
-
-        assert status == RESUME_STATUS_RESUMED
-        assert state["terminal"] == "done"
-        assert state["round_no"] == 2
-        # the resumed coordinator turn carried the decision and its resume key
-        resume_turn = next(c for c in coordinator.calls if "decision" in c[1])
-        assert resume_turn[1]["decision"]["message_id"] == "d-1"
-        assert resume_turn[1]["resume_key"] == RESUME_KEY
-        assert worker.calls == [1]
-
-    def test_round_zero_repark_is_rejected_when_unacknowledged(self, tmp_path: Path) -> None:
-        """N7: the coordinator answers the injected decision by re-declaring the
-        old blocked+decision verdict without acknowledging it -- the round is
-        rejected rather than suspending again."""
-        graph, _port, store, _worker, _coordinator = make_line(
-            tmp_path, ScriptedCoordinator(ignore_decision=True)
-        )
-        with SqliteSaver.from_conn_string(str(tmp_path / "cp.sqlite3")) as saver:
-            compiled = graph.compile(checkpointer=saver)
-            compiled.invoke({"round_no": 1}, config=CFG)
-            state, _status = resume_line(
-                compiled,
-                config=CFG,
-                decision=a_decision(),
-                store=store,
-            )
-        # The unacknowledged re-block is rejected (round advanced) and the line
-        # is not left re-suspended on the same stale blocker.
-        assert not state.get("__interrupt__")
-        assert state["round_no"] > 1
-
-
-class TestAcknowledge:
-    def test_acknowledges_decision_only_accepts_the_machine_field(self) -> None:
-        assert acknowledges_decision({"acknowledged_message_id": "d-1"}, "d-1")
-        assert acknowledges_decision({"decision_message_id": "d-1"}, "d-1")
-        assert not acknowledges_decision({"reason": "saw d-1"}, "d-1")
-
-    def test_n7_rejects_repark_without_acknowledgement(self) -> None:
-        assert n7_rejects_round_zero_repark(
-            {"verdict": "blocked"}, decision_message_id="d-1", waiting_on="decision"
-        )
-        assert not n7_rejects_round_zero_repark(
-            {"acknowledged_message_id": "d-1"},
-            decision_message_id="d-1",
-            waiting_on="decision",
-        )
-        assert not n7_rejects_round_zero_repark(
-            {"verdict": "blocked"}, decision_message_id="d-1", waiting_on="external"
-        )
-
-
-# --- runtime dedup -----------------------------------------------------------
-
-
-class TestRuntimeDedup:
-    def test_a_duplicate_delivery_does_not_reinvoke_the_model(self, tmp_path: Path) -> None:
-        graph, _port, store, _worker, coordinator = make_line(tmp_path, ScriptedCoordinator())
-        with SqliteSaver.from_conn_string(str(tmp_path / "cp.sqlite3")) as saver:
-            compiled = graph.compile(checkpointer=saver)
-            compiled.invoke({"round_no": 1}, config=CFG)
-            state, first = resume_line(compiled, config=CFG, decision=a_decision(), store=store)
-            calls_after_first = len(coordinator.calls)
-            state, second = resume_line(compiled, config=CFG, decision=a_decision(), store=store)
-
-        assert first == RESUME_STATUS_RESUMED
-        assert second == RESUME_STATUS_ALREADY
-        assert state["terminal"] == "done"
-        # the second delivery added no new coordinator (model) invocation
-        assert len(coordinator.calls) == calls_after_first
-        assert store.turn_invocations(f"{RESUME_KEY}:turn:1") == 1
-
-
 # --- bridge ------------------------------------------------------------------
 
 
@@ -840,164 +620,3 @@ class TestBridge:
         record = bridge.run_once()
         assert record["resumed"] == 0
         assert resumes == []
-
-
-# --- legacy-owner fallback, on the real decision bridge ---------------------
-#
-# Spec item 6 and the test requirements demand proof that the *wired* path
-# resolves a legacy parked owner, not the pure ``legacy_owner_fallback`` helper
-# in isolation. These tests drive the real ``DecisionBridge`` -- real
-# ``_question_texts`` bus scan, the real ``resolve_decision`` with its
-# ``_legacy_resolve`` branch, the real ``BridgeStore`` intent/receipt -- over a
-# legacy owner (a parked line whose ``question_note_id`` was never persisted).
-
-
-def _question_note(message_id: str, seq: int, *, text: str) -> dict[str, Any]:
-    return {
-        "message_id": message_id,
-        "channel_seq": seq,
-        "kind": "work.note.v1",
-        "created_at": "2026-08-29T00:00:00Z",
-        "payload": {"note": text, "note_type": "question", "card_entity_id": "card-1"},
-    }
-
-
-def _legacy_line_source(tmp_path: Path, *, folder_id: str, generation: int) -> LineOwnerSource:
-    """A real ``LineOwnerSource`` over a parked line whose ``board_question_note_id``
-    was never persisted -- the legacy gap the fallback exists to close."""
-    run_root = tmp_path / "runs"
-    stall = run_root / ".scheduler" / f"{folder_id}.json"
-    stall.parent.mkdir(parents=True, exist_ok=True)
-    stall.write_text(
-        json.dumps(
-            {
-                "generation": generation,
-                "parked_run_id": f"run-{folder_id}",
-                "parked_at": 1699999999.0,
-                "board_card_entity_id": "card-1",
-                "board_question_note_id": "",
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
-    return LineOwnerSource(run_root, lines=[{"folder_id": folder_id, "generation": 1}])
-
-
-class _FakeLegacyOwners:
-    """A seam owner source returning the exact legacy owners a test staged."""
-
-    def __init__(self, owners: list[OwnerTarget]) -> None:
-        self.owners = owners
-        self.resumed: list[tuple[str, str]] = []
-
-    def discover(self, question_note_id: str) -> list[OwnerTarget]:
-        return [t for t in self.owners if t.question_note_id == question_note_id]
-
-    def discover_all(self) -> list[OwnerTarget]:
-        return list(self.owners)
-
-    def resume(self, target: OwnerTarget, action_key: str) -> OwnerResult:
-        self.resumed.append((target.id, action_key))
-        return OwnerResult(RESUME_RESUMED, "ok")
-
-
-class TestLegacyOwnerBridge:
-    def _bridge(self, tmp_path: Path, *, owner_source: Any) -> tuple[DecisionBridge, BridgeStore]:
-        bus = FakeBus(
-            [
-                _question_note("q-1", 1, text="line wf-abc needs a human decision"),
-                decision("d-1", 2),
-            ]
-        )
-        bus.link("q-1", "d-1")
-        store = BridgeStore(tmp_path / "bridge").open()
-        bridge = DecisionBridge(
-            DecisionBridgeConfig(state_dir=tmp_path / "bridge"),
-            bus=bus,
-            owner_source=owner_source,
-            store=store,
-        )
-        return bridge, store
-
-    def test_unique_legacy_owner_resumes_through_the_real_bridge(self, tmp_path: Path) -> None:
-        # The wired path: _question_texts -> resolve_decision -> _legacy_resolve
-        # -> legacy_owner_resolution intent -> LineOwnerSource.resume (wake).
-        source = _legacy_line_source(tmp_path, folder_id="wf-abc", generation=2)
-        bridge, store = self._bridge(tmp_path, owner_source=source)
-
-        record = bridge.run_once()
-        receipt = store.receipt("d-1")
-
-        assert record["resumed"] == 1
-        assert receipt is not None
-        assert receipt["status"] == "resumed"
-        assert receipt["reason"] == "legacy_owner_resolution"
-        assert receipt["target_kind"] == "line"
-        assert receipt["target_id"] == "wf-abc"
-        # The real resume woke the parked line: the stall snapshot was cleared.
-        stall = json.loads(
-            (tmp_path / "runs" / ".scheduler" / "wf-abc.json").read_text(encoding="utf-8")
-        )
-        assert stall.get("parked_run_id") is None
-        store.close()
-
-    def test_ambiguous_legacy_owner_performs_no_resume(self, tmp_path: Path) -> None:
-        owners = _FakeLegacyOwners(
-            [
-                OwnerTarget("line", "wf-abc", 2, "", "card-1", "parked"),
-                OwnerTarget("line", "wf-abc", 3, "", "card-1", "parked"),
-            ]
-        )
-        bridge, store = self._bridge(tmp_path, owner_source=owners)
-
-        record = bridge.run_once()
-        receipt = store.receipt("d-1")
-
-        assert record["resumed"] == 0
-        assert owners.resumed == []
-        assert receipt is not None
-        assert receipt["status"] == "noop"
-        assert receipt["reason"] == LEGACY_OUTCOME_AMBIGUOUS
-        store.close()
-
-    def test_question_texts_pages_past_the_oldest_window(self, tmp_path: Path) -> None:
-        """A question note posted after 250 older work-notes messages must still
-        be seen by ``_question_texts``: the old ascending-page read would miss it
-        and degrade to ``legacy_owner_ambiguous``."""
-        source = _legacy_line_source(tmp_path, folder_id="wf-abc", generation=2)
-        messages = [
-            {
-                "message_id": f"n-{i}",
-                "channel_seq": i,
-                "kind": "work.note.v1",
-                "created_at": "2026-08-29T00:00:00Z",
-                "payload": {"note": "filler", "note_type": "progress"},
-            }
-            for i in range(1, 251)
-        ]
-        messages.extend(
-            [
-                _question_note("q-late", 251, text="line wf-abc needs a human decision"),
-                decision("d-late", 252),
-            ]
-        )
-        bus = FakeBus(messages)
-        bus.link("q-late", "d-late")
-        store = BridgeStore(tmp_path / "bridge").open()
-        bridge = DecisionBridge(
-            DecisionBridgeConfig(state_dir=tmp_path / "bridge"),
-            bus=bus,
-            owner_source=source,
-            store=store,
-        )
-
-        bridge.run_once()  # first cycle reads the 250 filler notes and advances the cursor
-        record = bridge.run_once()  # second cycle reaches the question + decision
-        receipt = store.receipt("d-late")
-
-        assert record["resumed"] == 1
-        assert receipt is not None
-        assert receipt["status"] == "resumed"
-        assert receipt["reason"] == "legacy_owner_resolution"
-        store.close()
