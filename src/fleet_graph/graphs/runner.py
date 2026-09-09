@@ -27,9 +27,6 @@ from fleet_graph.executors.agent_session import (
     SeatSpec,
     derive_seat_key,
 )
-from fleet_graph.goal_interrupt.contract import DecisionInput
-from fleet_graph.goal_interrupt.runtime import LineInterruptPort, resume_line
-from fleet_graph.goal_interrupt.store import GoalInterruptStore
 from fleet_graph.graphs.adapters import AgentRunCoordinator, AgentSessionWorker
 from fleet_graph.graphs.goal_line import LineDeps, build_goal_line_graph
 from fleet_graph.graphs.guards import LineBounds, LineGuards
@@ -58,9 +55,10 @@ class LineConfig:
     write: bool = False
     generation: int = 1
     #: The board card entity id the scheduler's escalation already materialised
-    #: (stall-state ``board_card_entity_id``). Empty means no known card yet and
-    #: the interrupt runtime falls back to publishing through the shared
-    #: constructor + shared key on its first ask.
+    #: (stall-state ``board_card_entity_id``). Retained because the scheduler
+    #: launcher still threads ``--board-card`` through the CLI into this config,
+    #: but its only consumer (the E2 in-graph interrupt) was removed in dd-41-3,
+    #: so the field is now inert and is cleaned up with the scheduler batch.
     board_card_entity_id: str = ""
     #: None means durable: run_root / "checkpoint.sqlite3". ":memory:" stays
     #: available for tests that want a throwaway thread.
@@ -230,13 +228,6 @@ def build_line(config: LineConfig, *, run_id: str | None = None) -> tuple[Any, L
         # and a revived line must read exactly who/basis/generation the revoke
         # recorded, not whatever terminal.json happens to say.
         revival=config.revival,
-        # The E2 in-graph interrupt port. Wired here so a human-decision wait
-        # on a real line routes through the durable interrupt instead of the
-        # legacy parking terminal (spec: "replace the normal goal-line parking
-        # path with a durable graph interrupt"). A line whose store cannot be
-        # opened still starts, but loses the interrupt routing rather than the
-        # whole run -- parking remains the fallback.
-        interrupt=_build_interrupt(config, run_id=run_id),
         run_id=run_id,
         metrics=_build_line_metrics(config),
         # G1: the coordinator round's goal.md content_revision reader. Falls
@@ -310,48 +301,6 @@ def _flush_line_metrics(deps: LineDeps) -> None:
         # A scrape-side write failure is an observability problem, not a line
         # failure: the line's outcome is already decided.
         metrics.write_exposition()
-
-
-def _build_interrupt(config: LineConfig, *, run_id: str = "") -> LineInterruptPort | None:
-    """The production E2 interrupt port for one line.
-
-    Opens the line's durable ``GoalInterruptStore`` (under ``run_root``) and, when
-    a bus credential is present, a ``Board`` for materialising the question and
-    card. The line's ``run_id`` is threaded through so ``ask`` reuses the
-    scheduler's escalation question idempotency key (``parked:<folder>:<run_id>``)
-    -- the one question a human answers, resuming the same interrupt. A missing
-    credential degrades to a deterministic question id rather than failing the
-    line start; a store that cannot be opened degrades to ``None`` (legacy
-    parking stays the path) rather than bricking the run.
-    """
-    try:
-        store = GoalInterruptStore(config.run_root).open()
-    except Exception:
-        return None
-    board = None
-    try:
-        from fleet_graph.bus.board import Board
-        from fleet_graph.bus.client import BusClient
-
-        board = Board(BusClient())
-    except Exception:
-        board = None
-    return LineInterruptPort(
-        folder_id=config.folder_id,
-        generation=config.generation,
-        store=store,
-        board=board,
-        # The scheduler's card, threaded through so the runtime reuses it
-        # instead of publishing a second one (E2 card pass-through).
-        card_entity_id=config.board_card_entity_id,
-        run_id=run_id,
-        # The scheduler's stall-state file for this line
-        # (``<run_root>/.scheduler/<folder_id>.json``). Threaded so the E2
-        # interrupt's ``persist`` mirrors its question note into the stall
-        # state, letting the decision bridge map a ``work.decision.v1``
-        # answering it back to the parked line.
-        stall_state_path=config.run_root.parent / ".scheduler" / f"{config.folder_id}.json",
-    )
 
 
 class _NullInbox:
@@ -486,41 +435,9 @@ def run_line(config: LineConfig, *, run_id: str | None = None) -> dict[str, Any]
     }
 
 
-def resume_goal_line(config: LineConfig, decision: DecisionInput) -> tuple[dict[str, Any], str]:
-    """Re-enter a suspended goal line's interrupt with a validated decision.
-
-    The production twin of ``resume_line``: it rebuilds the line's graph from the
-    *same* ``LineConfig`` that first suspended it (so thread_id, checkpoint path,
-    coordinator/worker wiring and the interrupt store all match), then injects
-    the validated ``DecisionInput`` through the resume key. This is what the
-    resident ``goal-interrupt`` bridge calls for each recovered decision, so a
-    human verdict in production actually resumes the same generation and
-    continuation instead of parking.
-    """
-    store = GoalInterruptStore(config.run_root).open()
-    deps: LineDeps | None = None
-    try:
-        graph, deps = build_line(config)
-        invoke_config: dict[str, Any] = {
-            "configurable": {"thread_id": config.thread_id},
-            "recursion_limit": config.max_rounds * 8 + 20,
-        }
-        with SqliteSaver.from_conn_string(config.resolved_checkpoint_path) as saver:
-            compiled = graph.compile(checkpointer=saver)
-            return resume_line(compiled, config=invoke_config, decision=decision, store=store)
-    finally:
-        # D3 effect side: render the protocol counters recorded during the
-        # resumed rounds to the line's textfile, exactly as run_line does for
-        # a fresh launch. Only when the line was actually built.
-        if deps is not None:
-            _flush_line_metrics(deps)
-        store.close()
-
-
 __all__ = [
     "LineConfig",
     "build_line",
-    "resume_goal_line",
     "resume_start",
     "run_line",
 ]
