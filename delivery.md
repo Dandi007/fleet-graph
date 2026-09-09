@@ -45,34 +45,29 @@ Git/PR 副作用与新引擎部署一律留待联合验证阶段。
 - baseline commit（本单基线，禁止偏离）: `5a0c392f45a5cf2b66231e61061a27201469edc6`
 - 目标交付 ref（唯一交付分支）: `refs/heads/release/fleet-compare-self`
 - 开发分支: `dd/fleet-compare-self/dev-fg-4053bbf02dcf`
-- 产品候选 commit（本交付覆盖的产品内容精确 HEAD，已存在、可验证的完整对象 ID）:
-  `b688d698844f7640b46958ad5fea509f5ba12bf4`
-  （本次返工针对 rf-bfe89f96 两个 major 的真实产品改动：L3 完整 validity key——
-  未知 target/PR 拒绝封存；L4/L5 replay——validity 证据缺失/损坏/不可测的可追踪
-  安全拒绝。覆盖 `src/fleet_graph/dd/dispatch.py`、
+- 产品候选 commit（本交付覆盖的产品代码精确 HEAD；`src/` 与 `tests/` 的完整对象 ID，
+  已存在、可机械验证）: `b688d698844f7640b46958ad5fea509f5ba12bf4`
+  （该提交完成 L3 完整 validity key——未知 target/PR 拒绝封存，与 L4/L5 replay/gate
+  的 validity 证据缺失/损坏/不可测之可追踪安全拒绝（rf-bfe89f96 FR 的代码改动），
+  覆盖 `src/fleet_graph/dd/dispatch.py`、
   `src/fleet_graph/graphs/{dd_materializer,dd_replay,dd_runner}.py`、
   `tests/test_dd_lifecycle_contract.py`、`tests/test_dd_materializer.py`、
   `tests/test_dd_runner.py`、`tests/test_rework_contract.py`）。
-- 本 `delivery.md` 与产品候选的关系：本文件是纯文档提交，落在产品候选
-  `b688d698…` 之上——`git merge-base --is-ancestor b688d698… <最终HEAD>` 成立，
-  且 `git diff --name-only b688d698… <最终HEAD> -- . ':(exclude).dev-dispatch'`
-  仅含 `delivery.md`（`b688d698…` 之后的最终 HEAD 无任何 `src/`/`tests/` 改动）。
-- 产品变更沿链关系（机械证据）：`b688d698…` 直接落在 rf-bfe89f96 返工输入
-  `c5c1a7e2…` 之后（`git merge-base --is-ancestor c5c1a7e2… b688d698…` 成立），
-  中间仅本次 8 个 `src/`/`tests/` 文件改动；再上溯，
-  `git diff --name-only ac67c859… b688d698… -- . ':(exclude).dev-dispatch'`
-  仅含本次返工的 `src/`/`tests/` 文件与 `delivery.md`，即 `ac67c859…` 之后的
-  `.dev-dispatch/**` 记账提交不含产品代码变更。
-- 最终交付 HEAD（`work_head_commit`，即携带本文件定稿的 commit 对象 ID）由
-  controller 在 Implement handoff receipt（`.dev-dispatch`）内机械封存于本文档
-  之外；本文件不得把文档自引用 SHA 冒充产品 SHA。
-- 输入 commit（本次 attempt 的精确起点，generation 4 重新 configure 后的基线）:
-  `4ae34b73e572bc408072ae959ebef9365ef5c7a8`
-- generation 4 说明：本 attempt 重新 configure（feedback index 归档至 `history.json`
-  并清空、`run-config.json` generation 2→4），SPEC 与产品代码均未变，产品候选仍为
-  `b688d698…`；本 attempt 仅重验开发阶段 acceptance（`compileall` 与
-  `pytest tests/test_dd_lifecycle_contract.py`）并刷新交付身份，不新增 `src/`/
-  `tests/` 改动。
+- 产品候选与当前 worktree 的树关系（本次 rework 复验的机械证据）：
+  `git diff --name-only b688d698… <work_head_commit> -- . ':(exclude).dev-dispatch'`
+  仅含 `delivery.md`；即本单 `src/`/`tests/` 产品代码自 `b688d698…` 起未再变动，
+  `b688d698…` 之后的提交仅涉及交付文档与 `.dev-dispatch` 记账。
+- 输入 commit（本次 attempt 的精确继承起点 `input_commit`）:
+  `6f6ce491bada1a3f6d9f1540cf7ae348cf8bbc18`
+- 本次 rework 说明：attempt `8d5a8e16-ec63-57b4-bad6-400431b06a9a`（rework mode）
+  仅针对 rf-a657a99a Final review 的 major finding（`delivery.md` 交付身份过期、
+  未记录本次实际交付的精确 HEAD 与输入身份）。SPEC、`src/`、`tests/` 均无改动；本
+  attempt 仅刷新交付身份并重跑开发阶段 acceptance（`compileall` 与
+  `pytest tests/test_dd_lifecycle_contract.py`）。
+- 最终交付 HEAD（`work_head_commit`）：携带本文件定稿的 commit 对象 ID，其父链以
+  input `6f6ce491…` 为继承起点、以产品候选 `b688d698…` 为祖先；本文件不以文档
+  自引用 SHA 冒充产品 SHA。该 SHA 由 controller 在 Implement handoff receipt
+  （`.dev-dispatch`）内机械封存，交付身份以该封存为准。
 - PR：尚未创建（本开发阶段无任何 live PR/远端副作用）；PR 将在 L1「typed merge
   authorization -> merge」阶段对 `release/fleet-compare-self` 创建，其精确
   PR number/URL 届时由 merge 授权记录。
