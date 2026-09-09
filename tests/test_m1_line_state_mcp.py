@@ -408,7 +408,7 @@ class TestPortR2:
         assert DEFAULT_PORT not in load_reserved_ports()
 
     def test_the_rejected_5614_is_in_the_reserved_list(self) -> None:
-        """5614 is now occupied (decision MCP); the red-able assertion above
+        """5614 is a reserved port; the red-able assertion above
         must turn red if the default ever drifts back to it."""
         assert 5614 in load_reserved_ports()
 

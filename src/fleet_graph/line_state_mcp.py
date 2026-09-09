@@ -31,7 +31,7 @@ Port (spec 交付 1, R1/R2): the surface serves loopback :5615. The committed
 ``config/line-state-mcp-reserved-ports.json`` is the single source of the
 occupied/reserved loopback ports; :5615 must never appear in it. The red-able
 port assertion in ``tests/test_m1_line_state_mcp.py`` makes a return to an
-occupied port (e.g. 5614, now taken by the decision MCP) fail the suite. This
+occupied port (e.g. 5614) fail the suite. This
 is a CI/acceptance-time assertion, deliberately not a runtime "probe the port
 at startup" behavior (spec item 0 R2).
 """
@@ -56,14 +56,14 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5615
 
 #: Path of the committed reserved/occupied loopback port list (R2 single source
-#: for this surface, mirroring ``config/decision-mcp-reserved-ports.json``).
+#: for this surface).
 RESERVED_PORTS_FILE = (
     Path(__file__).resolve().parent.parent.parent / "config" / "line-state-mcp-reserved-ports.json"
 )
 
 #: The FastMCP registration name of this surface (what a client sees in
-#: tools/list's server name, distinct from the dev-dispatch / goal / research /
-#: decision servers).
+#: tools/list's server name, distinct from the dev-dispatch / goal / research
+#: servers).
 MCP_SERVER_NAME = "fleet-graph-line-state"
 
 #: The read-only field surface, identical to ``:7494 /v1/lines``.
@@ -186,8 +186,7 @@ def build_line_state_mcp_server(
 
     ``config`` binds the data-source roots (the same ones the :7494 read model
     reads); ``view`` is an injectable seam so tests can drive the surface
-    against a scratch ``FleetStateView`` without a transport layer (spec 红线 3,
-    same as ``decision_mcp.build_decision_mcp_server``).
+    against a scratch ``FleetStateView`` without a transport layer (spec 红线 3).
 
     Two narrow, self-explanatory tools -- ``list_line_states`` and
     ``get_line_state(folder_id)`` -- each returning the field surface above.
