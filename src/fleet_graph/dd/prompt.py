@@ -108,6 +108,20 @@ cwd（实际绝对路径）、started_at/finished_at（UTC、Z 后缀）、work_
 不能安全执行时 BLOCKED 并报告具体原因，不能填该命令 exit_code=0。
 旧回执允许省略 provenance 仅用于历史兼容，不代表满足当前 SPEC 的证据要求。
 
+## 每次实现与返工的检查范围
+
+这段约束在每个 implement attempt 都有效，不依赖上一 Session 的监督消息。
+先执行冻结 SPEC 和本次 acceptance_commands 明确要求的检查；额外回归仅针对
+本次修改真正影响的行为。不得自行把定向检查扩成反复运行全量测试套件。
+若冻结要求本身是全量套件，保留该要求；出现失败或超时后先定位具体用例、
+依赖或阻塞原因，不通过重复全套或盲目扩大 timeout 代替诊断。
+工具 timeout 与 shell timeout 是不同边界；超时不是测试通过。
+完整 stdout/stderr 必须先保存，grep/tail 只能作为额外展示；不要用管道尾端
+或 echo 的成功码替代被测进程的 returncode。使用 subprocess.run 的真实返回值，
+或等价且可核验的独立退出码采集。无法取得原始流或真实退出码时如实报告缺口。
+本约束不授权忽略真实失败，不削弱冻结验收，不扩大产品范围或联合运行权限。
+
+
 Doing the work and returning a shape the seal cannot read is the same as not
 doing it: there is no other way for it to learn what you produced.\
 """

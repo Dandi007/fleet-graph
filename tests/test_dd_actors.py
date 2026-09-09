@@ -105,6 +105,36 @@ class TestDispatchingAnLlmStage:
         assert outcome.event == SPINE_EVENT, "implement declares no verdict"
         assert outcome.receipt == declared
 
+    def test_new_attempt_launch_keeps_validation_scope_without_session_history(
+        self, tmp_path: Path
+    ) -> None:
+        from fleet_graph.dd.prompt import (
+            PluginPromptSource, IMPLEMENT_PERSONA, IMPLEMENT_TEMPLATE,
+        )
+
+        class Builder:
+            def build(self, dispatch: Any, parent_receipt: Any = None) -> dict[str, Any]:
+                return dict(dispatch)
+
+        launcher = RecordingLauncher()
+        actor = make_actor(tmp_path, launcher)
+        actor.prompts = PluginPromptSource(
+            binding=None, builder=Builder(), worktree_path=str(tmp_path),
+            acceptance_commands=[["python3", "-m", "pytest", "tests/target.py"]],
+            _cache={IMPLEMENT_PERSONA: "实现者", IMPLEMENT_TEMPLATE: "{{acceptance_commands}}"},
+        )
+        for attempt in (1, 2):
+            actor.act(IMPLEMENT, dispatch_for(IMPLEMENT, attempt=attempt))
+        assert launcher.launched[0][1] != launcher.launched[1][1]
+        for spec, _ in launcher.launched:
+            prompt = Path(spec.prompt_file).read_text()
+            assert "tests/target.py" in prompt
+            assert "每次实现与返工的检查范围" in prompt
+            assert "不依赖上一 Session" in prompt
+            assert "若冻结要求本身是全量套件，保留该要求" in prompt
+            assert "完整 stdout/stderr 必须先保存" in prompt
+            assert "returncode" in prompt
+
     def test_the_input_travels_in_a_file_not_in_argv(self, tmp_path: Path) -> None:
         """`/proc` makes argv world-readable, and the input names commits."""
         launcher = RecordingLauncher()
