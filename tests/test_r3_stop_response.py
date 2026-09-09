@@ -251,6 +251,10 @@ class FakeGatePlane:
             "state": self.state,
             "dispatched_by": self.dispatched_by,
             "generation": 1,
+            # The gate's validity binding (spec L3) needs a complete target and
+            # PR head/base identity -- an attributed single carries both.
+            "remote_ref": f"refs/heads/release/{self.dispatched_by}",
+            "audit_ref": f"refs/heads/dd/{development_id}",
             "repo_path": str(self.workspace or "/tmp/repo"),
             "worktree_path": str(self.workspace or "/tmp/repo"),
         }

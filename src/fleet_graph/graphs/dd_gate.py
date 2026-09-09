@@ -146,9 +146,12 @@ class GraphGateNode:
         the subject's git at its accepted head, binds the committed spec digest
         and the *measured* acceptance-context revision (the committed run-config
         blob), and closes over the target identity and the PR head/base pair
-        from the single's record. Any read it cannot make raises -- the gate
-        refuses rather than recording an "unavailable" marker, so a verdict can
-        never seal against an unbound version.
+        from the single's record. The PR head (``audit_ref``) is never
+        substituted with the target ref -- a missing audit branch is expressed
+        as an empty head, matching ``MaterializationTarget.pr_identity``'s
+        empty-value fail-closed rule. Any read it cannot make raises -- the
+        gate refuses rather than recording an "unavailable" marker, so a verdict
+        can never seal against an unbound or fabricated version.
 
         When ``previous`` (a sealed validity key from the accepted/reviewed
         version -- a ``ValidityKey`` or a ``{"digest", "fields"}`` record) is
@@ -160,14 +163,29 @@ class GraphGateNode:
         """
         release_ref = str(status.get("remote_ref") or "")
         audit_ref = str(status.get("audit_ref") or "")
-        head_ref = audit_ref or release_ref
+        # The PR head/base pair is the order-private audit branch -> the durable
+        # merge target. It is never substituted with the target ref: an absent
+        # audit branch is expressed as "" here, exactly the empty-value
+        # fail-closed rule MaterializationTarget.pr_identity applies (spec L3:
+        # no substitute identity). A verdict whose target or PR identity cannot
+        # be named is refused fail-closed rather than sealed against a
+        # fabricated "release->release" pair or an empty identity.
+        pr_identity = f"{audit_ref}->{release_ref}" if (audit_ref and release_ref) else ""
+        if not release_ref or not pr_identity:
+            raise RuntimeError(
+                "the goal verdict cannot bind a complete validity key: "
+                "target_identity and pr_identity must both be bound to a real "
+                f"identity (spec L3); got target {release_ref!r} and PR head "
+                f"{audit_ref!r}, and sealing an unknown or empty target/PR "
+                "identity is refused"
+            )
         facts = BindingFacts(
             spec_digest=str(status.get("spec_digest") or ""),
             acceptance_context_revision=measure_acceptance_context_revision(
                 str(workspace), head_commit
             ),
             target_identity=release_ref,
-            pr_identity=(f"{head_ref}->{release_ref}" if (head_ref or release_ref) else ""),
+            pr_identity=pr_identity,
         )
         key = build_validity_binding(str(workspace), head_commit, facts)
         if previous is None:

@@ -765,6 +765,10 @@ class TestGateResumeDedup:
         record.update(
             {
                 "dispatched_by": "wf-1",
+                # The gate's validity binding (spec L3) needs a complete target
+                # and PR head/base identity -- an attributed single carries both.
+                "remote_ref": "refs/heads/release/wf-1",
+                "audit_ref": "refs/heads/dd/dev-abc",
                 "spec_digest": "sha256:spec",
                 "acceptance_commands": [],
                 "target_base_commit": "0" * 40,

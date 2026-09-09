@@ -32,6 +32,9 @@ def waiting_gate(repo: Path, tmp_path: Path, plugin_seals, monkeypatch):  # noqa
         "repo_path": str(repo),
         "remote_url": config.remote_url,
         "remote_ref": config.remote_ref,
+        # The gate's validity binding (spec L3) needs the order-private audit
+        # branch alongside the durable target -- an attributed single carries both.
+        "audit_ref": config.audit_ref,
         "target_base_commit": config.target_base_commit,
         "root_handoff_digest": config.root_handoff_digest,
         "bootstrap_commit": config.head_commit,

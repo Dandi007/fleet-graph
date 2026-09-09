@@ -899,6 +899,38 @@ class TestValidityBindingIsWired:
         with pytest.raises((ExactWorkspaceError, RuntimeError)):
             node._validity_binding(repo, head(repo), {"spec_digest": "sha256:" + "d" * 64})
 
+    def test_the_gate_refuses_when_the_pr_head_or_target_is_unknown(self, repo: Path) -> None:
+        """Spec L3: the gate must not fabricate a PR identity by substituting the
+        target ref for a missing audit branch (``release->release``). A verdict
+        whose target or PR head/base pair cannot be named refuses fail-closed,
+        consistent with ``MaterializationTarget.pr_identity``'s empty-value rule."""
+        from fleet_graph.graphs.dd_gate import GraphGateNode
+
+        commit = self._commit_run_config(repo)
+        node = GraphGateNode(plane=None)
+
+        # A release-branch target with no order-private audit branch: the PR
+        # head is unknown, so the binding refuses rather than minting a
+        # "release->release" pair.
+        with pytest.raises(RuntimeError, match="pr_identity"):
+            node._validity_binding(
+                repo,
+                commit,
+                {
+                    "spec_digest": "sha256:" + "d" * 64,
+                    "remote_ref": "refs/heads/release/self",
+                    "audit_ref": "",
+                },
+            )
+
+        # Neither identity is present: the binding refuses fail-closed too.
+        with pytest.raises(RuntimeError, match="pr_identity"):
+            node._validity_binding(
+                repo,
+                commit,
+                {"spec_digest": "sha256:" + "d" * 64, "remote_ref": "", "audit_ref": ""},
+            )
+
     def test_the_gate_verifies_against_the_sealed_key_and_flags_expiry(self, repo: Path) -> None:
         """Spec L5: a goal verdict is bound to the accepted/reviewed version, not
         self-compared. When the product tree drifts after the sealed key was
