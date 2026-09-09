@@ -352,6 +352,7 @@ def build_pipeline(
             state_root=str(config.state_root),
         ),
         verify_worktree_head=config.verify_worktree_head,
+        publication_retries=config.max_retries,
     )
 
     # Defaults that make an assembled pipeline runnable. A caller-supplied
@@ -499,6 +500,8 @@ def run_pipeline(
     launcher: Any = None,
     clock: Any = None,
     resume: bool = False,
+    publication_intent: str = "",
+    publication_output: str = "",
 ) -> dict[str, Any]:
     """Run one development, or resume the one this thread already suspended.
 
@@ -557,6 +560,11 @@ def run_pipeline(
 
     with SqliteSaver.from_conn_string(config.checkpoint_path) as saver:
         compiled = graph.compile(checkpointer=saver)
+        if publication_intent or publication_output:
+            if not resume or not publication_intent or not publication_output:
+                raise ValueError("publication recovery requires resume, intent and exact output")
+            from fleet_graph.graphs.dd_publication_recovery import recover_review_publication
+            recover_review_publication(compiled, deps, config, Path(publication_intent), publication_output)
         start = (
             None
             if resume

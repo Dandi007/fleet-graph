@@ -683,6 +683,8 @@ def _dd_run(args: argparse.Namespace) -> int:
             board=board,
             gate_card_entity_id=args.board_card or "",
             resume=args.resume,
+            publication_intent=getattr(args, "resume_publication_intent", "") or "",
+            publication_output=getattr(args, "resume_publication_output", "") or "",
         )
     except ReworkReplayRefused as refused:
         # Rework contract B (wf-8d9737): a structured refusal with the code
@@ -1643,6 +1645,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="resume the thread this development already suspended, instead of starting it. "
         "Carries no verdict: the gate re-reads the board itself. Needs the same --checkpoint",
     )
+    dd_run.add_argument("--resume-publication-intent", help="supervisor-only frozen review publication recovery intent")
+    dd_run.add_argument("--resume-publication-output", help="exact local deterministic output for publication recovery")
     dd_run.add_argument(
         "--stage-timeout",
         action="append",

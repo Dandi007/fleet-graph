@@ -241,6 +241,7 @@ class PluginMaterializer:
     target: MaterializationTarget
     lifecycle: Lifecycle = field(default_factory=Lifecycle.load)
     verify_worktree_head: bool = True
+    publication_retries: int = 2
 
     @property
     def implement_stage(self) -> str | None:
@@ -388,7 +389,14 @@ class PluginMaterializer:
             if stage.id == self.implement_stage
             else plugin_adapter.invoke_review_materializer
         )
-        result = invoke(self.binding, request, verify_worktree_head=self.verify_worktree_head)
+        for attempt in range(self.publication_retries + 1):
+            result = invoke(self.binding, request, verify_worktree_head=self.verify_worktree_head)
+            if not (result.get("retryable") is True and result.get("failure_code") in {
+                "PUBLISH_FAILED", "PROVIDER_UNAVAILABLE",
+            } and attempt < self.publication_retries):
+                break
+            # The exact same intent and actor result are retried. The plugin
+            # reconciles remote==output and refuses a competing remote value.
         sealed = self._read(stage, result)
         # The sealer wrote the stage's artifacts, so it -- not the agent --
         # is what output_verify should be believing.

@@ -393,6 +393,46 @@ def _transport_exhausted_outcome(stage_id: str, exhausted: TransportExhausted) -
     )
 
 
+def dispatch_for_state(state: PipelineState, stage: Stage, lifecycle: Lifecycle) -> Dispatch:
+    return {
+        "development_id": state.get("development_id", ""),
+        "stage": stage.id,
+        "mode": state.get("mode", MODE_INITIAL),
+        "generation": state.get("generation", 1),
+        "attempt": state.get("attempt", 1),
+        "attempt_started_at": state.get("attempt_started_at", ""),
+        # The identity the sealed chain continues under, where a replayed
+        # prefix pinned one. Everything that derives an attempt identity
+        # downstream -- the dispatch builder, the role input, the parent
+        # receipt path -- prefers this over re-deriving from the current
+        # generation, so a review of replayed work names the receipt that
+        # actually sealed it.
+        "pinned_attempt_id": state.get("pinned_attempt_id", ""),
+        # How many times this stage has already been retried. It travels
+        # on the dispatch because the run id is derived, and a retry that
+        # derives the same id re-adopts the run it is retrying.
+        "retry": int(state.get("retries", {}).get(stage.id, 0)),
+        # True when the last failure of this stage was a RunWaitTimeout
+        # (the run is still in flight): the actor must derive the ORIGINAL
+        # run id and re-adopt it rather than dispatching a new one.
+        "re_adopt": bool(state.get("re_adopt", {}).get(stage.id, False)),
+        "input_commit": state.get("head_commit", ""),
+        "parent_receipt": dict(state.get("last_receipt") or {}),
+        # Chain digests by the stage that sealed them. A later stage that
+        # must name an earlier receipt reads it from here rather than
+        # asking an agent to hand back a digest it has no business
+        # authoring.
+        "receipt_digests": dict(state.get("receipt_digests") or {}),
+        # Which commit each artifact kind was sealed at. A review has to
+        # name the implement commit it is reviewing, and that is not its
+        # own input commit once a second review runs after the first.
+        "artifact_commits": dict(state.get("artifacts") or {}),
+        "required_artifacts": list(stage.required_artifacts),
+        "produced_artifacts": list(stage.produced_artifacts),
+        "contract_version": lifecycle.contract_version,
+    }
+
+
 def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
     lifecycle = deps.lifecycle
 
@@ -429,45 +469,6 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             "terminal_reason": reason,
             "terminal_code": code,
             "fault": fault,
-        }
-
-    def _dispatch_for(state: PipelineState, stage: Stage) -> Dispatch:
-        return {
-            "development_id": state.get("development_id", ""),
-            "stage": stage.id,
-            "mode": state.get("mode", MODE_INITIAL),
-            "generation": state.get("generation", 1),
-            "attempt": state.get("attempt", 1),
-            "attempt_started_at": state.get("attempt_started_at", ""),
-            # The identity the sealed chain continues under, where a replayed
-            # prefix pinned one. Everything that derives an attempt identity
-            # downstream -- the dispatch builder, the role input, the parent
-            # receipt path -- prefers this over re-deriving from the current
-            # generation, so a review of replayed work names the receipt that
-            # actually sealed it.
-            "pinned_attempt_id": state.get("pinned_attempt_id", ""),
-            # How many times this stage has already been retried. It travels
-            # on the dispatch because the run id is derived, and a retry that
-            # derives the same id re-adopts the run it is retrying.
-            "retry": int(state.get("retries", {}).get(stage.id, 0)),
-            # True when the last failure of this stage was a RunWaitTimeout
-            # (the run is still in flight): the actor must derive the ORIGINAL
-            # run id and re-adopt it rather than dispatching a new one.
-            "re_adopt": bool(state.get("re_adopt", {}).get(stage.id, False)),
-            "input_commit": state.get("head_commit", ""),
-            "parent_receipt": dict(state.get("last_receipt") or {}),
-            # Chain digests by the stage that sealed them. A later stage that
-            # must name an earlier receipt reads it from here rather than
-            # asking an agent to hand back a digest it has no business
-            # authoring.
-            "receipt_digests": dict(state.get("receipt_digests") or {}),
-            # Which commit each artifact kind was sealed at. A review has to
-            # name the implement commit it is reviewing, and that is not its
-            # own input commit once a second review runs after the first.
-            "artifact_commits": dict(state.get("artifacts") or {}),
-            "required_artifacts": list(stage.required_artifacts),
-            "produced_artifacts": list(stage.produced_artifacts),
-            "contract_version": lifecycle.contract_version,
         }
 
     def _record(state: PipelineState, entry: dict[str, Any]) -> list[dict[str, Any]]:
@@ -516,7 +517,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                 code=STEP_LIMIT_REACHED,
             )
 
-        dispatch: Dispatch = _dispatch_for(state, stage)
+        dispatch: Dispatch = dispatch_for_state(state, stage, lifecycle)
         artifacts = dict(state.get("artifacts", {}))
         digests = dict(state.get("receipt_digests", {}))
         outcome: StageOutcome | None = None
