@@ -503,6 +503,31 @@ class TestAutoRePrepareClearsARemnantBeforeAFreshAttempt:
         assert git(repo, "rev-parse", re_prepares[0]["recovery_ref"]).strip() == remnant
         assert re_prepares[0]["input_commit"] == input_commit
         assert re_prepares[0]["stage"] == "implement"
+        spec, _ = actor.launcher.launched[-1]
+        assert re_prepares[0]["recovery_ref"] in Path(spec.prompt_file).read_text()
+
+    def test_dirty_recovery_reaches_actual_retry_prompt_without_applying_it(self, tmp_path: Path) -> None:
+        repo, input_commit = self._repo(tmp_path)
+        (repo / "seed.txt").write_text("modified\n", encoding="utf-8")
+        (repo / "new.txt").write_text("untracked work\n", encoding="utf-8")
+        events: list[dict[str, Any]] = []
+        actor = self._actor(tmp_path, repo, events)
+        actor.act(IMPLEMENT, {**dispatch_for(IMPLEMENT), "input_commit": input_commit, "retry": 2})
+        event = next(e for e in events if e.get("event") == "re_prepare")
+        saved = event["worktree_recovery_ref"]
+        assert git(repo, "show", f"{saved}:seed.txt") == "modified"
+        assert git(repo, "show", f"{saved}^3:new.txt") == "untracked work"
+        spec, _ = actor.launcher.launched[-1]
+        prompt = Path(spec.prompt_file).read_text(encoding="utf-8")
+        assert saved in prompt
+        assert input_commit in prompt
+        assert "第三 parent" in prompt
+        assert "真实退出码" in prompt
+        assert "不是可信通过证据" in prompt
+        assert head(repo) == input_commit
+        assert not git(repo, "status", "--porcelain").strip()
+        assert (repo / "seed.txt").read_text() == "seed\n"
+        assert not (repo / "new.txt").exists()
 
     def test_known_negative_reproduction_of_dev_fg_82373b544898_g1(self, tmp_path: Path) -> None:
         """The known negative, mechanized: before this change, on main, the

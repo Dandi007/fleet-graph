@@ -339,7 +339,7 @@ class AgentRunStageActor:
     def _timeout(self, stage: Stage) -> int:
         return self.timeouts.get(stage.id, self.default_timeout_seconds)
 
-    def _reprepare_worktree(self, stage: Stage, dispatch: Dispatch) -> None:
+    def _reprepare_worktree(self, stage: Stage, dispatch: Dispatch) -> str | None:
         """Restore the worktree before a fresh dispatch whose precondition fails.
 
         A previous attempt that did its work but never reported (the
@@ -349,9 +349,9 @@ class AgentRunStageActor:
         the same sanctioned reset the actor contract allows -- `reset --hard
         <input_commit>` plus `clean` -- performed here by the engine so the
         retry starts from a worktree that satisfies its precondition. The
-        cleared remnant commit is not preserved (git reflog keeps it), and the
-        action is recorded as `event=re_prepare` with the cleaned HEAD sha, so
-        the recovery is auditable.
+        remnant commit and dirty files are preserved under recovery refs. The
+        returned advisory reaches the next actor's actual prompt; preservation
+        alone must not silently make it start over without knowing these refs.
 
         Never runs while re-adopting a run still in flight (#167): that run
         owns its workspace. Only a run that has truly terminally failed (or
@@ -410,6 +410,22 @@ class AgentRunStageActor:
                 }
             )
 
+        return (
+            "\n\n## 引擎重试恢复上下文\n"
+            f"本次是失败调用后的干净重试，输入 HEAD 仍为 {input_commit}。\n"
+            f"前次已提交成果保存于 {recovery_ref}（{current}）。\n"
+            + (
+                f"未提交成果保存于 {recovery_ref}-worktree（{snapshot}）；"
+                "该 stash tree 保存跟踪修改，第三 parent（若存在）保存未跟踪文件。\n"
+                if dirty.stdout.strip() else ""
+            )
+            + "这些是本单未验收成果，不是可信通过证据。先只读比较恢复 ref 与冻结 SPEC，"
+            "由原执行者决定是否复用；不要盲 apply 覆盖当前成果，不改变输入前置条件。\n"
+            "必需验收按冻结 SPEC 执行并保存每条命令真实退出码/stdout/stderr；"
+            "管道不得用 tail 的成功码替代测试退出码。超时不是通过，"
+            "针对具体失败检查，不为获取不同输出格式重复全量长测。\n"
+        )
+
     def role_input(self, stage: Stage, dispatch: Dispatch, run_id: str) -> dict[str, Any]:
         """What the role's own input schema asks for, and nothing more.
 
@@ -442,8 +458,9 @@ class AgentRunStageActor:
         # attempt precondition. A run still in flight (re_adopt) owns its
         # workspace and is never re-prepared; only a genuinely terminal/lost
         # run earns a fresh dispatch, and only then is its residue cleared.
+        recovery_context = None
         if not re_adopt:
-            self._reprepare_worktree(stage, dispatch)
+            recovery_context = self._reprepare_worktree(stage, dispatch)
         # A timeout retry re-adopts the run still in flight: derive the
         # ORIGINAL run id (the retry-0 one), so the idempotent launcher adopts
         # the in-flight run instead of paying for a second one. Only a run
@@ -466,6 +483,7 @@ class AgentRunStageActor:
             self.run_root / "stages" / f"{stage.id}-{attempt_tag}-input.json", role_input
         )
         prompt_path = input_path
+        rendered = ""
         if self.prompts is not None:
             rendered = self.prompts.for_stage(
                 stage.id,
@@ -473,10 +491,12 @@ class AgentRunStageActor:
                 run_id=run_id,
                 actor_job_id=role_input["attempt_id"],
             )
-            if rendered:
-                prompt_path = self.run_root / "stages" / f"{stage.id}-{attempt_tag}-prompt.md"
-                prompt_path.parent.mkdir(parents=True, exist_ok=True)
-                prompt_path.write_text(rendered, encoding="utf-8")
+        if recovery_context:
+            rendered = (rendered or input_path.read_text(encoding="utf-8")) + recovery_context
+        if rendered:
+            prompt_path = self.run_root / "stages" / f"{stage.id}-{attempt_tag}-prompt.md"
+            prompt_path.parent.mkdir(parents=True, exist_ok=True)
+            prompt_path.write_text(rendered, encoding="utf-8")
 
         labels = {
             "development": self.development_id,
