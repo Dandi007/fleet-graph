@@ -33,7 +33,7 @@ from fleet_graph.dd.control_plane import (
     EXIT_REWORK,
     classify_failure,
 )
-from fleet_graph.dd.lifecycle import Lifecycle, UnknownTransition
+from fleet_graph.dd.lifecycle import LIFECYCLE_PATH, Lifecycle, UnknownTransition
 from fleet_graph.dd.merge_feedback import (
     MergeFeedbackKind,
     classify_merge_feedback,
@@ -571,3 +571,26 @@ class TestRawEventBoundary:
         fabricated: an empty actor with no review verdicts faults."""
         state = run_actor(ContractActor())
         assert state["terminal"] != TERMINAL_COMPLETE
+
+
+# --------------------------------------------------------------------------
+# L1 (consistency): the shipped contract and its schema must agree
+# --------------------------------------------------------------------------
+
+
+class TestLifecycleSchemaConsistency:
+    def test_the_lifecycle_manifest_validates_against_its_schema(self) -> None:
+        """The contract table development-lifecycle.json is the authority the
+        executor/materializer/replay read; its committed schema must describe
+        exactly that table rather than an older stage machine."""
+        import jsonschema
+
+        contracts = LIFECYCLE_PATH.parent
+        manifest = json.loads((contracts / "development-lifecycle.json").read_text())
+        schema = json.loads((contracts / "development-lifecycle.schema.json").read_text())
+        jsonschema.validate(manifest, schema)
+
+    def test_the_schema_pins_the_same_contract_version_as_the_manifest(self) -> None:
+        contracts = LIFECYCLE_PATH.parent
+        schema = json.loads((contracts / "development-lifecycle.schema.json").read_text())
+        assert schema["properties"]["contract_version"]["const"] == LIFECYCLE.contract_version

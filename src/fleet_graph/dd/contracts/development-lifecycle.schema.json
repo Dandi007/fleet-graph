@@ -72,7 +72,7 @@
     }
   },
   "properties": {
-    "contract_version": {"const": 2},
+    "contract_version": {"const": 3},
     "capabilities": {
       "type": "object",
       "required": ["attempt_context"],
@@ -185,8 +185,8 @@
     },
     "transitions": {
       "type": "array",
-      "minItems": 5,
-      "maxItems": 5,
+      "minItems": 7,
+      "maxItems": 7,
       "uniqueItems": true,
       "items": {
         "oneOf": [
@@ -194,9 +194,42 @@
             "const": {
               "from": "implement",
               "on": "success",
-              "to": "continuous_review",
+              "to": "acceptance",
               "next_mode": "inherit",
               "required_receipt": "implement",
+              "commit_binding": {
+                "source": "required_receipt.output_commit",
+                "target": "next_dispatch.input_commit",
+                "operator": "equal"
+              }
+            }
+          },
+          {
+            "const": {
+              "from": "acceptance",
+              "on": "success",
+              "to": "continuous_review",
+              "next_mode": "inherit",
+              "required_receipt": "acceptance",
+              "commit_binding": {
+                "source": "required_receipt.output_commit",
+                "target": "next_dispatch.input_commit",
+                "operator": "equal"
+              }
+            }
+          },
+          {
+            "const": {
+              "from": "acceptance",
+              "on": "REJECT",
+              "to": "implement",
+              "next_mode": "rework",
+              "required_receipt": "acceptance",
+              "event_binding": {
+                "source": "required_receipt.verdict",
+                "target": "transition.on",
+                "operator": "equal"
+              },
               "commit_binding": {
                 "source": "required_receipt.output_commit",
                 "target": "next_dispatch.input_commit",
@@ -265,7 +298,7 @@
             "const": {
               "from": "final_review",
               "on": "APPROVE",
-              "to": "acceptance",
+              "to": "human_gate",
               "next_mode": "inherit",
               "required_receipt": "final_review",
               "event_binding": {
