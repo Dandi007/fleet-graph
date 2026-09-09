@@ -1560,6 +1560,27 @@ class DdControlPlane:
 
     # --- start / gate ----------------------------------------------------
 
+    def _assert_supervision_control(self, development_id: str) -> None:
+        """Site-owned recovery holds are outside the worker-writable DD record.
+
+        This file is not exposed as an MCP mutation. The supervisor releases a
+        hold only after recording its infrastructure repair evidence. Read-side
+        tools and already running units are deliberately unaffected.
+        """
+        import os
+
+        configured = os.environ.get("FLEET_GRAPH_DD_SUPERVISION_HOLDS_FILE")
+        if not configured:
+            return
+        try:
+            holds = json.loads(Path(configured).read_text(encoding="utf-8"))
+            if not isinstance(holds, dict) or not all(isinstance(v, str) and v for v in holds.values()):
+                raise ValueError("expected development-id to nonempty reason mapping")
+        except (OSError, ValueError) as exc:
+            raise ControlPlaneError("SUPERVISION_HOLD_CONFIG_INVALID", str(exc)) from exc
+        if development_id in holds:
+            raise ControlPlaneError("SUPERVISION_RECOVERY_HOLD", holds[development_id])
+
     @serialized
     def start(self, development_id: str) -> dict[str, Any]:
         """Launch the development detached: resume the in-flight generation,
@@ -1569,6 +1590,7 @@ class DdControlPlane:
         (final), any other terminal starts generation n+1 fresh, and a
         non-terminal development resumes its own generation's thread.
         """
+        self._assert_supervision_control(development_id)
         record = self._record(development_id)
         active = self._unit_active(development_id)
         if active:
@@ -1947,6 +1969,7 @@ class DdControlPlane:
         an actor that lied about its verification does not get the exam
         changed. `complete` refuses too; there is nothing left to accept.
         """
+        self._assert_supervision_control(development_id)
         record = self._record(development_id)
         generation = self._generation(record)
         result = self._read_result(development_id, generation)
