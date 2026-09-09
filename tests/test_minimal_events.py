@@ -11,6 +11,7 @@ from fleet_graph.minimal.events import (
     KINDS,
     EventLog,
     fold,
+    last_run_id,
     resume_point,
 )
 
@@ -229,3 +230,74 @@ def test_resume_point_terminal_exit(tmp_path: Path) -> None:
 
     rp = resume_point(log.read())
     assert rp.action == "exit"
+
+
+def _exited(log: EventLog, stage: str, run_id: str, *, dd_id: str | None = None) -> None:
+    log.append(
+        "agent.exited",
+        {"stage": stage, "run_id": run_id, "exit_code": 0, "stop": "ok"},
+        dd_id=dd_id,
+    )
+
+
+class TestLastRunId:
+    def test_no_history_returns_none(self, tmp_path: Path) -> None:
+        log = make_log(tmp_path)
+        log.append("goal.enrolled", {})
+
+        assert last_run_id(log.read(), "goal") is None
+        assert last_run_id(log.read(), "impl") is None
+
+    def test_multiple_runs_take_the_last(self, tmp_path: Path) -> None:
+        log = make_log(tmp_path)
+        _exited(log, "impl", "dd-01-impl-1", dd_id="dd-01")
+        _exited(log, "impl", "dd-02-impl-1", dd_id="dd-02")
+
+        assert last_run_id(log.read(), "impl", dd_id="dd-02") == "dd-02-impl-1"
+
+    def test_roles_do_not_leak_across(self, tmp_path: Path) -> None:
+        log = make_log(tmp_path)
+        _exited(log, "impl", "dd-01-impl-1", dd_id="dd-01")
+        _exited(log, "goal_turn", "goal-g-1-turn-1")
+
+        assert last_run_id(log.read(), "goal") == "goal-g-1-turn-1"
+        assert last_run_id(log.read(), "impl", dd_id="dd-01") == "dd-01-impl-1"
+        assert last_run_id(log.read(), "cr") is None
+
+    def test_goal_role_spans_turn_and_review(self, tmp_path: Path) -> None:
+        log = make_log(tmp_path)
+        _exited(log, "goal_turn", "goal-g-1-turn-1")
+        _exited(log, "goal_review", "goal-g-1-review-1")
+
+        assert last_run_id(log.read(), "goal") == "goal-g-1-review-1"
+
+    def test_dd_scoped_roles_are_isolated_per_dd(self, tmp_path: Path) -> None:
+        log = make_log(tmp_path)
+        _exited(log, "impl", "dd-01-impl-1", dd_id="dd-01")
+        _exited(log, "impl", "dd-01-impl-2", dd_id="dd-01")
+
+        # A different DD's impl session never leaks into another DD.
+        assert last_run_id(log.read(), "impl", dd_id="dd-02") is None
+        assert last_run_id(log.read(), "impl", dd_id="dd-01") == "dd-01-impl-2"
+
+    def test_ignores_non_exited_events(self, tmp_path: Path) -> None:
+        log = make_log(tmp_path)
+        log.append(
+            "dd.stage.finished",
+            {"stage": "impl", "stop": "committed", "run_id": "dd-01-impl-1"},
+            dd_id="dd-01",
+        )
+        log.append(
+            "agent.failed",
+            {"stage": "impl", "run_id": "dd-01-impl-2", "exit_code": 1},
+            dd_id="dd-01",
+        )
+
+        assert last_run_id(log.read(), "impl", dd_id="dd-01") is None
+
+    def test_unknown_role_raises(self, tmp_path: Path) -> None:
+        log = make_log(tmp_path)
+        log.append("goal.enrolled", {})
+
+        with pytest.raises(ValueError):
+            last_run_id(log.read(), "boss")

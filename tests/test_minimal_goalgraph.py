@@ -363,6 +363,26 @@ def test_goal_session_prompt_only_on_first_call(tmp_path: Path) -> None:
     assert "--role" in first["argv"] and "goal" in first["argv"]
 
 
+def test_goal_turn_resumes_session_with_compact_at(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, stops=[dispatch_stop(), done_stop()])
+    run_goal(harness.deps, goal_id=GOAL_ID, enroll=dict(ENROLL))
+
+    first, second = harness.invoker.calls[0]["argv"], harness.invoker.calls[1]["argv"]
+
+    # The first turn is a fresh session: no resume, no compact threshold.
+    assert "--resume" not in first
+    assert "--compact-at" not in first
+
+    # The second turn resumes the first turn's run dir and carries the goal's
+    # default compact threshold (protocol §0.8: goal resume 0.7).
+    assert "--resume" in second
+    assert second[second.index("--resume") + 1] == (
+        harness.deps.session_root + f"/goal-{GOAL_ID}-turn-1"
+    )
+    assert "--compact-at" in second
+    assert second[second.index("--compact-at") + 1] == "0.7"
+
+
 # ---------------------------------------------------------------------------
 # 2. first-turn blocked ends immediately, run_dd never called
 # ---------------------------------------------------------------------------

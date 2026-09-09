@@ -25,6 +25,7 @@ from fleet_graph.minimal.agentrun import (
     build_argv,
     parse_stop,
     resolve_session_policy,
+    resume_args,
     run_agent,
     schema_for,
 )
@@ -167,6 +168,32 @@ class TestResolveSessionPolicy:
             resolve_session_policy("impl", {"impl": {"compact_at": bad}})
 
 
+class TestResumeArgs:
+    def test_no_last_run_is_fresh(self) -> None:
+        assert resume_args(SessionPolicy("resume", 0.7), None, session_root="/sessions") == (
+            None,
+            None,
+        )
+
+    def test_fresh_policy_makes_no_resume(self) -> None:
+        assert resume_args(SessionPolicy("fresh", None), "run-0", session_root="/sessions") == (
+            None,
+            None,
+        )
+
+    def test_resume_joins_session_root_and_id(self) -> None:
+        assert resume_args(SessionPolicy("resume", 0.7), "run-0", session_root="/sessions") == (
+            "/sessions/run-0",
+            0.7,
+        )
+
+    def test_empty_session_root_uses_id_alone(self) -> None:
+        assert resume_args(SessionPolicy("resume", 0.8), "run-1", session_root="") == (
+            "run-1",
+            0.8,
+        )
+
+
 # ---------------------------------------------------------------------------
 # build_argv
 # ---------------------------------------------------------------------------
@@ -267,6 +294,34 @@ class TestBuildArgv:
         assert argv[0] == "agent-run"
         for sep in (";", "|", "&&", "$(", "`"):
             assert not any(sep in token for token in argv), f"shell-ish {sep!r} in {argv!r}"
+
+
+class TestBuildArgvCompactAt:
+    def test_compact_at_sits_between_resume_and_model(self) -> None:
+        call = _call(resume_dir="/root/sessions/run-0", compact_at=0.7, model="claude-opus-5")
+        argv = build_argv(call)
+        assert argv.index("--compact-at") == argv.index("--resume") + 2
+        assert argv.index("--compact-at") < argv.index("--model")
+
+    def test_compact_at_token_shape(self) -> None:
+        call = _call(resume_dir="/root/sessions/run-0", compact_at=0.7)
+        argv = build_argv(call)
+        assert argv[argv.index("--resume") + 1] == "/root/sessions/run-0"
+        assert argv[argv.index("--compact-at") + 1] == "0.7"
+        assert "--model" not in argv
+
+    def test_ratio_is_a_short_form(self) -> None:
+        call = _call(resume_dir="/root/sessions/run-0", compact_at=0.75)
+        argv = build_argv(call)
+        assert argv[argv.index("--compact-at") + 1] == "0.75"
+
+    def test_compact_at_without_resume_dir_raises(self) -> None:
+        with pytest.raises(ValueError):
+            build_argv(_call(compact_at=0.7))
+
+    def test_compact_at_none_omits_the_token(self) -> None:
+        argv = build_argv(_call(resume_dir="/root/sessions/run-0"))
+        assert "--compact-at" not in argv
 
 
 # ---------------------------------------------------------------------------
