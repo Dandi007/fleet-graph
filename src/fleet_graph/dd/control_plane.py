@@ -100,6 +100,7 @@ from fleet_graph.dd.recovery import (
     HumanRecoveryExit,
     RecoveryDecision,
     RecoveryError,
+    recovery_validity_digest,
 )
 from fleet_graph.dd.scope import (
     RULE_ID,
@@ -110,6 +111,8 @@ from fleet_graph.dd.scope import (
     require_scope,
 )
 from fleet_graph.dd.upstream_constants import ATTEMPT_CONTEXT_CONTRACT_VERSION
+from fleet_graph.dd.validity import ValidityInputs
+from fleet_graph.dd.validity_binding import git_product_facts, measure_acceptance_context_revision
 from fleet_graph.graphs.dd_runner import EVENTS_FILE, RESULT_FILE
 from fleet_graph.state.run_artifacts import iso, write_json_durable
 
@@ -2832,6 +2835,7 @@ class DdControlPlane:
                         at=str(raw.get("at") or ""),
                         digest=str(raw.get("digest") or ""),
                         mechanism=str(raw.get("mechanism") or RECOVERY_MECHANISM),
+                        validity_digest=str(raw.get("validity_digest") or ""),
                     )
                 )
         # The exit's own authenticator is the fail-closed floor; the *real*
@@ -2901,6 +2905,40 @@ class DdControlPlane:
             )
         return proc.stdout.strip()
 
+    def _recovery_validity_digest(self, record: dict[str, Any]) -> str:
+        """Measure the version-bound validity key a recovery decision binds (spec L3/L5).
+
+        Unlike the dispatch/gate/materializer seal paths -- which refuse fail-closed
+        to build a *complete* key -- the recovery trail binds every real fact it can
+        measure and leaves the rest empty. The product revision and tree come out of
+        git at the current head (never an agent's self-report), the spec digest is the
+        admitted record's own, the acceptance-context revision is the committed
+        run-config's blob when one exists, and the target / PR identities are read off
+        the record. An absent fact is still bound as "" (``validity.py`` treats "" as a
+        bound fact, never a silent skip), so the transition unknown -> known later still
+        invalidates a stored decision instead of being skipped.
+        """
+        repo = Path(str(record["repo_path"]))
+        head_commit = self._head_commit(record)
+        revision, tree = git_product_facts(str(repo), head_commit)
+        try:
+            acceptance_context = measure_acceptance_context_revision(str(repo), head_commit)
+        except RuntimeError:
+            acceptance_context = ""
+        release_ref = str(record.get("remote_ref") or "")
+        audit_ref = str(record.get("audit_ref") or "")
+        pr_identity = f"{audit_ref}->{release_ref}" if (audit_ref and release_ref) else ""
+        return recovery_validity_digest(
+            ValidityInputs(
+                product_revision=revision.lower(),
+                product_tree=tree.lower(),
+                spec_digest=str(record.get("spec_digest") or ""),
+                acceptance_context_revision=acceptance_context,
+                target_identity=release_ref,
+                pr_identity=pr_identity,
+            )
+        )
+
     def _governance_decision(self, record: dict[str, Any], question_note_id: str) -> Any:
         """The human decision on the board for one question note, or None.
 
@@ -2945,10 +2983,23 @@ class DdControlPlane:
         launch failure -- it never fabricates ``resumed=true``. A re-invocation
         for an already-recorded target re-uses the existing sealed record and
         does not create a duplicate live thread.
+
+        The decision also binds the version-bound validity key (spec L3/L5): the
+        current product/Spec/acceptance-context/target/PR facts are measured out
+        of real git and the record when it is sealed, and a resume only proceeds
+        while the current facts still reproduce that key. If the product, SPEC,
+        acceptance context, target or PR identity has moved since the decision
+        was cast, the recorded decision is stale and the resume refuses rather
+        than relaunching against facts it no longer authorizes.
         """
         record = self._record(development_id)
         if not target_ref:
             target_ref = self._head_commit(record)
+
+        # Measured against the *current* product head, not the target ref, so a
+        # re-entry after the product advanced compares the facts the suspended
+        # thread would resume onto against the facts the decision was cast for.
+        current_validity = self._recovery_validity_digest(record)
 
         exit_ = self._load_recovery_exit(development_id)
         existing = exit_.recorded_for(target_ref)
@@ -2967,6 +3018,7 @@ class DdControlPlane:
                     decided_by=str(getattr(decision, "decided_by", "") or ""),
                     question_note_id=question_note_id,
                     at=iso(self.clock()),
+                    validity_digest=current_validity,
                 )
             except RecoveryError as exc:
                 raise ControlPlaneError("RECOVERY_REFUSED", str(exc)) from exc
@@ -2975,7 +3027,14 @@ class DdControlPlane:
         else:
             # Replayed recovery: the immutable record already attests to this
             # decision, so it is re-used rather than re-sealed. Sealing twice
-            # would fork the trail; launching again would duplicate a live thread.
+            # would fork the trail; launching again would duplicate a live
+            # thread. But a re-used record must still bind the current validity
+            # key: if the product/SPEC/context/target/PR moved since the
+            # decision, the resume refuses (fail-closed, spec L3/L4).
+            try:
+                exit_.resume(target_ref=target_ref, current_validity_digest=current_validity)
+            except RecoveryError as exc:
+                raise ControlPlaneError("RECOVERY_STALE", str(exc)) from exc
             sealed = existing
 
         resume = self._resume_recovery(record, target_ref)

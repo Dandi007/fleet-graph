@@ -24,6 +24,7 @@ from fleet_graph.executors.agent_run import RunStatus, RunTicket
 from fleet_graph.graphs.dd_pipeline import (
     TERMINAL_COMPLETE,
     TERMINAL_FAULT,
+    TERMINAL_PREPARED,
     TERMINAL_REFUSED,
     Dispatch,
     Sealed,
@@ -39,6 +40,8 @@ from fleet_graph.graphs.dd_scripts import ACCEPTANCE_PATH, GATE_PATH, RUN_CONFIG
 
 LIFECYCLE = Lifecycle.load()
 
+MERGER_STAGE = "merger"
+
 
 def make_config(repo: Path, tmp_path: Path) -> DevelopmentConfig:
     # A real bare repo, because the script sealer publishes to the durable ref
@@ -53,6 +56,7 @@ def make_config(repo: Path, tmp_path: Path) -> DevelopmentConfig:
         run_root=tmp_path / "runs",
         remote_url=str(bare),
         remote_ref="refs/heads/dev-001",
+        audit_ref="refs/heads/dd/dev-001",
         target_base_commit="b" * 40,
         root_handoff_digest="sha256:" + "c" * 64,
         plugin_binding=object(),
@@ -96,13 +100,24 @@ class AgentRunStub:
 class ScriptStub:
     """A script stage that produces what the contract says it produces."""
 
-    def __init__(self) -> None:
+    def __init__(self, repo: Path | None = None) -> None:
+        self.repo = repo
         self.ran: list[str] = []
 
     def act(self, stage: Any, dispatch: Dispatch) -> StageOutcome:
         self.ran.append(stage.id)
+        # Configure really writes the run-config; the materializer's validity
+        # key measures its committed revision (spec L3), so the stand-in does
+        # the same to keep the seal varietally bound.
+        if "run_config" in stage.produced_artifacts and self.repo is not None:
+            path = self.repo / RUN_CONFIG_PATH
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('{"acceptance_commands": [["true"]]}', encoding="utf-8")
+        # The merger's unsteered success is a measured merge now; the spine
+        # event is no longer a declared merge outcome (spec L6).
+        event = "MERGED" if stage.id == MERGER_STAGE else "success"
         return StageOutcome(
-            event="success",
+            event=event,
             receipt={"stage": stage.id},
             produced=tuple(stage.produced_artifacts),
         )
@@ -117,6 +132,7 @@ class RealCommitSealer:
         self.commits: list[str] = []
 
     def seal(self, stage_id: str, outcome: StageOutcome) -> dict[str, Any]:
+        git(self.repo, "add", "-A")
         git(self.repo, "commit", "-q", "--allow-empty", "-m", f"seal {stage_id}")
         commit = head(self.repo)
         self.commits.append(commit)
@@ -193,7 +209,7 @@ def run(
     verdicts: dict[str, list[str]] | None = None,
 ) -> tuple[dict[str, Any], AgentRunStub, ScriptStub]:
     launcher = AgentRunStub(verdicts)
-    scripts = ScriptStub()
+    scripts = ScriptStub(repo)
     local = RealCommitSealer(repo)
     # Every stage the plugin does not seal. `acceptance` is among them even
     # though it appears in the dispatch schema's stage enum.
@@ -219,9 +235,9 @@ class TestTheWholePipelineComposes:
         assert [entry["stage"] for entry in result["history"]] == [
             "configure",
             "implement",
+            "acceptance",
             "continuous_review",
             "final_review",
-            "acceptance",
             "human_gate",
             "merger",
         ]
@@ -301,7 +317,9 @@ class TestTheDefaultsMakeItRunnable:
             scripts={"human_gate": ScriptStub()},
             launcher=AgentRunStub({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}),
         )
-        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        # publish_merge is off by default, so the real merger seals a
+        # prepared -- not merged -- result, and the run ends "prepared".
+        assert result["terminal"] == TERMINAL_PREPARED, result["terminal_reason"]
         assert (repo / RUN_CONFIG_PATH).is_file()
         assert (repo / ACCEPTANCE_PATH).is_file()
 
@@ -426,7 +444,7 @@ class TestWaitingOnAHumanAndComingBack:
         )
         result = self._run(config, board, resume=True)
 
-        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        assert result["terminal"] == TERMINAL_PREPARED, result["terminal_reason"]
         assert result["awaiting"] is None
         # The verdict outlives the run: an assembled pipeline seals it into
         # the product tree without the caller asking for it.
@@ -536,7 +554,7 @@ class TestWaitingOnAHumanAndComingBack:
             resume=True,
         )
         assert launcher.dispatched == [], "a resume must not re-dispatch a sealed stage"
-        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        assert result["terminal"] == TERMINAL_PREPARED, result["terminal_reason"]
         assert result["gate_refused"] is None
         sealed = json.loads((repo / GATE_PATH.format(generation=1)).read_text(encoding="utf-8"))
         assert sealed["decision"] == "APPROVE"
@@ -578,7 +596,7 @@ class TestWaitingOnAHumanAndComingBack:
             raw={},
         )
         result = self._run(config, board, resume=True)
-        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        assert result["terminal"] == TERMINAL_PREPARED, result["terminal_reason"]
 
         scraped = parse(
             (tmp_path / "textfile" / "cost-obs-dev-001.prom").read_text(encoding="utf-8")
@@ -616,6 +634,7 @@ class TestARestartedGenerationKeepsItsCostFacts:
             run_root=run_root,
             remote_url="",
             remote_ref="refs/heads/dev-001",
+            audit_ref="refs/heads/dd/dev-001",
             target_base_commit="b" * 40,
             root_handoff_digest="sha256:" + "c" * 64,
             plugin_binding=object(),
@@ -663,7 +682,7 @@ class TestARestartedGenerationKeepsItsCostFacts:
             gate_card_entity_id="card-1",
             launcher=AgentRunStub({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}),
         )
-        assert result["terminal"] == TERMINAL_COMPLETE, result["terminal_reason"]
+        assert result["terminal"] == TERMINAL_PREPARED, result["terminal_reason"]
 
         scraped = parse((textfile / "cost-obs-dev-001.prom").read_text(encoding="utf-8"))
         # launch and both reviews survive the fresh generation's overwrite; the
@@ -717,7 +736,7 @@ class TestRePrepareClearsARemnantBeforeTheRetry:
                 return super().wait(ticket, **kwargs)
 
         launcher = RemnantThenSucceed()
-        scripts = ScriptStub()
+        scripts = ScriptStub(repo)
         local = RealCommitSealer(repo)
         unsealed = {name: local for name, stage in LIFECYCLE.stages.items() if not stage.is_llm}
         config = make_config(repo, tmp_path)
@@ -776,3 +795,29 @@ class TestTheRunLeavesArtifactsBehind:
             entry["stage"] for entry in result["history"]
         ]
         assert all(entry["at"] for entry in lines)
+
+    def test_a_failed_event_write_fails_the_run_loudly(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        """Spec L7: the events trail is the run's state model, not disposable
+        telemetry. A write failure to ``events.jsonl`` must fail the run loudly
+        -- never be swallowed so the pipeline migrates state with its evidence
+        lost."""
+        from fleet_graph.graphs.dd_runner import EVENTS_FILE, EventPersistenceError
+
+        config = make_config(repo, tmp_path)
+        # Force the append to events.jsonl to fail: pre-create it as a directory.
+        (config.run_root / EVENTS_FILE).mkdir(parents=True)
+        scripts = ScriptStub(repo)
+        local = RealCommitSealer(repo)
+        unsealed = {name: local for name, stage in LIFECYCLE.stages.items() if not stage.is_llm}
+
+        with pytest.raises(EventPersistenceError):
+            run_pipeline(
+                config,
+                scripts={name: scripts for name, s in LIFECYCLE.stages.items() if not s.is_llm},
+                materializers=unsealed,
+                launcher=AgentRunStub(
+                    {"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}
+                ),
+            )

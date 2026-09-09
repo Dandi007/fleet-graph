@@ -248,6 +248,14 @@ def admit(
         spec_text=SPEC + "\n```dd-gate-policy\nlegacy-six-v1\n```\n",
         dispatched_by=PRINCIPAL,
     )
+    # The gate's validity binding measures the committed run-config (spec L3);
+    # commit one into the subject repo after admission bootstraps the spec.
+    (repo / ".dev-dispatch" / "run-config.json").parent.mkdir(parents=True, exist_ok=True)
+    (repo / ".dev-dispatch" / "run-config.json").write_text(
+        '{"acceptance_commands": [["true"]]}', encoding="utf-8"
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "run-config")
     return plane, str(created["development_id"]), repo
 
 
@@ -542,6 +550,8 @@ class ReworkRetryActor:
             event = "APPROVE" if dispatch["attempt"] >= 2 else "REJECT"
         if stage.id == "final_review":
             event = "APPROVE"
+        if stage.id == "merger":
+            event = "MERGED"
         return StageOutcome(
             event=event,
             receipt={
@@ -573,6 +583,8 @@ class FlakyImplementActor:
                     detail="provider down",
                 )
         event = "APPROVE" if stage.id in ("continuous_review", "final_review") else SPINE_EVENT
+        if stage.id == "merger":
+            event = "MERGED"
         return StageOutcome(
             event=event,
             receipt={
@@ -623,7 +635,7 @@ class TestDefectThreeReceiptParentAnchorsLatestChainHead:
         actor = ReworkRetryActor(lifecycle)
         sealer = RecordingSealer()
 
-        state = run_walker(make_deps(lifecycle, actor, sealer, max_rework=4, max_retries=2))
+        state = run_walker(make_deps(lifecycle, actor, sealer, max_retries=2))
 
         assert state.get("terminal") == "complete", state.get("terminal_reason")
 

@@ -93,10 +93,26 @@ TERMINAL_FAILED = "failed"
 TERMINAL_REFUSED = "refused"
 TERMINAL_BOUNDS = "bounds"
 TERMINAL_FAULT = "fault"
+# The terminal kind a prepared-only merge lands in. The contract declares this
+# kind on the merger's PREPARED edge; the walker carries it through verbatim,
+# so a PREPARED result is recorded and observed as "prepared", never as the
+# "complete" a measured merge produces (spec L6: PREPARED is not a merge).
+TERMINAL_PREPARED = "prepared"
 
-# Terminal codes minted by the walker itself, for the two bounds exits. They
-# are not in the contract's failure taxonomy because the contract declares no
-# bound of its own (PipelineBounds' docstring); each names exactly one cause.
+# The terminal kind a typed target-competition merge refusal lands in (spec
+# L6). A target that advanced under the order is neither a content conflict
+# nor a generic refusal: it is the line's cue to re-run configure from the new
+# head (the control plane's `spec_conflict` / `reconfigure` exit), so the run
+# record carries a distinct, named terminal kind instead of burying the
+# distinction inside a plain `refused`. The stage actor selects it by raising
+# a ``StageRefused`` with ``terminal_kind`` set; the walker only carries it
+# through verbatim, it never classifies the feedback itself.
+TERMINAL_TARGET_COMPETITION = "target_competition"
+
+# Terminal codes minted historically by the walker's now-removed business
+# bounds. Business rework is unbounded (spec L2); these codes survive only so
+# the control plane's failure classification can keep naming legacy results
+# that carried them. The walker itself no longer mints them.
 REWORK_LIMIT_REACHED = "REWORK_LIMIT_REACHED"
 STEP_LIMIT_REACHED = "STEP_LIMIT_REACHED"
 
@@ -122,6 +138,12 @@ class StageRefused(RuntimeError):
     gate's awaiting ticket so the suspended state still reports which question
     note is holding the line; a resumable refusal without a ticket degrades to
     a plain suspension.
+
+    `terminal_kind` lets the raising stage name a distinct terminal kind for its
+    refusal when "refused" is the wrong label for it -- a target-competition
+    merge refusal wants `target_competition`, not a generic refusal (spec L6).
+    The walker never classifies the feedback itself; it carries the stage's
+    chosen kind through verbatim, so a refusal without one stays `refused`.
     """
 
     def __init__(
@@ -131,11 +153,13 @@ class StageRefused(RuntimeError):
         code: str = "",
         resumable: bool = False,
         ticket: dict[str, Any] | None = None,
+        terminal_kind: str = "",
     ) -> None:
         super().__init__(message)
         self.code = code
         self.resumable = resumable
         self.ticket = ticket
+        self.terminal_kind = terminal_kind
 
 
 @dataclass(frozen=True)
@@ -187,6 +211,12 @@ class Sealed:
     # commits whatever the stage left behind leaves this None, so the stage's
     # own report still has to survive output_verify.
     produced: tuple[str, ...] | None = None
+    # The version-bound validity key (spec L3/L7) the sealer measured and
+    # sealed with this stage's output. None when no validity binding is wired,
+    # which keeps the seal schema untouched. When present it is recorded on the
+    # raw-event boundary so a later stage can re-measure and detect which input
+    # moved -- the walker invents nothing here, it only observes the sealer.
+    validity: Any = None
 
 
 class Materializer(Protocol):
@@ -236,10 +266,16 @@ class Replayer(Protocol):
 
 @dataclass(frozen=True)
 class PipelineBounds:
-    """Pure counting, INV-8 style. The contract declares no bound of its own."""
+    """Infrastructure-only bounds. Business progress is unbounded (spec L2).
 
-    max_steps: int = 40
-    max_rework: int = 6
+    A reject verdict -- acceptance, CR, FR, the gate, or a code-changing merge
+    feedback -- re-enters the same DD at implement and increments the attempt;
+    there is no cap on how many times. What stays bounded is what is genuinely
+    infrastructure: the per-call retry of a retryable failure (provider
+    unavailable, transport exhaustion). Per-call timeouts are owned by the
+    actors and scripts that set them, not by the walker.
+    """
+
     max_retries: int = 2
 
 
@@ -393,6 +429,51 @@ def _transport_exhausted_outcome(stage_id: str, exhausted: TransportExhausted) -
     )
 
 
+def _validity_record(validity: Any) -> dict[str, Any]:
+    """The shape a sealed validity key is recorded in on the raw-event boundary.
+
+    A sealer hands back either a ``ValidityKey`` (digest + bound fields) or a
+    plain dict carrying those same facts. The walker records it verbatim --
+    it does not re-measure and does not invent a digest -- so the event trail
+    names exactly what the sealer bound, no more, no less.
+    """
+    if hasattr(validity, "digest") and hasattr(validity, "fields"):
+        return {"digest": validity.digest, "fields": validity.fields}
+    if isinstance(validity, dict):
+        return dict(validity)
+    return {"value": str(validity)}
+
+
+#: The opaque runtime run/session/receipt references a sealed receipt carries.
+#: Spec L7: the raw-event boundary must preserve the complete traceability --
+#: the Runtime run/session/receipt refs -- not just the stage/attempt/commit.
+#: These are the field names; anything absent from a given receipt is simply
+#: omitted, so the walker invents no reference and elides none that exists.
+_RECEIPT_REF_KEYS = (
+    "attempt_id",
+    "materialization_intent_id",
+    "actor_job_id",
+    "review_id",
+    "reviewer_job_id",
+    "work_head_commit",
+    "subject_commit",
+    "implementation_subject_commit",
+    "implementation_handoff_receipt_digest",
+    "parent_handoff_receipt_digest",
+)
+
+
+def _receipt_refs(receipt: Any) -> dict[str, Any]:
+    """The opaque runtime run/session/receipt refs present on a sealed receipt.
+
+    Never invents a reference: only fields the sealer actually wrote are
+    carried, so the event trail names exactly what the sealer bound.
+    """
+    if not isinstance(receipt, dict):
+        return {}
+    return {key: receipt[key] for key in _RECEIPT_REF_KEYS if key in receipt}
+
+
 def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
     lifecycle = deps.lifecycle
 
@@ -487,8 +568,11 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         `_terminal`, exactly as for the other non-complete terminals.
         """
         code = getattr(refused, "code", "")
+        # A refusal may name a distinct terminal kind (spec L6 target
+        # competition); the walker carries it through, never classifying it.
+        kind = getattr(refused, "terminal_kind", "") or TERMINAL_REFUSED
         return {
-            **_terminal(state, TERMINAL_REFUSED, str(refused), code=code),
+            **_terminal(state, kind, str(refused), code=code),
             "steps": steps,
             "history": _record(
                 state,
@@ -508,19 +592,16 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             return _terminal(state, TERMINAL_FAULT, f"unknown stage {stage_id!r}", fault=True)
 
         steps = state.get("steps", 0) + 1
-        if steps > deps.bounds.max_steps:
-            return _terminal(
-                state,
-                TERMINAL_BOUNDS,
-                f"step limit {deps.bounds.max_steps} reached",
-                code=STEP_LIMIT_REACHED,
-            )
 
         dispatch: Dispatch = _dispatch_for(state, stage)
         artifacts = dict(state.get("artifacts", {}))
         digests = dict(state.get("receipt_digests", {}))
         outcome: StageOutcome | None = None
         head_commit = state.get("head_commit", "")
+        # The validity key the sealer measured for this stage's output (spec
+        # L3/L7), None when no materializer carries a validity binding. It is
+        # recorded on the raw-event boundary only, never invented by the walker.
+        sealed_validity: Any = None
 
         if deps.replayer is not None:
             replayed = deps.replayer.replay(stage, dispatch)
@@ -551,6 +632,16 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                             "attempt": dispatch["attempt"],
                             "output_commit": replayed.output_commit,
                             "replayed": True,
+                            **(
+                                {"receipt_digest": digests.get(stage.id)}
+                                if digests.get(stage.id)
+                                else {}
+                            ),
+                            **(
+                                {"receipt_refs": _receipt_refs(replayed.receipt)}
+                                if _receipt_refs(replayed.receipt)
+                                else {}
+                            ),
                         },
                     ),
                 }
@@ -614,6 +705,7 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                 try:
                     sealed = deps.materializer.materialize(stage, dispatch, outcome)
                     head_commit = sealed.commit
+                    sealed_validity = getattr(sealed, "validity", None)
                     if sealed.receipt is not None:
                         # The sealer attested; its account supersedes the
                         # actor's claim for every downstream binding.
@@ -692,6 +784,14 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             if isinstance(outcome.receipt, dict) and "rebase" in outcome.receipt
             else None
         )
+        # Spec L7: the raw-event boundary carries the sealed receipt's digest
+        # and its opaque Runtime run/session/receipt refs, so a later stage (or
+        # a recovery pass) can re-trace exactly which receipt and which run this
+        # history entry was sealed under -- not just which stage and commit.
+        receipt_digest = digests.get(stage.id)
+        if not receipt_digest and isinstance(carried_receipt, dict) and carried_receipt:
+            receipt_digest = compute_json_digest(carried_receipt)
+        receipt_refs = _receipt_refs(carried_receipt)
         return {
             "steps": steps,
             "artifacts": artifacts,
@@ -719,7 +819,14 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
                     "event": outcome.event,
                     "attempt": dispatch["attempt"],
                     "output_commit": head_commit,
+                    **(
+                        {"validity": _validity_record(sealed_validity)}
+                        if sealed_validity is not None
+                        else {}
+                    ),
                     **({"rebase": rebase_record} if rebase_record is not None else {}),
+                    **({"receipt_digest": receipt_digest} if receipt_digest else {}),
+                    **({"receipt_refs": receipt_refs} if receipt_refs else {}),
                     **(
                         {
                             "failure_code": outcome.failure_code,
@@ -742,11 +849,6 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
         event = state.get("last_event", "")
         receipt = state.get("last_receipt") or None
         failure_code = str(state.get("last_failure_code", ""))
-
-        if lifecycle.is_terminal(stage_id):
-            if deps.cost_plane is not None and state.get("development_id"):
-                deps.cost_plane.record_settlement(order_id=str(state.get("development_id")))
-            return _terminal(state, TERMINAL_COMPLETE, f"{stage_id} is the last declared stage")
 
         exit_ = lifecycle.failure_transition(stage_id, event)
         # Egress layering (spec 交付面 2/4): a transport-rooted failure keeps
@@ -794,8 +896,29 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             except AmbiguousSpine as ambiguous:
                 return _terminal(state, TERMINAL_FAULT, str(ambiguous), fault=True)
             if successor is None:
+                # A stage with no declared verdict edge and no derived
+                # successor is the last one: reaching it is completion.
+                if lifecycle.is_terminal(stage_id):
+                    if deps.cost_plane is not None and state.get("development_id"):
+                        deps.cost_plane.record_settlement(
+                            order_id=str(state.get("development_id"))
+                        )
+                    return _terminal(state, TERMINAL_COMPLETE, f"{stage_id} is the last stage")
                 return _terminal(state, TERMINAL_FAULT, str(exc), fault=True)
             return {"stage": successor, "mode": state.get("mode", MODE_INITIAL)}
+
+        if transition.terminal:
+            # A terminal transition ends the run in the kind the contract
+            # declares -- "complete" for a measured merge, "prepared" for a
+            # prepared-only result. The walker carries the kind through
+            # verbatim, so it can tell the two apart without knowing either
+            # by name (spec L6). Whichever end it is, the order's management
+            # lifecycle is over, so its spend is settled exactly once.
+            if deps.cost_plane is not None and state.get("development_id"):
+                deps.cost_plane.record_settlement(order_id=str(state.get("development_id")))
+            return _terminal(
+                state, transition.terminal, f"{stage_id} {event}", code=""
+            )
 
         if not transition.is_rework:
             # `inherit` means what it says: an attempt that entered as rework
@@ -807,13 +930,9 @@ def build_dd_pipeline_graph(deps: PipelineDeps) -> StateGraph:
             return {"stage": transition.target, "mode": mode}
 
         rework = state.get("rework_count", 0) + 1
-        if rework > deps.bounds.max_rework:
-            return _terminal(
-                state,
-                TERMINAL_BOUNDS,
-                f"rework limit {deps.bounds.max_rework} reached at {stage_id}",
-                code=REWORK_LIMIT_REACHED,
-            )
+        # No cap here on purpose: business rework is unbounded (spec L2). The
+        # only guard against a runaway run is the recursion backstop the runner
+        # sets, which is a technical limit, not a business verdict.
         return {
             "stage": transition.target,
             "mode": transition.next_mode,
@@ -880,7 +999,9 @@ __all__ = [
     "TERMINAL_COMPLETE",
     "TERMINAL_FAILED",
     "TERMINAL_FAULT",
+    "TERMINAL_PREPARED",
     "TERMINAL_REFUSED",
+    "TERMINAL_TARGET_COMPETITION",
     "Actor",
     "Dispatch",
     "GatePending",

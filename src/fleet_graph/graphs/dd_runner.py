@@ -55,6 +55,13 @@ from fleet_graph.state.run_artifacts import iso, write_json_durable
 # The root input every stage requires and no stage produces.
 SPEC_ARTIFACT = "spec"
 
+# The walker-level recursion backstop handed to `compiled.invoke`. It is a
+# technical fail-closed limit (a graph that never settles must error, not spin
+# forever), deliberately unconnected to business progress: reject->rework
+# cycles are unbounded by contract (spec L2), and this only stops a graph that
+# has genuinely lost its way.
+RECURSION_BACKSTOP = 100_000
+
 # Run artifacts the control plane's read side assembles from. One name each,
 # defined here where they are written.
 EVENTS_FILE = "events.jsonl"
@@ -104,6 +111,17 @@ class ReworkDecisionUnbound(RuntimeError):
         self.unbound = list(unbound)
 
 
+class EventPersistenceError(RuntimeError):
+    """A raw-event write to ``events.jsonl`` failed and must not be swallowed.
+
+    The events trail is the run's state model, not disposable telemetry (spec
+    L7): a run that cannot record its own evidence must fail loudly rather than
+    migrate state on an untraceable basis. Raising here is the "report the
+    failure" half of the L7 contract; the runner lets it escape so the run ends
+    as a fault instead of continuing as if nothing was lost.
+    """
+
+
 class ReworkReplayRefused(RuntimeError):
     """A gate-rework generation the engine cannot assemble real work for.
 
@@ -140,8 +158,6 @@ class DevelopmentConfig:
     timeouts: dict[str, int] = field(default_factory=dict)
     models: dict[str, str] = field(default_factory=dict)
     checkpoint_path: str = ":memory:"
-    max_steps: int = 40
-    max_rework: int = 6
     max_retries: int = 2
     verify_worktree_head: bool = True
     #: Auto re-prepare before a fresh attempt: when a previous attempt of a
@@ -277,21 +293,30 @@ def build_pipeline(
         # the roots helper does not recognize replays nothing.
         prior_roots = prior_generation_state_roots(config.run_root, config.generation)
         if prior_roots:
+            # The current generation's launch facts the validity key binds: the
+            # durable merge target and the PR head/base pair. The replayer loads
+            # the previously sealed validity key and re-verifies these, so a
+            # target or PR change between generations invalidates the affected
+            # replayed stages rather than reusing the old receipts (spec L3/L4).
+            merge_head = config.audit_ref
             replayer = ReceiptReplayer(
                 workspace=config.workspace_path,
                 state_root=config.state_root,
                 prior_state_roots=prior_roots,
                 development_id=config.development_id,
                 generation=config.generation,
-                remote_url=config.remote_url,
-                # The seals being replayed live on the audit branch
-                # (publish_ref); verifying and re-publishing the chain must
-                # target the same ref or a line dispatch's replay would land
-                # receipts on the release branch and advance it past the
-                # frozen base.
-                remote_ref=publish_ref,
                 lifecycle=lifecycle,
                 run_config=dict(config.run_config or {}),
+                target_identity=config.remote_ref,
+                pr_identity=(
+                    f"{merge_head}->{config.remote_ref}"
+                    if (merge_head and config.remote_ref)
+                    else ""
+                ),
+                # The replayer's validity-evidence refusals are recorded on the
+                # same raw-event boundary the pipeline writes its history to, so
+                # a restarted generation's recovery is traceable (spec L7).
+                observe=observe,
             )
 
     builder = StageDispatchBuilder(
@@ -348,6 +373,11 @@ def build_pipeline(
         target=MaterializationTarget(
             remote_url=config.remote_url,
             remote_ref=publish_ref,
+            # The durable merge target and the order-private audit branch, so the
+            # validity key the sealer binds closes over the real target identity
+            # and PR head/base pair (spec L3) instead of leaving them empty.
+            target_ref=config.remote_ref,
+            audit_ref=config.audit_ref,
             worktree=str(config.workspace_path),
             state_root=str(config.state_root),
         ),
@@ -462,11 +492,7 @@ def build_pipeline(
         # owns; launch/review/promotion are emitted by their actors.
         cost_plane=cost_plane,
         management_cost=config.management_cost,
-        bounds=PipelineBounds(
-            max_steps=config.max_steps,
-            max_rework=config.max_rework,
-            max_retries=config.max_retries,
-        ),
+        bounds=PipelineBounds(max_retries=config.max_retries),
         clock=clock or time.time,
     )
     return build_dd_pipeline_graph(deps), deps
@@ -521,9 +547,13 @@ def run_pipeline(
             with events_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps({"at": iso(now()), **entry}, ensure_ascii=False) + "\n")
                 handle.flush()
-        except OSError:
-            # Observability must not fail the work it observes.
-            pass
+        except OSError as exc:
+            # The raw-event trail is the run's state model (spec L7): a write
+            # failure must not be swallowed, or the pipeline would migrate
+            # state with its evidence lost. Fail loudly instead.
+            raise EventPersistenceError(
+                f"failed to persist raw event to {events_path}: {type(exc).__name__}: {exc}"
+            ) from exc
 
     graph, deps = build_pipeline(
         config,
@@ -573,8 +603,10 @@ def run_pipeline(
             start,
             config={
                 "configurable": {"thread_id": config.thread_id},
-                # The bounds are the real limit; this is a runaway backstop.
-                "recursion_limit": config.max_steps * 4 + 20,
+                # A technical runaway backstop, not a business bound: business
+                # rework is unbounded (spec L2), but a graph that never settles
+                # must still fail closed rather than recurse forever.
+                "recursion_limit": RECURSION_BACKSTOP,
             },
         )
 
@@ -642,6 +674,7 @@ __all__ = [
     "REWORK_REPLAY_REFUSED",
     "SPEC_ARTIFACT",
     "DevelopmentConfig",
+    "EventPersistenceError",
     "ReworkDecisionUnbound",
     "ReworkReplayRefused",
     "awaiting_decision",

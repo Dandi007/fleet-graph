@@ -47,7 +47,7 @@
     "merge_result": {
       "path_pattern": ".dev-dispatch/merge/result-g{generation}.json",
       "required_fields": {
-        "result": ["MERGED", "PREPARED"]
+        "result": ["MERGED", "PREPARED", "REJECT"]
       }
     },
     "attempt_context_development": {
@@ -122,7 +122,7 @@
       }
     },
     "continuous_review": {
-      "required": ["spec", "implementation_evidence"],
+      "required": ["spec", "acceptance_result"],
       "produced": ["continuous_verdict", "feedback"],
       "failure_outputs": ["review_stage_failure"],
       "protocol_artifacts": {
@@ -162,8 +162,8 @@
         }
       }
     },
-    "acceptance": {"required": ["spec"], "produced": ["acceptance_result"]},
-    "human_gate": {"required": ["acceptance_result"], "produced": ["gate_decision"]},
+    "acceptance": {"required": ["spec", "product_code"], "produced": ["acceptance_result"]},
+    "human_gate": {"required": ["final_verdict"], "produced": ["gate_decision"]},
     "merger": {"required": ["gate_decision"], "produced": ["merge_result"]}
   }
 }

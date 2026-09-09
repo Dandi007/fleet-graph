@@ -420,6 +420,79 @@ class TestRecoveryReentry:
         assert resume["launch_failure"]
 
 
+class TestRecoveryValidityBinding:
+    """Spec L3/L4/L5: the recovery trail binds the version-bound validity key.
+
+    The decision is sealed against the product/Spec/acceptance-context/target/PR
+    facts measured out of real git at record time; the file-backed trail persists
+    that digest; and a resume only proceeds while the current facts still
+    reproduce it.
+    """
+
+    def test_the_sealed_validity_digest_survives_the_trail_round_trip(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        board = BoardDouble()
+        board.decision = _alice_decision()
+        plane = make_plane(tmp_path, board)
+        dev = plane.create(str(repo), spec_text=SPEC)["development_id"]
+        target = head(repo)
+
+        recovered = plane.recover(dev, target_ref=target, question_note_id="note-1")
+        digest = recovered["recovery"]["validity_digest"]
+        assert digest.startswith("sha256:"), "the decision must bind a validity digest"
+
+        # The digest is persisted and re-read off the file-backed trail, not
+        # reconstructed from the in-memory seal.
+        restored = plane._load_recovery_exit(dev).records()[0]
+        assert restored.validity_digest == digest
+        assert plane.recoveries(dev)["recoveries"][0]["validity_digest"] == digest
+
+    def test_a_recovery_resumes_while_the_product_is_unchanged(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        board = BoardDouble()
+        board.decision = _alice_decision()
+        active: set[str] = set()
+        plane = make_plane(tmp_path, board, unit_probe=lambda unit: unit in active)
+        dev = plane.create(str(repo), spec_text=SPEC)["development_id"]
+        target = head(repo)
+
+        first = plane.recover(dev, target_ref=target, question_note_id="note-1")
+        active.add(first["resume"]["unit"])
+
+        again = plane.recover(dev, target_ref=target, question_note_id="note-1")
+        assert again["resume"]["already_running"] is True
+        assert again["resume"]["launched"] is False
+
+    def test_a_recovery_refuses_to_resume_when_the_product_moved(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        board = BoardDouble()
+        board.decision = _alice_decision()
+        launcher = Recorder()
+        plane = make_plane(tmp_path, board, launcher=launcher)
+        dev = plane.create(str(repo), spec_text=SPEC)["development_id"]
+        target = head(repo)
+
+        first = plane.recover(dev, target_ref=target, question_note_id="note-1")
+        assert first["resume"]["resumed"] is True
+        assert launcher.specs
+
+        # The product moves after the decision was cast: the recorded recovery
+        # no longer binds the current facts, so the resume refuses fail-closed
+        # instead of relaunching against a version it never authorised.
+        (repo / "greet.py").write_text('def greet():\n    return "hi"\n', encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "product moved")
+
+        with pytest.raises(ControlPlaneError) as refused:
+            plane.recover(dev, target_ref=target, question_note_id="note-1")
+        assert refused.value.code == "RECOVERY_STALE"
+        # No second launch, and the trail still holds exactly one decision.
+        assert len(plane.recoveries(dev)["recoveries"]) == 1
+
+
 class TestB3EvidenceChainIsBoundToTheTrail:
     def test_the_chain_is_assembled_from_the_real_artifacts(
         self, repo: Path, tmp_path: Path

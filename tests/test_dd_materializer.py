@@ -67,6 +67,11 @@ def make_materializer(repo: Path) -> PluginMaterializer:
         target=MaterializationTarget(
             remote_url="https://example.invalid/repo.git",
             remote_ref="refs/heads/dev-001",
+            # The complete validity key (spec L3) binds a real durable merge
+            # target and a PR head/base pair; the seal refuses when either is
+            # absent, so the shared fixture models a bound target/PR.
+            target_ref="refs/heads/release/self",
+            audit_ref="refs/heads/dd/dev-fg-1",
             worktree=str(repo),
             state_root=str(repo / ".state"),
         ),
@@ -350,6 +355,9 @@ class TestReadingWhatTheSealerReturned:
     def _sealed(self, repo: Path, result: dict[str, Any], monkeypatch: Any, stage: Any = IMPLEMENT):
         monkeypatch.setattr(plugin_adapter, "invoke_implement_materializer", lambda *a, **k: result)
         monkeypatch.setattr(plugin_adapter, "invoke_review_materializer", lambda *a, **k: result)
+        # The fake ``output_commit`` is not a real git object; the validity key
+        # (fail-closed, spec L3) is exercised by its own test, not here.
+        monkeypatch.setattr(PluginMaterializer, "_validity_key", lambda self, c: {"stubbed": c})
         receipt = applied_receipt() if stage is IMPLEMENT else review_receipt()
         return make_materializer(repo).materialize(
             stage, dispatch_for(repo, stage.id), StageOutcome(receipt=receipt)
@@ -423,6 +431,7 @@ class TestReadingWhatTheSealerReturned:
 
         monkeypatch.setattr(plugin_adapter, "invoke_implement_materializer", implement_seal)
         monkeypatch.setattr(plugin_adapter, "invoke_review_materializer", review_seal)
+        monkeypatch.setattr(PluginMaterializer, "_validity_key", lambda self, c: {"stubbed": c})
 
         materializer = make_materializer(repo)
         dispatch = dispatch_for(repo, "continuous_review")
@@ -430,6 +439,88 @@ class TestReadingWhatTheSealerReturned:
         sealed = materializer.materialize(REVIEW, dispatch, StageOutcome(receipt=review_receipt()))
         assert called == ["review"]
         assert sealed.receipt is not None and sealed.receipt["verdict"] == "APPROVE"
+
+
+class TestTheValidityKeyIsPersistedFailClosed:
+    def test_a_failed_validity_write_aborts_the_seal(self, repo: Path) -> None:
+        """Spec L3: the sealed validity key is the replayer's re-verify evidence,
+        so a lost write must fail the materialization visibly (and retryably),
+        not let a stage seal with no verifiable binding on disk."""
+        block = repo / "blocked"
+        block.write_text("a file, not a directory", encoding="utf-8")
+        materializer = PluginMaterializer(
+            builder=StageDispatchBuilder(
+                DevelopmentChain(
+                    development_id=DEVELOPMENT_ID,
+                    workspace_path=str(repo),
+                    target_base_commit="b" * 40,
+                    root_handoff_digest="sha256:" + "c" * 64,
+                )
+            ),
+            binding=object(),
+            target=MaterializationTarget(
+                remote_url="https://example.invalid/repo.git",
+                remote_ref="refs/heads/dev-001",
+                worktree=str(repo),
+                state_root=str(block),
+            ),
+        )
+        with pytest.raises(MaterializationFailed, match="VALIDITY_PERSIST_FAILED") as failed:
+            materializer._persist_validity(
+                IMPLEMENT, dispatch_for(repo, "implement"), "9" * 40, {"stubbed": "9" * 40}
+            )
+        assert failed.value.retryable is True
+
+    def test_a_clean_validity_write_succeeds(self, repo: Path) -> None:
+        """The fail-closed write is not blanket refusal: a writable state root
+        still persists the key beside the receipt."""
+        materializer = make_materializer(repo)
+        materializer._persist_validity(
+            IMPLEMENT, dispatch_for(repo, "implement"), "9" * 40, {"stubbed": "9" * 40}
+        )
+        path = (
+            repo
+            / ".state"
+            / "receipts"
+            / derive_attempt_id(DEVELOPMENT_ID, 1, 1)
+            / "implement-validity.json"
+        )
+        assert path.is_file()
+        persisted = json.loads(path.read_text(encoding="utf-8"))
+        assert persisted["stage"] == "implement"
+        assert persisted["output_commit"] == "9" * 40
+        assert persisted["validity"] == {"stubbed": "9" * 40}
+
+    def test_a_seal_with_an_unknown_target_or_pr_is_refused(self, repo: Path) -> None:
+        """Spec L3: a complete validity key must bind a real target and PR
+        head/base pair. An unset ``target_ref``/``audit_ref`` makes the binding
+        incomplete, so the seal refuses instead of minting "" facts -- even
+        though the git facts, SPEC and run-config are all readable."""
+        run_config = repo / ".dev-dispatch" / "run-config.json"
+        run_config.parent.mkdir(parents=True, exist_ok=True)
+        run_config.write_text('{"acceptance_commands": [["true"]]}\n', encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "run-config")
+
+        materializer = PluginMaterializer(
+            builder=StageDispatchBuilder(
+                DevelopmentChain(
+                    development_id=DEVELOPMENT_ID,
+                    workspace_path=str(repo),
+                    target_base_commit="b" * 40,
+                    root_handoff_digest="sha256:" + "c" * 64,
+                )
+            ),
+            binding=object(),
+            target=MaterializationTarget(
+                remote_url="https://example.invalid/repo.git",
+                remote_ref="refs/heads/dev-001",
+                worktree=str(repo),
+                state_root=str(repo / ".state"),
+            ),
+        )
+        with pytest.raises(MaterializationFailed, match="VALIDITY_BINDING_FAILED"):
+            materializer._validity_key(head(repo))
 
 
 class TestTheParentReceiptIsTheOneTheContractNames:
@@ -503,6 +594,16 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
         write_index(repo, entries=entries, development_id=DEVELOPMENT_ID)
         git(repo, "add", "-A")
         git(repo, "commit", "-q", "-m", "index")
+
+    def _commit_run_config(self, repo: Path) -> None:
+        """Commit a run-config so the materializer's validity key can bind the
+        measured acceptance-context revision (spec L3: fail-closed, complete)."""
+        (repo / ".dev-dispatch" / "run-config.json").parent.mkdir(parents=True, exist_ok=True)
+        (repo / ".dev-dispatch" / "run-config.json").write_text(
+            '{"acceptance_commands": [["true"]]}', encoding="utf-8"
+        )
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "run-config")
 
     def _scope_and_commit(self, repo: Path, generation: int) -> None:
         """What configure does for a fresh generation, then committed."""
@@ -594,6 +695,7 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
         dispatch = dispatch_for(repo, "continuous_review")
         dispatch["generation"] = 2
         seal_implement_receipt(repo, derive_attempt_id(DEVELOPMENT_ID, 2, 1))
+        self._commit_run_config(repo)
         self._seal_via_carrier(monkeypatch)
 
         sealed = make_materializer(repo).materialize(
@@ -644,6 +746,7 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
         )
         dispatch = dispatch_for(repo, "continuous_review", attempt=2)
         seal_implement_receipt(repo, derive_attempt_id(DEVELOPMENT_ID, 1, 2))
+        self._commit_run_config(repo)
         self._seal_via_carrier(monkeypatch)
 
         sealed = make_materializer(repo).materialize(

@@ -36,8 +36,16 @@ from fleet_graph.dd.egress import (
 )
 from fleet_graph.dd.feedback_scope import scope_index_for_generation
 from fleet_graph.dd.git import run_git
+from fleet_graph.dd.merge_feedback import (
+    MergeFeedback,
+    MergeFeedbackKind,
+    classify_merge_feedback,
+    merge_event,
+    requires_rework,
+)
 from fleet_graph.dd.vendor import git_ops
 from fleet_graph.graphs.dd_pipeline import (
+    TERMINAL_TARGET_COMPETITION,
     Dispatch,
     PipelineFault,
     Sealed,
@@ -393,10 +401,13 @@ class ConfigureStage:
 class AcceptanceStage:
     """Runs the declared acceptance commands and records what they did.
 
-    A failing command refuses the pipeline rather than faulting it: the run
-    happened, the answer was no. The contract declares no failure edge out of
-    acceptance, and inventing one to express "the tests failed" would be
-    reading meaning the contract does not carry.
+    A failing command is a business REJECT (spec L2): the run happened, the
+    answer was no, and the stage returns it to implement as rework -- the same
+    DD, the next attempt -- rather than ending the pipeline. Acceptance failure
+    therefore blocks continuous review (spec L1), because review never runs on
+    work that did not pass. Environment/declaration problems (a missing run
+    config, a tampered declaration, a failed setup) remain refusals: they are
+    not a verdict on the work.
 
     **The operator's declaration is the authority, not the file in the
     worktree.** The implementer's role grants it `write: [worktree_path]`, so
@@ -495,8 +506,36 @@ class AcceptanceStage:
             "stderr_tail": (proc.stderr or "")[-2000:],
         }
 
+    def _sandbox_unavailable(self) -> bool:
+        """The isolated acceptance sandbox cannot run at all.
+
+        A bounded environment fact, typed distinctly from a business reject
+        (spec L2: non-recoverable infrastructure errors stay bounded). bwrap
+        present but forbidden to create namespaces fails fast here, before any
+        acceptance command runs, so a broken sandbox refuses the run instead of
+        masquerading as a failing test and re-entering implement forever.
+        """
+        try:
+            from fleet_graph.executors.sandbox import git_write_paths, sandbox_argv
+
+            argv = sandbox_argv(["true"], writable=git_write_paths(self.repo))
+        except (OSError, FileNotFoundError, ValueError, ImportError):
+            return True
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return True
+        return proc.returncode != 0
+
     def act(self, stage: Any, dispatch: Dispatch) -> StageOutcome:
         declared = self.commands()
+        commands_to_run = [list(command) for command in self.setup if command] + declared
+        if self.isolated and commands_to_run and self._sandbox_unavailable():
+            raise StageRefused(
+                "acceptance could not run: the isolated sandbox is unavailable "
+                "(bwrap missing or unable to create namespaces)",
+                code="ACCEPTANCE_SANDBOX_UNAVAILABLE",
+            )
 
         setup_results = []
         for command in [list(c) for c in self.setup if c]:
@@ -539,8 +578,38 @@ class AcceptanceStage:
             },
         )
         if failed:
-            raise StageRefused(f"acceptance failed: {failed}", code="ACCEPTANCE_FAILED")
+            # Business rejection, not a fault and not a terminal refusal: the
+            # tests failed, so the work goes back to implement as a REJECT --
+            # the same DD, the next attempt (spec L2). The environment/declaration
+            # problems above stay refusals; this is a verdict on the work itself.
+            # The acceptance record (passed: false) is still sealed, and the
+            # receipt carries the verdict the contract's `acceptance REJECT ->
+            # implement` edge binds against.
+            return StageOutcome(
+                event="REJECT",
+                receipt={
+                    "verdict": "REJECT",
+                    "acceptance_failed": [list(command) for command in failed],
+                    "results": results,
+                },
+                produced=tuple(stage.produced_artifacts),
+            )
         return StageOutcome(produced=tuple(stage.produced_artifacts))
+
+
+class ContentConflict(RuntimeError):
+    """The merge feedback a code change must resolve (spec L6).
+
+    Raised out of the CAS path when the vendored commit operation names a
+    content conflict (``TARGET_UPDATE_REQUIRED``, ``TARGET_MERGE_CONFLICT``,
+    ``REBASE_SPEC_INCOMPATIBLE``). The merge stage turns it into a typed
+    ``REJECT`` event that re-enters implement -- the same DD, the next attempt
+    -- rather than a terminal refusal, and carries the classified feedback so
+    the rework implement sees exactly what must change."""
+
+    def __init__(self, feedback: MergeFeedback) -> None:
+        super().__init__(f"merge requires a code change: {feedback.kind} {feedback.detail}".strip())
+        self.feedback = feedback
 
 
 @dataclass
@@ -584,17 +653,74 @@ class MergeStage:
     evidence: Callable[[dict[str, Any]], None] | None = None
 
     def act(self, stage: Any, dispatch: Dispatch) -> StageOutcome:
-        result = MERGED if self.publish else PREPARED
-        detail: dict[str, Any] = {}
-        if self.publish:
-            detail = self._fast_forward(dispatch)
+        subject = str(dispatch.get("input_commit", ""))
+        try:
+            detail: dict[str, Any] = {}
+            if self.publish:
+                detail = self._fast_forward(dispatch)
+            result = MERGED if self.publish else PREPARED
+        except ContentConflict as conflict:
+            return self._conflict_outcome(stage, dispatch, conflict.feedback)
+        except StageRefused as refused:
+            # The typed distinction is load-bearing: a target race is not a
+            # content conflict, a transport failure is not a verdict. Classify
+            # the refusing code and re-raise with the kind named, so the
+            # refusal that reaches the walker and the control plane carries the
+            # same typed judgement the merge_feedback table produces.
+            feedback = classify_merge_feedback(refused.code, str(refused))
+            kind = feedback.kind
+            # A target that advanced under the order is the line's cue to
+            # reconfigure from the new head -- a distinct terminal, never a
+            # plain refusal and never a content conflict (spec L6). Other
+            # refusals (transport/unknown, already-merged, generic merge
+            # refusal) keep the plain `refused` terminal: transport must not
+            # change the business verdict.
+            terminal_kind = (
+                TERMINAL_TARGET_COMPETITION
+                if kind == MergeFeedbackKind.TARGET_COMPETITION
+                else ""
+            )
+            raise StageRefused(
+                f"[{kind}] {refused}", code=refused.code, terminal_kind=terminal_kind
+            ) from None
 
+        feedback = classify_merge_feedback(result=result)
+        event = merge_event(feedback)
+        if not event:
+            # A merge whose outcome is not a loop-event is a fault of the
+            # classifier, not a success: never report an undifferentiated
+            # merge, and never let the walker invent a transition.
+            raise PipelineFault(
+                f"merge result {result!r} classified as {feedback.kind}; "
+                "no typed merge event to carry"
+            )
+
+        self._write_result(dispatch, result, feedback, detail)
+        return StageOutcome(
+            event=event,
+            receipt={
+                "verdict": result,
+                "output_commit": subject,
+                "merge_feedback": str(feedback.kind),
+                "result": result,
+            },
+            produced=tuple(stage.produced_artifacts),
+        )
+
+    def _write_result(
+        self,
+        dispatch: Dispatch,
+        result: str,
+        feedback: MergeFeedback,
+        detail: dict[str, Any],
+    ) -> None:
         write_json(
             self.repo,
             MERGE_PATH.format(generation=dispatch.get("generation", 1)),
             {
                 "development_id": dispatch.get("development_id", ""),
                 "result": result,
+                "merge_feedback": str(feedback.kind),
                 "subject_commit": dispatch.get("input_commit", ""),
                 "target_ref": self.target_ref,
                 **detail,
@@ -606,7 +732,40 @@ class MergeStage:
                 target_ref=self.target_ref,
                 via="merge",
             )
-        return StageOutcome(produced=tuple(stage.produced_artifacts))
+
+    def _conflict_outcome(
+        self, stage: Any, dispatch: Dispatch, feedback: MergeFeedback
+    ) -> StageOutcome:
+        """The merge feedback a code change must resolve: rework, same DD.
+
+        A content conflict (or any feedback ``requires_code_change``) returns
+        to implement through the contract's ``merger REJECT -> implement``
+        edge -- the same identity, the next attempt, and the merge result
+        recorded so the rework implement can see exactly what must change.
+        """
+        write_json(
+            self.repo,
+            MERGE_PATH.format(generation=dispatch.get("generation", 1)),
+            {
+                "development_id": dispatch.get("development_id", ""),
+                "result": "REJECT",
+                "merge_feedback": str(feedback.kind),
+                "subject_commit": dispatch.get("input_commit", ""),
+                "target_ref": self.target_ref,
+                "requires_code_change": True,
+                "detail": feedback.detail,
+            },
+        )
+        return StageOutcome(
+            event="REJECT",
+            receipt={
+                "verdict": "REJECT",
+                "output_commit": dispatch.get("input_commit", ""),
+                "merge_feedback": str(feedback.kind),
+                "requires_code_change": True,
+            },
+            produced=tuple(stage.produced_artifacts),
+        )
 
     def _retry_kwargs(self) -> dict[str, Any]:
         return {
@@ -626,16 +785,18 @@ class MergeStage:
         return RemoteResult(0, "", head)
 
     def _cas_fast_forward(self, subject: str, observed: str) -> RemoteResult:
-        try:
-            merged = git_ops.cas_fast_forward_target(
-                workspace_path=str(self.repo),
-                remote_url=self.remote_url,
-                target_ref=self.target_ref,
-                expected_target_head_commit=observed,
-                handoff_commit=subject,
-            )
-        except git_ops.ExactWorkspaceError as exc:
-            return RemoteResult(1, str(exc))
+        # The vendored CAS raises ExactWorkspaceError for a repo-layer verdict
+        # (target moved, content must rebase, subject incomplete). We let it
+        # propagate with its structured code -- swallowing it here (as the
+        # pre-L6 path did) would erase the distinction between a target race
+        # and a content conflict downstream.
+        merged = git_ops.cas_fast_forward_target(
+            workspace_path=str(self.repo),
+            remote_url=self.remote_url,
+            target_ref=self.target_ref,
+            expected_target_head_commit=observed,
+            handoff_commit=subject,
+        )
         return RemoteResult(0, "", merged)
 
     def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
@@ -769,6 +930,16 @@ class MergeStage:
                 op_name="cas-fast-forward",
                 **self._retry_kwargs(),
             )
+        except git_ops.ExactWorkspaceError as exc:
+            feedback = classify_merge_feedback(exc.code, str(exc))
+            if requires_rework(feedback):
+                # A content conflict is a code-change feedback: re-enter
+                # implement through the typed REJECT loop, never a refusal that
+                # would silently drop the rework (spec L6).
+                raise ContentConflict(feedback) from exc
+            raise StageRefused(
+                f"merge refused: {feedback.kind}: {exc}", code=exc.code or "MERGE_REFUSED"
+            ) from exc
         except EgressRepoError as exc:
             raise StageRefused(f"merge refused: {exc}", code="MERGE_REFUSED") from exc
         return {"previous_target_head": observed}

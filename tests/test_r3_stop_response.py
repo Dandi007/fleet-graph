@@ -205,6 +205,12 @@ def _gate_workspace(tmp_path: Path, name: str = "gate-subject") -> Path:
     workspace.mkdir(exist_ok=True)
     subprocess.run(["git", "init", "-q", str(workspace)], check=True)
     (workspace / "seed.txt").write_text("seed\n", encoding="utf-8")
+    # The gate's validity binding measures the committed run-config (spec L3),
+    # so the subject workspace carries one.
+    (workspace / ".dev-dispatch").mkdir(parents=True, exist_ok=True)
+    (workspace / ".dev-dispatch" / "run-config.json").write_text(
+        '{"acceptance_commands": [["true"]]}\n', encoding="utf-8"
+    )
     subprocess.run(["git", "-C", str(workspace), "add", "-A"], check=True)
     subprocess.run(
         [
@@ -245,6 +251,10 @@ class FakeGatePlane:
             "state": self.state,
             "dispatched_by": self.dispatched_by,
             "generation": 1,
+            # The gate's validity binding (spec L3) needs a complete target and
+            # PR head/base identity -- an attributed single carries both.
+            "remote_ref": f"refs/heads/release/{self.dispatched_by}",
+            "audit_ref": f"refs/heads/dd/{development_id}",
             "repo_path": str(self.workspace or "/tmp/repo"),
             "worktree_path": str(self.workspace or "/tmp/repo"),
         }

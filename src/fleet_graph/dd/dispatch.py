@@ -51,6 +51,11 @@ from fleet_graph.dd.upstream_constants import (
     ATTEMPT_CONTEXT_CONTRACT_VERSION,
     compute_json_digest,
 )
+from fleet_graph.dd.validity_binding import (
+    BindingFacts,
+    build_validity_binding,
+    measure_acceptance_context_revision,
+)
 from fleet_graph.dd.vendor import git_ops
 
 DISPATCH_SCHEMA_PATH = CONTRACTS_DIR / "stage-dispatch.schema.json"
@@ -313,6 +318,62 @@ class StageDispatchBuilder:
         if parent_receipt:
             return compute_json_digest(parent_receipt)
         return self.chain.root_handoff_digest
+
+    def validity_key(
+        self,
+        dispatch: dict[str, Any],
+        *,
+        facts: BindingFacts | None = None,
+    ) -> Any:
+        """The version-bound validity key (spec L3) for one dispatch.
+
+        Measures the product revision and tree out of git at the dispatch's
+        input commit, binds the committed SPEC digest read from that commit, and
+        closes over the caller-supplied acceptance-context / target / PR facts.
+        The strict ``stage-dispatch`` object stays untouched -- this key travels
+        on the raw-event boundary, not inside the dispatch the plugin reads.
+        """
+        input_commit = str(dispatch.get("input_commit", ""))
+        if git_ops._FULL_COMMIT_RE.fullmatch(input_commit) is None:
+            raise DispatchError(f"input_commit must be a full object id, got {input_commit!r}")
+        merged = facts or BindingFacts()
+        # The spec digest is the committed blob's own digest, read out of the
+        # commit -- never an agent's word.
+        spec_ref = git_ops.exact_artifact_identity(
+            self.chain.workspace_path, input_commit, self.spec_path
+        )
+        # The acceptance-context revision is measured from the committed
+        # run-config at the same commit, unless the caller already bound a
+        # measured one. Never left empty on this path, so a stage cannot seal
+        # with an incomplete validity key (spec L3: fail-closed, complete).
+        acceptance_revision = merged.acceptance_context_revision or (
+            measure_acceptance_context_revision(self.chain.workspace_path, input_commit)
+        )
+        # The durable merge target and the PR head/base pair must both be bound
+        # to a real identity before a key can be sealed. `target_base_commit`
+        # is descriptive context (a git object id), not a ref, so it is never
+        # substituted. An unknown target or PR identity is not a sealable fact:
+        # sealing "" as "bound, not-yet-known" would mint an incomplete key and
+        # let a stage seal against no target/PR binding at all (spec L3: the
+        # validity key must be complete). Refuse fail-closed instead.
+        target_identity = merged.target_identity
+        pr_identity = merged.pr_identity
+        if not target_identity or not pr_identity:
+            raise DispatchError(
+                "cannot seal a complete validity key: target_identity and "
+                "pr_identity must both be bound (spec L3); sealing an unknown "
+                "target or PR identity as a bound fact is refused"
+            )
+        return build_validity_binding(
+            self.chain.workspace_path,
+            input_commit,
+            BindingFacts(
+                spec_digest=spec_ref["digest"],
+                acceptance_context_revision=acceptance_revision,
+                target_identity=target_identity,
+                pr_identity=pr_identity,
+            ),
+        )
 
 
 __all__ = [

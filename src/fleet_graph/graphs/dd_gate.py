@@ -19,6 +19,14 @@ from fleet_graph.dd.self_gate import (
     render_rationale,
 )
 from fleet_graph.dd.self_gate_evidence import DEFAULT_DD_ROOT, collect_gate_evidence
+from fleet_graph.dd.validity_binding import (
+    BindingFacts,
+    binding_is_bookkeeping,
+    binding_key_from_fields,
+    build_validity_binding,
+    measure_acceptance_context_revision,
+    verify_binding,
+)
 from fleet_graph.graphs.dd_scripts import AUTHOR_EMAIL, AUTHOR_NAME, GATE_PATH, write_json
 from fleet_graph.graphs.stop_response import (
     REASON_CONSUMER_UNWIRED,
@@ -40,6 +48,7 @@ CODE_UNRESOLVED = "single_unresolved"
 CODE_OBLIGATIONS_FAILED = "gate_obligations_failed"
 CODE_REJECT_CONTRACT_INCOMPLETE = "reject_contract_incomplete"
 CODE_RELEASE_REFUSED = "release_refused"
+CODE_EXPIRED_VERDICT = "gate_verdict_expired"
 
 #: The workspace seal author (the same machine identity dd_scripts seals with).
 GATE_SEAL_MESSAGE = "dev-dispatch: gate decision sealed by the graph gate node"
@@ -128,6 +137,94 @@ class GraphGateNode:
             **kwargs,
         )
 
+    def _validity_binding(
+        self, workspace: Path, head_commit: str, status: dict[str, Any], previous: Any = None
+    ) -> dict[str, Any]:
+        """The version-bound validity key (spec L3/L5) the verdict seals against.
+
+        Fail-closed and complete: it measures the product revision/tree out of
+        the subject's git at its accepted head, binds the committed spec digest
+        and the *measured* acceptance-context revision (the committed run-config
+        blob), and closes over the target identity and the PR head/base pair
+        from the single's record. The PR head (``audit_ref``) is never
+        substituted with the target ref -- a missing audit branch is expressed
+        as an empty head, matching ``MaterializationTarget.pr_identity``'s
+        empty-value fail-closed rule. Any read it cannot make raises -- the
+        gate refuses rather than recording an "unavailable" marker, so a verdict
+        can never seal against an unbound or fabricated version.
+
+        When ``previous`` (a sealed validity key from the accepted/reviewed
+        version -- a ``ValidityKey`` or a ``{"digest", "fields"}`` record) is
+        supplied, the current facts are verified *against it* rather than
+        self-compared: ``expired`` is True when a meaningful bound fact changed
+        (spec, tree, acceptance context, target or PR), so an expired Goal
+        verdict is refused. Pure bookkeeping (a revision-only advance on the
+        same tree) does not expire the verdict (spec L3).
+        """
+        release_ref = str(status.get("remote_ref") or "")
+        audit_ref = str(status.get("audit_ref") or "")
+        # The PR head/base pair is the order-private audit branch -> the durable
+        # merge target. It is never substituted with the target ref: an absent
+        # audit branch is expressed as "" here, exactly the empty-value
+        # fail-closed rule MaterializationTarget.pr_identity applies (spec L3:
+        # no substitute identity). A verdict whose target or PR identity cannot
+        # be named is refused fail-closed rather than sealed against a
+        # fabricated "release->release" pair or an empty identity.
+        pr_identity = f"{audit_ref}->{release_ref}" if (audit_ref and release_ref) else ""
+        if not release_ref or not pr_identity:
+            raise RuntimeError(
+                "the goal verdict cannot bind a complete validity key: "
+                "target_identity and pr_identity must both be bound to a real "
+                f"identity (spec L3); got target {release_ref!r} and PR head "
+                f"{audit_ref!r}, and sealing an unknown or empty target/PR "
+                "identity is refused"
+            )
+        facts = BindingFacts(
+            spec_digest=str(status.get("spec_digest") or ""),
+            acceptance_context_revision=measure_acceptance_context_revision(
+                str(workspace), head_commit
+            ),
+            target_identity=release_ref,
+            pr_identity=pr_identity,
+        )
+        key = build_validity_binding(str(workspace), head_commit, facts)
+        if previous is None:
+            return {
+                "digest": key.digest,
+                "fields": key.fields,
+                "matches": True,
+                "changed": [],
+                "expired": False,
+            }
+        previous_key = (
+            previous
+            if hasattr(previous, "inputs") and hasattr(previous, "digest")
+            else binding_key_from_fields(
+                previous.get("fields") if isinstance(previous, dict) else None,
+                str(previous.get("digest") or "") if isinstance(previous, dict) else "",
+            )
+        )
+        if previous_key is None:
+            # A previously sealed key we cannot reconstruct is a version we
+            # cannot compare against: fail closed (expired) rather than pretend
+            # the verdict matched (spec L5).
+            return {
+                "digest": key.digest,
+                "fields": key.fields,
+                "matches": False,
+                "changed": sorted(key.fields),
+                "expired": True,
+            }
+        changed, matches = verify_binding(str(workspace), head_commit, facts, previous_key)
+        bookkeeping = binding_is_bookkeeping(str(workspace), head_commit, facts, previous_key)
+        return {
+            "digest": key.digest,
+            "fields": key.fields,
+            "matches": bool(matches),
+            "changed": list(changed),
+            "expired": not matches and not bookkeeping,
+        }
+
     def _seal_decision_file(
         self,
         *,
@@ -141,6 +238,7 @@ class GraphGateNode:
         head_commit: str,
         rationale: str = "",
         decision_message_id: str = "",
+        validity: dict[str, Any] | None = None,
     ) -> str:
         """Write and commit the gate verdict into the subject workspace.
 
@@ -166,6 +264,7 @@ class GraphGateNode:
                     for item in evidence
                 ],
                 "output_commit": head_commit,
+                **({"validity": validity} if validity is not None else {}),
             },
         )
         run_git(workspace, "add", "--", relative, check=True)
@@ -366,6 +465,29 @@ class GraphGateNode:
                     ensure_ascii=False,
                 )
 
+            # The version-bound validity key is bound and verified *before* any
+            # decision is published, so an unverifiable version refuses the gate
+            # with nothing sealed or published (spec L5: fail-closed). When the
+            # single's record carries the accepted/reviewed version's sealed
+            # validity key, the current facts are verified against it -- not
+            # self-compared -- and an expired Goal verdict is refused untouched.
+            validity = self._validity_binding(
+                workspace, head, status, previous=status.get("sealed_validity")
+            )
+            if validity.get("expired"):
+                return self._receipt(
+                    action,
+                    round_no=round_no,
+                    status=STATUS_FAILED,
+                    code=CODE_EXPIRED_VERDICT,
+                    detail=(
+                        f"the goal verdict for {development_id!r} is expired: the version "
+                        f"at head {head} no longer binds the accepted/reviewed validity "
+                        f"key (changed: {', '.join(validity.get('changed') or []) or 'none'})"
+                    ),
+                    development_id=development_id,
+                )
+
             published = dict(
                 self.plane.publish_gate_decision(
                     development_id,
@@ -386,6 +508,7 @@ class GraphGateNode:
                 head_commit=head,
                 rationale=str(published.get("rationale") or rationale),
                 decision_message_id=str(published.get("message_id") or ""),
+                validity=validity,
             )
             resume = dict(self.plane.gate(development_id, resume=True, action_key=action_key))
             resume_entry = dict(resume.get("resume") or {})
@@ -435,6 +558,7 @@ class GraphGateNode:
 
 
 __all__ = [
+    "CODE_EXPIRED_VERDICT",
     "CODE_NOT_AWAITING_GATE",
     "CODE_NOT_DISPATCHER",
     "CODE_OBLIGATIONS_FAILED",

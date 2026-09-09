@@ -40,10 +40,12 @@ class TestTableComesFromTheContract:
     @pytest.mark.parametrize(
         ("stage", "event", "target", "mode"),
         [
-            ("implement", "success", "continuous_review", "inherit"),
+            ("implement", "success", "acceptance", "inherit"),
+            ("acceptance", "success", "continuous_review", "inherit"),
+            ("acceptance", "REJECT", "implement", "rework"),
             ("continuous_review", "APPROVE", "final_review", "inherit"),
             ("continuous_review", "REJECT", "implement", "rework"),
-            ("final_review", "APPROVE", "acceptance", "inherit"),
+            ("final_review", "APPROVE", "human_gate", "inherit"),
             ("final_review", "REJECT", "implement", "rework"),
         ],
     )
@@ -95,7 +97,7 @@ class TestForwardChain:
             receipt={"output_commit": "abc123"},
             next_dispatch={"input_commit": "abc123"},
         )
-        assert transition.target == "continuous_review"
+        assert transition.target == "acceptance"
 
     def test_a_severed_chain_is_refused(self, lifecycle: Lifecycle) -> None:
         with pytest.raises(BindingViolation, match="forward chain is severed"):
@@ -185,7 +187,7 @@ class TestSingleSourceOfTruth:
         assert custom.contract_version == 99
 
     def test_the_real_contract_still_drives_the_default(self, lifecycle: Lifecycle) -> None:
-        assert lifecycle.transition("implement", "success").target == "continuous_review"
+        assert lifecycle.transition("implement", "success").target == "acceptance"
 
 
 class TestTheSpineIsDerivedNotWritten:
@@ -194,9 +196,10 @@ class TestTheSpineIsDerivedNotWritten:
     def test_spine_falls_out_of_the_artifact_graph(self, lifecycle: Lifecycle) -> None:
         assert lifecycle.spine == {
             "configure": "implement",
-            "implement": "continuous_review",
+            "implement": "acceptance",
+            "acceptance": "continuous_review",
             "continuous_review": "final_review",
-            "acceptance": "human_gate",
+            "final_review": "human_gate",
             "human_gate": "merger",
         }
 
@@ -216,8 +219,11 @@ class TestTheSpineIsDerivedNotWritten:
         assert len(lifecycle.artifact_consumers["spec"]) > 1
 
     def test_an_artifact_nobody_consumes_carries_no_edge(self, lifecycle: Lifecycle) -> None:
-        assert "product_code" not in lifecycle.artifact_consumers
-        assert lifecycle.artifact_producers["product_code"] == ("implement",)
+        # `implementation_evidence` is produced (by implement) but consumed by no
+        # stage in the artifact graph: the review reads it through its protocol
+        # artifacts, not as an ordering edge. product_code now feeds acceptance.
+        assert "implementation_evidence" not in lifecycle.artifact_consumers
+        assert lifecycle.artifact_producers["implementation_evidence"] == ("implement",)
 
     def test_only_the_last_stage_is_terminal(self, lifecycle: Lifecycle) -> None:
         terminal = [name for name in lifecycle.stages if lifecycle.is_terminal(name)]

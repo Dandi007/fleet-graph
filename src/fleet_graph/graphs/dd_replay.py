@@ -36,42 +36,38 @@ Continuous intent when it seals a Final review. Replay therefore re-installs
 that intent with its receipt; a review receipt whose intent the source
 generation no longer holds is an un-rechargeable link and re-runs for real.
 
-**Replay may trim dead weight, and only dead weight.** A pre-F4 restart left
-junk commits above the sealed tip (a fresh generation's `configure` re-seal,
-an acceptance record of a run that then failed). The plugin sealer requires
-the remote head to equal the input commit, so those commits must go before a
-review can seal on the replayed tip. The trim is fail-closed: it happens only
-when every commit above the tip touches nothing outside the reserved
-`.dev-dispatch/` / `.dd-evidence/` namespaces -- product code above the tip
-means no trim and no replay at all.
+**Replay never resets the branch.** Spec L4 forbids replay from resetting the
+branch, losing dirty state, or re-sending a confirmed effect. A prefix is
+reused only when the worktree already sits exactly on its sealed tip -- then
+nothing has to move, and the receipts are simply re-installed under the
+identity they were sealed with. When `HEAD` has moved past (or off) the tip,
+whatever sits above it is an unknown effect that must be preserved, not cut,
+so the replayer refuses fail-closed and the stage re-runs for real against the
+preserved scene (the pre-existing recoverable path).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import random
 import re
-import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from fleet_graph.dd import chain_rules
-from fleet_graph.dd.bootstrap import INDEX_PATH
+from fleet_graph.dd.bootstrap import INDEX_PATH, SPEC_PATH
 from fleet_graph.dd.dispatch import derive_attempt_id
-from fleet_graph.dd.egress import (
-    DEFAULT_EGRESS_POLICY,
-    EgressPolicy,
-    EgressRepoError,
-    TransportExhausted,
-    retry_remote,
-)
 from fleet_graph.dd.git import run_git
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
 from fleet_graph.dd.upstream_constants import compute_json_digest
-from fleet_graph.dd.vendor import plugin_adapter
+from fleet_graph.dd.validity import ValidityInputs, affected_stages, changed_fields
+from fleet_graph.dd.validity_binding import (
+    binding_key_from_fields,
+    git_product_facts,
+    measure_acceptance_context_revision,
+)
+from fleet_graph.dd.vendor import git_ops, plugin_adapter
 from fleet_graph.graphs.dd_actors import implement_stage, review_stages
 from fleet_graph.graphs.dd_pipeline import (
     MODE_INITIAL,
@@ -100,20 +96,34 @@ RECEIPT_FILES = {
 # materialization intent is unreadable").
 INTENTS_DIR = "intents"
 
+# Where the sealer persists the sealed validity key beside each receipt, under
+# `<state_root>/receipts/<attempt_id>/<stage>-validity.json` (the same layout the
+# receipts themselves use). The replayer loads it to re-verify the previously
+# sealed validity key against the current generation's facts (spec L3/L4) --
+# a changed product tree, SPEC, target identity or PR identity invalidates the
+# affected stage and re-runs it for real instead of reusing its receipt.
+VALIDITY_FILE_SUFFIX = "-validity.json"
+
 APPROVE = "APPROVE"
 # The rework-edge rules live in dd/chain_rules.py -- one source, shared with
 # supervise/audit.py's chain check, so the topology cannot drift between the
 # replayer and the auditor. REJECT is re-exported for existing importers.
 REJECT = chain_rules.REJECT
 
-#: The reserved control namespaces. Commits above the sealed tip that touch
-#: only these may be trimmed on replay; anything else is product drift and
-#: refuses the whole replay.
-RESERVED_PREFIXES = (".dev-dispatch/", ".dd-evidence/")
-
 #: Mechanical bound on the within-generation rework walk. The pipeline's own
 #: rework bound is single digits; this only stops a pathological directory.
 MAX_WALK_ATTEMPTS = 64
+
+#: Refusal codes for a replay step whose *validity evidence* cannot be used
+#: (spec L3/L4). These are distinct from the ordinary "a bound fact changed, so
+#: the stage re-runs for real" invalidation: an invalidation re-verifies against
+#: a complete key and is a legitimate migration, while these name the recovery
+#: path where the evidence itself is missing, corrupt or unmeasurable -- a safe
+#: rejection that must be traceable on the raw-event boundary, not a silent
+#: `return False`.
+VALIDITY_EVIDENCE_MISSING = "validity_evidence_missing"
+VALIDITY_EVIDENCE_CORRUPT = "validity_evidence_corrupt"
+VALIDITY_FACTS_UNMEASURABLE = "validity_facts_unmeasurable"
 
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 
@@ -189,8 +199,6 @@ class ReceiptReplayer:
     prior_state_roots: tuple[tuple[int, Path], ...]
     development_id: str
     generation: int
-    remote_url: str = ""
-    remote_ref: str = ""
     #: The current generation's declared acceptance context (acceptance
     #: commands, setup commands, environment). The replayed configure commit
     #: carries the *previous* generation's run-config; when the operator
@@ -199,20 +207,29 @@ class ReceiptReplayer:
     #: stage's tamper check sees agreement rather than a stale mismatch. None
     #: means "leave the replayed tree alone" (the pre-reconfigure behaviour).
     run_config: dict[str, Any] | None = None
+    #: The current generation's launch facts the validity key binds. They name
+    #: the durable merge target and the PR head/base pair this generation was
+    #: dispatched under; when either differs from what a previous generation
+    #: sealed, the affected replayed stages re-run for real (spec L3/L4).
+    target_identity: str = ""
+    pr_identity: str = ""
+    #: The raw-event sink the pipeline shares (``persist_event`` in production).
+    #: A validity-evidence refusal during replay is emitted here so a restarted
+    #: generation's recovery record is traceable (spec L7), not just a silent
+    #: `return False` that re-runs a stage for an unrecorded reason.
+    observe: Any = None
     lifecycle: Lifecycle = field(default_factory=Lifecycle.load)
-    # Egress resilience: the replay-time remote probe and the trim push retry
-    # transport-class failures under the bounded backoff. A probe or push
-    # that stays dark past the budget leaves the replay disabled -- the
-    # stage re-runs for real, the pre-existing fail-closed path.
-    egress_policy: EgressPolicy = field(default_factory=lambda: DEFAULT_EGRESS_POLICY)
-    sleep: Callable[[float], None] = time.sleep
-    rand: Callable[[], float] = random.random
 
     def __post_init__(self) -> None:
         self._plan: list[_Step] | None = None
         self._index = 0
         self._disabled = False
         self._pending_run_config: dict[str, Any] | None = None
+        #: The full in-memory trail of validity-evidence refusals, kept for a
+        #: verifier to inspect. Reliable even when no `observe` sink is wired.
+        self.refusals: list[dict[str, Any]] = []
+        #: How many of `refusals` have already been emitted to `observe`.
+        self._observed_refusals = 0
 
     # --- the walker's port ------------------------------------------------
 
@@ -246,6 +263,12 @@ class ReceiptReplayer:
                 candidates = self._candidate_plans()
             except Exception:
                 candidates = []
+            # Emit any validity-evidence refusals collected while reading the
+            # prior generations' sealed keys onto the raw-event boundary, but
+            # *outside* the swallow above: a journal-write failure must report
+            # (spec L7), never be hidden behind the defensive no-candidates
+            # fallback.
+            self._flush_refusals()
             self._plan = self._select(candidates, stage)
             if self._plan is None:
                 self._disabled = True
@@ -282,10 +305,15 @@ class ReceiptReplayer:
             return None
         step = self._plan[self._index]
         if step.stage_id != stage.id:
-            # A resumed thread mid-walk, or a contract whose order moved:
-            # either way this is not the prefix, so nothing is replayed --
-            # and, the index still being 0, nothing has been mutated.
-            self._disabled = True
+            # The linear order interleaves script stages between the sealed
+            # stages the plan covers (acceptance sits between implement and
+            # review). A script stage has no sealed receipt and always re-runs
+            # for real, but reaching it is not a chain break: the sealed review
+            # after it is still replayed. Only a mismatch on a sealed (llm)
+            # stage -- or a planned script stage such as configure -- is a real
+            # divergence and disables the prefix.
+            if stage.id in RECEIPT_FILES or any(s.stage_id == stage.id for s in self._plan):
+                self._disabled = True
             return None
         self._index += 1
         return Replayed(
@@ -409,6 +437,8 @@ class ReceiptReplayer:
         imp_raw, imp = loaded
         if not self._valid_implement(imp, head):
             return []
+        if not self._validity_allows(root, imp, implement_id, str(imp["output_commit"])):
+            return []
         configure_step = self._configure_step(configure_id, imp)
         if configure_step is None:
             return []
@@ -441,6 +471,15 @@ class ReceiptReplayer:
                     mode=mode,
                 ),
             ]
+            if self._acceptance_context_changed(configure_step.output_commit):
+                # The acceptance context was reconfigured. Per validity.py an
+                # acceptance-context revision change invalidates acceptance,
+                # continuous review and final review, so the sealed reviews --
+                # graded against the *old* context -- are not replayed; they
+                # and the acceptance stage re-run for real against the
+                # reconfigured context (spec L3/L5: any relevant change
+                # invalidates the affected re-verify/re-review).
+                return steps
             if not continuous_id:
                 return steps
 
@@ -452,6 +491,8 @@ class ReceiptReplayer:
                 "parent_handoff_receipt_digest"
             ) != byte_digest(imp_raw):
                 return steps  # broken at the review link; re-run from there
+            if not self._validity_allows(root, cr, continuous_id, str(cr["output_commit"])):
+                return steps  # a changed bound fact invalidates the review; re-run real
 
             verdict = str(cr.get("verdict") or "")
             if verdict == REJECT:
@@ -506,6 +547,8 @@ class ReceiptReplayer:
                 "parent_handoff_receipt_digest"
             ) != byte_digest(cr_raw):
                 return steps
+            if not self._validity_allows(root, fr, final_id, str(fr["output_commit"])):
+                return steps  # a changed bound fact invalidates the review; re-run real
 
             verdict = str(fr.get("verdict") or "")
             if verdict == REJECT:
@@ -571,6 +614,8 @@ class ReceiptReplayer:
             return False
         if str(fr.get("verdict") or "") != APPROVE:
             return False
+        if not self._validity_allows(root, fr, final_id, str(fr["output_commit"])):
+            return False
         return self._plugin_intent(root, fr) is not None
 
     def _rework_implement(
@@ -593,6 +638,8 @@ class ReceiptReplayer:
             return None
         raw, receipt = loaded
         if not self._valid_implement(receipt, head):
+            return None
+        if not self._validity_allows(root, receipt, implement_id, str(receipt["output_commit"])):
             return None
         if receipt.get("parent_handoff_receipt_digest") != chain_rules.rework_link_parent(
             rejecting_receipt
@@ -702,7 +749,159 @@ class ReceiptReplayer:
         output = str(receipt.get("output_commit") or "")
         return bool(_HEX40.fullmatch(output)) and self._is_ancestor(output, head)
 
-    # --- the one mutation: trim to the tip, install the receipts -----------
+    # --- validity key comparison (spec L3/L4) ------------------------------
+
+    def _sealed_validity(
+        self, root: Path, receipt: dict[str, Any], stage_id: str
+    ) -> tuple[dict[str, Any] | None, str]:
+        """The previously sealed validity key this receipt was sealed with, plus
+        the reason it is unusable when absent.
+
+        Read from `<root>/receipts/<attempt_id>/<stage>-validity.json`, the same
+        standard layout the receipt itself uses. The second element is a refusal
+        code instead of ``None`` when no *verifiable* key can be loaded: a
+        missing file (a legacy receipt sealed before the validity key existed,
+        or a key lost after sealing) is `VALIDITY_EVIDENCE_MISSING`; an
+        unparseable or non-object file is `VALIDITY_EVIDENCE_CORRUPT`. Both are
+        treated fail-closed by `_validity_allows` and made traceable, rather
+        than collapsing into an indistinguishable "no key" (spec L4: safe
+        reject, never a receipt-only reuse).
+        """
+        attempt_id = str(receipt.get("attempt_id") or "")
+        if not attempt_id:
+            return None, VALIDITY_EVIDENCE_MISSING
+        path = root / "receipts" / attempt_id / f"{stage_id}{VALIDITY_FILE_SUFFIX}"
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except OSError:
+            return None, VALIDITY_EVIDENCE_MISSING
+        except ValueError:
+            return None, VALIDITY_EVIDENCE_CORRUPT
+        if not isinstance(raw, dict):
+            return None, VALIDITY_EVIDENCE_CORRUPT
+        return raw, ""
+
+    def _record_refusal(self, stage_id: str, code: str, detail: str) -> None:
+        """Record one validity-evidence refusal, in memory and (later) to observe.
+
+        Kept in `self.refusals` immediately -- the reliable record a verifier
+        can inspect -- and emitted to `observe` when `_flush_refusals` runs
+        outside any swallow, so the recovery path leaves a trace rather than a
+        silent `return False`.
+        """
+        self.refusals.append(
+            {"event": "replay_refused", "stage": stage_id, "reason": code, "detail": detail}
+        )
+
+    def _flush_refusals(self) -> None:
+        """Emit un-emitted validity refusals to the raw-event sink (spec L7).
+
+        The observation here is the same shared sink the pipeline writes its
+        history to; a write failure propagates -- a journal write error is
+        never hidden (spec L7). The in-memory `refusals` list is untouched, so
+        a verifier can still read the full trail.
+        """
+        if self.observe is None:
+            self._observed_refusals = len(self.refusals)
+            return
+        while self._observed_refusals < len(self.refusals):
+            self.observe(self.refusals[self._observed_refusals])
+            self._observed_refusals += 1
+
+    def _committed_spec_digest(self, output_commit: str) -> str:
+        """The committed SPEC digest at `output_commit`, or "" when unreadable."""
+        try:
+            identity = git_ops.exact_artifact_identity(
+                str(self.workspace), output_commit, SPEC_PATH
+            )
+        except git_ops.ExactWorkspaceError:
+            return ""
+        return str(identity.get("digest") or "")
+
+    def _current_validity_inputs(self, output_commit: str) -> ValidityInputs | None:
+        """Re-measure the six bound validity facts for the current generation.
+
+        The product revision and tree are measured out of git at `output_commit`;
+        the SPEC digest is read from the committed spec blob; the
+        acceptance-context revision is the committed run-config's blob oid, and
+        the target/PR identities are this generation's declared launch facts.
+        None means one of the git facts is unreadable -- fail closed, never a
+        guessed SHA.
+        """
+        try:
+            revision, tree = git_product_facts(str(self.workspace), output_commit)
+        except git_ops.ExactWorkspaceError:
+            return None
+        try:
+            acceptance_revision = measure_acceptance_context_revision(
+                str(self.workspace), output_commit
+            )
+        except git_ops.ExactWorkspaceError:
+            acceptance_revision = ""
+        return ValidityInputs(
+            product_revision=revision.lower(),
+            product_tree=tree.lower(),
+            spec_digest=self._committed_spec_digest(output_commit),
+            acceptance_context_revision=acceptance_revision,
+            target_identity=self.target_identity,
+            pr_identity=self.pr_identity,
+        )
+
+    def _validity_allows(
+        self, root: Path, receipt: dict[str, Any], stage_id: str, output_commit: str
+    ) -> bool:
+        """Whether the previously sealed validity key still binds this stage.
+
+        True means the receipt may be replayed; False means the stage re-runs
+        for real. Fail-closed (spec L3/L4): a bound fact that re-verifies or
+        re-reviews this stage changed (product tree, SPEC, target, PR,
+        acceptance context), OR the sealed validity key cannot be loaded or
+        reconstructed -- a missing or corrupted key, or one whose fields are
+        incomplete -- all refuse replay. A receipt with no verifiable binding
+        on disk is never reused against the current facts: reusing it would
+        bypass exactly the version check the key exists to enforce.
+
+        The refusal reasons are made *traceable*: a missing/corrupted key, or
+        unmeasurable current facts, records a distinct refusal code on
+        `self.refusals` (and, via `_flush_refusals`, on the raw-event boundary),
+        so a recovery pass can tell "the evidence was lost" from "the facts
+        moved". A legitimate invalidation (a bound fact changed) is not one of
+        those refusals -- it stays the ordinary "re-run for real" migration.
+        """
+        sealed, evidence_code = self._sealed_validity(root, receipt, stage_id)
+        if sealed is None:
+            self._record_refusal(
+                stage_id,
+                evidence_code,
+                f"no verifiable validity key beside the {stage_id} receipt: "
+                f"{evidence_code}",
+            )
+            return False
+        validity = sealed.get("validity") if isinstance(sealed, dict) else None
+        fields = validity.get("fields") if isinstance(validity, dict) else None
+        digest = str(validity.get("digest") or "") if isinstance(validity, dict) else ""
+        key = binding_key_from_fields(fields, digest)
+        if key is None:
+            self._record_refusal(
+                stage_id,
+                VALIDITY_EVIDENCE_CORRUPT,
+                f"the persisted {stage_id} validity key cannot be reconstructed "
+                "from its recorded fields, or its sealed digest does not match "
+                "those fields",
+            )
+            return False
+        current = self._current_validity_inputs(output_commit)
+        if current is None:
+            self._record_refusal(
+                stage_id,
+                VALIDITY_FACTS_UNMEASURABLE,
+                f"the current facts for {stage_id} cannot be measured out of git",
+            )
+            return False
+        changed = changed_fields(current, key.inputs)
+        return stage_id not in affected_stages(changed)
+
+    # --- install the receipts onto the unchanged tip (never reset) ----------
 
     def _prepare(self, plan: list[_Step]) -> bool:
         tip = plan[-1].output_commit
@@ -710,40 +909,15 @@ class ReceiptReplayer:
         if not head:
             return False
         if head != tip:
-            diff = run_git(self.workspace, "diff", "--name-only", tip, head)
-            if diff.returncode != 0:
-                return False
-            names = [line.strip() for line in diff.stdout.splitlines() if line.strip()]
-            if not all(name.startswith(RESERVED_PREFIXES) for name in names):
-                # Product drift above the sealed tip: refuse rather than cut.
-                # (An empty diff is fine -- tree-identical junk commits, e.g.
-                # an --allow-empty re-seal, are the safest trim of all.)
-                return False
-            if self.remote_url and self.remote_ref:
-                observed = self._remote_head()
-                if observed != head:
-                    return False
-                try:
-                    retry_remote(
-                        lambda: run_git(
-                            self.workspace,
-                            "push",
-                            "--quiet",
-                            f"--force-with-lease={self.remote_ref}:{observed}",
-                            self.remote_url,
-                            f"{tip}:{self.remote_ref}",
-                        ),
-                        op_name="push",
-                        policy=self.egress_policy,
-                        sleep=self.sleep,
-                        rand=self.rand,
-                    )
-                except (TransportExhausted, EgressRepoError):
-                    return False
-            reset = run_git(self.workspace, "reset", "--hard", "--quiet", tip)
-            if reset.returncode != 0:
-                return False
-        elif not self._clear_stale_run_config_residue():
+            # Spec L4: replay must not reset the branch, lose dirty state, or
+            # re-send a confirmed effect. A prefix is safe to reuse only when
+            # the worktree already sits exactly on its sealed tip; anything
+            # sitting above the tip is an unknown effect that must be
+            # preserved, not cut. Refuse fail-closed here and let the stage
+            # re-run for real against the preserved scene (the recoverable
+            # state, reached through a real transition).
+            return False
+        if not self._clear_stale_run_config_residue():
             return False
 
         # Installed under the identity the receipts were sealed with -- their
@@ -774,8 +948,8 @@ class ReceiptReplayer:
     def _clear_stale_run_config_residue(self) -> bool:
         """Drop a previous generation's controller-owned ``run-config.json`` dirt.
 
-        When ``HEAD`` already equals the replay tip, ``_prepare`` skips its
-        ``reset --hard`` branch, so a reconfigured acceptance declaration a
+        ``_prepare`` only ever runs when ``HEAD`` already equals the replay tip
+        and never resets the branch, so a reconfigured acceptance declaration a
         *previous* failed generation left uncommitted survives into the fresh
         final reviewer and is blamed on the actor (ACTOR_RESERVED_PATH_CHANGED).
         Restore HEAD's committed copy of exactly that one file, and only when
@@ -830,6 +1004,23 @@ class ReceiptReplayer:
             return False
         generation = config.get("generation")
         return isinstance(generation, int) and generation < self.generation
+
+    def _acceptance_context_changed(self, configure_commit: str) -> bool:
+        """Whether the declared acceptance context reconfigures the replayed one.
+
+        The replayed configure commit carries the *previous* generation's
+        run-config. When the operator reconfigured the acceptance context, the
+        declared ``run_config`` differs from it -- and per
+        ``validity.affected_stages`` an acceptance-context revision change
+        invalidates acceptance through final review, so the sealed reviews
+        graded against the old context must not be replayed (spec L3/L5).
+        ``run_config is None`` keeps the pre-reconfigure behaviour (leave the
+        replayed tree alone), and an unreadable committed config fails closed
+        to "changed" rather than guessing the context did not move.
+        """
+        if self.run_config is None:
+            return False
+        return self._reconfigured_run_config(configure_commit) is not None
 
     def _reconfigured_run_config(self, configure_commit: str) -> dict[str, Any] | None:
         """The run-config this generation must materialise, when reconfigured.
@@ -899,20 +1090,6 @@ class ReceiptReplayer:
     def _is_ancestor(self, commit: str, head: str) -> bool:
         return run_git(self.workspace, "merge-base", "--is-ancestor", commit, head).returncode == 0
 
-    def _remote_head(self) -> str:
-        try:
-            proc = retry_remote(
-                lambda: run_git(self.workspace, "ls-remote", self.remote_url, self.remote_ref),
-                op_name="ls-remote",
-                policy=self.egress_policy,
-                sleep=self.sleep,
-                rand=self.rand,
-            )
-        except (TransportExhausted, EgressRepoError):
-            return ""
-        heads = [line.split()[0] for line in proc.stdout.splitlines() if line.strip()]
-        return heads[0] if heads else ""
-
     def _spine_predecessor(self, stage_id: str | None) -> str | None:
         if not stage_id:
             return None
@@ -942,7 +1119,9 @@ __all__ = [
     "MAX_WALK_ATTEMPTS",
     "RECEIPT_FILES",
     "REJECT",
-    "RESERVED_PREFIXES",
+    "VALIDITY_EVIDENCE_CORRUPT",
+    "VALIDITY_EVIDENCE_MISSING",
+    "VALIDITY_FACTS_UNMEASURABLE",
     "ReceiptReplayer",
     "byte_digest",
     "prior_generation_state_roots",

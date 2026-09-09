@@ -90,10 +90,20 @@ class Transition:
     required_receipt: str | None = None
     commit_binding: dict[str, Any] | None = None
     event_binding: dict[str, Any] | None = None
+    #: The terminal kind this edge ends the run in, when it is a terminal
+    #: transition (no ``target``). Empty for a hop to another stage. The value
+    #: is the *kind* name ("complete", "prepared", ...), declared by the
+    #: contract, so the walker distinguishes a measured merge from a
+    #: prepared-only result without knowing either by name (spec L6).
+    terminal: str = ""
 
     @property
     def is_rework(self) -> bool:
         return self.next_mode == "rework"
+
+    @property
+    def is_terminal(self) -> bool:
+        return bool(self.terminal)
 
 
 @dataclass(frozen=True)
@@ -150,11 +160,12 @@ class Lifecycle:
             Transition(
                 source=raw["from"],
                 event=raw["on"],
-                target=raw["to"],
+                target=raw.get("to", ""),
                 next_mode=raw.get("next_mode", "inherit"),
                 required_receipt=raw.get("required_receipt"),
                 commit_binding=raw.get("commit_binding"),
                 event_binding=raw.get("event_binding"),
+                terminal=raw.get("terminal", ""),
             )
             for raw in self.contract["transitions"]
         )
@@ -217,10 +228,24 @@ class Lifecycle:
         return tuple(t.event for t in self.transitions if t.source == stage)
 
     def is_terminal(self, stage: str) -> bool:
-        """A stage with neither a declared edge nor a derived successor ends it."""
+        """Whether the stage, once run, ends the run.
+
+        Two shapes count as terminal:
+
+        - The stage declares a *terminal* edge (``terminal`` set) and every
+          other edge it declares only re-enters earlier work -- no forward
+          hop to a later stage. This is the merge stage's shape after spec L6
+          typed merge feedback: ``MERGED``/``PREPARED`` end the run, ``REJECT``
+          reworks back to implement.
+        - The classic shape: no declared edges and no derived spine successor,
+          so the stage is the last one.
+        """
         if stage not in self.stages:
             return False
-        if self.events_from(stage):
+        declared = [t for t in self.transitions if t.source == stage]
+        if declared and any(t.terminal for t in declared):
+            return all(t.terminal or t.is_rework for t in declared)
+        if declared:
             return False
         try:
             return self.artifact_successor(stage) is None

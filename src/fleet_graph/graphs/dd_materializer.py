@@ -45,7 +45,8 @@ from fleet_graph.dd.dispatch import (
     read_committed_refs,
 )
 from fleet_graph.dd.lifecycle import Lifecycle, Stage
-from fleet_graph.dd.vendor import plugin_adapter
+from fleet_graph.dd.validity_binding import BindingFacts
+from fleet_graph.dd.vendor import git_ops, plugin_adapter
 from fleet_graph.graphs.dd_actors import (
     implement_stage,
     review_stages,
@@ -75,6 +76,14 @@ PARENT_RECEIPT_FILE = {
     "continuous_review": IMPLEMENT_RECEIPT_FILE,
     "final_review": "continuous-review-receipt.json",
 }
+
+# The sealed validity key is persisted beside its receipt, under
+# `<state_root>/receipts/<attempt_id>/<stage>-validity.json`, so a restarted
+# generation's replayer can *load* the previously sealed key and re-verify the
+# bound facts (spec L3/L4) instead of reusing a receipt against a changed
+# product tree, SPEC, target or PR. The layout mirrors the receipts directory
+# the replayer already reads.
+VALIDITY_FILE_SUFFIX = "-validity.json"
 
 APPLIED = "APPLIED"
 NON_APPLIED_OUTCOMES = ("DISPUTED", "BLOCKED")
@@ -127,6 +136,37 @@ class MaterializationTarget:
     remote_ref: str
     worktree: str
     state_root: str
+    #: The durable merge target this order lands on -- the line's release
+    #: branch. Whereas ``remote_ref`` is the ref the sealer publishes its
+    #: receipts to (the order-private audit branch), this is the ref the merge
+    #: itself targets, and is what the validity key binds as target identity.
+    target_ref: str = ""
+    #: The order-private audit branch (``refs/heads/dd/<dev>``) the merge is
+    #: authorized from. Together with ``target_ref`` it names the head/base pair
+    #: the validity key binds as PR identity (spec L6).
+    audit_ref: str = ""
+
+    @property
+    def merge_target_identity(self) -> str:
+        # The durable merge target. Never substituted with the publish ref: an
+        # unmapped target is expressed as "" (bound, not-yet-known), so a later
+        # reveal is detected as a change rather than silently promoted to the
+        # publish ref's identity (spec L3: no substitute identity).
+        return self.target_ref
+
+    @property
+    def merge_head_ref(self) -> str:
+        # The order-private audit branch. Never substituted with the publish
+        # ref for the same reason as `merge_target_identity`: an absent audit
+        # branch (the legacy single-durable-ref layout) is expressed as "", not
+        # as the publish ref.
+        return self.audit_ref
+
+    @property
+    def pr_identity(self) -> str:
+        head = self.merge_head_ref
+        base = self.merge_target_identity
+        return f"{head}->{base}" if (head and base) else ""
 
 
 @lru_cache(maxsize=1)
@@ -153,6 +193,21 @@ def receipt_digest(state_root: str, attempt_id: str, filename: str, *, label: st
             "HANDOFF_CHAIN_MISMATCH", f"no sealed {label} at {path}: {exc}"
         ) from exc
     return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def validity_payload(validity: Any) -> dict[str, Any]:
+    """The sealed validity key, in the shape a replayer can re-load.
+
+    A ``ValidityKey`` carries ``digest`` + ``fields``; a plain dict (or any
+    opaque value a stubbed/test sealer hand back) is recorded verbatim. The
+    record is never re-measured or invented here -- it names exactly what the
+    sealer bound.
+    """
+    if hasattr(validity, "digest") and hasattr(validity, "fields"):
+        return {"digest": validity.digest, "fields": validity.fields}
+    if isinstance(validity, dict):
+        return dict(validity)
+    return {"value": str(validity)}
 
 
 def review_actor_result(declared: dict[str, Any]) -> dict[str, Any]:
@@ -392,11 +447,90 @@ class PluginMaterializer:
         sealed = self._read(stage, result)
         # The sealer wrote the stage's artifacts, so it -- not the agent --
         # is what output_verify should be believing.
+        validity = self._validity_key(sealed.commit)
+        # Persist the sealed key beside its receipt so a restarted generation's
+        # replayer can load and re-verify it against the current facts (spec
+        # L3/L4). Fail-closed: a lost write aborts the seal (retryable), so a
+        # stage can never seal without its verifiable binding on disk.
+        self._persist_validity(stage, dispatch, sealed.commit, validity)
         return Sealed(
             commit=sealed.commit,
             receipt=sealed.receipt,
             produced=tuple(stage.produced_artifacts),
+            validity=validity,
         )
+
+    def _persist_validity(
+        self, stage: Stage, dispatch: Dispatch, output_commit: str, validity: Any
+    ) -> None:
+        """Write the sealed validity key beside its receipt for replay re-verify.
+
+        The file lives at `<state_root>/receipts/<attempt_id>/<stage>-validity.json`
+        under the same identity the receipt was sealed with, so a later
+        generation's replayer finds it exactly where it finds the receipt. An
+        unpinned dispatch re-derives the identity from (generation, attempt) as
+        the sealer normally would.
+
+        Fail-closed (spec L3): the replayer now *requires* this key to re-verify
+        a replayed stage against the current facts, so a seal whose binding
+        evidence did not land would produce a receipt that can never be safely
+        replayed. A write failure therefore aborts the materialization as a
+        retryable fault -- visible and recoverable -- rather than letting a
+        stage seal successfully with no verifiable binding on disk.
+        """
+        attempt_id = str(dispatch.get("pinned_attempt_id") or "") or derive_attempt_id(
+            self.builder.chain.development_id,
+            int(dispatch.get("generation", 1)),
+            int(dispatch.get("attempt", 1)),
+        )
+        payload = {
+            "stage": stage.id,
+            "attempt_id": attempt_id,
+            "output_commit": output_commit,
+            "validity": validity_payload(validity),
+        }
+        try:
+            directory = Path(self.target.state_root) / "receipts" / attempt_id
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / f"{stage.id}{VALIDITY_FILE_SUFFIX}").write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            raise MaterializationFailed(
+                "VALIDITY_PERSIST_FAILED",
+                f"could not persist the sealed validity key for {stage.id}/"
+                f"{attempt_id}: {exc}",
+                retryable=True,
+            ) from exc
+
+    def _validity_key(self, output_commit: str) -> Any:
+        """The validity key (spec L3) sealed with this stage's output commit.
+
+        Fail-closed: if the git/product facts or the caller facts cannot be
+        bound -- no workspace, an unreadable commit/tree/spec/run-config, or an
+        unknown target/PR identity (empty ``target_ref``/``audit_ref``) -- the
+        seal fails rather than sealing without a complete binding. An absent
+        binding must never slide through as ``None``, and an unknown target/PR
+        must never be sealed as a "bound, not-yet-known" fact: a later verify
+        would treat that as "nothing changed" and silently accept an unbound
+        stage (spec L3: the key must be complete, never a substituted target or
+        a fabricated PR identity).
+        """
+        if not self.builder.chain.workspace_path:
+            raise MaterializationFailed(
+                "VALIDITY_BINDING_FAILED",
+                "no workspace to measure the validity key from",
+            )
+        try:
+            return self.builder.validity_key(
+                {"input_commit": output_commit},
+                facts=BindingFacts(
+                    target_identity=self.target.merge_target_identity,
+                    pr_identity=self.target.pr_identity,
+                ),
+            )
+        except (DispatchError, git_ops.ExactWorkspaceError) as exc:
+            raise MaterializationFailed("VALIDITY_BINDING_FAILED", str(exc)) from exc
 
     def parent_digest(self, stage_id: str, attempt_id: str) -> str | None:
         """The parent receipt's byte digest, or None where there is no file."""
@@ -464,6 +598,7 @@ class StageMaterializers:
 __all__ = [
     "AUTHOR_EMAIL",
     "AUTHOR_NAME",
+    "VALIDITY_FILE_SUFFIX",
     "MaterializationFailed",
     "MaterializationTarget",
     "PluginMaterializer",
@@ -473,4 +608,5 @@ __all__ = [
     "receipt_digest",
     "review_actor_result",
     "review_result_fields",
+    "validity_payload",
 ]
