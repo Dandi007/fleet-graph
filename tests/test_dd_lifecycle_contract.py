@@ -1125,6 +1125,64 @@ class TestValidityBindingIsWired:
         )
         assert recovery_validity_digest(other) != digest
 
+    def test_resume_binds_the_recorded_validity_digest(self) -> None:
+        """Spec L3/L5 (recovery): a decision cast against a validity key only
+        resumes while the current facts still reproduce that key. A mismatch --
+        or no re-measured gift when the record requires one -- refuses, so a
+        recorded recovery cannot resume after its product/SPEC/context/target/PR
+        identity moved."""
+        from fleet_graph.dd.recovery import (
+            HumanRecoveryExit,
+            RecoveryError,
+            recovery_validity_digest,
+        )
+        from fleet_graph.dd.validity import ValidityInputs
+
+        inputs = ValidityInputs(
+            product_revision="a" * 40,
+            product_tree="b" * 40,
+            spec_digest="sha256:" + "c" * 64,
+        )
+        digest = recovery_validity_digest(inputs)
+        exit_ = HumanRecoveryExit()
+        exit_.record(
+            target_ref="refs/heads/release/x",
+            decision="rework",
+            decided_by="human",
+            question_note_id="note-1",
+            validity_digest=digest,
+        )
+
+        resumed = exit_.resume(target_ref="refs/heads/release/x", current_validity_digest=digest)
+        assert resumed["resumed"] is True
+
+        stale = recovery_validity_digest(
+            ValidityInputs(
+                product_revision="f" * 40,
+                product_tree="b" * 40,
+                spec_digest="sha256:" + "c" * 64,
+            )
+        )
+        with pytest.raises(RecoveryError, match="no longer binds"):
+            exit_.resume(target_ref="refs/heads/release/x", current_validity_digest=stale)
+
+        with pytest.raises(RecoveryError, match="re-measured"):
+            exit_.resume(target_ref="refs/heads/release/x")
+
+    def test_a_legacy_recovery_without_a_validity_key_still_resumes(self) -> None:
+        """Spec L4: a legacy record without a validity key is explicitly
+        permitted (it bound no key), never silently refused as if it had."""
+        from fleet_graph.dd.recovery import HumanRecoveryExit
+
+        exit_ = HumanRecoveryExit()
+        exit_.record(
+            target_ref="refs/heads/release/x",
+            decision="resume",
+            decided_by="a",
+            question_note_id="n",
+        )
+        assert exit_.resume(target_ref="refs/heads/release/x")["resumed"] is True
+
     def test_binding_key_from_fields_refuses_a_digest_that_does_not_match(self) -> None:
         """Spec L3/L4: the persisted digest is part of the seal. Reconstructing a
         key from fields whose digest was tampered must refuse fail-closed

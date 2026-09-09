@@ -175,13 +175,20 @@ class HumanRecoveryExit:
     def recorded_for(self, target_ref: str) -> RecoveryDecision | None:
         return self._by_target.get(target_ref)
 
-    def resume(self, *, target_ref: str) -> dict[str, Any]:
+    def resume(self, *, target_ref: str, current_validity_digest: str = "") -> dict[str, Any]:
         """Resume the suspended work, only from its recorded decision.
 
         There is no path here that resumes from a claim: without a recorded
         decision for this exact target, this refuses. The returned payload
         points at the sealed digest, so the caller (and the evidence trail)
         can name exactly which decision authorised the resumption.
+
+        A decision that was cast against a version-bound validity key (spec
+        L3/L5) only resumes while the current facts still reproduce that key.
+        When ``current_validity_digest`` is supplied it is compared against the
+        recorded one: a mismatch -- or no gift when the record requires one --
+        refuses, so a recorded recovery can never resume work after its product,
+        SPEC, acceptance context, target or PR identity moved.
         """
         record = self.recorded_for(target_ref)
         if record is None:
@@ -189,6 +196,19 @@ class HumanRecoveryExit:
                 f"no recorded recovery decision for {target_ref!r}; "
                 "suspended work resumes only from a recorded decision"
             )
+        if record.validity_digest:
+            if not current_validity_digest:
+                raise RecoveryError(
+                    f"recovery for {target_ref!r} binds validity key "
+                    f"{record.validity_digest[:16]}; the current validity key must be "
+                    "re-measured before the suspended work can resume"
+                )
+            if current_validity_digest != record.validity_digest:
+                raise RecoveryError(
+                    f"recovery for {target_ref!r} no longer binds the current validity key: "
+                    f"recorded {record.validity_digest[:16]}, "
+                    f"current {current_validity_digest[:16]}"
+                )
         return {
             "target_ref": target_ref,
             "resumed": True,
