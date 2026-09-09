@@ -266,6 +266,18 @@ generation's attempt chain, so earlier-generation records appear in the archive,
 not in the index. Do not modify anything: this is a read-only review, and a
 reviewer that writes to the subject workspace has its verdict discarded.
 
+## 交付文档的精确身份契约
+
+精确身份由已存在的产品候选 SHA、真实输入 commit、封存 implement handoff 的
+work_head_commit 及其机械关系共同核验。delivery.md 不需要内嵌包含它自身的
+commit SHA；不能要求反复提交以求自引用固定点，也不能仅因产品候选、文档提交、
+控制封存 SHA 不同或最终 SHA 在 handoff 中记录就拒绝。
+独立核验完整对象 ID、候选祖先关系、输入与 handoff 一致，以及候选到被审版本的
+产品 diff；排除 .dev-dispatch 后若仅 delivery.md 变化，文档候选仍可准确指认未变
+产品，但文档必须如实说明覆盖范围及后续提交关系。若有真实产品变化、对象不存在、
+输入失实、缺失 handoff 或关系不可验证，必须按真实缺口审查，不能以此规则放行。
+该身份契约不替代其他 SPEC、开发检查或审查要求，也不构成预先 APPROVE。
+
 ## Your verdict
 
 `APPROVE` only if the change satisfies the spec. `REJECT` otherwise, with at

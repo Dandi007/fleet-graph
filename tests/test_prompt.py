@@ -424,6 +424,17 @@ class TestTheReviewSubjectBinding:
         assert metadata in rendered, "the sealed output is recorded too"
         assert f"git diff --exit-code {product}" in rendered
 
+    def test_final_review_receives_non_self_referential_delivery_contract(self) -> None:
+        rendered = self._source().for_stage(
+            "final_review", {"input_commit": "a" * 40}, run_id="fresh-fr", actor_job_id="job"
+        )
+        assert rendered is not None
+        assert "交付文档的精确身份契约" in rendered
+        assert "自引用固定点" in rendered
+        assert "候选祖先关系" in rendered
+        assert "真实产品变化" in rendered
+        assert "不构成预先 APPROVE" in rendered
+
     def test_final_review_anchors_on_the_sealed_implement_output(self) -> None:
         """The final review's parent is the continuous review receipt, which
         has no `work_head_commit`; it anchors on the implement's sealed output,
