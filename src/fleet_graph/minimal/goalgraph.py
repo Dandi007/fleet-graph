@@ -4,7 +4,11 @@ One Goal Agent per goal, one Stop per turn, three exits (protocol §2):
 
 - ``dispatch`` → ``validate_dispatch`` (``dispatch.py`` field checks plus the
   GO-36 git gate) → ``run_dd`` → back to ``read_control`` → the next turn;
-- ``done`` → ``final_merge`` (release → the goal's target branch);
+- ``done`` → ``validate_done`` (the protocol §0.10 gate: no in-flight DD —
+  a ``dd.dispatched`` whose terminal ``dd.merged`` / ``dd.failed`` is still
+  missing; one ``goal.warning`` and a bounce back to the next turn, the same
+  bounce-don't-guess semantics as ``validate_dispatch``) → ``final_merge``
+  (release → the goal's target branch);
 - ``blocked`` → ``finish_blocked`` writes ``goal.blocked`` and ends.
 
 Seams this module deliberately keeps (each belongs to another DD):
@@ -34,8 +38,10 @@ per new control line, before acting on it), ``goal.message`` (an MCP message
 made durable — state clears it after injection), ``goal.turn.started``
 (``events.fold`` counts turns from it), ``goal.steered`` (GO-20),
 ``goal.dispatch_rejected`` (dispatch bounced with field-level errors; the
-kind is registered in ``events.GOAL_KINDS`` per the DD-13 precedent), the
-terminal ``goal.done`` / ``goal.blocked`` / ``engine.exiting(stop)``, and —
+kind is registered in ``events.GOAL_KINDS`` per the DD-13 precedent), a
+``goal.warning`` with ``reason: done_with_inflight_dd`` (a ``done`` bounced
+by the §0.10 no-in-flight-DD gate), the terminal ``goal.done`` /
+``goal.blocked`` / ``engine.exiting(stop)``, and —
 only behind the opt-in seam — the scribe's ``scribe.observed`` /
 ``scribe.failed`` (registered in ``events.SCRIBE_KINDS``).
 
@@ -198,6 +204,26 @@ def _one_line_dd_summary(history: list[events.DDSummary], result: dict[str, Any]
     return f"{len(history)} 张 DD：{merged} merged，{failed} failed（{dd_id}：{blurb}）"
 
 
+def _inflight_dd_ids(events_list: list[events.Event]) -> list[str]:
+    """DD ids with a ``dd.dispatched`` but no terminal ``dd.merged`` / ``dd.failed``.
+
+    §0.10's "done 时无未合并的 DD" is decided here, not in ``events.fold``
+    (whose derived structure stays unchanged). Insertion order = first
+    dispatch order. A re-dispatch of an already-terminal id reopens it (a
+    dispatch without its terminal event is open, whatever came before);
+    ``dd.failed`` is itself terminal, so a failed DD never appears here.
+    """
+    open_ids: dict[str, None] = {}
+    for ev in events_list:
+        if ev.dd_id is None:
+            continue
+        if ev.kind == "dd.dispatched":
+            open_ids[ev.dd_id] = None
+        elif ev.kind in ("dd.merged", "dd.failed"):
+            open_ids.pop(ev.dd_id, None)
+    return list(open_ids)
+
+
 def _route_after_read_control(state: GoalGraphState) -> str:
     return END if state.get("stop") == "stopped" else "goal_turn"
 
@@ -207,7 +233,7 @@ def _route_after_goal_turn(state: GoalGraphState) -> str:
     if stop == "dispatch":
         return "validate_dispatch"
     if stop == "done":
-        return "final_merge"
+        return "validate_done"
     if stop == "blocked":
         return "finish_blocked"
     raise ValueError(f"unknown goal turn stop {stop!r} (expected dispatch/done/blocked)")
@@ -217,6 +243,12 @@ def _route_after_validate(state: GoalGraphState) -> str:
     # validate_dispatch clears `stop` when it bounces the dispatch back;
     # a surviving "dispatch" means the GO-36 checks passed and run_dd is next.
     return "run_dd" if state.get("stop") == "dispatch" else "goal_turn"
+
+
+def _route_after_validate_done(state: GoalGraphState) -> str:
+    # validate_done clears `stop` when it bounces the done back; a surviving
+    # "done" means every dispatched DD is terminal and final_merge is next.
+    return "final_merge" if state.get("stop") == "done" else "goal_turn"
 
 
 def _route_after_final_merge(state: GoalGraphState) -> str:
@@ -240,8 +272,11 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
     + the GO-36 git gate) and ``run_dd`` before looping back to
     ``read_control``; a rejected dispatch bounces straight back to
     ``goal_turn`` with the field-level errors as the next handoff (mechanical
-    principle: bounce, don't guess). ``checkpointer`` is only a droppable
-    cache — ``events.jsonl`` stays the only source of truth (protocol §11).
+    principle: bounce, don't guess). ``done`` goes through ``validate_done``
+    first — the §0.10 no-in-flight-DD gate — and bounces back the same way
+    when a dispatched DD is still unresolved; only a clean done reaches
+    ``final_merge``. ``checkpointer`` is only a droppable cache —
+    ``events.jsonl`` stays the only source of truth (protocol §11).
     """
     policy = agentrun.resolve_session_policy("goal", deps.session_overrides)
     goal_model = (deps.model_by_role or {}).get("goal")
@@ -609,6 +644,35 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
             return {"stop": None, "warnings": ["dispatch rejected: " + "; ".join(errors)]}
         return {}
 
+    def validate_done(state: GoalGraphState) -> dict[str, Any]:
+        """The §0.10 done gate: no dispatched-but-unresolved DD, else bounce.
+
+        Protocol §0.10 (Goal Agent, Stop 后核对): ``done`` requires no
+        unmerged DD. Mechanically (GO-25): a DD is in-flight when the log
+        holds its ``dd.dispatched`` without a terminal ``dd.merged`` /
+        ``dd.failed`` for it. A non-empty in-flight list writes one
+        ``goal.warning`` (``reason`` = ``done_with_inflight_dd``, ``dd_ids``
+        = the list), clears ``stop``, and hands the field-level explanation
+        to the next turn's ``warnings`` — the same bounce-don't-guess
+        semantics ``validate_dispatch`` applies to dispatch. ``failed`` is a
+        terminal outcome: it does not count as "unmerged" and never blocks
+        done — the Goal Agent already saw it in ``dd_summary`` and judged it;
+        only a dispatched DD still lacking its terminal event blocks the
+        done. An empty list passes through to ``final_merge`` unchanged.
+        """
+        inflight = _inflight_dd_ids(list(deps.event_log.read()))
+        if not inflight:
+            return {}
+        handoff = (
+            "done rejected (done_with_inflight_dd): dd.dispatched without a "
+            "terminal dd.merged/dd.failed: " + ", ".join(inflight)
+        )
+        deps.event_log.append(
+            "goal.warning",
+            {"reason": "done_with_inflight_dd", "dd_ids": inflight, "message": handoff},
+        )
+        return {"stop": None, "warnings": [handoff]}
+
     def run_dd_node(state: GoalGraphState) -> dict[str, Any]:
         """Execute the dispatched DD via the seam, then loop to read_control."""
         dispatch_obj = (state.get("last_stop") or {}).get("dispatch") or {}
@@ -682,6 +746,7 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
     graph.add_node("read_control", read_control)
     graph.add_node("goal_turn", goal_turn)
     graph.add_node("validate_dispatch", validate_dispatch)
+    graph.add_node("validate_done", validate_done)
     graph.add_node("run_dd", run_dd_node)
     graph.add_node("final_merge", final_merge_node)
     graph.add_node("finish_blocked", finish_blocked)
@@ -697,7 +762,7 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
         _route_after_goal_turn,
         {
             "validate_dispatch": "validate_dispatch",
-            "final_merge": "final_merge",
+            "validate_done": "validate_done",
             "finish_blocked": "finish_blocked",
         },
     )
@@ -705,6 +770,11 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
         "validate_dispatch",
         _route_after_validate,
         {"run_dd": "run_dd", "goal_turn": "goal_turn"},
+    )
+    graph.add_conditional_edges(
+        "validate_done",
+        _route_after_validate_done,
+        {"final_merge": "final_merge", "goal_turn": "goal_turn"},
     )
     graph.add_edge("run_dd", "read_control")
     graph.add_conditional_edges(

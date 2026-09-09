@@ -584,3 +584,75 @@ def test_final_merge_rebased_bounces_back_to_goal_turn(tmp_path: Path) -> None:
         for ev in harness.events_of("goal.warning")
     )
     assert harness.kinds()[-1] == "goal.done"
+
+
+# ---------------------------------------------------------------------------
+# validate_done: done with an in-flight DD bounces back (protocol §0.10)
+# ---------------------------------------------------------------------------
+
+
+def test_done_with_inflight_dd_bounces_back_to_goal_turn(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, stops=[done_stop(), blocked_stop()])
+    # A crashed DD from before: dispatched, never resolved (no dd.merged /
+    # dd.failed terminal event) — e.g. an engine restart that never resumed it.
+    harness.log.append("dd.dispatched", {"spec_text": "旧的 X", "branch": DD_BRANCH}, dd_id="dd-99")
+
+    result = run_goal(harness.deps, goal_id=GOAL_ID, enroll=dict(ENROLL))
+
+    # The done was bounced: the next turn ran, final_merge never fired, and
+    # the goal only ended when the agent said something else (blocked).
+    assert result["stop"] == "blocked"
+    assert harness.final_merge.calls == 0
+    assert harness.run_dd.calls == []
+    assert len(harness.invoker.calls) == 2
+    assert "goal.done" not in harness.kinds()
+
+    bounced = [
+        ev
+        for ev in harness.events_of("goal.warning")
+        if ev.payload.get("reason") == "done_with_inflight_dd"
+    ]
+    assert len(bounced) == 1
+    assert bounced[0].payload["dd_ids"] == ["dd-99"]
+
+    # The field-level explanation is the next turn's handoff content.
+    in2 = harness.invoker.in_obj(1)
+    assert in2["turn_no"] == 1  # no DD ran, so the bounced turn stays turn 1
+    assert in2["last_stop"] == done_stop()
+    assert any(
+        "done_with_inflight_dd" in warning and "dd-99" in warning for warning in in2["warnings"]
+    )
+
+
+def test_done_without_inflight_dd_reaches_final_merge_and_done(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, stops=[done_stop()])
+
+    result = run_goal(harness.deps, goal_id=GOAL_ID, enroll=dict(ENROLL))
+
+    assert result["stop"] == "done"
+    assert harness.final_merge.calls == 1
+    assert harness.kinds()[-1] == "goal.done"
+    assert not any(
+        ev.payload.get("reason") == "done_with_inflight_dd"
+        for ev in harness.events_of("goal.warning")
+    )
+
+
+def test_failed_dd_is_terminal_and_does_not_block_done(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, stops=[done_stop()])
+    # A failed DD is terminal (§0.10): not "unmerged", never a done blocker —
+    # the Goal Agent already judged it via dd_summary.
+    harness.log.append(
+        "dd.dispatched", {"spec_text": "做不了的那个", "branch": DD_BRANCH}, dd_id="dd-01"
+    )
+    harness.log.append("dd.failed", {"stage": "impl", "detail": "做不了"}, dd_id="dd-01")
+
+    result = run_goal(harness.deps, goal_id=GOAL_ID, enroll=dict(ENROLL))
+
+    assert result["stop"] == "done"
+    assert harness.final_merge.calls == 1
+    assert harness.kinds()[-1] == "goal.done"
+    assert not any(
+        ev.payload.get("reason") == "done_with_inflight_dd"
+        for ev in harness.events_of("goal.warning")
+    )
