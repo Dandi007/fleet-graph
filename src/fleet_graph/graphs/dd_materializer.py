@@ -29,7 +29,6 @@ contract that already states it.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -149,17 +148,25 @@ class MaterializationTarget:
 
     @property
     def merge_target_identity(self) -> str:
-        return self.target_ref or self.remote_ref
+        # The durable merge target. Never substituted with the publish ref: an
+        # unmapped target is expressed as "" (bound, not-yet-known), so a later
+        # reveal is detected as a change rather than silently promoted to the
+        # publish ref's identity (spec L3: no substitute identity).
+        return self.target_ref
 
     @property
     def merge_head_ref(self) -> str:
-        return self.audit_ref or self.remote_ref
+        # The order-private audit branch. Never substituted with the publish
+        # ref for the same reason as `merge_target_identity`: an absent audit
+        # branch (the legacy single-durable-ref layout) is expressed as "", not
+        # as the publish ref.
+        return self.audit_ref
 
     @property
     def pr_identity(self) -> str:
         head = self.merge_head_ref
         base = self.merge_target_identity
-        return f"{head}->{base}" if (head or base) else ""
+        return f"{head}->{base}" if (head and base) else ""
 
 
 @lru_cache(maxsize=1)
@@ -443,8 +450,8 @@ class PluginMaterializer:
         validity = self._validity_key(sealed.commit)
         # Persist the sealed key beside its receipt so a restarted generation's
         # replayer can load and re-verify it against the current facts (spec
-        # L3/L4). Best-effort: the seal and its receipt are already durable via
-        # git + the plugin receipt; this is the replay-comparison record only.
+        # L3/L4). Fail-closed: a lost write aborts the seal (retryable), so a
+        # stage can never seal without its verifiable binding on disk.
         self._persist_validity(stage, dispatch, sealed.commit, validity)
         return Sealed(
             commit=sealed.commit,
@@ -462,12 +469,14 @@ class PluginMaterializer:
         under the same identity the receipt was sealed with, so a later
         generation's replayer finds it exactly where it finds the receipt. An
         unpinned dispatch re-derives the identity from (generation, attempt) as
-        the sealer normally would. A lost write is an observability gap, not a
-        chain break: the seal and its receipt are already durable via git and
-        the plugin receipt, so this supplementary replay-comparison record is
-        suppressed the same way `ConfigureStage._freeze_base` suppresses its own
-        record write (a later replayer that finds no key degrades to the
-        receipt-mechanics + acceptance-context checks it already performs).
+        the sealer normally would.
+
+        Fail-closed (spec L3): the replayer now *requires* this key to re-verify
+        a replayed stage against the current facts, so a seal whose binding
+        evidence did not land would produce a receipt that can never be safely
+        replayed. A write failure therefore aborts the materialization as a
+        retryable fault -- visible and recoverable -- rather than letting a
+        stage seal successfully with no verifiable binding on disk.
         """
         attempt_id = str(dispatch.get("pinned_attempt_id") or "") or derive_attempt_id(
             self.builder.chain.development_id,
@@ -480,12 +489,19 @@ class PluginMaterializer:
             "output_commit": output_commit,
             "validity": validity_payload(validity),
         }
-        with contextlib.suppress(OSError):
+        try:
             directory = Path(self.target.state_root) / "receipts" / attempt_id
             directory.mkdir(parents=True, exist_ok=True)
             (directory / f"{stage.id}{VALIDITY_FILE_SUFFIX}").write_text(
                 json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
             )
+        except OSError as exc:
+            raise MaterializationFailed(
+                "VALIDITY_PERSIST_FAILED",
+                f"could not persist the sealed validity key for {stage.id}/"
+                f"{attempt_id}: {exc}",
+                retryable=True,
+            ) from exc
 
     def _validity_key(self, output_commit: str) -> Any:
         """The validity key (spec L3) sealed with this stage's output commit.

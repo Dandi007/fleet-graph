@@ -795,7 +795,11 @@ class TestValidityBindingIsWired:
         assert key.digest.startswith("sha256:")
         assert key.inputs.product_revision == commit
         assert key.inputs.spec_digest.startswith("sha256:")
-        assert key.inputs.target_identity == "0" * 40  # the chain's frozen base
+        # The target identity is not substituted: with no caller-supplied target,
+        # it stays "" (bound, not-yet-known) -- never the chain's base commit
+        # (a git object id is not a ref) and never a substitute identity.
+        assert key.inputs.target_identity == ""
+        assert key.inputs.pr_identity == ""
         # The acceptance-context revision is measured out of git, not left empty.
         assert key.inputs.acceptance_context_revision, "acceptance context must bind"
 
@@ -815,6 +819,24 @@ class TestValidityBindingIsWired:
         )
         with pytest.raises((DispatchError, ExactWorkspaceError)):
             builder.validity_key({"input_commit": head(repo)})
+
+    def test_a_materialization_target_expresses_target_and_pr_nonexistence(
+        self, repo: Path
+    ) -> None:
+        from fleet_graph.graphs.dd_materializer import MaterializationTarget
+
+        target = MaterializationTarget(
+            remote_url="https://example.invalid/repo.git",
+            remote_ref="refs/heads/dev-1",
+            worktree=str(repo),
+            state_root=str(repo / ".state"),
+        )
+        # Neither the merge target nor the PR head/base is substituted with the
+        # publish ref when unset: absence is expressed as "" (bound, not yet
+        # known), never re-identified as the publish ref (spec L3).
+        assert target.merge_target_identity == ""
+        assert target.merge_head_ref == ""
+        assert target.pr_identity == ""
 
     def test_the_gate_binds_and_verifies_a_validity_key(self, repo: Path) -> None:
         from fleet_graph.graphs.dd_gate import GraphGateNode

@@ -730,9 +730,13 @@ class ReceiptReplayer:
         """The previously sealed validity key this receipt was sealed with, if any.
 
         Read from `<root>/receipts/<attempt_id>/<stage>-validity.json`, the same
-        standard layout the receipt itself uses. None means no prior key was
-        persisted -- a legacy receipt -- and the replayer degrades to the
-        receipt-mechanics + acceptance-context checks it already performs.
+        standard layout the receipt itself uses. ``None`` means no *verifiable*
+        key is on disk -- either a receipt sealed before the validity key was
+        introduced (a legacy receipt whose target/PR binding cannot be recovered)
+        or a key that was lost or corrupted after sealing. Both are treated
+        fail-closed by `_validity_allows`: with no complete binding to verify
+        against, the stage re-runs for real rather than reusing a receipt whose
+        bound facts (spec L4: safe reject, never a receipt-only reuse).
         """
         attempt_id = str(receipt.get("attempt_id") or "")
         if not attempt_id:
@@ -788,16 +792,18 @@ class ReceiptReplayer:
     ) -> bool:
         """Whether the previously sealed validity key still binds this stage.
 
-        True means the receipt may be replayed; False means a bound fact that
-        re-verifies/re-reviews this stage changed (product tree, SPEC, target,
-        PR, acceptance context), so the stage must re-run for real. When no
-        previously sealed key can be loaded there is nothing to compare -- the
-        receipt-mechanics checks and the acceptance-context reconfigure check
-        already ran -- so the stage is allowed rather than guessing a change.
+        True means the receipt may be replayed; False means the stage re-runs
+        for real. Fail-closed (spec L3/L4): a bound fact that re-verifies or
+        re-reviews this stage changed (product tree, SPEC, target, PR,
+        acceptance context), OR the sealed validity key cannot be loaded or
+        reconstructed -- a missing or corrupted key, or one whose fields are
+        incomplete -- all refuse replay. A receipt with no verifiable binding
+        on disk is never reused against the current facts: reusing it would
+        bypass exactly the version check the key exists to enforce.
         """
         sealed = self._sealed_validity(root, receipt, stage_id)
         if sealed is None:
-            return True
+            return False  # no verifiable key: safe reject, re-run for real
         fields = sealed.get("validity", {}).get("fields") if isinstance(sealed, dict) else None
         key = binding_key_from_fields(fields)
         if key is None:

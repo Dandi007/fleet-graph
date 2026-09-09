@@ -298,7 +298,7 @@ def build_pipeline(
             # the previously sealed validity key and re-verifies these, so a
             # target or PR change between generations invalidates the affected
             # replayed stages rather than reusing the old receipts (spec L3/L4).
-            merge_head = config.audit_ref or config.remote_ref
+            merge_head = config.audit_ref
             replayer = ReceiptReplayer(
                 workspace=config.workspace_path,
                 state_root=config.state_root,

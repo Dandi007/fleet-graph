@@ -355,7 +355,14 @@ class StageDispatchBuilder:
             BindingFacts(
                 spec_digest=spec_ref["digest"],
                 acceptance_context_revision=acceptance_revision,
-                target_identity=merged.target_identity or self.chain.target_base_commit,
+                # The durable merge target stays whatever the caller bound --
+                # never substituted with the chain's base commit. `target_base_commit`
+                # is descriptive context (a git object id), not a ref; an absent
+                # target identity is expressed as "" (bound, not-yet-known), so a
+                # later reveal invalidates the affected stage instead of quietly
+                # re-identifying the target as the base commit (spec L3: no
+                # substitute identity).
+                target_identity=merged.target_identity,
                 pr_identity=merged.pr_identity,
             ),
         )

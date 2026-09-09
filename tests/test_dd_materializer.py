@@ -436,6 +436,57 @@ class TestReadingWhatTheSealerReturned:
         assert sealed.receipt is not None and sealed.receipt["verdict"] == "APPROVE"
 
 
+class TestTheValidityKeyIsPersistedFailClosed:
+    def test_a_failed_validity_write_aborts_the_seal(self, repo: Path) -> None:
+        """Spec L3: the sealed validity key is the replayer's re-verify evidence,
+        so a lost write must fail the materialization visibly (and retryably),
+        not let a stage seal with no verifiable binding on disk."""
+        block = repo / "blocked"
+        block.write_text("a file, not a directory", encoding="utf-8")
+        materializer = PluginMaterializer(
+            builder=StageDispatchBuilder(
+                DevelopmentChain(
+                    development_id=DEVELOPMENT_ID,
+                    workspace_path=str(repo),
+                    target_base_commit="b" * 40,
+                    root_handoff_digest="sha256:" + "c" * 64,
+                )
+            ),
+            binding=object(),
+            target=MaterializationTarget(
+                remote_url="https://example.invalid/repo.git",
+                remote_ref="refs/heads/dev-001",
+                worktree=str(repo),
+                state_root=str(block),
+            ),
+        )
+        with pytest.raises(MaterializationFailed, match="VALIDITY_PERSIST_FAILED") as failed:
+            materializer._persist_validity(
+                IMPLEMENT, dispatch_for(repo, "implement"), "9" * 40, {"stubbed": "9" * 40}
+            )
+        assert failed.value.retryable is True
+
+    def test_a_clean_validity_write_succeeds(self, repo: Path) -> None:
+        """The fail-closed write is not blanket refusal: a writable state root
+        still persists the key beside the receipt."""
+        materializer = make_materializer(repo)
+        materializer._persist_validity(
+            IMPLEMENT, dispatch_for(repo, "implement"), "9" * 40, {"stubbed": "9" * 40}
+        )
+        path = (
+            repo
+            / ".state"
+            / "receipts"
+            / derive_attempt_id(DEVELOPMENT_ID, 1, 1)
+            / "implement-validity.json"
+        )
+        assert path.is_file()
+        persisted = json.loads(path.read_text(encoding="utf-8"))
+        assert persisted["stage"] == "implement"
+        assert persisted["output_commit"] == "9" * 40
+        assert persisted["validity"] == {"stubbed": "9" * 40}
+
+
 class TestTheParentReceiptIsTheOneTheContractNames:
     def test_each_review_names_its_own_parent_file(self) -> None:
         """Continuous reviews the Implement receipt; Final reviews the
