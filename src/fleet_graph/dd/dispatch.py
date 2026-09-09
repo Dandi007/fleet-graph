@@ -349,21 +349,29 @@ class StageDispatchBuilder:
         acceptance_revision = merged.acceptance_context_revision or (
             measure_acceptance_context_revision(self.chain.workspace_path, input_commit)
         )
+        # The durable merge target and the PR head/base pair must both be bound
+        # to a real identity before a key can be sealed. `target_base_commit`
+        # is descriptive context (a git object id), not a ref, so it is never
+        # substituted. An unknown target or PR identity is not a sealable fact:
+        # sealing "" as "bound, not-yet-known" would mint an incomplete key and
+        # let a stage seal against no target/PR binding at all (spec L3: the
+        # validity key must be complete). Refuse fail-closed instead.
+        target_identity = merged.target_identity
+        pr_identity = merged.pr_identity
+        if not target_identity or not pr_identity:
+            raise DispatchError(
+                "cannot seal a complete validity key: target_identity and "
+                "pr_identity must both be bound (spec L3); sealing an unknown "
+                "target or PR identity as a bound fact is refused"
+            )
         return build_validity_binding(
             self.chain.workspace_path,
             input_commit,
             BindingFacts(
                 spec_digest=spec_ref["digest"],
                 acceptance_context_revision=acceptance_revision,
-                # The durable merge target stays whatever the caller bound --
-                # never substituted with the chain's base commit. `target_base_commit`
-                # is descriptive context (a git object id), not a ref; an absent
-                # target identity is expressed as "" (bound, not-yet-known), so a
-                # later reveal invalidates the affected stage instead of quietly
-                # re-identifying the target as the base commit (spec L3: no
-                # substitute identity).
-                target_identity=merged.target_identity,
-                pr_identity=merged.pr_identity,
+                target_identity=target_identity,
+                pr_identity=pr_identity,
             ),
         )
 

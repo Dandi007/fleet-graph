@@ -114,6 +114,17 @@ REJECT = chain_rules.REJECT
 #: rework bound is single digits; this only stops a pathological directory.
 MAX_WALK_ATTEMPTS = 64
 
+#: Refusal codes for a replay step whose *validity evidence* cannot be used
+#: (spec L3/L4). These are distinct from the ordinary "a bound fact changed, so
+#: the stage re-runs for real" invalidation: an invalidation re-verifies against
+#: a complete key and is a legitimate migration, while these name the recovery
+#: path where the evidence itself is missing, corrupt or unmeasurable -- a safe
+#: rejection that must be traceable on the raw-event boundary, not a silent
+#: `return False`.
+VALIDITY_EVIDENCE_MISSING = "validity_evidence_missing"
+VALIDITY_EVIDENCE_CORRUPT = "validity_evidence_corrupt"
+VALIDITY_FACTS_UNMEASURABLE = "validity_facts_unmeasurable"
+
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -202,6 +213,11 @@ class ReceiptReplayer:
     #: sealed, the affected replayed stages re-run for real (spec L3/L4).
     target_identity: str = ""
     pr_identity: str = ""
+    #: The raw-event sink the pipeline shares (``persist_event`` in production).
+    #: A validity-evidence refusal during replay is emitted here so a restarted
+    #: generation's recovery record is traceable (spec L7), not just a silent
+    #: `return False` that re-runs a stage for an unrecorded reason.
+    observe: Any = None
     lifecycle: Lifecycle = field(default_factory=Lifecycle.load)
 
     def __post_init__(self) -> None:
@@ -209,6 +225,11 @@ class ReceiptReplayer:
         self._index = 0
         self._disabled = False
         self._pending_run_config: dict[str, Any] | None = None
+        #: The full in-memory trail of validity-evidence refusals, kept for a
+        #: verifier to inspect. Reliable even when no `observe` sink is wired.
+        self.refusals: list[dict[str, Any]] = []
+        #: How many of `refusals` have already been emitted to `observe`.
+        self._observed_refusals = 0
 
     # --- the walker's port ------------------------------------------------
 
@@ -242,6 +263,12 @@ class ReceiptReplayer:
                 candidates = self._candidate_plans()
             except Exception:
                 candidates = []
+            # Emit any validity-evidence refusals collected while reading the
+            # prior generations' sealed keys onto the raw-event boundary, but
+            # *outside* the swallow above: a journal-write failure must report
+            # (spec L7), never be hidden behind the defensive no-candidates
+            # fallback.
+            self._flush_refusals()
             self._plan = self._select(candidates, stage)
             if self._plan is None:
                 self._disabled = True
@@ -726,27 +753,60 @@ class ReceiptReplayer:
 
     def _sealed_validity(
         self, root: Path, receipt: dict[str, Any], stage_id: str
-    ) -> dict[str, Any] | None:
-        """The previously sealed validity key this receipt was sealed with, if any.
+    ) -> tuple[dict[str, Any] | None, str]:
+        """The previously sealed validity key this receipt was sealed with, plus
+        the reason it is unusable when absent.
 
         Read from `<root>/receipts/<attempt_id>/<stage>-validity.json`, the same
-        standard layout the receipt itself uses. ``None`` means no *verifiable*
-        key is on disk -- either a receipt sealed before the validity key was
-        introduced (a legacy receipt whose target/PR binding cannot be recovered)
-        or a key that was lost or corrupted after sealing. Both are treated
-        fail-closed by `_validity_allows`: with no complete binding to verify
-        against, the stage re-runs for real rather than reusing a receipt whose
-        bound facts (spec L4: safe reject, never a receipt-only reuse).
+        standard layout the receipt itself uses. The second element is a refusal
+        code instead of ``None`` when no *verifiable* key can be loaded: a
+        missing file (a legacy receipt sealed before the validity key existed,
+        or a key lost after sealing) is `VALIDITY_EVIDENCE_MISSING`; an
+        unparseable or non-object file is `VALIDITY_EVIDENCE_CORRUPT`. Both are
+        treated fail-closed by `_validity_allows` and made traceable, rather
+        than collapsing into an indistinguishable "no key" (spec L4: safe
+        reject, never a receipt-only reuse).
         """
         attempt_id = str(receipt.get("attempt_id") or "")
         if not attempt_id:
-            return None
+            return None, VALIDITY_EVIDENCE_MISSING
         path = root / "receipts" / attempt_id / f"{stage_id}{VALIDITY_FILE_SUFFIX}"
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-        return raw if isinstance(raw, dict) else None
+        except OSError:
+            return None, VALIDITY_EVIDENCE_MISSING
+        except ValueError:
+            return None, VALIDITY_EVIDENCE_CORRUPT
+        if not isinstance(raw, dict):
+            return None, VALIDITY_EVIDENCE_CORRUPT
+        return raw, ""
+
+    def _record_refusal(self, stage_id: str, code: str, detail: str) -> None:
+        """Record one validity-evidence refusal, in memory and (later) to observe.
+
+        Kept in `self.refusals` immediately -- the reliable record a verifier
+        can inspect -- and emitted to `observe` when `_flush_refusals` runs
+        outside any swallow, so the recovery path leaves a trace rather than a
+        silent `return False`.
+        """
+        self.refusals.append(
+            {"event": "replay_refused", "stage": stage_id, "reason": code, "detail": detail}
+        )
+
+    def _flush_refusals(self) -> None:
+        """Emit un-emitted validity refusals to the raw-event sink (spec L7).
+
+        The observation here is the same shared sink the pipeline writes its
+        history to; a write failure propagates -- a journal write error is
+        never hidden (spec L7). The in-memory `refusals` list is untouched, so
+        a verifier can still read the full trail.
+        """
+        if self.observe is None:
+            self._observed_refusals = len(self.refusals)
+            return
+        while self._observed_refusals < len(self.refusals):
+            self.observe(self.refusals[self._observed_refusals])
+            self._observed_refusals += 1
 
     def _committed_spec_digest(self, output_commit: str) -> str:
         """The committed SPEC digest at `output_commit`, or "" when unreadable."""
@@ -800,17 +860,42 @@ class ReceiptReplayer:
         incomplete -- all refuse replay. A receipt with no verifiable binding
         on disk is never reused against the current facts: reusing it would
         bypass exactly the version check the key exists to enforce.
+
+        The refusal reasons are made *traceable*: a missing/corrupted key, or
+        unmeasurable current facts, records a distinct refusal code on
+        `self.refusals` (and, via `_flush_refusals`, on the raw-event boundary),
+        so a recovery pass can tell "the evidence was lost" from "the facts
+        moved". A legitimate invalidation (a bound fact changed) is not one of
+        those refusals -- it stays the ordinary "re-run for real" migration.
         """
-        sealed = self._sealed_validity(root, receipt, stage_id)
+        sealed, evidence_code = self._sealed_validity(root, receipt, stage_id)
         if sealed is None:
-            return False  # no verifiable key: safe reject, re-run for real
-        fields = sealed.get("validity", {}).get("fields") if isinstance(sealed, dict) else None
+            self._record_refusal(
+                stage_id,
+                evidence_code,
+                f"no verifiable validity key beside the {stage_id} receipt: "
+                f"{evidence_code}",
+            )
+            return False
+        validity = sealed.get("validity") if isinstance(sealed, dict) else None
+        fields = validity.get("fields") if isinstance(validity, dict) else None
         key = binding_key_from_fields(fields)
         if key is None:
-            return False  # a persisted key that cannot be reconstructed: fail closed
+            self._record_refusal(
+                stage_id,
+                VALIDITY_EVIDENCE_CORRUPT,
+                f"the persisted {stage_id} validity key cannot be reconstructed "
+                "from its recorded fields",
+            )
+            return False
         current = self._current_validity_inputs(output_commit)
         if current is None:
-            return False  # cannot measure the current facts: fail closed
+            self._record_refusal(
+                stage_id,
+                VALIDITY_FACTS_UNMEASURABLE,
+                f"the current facts for {stage_id} cannot be measured out of git",
+            )
+            return False
         changed = changed_fields(current, key.inputs)
         return stage_id not in affected_stages(changed)
 
@@ -1032,6 +1117,9 @@ __all__ = [
     "MAX_WALK_ATTEMPTS",
     "RECEIPT_FILES",
     "REJECT",
+    "VALIDITY_EVIDENCE_CORRUPT",
+    "VALIDITY_EVIDENCE_MISSING",
+    "VALIDITY_FACTS_UNMEASURABLE",
     "ReceiptReplayer",
     "byte_digest",
     "prior_generation_state_roots",

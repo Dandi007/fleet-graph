@@ -313,6 +313,10 @@ def build_pipeline(
                     if (merge_head and config.remote_ref)
                     else ""
                 ),
+                # The replayer's validity-evidence refusals are recorded on the
+                # same raw-event boundary the pipeline writes its history to, so
+                # a restarted generation's recovery is traceable (spec L7).
+                observe=observe,
             )
 
     builder = StageDispatchBuilder(

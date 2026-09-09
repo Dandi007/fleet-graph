@@ -507,10 +507,14 @@ class PluginMaterializer:
         """The validity key (spec L3) sealed with this stage's output commit.
 
         Fail-closed: if the git/product facts or the caller facts cannot be
-        bound -- no workspace, an unreadable commit/tree/spec/run-config -- the
-        seal fails rather than sealing without the binding. An absent binding
-        must never slide through as ``None``; a later verify would treat that
-        as "nothing bound" and silently accept an unbound stage.
+        bound -- no workspace, an unreadable commit/tree/spec/run-config, or an
+        unknown target/PR identity (empty ``target_ref``/``audit_ref``) -- the
+        seal fails rather than sealing without a complete binding. An absent
+        binding must never slide through as ``None``, and an unknown target/PR
+        must never be sealed as a "bound, not-yet-known" fact: a later verify
+        would treat that as "nothing changed" and silently accept an unbound
+        stage (spec L3: the key must be complete, never a substituted target or
+        a fabricated PR identity).
         """
         if not self.builder.chain.workspace_path:
             raise MaterializationFailed(

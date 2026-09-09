@@ -781,6 +781,7 @@ class TestValidityBindingIsWired:
 
     def test_the_dispatch_builder_measures_a_validity_key(self, repo: Path) -> None:
         from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder
+        from fleet_graph.dd.validity_binding import BindingFacts
 
         commit = self._commit_run_config(repo)
         builder = StageDispatchBuilder(
@@ -791,17 +792,47 @@ class TestValidityBindingIsWired:
                 root_handoff_digest="sha256:" + "0" * 64,
             )
         )
-        key = builder.validity_key({"input_commit": commit})
+        facts = BindingFacts(
+            target_identity="refs/heads/release/self",
+            pr_identity="refs/heads/dd/dev-fg-1->refs/heads/release/self",
+        )
+        key = builder.validity_key({"input_commit": commit}, facts=facts)
         assert key.digest.startswith("sha256:")
         assert key.inputs.product_revision == commit
         assert key.inputs.spec_digest.startswith("sha256:")
-        # The target identity is not substituted: with no caller-supplied target,
-        # it stays "" (bound, not-yet-known) -- never the chain's base commit
-        # (a git object id is not a ref) and never a substitute identity.
-        assert key.inputs.target_identity == ""
-        assert key.inputs.pr_identity == ""
+        # The target and PR identities are the caller's bound facts -- never the
+        # chain's base commit (a git object id is not a ref) and never a
+        # substitute identity. The key is complete: all six fields bind.
+        assert key.inputs.target_identity == "refs/heads/release/self"
+        assert key.inputs.pr_identity == "refs/heads/dd/dev-fg-1->refs/heads/release/self"
         # The acceptance-context revision is measured out of git, not left empty.
         assert key.inputs.acceptance_context_revision, "acceptance context must bind"
+
+    def test_the_dispatch_builder_refuses_to_seal_an_unknown_target_or_pr(
+        self, repo: Path
+    ) -> None:
+        """Spec L3: the validity key must be complete. An unknown target or PR
+        identity is not a sealable fact -- sealing "" as a bound fact would mint
+        an incomplete key, so the builder refuses instead of guessing."""
+        from fleet_graph.dd.dispatch import DevelopmentChain, DispatchError, StageDispatchBuilder
+        from fleet_graph.dd.validity_binding import BindingFacts
+
+        commit = self._commit_run_config(repo)
+        builder = StageDispatchBuilder(
+            DevelopmentChain(
+                development_id="dev-1",
+                workspace_path=str(repo),
+                target_base_commit="0" * 40,
+                root_handoff_digest="sha256:" + "0" * 64,
+            )
+        )
+        with pytest.raises(DispatchError, match="complete validity key"):
+            builder.validity_key({"input_commit": commit}, facts=BindingFacts())
+        with pytest.raises(DispatchError, match="complete validity key"):
+            builder.validity_key(
+                {"input_commit": commit},
+                facts=BindingFacts(target_identity="refs/heads/release/self", pr_identity=""),
+            )
 
     def test_the_dispatch_builder_refuses_to_bind_without_a_run_config(
         self, repo: Path
@@ -947,6 +978,94 @@ class TestValidityBindingIsWired:
         # a None binding.
         with pytest.raises(MaterializationFailed, match="VALIDITY_BINDING_FAILED"):
             materializer._validity_key("9" * 40)
+
+    def test_the_materializer_refuses_to_seal_with_an_unknown_target_or_pr(
+        self, repo: Path
+    ) -> None:
+        """Spec L3: the seal must not mint an incomplete validity key. Even when
+        the git facts, SPEC and run-config are all readable, an unknown target
+        or PR identity (an unset ``target_ref``/``audit_ref``) makes the binding
+        incomplete, so the seal fails closed instead of sealing "" facts."""
+        from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder
+        from fleet_graph.graphs.dd_materializer import (
+            MaterializationFailed,
+            MaterializationTarget,
+            PluginMaterializer,
+        )
+
+        commit = self._commit_run_config(repo)
+        builder = StageDispatchBuilder(
+            DevelopmentChain(
+                development_id="dev-1",
+                workspace_path=str(repo),
+                target_base_commit="0" * 40,
+                root_handoff_digest="sha256:" + "0" * 64,
+            )
+        )
+        materializer = PluginMaterializer(
+            builder=builder,
+            binding=object(),
+            target=MaterializationTarget(
+                remote_url="https://example.invalid/repo.git",
+                remote_ref="refs/heads/dev-1",
+                worktree=str(repo),
+                state_root=str(repo / ".state"),
+            ),
+            verify_worktree_head=True,
+        )
+        # Valid commit with a committed spec and run-config, but no durable
+        # merge target or audit branch: the seal must refuse, not fabricate.
+        with pytest.raises(MaterializationFailed, match="VALIDITY_BINDING_FAILED"):
+            materializer._validity_key(commit)
+
+    def test_replay_records_a_traceable_refusal_when_validity_evidence_is_lost(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """Spec L4: a replay step that finds the sealed validity key missing or
+        corrupted refuses traceably, not silently. The refusal names a distinct
+        code and is emitted to the raw-event sink, so a recovery pass can tell
+        "the evidence was lost" from "the facts moved"."""
+        from fleet_graph.dd.lifecycle import Lifecycle
+        from fleet_graph.graphs.dd_replay import (
+            VALIDITY_EVIDENCE_CORRUPT,
+            VALIDITY_EVIDENCE_MISSING,
+            ReceiptReplayer,
+        )
+
+        state_root = tmp_path / "state"
+        receipt = {"attempt_id": "attempt-1"}
+
+        def make_replayer() -> tuple[ReceiptReplayer, list[dict[str, object]]]:
+            observed: list[dict[str, object]] = []
+            replayer = ReceiptReplayer(
+                workspace=repo,
+                state_root=state_root,
+                prior_state_roots=(),
+                development_id="dev-1",
+                generation=2,
+                lifecycle=Lifecycle.load(),
+                target_identity="refs/heads/release/self",
+                pr_identity="refs/heads/dd/dev-fg-1->refs/heads/release/self",
+                observe=observed.append,
+            )
+            return replayer, observed
+
+        # Missing key: safe reject with a distinct, traceable code.
+        replayer, observed = make_replayer()
+        assert replayer._validity_allows(state_root, receipt, "implement", head(repo)) is False
+        assert replayer.refusals[-1]["reason"] == VALIDITY_EVIDENCE_MISSING
+        replayer._flush_refusals()
+        assert observed == replayer.refusals
+
+        # Corrupted key: same fail-closed rejection, distinct code.
+        key_dir = state_root / "receipts" / "attempt-1"
+        key_dir.mkdir(parents=True, exist_ok=True)
+        (key_dir / "implement-validity.json").write_text("{not json", encoding="utf-8")
+        replayer, observed = make_replayer()
+        assert replayer._validity_allows(state_root, receipt, "implement", head(repo)) is False
+        assert replayer.refusals[-1]["reason"] == VALIDITY_EVIDENCE_CORRUPT
+        replayer._flush_refusals()
+        assert observed == replayer.refusals
 
     def test_recovery_binds_the_validity_digest(self) -> None:
         from fleet_graph.dd.recovery import HumanRecoveryExit, recovery_validity_digest

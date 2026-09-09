@@ -67,6 +67,11 @@ def make_materializer(repo: Path) -> PluginMaterializer:
         target=MaterializationTarget(
             remote_url="https://example.invalid/repo.git",
             remote_ref="refs/heads/dev-001",
+            # The complete validity key (spec L3) binds a real durable merge
+            # target and a PR head/base pair; the seal refuses when either is
+            # absent, so the shared fixture models a bound target/PR.
+            target_ref="refs/heads/release/self",
+            audit_ref="refs/heads/dd/dev-fg-1",
             worktree=str(repo),
             state_root=str(repo / ".state"),
         ),
@@ -485,6 +490,37 @@ class TestTheValidityKeyIsPersistedFailClosed:
         assert persisted["stage"] == "implement"
         assert persisted["output_commit"] == "9" * 40
         assert persisted["validity"] == {"stubbed": "9" * 40}
+
+    def test_a_seal_with_an_unknown_target_or_pr_is_refused(self, repo: Path) -> None:
+        """Spec L3: a complete validity key must bind a real target and PR
+        head/base pair. An unset ``target_ref``/``audit_ref`` makes the binding
+        incomplete, so the seal refuses instead of minting "" facts -- even
+        though the git facts, SPEC and run-config are all readable."""
+        run_config = repo / ".dev-dispatch" / "run-config.json"
+        run_config.parent.mkdir(parents=True, exist_ok=True)
+        run_config.write_text('{"acceptance_commands": [["true"]]}\n', encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "run-config")
+
+        materializer = PluginMaterializer(
+            builder=StageDispatchBuilder(
+                DevelopmentChain(
+                    development_id=DEVELOPMENT_ID,
+                    workspace_path=str(repo),
+                    target_base_commit="b" * 40,
+                    root_handoff_digest="sha256:" + "c" * 64,
+                )
+            ),
+            binding=object(),
+            target=MaterializationTarget(
+                remote_url="https://example.invalid/repo.git",
+                remote_ref="refs/heads/dev-001",
+                worktree=str(repo),
+                state_root=str(repo / ".state"),
+            ),
+        )
+        with pytest.raises(MaterializationFailed, match="VALIDITY_BINDING_FAILED"):
+            materializer._validity_key(head(repo))
 
 
 class TestTheParentReceiptIsTheOneTheContractNames:
