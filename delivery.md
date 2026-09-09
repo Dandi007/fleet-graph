@@ -46,21 +46,24 @@ Git/PR 副作用与新引擎部署一律留待联合验证阶段。
 - 目标交付 ref（唯一交付分支）: `refs/heads/release/fleet-compare-self`
 - 开发分支: `dd/fleet-compare-self/dev-fg-4053bbf02dcf`
 - 产品候选 commit（本交付覆盖的产品内容精确 HEAD，已存在、可验证的完整对象 ID）:
-  `0d08b861f6608b82c6d812b726c67a3c9ae4cc27`
-  （`src/fleet_graph` 与 `tests/` 中 L1–L7 DD 生命周期实现最后一次改动的 commit；
-  覆盖 `src/fleet_graph/dd/**`、`src/fleet_graph/graphs/{dd_pipeline,dd_scripts,
-  dd_runner,dd_replay,dd_gate,dd_materializer}.py`、
+  `ac67c8590bb5d6be7b5aabc7e76e1532152ea5a6`
+  （`src/fleet_graph` 与 `tests/` 中 L1–L7 DD 生命周期实现最后一次改动的 commit，
+  即 1753ec77 FR 的 fail-closed L3 validity binding 与 no-substitute target/PR
+  identity 修复；覆盖 `src/fleet_graph/dd/**`、`src/fleet_graph/graphs/{dd_pipeline,
+  dd_scripts,dd_runner,dd_replay,dd_gate,dd_materializer}.py`、
   `tests/test_dd_lifecycle_contract.py` 及其余生命周期测试 `tests/test_dd_*.py`）。
 - 本 `delivery.md` 与产品候选的关系：本文件是纯文档提交，落在产品候选
-  `0d08b861…` 之上——`git merge-base --is-ancestor 0d08b861… <最终HEAD>` 成立
-  （其间 `.dev-dispatch/**` 仅有 controller 的 `materialize continuous_review`/
-  `materialize implement` 记账提交，不含产品代码变更），且
-  `git diff --name-only 0d08b861… <最终HEAD> -- . ':(exclude).dev-dispatch'`
-  仅含 `delivery.md`（无任何产品代码变更）。
+  `ac67c859…` 之上——`git merge-base --is-ancestor ac67c859… <最终HEAD>` 成立
+  （其间 `.dev-dispatch/**` 仅有 controller 的 `materialize implement`/
+  `materialize continuous_review`/`materialize final_review`（73d1dfb6）记账提交，
+  不含产品代码变更），且
+  `git diff --name-only ac67c859… <最终HEAD> -- . ':(exclude).dev-dispatch'`
+  仅含 `delivery.md`（无任何产品代码变更，`ac67c859…` 之后没有任何 `src/` 或
+  `tests/` 改动）。
 - 最终交付 HEAD（`work_head_commit`，即携带本文件定稿的 commit 对象 ID）由
   controller 在 Implement handoff receipt（`.dev-dispatch`）内机械封存于本文档
   之外；本文件不得把文档自引用 SHA 冒充产品 SHA。
-- 输入 commit（本次返工的精确起点）: `68c1ff9d22f7f5c998d20e328c24059206b5737b`
+- 输入 commit（本次返工的精确起点）: `4b1431f83b000ec493d0467e060c08570727cbfd`
 - PR：尚未创建（本开发阶段无任何 live PR/远端副作用）；PR 将在 L1「typed merge
   authorization -> merge」阶段对 `release/fleet-compare-self` 创建，其精确
   PR number/URL 届时由 merge 授权记录。
