@@ -52,6 +52,7 @@ import pytest
 
 from fleet_graph.dd.self_gate import EvidenceItem
 from fleet_graph.graphs.dd_gate import (
+    CODE_EXPIRED_VERDICT,
     CODE_NOT_AWAITING_GATE,
     CODE_NOT_DISPATCHER,
     CODE_OBLIGATIONS_FAILED,
@@ -393,6 +394,60 @@ def test_a_failed_obligation_refuses_the_release(tmp_path: Path) -> None:
     )
     assert plane.published == []
     assert plane.resumed == []
+
+
+def test_a_drifted_version_refuses_the_gate_as_expired(tmp_path: Path) -> None:
+    """Spec L5: the goal verdict binds the accepted/reviewed version. When the
+    single carries a sealed validity key and the product has since drifted, the
+    verdict is expired and refused -- never re-approved against a moved tree."""
+    from fleet_graph.graphs.dd_gate import GraphGateNode
+
+    workspace = _workspace(tmp_path)
+    accepted_head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    status = {
+        "spec_digest": "sha256:" + "d" * 64,
+        "remote_ref": "refs/heads/release/fc-self",
+        "audit_ref": "refs/heads/dd/dev-fg-1",
+    }
+    sealed = GraphGateNode(plane=None)._validity_binding(workspace, accepted_head, status)
+    assert sealed["expired"] is False
+
+    # Drift the product: a real tree change above the accepted version.
+    (workspace / "product.py").write_text("print('drift')\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(workspace), "add", "-A"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "product drift",
+        ],
+        check=True,
+    )
+
+    class DriftedPlane(FakeGatePlane):
+        def get(self, development_id: str) -> dict[str, Any]:
+            record = super().get(development_id)
+            record.update(status)
+            record["sealed_validity"] = sealed
+            return record
+
+    receipt = _consume(tmp_path, DriftedPlane(workspace=workspace), _action())
+
+    assert receipt["status"] == STATUS_FAILED
+    assert receipt["reason"] == CODE_EXPIRED_VERDICT
 
 
 def test_unknown_development_is_a_failed_receipt(tmp_path: Path) -> None:

@@ -793,3 +793,29 @@ class TestTheRunLeavesArtifactsBehind:
             entry["stage"] for entry in result["history"]
         ]
         assert all(entry["at"] for entry in lines)
+
+    def test_a_failed_event_write_fails_the_run_loudly(
+        self, repo: Path, tmp_path: Path, plugin_seals: RealCommitSealer
+    ) -> None:
+        """Spec L7: the events trail is the run's state model, not disposable
+        telemetry. A write failure to ``events.jsonl`` must fail the run loudly
+        -- never be swallowed so the pipeline migrates state with its evidence
+        lost."""
+        from fleet_graph.graphs.dd_runner import EVENTS_FILE, EventPersistenceError
+
+        config = make_config(repo, tmp_path)
+        # Force the append to events.jsonl to fail: pre-create it as a directory.
+        (config.run_root / EVENTS_FILE).mkdir(parents=True)
+        scripts = ScriptStub(repo)
+        local = RealCommitSealer(repo)
+        unsealed = {name: local for name, stage in LIFECYCLE.stages.items() if not stage.is_llm}
+
+        with pytest.raises(EventPersistenceError):
+            run_pipeline(
+                config,
+                scripts={name: scripts for name, s in LIFECYCLE.stages.items() if not s.is_llm},
+                materializers=unsealed,
+                launcher=AgentRunStub(
+                    {"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]}
+                ),
+            )

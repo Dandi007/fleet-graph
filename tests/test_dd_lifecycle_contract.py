@@ -613,6 +613,21 @@ class TestRawEventBoundary:
         state = run_actor(ContractActor())
         assert state["terminal"] != TERMINAL_COMPLETE
 
+    def test_a_failing_observability_sink_is_not_swallowed(self) -> None:
+        """Spec L7: a raw-event write failure must not be swallowed. The walker
+        calls its observer per history entry; a failing observer propagates
+        rather than letting the pipeline migrate state on an untraceable basis."""
+        seen: list[dict[str, Any]] = []
+
+        def failing_observe(entry: dict[str, Any]) -> None:
+            seen.append(entry)
+            raise OSError("events.jsonl write failed")
+
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        with pytest.raises(OSError):
+            run_actor(actor, observe=failing_observe)
+        assert seen, "the failing observer was invoked before it failed"
+
 
 # --------------------------------------------------------------------------
 # L1 (consistency): the shipped contract and its schema must agree
@@ -744,6 +759,53 @@ class TestValidityBindingIsWired:
         node = GraphGateNode(plane=None)
         with pytest.raises((ExactWorkspaceError, RuntimeError)):
             node._validity_binding(repo, head(repo), {"spec_digest": "sha256:" + "d" * 64})
+
+    def test_the_gate_verifies_against_the_sealed_key_and_flags_expiry(self, repo: Path) -> None:
+        """Spec L5: a goal verdict is bound to the accepted/reviewed version, not
+        self-compared. When the product tree drifts after the sealed key was
+        measured, the current facts no longer bind it and the verdict is expired."""
+        from fleet_graph.graphs.dd_gate import GraphGateNode
+
+        commit = self._commit_run_config(repo)
+        node = GraphGateNode(plane=None)
+        status = {
+            "spec_digest": "sha256:" + "d" * 64,
+            "remote_ref": "refs/heads/release/self",
+            "audit_ref": "refs/heads/dd/dev-fg-1",
+        }
+        sealed = node._validity_binding(repo, commit, status)
+        assert sealed["expired"] is False
+
+        path = repo / "product.py"
+        path.write_text("print('drift')\n", encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "product drift")
+        drifted = head(repo)
+
+        result = node._validity_binding(repo, drifted, status, previous=sealed)
+        assert result["expired"] is True
+        assert "product_tree" in result["changed"]
+
+    def test_a_bookkeeping_only_advance_does_not_expire_the_verdict(self, repo: Path) -> None:
+        """A pure bookkeeping commit (same tree) must not invalidate a verdict
+        (spec L3): the revision advances, every meaningful fact stays put."""
+        from fleet_graph.graphs.dd_gate import GraphGateNode
+
+        commit = self._commit_run_config(repo)
+        node = GraphGateNode(plane=None)
+        status = {
+            "spec_digest": "sha256:" + "d" * 64,
+            "remote_ref": "refs/heads/release/self",
+            "audit_ref": "refs/heads/dd/dev-fg-1",
+        }
+        sealed = node._validity_binding(repo, commit, status)
+        git(repo, "commit", "-q", "--allow-empty", "-m", "bookkeeping")
+        later = head(repo)
+
+        result = node._validity_binding(repo, later, status, previous=sealed)
+        assert result["expired"] is False
+        assert result["matches"] is False
+        assert "product_revision" in result["changed"]
 
     def test_the_materializer_refuses_to_seal_without_a_binding(self, repo: Path) -> None:
         from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder

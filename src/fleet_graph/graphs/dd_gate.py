@@ -21,6 +21,8 @@ from fleet_graph.dd.self_gate import (
 from fleet_graph.dd.self_gate_evidence import DEFAULT_DD_ROOT, collect_gate_evidence
 from fleet_graph.dd.validity_binding import (
     BindingFacts,
+    binding_is_bookkeeping,
+    binding_key_from_fields,
     build_validity_binding,
     measure_acceptance_context_revision,
     verify_binding,
@@ -46,6 +48,7 @@ CODE_UNRESOLVED = "single_unresolved"
 CODE_OBLIGATIONS_FAILED = "gate_obligations_failed"
 CODE_REJECT_CONTRACT_INCOMPLETE = "reject_contract_incomplete"
 CODE_RELEASE_REFUSED = "release_refused"
+CODE_EXPIRED_VERDICT = "gate_verdict_expired"
 
 #: The workspace seal author (the same machine identity dd_scripts seals with).
 GATE_SEAL_MESSAGE = "dev-dispatch: gate decision sealed by the graph gate node"
@@ -135,7 +138,7 @@ class GraphGateNode:
         )
 
     def _validity_binding(
-        self, workspace: Path, head_commit: str, status: dict[str, Any]
+        self, workspace: Path, head_commit: str, status: dict[str, Any], previous: Any = None
     ) -> dict[str, Any]:
         """The version-bound validity key (spec L3/L5) the verdict seals against.
 
@@ -146,6 +149,14 @@ class GraphGateNode:
         from the single's record. Any read it cannot make raises -- the gate
         refuses rather than recording an "unavailable" marker, so a verdict can
         never seal against an unbound version.
+
+        When ``previous`` (a sealed validity key from the accepted/reviewed
+        version -- a ``ValidityKey`` or a ``{"digest", "fields"}`` record) is
+        supplied, the current facts are verified *against it* rather than
+        self-compared: ``expired`` is True when a meaningful bound fact changed
+        (spec, tree, acceptance context, target or PR), so an expired Goal
+        verdict is refused. Pure bookkeeping (a revision-only advance on the
+        same tree) does not expire the verdict (spec L3).
         """
         release_ref = str(status.get("remote_ref") or "")
         audit_ref = str(status.get("audit_ref") or "")
@@ -159,12 +170,40 @@ class GraphGateNode:
             pr_identity=(f"{head_ref}->{release_ref}" if (head_ref or release_ref) else ""),
         )
         key = build_validity_binding(str(workspace), head_commit, facts)
-        changed, matches = verify_binding(str(workspace), head_commit, facts, key)
+        if previous is None:
+            return {
+                "digest": key.digest,
+                "fields": key.fields,
+                "matches": True,
+                "changed": [],
+                "expired": False,
+            }
+        previous_key = (
+            previous
+            if hasattr(previous, "inputs") and hasattr(previous, "digest")
+            else binding_key_from_fields(
+                previous.get("fields") if isinstance(previous, dict) else None
+            )
+        )
+        if previous_key is None:
+            # A previously sealed key we cannot reconstruct is a version we
+            # cannot compare against: fail closed (expired) rather than pretend
+            # the verdict matched (spec L5).
+            return {
+                "digest": key.digest,
+                "fields": key.fields,
+                "matches": False,
+                "changed": sorted(key.fields),
+                "expired": True,
+            }
+        changed, matches = verify_binding(str(workspace), head_commit, facts, previous_key)
+        bookkeeping = binding_is_bookkeeping(str(workspace), head_commit, facts, previous_key)
         return {
             "digest": key.digest,
             "fields": key.fields,
             "matches": bool(matches),
             "changed": list(changed),
+            "expired": not matches and not bookkeeping,
         }
 
     def _seal_decision_file(
@@ -409,8 +448,26 @@ class GraphGateNode:
 
             # The version-bound validity key is bound and verified *before* any
             # decision is published, so an unverifiable version refuses the gate
-            # with nothing sealed or published (spec L5: fail-closed).
-            validity = self._validity_binding(workspace, head, status)
+            # with nothing sealed or published (spec L5: fail-closed). When the
+            # single's record carries the accepted/reviewed version's sealed
+            # validity key, the current facts are verified against it -- not
+            # self-compared -- and an expired Goal verdict is refused untouched.
+            validity = self._validity_binding(
+                workspace, head, status, previous=status.get("sealed_validity")
+            )
+            if validity.get("expired"):
+                return self._receipt(
+                    action,
+                    round_no=round_no,
+                    status=STATUS_FAILED,
+                    code=CODE_EXPIRED_VERDICT,
+                    detail=(
+                        f"the goal verdict for {development_id!r} is expired: the version "
+                        f"at head {head} no longer binds the accepted/reviewed validity "
+                        f"key (changed: {', '.join(validity.get('changed') or []) or 'none'})"
+                    ),
+                    development_id=development_id,
+                )
 
             published = dict(
                 self.plane.publish_gate_decision(
@@ -482,6 +539,7 @@ class GraphGateNode:
 
 
 __all__ = [
+    "CODE_EXPIRED_VERDICT",
     "CODE_NOT_AWAITING_GATE",
     "CODE_NOT_DISPATCHER",
     "CODE_OBLIGATIONS_FAILED",

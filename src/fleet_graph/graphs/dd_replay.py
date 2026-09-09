@@ -446,6 +446,15 @@ class ReceiptReplayer:
                     mode=mode,
                 ),
             ]
+            if self._acceptance_context_changed(configure_step.output_commit):
+                # The acceptance context was reconfigured. Per validity.py an
+                # acceptance-context revision change invalidates acceptance,
+                # continuous review and final review, so the sealed reviews --
+                # graded against the *old* context -- are not replayed; they
+                # and the acceptance stage re-run for real against the
+                # reconfigured context (spec L3/L5: any relevant change
+                # invalidates the affected re-verify/re-review).
+                return steps
             if not continuous_id:
                 return steps
 
@@ -715,6 +724,16 @@ class ReceiptReplayer:
         if not head:
             return False
         if head != tip:
+            # The trim below runs `reset --hard`, which would destroy any
+            # uncommitted product work in the tree or index. Spec L4 forbids
+            # both the reset of product state and the loss of dirty state:
+            # before touching anything, refuse the replay when the tree carries
+            # uncommitted non-reserved changes (or cannot be inspected), so the
+            # stage re-runs for real against the preserved scene (fail-closed).
+            # Controller-owned `.dev-dispatch`/`.dd-evidence` residue is dead
+            # weight the trim already cuts, so it stays permitted.
+            if self._has_uncommitted_product_changes() is not False:
+                return False
             diff = run_git(self.workspace, "diff", "--name-only", tip, head)
             if diff.returncode != 0:
                 return False
@@ -776,6 +795,34 @@ class ReceiptReplayer:
             self._pending_run_config = self._reconfigured_run_config(plan[0].output_commit)
         return True
 
+    def _has_uncommitted_product_changes(self) -> bool | None:
+        """Whether the tree/index carries uncommitted changes outside the
+        reserved (controller-owned) namespaces.
+
+        Used only before the ``reset --hard`` trim, where an uncommitted product
+        change would be silently destroyed (spec L4: no reset, no lost dirty
+        state). Reserved ``.dev-dispatch``/``.dd-evidence`` dirt is itself dead
+        weight the trim already cuts, and the stale-run-config case on the
+        ``HEAD == tip`` path is handled separately, so it stays permitted here.
+        ``False`` means the product paths are provably clean; ``True`` means a
+        product change is uncommitted; ``None`` means the tree could not be
+        inspected -- a caller must treat both ``True`` and ``None`` as "refuse to
+        trim", never guess.
+        """
+        status = run_git(
+            self.workspace,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        )
+        if status.returncode != 0:
+            return None
+        for line in status.stdout.splitlines():
+            path = line[3:] if len(line) > 3 else ""
+            if path and not path.startswith(RESERVED_PREFIXES):
+                return True
+        return False
+
     def _clear_stale_run_config_residue(self) -> bool:
         """Drop a previous generation's controller-owned ``run-config.json`` dirt.
 
@@ -835,6 +882,23 @@ class ReceiptReplayer:
             return False
         generation = config.get("generation")
         return isinstance(generation, int) and generation < self.generation
+
+    def _acceptance_context_changed(self, configure_commit: str) -> bool:
+        """Whether the declared acceptance context reconfigures the replayed one.
+
+        The replayed configure commit carries the *previous* generation's
+        run-config. When the operator reconfigured the acceptance context, the
+        declared ``run_config`` differs from it -- and per
+        ``validity.affected_stages`` an acceptance-context revision change
+        invalidates acceptance through final review, so the sealed reviews
+        graded against the old context must not be replayed (spec L3/L5).
+        ``run_config is None`` keeps the pre-reconfigure behaviour (leave the
+        replayed tree alone), and an unreadable committed config fails closed
+        to "changed" rather than guessing the context did not move.
+        """
+        if self.run_config is None:
+            return False
+        return self._reconfigured_run_config(configure_commit) is not None
 
     def _reconfigured_run_config(self, configure_commit: str) -> dict[str, Any] | None:
         """The run-config this generation must materialise, when reconfigured.

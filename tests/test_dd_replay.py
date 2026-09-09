@@ -483,6 +483,57 @@ class TestAReviewedChainContinuesThroughItsReviews:
         assert g1.installed("continuous-review-receipt.json").read_bytes() == cr_raw
         assert g1.installed("final-review-receipt.json").exists()
 
+    def test_a_reconfigured_context_invalidates_the_sealed_reviews(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """A fully-reviewed, approved chain is replayed -- but only until its
+        acceptance context is reconfigured. Per validity.py an
+        acceptance-context revision change invalidates acceptance through final
+        review, so the sealed reviews re-run for real rather than being reused
+        against a context they never graded (spec L3/L5)."""
+        g1 = G1(repo, tmp_path)
+        rc = commit_file(
+            repo, ".dev-dispatch/reviews/continuous/g1-a1.json", '{"verdict": "APPROVE"}'
+        )
+        cr = review_receipt(
+            parent_digest=byte_digest(g1.raw),
+            subject=g1.implement,
+            output=rc,
+            verdict="APPROVE",
+        )
+        cr_raw = write_receipt(g1.state_root, 1, 1, "continuous-review-receipt.json", cr)
+        write_intent(g1.state_root, cr)
+        rf = commit_file(repo, ".dev-dispatch/reviews/final/g1-a1.json", '{"verdict": "APPROVE"}')
+        fr = review_receipt(
+            parent_digest=byte_digest(cr_raw),
+            subject=rc,
+            output=rf,
+            verdict="APPROVE",
+            phase="final",
+        )
+        write_receipt(g1.state_root, 1, 1, "final-review-receipt.json", fr)
+        write_intent(g1.state_root, fr)
+        junk = g1.junk_configure()
+
+        declared = {"acceptance_commands": [["true"]], "setup_commands": [], "acceptance_env": {}}
+        replayer = ReceiptReplayer(
+            workspace=g1.repo,
+            state_root=g1.dev_root / "g2" / "state",
+            prior_state_roots=((1, g1.state_root),),
+            development_id=DEVELOPMENT_ID,
+            generation=2,
+            lifecycle=LIFECYCLE,
+            run_config=declared,
+        )
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=replayer), junk)
+
+        assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
+        assert replayed_stages(state) == ["configure", "implement"]
+        assert next(stage for stage, _ in actor.calls) == "acceptance"
+        assert ("continuous_review", 1) in actor.calls
+        assert ("final_review", 1) in actor.calls
+
     def test_a_final_approve_chain_with_only_a_missing_continuous_intent_replays_through(
         self, repo: Path, tmp_path: Path
     ) -> None:
@@ -909,6 +960,26 @@ class TestReplayFailsClosed:
         assert next(stage for stage, _ in actor.calls) == "configure"
         assert head(repo) == drifted
 
+    def test_an_uncommitted_product_change_refuses_the_trim_and_is_preserved(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """The trim's ``reset --hard`` would destroy uncommitted product work.
+        A dirty product file in the working tree -- even when the commit diff
+        above the tip lies entirely in the reserved namespaces -- must refuse
+        the replay and leave the scene untouched (spec L4: no reset, no lost
+        dirty state)."""
+        g1 = G1(repo, tmp_path)
+        junk = g1.junk_configure()
+        (repo / "product.py").write_text("print('uncommitted work')\n", encoding="utf-8")
+
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
+        state = run_generation_two(make_deps(actor=actor, replayer=g1.replayer()), junk)
+
+        assert replayed_stages(state) == []
+        assert next(stage for stage, _ in actor.calls) == "configure"
+        assert head(repo) == junk
+        assert "uncommitted work" in (repo / "product.py").read_text(encoding="utf-8")
+
     def test_a_rework_dispatch_is_never_replayed(self, repo: Path, tmp_path: Path) -> None:
         g1 = G1(repo, tmp_path)
         replayer = g1.replayer()
@@ -1076,12 +1147,15 @@ class TestAReconfiguredReplayDoesNotBlameTheReviewer:
     review prefix.
 
     A legal reconfigure changes the acceptance context of a successor
-    generation whose configure/implement/continuous-review prefix replays from
-    the previous generation. The replayed configure commit carries the stale
-    run-config, so the reconfigured run-config has to be re-produced -- but it
-    must not appear as staged or unstaged `.dev-dispatch/run-config.json` drift
-    while the read-only final reviewer is materializing, or the reviewer is
-    blamed for a write it never did (ACTOR_RESERVED_PATH_CHANGED)."""
+    generation. Per spec L3/L5 that change invalidates acceptance through final
+    review, so the sealed reviews -- graded against the old context -- are not
+    replayed: only the configure/implement prefix replays, and both review
+    stages re-run for real against the reconfigured context. The replayed
+    configure commit carries the stale run-config, so the reconfigured
+    run-config has to be re-produced -- but it must not appear as staged or
+    unstaged `.dev-dispatch/run-config.json` drift while the read-only reviewers
+    are materializing, or a reviewer is blamed for a write it never did
+    (ACTOR_RESERVED_PATH_CHANGED)."""
 
     def _g1_with_replayed_continuous_review(self, repo: Path, tmp_path: Path) -> tuple[G1, str]:
         g1 = G1(repo, tmp_path)
@@ -1125,7 +1199,7 @@ class TestAReconfiguredReplayDoesNotBlameTheReviewer:
             "setup_commands": [["echo", "reconfigured-setup"]],
             "acceptance_env": {"PYTHONPATH": "src"},
         }
-        actor = ContractActor({"final_review": ["APPROVE"]})
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
         scripts = {name: actor for name, stage in LIFECYCLE.stages.items() if not stage.is_llm}
         scripts["acceptance"] = AcceptanceStage(
             repo=repo,
@@ -1141,13 +1215,13 @@ class TestAReconfiguredReplayDoesNotBlameTheReviewer:
         )
 
         assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
-        # The sealed prefix replays through the continuous review; the final
-        # review runs for real and materializes without a reserved-path blame.
-        assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
+        # The reconfigured context invalidated the sealed reviews (spec L3/L5):
+        # only the configure/implement prefix replays, both reviews run for
+        # real, and neither materialization is blamed for reserved-path drift.
+        assert replayed_stages(state) == ["configure", "implement"]
+        assert ("continuous_review", 1) in actor.calls
         assert ("final_review", 1) in actor.calls
-        assert not any(
-            stage in ("configure", "implement", "continuous_review") for stage, _ in actor.calls
-        )
+        assert not any(stage in ("configure", "implement") for stage, _ in actor.calls)
         assert guard.violations == []
         # The reconfigured run-config was re-produced for the acceptance stage,
         # which graded against it rather than g1's stale declaration.
@@ -1171,7 +1245,7 @@ class TestAReconfiguredReplayDoesNotBlameTheReviewer:
                     )
                 return super().act(stage, dispatch)
 
-        actor = ReviewerThatWrites({"final_review": ["APPROVE"]})
+        actor = ReviewerThatWrites({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
         guard = ReviewReservedPathGuard(repo)
 
         state = run_generation_two(
@@ -1190,13 +1264,12 @@ class TestAStaleRunConfigResidueAtTheReplayTipIsRemoved:
 
     The predecessor fix only defers a *newly reproduced* run-config until
     acceptance; it does not cover stale controller-owned ``run-config.json``
-    dirt left by an earlier failed generation when replay preparation finds
-    ``HEAD == replay tip``, so ``_prepare`` skips its ``reset --hard`` branch
-    and the stale dirt survives into the fresh final reviewer
-    (ACTOR_RESERVED_PATH_CHANGED). This proves the uncovered path is closed:
-    only provably controller-owned stale residue is removed, a genuine
-    final-review actor write is still refused, and acceptance still observes
-    the current declaration."""
+    dirt left by an earlier failed generation, so ``_prepare`` must drop it
+    without blaming the fresh reviewer (ACTOR_RESERVED_PATH_CHANGED). A
+    reconfigured context invalidates the sealed reviews (spec L3/L5), so the
+    residue is dropped by the trim to the implement tip; a non-controller
+    run-config is never hidden, and acceptance still observes the current
+    declaration."""
 
     def _g1_with_replayed_continuous_review_at_tip(self, repo: Path, tmp_path: Path) -> G1:
         """The replay tip is already HEAD: no junk above it to trim."""
@@ -1253,7 +1326,7 @@ class TestAStaleRunConfigResidueAtTheReplayTipIsRemoved:
             "acceptance_env": {"PYTHONPATH": "src"},
         }
         replayer = self._generation_n_player(g1, 5, declared)
-        actor = ContractActor({"final_review": ["APPROVE"]})
+        actor = ContractActor({"continuous_review": ["APPROVE"], "final_review": ["APPROVE"]})
         scripts = {name: actor for name, stage in LIFECYCLE.stages.items() if not stage.is_llm}
         scripts["acceptance"] = AcceptanceStage(
             repo=repo,
@@ -1277,7 +1350,11 @@ class TestAStaleRunConfigResidueAtTheReplayTipIsRemoved:
         )
 
         assert state["terminal"] == TERMINAL_COMPLETE, state.get("terminal_reason")
-        assert replayed_stages(state) == ["configure", "implement", "continuous_review"]
+        # The reconfigured context invalidated the sealed reviews, so the stale
+        # run-config residue is dropped by the trim to the implement tip and
+        # both reviews re-run for real -- without a reserved-path blame.
+        assert replayed_stages(state) == ["configure", "implement"]
+        assert ("continuous_review", 1) in actor.calls
         assert ("final_review", 1) in actor.calls
         assert guard.violations == []
         # The stale residue was dropped, and acceptance graded against the

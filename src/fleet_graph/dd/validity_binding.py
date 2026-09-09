@@ -25,6 +25,7 @@ read them, so the binding closes over one coherent point in time.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from fleet_graph.dd.validity import (
     ValidityInputs,
@@ -33,6 +34,7 @@ from fleet_graph.dd.validity import (
     build_validity_key,
     changed_fields,
     is_bookkeeping_only,
+    validity_fields,
     verify_validity,
 )
 
@@ -41,6 +43,7 @@ __all__ = [
     "BindingFacts",
     "binding_affected",
     "binding_is_bookkeeping",
+    "binding_key_from_fields",
     "build_validity_binding",
     "git_product_facts",
     "measure_acceptance_context_revision",
@@ -96,6 +99,25 @@ class BindingFacts:
             target_identity=self.target_identity,
             pr_identity=self.pr_identity,
         )
+
+
+def binding_key_from_fields(fields: Any) -> ValidityKey | None:
+    """Reconstruct a sealed validity key from its ``fields`` record.
+
+    A sealed key travels as ``{"digest", "fields"}`` on the raw-event boundary
+    and in a gate decision file. To verify a *later* set of facts against it,
+    the verifier needs the key's bound inputs -- this rebuilds an immutable
+    ``ValidityKey`` from the recorded fields, refusing (``None``) any record
+    that does not name the complete bound field set rather than comparing
+    against a half-read key.
+    """
+    if not isinstance(fields, dict):
+        return None
+    names = validity_fields()
+    if any(name not in fields for name in names):
+        return None
+    inputs = ValidityInputs(**{name: fields[name] for name in names})
+    return build_validity_key(inputs)
 
 
 def build_validity_binding(

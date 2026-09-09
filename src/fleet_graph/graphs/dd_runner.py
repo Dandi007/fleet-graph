@@ -111,6 +111,17 @@ class ReworkDecisionUnbound(RuntimeError):
         self.unbound = list(unbound)
 
 
+class EventPersistenceError(RuntimeError):
+    """A raw-event write to ``events.jsonl`` failed and must not be swallowed.
+
+    The events trail is the run's state model, not disposable telemetry (spec
+    L7): a run that cannot record its own evidence must fail loudly rather than
+    migrate state on an untraceable basis. Raising here is the "report the
+    failure" half of the L7 contract; the runner lets it escape so the run ends
+    as a fault instead of continuing as if nothing was lost.
+    """
+
+
 class ReworkReplayRefused(RuntimeError):
     """A gate-rework generation the engine cannot assemble real work for.
 
@@ -527,9 +538,13 @@ def run_pipeline(
             with events_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps({"at": iso(now()), **entry}, ensure_ascii=False) + "\n")
                 handle.flush()
-        except OSError:
-            # Observability must not fail the work it observes.
-            pass
+        except OSError as exc:
+            # The raw-event trail is the run's state model (spec L7): a write
+            # failure must not be swallowed, or the pipeline would migrate
+            # state with its evidence lost. Fail loudly instead.
+            raise EventPersistenceError(
+                f"failed to persist raw event to {events_path}: {type(exc).__name__}: {exc}"
+            ) from exc
 
     graph, deps = build_pipeline(
         config,
@@ -650,6 +665,7 @@ __all__ = [
     "REWORK_REPLAY_REFUSED",
     "SPEC_ARTIFACT",
     "DevelopmentConfig",
+    "EventPersistenceError",
     "ReworkDecisionUnbound",
     "ReworkReplayRefused",
     "awaiting_decision",
