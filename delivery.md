@@ -45,10 +45,23 @@ Git/PR 副作用与新引擎部署一律留待联合验证阶段。
 - baseline commit（本单基线，禁止偏离）: `5a0c392f45a5cf2b66231e61061a27201469edc6`
 - 目标交付 ref（唯一交付分支）: `refs/heads/release/fleet-compare-self`
 - 开发分支: `dd/fleet-compare-self/dev-fg-4053bbf02dcf`
-- 本交付原子 commit：以携带本 `delivery.md` 的 commit 为准（`git rev-parse HEAD`；
-  交付须为原子 push 到 `release/fleet-compare-self`，其精确 SHA 在 push 时确认）。
-- PR：尚未创建；留待 L1「typed merge authorization -> merge」阶段对
-  `release/fleet-compare-self` 发起，未在本开发阶段产生任何 live PR 副作用。
+- 产品候选 commit（本交付覆盖的产品内容精确 HEAD，已存在、可验证的完整对象 ID）:
+  `a6d37e1717b5494469991da5e45afd8c337dd09a`
+  （`src/fleet_graph` 与 `tests/` 中 L1–L7 DD 生命周期实现最后一次改动的 commit；
+  覆盖 `src/fleet_graph/dd/**`、`src/fleet_graph/graphs/{dd_pipeline,dd_scripts,
+  dd_runner,dd_replay,dd_gate,dd_materializer,dd_control_plane}.py`、
+  `tests/test_dd_lifecycle_contract.py` 及 `pyproject.toml`/`uv.lock`）。
+- 本 `delivery.md` 与产品候选的关系：本文件是纯文档提交，落在产品候选
+  `a6d37e17…` 之上——`git merge-base --is-ancestor a6d37e17… <最终HEAD>` 成立，
+  且 `git diff --name-only a6d37e17… <最终HEAD> -- . ':(exclude).dev-dispatch'`
+  仅含 `delivery.md`（无任何产品代码变更）。
+- 最终交付 HEAD（`work_head_commit`，即携带本文件定稿的 commit 对象 ID）由
+  controller 在 Implement handoff receipt（`.dev-dispatch`）内机械封存于本文档
+  之外；本文件不得把文档自引用 SHA 冒充产品 SHA。
+- 输入 commit（本次返工的精确起点）: `eb5f0aace7f6839f72f770090487c2f895663c33`
+- PR：尚未创建（本开发阶段无任何 live PR/远端副作用）；PR 将在 L1「typed merge
+  authorization -> merge」阶段对 `release/fleet-compare-self` 创建，其精确
+  PR number/URL 届时由 merge 授权记录。
 - 运行时：Python 3.11（`requires-python >=3.11,<3.12`）。
 - 依赖管理：`uv`；`uv sync --frozen` + `uv.lock`（锁定）；开发树内
   `UV_LINK_MODE=copy`、隔离可写 `UV_CACHE_DIR`、`UV_OFFLINE=1`；
