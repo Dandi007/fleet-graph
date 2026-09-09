@@ -265,6 +265,14 @@ class TestHappyPath:
         run_stage(req, git_runner=FakeGitRunner(), agent_invoker=invoker)
         assert invoker.calls[0][1] is not None
 
+    def test_compact_at_flows_through_to_argv(self) -> None:
+        req = _request(resume_dir="/root/sessions/run-0", compact_at=0.7)
+        invoker = FakeInvoker(0, _committed_stdout())
+        run_stage(req, git_runner=FakeGitRunner(), agent_invoker=invoker)
+        argv = invoker.calls[0][0]
+        assert argv[argv.index("--resume") + 1] == "/root/sessions/run-0"
+        assert argv[argv.index("--compact-at") + 1] == "0.7"
+
 
 def _review_stdout(role: str = "cr") -> str:
     return json.dumps(

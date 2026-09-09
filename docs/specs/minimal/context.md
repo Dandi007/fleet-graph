@@ -15,6 +15,7 @@ GO-26~36 已回写进 design.md / protocol.md 正文（2026-09-08，dd-24），�
 - 书记员（GO-21）已在生产接线里默认启用：`engine.build_deps` / `run_engine` 默认 `scribe_enabled=True` 透传进 `GoalDeps`，五个 §12 goal 级触发点全部接上（`goal.turn.finished`、`dd.merged`/`dd.failed`、`goal.done`/`goal.blocked`、turn 边界的 `goal.warning`）。
 - WF 回写（GO-19 一等公民落地）：引擎在四个 goal 级边界（turn 结束、DD 结束、done / blocked）和书记员 `warn` / `high` observation 之后，经 work-folder MCP 把一行 progress / findings 追加进 WF（`progress.md` / `findings.md`），故障一律吞掉只落 `goal.warning`、不阻塞主流程：`workfolder.py`（`WorkFolderWriter` / `McpWorkFolderWriter` / `NullWorkFolderWriter` / `progress_line`）+ `goalgraph.py`（`wf_writer` seam）+ `engine.py`（`build_deps` 构造真实 writer；`work_folder` 为 None 用 null）。
 - §11 的 DD 级逐 stage 续跑已落地：引擎重启不再把在飞 DD 判 `failed(lost_on_restart)`，`ddgraph.resume_entry` 从 events 折出续跑点（丢步骤重起同一步骤、验收整轮重跑、边界走下一步骤、终态直接取结果对象），经 `run_dd(initial_state=...)` 重进图——impl commit 与 CR / FR 结论不作废：`ddgraph.py` + `engine.py`。
+- GO-22/23 已落地（per-role session resume + compact 阈值透传）：每处 agent stage 按 role 解析 §0.8 的 session 策略，`resume` 模式下从 events 折出该 role 上一次的 run_id，续靠 `--resume <session_root>/<last_run_id>` 并带 `--compact-at <ratio>`，首跑 fresh（两者皆 None）；DD 内 impl / CR / FR 的作用域按 DD 隔离：`agentrun.py`（`AgentCall.compact_at` / `build_argv` / `resume_args`）+ `events.py`（`last_run_id`）+ `stagerunner.py` + `goalgraph.py` + `ddgraph.py`。
 
 ## 待用户拍板（仍待人拍，未替拍）
 1. 加 repo 走 dispatch（Goal Agent 列新 repo 带 remote+target_branch，引擎按 enroll 规则核过即加、版本+1、goal.steered 来源 goal_agent）〔推荐〕，还是只允许人经 goal_steer。

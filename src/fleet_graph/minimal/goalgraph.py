@@ -120,7 +120,7 @@ class GoalDeps:
     wf_writer: workfolder.WorkFolderWriter | None = None
     warn_turns: int = 30
     session_root: str = ""
-    session_overrides: dict[str, dict[str, Any]] | None = None
+    session_policies: dict[str, dict[str, Any]] | None = None
     model_by_role: dict[str, str] | None = None
     timeout_s: int = 300
     scribe_enabled: bool = False
@@ -300,7 +300,7 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
     ``final_merge``. ``checkpointer`` is only a droppable cache —
     ``events.jsonl`` stays the only source of truth (protocol §11).
     """
-    policy = agentrun.resolve_session_policy("goal", deps.session_overrides)
+    policy = agentrun.resolve_session_policy("goal", deps.session_policies)
     goal_model = (deps.model_by_role or {}).get("goal")
 
     def _work_folder(state: GoalGraphState) -> str | None:
@@ -363,6 +363,12 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
         since_seq = _scribe_cursor(events_list) + 1
         until_seq = max((ev.seq for ev in events_list), default=0)
         sessions_dir = deps.session_root or str(log.goal_run_root / "sessions")
+        scribe_policy = agentrun.resolve_session_policy("scribe", deps.session_policies)
+        scribe_resume_dir, scribe_compact_at = agentrun.resume_args(
+            scribe_policy,
+            events.last_run_id(events_list, "scribe"),
+            session_root=sessions_dir,
+        )
         request = stagerunner.StageRequest(
             stage="scribe",
             run_id=f"goal-{state['goal_id']}-scribe-{until_seq}",
@@ -383,13 +389,15 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
             ),
             repos=[],
             expected_schema=agentrun.schema_for("scribe"),
-            policy=agentrun.resolve_session_policy("scribe", deps.session_overrides),
+            policy=scribe_policy,
             cwd=".",
             is_first_call=not any(
                 ev.kind == "agent.exited" and (ev.payload or {}).get("stage") == "scribe"
                 for ev in events_list
             ),
             session_root=deps.session_root,
+            resume_dir=scribe_resume_dir,
+            compact_at=scribe_compact_at,
             timeout_s=deps.timeout_s,
             model=(deps.model_by_role or {}).get("scribe"),
         )
@@ -572,6 +580,12 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
             ev.kind == "agent.exited" and (ev.payload or {}).get("stage") == "goal_turn"
             for ev in events_list
         )
+        sessions_dir = deps.session_root or str(log.goal_run_root / "sessions")
+        resume_dir, compact_at = agentrun.resume_args(
+            policy,
+            events.last_run_id(events_list, "goal"),
+            session_root=sessions_dir,
+        )
         request = stagerunner.StageRequest(
             stage="goal_turn",
             run_id=f"goal-{state['goal_id']}-turn-{turn_no}",
@@ -582,6 +596,8 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
             cwd=repos[0]["path"] if repos else ".",
             is_first_call=not saw_goal_exit,
             session_root=deps.session_root,
+            resume_dir=resume_dir,
+            compact_at=compact_at,
             timeout_s=deps.timeout_s,
             model=goal_model,
         )
@@ -768,6 +784,14 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
             cr_result: dict[str, Any] | None,
         ) -> stagerunner.StageOutcome:
             """One CR/FR stage of the release re-review, via the single agent seam."""
+            events_list = list(log.read())
+            sessions_dir = deps.session_root or str(log.goal_run_root / "sessions")
+            review_policy = agentrun.resolve_session_policy(role, deps.session_policies)
+            resume_dir, compact_at = agentrun.resume_args(
+                review_policy,
+                events.last_run_id(events_list, role),
+                session_root=sessions_dir,
+            )
             in_obj = prompts.build_review_in(
                 role=role,
                 dd_id=state["goal_id"],
@@ -790,10 +814,12 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
                 in_obj=in_obj,
                 repos=list(refs),
                 expected_schema=agentrun.schema_for(role),
-                policy=agentrun.resolve_session_policy(role, deps.session_overrides),
+                policy=review_policy,
                 cwd=workspace,
                 is_first_call=True,
                 session_root=deps.session_root,
+                resume_dir=resume_dir,
+                compact_at=compact_at,
                 timeout_s=deps.timeout_s,
                 model=(deps.model_by_role or {}).get(role),
             )
@@ -818,6 +844,13 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
                 and (ev.payload or {}).get("stage") in ("goal_turn", "goal_review")
                 for ev in events_list
             )
+            sessions_dir = deps.session_root or str(log.goal_run_root / "sessions")
+            goal_policy = agentrun.resolve_session_policy("goal", deps.session_policies)
+            resume_dir, compact_at = agentrun.resume_args(
+                goal_policy,
+                events.last_run_id(events_list, "goal"),
+                session_root=sessions_dir,
+            )
             in_obj = prompts.build_goal_review_in(
                 goal=goal_obj,
                 dd=dd,
@@ -833,10 +866,12 @@ def build_goal_graph(deps: GoalDeps, *, checkpointer: Any = None) -> Any:
                 in_obj=in_obj,
                 repos=[],
                 expected_schema=agentrun.schema_for("goal", "review"),
-                policy=agentrun.resolve_session_policy("goal", deps.session_overrides),
+                policy=goal_policy,
                 cwd=workspace,
                 is_first_call=is_first_call,
                 session_root=deps.session_root,
+                resume_dir=resume_dir,
+                compact_at=compact_at,
                 timeout_s=deps.timeout_s,
                 model=(deps.model_by_role or {}).get("goal"),
             )

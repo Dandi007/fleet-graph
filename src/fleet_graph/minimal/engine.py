@@ -221,7 +221,7 @@ class _Wiring:
     goal: dict[str, Any]
     release_branch: str
     session_root: str
-    session_overrides: dict[str, dict[str, Any]] | None
+    session_policies: dict[str, dict[str, Any]] | None
     model_by_role: dict[str, str] | None
     timeout_s: int
     warn_dd_rounds: int
@@ -297,7 +297,7 @@ def _run_merge_agent(
         in_obj=in_obj,
         repos=list(repos),
         expected_schema=agentrun.schema_for("merge"),
-        policy=agentrun.resolve_session_policy("merge", wiring.session_overrides),
+        policy=agentrun.resolve_session_policy("merge", wiring.session_policies),
         cwd=workspace,
         is_first_call=True,
         session_root=wiring.session_root,
@@ -405,7 +405,7 @@ def _run_dd_seam(wiring: _Wiring, enroll_obj: dict[str, Any]) -> Any:
             goal=wiring.goal,
             release_branch=wiring.release_branch,
             release_head=release_head,
-            session_overrides=wiring.session_overrides,
+            session_policies=wiring.session_policies,
             session_root=wiring.session_root,
             model_by_role=wiring.model_by_role,
             timeout_s=wiring.timeout_s,
@@ -483,7 +483,7 @@ def build_deps(
     git_runner: gitgate.GitRunner | None = None,
     bash_runner: acceptance.Runner | None = None,
     gh_runner: mergegate.GhRunner | None = None,
-    session_overrides: dict[str, dict[str, Any]] | None = None,
+    session_policies: dict[str, dict[str, Any]] | None = None,
     model_by_role: dict[str, str] | None = None,
     timeout_s: int = 300,
     warn_turns: int = 30,
@@ -526,7 +526,7 @@ def build_deps(
         goal=goal,
         release_branch=release_branch,
         session_root=str(run_root.sessions_dir),
-        session_overrides=session_overrides,
+        session_policies=session_policies,
         model_by_role=model_by_role,
         timeout_s=timeout_s,
         warn_dd_rounds=warn_dd_rounds,
@@ -541,7 +541,7 @@ def build_deps(
         wf_writer=wf_writer,
         warn_turns=warn_turns,
         session_root=str(run_root.sessions_dir),
-        session_overrides=session_overrides,
+        session_policies=session_policies,
         model_by_role=model_by_role,
         timeout_s=timeout_s,
         scribe_enabled=scribe_enabled,
@@ -821,7 +821,7 @@ def run_engine(
     git_runner: gitgate.GitRunner | None = None,
     bash_runner: acceptance.Runner | None = None,
     gh_runner: mergegate.GhRunner | None = None,
-    session_overrides: dict[str, dict[str, Any]] | None = None,
+    session_policies: dict[str, dict[str, Any]] | None = None,
     model_by_role: dict[str, str] | None = None,
     timeout_s: int = 300,
     warn_turns: int = 30,
@@ -871,7 +871,7 @@ def run_engine(
         git_runner=git_runner,
         bash_runner=bash_runner,
         gh_runner=gh_runner,
-        session_overrides=session_overrides,
+        session_policies=session_policies,
         model_by_role=model_by_role,
         timeout_s=timeout_s,
         warn_turns=warn_turns,

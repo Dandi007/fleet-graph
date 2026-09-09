@@ -82,7 +82,7 @@ class DDDeps:
     goal: dict[str, Any]
     release_branch: str
     release_head: str
-    session_overrides: dict[str, dict[str, Any]] | None = None
+    session_policies: dict[str, dict[str, Any]] | None = None
     session_root: str = ""
     model_by_role: dict[str, str] | None = None
     timeout_s: int = 300
@@ -271,16 +271,25 @@ def build_dd_graph(deps: DDDeps, *, checkpointer: Any = None) -> Any:
     ) -> dict[str, Any]:
         dd_id = state["dd_id"]
         events_list = list(log.read())
+        sessions_dir = deps.session_root or str(log.goal_run_root / "sessions")
+        policy = agentrun.resolve_session_policy(role, deps.session_policies)
+        resume_dir, compact_at = agentrun.resume_args(
+            policy,
+            events.last_run_id(events_list, role, dd_id=dd_id),
+            session_root=sessions_dir,
+        )
         request = stagerunner.StageRequest(
             stage=stage,
             run_id=f"{dd_id}-{stage}-{state.get('round') or 1}",
             in_obj=in_obj,
             repos=repos,
             expected_schema=expected_schema,
-            policy=agentrun.resolve_session_policy(role, deps.session_overrides),
+            policy=policy,
             cwd=state["repos"][0]["path"],
             is_first_call=not _saw_stage(events_list, stage, dd_id),
             session_root=deps.session_root,
+            resume_dir=resume_dir,
+            compact_at=compact_at,
             timeout_s=deps.timeout_s,
             model=(deps.model_by_role or {}).get(role),
         )

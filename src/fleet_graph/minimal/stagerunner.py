@@ -23,7 +23,7 @@ the event writes) is injected or deferred:
   the caller hands to ``events.EventLog``; stagerunner never touches the disk.
 
 The request carries the eight semantic handoff fields, plus the argv plumbing
-(``session_root`` / ``timeout_s`` / ``resume_dir`` / ``model``) that
+(``session_root`` / ``timeout_s`` / ``resume_dir`` / ``compact_at`` / ``model``) that
 ``agentrun.build_argv`` needs — those are engine config the caller already has
 and defaults keep them optional for the pure-orchestration tests.
 """
@@ -89,6 +89,7 @@ class StageRequest:
     session_root: str = ""
     timeout_s: int = 300
     resume_dir: str | None = None
+    compact_at: float | None = None
     model: str | None = None
 
     def __post_init__(self) -> None:
@@ -187,6 +188,7 @@ def _build_argv(req: StageRequest, role: str, call_kind: str | None) -> list[str
         timeout_s=req.timeout_s,
         output_schema_json=output_schema_json,
         resume_dir=req.resume_dir,
+        compact_at=req.compact_at,
         model=req.model,
     )
     return agentrun.build_argv(call)

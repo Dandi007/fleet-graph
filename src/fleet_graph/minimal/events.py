@@ -368,3 +368,50 @@ def resume_point(events: Iterable[Event]) -> ResumePoint:
 
     stage = payload.get("stage") if kind.endswith(".finished") else None
     return ResumePoint(action="next_step", stage=stage, dd_id=dd_id, detail=None)
+
+
+# The stage(s) whose ``agent.exited`` events belong to each role (mirrors
+# stagerunner's stage→role table, keyed from the role side). ``goal`` owns both
+# ``goal_turn`` and ``goal_review``; every other role maps one-to-one onto a stage.
+_ROLE_STAGES: dict[str, tuple[str, ...]] = {
+    "goal": ("goal_turn", "goal_review"),
+    "impl": ("impl",),
+    "cr": ("cr",),
+    "fr": ("fr",),
+    "merge": ("merge",),
+    "scribe": ("scribe",),
+}
+
+# Roles whose session scope is a single DD (protocol §0.8); the rest (goal,
+# scribe) are goal-scoped and ignore the dd dimension.
+_DD_SCOPED_ROLES = frozenset({"impl", "cr", "fr"})
+
+
+def last_run_id(events: Iterable[Event], role: str, *, dd_id: str | None = None) -> str | None:
+    """The ``run_id`` of ``role``'s most recent completed run, or None.
+
+    Derived only from the ``agent.exited`` events the engine already writes
+    (protocol §11: ``events.jsonl`` is the only state source). A run belongs to
+    ``role`` when its payload ``stage`` is one of that role's stages (``goal``
+    owns both ``goal_turn`` and ``goal_review``). Impl / CR / FR have one session
+    per DD (protocol §0.8), so for them ``dd_id`` scopes the fold to that DD's
+    runs; goal-scoped roles (goal / scribe) ignore it. The last matching run in
+    input order wins; with no history the result is None.
+    """
+    stages = _ROLE_STAGES.get(role)
+    if stages is None:
+        raise ValueError(f"unknown role {role!r}")
+    dd_scoped = role in _DD_SCOPED_ROLES
+    last: str | None = None
+    for ev in events:
+        if ev.kind != "agent.exited":
+            continue
+        if dd_scoped and ev.dd_id != dd_id:
+            continue
+        payload = ev.payload or {}
+        if payload.get("stage") not in stages:
+            continue
+        run_id = payload.get("run_id")
+        if isinstance(run_id, str) and run_id:
+            last = run_id
+    return last

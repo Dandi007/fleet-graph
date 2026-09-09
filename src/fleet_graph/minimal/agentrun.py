@@ -160,6 +160,27 @@ def resolve_session_policy(role: str, overrides: dict[str, dict[str, Any]] | Non
     return SessionPolicy(mode=mode, compact_at=compact_at)
 
 
+def resume_args(
+    policy: SessionPolicy,
+    last_run_id: str | None,
+    *,
+    session_root: str,
+) -> tuple[str | None, float | None]:
+    """The ``(resume_dir, compact_at)`` for one stage, or ``(None, None)`` when fresh.
+
+    A stage resumes only when its policy mode is ``"resume"`` and a prior run
+    exists (``last_run_id`` is not None); the directory is
+    ``<session_root>/<last_run_id>`` and the threshold is the policy's own
+    ``compact_at``. Otherwise the call is that session's first, so no
+    ``--resume`` and no ``--compact-at`` are emitted.
+    """
+    if policy.mode != "resume" or last_run_id is None:
+        return None, None
+    root = session_root.rstrip("/")
+    resume_dir = f"{root}/{last_run_id}" if root else last_run_id
+    return resume_dir, policy.compact_at
+
+
 # ---------------------------------------------------------------------------
 # The agent-run invocation
 # ---------------------------------------------------------------------------
@@ -184,6 +205,7 @@ class AgentCall:
     output_schema_json: str
     harness: str | None = None
     resume_dir: str | None = None
+    compact_at: float | None = None
     model: str | None = None
 
     def __post_init__(self) -> None:
@@ -196,9 +218,11 @@ def build_argv(call: AgentCall) -> list[str]:
 
     ``agent-run --role R --harness H --session-root S --run-id ID
     --output-schema JSON --isolation full --timeout N --cwd W``, then
-    ``--resume DIR`` and/or ``--model M`` when present. The three
-    whitelisted tokens are validated here (see ``_SAFE_TOKEN_RE``) and
-    ``timeout_s`` must be a positive integer; otherwise ``ValueError``.
+    ``--resume DIR``, ``--compact-at RATIO`` and/or ``--model M`` when present.
+    ``compact_at`` without ``resume_dir`` raises (a fresh run carries no
+    threshold, mirroring ``_validate_policy``). The three whitelisted tokens are
+    validated here (see ``_SAFE_TOKEN_RE``) and ``timeout_s`` must be a positive
+    integer; otherwise ``ValueError``.
     """
     for token_name, token in (
         ("role", call.role),
@@ -213,6 +237,12 @@ def build_argv(call: AgentCall) -> list[str]:
     timeout_s = call.timeout_s
     if not isinstance(timeout_s, int) or isinstance(timeout_s, bool) or timeout_s <= 0:
         raise ValueError(f"timeout_s must be a positive integer, got {timeout_s!r}")
+
+    if call.compact_at is not None and call.resume_dir is None:
+        raise ValueError(
+            f"compact_at={call.compact_at!r} requires a resume_dir; "
+            "a fresh run carries no threshold"
+        )
 
     argv = [
         "agent-run",
@@ -235,6 +265,8 @@ def build_argv(call: AgentCall) -> list[str]:
     ]
     if call.resume_dir is not None:
         argv += ["--resume", call.resume_dir]
+    if call.compact_at is not None:
+        argv += ["--compact-at", str(call.compact_at)]
     if call.model is not None:
         argv += ["--model", call.model]
     return argv
@@ -446,6 +478,7 @@ __all__ = [
     "build_argv",
     "parse_stop",
     "resolve_session_policy",
+    "resume_args",
     "run_agent",
     "schema_for",
 ]
