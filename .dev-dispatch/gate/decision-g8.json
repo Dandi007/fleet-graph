@@ -1,32 +1,12 @@
 {
  "development_id": "dev-fg-4053bbf02dcf",
  "decision": "APPROVE",
+ "raw_decision": "APPROVE",
+ "normalization_form": "bare",
  "decided_by": "wf-2bf703",
- "decided_by_source": "graph-gate-node",
- "action_key": "dd-gate-node:dev-fg-4053bbf02dcf:g8:supervisor-g8-preserved-fr-20260909:APPROVE",
  "decision_message_id": "engine-decision:d536ebc55e19bdc7678490a6d3b002c89161e05744089cd15af1ca3c6b23c4cc",
  "rationale": "acceptance_frozen=PASS:run_config_matches=True; implement_checks_passed=True; declared=[['python3', '-m', 'compileall', '-q', 'src'], ['python3', '-m', 'pytest', '-q', 'tests/test_dd_lifecycle_contract.py']]; additional_checks=[]; review_chain_approved=PASS:implementation=5e5ebb351b34df6670984499a62e9afed79d45be; changed_product=[]; dirty=; personally_rerun=PASS:{\"results\": [{\"command\": [\"uv\", \"sync\", \"--frozen\"], \"exit_code\": 0, \"stdout_tail\": \"\", \"stderr_tail\": \"Checked 100 packages in 1ms\\n\"}, {\"command\": [\"python3\", \"-m\", \"compileall\", \"-q\", \"src\"], \"exit_code\": 0, \"stdout_tail\": \"\", \"stderr_tail\": \"\"}, {\"command\": [\"python3\", \"-m\", \"pytest\", \"-q\", \"tests/test_dd_lifecycle_contract.py\"], \"exit_code\": 0, \"stdout_tail\": \"........................................................................ [100%]\\n\", \"stderr_tail\": \"\"}], \"subject_unchanged\": true}; zero_test_deletion=PASS:no test file deleted in base..head",
- "evidence": [
-  {
-   "id": "acceptance_frozen",
-   "passed": true,
-   "detail": "run_config_matches=True; implement_checks_passed=True; declared=[['python3', '-m', 'compileall', '-q', 'src'], ['python3', '-m', 'pytest', '-q', 'tests/test_dd_lifecycle_contract.py']]; additional_checks=[]"
-  },
-  {
-   "id": "review_chain_approved",
-   "passed": true,
-   "detail": "implementation=5e5ebb351b34df6670984499a62e9afed79d45be; changed_product=[]; dirty="
-  },
-  {
-   "id": "personally_rerun",
-   "passed": true,
-   "detail": "{\"results\": [{\"command\": [\"uv\", \"sync\", \"--frozen\"], \"exit_code\": 0, \"stdout_tail\": \"\", \"stderr_tail\": \"Checked 100 packages in 1ms\\n\"}, {\"command\": [\"python3\", \"-m\", \"compileall\", \"-q\", \"src\"], \"exit_code\": 0, \"stdout_tail\": \"\", \"stderr_tail\": \"\"}, {\"command\": [\"python3\", \"-m\", \"pytest\", \"-q\", \"tests/test_dd_lifecycle_contract.py\"], \"exit_code\": 0, \"stdout_tail\": \"........................................................................ [100%]\\n\", \"stderr_tail\": \"\"}], \"subject_unchanged\": true}"
-  },
-  {
-   "id": "zero_test_deletion",
-   "passed": true,
-   "detail": "no test file deleted in base..head"
-  }
- ],
+ "question_note_id": "engine:dd-gate:dev-fg-4053bbf02dcf:g8",
+ "card_entity_id": "",
  "output_commit": "1637e1263b1890fad406a24f3c42c34782fad5cf"
 }
