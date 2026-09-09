@@ -57,7 +57,7 @@ Git/PR 副作用与新引擎部署一律留待联合验证阶段。
   `b688d698…` 之上——`git merge-base --is-ancestor b688d698… <最终HEAD>` 成立，
   且 `git diff --name-only b688d698… <最终HEAD> -- . ':(exclude).dev-dispatch'`
   仅含 `delivery.md`（`b688d698…` 之后的最终 HEAD 无任何 `src/`/`tests/` 改动）。
-- 产品变更沿链关系（机械证据）：`b688d698…` 直接落在本次返工输入
+- 产品变更沿链关系（机械证据）：`b688d698…` 直接落在 rf-bfe89f96 返工输入
   `c5c1a7e2…` 之后（`git merge-base --is-ancestor c5c1a7e2… b688d698…` 成立），
   中间仅本次 8 个 `src/`/`tests/` 文件改动；再上溯，
   `git diff --name-only ac67c859… b688d698… -- . ':(exclude).dev-dispatch'`
@@ -66,7 +66,13 @@ Git/PR 副作用与新引擎部署一律留待联合验证阶段。
 - 最终交付 HEAD（`work_head_commit`，即携带本文件定稿的 commit 对象 ID）由
   controller 在 Implement handoff receipt（`.dev-dispatch`）内机械封存于本文档
   之外；本文件不得把文档自引用 SHA 冒充产品 SHA。
-- 输入 commit（本次返工的精确起点）: `c5c1a7e2084ba3c565679fd8267eb20a820a4a4a`
+- 输入 commit（本次 attempt 的精确起点，generation 4 重新 configure 后的基线）:
+  `4ae34b73e572bc408072ae959ebef9365ef5c7a8`
+- generation 4 说明：本 attempt 重新 configure（feedback index 归档至 `history.json`
+  并清空、`run-config.json` generation 2→4），SPEC 与产品代码均未变，产品候选仍为
+  `b688d698…`；本 attempt 仅重验开发阶段 acceptance（`compileall` 与
+  `pytest tests/test_dd_lifecycle_contract.py`）并刷新交付身份，不新增 `src/`/
+  `tests/` 改动。
 - PR：尚未创建（本开发阶段无任何 live PR/远端副作用）；PR 将在 L1「typed merge
   authorization -> merge」阶段对 `release/fleet-compare-self` 创建，其精确
   PR number/URL 届时由 merge 授权记录。
