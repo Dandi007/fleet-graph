@@ -177,6 +177,57 @@ def test_goal_status_tail(tmp_path: Path) -> None:
     assert [e["seq"] for e in view["tail"]] == [1, 2, 3]
 
 
+def test_goal_status_recent_observations_empty_without_file(tmp_path: Path) -> None:
+    seed_running(tmp_path, "g-000001")
+    view = goal_status(tmp_path, "g-000001", tail=0)
+    assert view["recent_observations"] == []
+    assert next(iter(view)) == "recent_observations"  # 顶部：先插入该键
+
+
+def test_goal_status_recent_observations_last_three_in_write_order(tmp_path: Path) -> None:
+    root = tmp_path / "g-000001"
+    root.mkdir(parents=True)
+    lines = [
+        {"ts": "2026-09-05T10:00:00+00:00", "severity": "info", "title": f"o{i}"}
+        for i in range(1, 6)
+    ]
+    (root / "observations.jsonl").write_text(
+        "\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n",
+        encoding="utf-8",
+    )
+    seed_running(tmp_path, "g-000001")
+    view = goal_status(tmp_path, "g-000001", tail=0)
+    assert [obs["title"] for obs in view["recent_observations"]] == ["o3", "o4", "o5"]
+
+
+def test_goal_status_recent_observations_skips_bad_lines(tmp_path: Path) -> None:
+    root = tmp_path / "g-000001"
+    root.mkdir(parents=True)
+    (root / "observations.jsonl").write_text(
+        '{"ts": "a", "severity": "info", "title": "ok"}\n'
+        '{"ts": "b", "severity": "warn", "title": "broken\n',  # 半行坏 JSON
+        encoding="utf-8",
+    )
+    seed_running(tmp_path, "g-000001")
+    view = goal_status(tmp_path, "g-000001", tail=0)
+    assert [obs["title"] for obs in view["recent_observations"]] == ["ok"]
+
+
+def test_goal_status_recent_observations_injected_reader(tmp_path: Path) -> None:
+    seed_running(tmp_path, "g-000001")
+
+    def fake_reader(path: str) -> list[dict]:
+        return [
+            {"ts": "c", "severity": "high", "title": "x"},
+            {"ts": "d", "severity": "info", "title": "y"},
+            {"ts": "e", "severity": "warn", "title": "z"},
+            {"ts": "f", "severity": "info", "title": "w"},
+        ]
+
+    view = goal_status(tmp_path, "g-000001", tail=0, reader=fake_reader)
+    assert [obs["title"] for obs in view["recent_observations"]] == ["y", "z", "w"]
+
+
 def test_goal_events_since_seq(tmp_path: Path) -> None:
     elog = make_event_log(tmp_path, "g-000001")
     elog.append("goal.enrolled", {})

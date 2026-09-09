@@ -184,15 +184,27 @@ def goal_status(
     *,
     tail: int = 20,
     alive_probe: Callable[[int | None], bool] | None = None,
+    reader: Callable[[str], list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    """派生状态 + 最近 ``tail`` 条 event（复用 ``control.goal_status_view``）。"""
+    """派生状态 + 最近 ``tail`` 条 event（复用 ``control.goal_status_view``），
+    顶部附最近 3 条 L1 observation（protocol §12 末行）。
+
+    ``recent_observations`` 键先于 ``goal_status_view`` 的其余键插入，使
+    ``json.dumps`` 序列化里它排最前（dict 本身无序，只是插入顺序）。``reader``
+    注入式，默认 :func:`default_observations_reader`（读不到 / 半行坏 JSON 一律
+    跳过，绝不抛）。"""
     root = _run_root(engine_root, goal_id)
     events = list(EventLog(root).read())
     probe = alive_probe if alive_probe is not None else _default_alive_probe
     pid = _last_engine_pid(events)
     alive = False if pid is None else bool(probe(pid))
     tail_events = events[-tail:] if tail and tail > 0 else None
-    return control.goal_status_view(events, alive=alive, tail_events=tail_events)
+    view = control.goal_status_view(events, alive=alive, tail_events=tail_events)
+    read_observations = default_observations_reader if reader is None else reader
+    observations = read_observations(str(root / "observations.jsonl"))
+    result: dict[str, Any] = {"recent_observations": observations[-3:]}
+    result.update(view)
+    return result
 
 
 def goal_events(
