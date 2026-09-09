@@ -734,6 +734,11 @@ class TestGateResumeDedup:
         workspace.mkdir()
         subprocess.run(["git", "init", "-q", str(workspace)], check=True)
         (workspace / "seed.txt").write_text("seed\n", encoding="utf-8")
+        # The gate's validity binding measures the committed run-config (spec L3).
+        (workspace / ".dev-dispatch").mkdir(parents=True, exist_ok=True)
+        (workspace / ".dev-dispatch" / "run-config.json").write_text(
+            '{"acceptance_commands": [["true"]]}\n', encoding="utf-8"
+        )
         subprocess.run(["git", "-C", str(workspace), "add", "-A"], check=True)
         subprocess.run(
             [

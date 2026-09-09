@@ -99,11 +99,19 @@ class AgentRunStub:
 class ScriptStub:
     """A script stage that produces what the contract says it produces."""
 
-    def __init__(self) -> None:
+    def __init__(self, repo: Path | None = None) -> None:
+        self.repo = repo
         self.ran: list[str] = []
 
     def act(self, stage: Any, dispatch: Dispatch) -> StageOutcome:
         self.ran.append(stage.id)
+        # Configure really writes the run-config; the materializer's validity
+        # key measures its committed revision (spec L3), so the stand-in does
+        # the same to keep the seal varietally bound.
+        if "run_config" in stage.produced_artifacts and self.repo is not None:
+            path = self.repo / RUN_CONFIG_PATH
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('{"acceptance_commands": [["true"]]}', encoding="utf-8")
         # The merger's unsteered success is a measured merge now; the spine
         # event is no longer a declared merge outcome (spec L6).
         event = "MERGED" if stage.id == MERGER_STAGE else "success"
@@ -123,6 +131,7 @@ class RealCommitSealer:
         self.commits: list[str] = []
 
     def seal(self, stage_id: str, outcome: StageOutcome) -> dict[str, Any]:
+        git(self.repo, "add", "-A")
         git(self.repo, "commit", "-q", "--allow-empty", "-m", f"seal {stage_id}")
         commit = head(self.repo)
         self.commits.append(commit)
@@ -199,7 +208,7 @@ def run(
     verdicts: dict[str, list[str]] | None = None,
 ) -> tuple[dict[str, Any], AgentRunStub, ScriptStub]:
     launcher = AgentRunStub(verdicts)
-    scripts = ScriptStub()
+    scripts = ScriptStub(repo)
     local = RealCommitSealer(repo)
     # Every stage the plugin does not seal. `acceptance` is among them even
     # though it appears in the dispatch schema's stage enum.
@@ -725,7 +734,7 @@ class TestRePrepareClearsARemnantBeforeTheRetry:
                 return super().wait(ticket, **kwargs)
 
         launcher = RemnantThenSucceed()
-        scripts = ScriptStub()
+        scripts = ScriptStub(repo)
         local = RealCommitSealer(repo)
         unsealed = {name: local for name, stage in LIFECYCLE.stages.items() if not stage.is_llm}
         config = make_config(repo, tmp_path)

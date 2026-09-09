@@ -353,6 +353,11 @@ def build_pipeline(
         target=MaterializationTarget(
             remote_url=config.remote_url,
             remote_ref=publish_ref,
+            # The durable merge target and the order-private audit branch, so the
+            # validity key the sealer binds closes over the real target identity
+            # and PR head/base pair (spec L3) instead of leaving them empty.
+            target_ref=config.remote_ref,
+            audit_ref=config.audit_ref,
             worktree=str(config.workspace_path),
             state_root=str(config.state_root),
         ),

@@ -128,6 +128,29 @@ class MaterializationTarget:
     remote_ref: str
     worktree: str
     state_root: str
+    #: The durable merge target this order lands on -- the line's release
+    #: branch. Whereas ``remote_ref`` is the ref the sealer publishes its
+    #: receipts to (the order-private audit branch), this is the ref the merge
+    #: itself targets, and is what the validity key binds as target identity.
+    target_ref: str = ""
+    #: The order-private audit branch (``refs/heads/dd/<dev>``) the merge is
+    #: authorized from. Together with ``target_ref`` it names the head/base pair
+    #: the validity key binds as PR identity (spec L6).
+    audit_ref: str = ""
+
+    @property
+    def merge_target_identity(self) -> str:
+        return self.target_ref or self.remote_ref
+
+    @property
+    def merge_head_ref(self) -> str:
+        return self.audit_ref or self.remote_ref
+
+    @property
+    def pr_identity(self) -> str:
+        head = self.merge_head_ref
+        base = self.merge_target_identity
+        return f"{head}->{base}" if (head or base) else ""
 
 
 @lru_cache(maxsize=1)
@@ -403,22 +426,27 @@ class PluginMaterializer:
     def _validity_key(self, output_commit: str) -> Any:
         """The validity key (spec L3) sealed with this stage's output commit.
 
-        The product revision/tree are measured out of git at the output commit
-        the plugin just wrote; the spec digest comes from the committed spec
-        blob; the target identity is the durable ref this order merges onto.
-        A read that cannot bind (no git object, unreadable spec) returns None
-        -- the seal schema is untouched, and a later verify treats an absent
-        binding as absent rather than inventing one.
+        Fail-closed: if the git/product facts or the caller facts cannot be
+        bound -- no workspace, an unreadable commit/tree/spec/run-config -- the
+        seal fails rather than sealing without the binding. An absent binding
+        must never slide through as ``None``; a later verify would treat that
+        as "nothing bound" and silently accept an unbound stage.
         """
         if not self.builder.chain.workspace_path:
-            return None
+            raise MaterializationFailed(
+                "VALIDITY_BINDING_FAILED",
+                "no workspace to measure the validity key from",
+            )
         try:
             return self.builder.validity_key(
                 {"input_commit": output_commit},
-                facts=BindingFacts(target_identity=self.target.remote_ref),
+                facts=BindingFacts(
+                    target_identity=self.target.merge_target_identity,
+                    pr_identity=self.target.pr_identity,
+                ),
             )
-        except (DispatchError, git_ops.ExactWorkspaceError):
-            return None
+        except (DispatchError, git_ops.ExactWorkspaceError) as exc:
+            raise MaterializationFailed("VALIDITY_BINDING_FAILED", str(exc)) from exc
 
     def parent_digest(self, stage_id: str, attempt_id: str) -> str | None:
         """The parent receipt's byte digest, or None where there is no file."""

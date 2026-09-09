@@ -667,8 +667,42 @@ class TestValidityBindingIsWired:
         changed, matches = verify_binding(str(repo), commit, moved, key)
         assert changed == ("spec_digest",) and matches is False
 
+    def _commit_run_config(self, repo: Path) -> str:
+        """Commit a run-config so the measured acceptance-context revision exists."""
+        from fleet_graph.dd.validity_binding import RUN_CONFIG_PATH
+
+        path = repo / RUN_CONFIG_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"acceptance_commands": [["true"]]}\n', encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "run-config")
+        return head(repo)
+
     def test_the_dispatch_builder_measures_a_validity_key(self, repo: Path) -> None:
         from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder
+
+        commit = self._commit_run_config(repo)
+        builder = StageDispatchBuilder(
+            DevelopmentChain(
+                development_id="dev-1",
+                workspace_path=str(repo),
+                target_base_commit="0" * 40,
+                root_handoff_digest="sha256:" + "0" * 64,
+            )
+        )
+        key = builder.validity_key({"input_commit": commit})
+        assert key.digest.startswith("sha256:")
+        assert key.inputs.product_revision == commit
+        assert key.inputs.spec_digest.startswith("sha256:")
+        assert key.inputs.target_identity == "0" * 40  # the chain's frozen base
+        # The acceptance-context revision is measured out of git, not left empty.
+        assert key.inputs.acceptance_context_revision, "acceptance context must bind"
+
+    def test_the_dispatch_builder_refuses_to_bind_without_a_run_config(
+        self, repo: Path
+    ) -> None:
+        from fleet_graph.dd.dispatch import DevelopmentChain, DispatchError, StageDispatchBuilder
+        from fleet_graph.dd.vendor.git_ops import ExactWorkspaceError
 
         builder = StageDispatchBuilder(
             DevelopmentChain(
@@ -678,23 +712,71 @@ class TestValidityBindingIsWired:
                 root_handoff_digest="sha256:" + "0" * 64,
             )
         )
-        key = builder.validity_key({"input_commit": head(repo)})
-        assert key.digest.startswith("sha256:")
-        assert key.inputs.product_revision == head(repo)
-        assert key.inputs.spec_digest.startswith("sha256:")
-        assert key.inputs.target_identity == "0" * 40  # the chain's frozen base
+        with pytest.raises((DispatchError, ExactWorkspaceError)):
+            builder.validity_key({"input_commit": head(repo)})
 
     def test_the_gate_binds_and_verifies_a_validity_key(self, repo: Path) -> None:
         from fleet_graph.graphs.dd_gate import GraphGateNode
 
+        commit = self._commit_run_config(repo)
         node = GraphGateNode(plane=None)
         binding = node._validity_binding(
-            repo, head(repo), {"spec_digest": "sha256:" + "d" * 64}
+            repo,
+            commit,
+            {
+                "spec_digest": "sha256:" + "d" * 64,
+                "remote_ref": "refs/heads/release/self",
+                "audit_ref": "refs/heads/dd/dev-fg-1",
+            },
         )
         assert binding["matches"] is True
         assert binding["changed"] == []
         assert binding["digest"].startswith("sha256:")
         assert "product_revision" in binding["fields"]
+        assert binding["fields"]["target_identity"] == "refs/heads/release/self"
+        assert binding["fields"]["pr_identity"] == "refs/heads/dd/dev-fg-1->refs/heads/release/self"
+        assert binding["fields"]["acceptance_context_revision"], "acceptance context must bind"
+
+    def test_the_gate_refuses_when_validity_cannot_be_bound(self, repo: Path) -> None:
+        from fleet_graph.dd.vendor.git_ops import ExactWorkspaceError
+        from fleet_graph.graphs.dd_gate import GraphGateNode
+
+        node = GraphGateNode(plane=None)
+        with pytest.raises((ExactWorkspaceError, RuntimeError)):
+            node._validity_binding(repo, head(repo), {"spec_digest": "sha256:" + "d" * 64})
+
+    def test_the_materializer_refuses_to_seal_without_a_binding(self, repo: Path) -> None:
+        from fleet_graph.dd.dispatch import DevelopmentChain, StageDispatchBuilder
+        from fleet_graph.graphs.dd_materializer import (
+            MaterializationFailed,
+            MaterializationTarget,
+            PluginMaterializer,
+        )
+
+        builder = StageDispatchBuilder(
+            DevelopmentChain(
+                development_id="dev-1",
+                workspace_path=str(repo),
+                target_base_commit="0" * 40,
+                root_handoff_digest="sha256:" + "0" * 64,
+            )
+        )
+        materializer = PluginMaterializer(
+            builder=builder,
+            binding=object(),
+            target=MaterializationTarget(
+                remote_url="https://example.invalid/repo.git",
+                remote_ref="refs/heads/dev-1",
+                worktree=str(repo),
+                state_root=str(repo / ".state"),
+            ),
+            verify_worktree_head=True,
+        )
+        # No workspace run-config, and a commit the git tree cannot read: the
+        # validity key cannot be bound, so the seal must fail rather than invent
+        # a None binding.
+        with pytest.raises(MaterializationFailed, match="VALIDITY_BINDING_FAILED"):
+            materializer._validity_key("9" * 40)
 
     def test_recovery_binds_the_validity_digest(self) -> None:
         from fleet_graph.dd.recovery import HumanRecoveryExit, recovery_validity_digest

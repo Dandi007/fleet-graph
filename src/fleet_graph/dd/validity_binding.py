@@ -37,13 +37,34 @@ from fleet_graph.dd.validity import (
 )
 
 __all__ = [
+    "RUN_CONFIG_PATH",
     "BindingFacts",
     "binding_affected",
     "binding_is_bookkeeping",
     "build_validity_binding",
     "git_product_facts",
+    "measure_acceptance_context_revision",
     "verify_binding",
 ]
+
+#: The committed run-config that pins the acceptance context. Its blob oid is
+#: the acceptance-context revision the validity key binds (spec L3): the exact
+#: run-config the acceptance commands were graded against, never a report.
+RUN_CONFIG_PATH = ".dev-dispatch/run-config.json"
+
+
+def measure_acceptance_context_revision(workspace_path: str, input_commit: str) -> str:
+    """The acceptance-context revision: the committed run-config's blob oid.
+
+    Read from git plumbing at ``input_commit``. Raises
+    ``git_ops.ExactWorkspaceError`` when the run-config is absent or unreadable
+    -- a fail-closed read, never an empty or guessed revision.
+    """
+    from fleet_graph.dd.vendor import git_ops
+
+    return git_ops.exact_artifact_identity(workspace_path, input_commit, RUN_CONFIG_PATH)[
+        "blob_oid"
+    ]
 
 
 def git_product_facts(workspace_path: str, input_commit: str) -> tuple[str, str]:

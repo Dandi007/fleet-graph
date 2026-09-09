@@ -19,7 +19,12 @@ from fleet_graph.dd.self_gate import (
     render_rationale,
 )
 from fleet_graph.dd.self_gate_evidence import DEFAULT_DD_ROOT, collect_gate_evidence
-from fleet_graph.dd.validity_binding import BindingFacts, build_validity_binding, verify_binding
+from fleet_graph.dd.validity_binding import (
+    BindingFacts,
+    build_validity_binding,
+    measure_acceptance_context_revision,
+    verify_binding,
+)
 from fleet_graph.graphs.dd_scripts import AUTHOR_EMAIL, AUTHOR_NAME, GATE_PATH, write_json
 from fleet_graph.graphs.stop_response import (
     REASON_CONSUMER_UNWIRED,
@@ -134,23 +139,33 @@ class GraphGateNode:
     ) -> dict[str, Any]:
         """The version-bound validity key (spec L3/L5) the verdict seals against.
 
-        Measures the product revision/tree out of the subject's git at its
-        accepted head and binds the single's recorded spec digest; the verdict
-        is only as good as the version it names, so the key travels on the
-        sealed decision as a durability fact, never an agent's claim.
+        Fail-closed and complete: it measures the product revision/tree out of
+        the subject's git at its accepted head, binds the committed spec digest
+        and the *measured* acceptance-context revision (the committed run-config
+        blob), and closes over the target identity and the PR head/base pair
+        from the single's record. Any read it cannot make raises -- the gate
+        refuses rather than recording an "unavailable" marker, so a verdict can
+        never seal against an unbound version.
         """
-        try:
-            facts = BindingFacts(spec_digest=str(status.get("spec_digest") or ""))
-            key = build_validity_binding(str(workspace), head_commit, facts)
-            changed, matches = verify_binding(str(workspace), head_commit, facts, key)
-            return {
-                "digest": key.digest,
-                "fields": key.fields,
-                "matches": bool(matches),
-                "changed": list(changed),
-            }
-        except Exception as exc:
-            return {"unavailable": str(exc)}
+        release_ref = str(status.get("remote_ref") or "")
+        audit_ref = str(status.get("audit_ref") or "")
+        head_ref = audit_ref or release_ref
+        facts = BindingFacts(
+            spec_digest=str(status.get("spec_digest") or ""),
+            acceptance_context_revision=measure_acceptance_context_revision(
+                str(workspace), head_commit
+            ),
+            target_identity=release_ref,
+            pr_identity=(f"{head_ref}->{release_ref}" if (head_ref or release_ref) else ""),
+        )
+        key = build_validity_binding(str(workspace), head_commit, facts)
+        changed, matches = verify_binding(str(workspace), head_commit, facts, key)
+        return {
+            "digest": key.digest,
+            "fields": key.fields,
+            "matches": bool(matches),
+            "changed": list(changed),
+        }
 
     def _seal_decision_file(
         self,
@@ -392,6 +407,11 @@ class GraphGateNode:
                     ensure_ascii=False,
                 )
 
+            # The version-bound validity key is bound and verified *before* any
+            # decision is published, so an unverifiable version refuses the gate
+            # with nothing sealed or published (spec L5: fail-closed).
+            validity = self._validity_binding(workspace, head, status)
+
             published = dict(
                 self.plane.publish_gate_decision(
                     development_id,
@@ -412,7 +432,7 @@ class GraphGateNode:
                 head_commit=head,
                 rationale=str(published.get("rationale") or rationale),
                 decision_message_id=str(published.get("message_id") or ""),
-                validity=self._validity_binding(workspace, head, status),
+                validity=validity,
             )
             resume = dict(self.plane.gate(development_id, resume=True, action_key=action_key))
             resume_entry = dict(resume.get("resume") or {})

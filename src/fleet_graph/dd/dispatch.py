@@ -51,7 +51,11 @@ from fleet_graph.dd.upstream_constants import (
     ATTEMPT_CONTEXT_CONTRACT_VERSION,
     compute_json_digest,
 )
-from fleet_graph.dd.validity_binding import BindingFacts, build_validity_binding
+from fleet_graph.dd.validity_binding import (
+    BindingFacts,
+    build_validity_binding,
+    measure_acceptance_context_revision,
+)
 from fleet_graph.dd.vendor import git_ops
 
 DISPATCH_SCHEMA_PATH = CONTRACTS_DIR / "stage-dispatch.schema.json"
@@ -338,12 +342,19 @@ class StageDispatchBuilder:
         spec_ref = git_ops.exact_artifact_identity(
             self.chain.workspace_path, input_commit, self.spec_path
         )
+        # The acceptance-context revision is measured from the committed
+        # run-config at the same commit, unless the caller already bound a
+        # measured one. Never left empty on this path, so a stage cannot seal
+        # with an incomplete validity key (spec L3: fail-closed, complete).
+        acceptance_revision = merged.acceptance_context_revision or (
+            measure_acceptance_context_revision(self.chain.workspace_path, input_commit)
+        )
         return build_validity_binding(
             self.chain.workspace_path,
             input_commit,
             BindingFacts(
                 spec_digest=spec_ref["digest"],
-                acceptance_context_revision=merged.acceptance_context_revision,
+                acceptance_context_revision=acceptance_revision,
                 target_identity=merged.target_identity or self.chain.target_base_commit,
                 pr_identity=merged.pr_identity,
             ),

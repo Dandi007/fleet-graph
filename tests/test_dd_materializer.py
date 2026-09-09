@@ -350,6 +350,9 @@ class TestReadingWhatTheSealerReturned:
     def _sealed(self, repo: Path, result: dict[str, Any], monkeypatch: Any, stage: Any = IMPLEMENT):
         monkeypatch.setattr(plugin_adapter, "invoke_implement_materializer", lambda *a, **k: result)
         monkeypatch.setattr(plugin_adapter, "invoke_review_materializer", lambda *a, **k: result)
+        # The fake ``output_commit`` is not a real git object; the validity key
+        # (fail-closed, spec L3) is exercised by its own test, not here.
+        monkeypatch.setattr(PluginMaterializer, "_validity_key", lambda self, c: {"stubbed": c})
         receipt = applied_receipt() if stage is IMPLEMENT else review_receipt()
         return make_materializer(repo).materialize(
             stage, dispatch_for(repo, stage.id), StageOutcome(receipt=receipt)
@@ -423,6 +426,7 @@ class TestReadingWhatTheSealerReturned:
 
         monkeypatch.setattr(plugin_adapter, "invoke_implement_materializer", implement_seal)
         monkeypatch.setattr(plugin_adapter, "invoke_review_materializer", review_seal)
+        monkeypatch.setattr(PluginMaterializer, "_validity_key", lambda self, c: {"stubbed": c})
 
         materializer = make_materializer(repo)
         dispatch = dispatch_for(repo, "continuous_review")
@@ -503,6 +507,16 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
         write_index(repo, entries=entries, development_id=DEVELOPMENT_ID)
         git(repo, "add", "-A")
         git(repo, "commit", "-q", "-m", "index")
+
+    def _commit_run_config(self, repo: Path) -> None:
+        """Commit a run-config so the materializer's validity key can bind the
+        measured acceptance-context revision (spec L3: fail-closed, complete)."""
+        (repo / ".dev-dispatch" / "run-config.json").parent.mkdir(parents=True, exist_ok=True)
+        (repo / ".dev-dispatch" / "run-config.json").write_text(
+            '{"acceptance_commands": [["true"]]}', encoding="utf-8"
+        )
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "run-config")
 
     def _scope_and_commit(self, repo: Path, generation: int) -> None:
         """What configure does for a fresh generation, then committed."""
@@ -594,6 +608,7 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
         dispatch = dispatch_for(repo, "continuous_review")
         dispatch["generation"] = 2
         seal_implement_receipt(repo, derive_attempt_id(DEVELOPMENT_ID, 2, 1))
+        self._commit_run_config(repo)
         self._seal_via_carrier(monkeypatch)
 
         sealed = make_materializer(repo).materialize(
@@ -644,6 +659,7 @@ class TestTheOrderingRuleIsEnforcedAtMaterialization:
         )
         dispatch = dispatch_for(repo, "continuous_review", attempt=2)
         seal_implement_receipt(repo, derive_attempt_id(DEVELOPMENT_ID, 1, 2))
+        self._commit_run_config(repo)
         self._seal_via_carrier(monkeypatch)
 
         sealed = make_materializer(repo).materialize(

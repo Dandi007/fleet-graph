@@ -248,6 +248,14 @@ def admit(
         spec_text=SPEC + "\n```dd-gate-policy\nlegacy-six-v1\n```\n",
         dispatched_by=PRINCIPAL,
     )
+    # The gate's validity binding measures the committed run-config (spec L3);
+    # commit one into the subject repo after admission bootstraps the spec.
+    (repo / ".dev-dispatch" / "run-config.json").parent.mkdir(parents=True, exist_ok=True)
+    (repo / ".dev-dispatch" / "run-config.json").write_text(
+        '{"acceptance_commands": [["true"]]}', encoding="utf-8"
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "run-config")
     return plane, str(created["development_id"]), repo
 
 
